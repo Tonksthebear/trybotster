@@ -7,7 +7,7 @@
 //!
 //! Reader threads broadcast [`PtyEvent::Output`] via a broadcast channel.
 //! This enables decoupled pub/sub where:
-//! - TUI client feeds output to its local vt100 parser
+//! - TUI client feeds output to its local terminal parser
 //! - Browser client encrypts and sends via ActionCable channel
 //!
 //! Each client subscribes to events independently and handles them
@@ -16,12 +16,14 @@
 // Rust guideline compliant 2026-02
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+#[cfg(test)]
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -29,7 +31,8 @@ use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 use tokio::sync::broadcast;
 
 use super::notification::detect_notifications;
-use super::pty::PtyEvent;
+use super::pty::{HubEventListener, PtyEvent};
+use crate::terminal::AlacrittyParser;
 
 /// Configuration for spawning a process in a PtySession.
 ///
@@ -128,30 +131,138 @@ pub fn build_command(
     cmd
 }
 
+/// Process a single chunk of raw PTY output bytes.
+///
+/// Single source of truth for per-chunk PTY byte processing.
+/// Both the reader thread ([`spawn_reader_thread`]) and the broker output
+/// path ([`crate::hub::agent_handle::PtyHandle::feed_broker_output`]) call
+/// this function, guaranteeing identical behavior regardless of which path
+/// delivers bytes to the Hub.
+///
+/// # What this does per chunk
+///
+/// 1. **OSC notification detection** — OSC 9 / OSC 777 sequences, gated by
+///    `detect_notifs` (true for CLI sessions, false for server PTYs).
+/// 2. **Window title** — OSC 2 sequences update the TUI tab title.
+/// 3. **CWD** — OSC 7 sequences update the working directory indicator.
+/// 4. **Prompt marks** — OSC 133 A/B/C/D sequences mark shell prompt regions.
+/// 5. **Kitty keyboard protocol** — CSI > u push / CSI < u pop updates
+///    `kitty_enabled` and fires [`PtyEvent::KittyChanged`].
+/// 6. **Cursor visibility** — CSI ? 25 h/l transitions fire
+///    [`PtyEvent::CursorVisibilityChanged`]. Only state *changes* are emitted
+///    to avoid flooding subscribers during TUI redraws. `last_cursor_visible`
+///    carries this state across calls and must be persisted by the caller.
+/// 7. **Shadow screen update** — bytes are fed to the `AlacrittyParser`.
+///    No `catch_unwind` guard needed — alacritty_terminal is robust at all
+///    sizes and sequences. CSI 3 J (erase scrollback) and all other sequences
+///    are handled natively by alacritty.
+/// 8. **`resize_pending` clear** — signals the app has redrawn after a resize.
+/// 9. **Output broadcast** — raw bytes are sent to all live subscribers via
+///    the broadcast channel. Lagged receivers skip missed frames.
+///
+/// # Note: Focus reporting
+///
+/// CSI ? 1004 h (focus reporting enable) is intentionally **not** handled here.
+/// Responding to every occurrence fires [`PtyEvent::FocusRequested`] → TUI writes
+/// `\x1b[I` → app redraws → re-emits `\x1b[?1004h` → infinite loop. Focus event
+/// delivery requires "arm once" state tracking (fire on first enable, suppress until
+/// `\x1b[?1004l` disables it) which is not yet implemented.
+///
+/// # Arguments
+///
+/// * `data` - Raw bytes from the PTY master FD.
+/// * `shadow_screen` - Shadow terminal for parsed state snapshots.
+/// * `event_tx` - Broadcast channel for [`PtyEvent`] notifications.
+/// * `kitty_enabled` - Shared flag tracking kitty keyboard protocol state.
+/// * `resize_pending` - Cleared when output arrives after a resize.
+/// * `detect_notifs` - Enable OSC notification detection (true for CLI sessions).
+/// * `last_cursor_visible` - Persistent cursor visibility state for deduplication.
+///   Caller must preserve this across calls (local var in reader thread,
+///   `Arc<Mutex<Option<bool>>>` field in [`crate::hub::agent_handle::PtyHandle`]).
+/// * `label` - Log label for this session (e.g., `"CLI"`, `"Server"`, `"Broker"`).
+pub(crate) fn process_pty_bytes(
+    data: &[u8],
+    shadow_screen: &Arc<Mutex<AlacrittyParser<HubEventListener>>>,
+    event_tx: &broadcast::Sender<PtyEvent>,
+    kitty_enabled: &AtomicBool,
+    resize_pending: &AtomicBool,
+    detect_notifs: bool,
+    last_cursor_visible: &mut Option<bool>,
+    _label: &str,
+) {
+    // ── 1. OSC notification detection ────────────────────────────────────
+    if detect_notifs {
+        for notif in detect_notifications(data) {
+            log::info!("Broadcasting PTY notification: {:?}", notif);
+            let _ = event_tx.send(PtyEvent::notification(notif));
+        }
+    }
+
+    // ── 2-3. OSC metadata: CWD, prompt marks ───────────────────────────
+    // Title scanning removed — alacritty fires Event::Title via HubEventListener.
+    if let Some(cwd) = scan_cwd(data) {
+        let _ = event_tx.send(PtyEvent::cwd_changed(cwd));
+    }
+    for mark in scan_prompt_marks(data) {
+        let _ = event_tx.send(PtyEvent::prompt_mark(mark));
+    }
+
+    // ── 4. Shadow screen update ──────────────────────────────────────────
+    // alacritty_terminal handles all escape sequences natively:
+    // - Title changes fire Event::Title via HubEventListener
+    // - Kitty keyboard protocol tracked via TermMode::KITTY_KEYBOARD_PROTOCOL
+    // - DECTCEM cursor visibility tracked via TermMode::SHOW_CURSOR
+    // - CSI 3 J (clear scrollback) handled by alacritty grid
+    // No catch_unwind needed — alacritty is robust at all terminal sizes.
+    let (new_kitty, new_cursor_hidden) = {
+        let mut parser = shadow_screen.lock().expect("shadow_screen lock poisoned");
+        parser.process(data);
+        (parser.kitty_enabled(), parser.cursor_hidden())
+    };
+
+    // ── 5. Kitty state transition ────────────────────────────────────────
+    let old_kitty = kitty_enabled.load(Ordering::Relaxed);
+    if new_kitty != old_kitty {
+        kitty_enabled.store(new_kitty, Ordering::Relaxed);
+        let _ = event_tx.send(PtyEvent::kitty_changed(new_kitty));
+    }
+
+    // ── 6. Cursor visibility transition ──────────────────────────────────
+    let visible = !new_cursor_hidden;
+    if *last_cursor_visible != Some(visible) {
+        *last_cursor_visible = Some(visible);
+        let _ = event_tx.send(PtyEvent::cursor_visibility_changed(visible));
+    }
+
+    // ── 7. Clear resize-pending flag ─────────────────────────────────────
+    // App produced output — shadow screen is no longer stale from a prior resize.
+    resize_pending.store(false, Ordering::Release);
+
+    // ── 8. Broadcast raw bytes ───────────────────────────────────────────
+    // Clients parse bytes in their own parsers (xterm.js, TUI).
+    // Lagged receivers skip missed frames — same behavior as a live PTY.
+    let _ = event_tx.send(PtyEvent::output(data.to_vec()));
+}
+
 /// Spawn a unified PTY reader thread with optional notification detection.
 ///
-/// This is the reader thread implementation used by
-/// [`PtySession::spawn()`](super::pty::PtySession::spawn), parameterized
-/// by `detect_notifications`:
-///
-/// - When `true`, OSC notification sequences are detected and broadcast
-///   as [`PtyEvent::Notification`] events (CLI session behavior).
-/// - When `false`, notification detection is skipped (server session behavior).
-///
-/// The reader thread feeds every PTY byte to both the shadow screen (for
-/// reconnect snapshots) and the broadcast channel (for live subscribers).
+/// Used exclusively in unit tests to exercise [`process_pty_bytes`] via a
+/// live pipe reader. Production agents route output through the broker and
+/// call [`process_pty_bytes`] directly via
+/// [`PtyHandle::feed_broker_output`](crate::hub::agent_handle::PtyHandle::feed_broker_output).
 ///
 /// # Arguments
 ///
 /// * `reader` - PTY output reader
 /// * `shadow_screen` - Shadow terminal for parsed state snapshots
 /// * `event_tx` - Broadcast channel for PtyEvent notifications
-/// * `detect_notifs` - Enable OSC notification detection
+/// * `detect_notifs` - Enable OSC notification detection (true for CLI sessions)
 /// * `kitty_enabled` - Shared flag updated when kitty keyboard protocol is pushed/popped
 /// * `resize_pending` - Cleared when PTY output arrives (app has redrawn after resize)
-pub fn spawn_reader_thread(
+#[cfg(test)]
+pub(crate) fn spawn_reader_thread(
     reader: Box<dyn Read + Send>,
-    shadow_screen: Arc<Mutex<vt100::Parser>>,
+    shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
     event_tx: broadcast::Sender<PtyEvent>,
     detect_notifs: bool,
     kitty_enabled: Arc<AtomicBool>,
@@ -160,11 +271,13 @@ pub fn spawn_reader_thread(
     let label = if detect_notifs { "CLI" } else { "Server" };
 
     thread::spawn(move || {
-        let mut reader = reader;
         log::info!("{label} PTY reader thread started");
+        let mut reader = reader;
         let mut buf = [0u8; 4096];
-        // Track cursor visibility state for transition-only emission.
-        let mut last_cursor_visible: Option<bool> = None;
+        // Start as Some(true): alacritty initializes with SHOW_CURSOR set, so the
+        // cursor is already visible. Initializing to None would emit a spurious
+        // CursorVisibilityChanged(true) on the very first read even when nothing changed.
+        let mut last_cursor_visible: Option<bool> = Some(true);
 
         loop {
             match reader.read(&mut buf) {
@@ -174,135 +287,16 @@ pub fn spawn_reader_thread(
                     break;
                 }
                 Ok(n) => {
-                    let chunk = &buf[..n];
-
-                    // Detect notifications and broadcast as PtyEvent::Notification
-                    if detect_notifs {
-                        let notifications = detect_notifications(chunk);
-                        for notif in notifications {
-                            log::info!("Broadcasting PTY notification: {:?}", notif);
-                            let _ = event_tx.send(PtyEvent::notification(notif));
-                        }
-                    }
-
-                    // Detect OSC metadata events (title, CWD, prompt marks).
-                    // These run for all sessions (not just detect_notifs) because
-                    // title/CWD/prompt info is useful for both CLI and server PTYs.
-                    if let Some(title) = scan_window_title(chunk) {
-                        let _ = event_tx.send(PtyEvent::title_changed(title));
-                    }
-                    if let Some(cwd) = scan_cwd(chunk) {
-                        let _ = event_tx.send(PtyEvent::cwd_changed(cwd));
-                    }
-                    for mark in scan_prompt_marks(chunk) {
-                        let _ = event_tx.send(PtyEvent::prompt_mark(mark));
-                    }
-
-                    // Track kitty keyboard protocol state from raw PTY output.
-                    // The vt100 crate doesn't parse kitty sequences, so we scan
-                    // the raw bytes for CSI > flags u (push) / CSI < u (pop).
-                    if let Some(state) = scan_kitty_keyboard_state(chunk) {
-                        kitty_enabled.store(state, Ordering::Relaxed);
-                        let _ = event_tx.send(PtyEvent::kitty_changed(state));
-                    }
-
-                    // Detect focus reporting enable (CSI ? 1004 h) so the TUI
-                    // can respond with the current terminal focus state.
-                    if scan_focus_reporting_enabled(chunk) {
-                        let _ = event_tx.send(PtyEvent::focus_requested());
-                    }
-
-                    // Detect DECTCEM cursor visibility changes (CSI ? 25 h/l).
-                    // Only emit on transitions to avoid flooding during TUI redraws.
-                    if let Some(visible) = scan_cursor_visibility(chunk) {
-                        if last_cursor_visible != Some(visible) {
-                            last_cursor_visible = Some(visible);
-                            let _ = event_tx.send(PtyEvent::cursor_visibility_changed(visible));
-                        }
-                    }
-
-                    // Feed PTY bytes to shadow screen for parsed state tracking.
-                    // vt100 handles scrollback limits internally by line count.
-                    //
-                    // Safety net: vt100 0.16.2 has arithmetic overflow bugs
-                    // (e.g. `grid.rs:683` col_wrap on 1-row grids). The primary
-                    // defense is the MIN_PARSER_ROWS clamp in PtySession and
-                    // resize_shadow_screen(), but we keep catch_unwind as a
-                    // generic safety net for any unforeseen vt100 panics.
-                    // On panic the parser is replaced with a fresh instance
-                    // to avoid cascading failures.
-                    {
-                        let mut parser = shadow_screen
-                            .lock()
-                            .expect("shadow_screen lock poisoned");
-
-                        // catch_unwind requires the closure to be UnwindSafe.
-                        // MutexGuard is !UnwindSafe because the guarded state
-                        // may be inconsistent after a panic. We use
-                        // AssertUnwindSafe because on panic we immediately
-                        // replace the parser with a fresh instance, so
-                        // any inconsistent grid state is discarded.
-                        let result = std::panic::catch_unwind(
-                            std::panic::AssertUnwindSafe(|| {
-                                parser.process(chunk);
-                            }),
-                        );
-
-                        if let Err(panic_info) = result {
-                            let msg = panic_info
-                                .downcast_ref::<String>()
-                                .map(String::as_str)
-                                .or_else(|| {
-                                    panic_info.downcast_ref::<&str>().copied()
-                                })
-                                .unwrap_or("unknown panic");
-
-                            // The parser's internal grid state is now
-                            // inconsistent (e.g. invalid scroll region),
-                            // so every future process() would also panic.
-                            // Replace with a fresh parser at the same
-                            // dimensions. Reading size() is safe — it just
-                            // returns stored u16 fields, no grid arithmetic.
-                            let (rows, cols) = parser.screen().size();
-                            let rows = rows.max(super::pty::MIN_PARSER_ROWS);
-                            *parser = vt100::Parser::new(
-                                rows,
-                                cols,
-                                super::pty::SHADOW_SCROLLBACK_LINES,
-                            );
-                            log::error!(
-                                "{label} vt100 parser panicked (reset {rows}x{cols}): {msg}"
-                            );
-                        } else {
-                            // CSI 3 J (\x1b[3J) = "Erase Saved Lines" (clear
-                            // scrollback). The vt100 crate ignores this
-                            // sequence, so we handle it manually by replacing
-                            // the parser with a fresh one seeded with the
-                            // current visible screen state.
-                            if contains_clear_scrollback(chunk) {
-                                let (rows, cols) = parser.screen().size();
-                                let visible =
-                                    parser.screen().contents_formatted();
-                                *parser = vt100::Parser::new(
-                                    rows,
-                                    cols,
-                                    super::pty::SHADOW_SCROLLBACK_LINES,
-                                );
-                                parser.process(&visible);
-                                log::info!(
-                                    "{label} shadow screen scrollback cleared (CSI 3 J)"
-                                );
-                            }
-                        }
-                    }
-
-                    // App produced output — shadow screen is no longer stale
-                    // from a prior resize.
-                    resize_pending.store(false, Ordering::Release);
-
-                    // Broadcast raw output to all live subscribers.
-                    // Clients parse bytes in their own parsers (xterm.js, TUI vt100).
-                    let _ = event_tx.send(PtyEvent::output(chunk.to_vec()));
+                    process_pty_bytes(
+                        &buf[..n],
+                        &shadow_screen,
+                        &event_tx,
+                        &kitty_enabled,
+                        &resize_pending,
+                        detect_notifs,
+                        &mut last_cursor_visible,
+                        label,
+                    );
                 }
                 Err(e) => {
                     log::error!("{label} PTY read error: {e}");
@@ -315,26 +309,16 @@ pub fn spawn_reader_thread(
     })
 }
 
-/// Check if a byte buffer contains the CSI 3 J (clear scrollback) sequence.
-///
-/// Scans for `\x1b[3J` which terminals emit when the user runs `clear` or
-/// equivalent commands. The vt100 crate does not handle this sequence, so
-/// callers must clear scrollback manually when this returns true.
-pub(crate) fn contains_clear_scrollback(data: &[u8]) -> bool {
-    // CSI 3 J = ESC [ 3 J = [0x1b, 0x5b, 0x33, 0x4a]
-    data.windows(4)
-        .any(|w| w == b"\x1b[3J")
-}
-
 /// Scan PTY output for kitty keyboard protocol push/pop sequences.
 ///
 /// Returns `Some(true)` if the last relevant sequence is a push (`CSI > flags u`),
 /// `Some(false)` if it's a pop (`CSI < u`), or `None` if no kitty sequences found.
 ///
-/// The vt100 crate does not track kitty keyboard protocol state, so we scan
-/// the raw byte stream directly. We check the *last* occurrence because a
-/// single output chunk may contain multiple push/pop sequences (e.g. during
-/// shell startup).
+/// alacritty_terminal tracks kitty state internally via `TermMode`, but
+/// this function is retained for the broker path where raw bytes arrive
+/// before the shadow parser has been updated. We check the *last* occurrence
+/// because a single output chunk may contain multiple push/pop sequences
+/// (e.g. during shell startup).
 pub fn scan_kitty_keyboard_state(data: &[u8]) -> Option<bool> {
     let mut result = None;
 
@@ -371,17 +355,6 @@ pub fn scan_kitty_keyboard_state(data: &[u8]) -> Option<bool> {
     }
 
     result
-}
-
-/// Scan PTY output for focus reporting enable sequence (`CSI ? 1004 h`).
-///
-/// Returns `true` if the byte stream contains `\x1b[?1004h`, indicating
-/// the application wants terminal focus events. The TUI should respond
-/// with the current focus state (`CSI I` or `CSI O`).
-pub fn scan_focus_reporting_enabled(data: &[u8]) -> bool {
-    // Match the byte sequence: ESC [ ? 1 0 0 4 h
-    let needle = b"\x1b[?1004h";
-    data.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Scan PTY output for DECTCEM cursor visibility sequences.
@@ -683,9 +656,15 @@ mod tests {
         }
     }
 
-    /// Helper: create a shadow screen for testing.
-    fn test_shadow_screen() -> Arc<Mutex<vt100::Parser>> {
-        Arc::new(Mutex::new(vt100::Parser::new(24, 80, 100)))
+    /// Helper: create a shadow screen wired to the given event channel.
+    ///
+    /// Uses the same `event_tx` as the reader thread so that events fired by
+    /// the [`HubEventListener`] (e.g. `TitleChanged`) arrive on the same
+    /// receiver as `Output` events — matching the production `PtySession::new()`
+    /// behaviour where both share a single broadcast channel.
+    fn test_shadow_screen(event_tx: broadcast::Sender<PtyEvent>) -> Arc<Mutex<AlacrittyParser<HubEventListener>>> {
+        let listener = HubEventListener::new(event_tx);
+        Arc::new(Mutex::new(AlacrittyParser::new_with_listener(24, 80, 100, listener)))
     }
 
     /// Helper: create a kitty flag for testing.
@@ -701,8 +680,8 @@ mod tests {
     fn test_unified_reader_broadcasts_output_without_notifications() {
         let test_data = b"Hello from unified reader (server mode)";
         let reader = MockReader::new(test_data);
-        let shadow = test_shadow_screen();
         let (tx, mut rx) = broadcast::channel::<PtyEvent>(16);
+        let shadow = test_shadow_screen(tx.clone());
 
         let handle = spawn_reader_thread(reader, shadow.clone(), tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
@@ -716,11 +695,12 @@ mod tests {
             _ => panic!("Expected Output event"),
         }
 
-        // Verify shadow screen was fed
-        let screen_text = shadow.lock().unwrap().screen().contents();
+        // Verify shadow screen was fed — generate snapshot and check for text.
+        let snapshot = crate::terminal::generate_ansi_snapshot(&*shadow.lock().unwrap(), false);
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
         assert!(
-            screen_text.contains("Hello from unified reader"),
-            "Shadow screen should contain the output"
+            snapshot_str.contains("Hello from unified reader"),
+            "Shadow screen snapshot should contain the output"
         );
     }
 
@@ -728,8 +708,8 @@ mod tests {
     fn test_unified_reader_broadcasts_output_with_notifications() {
         let test_data = b"Hello from unified reader (CLI mode)";
         let reader = MockReader::new(test_data);
-        let shadow = test_shadow_screen();
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
+        let shadow = test_shadow_screen(event_tx.clone());
 
         let handle = spawn_reader_thread(reader, shadow, event_tx, true, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
@@ -748,8 +728,8 @@ mod tests {
         // OSC 9 notification: ESC ] 9 ; message BEL
         let test_data = b"\x1b]9;Build complete\x07";
         let reader = MockReader::new(test_data);
-        let shadow = test_shadow_screen();
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
+        let shadow = test_shadow_screen(event_tx.clone());
 
         let handle = spawn_reader_thread(reader, shadow, event_tx, true, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
@@ -775,8 +755,8 @@ mod tests {
     fn test_unified_reader_skips_notifications_when_disabled() {
         let test_data = b"\x1b]9;Build complete\x07";
         let reader = MockReader::new(test_data);
-        let shadow = test_shadow_screen();
         let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(16);
+        let shadow = test_shadow_screen(event_tx.clone());
 
         let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
@@ -787,28 +767,6 @@ mod tests {
         // Reader emits ProcessExited on EOF
         let exit_event = event_rx.try_recv().expect("Should receive ProcessExited on EOF");
         assert!(matches!(exit_event, PtyEvent::ProcessExited { exit_code: None }));
-    }
-
-    // =========================================================================
-    // Clear Scrollback Detection Tests
-    // =========================================================================
-
-    #[test]
-    fn test_contains_clear_scrollback_detects_csi_3j() {
-        assert!(contains_clear_scrollback(b"\x1b[3J"));
-        // Embedded in larger output (typical `clear` command output)
-        assert!(contains_clear_scrollback(b"\x1b[H\x1b[2J\x1b[3J"));
-        assert!(contains_clear_scrollback(b"some text\x1b[3Jmore text"));
-    }
-
-    #[test]
-    fn test_contains_clear_scrollback_ignores_other_sequences() {
-        assert!(!contains_clear_scrollback(b"\x1b[2J"));
-        assert!(!contains_clear_scrollback(b"\x1b[H"));
-        assert!(!contains_clear_scrollback(b"plain text"));
-        assert!(!contains_clear_scrollback(b""));
-        // Partial sequence should not match
-        assert!(!contains_clear_scrollback(b"\x1b[3"));
     }
 
     #[test]
@@ -824,34 +782,24 @@ mod tests {
         data.extend(b"fresh start");
 
         let reader = MockReader::new(&data);
-        let shadow = test_shadow_screen();
         let (event_tx, _event_rx) = broadcast::channel::<PtyEvent>(64);
+        let shadow = test_shadow_screen(event_tx.clone());
 
         let handle = spawn_reader_thread(reader, shadow.clone(), event_tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
 
-        // Scrollback should have been cleared — only visible screen remains
-        let parser = shadow.lock().unwrap();
-        let screen = parser.screen();
-
-        // Verify fresh content is visible
-        let contents = screen.contents();
+        // Verify fresh content is visible via snapshot
+        let snapshot = crate::terminal::generate_ansi_snapshot(&*shadow.lock().unwrap(), false);
+        let snapshot_str = String::from_utf8_lossy(&snapshot);
         assert!(
-            contents.contains("fresh start"),
+            snapshot_str.contains("fresh start"),
             "Screen should contain post-clear content"
         );
 
-        // Verify scrollback is empty (the pre-clear lines were dropped).
-        // Probe total scrollback lines the same way snapshot_with_scrollback does.
-        drop(parser);
-        let mut parser = shadow.lock().unwrap();
-        let screen = parser.screen_mut();
-        let saved = screen.scrollback();
-        screen.set_scrollback(usize::MAX);
-        let total_scrollback = screen.scrollback();
-        screen.set_scrollback(saved);
+        // Verify scrollback is empty (alacritty handles CSI 3J natively).
+        let parser = shadow.lock().unwrap();
         assert_eq!(
-            total_scrollback, 0,
+            parser.history_size(), 0,
             "Scrollback should be empty after CSI 3 J"
         );
     }
@@ -980,8 +928,8 @@ mod tests {
         data.extend(b"more output");
 
         let reader = MockReader::new(&data);
-        let shadow = test_shadow_screen();
         let (event_tx, _rx) = broadcast::channel::<PtyEvent>(16);
+        let shadow = test_shadow_screen(event_tx.clone());
         let kitty = test_kitty_flag();
 
         assert!(!kitty.load(Ordering::Relaxed), "kitty should start false");
@@ -999,8 +947,8 @@ mod tests {
         data.extend(b"\x1b[<u");  // pop
 
         let reader = MockReader::new(&data);
-        let shadow = test_shadow_screen();
         let (event_tx, _rx) = broadcast::channel::<PtyEvent>(16);
+        let shadow = test_shadow_screen(event_tx.clone());
         let kitty = test_kitty_flag();
 
         let handle = spawn_reader_thread(reader, shadow, event_tx, false, Arc::clone(&kitty), test_resize_flag());
@@ -1012,8 +960,8 @@ mod tests {
     #[test]
     fn test_reader_kitty_flag_unset_for_normal_output() {
         let reader = MockReader::new(b"hello world\r\n");
-        let shadow = test_shadow_screen();
         let (event_tx, _rx) = broadcast::channel::<PtyEvent>(16);
+        let shadow = test_shadow_screen(event_tx.clone());
         let kitty = test_kitty_flag();
 
         let handle = spawn_reader_thread(reader, shadow, event_tx, false, Arc::clone(&kitty), test_resize_flag());
@@ -1034,8 +982,8 @@ mod tests {
         data.extend(b"more output");
 
         let reader = MockReader::new(&data);
-        let shadow = test_shadow_screen();
         let (event_tx, mut rx) = broadcast::channel::<PtyEvent>(32);
+        let shadow = test_shadow_screen(event_tx.clone());
 
         let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
@@ -1055,8 +1003,8 @@ mod tests {
     fn test_reader_emits_cwd_changed_event() {
         let data = b"\x1b]7;file://localhost/home/user/projects\x07";
         let reader = MockReader::new(data);
-        let shadow = test_shadow_screen();
         let (event_tx, mut rx) = broadcast::channel::<PtyEvent>(32);
+        let shadow = test_shadow_screen(event_tx.clone());
 
         let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
@@ -1079,8 +1027,8 @@ mod tests {
         data.extend(b"\x1b]133;D;0\x07"); // command finished
 
         let reader = MockReader::new(&data);
-        let shadow = test_shadow_screen();
         let (event_tx, mut rx) = broadcast::channel::<PtyEvent>(32);
+        let shadow = test_shadow_screen(event_tx.clone());
 
         let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
@@ -1105,8 +1053,8 @@ mod tests {
         data.extend(b"\x1b]9;notification\x07"); // this should NOT emit (detect_notifs=false)
 
         let reader = MockReader::new(&data);
-        let shadow = test_shadow_screen();
         let (event_tx, mut rx) = broadcast::channel::<PtyEvent>(32);
+        let shadow = test_shadow_screen(event_tx.clone());
 
         let handle = spawn_reader_thread(reader, shadow, event_tx, false, test_kitty_flag(), test_resize_flag());
         handle.join().expect("Reader thread panicked");
@@ -1287,146 +1235,5 @@ mod tests {
         assert_eq!(percent_decode("no%encoding"), "no%encoding"); // invalid hex
     }
 
-    // =========================================================================
-    // vt100 Panic Recovery Tests
-    // =========================================================================
-
-    /// Confirm the vt100 bug exists: resize can create a single-row scroll
-    /// region (scroll_top == scroll_bottom) that `col_wrap` cannot handle.
-    ///
-    /// vt100 0.16.2 `grid.rs:683` does `prev_pos.row -= scrolled` without
-    /// overflow protection. When cursor is at row 0 inside a single-row
-    /// scroll region and wraps, `scrolled=1` and `0 - 1` panics.
-    #[test]
-    #[should_panic(expected = "attempt to subtract with overflow")]
-    fn test_vt100_col_wrap_underflow_reproducer() {
-        // Step 1: 3-row terminal, set scroll region rows 1..2 (0-indexed: 0..1).
-        let mut parser = vt100::Parser::new(3, 10, 0);
-        parser.process(b"\x1b[1;2r"); // scroll_top=0, scroll_bottom=1
-
-        // Step 2: Resize to 1 row. set_size clamps scroll_bottom to 0,
-        //         but the `< scroll_top` guard doesn't fire (0 < 0 = false),
-        //         leaving scroll_top=0, scroll_bottom=0 — an invalid state
-        //         that set_scroll_region would reject.
-        parser.screen_mut().set_size(1, 10);
-
-        // Step 3: Fill the row (10 chars) then one more to trigger col_wrap.
-        //         col_wrap: prev_pos.row=0, row_inc_scroll returns 1,
-        //         0_u16 - 1_u16 → overflow panic.
-        parser.process(b"AAAAAAAAAAB");
-    }
-
-    /// Verify the reader thread survives a vt100 parser panic (safety net).
-    ///
-    /// This test bypasses the production DECSTBM reset fix by calling
-    /// `set_size()` directly, simulating a hypothetical vt100 panic from
-    /// any cause. Without `catch_unwind` + parser reset, the panic would
-    /// kill the thread and poison the `shadow_screen` mutex.
-    #[test]
-    fn test_reader_survives_vt100_parser_panic() {
-        // Phase 1: establish a scroll region (delivered as PTY output).
-        let phase1 = b"\x1b[1;2r";
-
-        // Phase 2: post-resize overflow trigger + post-panic output.
-        let phase2 = b"AAAAAAAAAAB\x1b[r after panic";
-
-        // We use two separate MockReaders stitched by a wrapper that
-        // injects a resize between phases, simulating a real terminal
-        // resize arriving between two PTY read() calls.
-        struct ResizeThenRead {
-            phase: u8,
-            phase1: Cursor<Vec<u8>>,
-            phase2: Cursor<Vec<u8>>,
-            shadow: Arc<Mutex<vt100::Parser>>,
-        }
-        impl Read for ResizeThenRead {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                match self.phase {
-                    0 => {
-                        let n = self.phase1.read(buf)?;
-                        if n == 0 {
-                            // Between reads, resize shrinks terminal to 1 row,
-                            // creating the invalid single-row scroll region.
-                            self.shadow
-                                .lock()
-                                .unwrap()
-                                .screen_mut()
-                                .set_size(1, 10);
-                            self.phase = 1;
-                            self.phase2.read(buf)
-                        } else {
-                            Ok(n)
-                        }
-                    }
-                    _ => self.phase2.read(buf),
-                }
-            }
-        }
-
-        // Start with 3 rows, 10 cols.
-        let shadow: Arc<Mutex<vt100::Parser>> =
-            Arc::new(Mutex::new(vt100::Parser::new(3, 10, 0)));
-        let reader: Box<dyn Read + Send> = Box::new(ResizeThenRead {
-            phase: 0,
-            phase1: Cursor::new(phase1.to_vec()),
-            phase2: Cursor::new(phase2.to_vec()),
-            shadow: Arc::clone(&shadow),
-        });
-        let (event_tx, mut event_rx) = broadcast::channel::<PtyEvent>(64);
-
-        let handle = spawn_reader_thread(
-            reader,
-            shadow.clone(),
-            event_tx,
-            false,
-            test_kitty_flag(),
-            test_resize_flag(),
-        );
-
-        // The reader thread must not panic.
-        handle.join().expect("Reader thread panicked — catch_unwind missing");
-
-        // The shadow_screen mutex must not be poisoned.
-        assert!(
-            shadow.lock().is_ok(),
-            "shadow_screen mutex poisoned — catch_unwind missing"
-        );
-
-        // Output events should still have been broadcast.
-        let mut got_output = false;
-        while let Ok(event) = event_rx.try_recv() {
-            if matches!(event, PtyEvent::Output(_)) {
-                got_output = true;
-            }
-        }
-        assert!(got_output, "Reader should still broadcast output events");
-    }
-
-    /// Verify that clamping rows to `MIN_PARSER_ROWS` prevents the vt100
-    /// col_wrap panic.
-    ///
-    /// This is the production fix: all `set_size()` and `Parser::new()` calls
-    /// clamp rows to at least 2. A 1-row grid triggers an underflow in
-    /// `Grid::col_wrap` (grid.rs:683) on any line wrap.
-    #[test]
-    fn test_min_rows_clamp_prevents_panic() {
-        use crate::agent::pty::MIN_PARSER_ROWS;
-
-        // Without clamp: 1-row grid panics on line wrap.
-        let result = std::panic::catch_unwind(|| {
-            let mut parser = vt100::Parser::new(1, 10, 0);
-            parser.process(b"AAAAAAAAAAB"); // wraps → col_wrap → boom
-        });
-        assert!(result.is_err(), "1-row grid should panic on col_wrap");
-
-        // With clamp: MIN_PARSER_ROWS avoids the panic.
-        let rows: u16 = 1;
-        let mut parser = vt100::Parser::new(rows.max(MIN_PARSER_ROWS), 10, 0);
-        parser.process(b"AAAAAAAAAAB"); // wraps safely with 2+ rows
-
-        // Also safe after set_size with clamp.
-        parser.screen_mut().set_size(rows.max(MIN_PARSER_ROWS), 10);
-        parser.process(b"AAAAAAAAAAB");
-    }
 
 }

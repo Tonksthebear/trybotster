@@ -2,27 +2,32 @@
 //!
 //! This module provides pseudo-terminal (PTY) session handling with a pub/sub
 //! architecture. PTY sessions broadcast events to connected clients, and each
-//! client maintains its own terminal state (vt100 parser, etc.).
+//! client maintains its own terminal state.
 //!
 //! # Architecture
 //!
 //! ```text
 //! PtySession (owns I/O, broadcasts events)
-//!  ├── master_pty: MasterPty (for resizing)
+//!  ├── master_pty: MasterPty (for resizing + FD transfer to broker)
 //!  ├── writer: Write (for input)
-//!  ├── reader_thread: JoinHandle (PTY output reader)
 //!  ├── child: Child (spawned process)
-//!  ├── shadow_screen: Arc<Mutex<vt100::Parser>> (parsed terminal state)
+//!  ├── shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>
 //!  └── event_tx: broadcast::Sender<PtyEvent> (output + notification broadcast)
 //! ```
 //!
+//! Output reaches the Hub exclusively via the broker: the broker holds the
+//! PTY master FD (transferred via SCM_RIGHTS), reads raw bytes, and forwards
+//! them as `BrokerPtyOutput` frames. The Hub calls
+//! [`PtyHandle::feed_broker_output`](crate::hub::agent_handle::PtyHandle::feed_broker_output)
+//! which processes bytes through [`crate::agent::spawn::process_pty_bytes`].
+//!
 //! # Shadow Terminal (zmx pattern)
 //!
-//! Each PTY session maintains a `vt100::Parser` shadow screen that receives
-//! the same bytes as live subscribers. On browser connect/reconnect, the shadow
-//! screen produces a clean ANSI snapshot via `contents_formatted()` instead of
-//! replaying raw byte history — eliminating escape sequence garbling and cursor
-//! desync. Live streaming still uses raw PTY bytes for efficiency.
+//! Each PTY session maintains an [`AlacrittyParser`] shadow screen that
+//! receives the same bytes as live subscribers. On browser connect/reconnect,
+//! [`generate_ansi_snapshot`] produces clean ANSI output with correct cursor
+//! and SGR state — eliminating escape sequence garbling and cursor desync.
+//! Live streaming still uses raw PTY bytes for efficiency.
 //!
 //! # Event Broadcasting
 //!
@@ -52,6 +57,8 @@ pub use events::{PromptMark, PtyEvent};
 
 pub use super::spawn::PtySpawnConfig;
 
+use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::grid::Dimensions;
 use anyhow::{Context, Result};
 use portable_pty::{Child, MasterPty, PtySize};
 use std::{
@@ -66,25 +73,11 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::agent::spawn;
+use crate::terminal::{AlacrittyParser, DEFAULT_SCROLLBACK_LINES};
 
 /// Default channel capacity for PTY command channels.
 const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
 
-/// Number of scrollback lines tracked by the shadow terminal.
-///
-/// 5000 lines at 80 cols produces ~400KB of formatted ANSI output
-/// on snapshot. This provides ample history for reconnecting browsers
-/// while keeping memory bounded by line count rather than raw bytes.
-pub(crate) const SHADOW_SCROLLBACK_LINES: usize = 5000;
-
-/// Minimum row count for vt100 parser to avoid col_wrap overflow panic.
-///
-/// vt100 0.16.2 has a bug where a 1-row grid causes `col_wrap()` to
-/// underflow (`prev_pos.row -= scrolled` where both are 0 and 1). This
-/// affects both `set_size()` and `Parser::new()`. Clamping to 2 rows
-/// avoids the impossible state while being functionally equivalent (a
-/// 1-row terminal is unusable anyway).
-pub(crate) const MIN_PARSER_ROWS: u16 = 2;
 
 /// Default broadcast channel capacity.
 ///
@@ -98,6 +91,37 @@ pub mod pty_index {
     pub const CLI: usize = 0;
     /// Server PTY index (dev server process).
     pub const SERVER: usize = 1;
+}
+
+/// Event listener that routes alacritty terminal events to the PTY broadcast channel.
+///
+/// Installed on hub-side shadow screens so that title changes detected by the
+/// alacritty parser are automatically broadcast as [`PtyEvent::TitleChanged`].
+#[derive(Clone)]
+pub struct HubEventListener {
+    /// Broadcast sender for PTY events.
+    event_tx: broadcast::Sender<PtyEvent>,
+}
+
+impl HubEventListener {
+    /// Create a new listener that routes events to the given broadcast channel.
+    pub fn new(event_tx: broadcast::Sender<PtyEvent>) -> Self {
+        Self { event_tx }
+    }
+}
+
+impl EventListener for HubEventListener {
+    fn send_event(&self, event: Event) {
+        if let Event::Title(title) = event {
+            let _ = self.event_tx.send(PtyEvent::title_changed(title));
+        }
+    }
+}
+
+impl std::fmt::Debug for HubEventListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubEventListener").finish()
+    }
 }
 
 /// Shared mutable state for PTY command processing.
@@ -139,7 +163,7 @@ impl std::fmt::Debug for SharedPtyState {
 ///
 /// Each PTY session manages:
 /// - A pseudo-terminal for process I/O
-/// - A shadow terminal (`vt100::Parser`) for clean ANSI snapshots on reconnect
+/// - A shadow terminal (`AlacrittyParser<HubEventListener>`) for clean ANSI snapshots on reconnect
 /// - A broadcast channel for event distribution to clients
 /// - An optional port for HTTP forwarding (used by server PTY for dev server preview)
 ///
@@ -189,9 +213,9 @@ pub struct PtySession {
     /// Shadow terminal for clean ANSI snapshots on reconnect.
     ///
     /// Receives the same PTY bytes as live subscribers. On connect,
-    /// `contents_formatted()` produces clean ANSI output with correct
-    /// cursor position — no escape sequence garbling from raw replay.
-    pub shadow_screen: Arc<Mutex<vt100::Parser>>,
+    /// [`generate_ansi_snapshot`](crate::terminal::generate_ansi_snapshot)
+    /// produces clean ANSI output with correct cursor and SGR state.
+    pub shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
 
     /// Broadcast sender for PTY events.
     ///
@@ -283,13 +307,14 @@ impl PtySession {
             last_human_input_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         };
 
+        let listener = HubEventListener::new(event_tx.clone());
         Self {
             shared_state: Arc::new(Mutex::new(shared_state)),
             reader_thread: None,
             command_processor_handle: None,
             child: None,
             shadow_screen: Arc::new(Mutex::new(
-                vt100::Parser::new(rows.max(MIN_PARSER_ROWS), cols, SHADOW_SCROLLBACK_LINES),
+                AlacrittyParser::new_with_listener(rows, cols, DEFAULT_SCROLLBACK_LINES, listener),
             )),
             event_tx,
             command_tx,
@@ -444,17 +469,9 @@ impl PtySession {
         self.set_child(child);
         self.set_writer(pair.master.take_writer()?);
 
-        // Start unified reader thread
-        let reader = pair.master.try_clone_reader()?;
-        self.reader_thread = Some(spawn::spawn_reader_thread(
-            reader,
-            Arc::clone(&self.shadow_screen),
-            self.event_sender(),
-            config.detect_notifications,
-            Arc::clone(&self.kitty_enabled),
-            Arc::clone(&self.resize_pending),
-        ));
-
+        // The broker is the sole reader of the PTY master FD.
+        // Output reaches the Hub via BrokerPtyOutput → feed_broker_output.
+        // No Hub-side reader thread is started here.
         self.set_master_pty(pair.master);
 
         // Start command processor task
@@ -514,7 +531,7 @@ impl PtySession {
         &self,
     ) -> (
         Arc<Mutex<SharedPtyState>>,
-        Arc<Mutex<vt100::Parser>>,
+        Arc<Mutex<AlacrittyParser<HubEventListener>>>,
         broadcast::Sender<PtyEvent>,
         Arc<AtomicBool>,
         Arc<AtomicBool>,
@@ -685,13 +702,41 @@ impl PtySession {
     ///
     /// This is automatically called on drop, but can be called manually
     /// for explicit cleanup.
+    ///
+    /// # macOS PTY session leader behavior
+    ///
+    /// On macOS, bash is the PTY session leader (it opened the slave as its
+    /// controlling terminal via `setsid()` + `TIOCSCTTY`). When the session
+    /// leader dies, macOS will not finalize the session — and therefore will
+    /// not report the zombie to `waitpid` — until all master-side PTY FDs are
+    /// released. Both `master_pty` and `writer` hold independent `dup`'d FDs
+    /// to the master, so both must be dropped before calling `wait()`.
+    ///
+    /// The reader thread's clone (`try_clone_reader`) is a third reference,
+    /// but that thread exits on its own: once the slave FD closes (immediately
+    /// on the child's death), `read()` on the master returns `EIO`, the thread
+    /// exits its loop, and the clone is dropped.
     pub fn kill_child(&mut self) {
         if let Some(mut child) = self.child.take() {
             log::info!("Killing PTY child process");
             if let Err(e) = child.kill() {
                 log::warn!("Failed to kill PTY child: {e}");
             }
-            // Wait for process to exit to prevent zombies
+
+            // Release both master-PTY FD references before waiting.
+            // See doc-comment above for why this is required on macOS.
+            {
+                let mut state = self
+                    .shared_state
+                    .lock()
+                    .expect("shared_state lock poisoned");
+                drop(state.master_pty.take());
+                drop(state.writer.take());
+            }
+
+            // Wait for process to exit to prevent zombies.
+            // With master FDs released, macOS can finalize the PTY session
+            // and report the exit status immediately.
             let _ = child.wait();
         }
     }
@@ -706,17 +751,16 @@ impl PtySession {
     /// cursor tracking — especially visible on Linux.
     pub fn resize(&self, rows: u16, cols: u16) {
         // 1. Shadow screen first — ready for new-size output.
-        // Clamp rows to MIN_PARSER_ROWS to avoid vt100 0.16.2 col_wrap
-        // panic: a 1-row grid causes `prev_pos.row -= scrolled` to
-        // underflow in Grid::col_wrap (grid.rs:683).
         let old_dims = {
             let mut parser = self
                 .shadow_screen
                 .lock()
                 .expect("shadow_screen lock poisoned");
-            let screen = parser.screen_mut();
-            let old = screen.size();
-            screen.set_size(rows.max(MIN_PARSER_ROWS), cols);
+            let old = (
+                parser.term().grid().screen_lines() as u16,
+                parser.term().grid().columns() as u16,
+            );
+            parser.resize(rows, cols);
             old
         };
 
@@ -742,7 +786,7 @@ impl PtySession {
                         .shadow_screen
                         .lock()
                         .expect("shadow_screen lock poisoned");
-                    parser.screen_mut().set_size(old_dims.0.max(MIN_PARSER_ROWS), old_dims.1);
+                    parser.resize(old_dims.0, old_dims.1);
                     state.dimensions = (old_dims.0, old_dims.1);
                     return;
                 }
@@ -785,22 +829,24 @@ impl PtySession {
 
     /// Get a clean ANSI snapshot of the current terminal state.
     ///
-    /// Locks the shadow screen and delegates to [`snapshot_with_scrollback`].
+    /// Locks the shadow screen and delegates to
+    /// [`generate_ansi_snapshot`](crate::terminal::generate_ansi_snapshot).
     /// Appends the kitty keyboard push sequence when the inner PTY has
     /// activated kitty mode, so connecting terminals enter kitty mode.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
-        let mut parser = self
+        let parser = self
             .shadow_screen
             .lock()
             .expect("shadow_screen lock poisoned");
         let skip_visible = self.resize_pending.swap(false, Ordering::AcqRel);
-        let mut snapshot = snapshot_with_scrollback(parser.screen_mut(), skip_visible);
+        let mut snapshot = crate::terminal::generate_ansi_snapshot(&*parser, skip_visible);
 
         // Restore kitty keyboard protocol state in the snapshot.
-        // The vt100 shadow screen doesn't track kitty mode, so we append
-        // the push sequence from our own tracking of the raw PTY output.
-        if self.kitty_enabled.load(Ordering::Relaxed) {
+        // alacritty tracks kitty mode internally, but the snapshot function
+        // doesn't emit the push sequence — append it so connecting terminals
+        // enter kitty mode.
+        if parser.kitty_enabled() {
             // CSI > 1 u = push kitty keyboard with DISAMBIGUATE_ESCAPE_CODES flag.
             snapshot.extend(b"\x1b[>1u");
         }
@@ -885,7 +931,7 @@ pub(crate) fn do_resize(
     rows: u16,
     cols: u16,
     shared_state: &Arc<Mutex<SharedPtyState>>,
-    shadow_screen: &Arc<Mutex<vt100::Parser>>,
+    shadow_screen: &Arc<Mutex<AlacrittyParser<HubEventListener>>>,
     event_tx: &broadcast::Sender<PtyEvent>,
     resize_pending: &Arc<AtomicBool>,
 ) {
@@ -894,9 +940,11 @@ pub(crate) fn do_resize(
         let mut parser = shadow_screen
             .lock()
             .expect("shadow_screen lock poisoned");
-        let screen = parser.screen_mut();
-        let old = screen.size();
-        screen.set_size(rows.max(MIN_PARSER_ROWS), cols);
+        let old = (
+            parser.term().grid().screen_lines() as u16,
+            parser.term().grid().columns() as u16,
+        );
+        parser.resize(rows, cols);
         old
     };
 
@@ -918,7 +966,7 @@ pub(crate) fn do_resize(
                 let mut parser = shadow_screen
                     .lock()
                     .expect("shadow_screen lock poisoned");
-                parser.screen_mut().set_size(old_dims.0.max(MIN_PARSER_ROWS), old_dims.1);
+                parser.resize(old_dims.0, old_dims.1);
                 state.dimensions = (old_dims.0, old_dims.1);
                 return;
             }
@@ -928,8 +976,7 @@ pub(crate) fn do_resize(
     // Only mark resize_pending when dimensions actually changed.
     // Same-size "resizes" (e.g. browser reconnect at same dimensions)
     // don't invalidate the visible screen content.
-    let effective_rows = rows.max(MIN_PARSER_ROWS);
-    if (effective_rows, cols) != (old_dims.0.max(MIN_PARSER_ROWS), old_dims.1) {
+    if (rows, cols) != (old_dims.0, old_dims.1) {
         resize_pending.store(true, Ordering::Release);
     }
 
@@ -937,118 +984,6 @@ pub(crate) fn do_resize(
     let _ = event_tx.send(PtyEvent::resized(rows, cols));
 }
 
-/// Build a clean ANSI snapshot from a vt100 screen.
-///
-/// Returns the visible screen contents as formatted ANSI escape sequences
-/// with the cursor positioned correctly. Used for browser connect/reconnect
-/// instead of replaying raw byte history.
-///
-/// The snapshot includes:
-/// - Terminal state reset (clear screen, reset attributes)
-/// - Visible screen contents with correct colors/attributes
-/// - Cursor positioned where the PTY left it
-#[must_use]
-pub fn snapshot_from_screen(screen: &vt100::Screen) -> Vec<u8> {
-    let mut output = Vec::new();
-    // Reset terminal state and clear screen
-    output.extend(b"\x1b[H\x1b[2J\x1b[0m");
-    // Emit visible screen with ANSI attributes (colors, bold, etc.)
-    output.extend(screen.contents_formatted());
-    // Position cursor where the PTY left it
-    let (row, col) = screen.cursor_position();
-    output.extend(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
-    output
-}
-
-/// Produces a snapshot that includes scrollback history plus the visible screen.
-///
-/// Scrollback rows are emitted as ANSI-formatted text (oldest first) so they
-/// flow through ghostty's VT core and naturally land in its scrollback buffer.
-/// After all history is sent, the screen is cleared and the visible state is
-/// rendered with precise cursor positioning.
-///
-/// Falls back to [`snapshot_from_screen`] when no scrollback exists.
-///
-/// When `skip_visible` is true (resize just happened, app hasn't redrawn),
-/// Phase 2 clears the screen instead of drawing stale `contents_formatted()`.
-/// The live forwarder will carry the application's actual redraw output.
-#[must_use]
-pub fn snapshot_with_scrollback(screen: &mut vt100::Screen, skip_visible: bool) -> Vec<u8> {
-    let saved_offset = screen.scrollback();
-
-    // Discover how many scrollback lines the shadow terminal has accumulated.
-    screen.set_scrollback(usize::MAX);
-    let total_scrollback = screen.scrollback();
-    screen.set_scrollback(saved_offset);
-
-    if total_scrollback == 0 {
-        if skip_visible {
-            // No scrollback and stale visible content — just clear.
-            return b"\x1b[H\x1b[2J\x1b[0m".to_vec();
-        }
-        return snapshot_from_screen(screen);
-    }
-
-    let rows = screen.size().0 as usize;
-    let cols = screen.size().1;
-    // Pre-allocate: ~120 bytes per scrollback line is a reasonable estimate.
-    let mut output = Vec::with_capacity(total_scrollback * 120);
-
-    // Phase 1: Emit scrollback history (oldest → newest).
-    //
-    // At scrollback offset N, `visible_rows()` shows the last N rows of the
-    // scrollback buffer followed by screen rows. We step through in
-    // screen-height chunks from the top of history, emitting only the
-    // scrollback portion of each view.
-    output.extend(b"\x1b[0m");
-
-    let mut remaining = total_scrollback;
-    while remaining > 0 {
-        screen.set_scrollback(remaining);
-        let scrollback_rows_in_view = remaining.min(rows);
-
-        for (i, row_bytes) in screen.rows_formatted(0, cols).enumerate() {
-            if i >= scrollback_rows_in_view {
-                break;
-            }
-            output.extend(&row_bytes);
-            output.extend(b"\r\n");
-        }
-
-        remaining = remaining.saturating_sub(rows);
-    }
-
-    // Phase 2 always emits the live screen (contents_formatted), so the viewport
-    // must be at 0 when we read cursor_position() — not saved_offset, which could
-    // be non-zero and would return cursor coordinates relative to a scrolled view.
-    screen.set_scrollback(0);
-
-    // Phase 2: Visible screen with full ANSI formatting and cursor position.
-    //
-    // After Phase 1, the last `rows`-worth of scrollback lines are sitting on
-    // the receiving parser's visible screen. \x1b[2J would erase them without
-    // pushing to scrollback, losing those lines. Instead, scroll them off the
-    // top so they land in the scrollback buffer, then draw the live screen.
-    output.extend(format!("\x1b[{};1H", rows).as_bytes());
-    for _ in 0..rows {
-        output.push(b'\n');
-    }
-    output.extend(b"\x1b[H\x1b[0m");
-
-    if skip_visible {
-        // Resize just happened — the shadow screen's visible content is the
-        // old layout reflowed to new dimensions (stale). Clear the screen and
-        // let the application's SIGWINCH-triggered redraw arrive via the live
-        // forwarder instead.
-        output.extend(b"\x1b[2J\x1b[H");
-    } else {
-        output.extend(screen.contents_formatted());
-        let (row, col) = screen.cursor_position();
-        output.extend(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
-    }
-
-    output
-}
 
 #[cfg(test)]
 mod tests {
@@ -1104,8 +1039,8 @@ mod tests {
         // Snapshot should contain the text and ANSI reset/cursor sequences
         let snapshot_str = String::from_utf8_lossy(&snapshot);
         assert!(snapshot_str.contains("hello world"));
-        // Should start with reset sequence
-        assert!(snapshot_str.starts_with("\x1b[H\x1b[2J\x1b[0m"));
+        // generate_ansi_snapshot() preamble: ESC[0m (reset) then ESC[H (home)
+        assert!(snapshot_str.starts_with("\x1b[0m\x1b[H"));
     }
 
     #[test]
@@ -1132,14 +1067,14 @@ mod tests {
     fn test_snapshot_includes_kitty_push_when_enabled() {
         let session = PtySession::new(24, 80);
 
-        session
-            .shadow_screen
-            .lock()
-            .unwrap()
-            .process(b"hello");
-
-        // Simulate reader thread detecting kitty push
-        session.kitty_enabled.store(true, Ordering::Relaxed);
+        // Feed hello text then a kitty push sequence.
+        // The push sequence sets TermMode::KITTY_KEYBOARD_PROTOCOL which
+        // get_snapshot() reads via parser.kitty_enabled() — not the external AtomicBool.
+        {
+            let mut p = session.shadow_screen.lock().unwrap();
+            p.process(b"hello");
+            p.process(b"\x1b[>1u"); // CSI > 1 u — kitty push (DISAMBIGUATE_ESC_CODES)
+        }
 
         let snapshot = session.get_snapshot();
         let snapshot_str = String::from_utf8_lossy(&snapshot);
@@ -1174,9 +1109,12 @@ mod tests {
     fn test_snapshot_excludes_kitty_after_pop() {
         let session = PtySession::new(24, 80);
 
-        // Push then pop
-        session.kitty_enabled.store(true, Ordering::Relaxed);
-        session.kitty_enabled.store(false, Ordering::Relaxed);
+        // Feed push then pop — TermMode ends with kitty disabled.
+        {
+            let mut p = session.shadow_screen.lock().unwrap();
+            p.process(b"\x1b[>1u"); // push
+            p.process(b"\x1b[<u");  // pop
+        }
 
         let snapshot = session.get_snapshot();
 

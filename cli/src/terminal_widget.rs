@@ -1,17 +1,30 @@
-//! Terminal widget for rendering vt100 screens to ratatui
+//! Terminal widget for rendering alacritty grid state to ratatui.
 //!
-//! This module provides a simple, testable widget that renders a vt100::Screen
-//! to a ratatui buffer. It replaces tui-term with a minimal implementation
-//! that works with vt100 0.16+ (which has working scrollback).
+//! This module provides a simple, testable widget that renders an alacritty
+//! `Term` to a ratatui buffer. Cell colors and flags are mapped through
+//! [`to_ratatui_color`] and alacritty's [`Flags`] bitfield.
+//!
+//! Scroll offset is passed as a parameter — the widget indexes into the
+//! grid's history lines directly via negative `Line` indices, avoiding
+//! any mutable state on `Term` during rendering.
+
+// Rust guideline compliant 2026-02
+
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::Term;
 
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     widgets::{Block, Widget},
 };
 
-/// Configuration for cursor rendering
+use crate::terminal::{to_ratatui_color, NoopListener};
+
+/// Configuration for cursor rendering.
 #[derive(Debug, Clone)]
 pub struct CursorConfig {
     /// Whether to display the cursor.
@@ -26,16 +39,17 @@ impl Default for CursorConfig {
     fn default() -> Self {
         Self {
             show: true,
-            symbol: "█".to_string(),
+            symbol: "\u{2588}".to_string(),
             // Use REVERSED to invert terminal colors instead of hardcoding
             style: Style::default().add_modifier(Modifier::REVERSED),
         }
     }
 }
 
-/// A widget that renders a vt100::Screen to a ratatui buffer
+/// A widget that renders an alacritty `Term` to a ratatui buffer.
 pub struct TerminalWidget<'a> {
-    screen: &'a vt100::Screen,
+    term: &'a Term<NoopListener>,
+    scroll_offset: usize,
     block: Option<Block<'a>>,
     cursor: CursorConfig,
 }
@@ -44,34 +58,39 @@ impl std::fmt::Debug for TerminalWidget<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TerminalWidget")
             .field("cursor", &self.cursor)
+            .field("scroll_offset", &self.scroll_offset)
             .field("has_block", &self.block.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl<'a> TerminalWidget<'a> {
-    /// Create a new terminal widget from a vt100 screen
-    pub fn new(screen: &'a vt100::Screen) -> Self {
+    /// Create a new terminal widget from an alacritty `Term`.
+    ///
+    /// `scroll_offset` is the number of lines scrolled up from the bottom
+    /// (0 = live view, N = N lines into history).
+    pub fn new(term: &'a Term<NoopListener>, scroll_offset: usize) -> Self {
         Self {
-            screen,
+            term,
+            scroll_offset,
             block: None,
             cursor: CursorConfig::default(),
         }
     }
 
-    /// Set the block (border/title) for the widget
+    /// Set the block (border/title) for the widget.
     pub fn block(mut self, block: Block<'a>) -> Self {
         self.block = Some(block);
         self
     }
 
-    /// Configure cursor rendering
+    /// Configure cursor rendering.
     pub fn cursor(mut self, cursor: CursorConfig) -> Self {
         self.cursor = cursor;
         self
     }
 
-    /// Hide the cursor
+    /// Hide the cursor.
     pub fn hide_cursor(mut self) -> Self {
         self.cursor.show = false;
         self
@@ -90,155 +109,173 @@ impl Widget for TerminalWidget<'_> {
         };
 
         // Render screen cells
-        render_screen(self.screen, inner_area, buf);
+        render_grid(self.term, self.scroll_offset, inner_area, buf);
 
-        // Render cursor
-        if self.cursor.show && !self.screen.hide_cursor() {
-            render_cursor(self.screen, inner_area, buf, &self.cursor);
+        // Render cursor (only when at live view — no cursor when scrolled)
+        if self.cursor.show && self.scroll_offset == 0 {
+            render_cursor(self.term, inner_area, buf, &self.cursor);
         }
     }
 }
 
-/// Render vt100 screen cells to ratatui buffer
-fn render_screen(screen: &vt100::Screen, area: Rect, buf: &mut Buffer) {
+/// Render alacritty grid cells to ratatui buffer.
+///
+/// When `scroll_offset > 0`, we render history lines. Line indices work as:
+/// - `Line(0)` to `Line(screen_lines - 1)` = viewport
+/// - `Line(-1)` = most recent history line
+/// - `Line(-history_size)` = oldest history line
+///
+/// With scroll_offset N, the top of the rendered area shows the line that
+/// is N lines above the top of the viewport.
+fn render_grid(
+    term: &Term<NoopListener>,
+    scroll_offset: usize,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let grid = term.grid();
+
     for row in 0..area.height {
+        // Calculate the grid line index for this display row.
+        // At scroll_offset=0: row 0 maps to Line(0) (top of viewport).
+        // At scroll_offset=N: row 0 maps to Line(-N) (N lines into history).
+        let line_idx = row as i32 - scroll_offset as i32;
+        let line = Line(line_idx);
+
+        // Bounds check: don't index beyond available history or below viewport.
+        let history = grid.history_size() as i32;
+        if line_idx < -history || line_idx >= grid.screen_lines() as i32 {
+            continue;
+        }
+
         for col in 0..area.width {
-            if let Some(cell) = screen.cell(row, col) {
-                // Skip continuation cells — the wide char was already rendered
-                // by its first cell via set_symbol (which handles multi-width).
-                if cell.is_wide_continuation() {
-                    continue;
-                }
+            if (col as usize) >= grid.columns() {
+                break;
+            }
 
-                let buf_x = area.x + col;
-                let buf_y = area.y + row;
+            let cell = &grid[Point::new(line, Column(col as usize))];
 
-                if buf_x < area.x + area.width && buf_y < area.y + area.height {
-                    let buf_cell = &mut buf[(buf_x, buf_y)];
-                    apply_cell(cell, buf_cell);
-                }
+            // Skip wide-char spacer — the base wide char was already rendered
+            // by the preceding cell via set_symbol (which handles multi-width).
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+
+            let buf_x = area.x + col;
+            let buf_y = area.y + row;
+
+            if buf_x < area.x + area.width && buf_y < area.y + area.height {
+                let buf_cell = &mut buf[(buf_x, buf_y)];
+                apply_cell(cell, buf_cell);
             }
         }
     }
 }
 
-/// Render cursor at current position
+/// Render cursor at current position.
 fn render_cursor(
-    screen: &vt100::Screen,
+    term: &Term<NoopListener>,
     area: Rect,
     buf: &mut Buffer,
     cursor_config: &CursorConfig,
 ) {
-    let (cursor_row, cursor_col) = screen.cursor_position();
+    let cursor_point = term.grid().cursor.point;
+    let cursor_col = cursor_point.column.0 as u16;
+    let cursor_row = cursor_point.line.0 as u16;
 
     let buf_x = area.x + cursor_col;
     let buf_y = area.y + cursor_row;
 
     if buf_x < area.x + area.width && buf_y < area.y + area.height {
         let buf_cell = &mut buf[(buf_x, buf_y)];
+        let grid = term.grid();
+        let cell = &grid[cursor_point];
 
-        // If cell has content, just style it; otherwise show cursor symbol
-        if let Some(cell) = screen.cell(cursor_row, cursor_col) {
-            if cell.has_contents() {
-                buf_cell.set_style(cursor_config.style.add_modifier(Modifier::REVERSED));
-            } else {
-                buf_cell.set_symbol(&cursor_config.symbol);
-                buf_cell.set_style(cursor_config.style);
-            }
+        if cell.c != ' ' && cell.c != '\0' {
+            buf_cell.set_style(cursor_config.style.add_modifier(Modifier::REVERSED));
+        } else {
+            buf_cell.set_symbol(&cursor_config.symbol);
+            buf_cell.set_style(cursor_config.style);
         }
     }
 }
 
-/// Apply vt100 cell properties to ratatui buffer cell
-fn apply_cell(vt_cell: &vt100::Cell, buf_cell: &mut ratatui::buffer::Cell) {
-    // Set content
-    if vt_cell.has_contents() {
-        buf_cell.set_symbol(vt_cell.contents());
+/// Apply alacritty cell properties to ratatui buffer cell.
+fn apply_cell(
+    cell: &alacritty_terminal::term::cell::Cell,
+    buf_cell: &mut ratatui::buffer::Cell,
+) {
+    // Set content — alacritty stores a single char + optional zerowidth extras.
+    if cell.c != ' ' && cell.c != '\0' {
+        let mut s = String::with_capacity(4);
+        s.push(cell.c);
+        if let Some(zw) = cell.zerowidth() {
+            for &c in zw {
+                s.push(c);
+            }
+        }
+        buf_cell.set_symbol(&s);
     }
 
-    // Build style from vt100 cell attributes
+    // Build style from alacritty cell attributes.
     let mut style = Style::default();
 
-    // Foreground color
-    style = style.fg(convert_color(vt_cell.fgcolor()));
+    style = style.fg(to_ratatui_color(cell.fg));
+    style = style.bg(to_ratatui_color(cell.bg));
 
-    // Background color
-    style = style.bg(convert_color(vt_cell.bgcolor()));
-
-    // Text modifiers
-    if vt_cell.bold() {
+    if cell.flags.contains(Flags::BOLD) {
         style = style.add_modifier(Modifier::BOLD);
     }
-    if vt_cell.italic() {
+    if cell.flags.contains(Flags::ITALIC) {
         style = style.add_modifier(Modifier::ITALIC);
     }
-    if vt_cell.underline() {
+    if cell.flags.contains(Flags::UNDERLINE) {
         style = style.add_modifier(Modifier::UNDERLINED);
     }
-    if vt_cell.inverse() {
+    if cell.flags.contains(Flags::INVERSE) {
         style = style.add_modifier(Modifier::REVERSED);
     }
-    if vt_cell.dim() {
+    if cell.flags.contains(Flags::DIM) {
         style = style.add_modifier(Modifier::DIM);
+    }
+    if cell.flags.contains(Flags::HIDDEN) {
+        style = style.add_modifier(Modifier::HIDDEN);
+    }
+    if cell.flags.contains(Flags::STRIKEOUT) {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
     }
 
     buf_cell.set_style(style);
 }
 
-/// Convert vt100 color to ratatui color
-fn convert_color(color: vt100::Color) -> Color {
-    match color {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(i) => Color::Indexed(i),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::AlacrittyParser;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
     use ratatui::Terminal;
 
     #[test]
     fn test_terminal_widget_creation() {
-        let parser = vt100::Parser::new(24, 80, 1000);
-        let widget = TerminalWidget::new(parser.screen());
+        let parser = AlacrittyParser::new_noop(24, 80, 1000);
+        let widget = TerminalWidget::new(parser.term(), 0);
         assert!(widget.cursor.show);
     }
 
     #[test]
     fn test_terminal_widget_hide_cursor() {
-        let parser = vt100::Parser::new(24, 80, 1000);
-        let widget = TerminalWidget::new(parser.screen()).hide_cursor();
+        let parser = AlacrittyParser::new_noop(24, 80, 1000);
+        let widget = TerminalWidget::new(parser.term(), 0).hide_cursor();
         assert!(!widget.cursor.show);
     }
 
     #[test]
     fn test_terminal_widget_with_block() {
-        let parser = vt100::Parser::new(24, 80, 1000);
+        let parser = AlacrittyParser::new_noop(24, 80, 1000);
         let block = Block::default().title("Test");
-        let widget = TerminalWidget::new(parser.screen()).block(block);
+        let widget = TerminalWidget::new(parser.term(), 0).block(block);
         assert!(widget.block.is_some());
-    }
-
-    #[test]
-    fn test_convert_color_default() {
-        assert_eq!(convert_color(vt100::Color::Default), Color::Reset);
-    }
-
-    #[test]
-    fn test_convert_color_indexed() {
-        assert_eq!(convert_color(vt100::Color::Idx(1)), Color::Indexed(1));
-        assert_eq!(convert_color(vt100::Color::Idx(255)), Color::Indexed(255));
-    }
-
-    #[test]
-    fn test_convert_color_rgb() {
-        assert_eq!(
-            convert_color(vt100::Color::Rgb(255, 128, 64)),
-            Color::Rgb(255, 128, 64)
-        );
     }
 
     #[test]
@@ -246,11 +283,11 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let parser = vt100::Parser::new(24, 80, 1000);
+        let parser = AlacrittyParser::new_noop(24, 80, 1000);
 
         terminal
             .draw(|f| {
-                let widget = TerminalWidget::new(parser.screen());
+                let widget = TerminalWidget::new(parser.term(), 0);
                 f.render_widget(widget, f.area());
             })
             .unwrap();
@@ -263,12 +300,12 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut parser = vt100::Parser::new(24, 80, 1000);
+        let mut parser = AlacrittyParser::new_noop(24, 80, 1000);
         parser.process(b"Hello, World!");
 
         terminal
             .draw(|f| {
-                let widget = TerminalWidget::new(parser.screen());
+                let widget = TerminalWidget::new(parser.term(), 0);
                 f.render_widget(widget, f.area());
             })
             .unwrap();
@@ -285,19 +322,19 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut parser = vt100::Parser::new(24, 80, 1000);
+        let mut parser = AlacrittyParser::new_noop(24, 80, 1000);
         // Red foreground: ESC[31m
         parser.process(b"\x1b[31mRed Text\x1b[0m");
 
         terminal
             .draw(|f| {
-                let widget = TerminalWidget::new(parser.screen());
+                let widget = TerminalWidget::new(parser.term(), 0);
                 f.render_widget(widget, f.area());
             })
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        // Index 1 is red in standard 16-color palette
+        // Named red maps to Indexed(1) via to_ratatui_color
         assert_eq!(buffer[(0, 0)].fg, Color::Indexed(1));
     }
 
@@ -306,13 +343,13 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut parser = vt100::Parser::new(24, 80, 1000);
+        let mut parser = AlacrittyParser::new_noop(24, 80, 1000);
         // Bold: ESC[1m
         parser.process(b"\x1b[1mBold\x1b[0m");
 
         terminal
             .draw(|f| {
-                let widget = TerminalWidget::new(parser.screen());
+                let widget = TerminalWidget::new(parser.term(), 0);
                 f.render_widget(widget, f.area());
             })
             .unwrap();
@@ -323,56 +360,47 @@ mod tests {
 
     #[test]
     fn test_scrollback_does_not_panic() {
-        // This is the key test - vt100 0.15 would panic here
-        let mut parser = vt100::Parser::new(24, 80, 1000);
+        let mut parser = AlacrittyParser::new_noop(24, 80, 1000);
 
         // Fill screen and scrollback with content
         for i in 0..100 {
             parser.process(format!("Line {}\r\n", i).as_bytes());
         }
 
-        // Scroll back beyond screen height - this would panic in vt100 0.15
-        // In vt100 0.16, set_scrollback is on Screen
-        parser.screen_mut().set_scrollback(50);
-
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
+        // Render with scroll offset into history
         terminal
             .draw(|f| {
-                let widget = TerminalWidget::new(parser.screen());
+                let widget = TerminalWidget::new(parser.term(), 50);
                 f.render_widget(widget, f.area());
             })
             .unwrap();
 
-        // Should not panic!
+        // Should not panic
     }
 
     #[test]
     fn test_scrollback_shows_history() {
-        let mut parser = vt100::Parser::new(24, 80, 1000);
+        let mut parser = AlacrittyParser::new_noop(24, 80, 1000);
 
         // Add numbered lines
         for i in 0..50 {
             parser.process(format!("Line {:02}\r\n", i).as_bytes());
         }
 
-        // At offset 0, we should see the latest lines
-        assert_eq!(parser.screen().scrollback(), 0);
-
-        // Scroll back (in vt100 0.16, set_scrollback is on Screen)
-        parser.screen_mut().set_scrollback(20);
-        assert_eq!(parser.screen().scrollback(), 20);
-
-        // Screen should now show earlier content
+        // Render with scroll offset
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
             .draw(|f| {
-                let widget = TerminalWidget::new(parser.screen());
+                let widget = TerminalWidget::new(parser.term(), 20);
                 f.render_widget(widget, f.area());
             })
             .unwrap();
+
+        // Should not panic — content correctness tested at integration level
     }
 }

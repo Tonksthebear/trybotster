@@ -492,8 +492,8 @@ pub(crate) fn register(
     // hub.get_pty_snapshot_from_broker(session_id) → string | nil
     //
     // Fetches the scrollback ring buffer for a broker-held session. Lua calls
-    // this on Hub restart to replay bytes into a fresh vt100::Parser so the
-    // shadow screen is reconstructed before setting up forwarders.
+    // this on Hub restart to replay bytes into a fresh AlacrittyParser shadow
+    // screen so state is reconstructed before setting up forwarders.
     //
     // Returns the raw byte string on success, or nil if the broker is not
     // connected or the fetch fails.
@@ -546,8 +546,8 @@ pub(crate) fn register(
     //   → PtySessionHandle userdata
     //
     // Creates a shadow-screen-only PTY handle for Hub restart recovery.
-    // No real PTY process is spawned — only the vt100 parser and broadcast
-    // channel are initialised with the given dimensions.
+    // No real PTY process is spawned — only the AlacrittyParser shadow screen
+    // and broadcast channel are initialised with the given dimensions.
     //
     // Also fires HubEvent::BrokerSessionRegistered so the Hub's
     // broker_sessions routing table maps session_id → (agent_key, pty_index).

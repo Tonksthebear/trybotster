@@ -19,7 +19,7 @@
 //! Hub disconnects → broker starts reconnect_timeout countdown
 //! Hub reconnects  → Hub sends GetSnapshot(session_id) per session
 //!                   Broker sends raw ring-buffer bytes in Snapshot frame
-//!                   Hub replays into fresh vt100::Parser
+//!                   Hub replays into fresh AlacrittyParser shadow screen
 //!
 //! Timeout expires → broker kills children and exits
 //! KillAll command → broker kills children and exits immediately
@@ -50,7 +50,10 @@ pub mod connection;
 pub mod protocol;
 pub mod ring_buffer;
 
-pub(crate) use connection::{start_output_forwarder, BrokerConnection, SharedBrokerConnection};
+#[cfg(test)]
+mod integration_test_full;
+
+pub(crate) use connection::{BrokerConnection, SharedBrokerConnection};
 
 use ring_buffer::RingBuffer;
 
@@ -342,6 +345,12 @@ fn handle_connection(
     let writer = thread::spawn(move || {
         let mut ws = write_stream;
         for frame in output_rx {
+            // An empty sentinel frame signals that the Hub has disconnected
+            // and the writer should exit.  Real PtyOutput / control frames
+            // are always non-empty (they have at minimum a 5-byte header).
+            if frame.is_empty() {
+                break;
+            }
             if ws.write_all(&frame).is_err() {
                 break;
             }
@@ -444,7 +453,20 @@ fn handle_connection(
         }
     }
 
-    // Hub disconnected — drop the output channel to stop the writer.
+    // Hub disconnected — wake the writer thread so it exits.
+    //
+    // After the main loop exits, `output_tx` is dropped here.  Normally the
+    // writer's `for frame in output_rx` loop ends when ALL senders are gone.
+    // But reader_loop threads for live sessions still hold their own clones of
+    // `output_tx`; those threads may be blocked on `file.read()` and will not
+    // drop their clone until the session ends.  If we simply drop and join, the
+    // writer blocks forever — holding up `handle_connection` and preventing the
+    // broker from entering `wait_for_reconnect`.
+    //
+    // Fix: send an empty sentinel frame before dropping.  The writer thread
+    // breaks on the first empty frame (a zero-length `Vec` is never a valid
+    // encoded frame, so this cannot be confused with real PTY output).
+    let _ = output_tx.try_send(vec![]); // sentinel: signals writer to exit
     drop(output_tx);
     let _ = writer.join();
 

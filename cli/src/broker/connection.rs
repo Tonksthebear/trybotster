@@ -14,6 +14,7 @@
 //!                                             │   └── spawn broker subprocess
 //!                                             ▼
 //!                                     set_timeout(120)
+//!                                     install_forwarder(event_tx)
 //!
 //! PTY spawn ──register_pty(key, idx, pid, rows, cols, fd)──► BrokerMessage::Registered
 //!
@@ -21,12 +22,26 @@
 //! Hub shutdown  (clean)  ──kill_all()──────────────► broker kills children + exits
 //! ```
 //!
+//! # Single-reader architecture
+//!
+//! After `install_forwarder()` is called, all socket reads are owned by a
+//! dedicated demux thread. The thread routes frames to two destinations:
+//!
+//! - `PtyOutput` / `PtyExited` → `HubEvent` channel (async event loop)
+//! - Control responses (`Registered`, `Snapshot`, `Ack`, `Pong`) → internal
+//!   `mpsc` channel consumed by `read_response()`
+//!
+//! This eliminates the race condition that existed when `try_clone_stream()`
+//! was used: two readers sharing the same kernel socket receive buffer meant
+//! that `Registered` frames could be consumed by the forwarder thread before
+//! `read_response()` could see them, causing silent registration failure.
+//!
 //! # Relay mode after restart
 //!
 //! When the Hub reconnects after a restart it no longer holds the master PTY
 //! FDs. The broker continues reading the PTYs and forwards output via
-//! `PtyOutput` frames. The Hub feeds those bytes into a fresh `vt100::Parser`
-//! to reconstruct the shadow screen, and routes PTY input back via `PtyInput`
+//! `PtyOutput` frames. The Hub feeds those bytes into an `AlacrittyParser`
+//! shadow screen to reconstruct terminal state, and routes PTY input back via `PtyInput`
 //! frames until the agent processes terminate.
 //!
 //! The initial reconnect always calls `get_snapshot()` per session to obtain
@@ -39,6 +54,7 @@ use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -58,20 +74,46 @@ pub type SharedBrokerConnection = Arc<Mutex<Option<BrokerConnection>>>;
 /// Hub-side connection to the PTY broker process.
 ///
 /// Wraps a `UnixStream` and provides typed methods for the broker protocol.
-/// Operates in **blocking mode** with a short read timeout — suitable for
-/// synchronous request/response flows (registration, snapshot, control).
 ///
-/// Broker-initiated frames (`PtyOutput`, `PtyExited`) are delivered via a
-/// background reader thread started by [`BrokerConnection::start_output_forwarder`].
+/// # Reading model
+///
+/// Before [`install_forwarder`] is called, `read_response()` reads directly
+/// from the socket (used for `set_timeout` and `ping` during initial setup).
+///
+/// After [`install_forwarder`] is called, a demux thread owns all socket
+/// reads and routes frames to two destinations:
+///
+/// - Output frames (`PtyOutput`, `PtyExited`) → `HubEvent` channel
+/// - Control frames (`Registered`, `Snapshot`, `Ack`, `Pong`, `Error`) →
+///   internal `mpsc` channel consumed by `read_response()`
+///
+/// This eliminates the race where the forwarder and `read_response()` both
+/// competed to read `Registered` frames off the same socket receive buffer.
+///
+/// [`install_forwarder`]: BrokerConnection::install_forwarder
 pub struct BrokerConnection {
-    stream: UnixStream,
-    decoder: BrokerFrameDecoder,
-    /// Overflow frames decoded in the same socket read as a response frame.
+    /// Socket used for writing Hub → Broker frames.
     ///
-    /// `read_response` returns exactly one frame per call. When the decoder
-    /// produces multiple frames from a single `read()`, extras are queued here
-    /// and returned on subsequent calls without re-reading the socket.
+    /// After `install_forwarder()`, this FD is write-only in practice:
+    /// all reads are delegated to the demux thread via the dup'd FD.
+    stream: UnixStream,
+    /// Direct-read decoder — only used before `install_forwarder()`.
+    decoder: BrokerFrameDecoder,
+    /// Overflow buffer for the direct-read path (pre-forwarder only).
     frame_buffer: VecDeque<BrokerFrame>,
+    /// Channel for control responses delivered by the demux reader thread.
+    ///
+    /// `None` until `install_forwarder()` is called. Once set, `read_response()`
+    /// blocks on this channel instead of the socket to avoid racing with the
+    /// forwarder thread.
+    response_rx: Option<std::sync::mpsc::Receiver<BrokerFrame>>,
+    /// Flag indicating the demux reader thread is still alive.
+    ///
+    /// Set to `true` by `install_forwarder()`, cleared by the demux thread
+    /// on exit (EOF, decode error, or dropped response channel). The Hub
+    /// checks this via `is_demux_alive()` during the cleanup tick to detect
+    /// silent forwarder death and trigger broker reconnection.
+    demux_alive: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for BrokerConnection {
@@ -99,6 +141,8 @@ impl BrokerConnection {
             stream,
             decoder: BrokerFrameDecoder::new(),
             frame_buffer: VecDeque::new(),
+            response_rx: None,
+            demux_alive: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -248,9 +292,24 @@ impl BrokerConnection {
     /// Use this when the Hub is **restarting** — the broker will keep PTY
     /// children alive until the new Hub instance reconnects, or the timeout
     /// expires.
+    ///
+    /// # Shutdown vs. drop
+    ///
+    /// `shutdown(Both)` is called explicitly before dropping the stream.
+    /// Simply dropping the `UnixStream` FD would leave the demux reader thread's
+    /// `try_clone()` dup alive, preventing the broker from detecting Hub
+    /// disconnect: the broker's `recvmsg_fds` would block indefinitely because
+    /// the dup still keeps the socket open.
+    ///
+    /// `shutdown()` operates on the underlying kernel socket object — it
+    /// affects **all** file descriptors that share that socket (including
+    /// dup'd copies held by the demux thread). The broker's `recvmsg_fds`
+    /// then receives empty data (EOF) and exits `handle_connection`; the
+    /// demux thread's `read()` returns an error and the thread exits cleanly.
     pub fn disconnect_graceful(self) {
-        // Dropping self closes the UnixStream, which the broker detects as
-        // Hub disconnect and starts the reconnect countdown.
+        // Signal EOF on the kernel socket so the broker detects disconnect
+        // immediately, even if the demux thread holds a dup of this socket.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
         drop(self);
     }
 
@@ -282,28 +341,46 @@ impl BrokerConnection {
         }
     }
 
-    /// Clone the underlying socket for use in a background reader thread.
+    /// Construct a `BrokerConnection` from an existing `UnixStream`.
     ///
-    /// The background thread reads `PtyOutput` and `PtyExited` frames from
-    /// the broker and feeds them into the Hub's event bus.  The main connection
-    /// object retains write access for control messages.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the socket clone fails.
-    pub fn try_clone_stream(&self) -> Result<UnixStream> {
-        self.stream.try_clone().context("clone broker socket for reader thread")
+    /// Only available in tests — production code always uses [`connect`].
+    #[cfg(test)]
+    pub(crate) fn from_stream(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            decoder: BrokerFrameDecoder::new(),
+            frame_buffer: VecDeque::new(),
+            response_rx: None,
+            demux_alive: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     // ── Internal ─────────────────────────────────────────────────────────────
 
-    /// Read one complete control or data frame from the broker socket.
+    /// Read one complete control frame from the broker.
     ///
-    /// Drains the internal overflow buffer first, so callers that trigger a
-    /// response never silently discard frames decoded in the same `read()`.
-    /// Returns `Err` on EOF, I/O error, or decode failure.
+    /// # Two reading modes
+    ///
+    /// **Pre-forwarder** (before `install_forwarder()`): reads directly from
+    /// the socket. Used during initial setup for `set_timeout` / `ping`.
+    ///
+    /// **Post-forwarder** (after `install_forwarder()`): reads from the
+    /// internal `mpsc` channel fed by the demux reader thread. The demux
+    /// thread is the sole socket reader, so there is no race between this
+    /// method and the output forwarder path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on socket EOF, I/O error, decode failure (pre-forwarder),
+    /// or channel disconnect (post-forwarder — the demux thread exited).
     fn read_response(&mut self) -> Result<BrokerFrame> {
-        // Return any frame buffered from a previous read before blocking.
+        if let Some(ref rx) = self.response_rx {
+            // Post-forwarder: demux thread owns all socket reads and sends
+            // control frames here. No socket contention.
+            return rx.recv().context("broker demux reader thread disconnected");
+        }
+
+        // Pre-forwarder: read directly from the socket (no race yet).
         if let Some(frame) = self.frame_buffer.pop_front() {
             return Ok(frame);
         }
@@ -315,11 +392,69 @@ impl BrokerConnection {
             }
             let mut frames = self.decoder.feed(&buf[..n])?.into_iter();
             if let Some(frame) = frames.next() {
-                // Park any extra frames decoded from this read for the next call.
                 self.frame_buffer.extend(frames);
                 return Ok(frame);
             }
         }
+    }
+
+    /// Install the demux reader thread and switch `read_response()` to channel mode.
+    ///
+    /// Spawns a background thread that reads **all** frames from a dup of the
+    /// broker socket and routes them:
+    ///
+    /// - `PtyOutput` / `PtyExited` → `event_tx` (Hub event loop)
+    /// - All other frames (`Registered`, `Snapshot`, `Ack`, `Pong`, `Error`) →
+    ///   internal channel consumed by [`read_response()`]
+    ///
+    /// After this call, `read_response()` never reads the socket directly, so
+    /// there is no race between registration calls and the forwarder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket dup fails or the thread cannot be spawned.
+    /// On error the forwarder is not installed — `read_response()` falls back to
+    /// direct socket reads (output forwarding will be absent but commands work).
+    pub fn install_forwarder(
+        &mut self,
+        event_tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
+    ) -> Result<()> {
+        let reader_stream = self.stream.try_clone()
+            .context("dup broker socket for demux reader")?;
+        let (response_tx, response_rx) = std::sync::mpsc::channel::<BrokerFrame>();
+        self.response_rx = Some(response_rx);
+
+        // Mark demux as alive before spawning — the thread clears this on exit.
+        self.demux_alive.store(true, Ordering::Release);
+        let alive_flag = Arc::clone(&self.demux_alive);
+
+        std::thread::Builder::new()
+            .name("broker-demux".to_owned())
+            .spawn(move || {
+                demux_reader(reader_stream, response_tx, event_tx);
+                alive_flag.store(false, Ordering::Release);
+            })
+            .context("spawn broker-demux thread")?;
+        Ok(())
+    }
+
+    /// Check whether the demux reader thread is still running.
+    ///
+    /// Returns `false` if the thread exited (socket EOF, decode error,
+    /// or dropped response channel). The Hub should trigger a broker
+    /// reconnect when this returns `false` after `install_forwarder()`
+    /// was called.
+    pub fn is_demux_alive(&self) -> bool {
+        self.demux_alive.load(Ordering::Acquire)
+    }
+
+    /// Whether `install_forwarder()` has been called on this connection.
+    ///
+    /// Returns `true` once the demux thread has been started and `response_rx`
+    /// is set. Used by the Hub's health check to distinguish "forwarder never
+    /// installed" (skip check) from "forwarder died" (fire event).
+    pub fn has_forwarder(&self) -> bool {
+        self.response_rx.is_some()
     }
 }
 
@@ -560,69 +695,371 @@ mod tests {
     }
 }
 
-/// Start a background thread that reads broker-initiated frames from `stream`
-/// and routes them to `event_tx`.
+/// Demux reader loop — sole consumer of the broker socket receive buffer.
 ///
-/// Handles:
-/// - `BrokerFrame::PtyOutput(session_id, bytes)` → `HubEvent::BrokerPtyOutput`
-/// - `BrokerFrame::BrokerControl(BrokerMessage::PtyExited { .. })` → `HubEvent::BrokerPtyExited`
+/// Reads all frames from `stream` and routes them:
 ///
-/// The thread exits silently when the stream closes.
-pub(crate) fn start_output_forwarder(
+/// - `PtyOutput` / `PtyExited` → `event_tx` (Hub async event loop)
+/// - All other frames (control responses: `Registered`, `Snapshot`, `Ack`,
+///   `Pong`, `Error`) → `response_tx` (consumed by `read_response()`)
+///
+/// Running as the sole reader eliminates the race condition that existed when
+/// both `read_response()` and a separate forwarder thread competed to read
+/// from dup'd file descriptors sharing the same kernel receive buffer.
+fn demux_reader(
     stream: UnixStream,
+    response_tx: std::sync::mpsc::Sender<BrokerFrame>,
     event_tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
 ) {
-    if let Err(e) = std::thread::Builder::new()
-        .name("broker-reader".to_owned())
-        .spawn(move || {
-            let mut decoder = BrokerFrameDecoder::new();
-            let mut stream = stream;
-            // Remove read timeout for the reader thread — it should block until data arrives.
-            let _ = stream.set_read_timeout(None);
-            let mut buf = [0u8; 8192];
-            loop {
-                let n = match stream.read(&mut buf) {
-                    Ok(0) | Err(_) => break, // broker closed or error
-                    Ok(n) => n,
-                };
-                let frames = match decoder.feed(&buf[..n]) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log::warn!("[broker-reader] decode error: {e}");
-                        break;
-                    }
-                };
-                for frame in frames {
-                    match frame {
-                        BrokerFrame::PtyOutput(session_id, data) => {
-                            let _ = event_tx.send(
-                                crate::hub::events::HubEvent::BrokerPtyOutput { session_id, data },
-                            );
-                        }
-                        BrokerFrame::BrokerControl(BrokerMessage::PtyExited {
+    let mut decoder = BrokerFrameDecoder::new();
+    let mut stream = stream;
+    // Block indefinitely — the Hub sends data only when needed, and the PTY
+    // sends output continuously. A timeout here would cause spurious errors.
+    let _ = stream.set_read_timeout(None);
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let n = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let frames = match decoder.feed(&buf[..n]) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("[broker-demux] decode error: {e}");
+                break;
+            }
+        };
+        for frame in frames {
+            match frame {
+                BrokerFrame::PtyOutput(session_id, data) => {
+                    let _ = event_tx.send(
+                        crate::hub::events::HubEvent::BrokerPtyOutput { session_id, data },
+                    );
+                }
+                BrokerFrame::BrokerControl(BrokerMessage::PtyExited {
+                    session_id,
+                    agent_key,
+                    pty_index,
+                    exit_code,
+                }) => {
+                    let _ = event_tx.send(
+                        crate::hub::events::HubEvent::BrokerPtyExited {
                             session_id,
                             agent_key,
                             pty_index,
                             exit_code,
-                        }) => {
-                            let _ = event_tx.send(
-                                crate::hub::events::HubEvent::BrokerPtyExited {
-                                    session_id,
-                                    agent_key,
-                                    pty_index,
-                                    exit_code,
-                                },
-                            );
-                        }
-                        _ => {
-                            log::debug!("[broker-reader] ignoring unexpected frame");
-                        }
+                        },
+                    );
+                }
+                other => {
+                    // Control response: Registered, Snapshot, Ack, Pong, Error, etc.
+                    // Route to BrokerConnection::read_response() via channel.
+                    if response_tx.send(other).is_err() {
+                        // BrokerConnection was dropped — no one is waiting.
+                        break;
                     }
                 }
             }
-            log::debug!("[broker-reader] thread exiting");
-        })
-    {
-        log::warn!("[broker] failed to spawn broker-reader thread: {e}");
+        }
+    }
+    log::debug!("[broker-demux] thread exiting");
+}
+
+// ─── Integration tests ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use super::super::protocol::encode_broker_control;
+    use crate::hub::events::HubEvent;
+    use std::os::unix::io::AsRawFd;
+
+    /// Receive one message from `sock`, extracting any SCM_RIGHTS ancillary FDs.
+    unsafe fn recv_with_fd(sock: libc::c_int) -> (Vec<u8>, Vec<libc::c_int>) {
+        unsafe {
+            let mut data_buf = vec![0u8; 4096];
+            let fd_size = std::mem::size_of::<libc::c_int>();
+            let cmsg_space = libc::CMSG_SPACE(fd_size as u32) as usize;
+            let mut cmsg_buf = vec![0u8; cmsg_space * 4];
+
+            let mut iov = libc::iovec {
+                iov_base: data_buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: data_buf.len(),
+            };
+            let msg = libc::msghdr {
+                msg_name: std::ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: &mut iov,
+                msg_iovlen: 1,
+                msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
+                msg_controllen: cmsg_buf.len() as _,
+                msg_flags: 0,
+            };
+            let mut msg = msg;
+
+            let n = libc::recvmsg(sock, &mut msg, 0);
+            assert!(n >= 0, "recvmsg failed: {}", std::io::Error::last_os_error());
+            data_buf.truncate(n as usize);
+
+            let mut fds = Vec::new();
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET
+                    && (*cmsg).cmsg_type == libc::SCM_RIGHTS
+                {
+                    let data = libc::CMSG_DATA(cmsg);
+                    let count = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize)
+                        / std::mem::size_of::<libc::c_int>();
+                    for i in 0..count {
+                        let fd: libc::c_int = std::ptr::read_unaligned(
+                            data.add(i * std::mem::size_of::<libc::c_int>()) as *const libc::c_int,
+                        );
+                        fds.push(fd);
+                    }
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+
+            (data_buf, fds)
+        }
+    }
+
+    /// Create a pipe and return (read_fd, write_fd). Caller must close both.
+    fn make_pipe() -> (i32, i32) {
+        let mut pipe_fds = [0i32; 2];
+        let ret = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+        assert_eq!(ret, 0, "pipe: {}", std::io::Error::last_os_error());
+        (pipe_fds[0], pipe_fds[1])
+    }
+
+    // ── Test 1: THE REGRESSION TEST ─────────────────────────────────────────
+
+    /// Proves the race condition fix: `Registered` reaches `read_response()`
+    /// through the demux channel, not by racing on the socket receive buffer.
+    ///
+    /// Before the fix, `install_forwarder()` used `try_clone_stream()` which
+    /// created a dup FD. Both the forwarder thread and `read_response()` competed
+    /// on the same kernel socket receive buffer — if the forwarder won, `Registered`
+    /// was consumed as a `PtyOutput` candidate and `read_response()` blocked forever.
+    #[test]
+    fn test_register_pty_with_forwarder_running() {
+        let (broker_stream, client_stream) = UnixStream::pair().unwrap();
+        let broker_fd = broker_stream.as_raw_fd();
+
+        // Create a pipe FD to pass via SCM_RIGHTS in register_pty.
+        let (pipe_read, pipe_write) = make_pipe();
+
+        // Mock broker thread: receive FdTransfer, send back Registered.
+        let broker_handle = std::thread::spawn(move || {
+            // Receive the FdTransfer frame + SCM_RIGHTS FD.
+            let (data, fds) = unsafe { recv_with_fd(broker_fd) };
+            assert!(!data.is_empty(), "should receive FdTransfer frame bytes");
+            assert_eq!(fds.len(), 1, "should receive exactly 1 FD via SCM_RIGHTS");
+
+            // Close the received FD — we don't need it.
+            unsafe { libc::close(fds[0]) };
+
+            // Decode the frame to verify it's FdTransfer.
+            let mut decoder = BrokerFrameDecoder::new();
+            let frames = decoder.feed(&data).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert!(
+                matches!(&frames[0], BrokerFrame::FdTransfer(_)),
+                "expected FdTransfer frame"
+            );
+
+            // Send Registered response.
+            let resp = encode_broker_control(&BrokerMessage::Registered {
+                agent_key: "test-agent".to_string(),
+                pty_index: 0,
+                session_id: 42,
+            });
+            use std::io::Write;
+            let mut bs = broker_stream;
+            bs.write_all(&resp).unwrap();
+        });
+
+        let mut conn = BrokerConnection::from_stream(client_stream);
+
+        // Create event channel and install forwarder BEFORE registration.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
+        conn.install_forwarder(event_tx).unwrap();
+
+        // Register PTY — this must succeed (Registered routed to read_response via channel).
+        let session_id = conn.register_pty("test-agent", 0, 0, 24, 80, pipe_read).unwrap();
+        assert_eq!(session_id, 42, "register_pty should return broker-assigned session_id");
+
+        // Registered must NOT have leaked to the event channel.
+        assert!(
+            event_rx.try_recv().is_err(),
+            "Registered frame must not appear in event channel"
+        );
+
+        broker_handle.join().unwrap();
+
+        // Cleanup pipe FDs.
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+    }
+
+    // ── Test 2: PtyOutput routes to event channel ───────────────────────────
+
+    /// Verifies that `PtyOutput` frames are routed to the event channel (not
+    /// consumed by `read_response()`).
+    #[test]
+    fn test_pty_output_routes_to_event_channel() {
+        let (broker_stream, client_stream) = UnixStream::pair().unwrap();
+
+        let mut conn = BrokerConnection::from_stream(client_stream);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
+        conn.install_forwarder(event_tx).unwrap();
+
+        // Mock broker: send a PtyOutput frame.
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let frame = encode_data(frame_type::PTY_OUTPUT, 7, b"hello world");
+            let mut bs = broker_stream;
+            bs.write_all(&frame).unwrap();
+            // Drop closes the socket, which will cause the demux reader to exit.
+        });
+
+        // Receive the event with a timeout.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv()).await
+        });
+
+        match result {
+            Ok(Some(HubEvent::BrokerPtyOutput { session_id, data })) => {
+                assert_eq!(session_id, 7);
+                assert_eq!(data, b"hello world");
+            }
+            other => panic!("expected BrokerPtyOutput event, got: {other:?}"),
+        }
+    }
+
+    // ── Test 3: set_timeout works before forwarder ──────────────────────────
+
+    /// Verifies `set_timeout()` works in pre-forwarder mode (direct socket reads).
+    #[test]
+    fn test_set_timeout_works_before_forwarder() {
+        let (broker_stream, client_stream) = UnixStream::pair().unwrap();
+
+        // Mock broker: read SetTimeout frame, send Ack.
+        let broker_handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut bs = broker_stream;
+            let mut buf = [0u8; 4096];
+            let n = bs.read(&mut buf).unwrap();
+            assert!(n > 0, "should receive SetTimeout frame");
+
+            let mut decoder = BrokerFrameDecoder::new();
+            let frames = decoder.feed(&buf[..n]).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert!(
+                matches!(
+                    &frames[0],
+                    BrokerFrame::HubControl(super::super::protocol::HubMessage::SetTimeout {
+                        seconds: 60
+                    })
+                ),
+                "expected SetTimeout(60)"
+            );
+
+            let resp = encode_broker_control(&BrokerMessage::Ack);
+            bs.write_all(&resp).unwrap();
+        });
+
+        let mut conn = BrokerConnection::from_stream(client_stream);
+        // No install_forwarder — tests the pre-forwarder direct-read path.
+        conn.set_timeout(60).unwrap();
+
+        broker_handle.join().unwrap();
+    }
+
+    // ── Test 4: ping works before forwarder ─────────────────────────────────
+
+    /// Verifies `ping()` works in pre-forwarder mode.
+    #[test]
+    fn test_ping_works_before_forwarder() {
+        let (broker_stream, client_stream) = UnixStream::pair().unwrap();
+
+        // Mock broker: read Ping, send Pong.
+        let broker_handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut bs = broker_stream;
+            let mut buf = [0u8; 4096];
+            let n = bs.read(&mut buf).unwrap();
+            assert!(n > 0, "should receive Ping frame");
+
+            let mut decoder = BrokerFrameDecoder::new();
+            let frames = decoder.feed(&buf[..n]).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert!(
+                matches!(&frames[0], BrokerFrame::HubControl(super::super::protocol::HubMessage::Ping)),
+                "expected Ping"
+            );
+
+            let resp = encode_broker_control(&BrokerMessage::Pong);
+            bs.write_all(&resp).unwrap();
+        });
+
+        let mut conn = BrokerConnection::from_stream(client_stream);
+        conn.ping().unwrap();
+
+        broker_handle.join().unwrap();
+    }
+
+    // ── Test 5: get_snapshot with forwarder running ─────────────────────────
+
+    /// Verifies `get_snapshot()` works after `install_forwarder()` — the
+    /// Snapshot response is routed through the demux channel to `read_response()`,
+    /// not to the event channel.
+    #[test]
+    fn test_get_snapshot_with_forwarder_running() {
+        let (broker_stream, client_stream) = UnixStream::pair().unwrap();
+
+        // Mock broker: read GetSnapshot, send Snapshot data frame.
+        let broker_handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut bs = broker_stream;
+            let mut buf = [0u8; 4096];
+            let n = bs.read(&mut buf).unwrap();
+            assert!(n > 0, "should receive GetSnapshot frame");
+
+            let mut decoder = BrokerFrameDecoder::new();
+            let frames = decoder.feed(&buf[..n]).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert!(
+                matches!(
+                    &frames[0],
+                    BrokerFrame::HubControl(super::super::protocol::HubMessage::GetSnapshot {
+                        session_id: 1
+                    })
+                ),
+                "expected GetSnapshot(1)"
+            );
+
+            let resp = encode_data(frame_type::SNAPSHOT, 1, b"screen-data");
+            bs.write_all(&resp).unwrap();
+        });
+
+        let mut conn = BrokerConnection::from_stream(client_stream);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
+        conn.install_forwarder(event_tx).unwrap();
+
+        let snapshot = conn.get_snapshot(1).unwrap();
+        assert_eq!(snapshot, b"screen-data", "snapshot data should match");
+
+        // Snapshot must NOT have leaked to the event channel.
+        assert!(
+            event_rx.try_recv().is_err(),
+            "Snapshot frame must not appear in event channel"
+        );
+
+        broker_handle.join().unwrap();
     }
 }

@@ -213,6 +213,8 @@ function Agent.new(config)
 
     -- Register in agent registry
     agents[key] = self
+    -- Clear ghost registry entry — real agent supersedes the ghost.
+    state.get("ghost_agent_registry", {})[key] = nil
 
     -- Notify observers
     hooks.notify("after_agent_create", self)
@@ -457,6 +459,25 @@ function Agent:add_session(session_config)
             key, result, #ordered_handles))
     else
         log.error(string.format("Agent %s: failed to re-register: %s", key, tostring(result)))
+    end
+
+    -- Register new session with the broker so it survives a Hub restart.
+    -- Uses the same pattern as Agent.new(): persist session_id + dims in metadata
+    -- so broker_reconnected can reconstruct ghost PTYs for this session.
+    local ok2, session_id = pcall(hub.register_pty_with_broker, handle, key, new_pty_index)
+    if ok2 and session_id then
+        self:set_meta("broker_session_" .. new_pty_index, tostring(session_id))
+        local dims_ok, s_rows, s_cols = pcall(function() return handle:dimensions() end)
+        if dims_ok and s_rows then
+            self:set_meta("broker_pty_rows_" .. new_pty_index, tostring(s_rows))
+            self:set_meta("broker_pty_cols_" .. new_pty_index, tostring(s_cols))
+        end
+        log.info(string.format("Agent %s: pty_index %d registered with broker → session %d",
+            key, new_pty_index, session_id))
+    elseif not ok2 then
+        log.warn(string.format("Agent %s: broker registration failed for pty_index %d: %s",
+            key, new_pty_index, tostring(session_id)))
+    -- session_id == nil means broker not connected; skip silently
     end
 
     -- Notify observers so clients get updated session list
@@ -813,8 +834,18 @@ end
 -- @return array of info tables
 function Agent.all_info()
     local result = {}
+    local seen = {}
     for _, agent in ipairs(Agent.list()) do
-        table.insert(result, agent:info())
+        local info = agent:info()
+        result[#result + 1] = info
+        seen[info.id] = true
+    end
+    -- Include ghost agents (broker restart recovery) not yet replaced by real agents.
+    local ghost_registry = state.get("ghost_agent_registry", {})
+    for id, ghost_info in pairs(ghost_registry) do
+        if not seen[id] then
+            result[#result + 1] = ghost_info
+        end
     end
     return result
 end

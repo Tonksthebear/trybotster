@@ -249,8 +249,8 @@ pub(crate) enum HubEvent {
 
     /// Raw PTY output forwarded from the broker (relay mode after Hub restart).
     ///
-    /// Sent by the broker reader thread started in
-    /// [`crate::broker::connection::start_output_forwarder`].
+    /// Sent by the demux reader thread installed via
+    /// [`crate::broker::BrokerConnection::install_forwarder`].
     /// The Hub feeds these bytes into the corresponding agent's shadow screen
     /// and event broadcast channel so connected clients receive live output.
     BrokerPtyOutput {
@@ -297,6 +297,20 @@ pub(crate) enum HubEvent {
     AgentUnregistered {
         /// The agent key that was removed.
         agent_key: String,
+    },
+
+    /// Async WebRTC offer handling completed — SDP answer is ready.
+    ///
+    /// Sent by the spawned task in `handle_webrtc_offer` after ICE config
+    /// fetch, SDP negotiation, and answer encryption complete. The main loop
+    /// re-inserts the channel and relays the encrypted answer via Lua.
+    WebRtcOfferCompleted {
+        /// Browser identity for channel re-insertion and signal routing.
+        browser_identity: String,
+        /// The WebRTC channel to re-insert into the HashMap.
+        channel: crate::channel::WebRtcChannel,
+        /// Encrypted answer envelope, ready for Lua relay. `None` on failure.
+        encrypted_answer: Option<serde_json::Value>,
     },
 }
 

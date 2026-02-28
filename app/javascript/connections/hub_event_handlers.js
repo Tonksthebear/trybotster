@@ -38,9 +38,9 @@ export function setupHubEventListeners(bridge, hubId, cb) {
   }))
 
   // ActionCable signaling state (connected/disconnected)
-  unsubs.push(bridge.on("signaling:state", (event) => {
+  unsubs.push(bridge.on("signaling:state", async (event) => {
     if (event.hubId !== hubId) return
-    handleSignalingState(event, cb)
+    await handleSignalingState(event, cb)
   }))
 
   // Health events from ActionCable signaling channel
@@ -98,19 +98,44 @@ function handlePeerConnected(event, cb) {
 
 async function handleSignalingState(event, cb) {
   if (event.state === "disconnected") {
-    // Subscription went through the DC which may now be dead — clear it.
-    cb.clearStaleSubscription()
+    // ActionCable went down. Do NOT tear down an existing healthy WebRTC
+    // DataChannel — data still flows peer-to-peer without signaling.
+    // But mark that signaling is unavailable so we don't attempt new
+    // peer connections (they need AC for offer/answer exchange).
+    // Only clear the subscription if the DC is also dead.
+    try {
+      const { dcState } = await cb.probePeerHealth()
+      if (dcState !== "open") {
+        // DC is also dead — clean up fully
+        cb.clearStaleSubscription()
+      }
+      // If DC is open, leave subscription intact — data still flows
+    } catch {
+      // Probe failed — assume DC is also dead
+      cb.clearStaleSubscription()
+    }
     cb.setBrowserStatus(BrowserStatus.DISCONNECTED)
   } else if (event.state === "connected" && cb.getBrowserStatus() === BrowserStatus.DISCONNECTED) {
-    // ActionCable reconnected — immediately probe WebRTC health.
-    // If peer is dead (iOS sleep, wifi→cellular, etc.), the transport
-    // cleans it up and emits connection:state disconnected, which triggers
-    // handlePeerDisconnected → schedulePeerReconnect. No passive timeout.
-    cb.probePeerHealth()
-
-    // Mark browser as connected. setBrowserStatus triggers ensureConnected
-    // which will reconnect the peer if the probe killed it.
+    // ActionCable reconnected. Check if the existing WebRTC DC is still
+    // healthy before deciding what to do.
     cb.setBrowserStatus(BrowserStatus.SUBSCRIBED)
+
+    try {
+      const { dcState } = await cb.probePeerHealth()
+      if (dcState === "open" && cb.hasSubscription()) {
+        // DC is open and subscription exists — existing connection is healthy.
+        // Nothing to do; data was flowing the whole time AC was down.
+        cb.log("AC reconnected, DC still open — no action needed")
+      } else {
+        // DC is closed/degraded — use the restored AC to re-establish peer.
+        // probePeerHealth already cleaned up the dead peer if needed.
+        cb.log(`AC reconnected, DC=${dcState} — re-establishing peer`)
+        cb.ensureConnected()
+      }
+    } catch {
+      // Probe failed — try to reconnect
+      cb.ensureConnected()
+    }
   }
 }
 

@@ -226,6 +226,17 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
     -- Notify via hooks (connections.lua observes and broadcasts to clients)
     hooks.notify("agent_created", agent:info())
 
+    -- Deliver initial prompt to the agent PTY via probe-based message delivery.
+    -- send_message lazily initialises the delivery task, so this is safe to call
+    -- immediately — the probe mechanism waits until the shell is ready before
+    -- injecting the text.
+    if prompt and prompt ~= "" then
+        local session = agent.sessions and agent.sessions["agent"]
+        if session then
+            session:send_message(prompt)
+        end
+    end
+
     return agent
 end
 

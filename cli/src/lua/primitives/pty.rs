@@ -90,8 +90,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 
-use crate::agent::pty::{PtySession, SharedPtyState};
+use crate::agent::pty::{HubEventListener, PtySession, SharedPtyState};
 use crate::agent::spawn::PtySpawnConfig;
+use crate::terminal::AlacrittyParser;
 use crate::hub::events::HubEvent;
 use tokio::sync::broadcast;
 
@@ -137,7 +138,7 @@ pub struct PtySessionHandle {
     shared_state: Arc<Mutex<SharedPtyState>>,
 
     /// Shadow terminal for clean ANSI snapshots on reconnect.
-    shadow_screen: Arc<Mutex<vt100::Parser>>,
+    shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
 
     /// Event broadcast sender for subscribing to PTY output.
     event_tx: broadcast::Sender<PtyEvent>,
@@ -169,7 +170,7 @@ impl std::fmt::Debug for PtySessionHandle {
 impl PtySessionHandle {
     /// Create a ghost `PtySessionHandle` for Hub restart recovery.
     ///
-    /// A ghost handle has no real PTY process — only the vt100 shadow screen
+    /// A ghost handle has no real PTY process — only the alacritty shadow screen
     /// and broadcast channel are initialised with the given dimensions. Use
     /// [`PtySessionHandle::feed_output`] (via Lua) to replay broker scrollback
     /// bytes into the shadow screen, and [`PtySessionHandle::to_pty_handle`] to
@@ -190,8 +191,6 @@ impl PtySessionHandle {
     /// ```
     #[must_use]
     pub fn new_ghost(rows: u16, cols: u16, hub_event_tx: HubEventSender) -> Self {
-        use crate::agent::pty::PtySession;
-
         let session = PtySession::new(rows, cols);
         let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) =
             session.get_direct_access();
@@ -222,6 +221,7 @@ impl PtySessionHandle {
             Arc::clone(&self.shadow_screen),
             Arc::clone(&self.kitty_enabled),
             Arc::clone(&self.resize_pending),
+            true, // Ghost PTYs are always CLI sessions (broker agents)
             self.port,
         )
     }
@@ -327,13 +327,13 @@ impl LuaUserData for PtySessionHandle {
         // session:cursor_visible() -> boolean
         // Returns true when the PTY's cursor is visible (free-text input expected),
         // false when hidden (generation, selection UI, or no input expected).
-        // Reads directly from the vt100 shadow screen state.
+        // Reads directly from the alacritty shadow screen state.
         methods.add_method("cursor_visible", |_, this, ()| {
             let parser = this
                 .shadow_screen
                 .lock()
                 .expect("PtySessionHandle shadow_screen lock poisoned");
-            Ok(!parser.screen().hide_cursor())
+            Ok(!parser.cursor_hidden())
         });
 
         // session:send_message(text) - Queue a message for probe-based delivery.
@@ -372,12 +372,12 @@ impl LuaUserData for PtySessionHandle {
         // session:get_snapshot() -> string (clean ANSI bytes)
         // Also aliased as get_scrollback for backwards compatibility.
         methods.add_method("get_snapshot", |lua, this, ()| {
-            let mut parser = this
+            let parser = this
                 .shadow_screen
                 .lock()
                 .expect("PtySessionHandle shadow_screen lock poisoned");
             let skip_visible = this.resize_pending.swap(false, Ordering::AcqRel);
-            let output = crate::agent::pty::snapshot_with_scrollback(parser.screen_mut(), skip_visible);
+            let output = crate::terminal::generate_ansi_snapshot(&*parser, skip_visible);
             lua.create_string(&output)
         });
 
@@ -392,13 +392,13 @@ impl LuaUserData for PtySessionHandle {
                 .shadow_screen
                 .lock()
                 .expect("PtySessionHandle shadow_screen lock poisoned");
-            let text = parser.screen().contents();
+            let text = parser.contents();
             lua.create_string(text.as_bytes())
         });
 
         // session:feed_output(bytes) - Feed raw bytes into the shadow screen.
         //
-        // Processes `bytes` through the vt100 parser that backs `get_snapshot()`
+        // Processes `bytes` through the alacritty parser that backs `get_snapshot()`
         // and `get_screen()`. Used by `Agent:replay_broker_scrollback()` to replay
         // the broker's ring-buffer contents after a Hub restart so newly connecting
         // clients see the current terminal state instead of a blank screen.
@@ -413,12 +413,12 @@ impl LuaUserData for PtySessionHandle {
 
         // Backwards-compatible alias
         methods.add_method("get_scrollback", |lua, this, ()| {
-            let mut parser = this
+            let parser = this
                 .shadow_screen
                 .lock()
                 .expect("PtySessionHandle shadow_screen lock poisoned");
             let skip_visible = this.resize_pending.swap(false, Ordering::AcqRel);
-            let output = crate::agent::pty::snapshot_with_scrollback(parser.screen_mut(), skip_visible);
+            let output = crate::terminal::generate_ansi_snapshot(&*parser, skip_visible);
             lua.create_string(&output)
         });
 
@@ -1531,9 +1531,9 @@ mod tests {
             .load("return session:get_snapshot()")
             .eval()
             .expect("get_snapshot should work");
-        // Should at least contain the reset sequence
+        // generate_ansi_snapshot() preamble: ESC[0m (reset) then ESC[H (home)
         let bytes = result.as_bytes();
-        assert!(bytes.starts_with(b"\x1b[H\x1b[2J\x1b[0m"));
+        assert!(bytes.starts_with(b"\x1b[0m\x1b[H"));
     }
 
     #[test]

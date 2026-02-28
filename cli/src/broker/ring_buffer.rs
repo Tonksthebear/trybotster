@@ -9,9 +9,9 @@
 //! Each registered PTY session owns a `RingBuffer`.  The broker appends PTY
 //! output via [`RingBuffer::push`]; on hub reconnect the hub calls
 //! `GetSnapshot` and the broker responds with [`RingBuffer::to_vec`] in a
-//! `Snapshot` frame.  The hub feeds those bytes into a fresh `vt100::Parser`
-//! to restore terminal state without replaying raw escape sequences from the
-//! beginning of time.
+//! `Snapshot` frame.  The hub feeds those bytes into a fresh `AlacrittyParser`
+//! shadow screen to restore terminal state without replaying raw escape sequences
+//! from the beginning of time.
 
 // Rust guideline compliant 2026-02
 
@@ -282,14 +282,16 @@ mod tests {
         assert_eq!(rb.to_vec(), data);
     }
 
-    // ── Replay into vt100::Parser ─────────────────────────────────────────
+    // ── Replay into AlacrittyParser ───────────────────────────────────────
     //
     // Validates the broker's snapshot-replay path: push raw PTY output into
-    // the ring buffer, read it back, and feed it into a fresh vt100::Parser.
+    // the ring buffer, read it back, and feed it into a fresh AlacrittyParser.
     // The parsed screen must contain the expected text.
 
     #[test]
-    fn test_snapshot_replay_into_vt100_parser() {
+    fn test_snapshot_replay_into_parser() {
+        use crate::terminal::AlacrittyParser;
+
         let mut rb = RingBuffer::new(DEFAULT_RING_CAPACITY);
 
         // Simulate a PTY session emitting a prompt and some output
@@ -298,11 +300,11 @@ mod tests {
 
         // Retrieve snapshot and feed into a fresh parser (as hub does on reconnect)
         let snapshot = rb.to_vec();
-        let mut parser = vt100::Parser::new(24, 80, 1000);
+        let mut parser = AlacrittyParser::new_noop(24, 80, 1000);
         parser.process(&snapshot);
 
         // Screen should contain visible text from the output
-        let screen_contents = parser.screen().contents();
+        let screen_contents = parser.contents();
         assert!(
             screen_contents.contains("ls -la") || screen_contents.contains("total 8"),
             "parser screen should contain PTY output; got: {:?}",

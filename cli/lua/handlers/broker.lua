@@ -13,6 +13,8 @@
 --   4. Replay broker scrollback into each ghost handle's shadow screen so
 --      connecting browsers see the correct terminal state on reconnect.
 
+local Agent = require("lib.agent")
+
 --- Derive the agent key from repo and branch_name using the same formula
 --- used by Agent:agent_key() in lib/agent.lua.
 -- @param repo string  e.g. "owner/repo"
@@ -26,6 +28,8 @@ end
 
 events.on("broker_reconnected", function()
     log.info("[broker] Hub restarted — scanning worktrees for surviving agents")
+
+    local ghost_infos = {}
 
     local worktrees = worktree.list()
     for _, wt in ipairs(worktrees) do
@@ -128,6 +132,59 @@ events.on("broker_reconnected", function()
             agent_key, #ghost_handles, agent_idx
         ))
 
+        -- Build a ghost info table matching Agent:info() structure so the TUI
+        -- can render this agent. Status "ghost" lets clients style it differently.
+        local ghost_info = {
+            id           = agent_key,
+            display_name = ctx.branch_name or agent_key,
+            title        = nil,
+            cwd          = wt.path,
+            profile_name = ctx.profile_name,
+            repo         = ctx.repo,
+            metadata     = meta,
+            branch_name  = ctx.branch_name,
+            worktree_path = wt.path,
+            in_worktree  = true,
+            status       = "ghost",
+            sessions     = {},
+            notification = false,
+            has_server_pty = false,
+            server_running = false,
+            port         = nil,
+            created_at   = nil,
+        }
+        ghost_infos[#ghost_infos + 1] = ghost_info
+
         ::continue::
+    end
+
+    -- Surface ghost agents in the TUI by firing agent_created for each and
+    -- then broadcasting a combined agent_list (real + ghosts).
+    if #ghost_infos > 0 then
+        -- Required inside the handler body (hot-reload safe).
+        local state = require("hub.state")
+        local connections = require("handlers.connections")
+
+        -- Persist ghost infos so Agent.all_info() serves them to late-connecting clients.
+        local ghost_registry = state.get("ghost_agent_registry", {})
+        for _, gi in ipairs(ghost_infos) do
+            ghost_registry[gi.id] = gi
+        end
+
+        local ok, err = pcall(function()
+            for _, ghost_info in ipairs(ghost_infos) do
+                hooks.notify("agent_created", ghost_info)
+            end
+            -- Agent.all_info() now includes ghosts from the registry — no manual merge needed.
+            connections.broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+        end)
+
+        if not ok then
+            log.warn(string.format("[broker] Failed to broadcast ghost agents: %s", tostring(err)))
+        else
+            log.info(string.format(
+                "[broker] Broadcast %d ghost agent(s) to TUI", #ghost_infos
+            ))
+        end
     end
 end)
