@@ -45,7 +45,7 @@ impl TerminalModes {
 
     /// Sync outer terminal modes to match the focused panel's PTY state.
     ///
-    /// Reads DECCKM and bracketed paste from the panel's vt100 screen.
+    /// Reads DECCKM and bracketed paste from the panel's AlacrittyParser.
     /// Kitty keyboard protocol is gated on `has_overlay` — overlays use
     /// traditional key encoding for keybinding dispatch.
     ///
@@ -55,10 +55,7 @@ impl TerminalModes {
     /// [ghostty]: https://github.com/ghostty-org/ghostty/discussions/7780
     pub fn sync(&mut self, focused_panel: Option<&TerminalPanel>, has_overlay: bool) {
         let (app_cursor, bp) = focused_panel
-            .map(|panel| {
-                let screen = panel.screen();
-                (screen.application_cursor(), screen.bracketed_paste())
-            })
+            .map(|panel| (panel.application_cursor(), panel.bracketed_paste()))
             .unwrap_or((false, false));
 
         if app_cursor != self.outer_app_cursor {

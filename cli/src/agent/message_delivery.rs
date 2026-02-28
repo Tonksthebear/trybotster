@@ -220,6 +220,21 @@ enum DeliveryResult {
     ChannelClosed,
 }
 
+/// Minimum interval between probe attempts.
+///
+/// Prevents the feedback loop where tool output triggers a probe retry,
+/// the probe echoes (more output), which triggers another retry immediately.
+/// At 500 ms the probe cadence is slow enough to break the cascade while
+/// still delivering messages promptly once the PTY is free.
+const MIN_PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Backoff delay inserted after a probe timeout before watching for output.
+///
+/// Without this, a burst of tool output immediately after the timeout arm
+/// runs causes another probe attempt before the PTY has had a chance to
+/// settle into free-text input mode.
+const PROBE_TIMEOUT_BACKOFF: Duration = Duration::from_millis(300);
+
 /// Attempt to deliver the next message using the probe mechanism.
 ///
 /// 1. Inject `zx` probe
@@ -235,6 +250,12 @@ async fn attempt_delivery(
 ) -> DeliveryResult {
     let mut rx = event_tx.subscribe();
 
+    // Track when we last sent a probe so we can enforce MIN_PROBE_INTERVAL.
+    // Start sufficiently in the past so the first probe fires immediately.
+    let mut last_probe_at = tokio::time::Instant::now()
+        .checked_sub(MIN_PROBE_INTERVAL)
+        .unwrap_or_else(tokio::time::Instant::now);
+
     // Retry loop: keep probing until we succeed or the PTY dies.
     loop {
         // Re-check human activity before each probe attempt.
@@ -243,7 +264,14 @@ async fn attempt_delivery(
             continue;
         }
 
+        // Enforce minimum probe interval to break the output→retry feedback loop.
+        let elapsed = last_probe_at.elapsed();
+        if elapsed < MIN_PROBE_INTERVAL {
+            tokio::time::sleep(MIN_PROBE_INTERVAL - elapsed).await;
+        }
+
         // Inject probe.
+        last_probe_at = tokio::time::Instant::now();
         if !write_to_pty(shared_state, PROBE) {
             return DeliveryResult::PtyUnavailable;
         }
@@ -339,6 +367,18 @@ async fn attempt_delivery(
                 }
 
                 log::debug!("[MessageDelivery] Probe timeout, waiting for PTY output to retry");
+
+                // Brief backoff before watching for output events.
+                // Prevents a burst of tool output that arrives right after
+                // the timeout from immediately triggering another probe.
+                tokio::time::sleep(PROBE_TIMEOUT_BACKOFF).await;
+
+                // Drain any output events that arrived during the backoff,
+                // then wait for the next one (or the periodic 5 s timer).
+                while let Ok(Ok(_)) = tokio::time::timeout(
+                    Duration::from_millis(0),
+                    rx.recv(),
+                ).await {}
 
                 // Wait for next PTY output event or a new wake signal.
                 tokio::select! {

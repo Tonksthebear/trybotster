@@ -192,6 +192,7 @@ impl Hub {
                 self.poll_stream_frames_outgoing();
                 self.poll_pty_observers();
                 self.ratchet_restarted_peers.clear();
+                self.check_broker_demux_health();
             }
             HubEvent::DcOpened { browser_identity } => {
                 log::info!(
@@ -223,6 +224,12 @@ impl Hub {
                             }
                         }
                     });
+
+                    // Spawn per-peer send task so DataChannel sends run off the event loop.
+                    self.spawn_peer_send_task(&browser_identity);
+
+                    // Spawn periodic DC ping task for liveness detection.
+                    self.spawn_dc_ping_task(&browser_identity);
                 }
 
                 if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
@@ -231,47 +238,20 @@ impl Hub {
             }
             HubEvent::WebRtcSend(send_req) => {
                 use crate::lua::primitives::WebRtcSendRequest;
-                const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
                 match send_req {
                     WebRtcSendRequest::Json { peer_id, data } => {
-                        if let Some(channel) = self.webrtc_channels.get(&peer_id) {
-                            let payload = match serde_json::to_vec(&data) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    log::warn!("[WebRTC] Lua send failed to serialize: {e}");
-                                    return;
-                                }
-                            };
-                            let peer = crate::channel::PeerId(peer_id.clone());
-                            match tokio::task::block_in_place(|| {
-                                self.tokio_runtime.block_on(
-                                    tokio::time::timeout(SEND_TIMEOUT, channel.send_to(&payload, &peer))
-                                )
-                            }) {
-                                Ok(Err(e)) => log::warn!("[WebRTC] Lua send failed: {e}"),
-                                Err(_) => log::warn!("[WebRTC] Lua send timed out for {}", &peer_id[..peer_id.len().min(8)]),
-                                Ok(Ok(())) => {}
+                        let payload = match serde_json::to_vec(&data) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::warn!("[WebRTC] Lua send failed to serialize: {e}");
+                                return;
                             }
-                        } else {
-                            log::debug!("[WebRTC] Lua send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
-                        }
+                        };
+                        self.try_send_to_peer(&peer_id, super::WebRtcSendItem::Json { data: payload });
                     }
                     WebRtcSendRequest::Binary { peer_id, data } => {
-                        if let Some(channel) = self.webrtc_channels.get(&peer_id) {
-                            let peer = crate::channel::PeerId(peer_id.clone());
-                            match tokio::task::block_in_place(|| {
-                                self.tokio_runtime.block_on(
-                                    tokio::time::timeout(SEND_TIMEOUT, channel.send_to(&data, &peer))
-                                )
-                            }) {
-                                Ok(Err(e)) => log::warn!("[WebRTC] Lua binary send failed: {e}"),
-                                Err(_) => log::warn!("[WebRTC] Lua binary send timed out for {}", &peer_id[..peer_id.len().min(8)]),
-                                Ok(Ok(())) => {}
-                            }
-                        } else {
-                            log::debug!("[WebRTC] Lua binary send to unknown peer: {}", &peer_id[..peer_id.len().min(8)]);
-                        }
+                        self.try_send_to_peer(&peer_id, super::WebRtcSendItem::Binary { data });
                     }
                 }
             }
@@ -604,6 +584,24 @@ impl Hub {
                         removed,
                         agent_key
                     );
+                }
+            }
+            HubEvent::WebRtcOfferCompleted { browser_identity, channel, encrypted_answer } => {
+                // Re-insert the channel that was removed for async SDP processing.
+                // May overwrite a newer channel if a second offer arrived during
+                // async work — acceptable race, latest connection wins.
+                self.webrtc_channels.insert(browser_identity.clone(), channel);
+
+                if let Some(envelope_value) = encrypted_answer {
+                    let data = serde_json::json!({
+                        "browser_identity": browser_identity,
+                        "envelope": envelope_value,
+                    });
+                    if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
+                        log::error!("[WebRTC] Failed to fire outgoing_signal for answer: {e}");
+                    } else {
+                        log::info!("[WebRTC] Encrypted answer sent via Lua relay (async)");
+                    }
                 }
             }
         }
@@ -1077,6 +1075,8 @@ impl Hub {
                         "[WebRTC] DataChannel opened for {}, firing peer_connected",
                         &browser_identity[..browser_identity.len().min(8)]
                     );
+                    // Spawn per-peer send task (same as production DcOpened handler)
+                    self.spawn_peer_send_task(&browser_identity);
                     if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
                         log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
                     }
@@ -1143,15 +1143,13 @@ impl Hub {
             }
         };
 
-        // Send type 2 via DataChannel (if available)
-        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
-            if let Err(e) = tokio::task::block_in_place(|| {
-                self.tokio_runtime
-                    .block_on(channel.send_bundle_refresh(&bundle_bytes))
-            }) {
-                log::warn!("[RatchetRestart] Failed to send bundle refresh via DC: {e}");
-            }
-        }
+        // Send type 2 via DataChannel — non-blocking via per-peer send task
+        self.try_send_to_peer(
+            browser_identity,
+            super::WebRtcSendItem::BundleRefresh {
+                bundle_bytes: bundle_bytes.clone(),
+            },
+        );
 
         // Also send via ActionCable
         let envelope = serde_json::json!({
@@ -1270,6 +1268,18 @@ impl Hub {
         // Remove connection start time tracking
         self.webrtc_connection_started.remove(browser_identity);
 
+        // Stop per-peer send task (dropping sender causes task exit)
+        if let Some(state) = self.webrtc_send_tasks.remove(browser_identity) {
+            drop(state.tx);
+            state.task.abort();
+            log::debug!("[WebRTC] Stopped send task for {}", &browser_identity[..browser_identity.len().min(8)]);
+        }
+
+        // Stop DC ping task for this peer
+        if let Some(task) = self.dc_ping_tasks.remove(browser_identity) {
+            task.abort();
+        }
+
         // Close and remove stream multiplexer for this browser
         if let Some(mut mux) = self.stream_muxes.remove(browser_identity) {
             mux.close_all();
@@ -1344,6 +1354,24 @@ impl Hub {
                 }
                 "push_status_req" => {
                     self.handle_push_status_request(browser_identity, &msg);
+                    return;
+                }
+                "dc_ping" => {
+                    // Browser sent a heartbeat ping — respond immediately so it
+                    // doesn't declare the connection stalled after 3 missed pongs.
+                    let pong = serde_json::to_vec(&serde_json::json!({ "type": "dc_pong" }))
+                        .expect("static JSON serialization cannot fail");
+                    self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: pong });
+                    return;
+                }
+                "dc_pong" => {
+                    // Browser responded to our dc_ping — connection is alive.
+                    // Informational logging only; the browser side uses missed
+                    // pongs to detect dead connections and trigger reconnect.
+                    log::trace!(
+                        "[WebRTC] dc_pong from {}",
+                        &browser_identity[..browser_identity.len().min(8)]
+                    );
                     return;
                 }
                 _ => {}
@@ -2479,8 +2507,8 @@ impl Hub {
 
     /// Poll stream multiplexers for outgoing frames and send via WebRTC.
     ///
-    /// Iterates all active multiplexers, drains their output queues, and sends
-    /// each frame via the corresponding WebRTC channel's `send_stream_raw`.
+    /// Iterates all active multiplexers, drains their output queues, and queues
+    /// each frame via the per-peer send channel (non-blocking).
     pub(crate) fn poll_stream_frames_outgoing(&mut self) {
         let browser_ids: Vec<String> = self.stream_muxes.keys().cloned().collect();
 
@@ -2496,73 +2524,246 @@ impl Hub {
                 continue;
             }
 
-            let Some(channel) = self.webrtc_channels.get(&browser_identity) else {
-                log::warn!(
-                    "[StreamMux] No WebRTC channel for browser {} when sending frames",
-                    &browser_identity[..browser_identity.len().min(8)]
-                );
-                continue;
-            };
-
-            let peer = crate::channel::PeerId(browser_identity.clone());
-
             for frame in frames {
-                if let Err(e) = tokio::task::block_in_place(|| {
-                    self.tokio_runtime.block_on(
-                        channel.send_stream_raw(frame.frame_type, frame.stream_id, &frame.payload, &peer),
-                    )
-                }) {
-                    log::warn!("[StreamMux] Failed to send frame: {e}");
-                }
+                self.try_send_to_peer(
+                    &browser_identity,
+                    super::WebRtcSendItem::Stream {
+                        frame_type: frame.frame_type,
+                        stream_id: frame.stream_id,
+                        payload: frame.payload,
+                    },
+                );
             }
         }
     }
 
-    /// Send raw PTY bytes to a WebRTC subscription via Olm-encrypted m.botster.pty.
+    /// Queue raw PTY bytes for async delivery to a WebRTC peer.
     ///
-    /// Uses the hot path: compress → base64 → Olm encrypt → binary DataChannel.
-    /// The browser decrypts and routes by subscription ID + msgtype.
-    /// Returns `false` if the DataChannel is not open (circuit breaker signal).
+    /// Non-blocking: pushes a [`WebRtcSendItem::Pty`] into the per-peer send
+    /// channel. The actual compress → encrypt → DataChannel send happens in
+    /// the spawned per-peer task.
+    ///
+    /// Returns `false` if the peer has no send task (not connected) or the
+    /// send task has marked the peer as dead (circuit breaker).
     fn send_webrtc_raw(
         &self,
         subscription_id: &str,
         browser_identity: &str,
         data: Vec<u8>,
     ) -> bool {
-        /// Send timeout to prevent SCTP congestion from blocking the tick loop.
-        /// Dead peers cause SCTP retransmit backpressure that can block `dc.send()`
-        /// for 60+ seconds. This timeout ensures the tick loop stays responsive.
-        const SEND_TIMEOUT: Duration = Duration::from_secs(2);
-
-        let Some(channel) = self.webrtc_channels.get(browser_identity) else {
+        let Some(state) = self.webrtc_send_tasks.get(browser_identity) else {
             return false;
         };
 
-        let peer = crate::channel::PeerId(browser_identity.to_string());
-        let send_future = channel.send_pty_raw(subscription_id, &data, &peer);
-        match tokio::task::block_in_place(|| {
-            self.tokio_runtime.block_on(tokio::time::timeout(SEND_TIMEOUT, send_future))
+        // Circuit breaker: send task detected dead peer
+        if state.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+
+        match state.tx.try_send(super::WebRtcSendItem::Pty {
+            subscription_id: subscription_id.to_string(),
+            data,
         }) {
-            Ok(Ok(())) => true,
-            Ok(Err(e)) => {
-                let msg = e.to_string();
-                if msg.contains("not opened") || msg.contains("No data channel") {
-                    // DataChannel dead — caller should stop sending to this peer
-                    false
-                } else {
-                    log::warn!("[WebRTC] Failed to send PTY data: {e}");
-                    true // Transient error, keep trying
-                }
-            }
-            Err(_elapsed) => {
-                // Send timed out — SCTP is congested or peer is dead
-                log::warn!(
-                    "[WebRTC] Send timed out for {} (SCTP congestion), treating as dead",
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Per-peer channel full — peer is slow, drop this frame.
+                // PTY output is a continuous stream; dropping is acceptable.
+                log::debug!(
+                    "[WebRTC] Send channel full for {}, dropping PTY frame",
                     &browser_identity[..browser_identity.len().min(8)]
                 );
+                true // Not dead, just slow — keep trying future frames
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                // Send task exited — mark dead for fast circuit-breaker on
+                // subsequent sends before the cleanup tick runs.
+                state.dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 false
             }
         }
+    }
+
+    /// Queue a send item for a peer via the per-peer send channel.
+    ///
+    /// Logs warnings on failure but never blocks the event loop. Used by
+    /// `HubEvent::WebRtcSend` (Lua sends) and stream frame delivery.
+    fn try_send_to_peer(&self, peer_id: &str, item: super::WebRtcSendItem) {
+        let Some(state) = self.webrtc_send_tasks.get(peer_id) else {
+            log::debug!(
+                "[WebRTC] Send to unknown/disconnected peer: {}",
+                &peer_id[..peer_id.len().min(8)]
+            );
+            return;
+        };
+
+        if state.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            log::debug!(
+                "[WebRTC] Send to dead peer: {}",
+                &peer_id[..peer_id.len().min(8)]
+            );
+            return;
+        }
+
+        match state.tx.try_send(item) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Channel full — the send task is still alive but can't keep up.
+                // Don't mark dead: the send task itself will detect a truly dead
+                // peer via timeout. A full channel during a PTY output burst is
+                // normal backpressure, not a fatal condition.
+                log::debug!(
+                    "[WebRTC] Send channel full for {}, dropping frame",
+                    &peer_id[..peer_id.len().min(8)]
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                state.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                log::debug!(
+                    "[WebRTC] Send channel closed for {}, marking peer dead",
+                    &peer_id[..peer_id.len().min(8)]
+                );
+            }
+        }
+    }
+
+    /// Spawn a per-peer async send task for off-event-loop DataChannel sends.
+    ///
+    /// Creates a bounded channel and a `tokio::spawn` task that drains send
+    /// items and calls the actual async send methods with timeout. The task
+    /// sets the `dead` flag and exits if a send times out.
+    fn spawn_peer_send_task(&mut self, browser_identity: &str) {
+        // Remove any stale send task for this peer
+        if let Some(old) = self.webrtc_send_tasks.remove(browser_identity) {
+            old.task.abort();
+        }
+
+        let Some(channel) = self.webrtc_channels.get(browser_identity) else {
+            return;
+        };
+
+        let sender = channel.sender();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<super::WebRtcSendItem>(
+            super::PEER_SEND_CHANNEL_CAPACITY,
+        );
+        let dead = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dead_clone = std::sync::Arc::clone(&dead);
+        let bi = browser_identity.to_string();
+
+        let task = self.tokio_runtime.spawn(async move {
+            while let Some(item) = rx.recv().await {
+                let result = tokio::time::timeout(
+                    super::PEER_SEND_TIMEOUT,
+                    Self::execute_send(&sender, item),
+                ).await;
+
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        let msg = e.to_string();
+                        if msg.contains("not opened") || msg.contains("No data channel")
+                            || msg.contains("No peer connection")
+                        {
+                            log::warn!(
+                                "[WebRTC-Send] Peer {} dead ({}), exiting send task",
+                                &bi[..bi.len().min(8)], msg
+                            );
+                            dead_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        log::warn!("[WebRTC-Send] Send error for {}: {e}", &bi[..bi.len().min(8)]);
+                    }
+                    Err(_elapsed) => {
+                        log::warn!(
+                            "[WebRTC-Send] Send timed out for {} (SCTP congestion), marking dead",
+                            &bi[..bi.len().min(8)]
+                        );
+                        dead_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+            log::debug!("[WebRTC-Send] Send task exiting for {}", &bi[..bi.len().min(8)]);
+        });
+
+        self.webrtc_send_tasks.insert(
+            browser_identity.to_string(),
+            super::PeerSendState { tx, dead, task },
+        );
+    }
+
+    /// Execute a single send item on a [`WebRtcSender`].
+    ///
+    /// Dispatches to the appropriate async send method based on the item type.
+    async fn execute_send(
+        sender: &crate::channel::webrtc::WebRtcSender,
+        item: super::WebRtcSendItem,
+    ) -> Result<(), crate::channel::ChannelError> {
+        match item {
+            super::WebRtcSendItem::Pty { subscription_id, data } => {
+                sender.send_pty_raw(&subscription_id, &data).await
+            }
+            super::WebRtcSendItem::Json { data } => {
+                sender.send_json(&data).await
+            }
+            super::WebRtcSendItem::Binary { data } => {
+                sender.send_json(&data).await
+            }
+            super::WebRtcSendItem::Stream { frame_type, stream_id, payload } => {
+                sender.send_stream_raw(frame_type, stream_id, &payload).await
+            }
+            super::WebRtcSendItem::BundleRefresh { bundle_bytes } => {
+                sender.send_bundle_refresh(&bundle_bytes).await
+            }
+        }
+    }
+
+    /// Spawn a periodic DataChannel ping task for liveness detection.
+    ///
+    /// Sends `{ "type": "dc_ping" }` every 10 seconds through the per-peer
+    /// send channel. The browser responds with `dc_pong`; if pongs stop
+    /// arriving, the browser detects the dead connection and reconnects.
+    /// The task exits naturally when the send channel is dropped (peer cleanup).
+    fn spawn_dc_ping_task(&mut self, browser_identity: &str) {
+        /// Interval between DC pings. 10 seconds balances liveness detection
+        /// speed against bandwidth/CPU cost on mobile browsers.
+        const DC_PING_INTERVAL: Duration = Duration::from_secs(10);
+
+        // Abort any existing ping task for this peer (e.g. ICE restart).
+        if let Some(old) = self.dc_ping_tasks.remove(browser_identity) {
+            old.abort();
+        }
+
+        let Some(state) = self.webrtc_send_tasks.get(browser_identity) else {
+            return;
+        };
+        let tx = state.tx.clone();
+        let bi = browser_identity.to_string();
+
+        let ping_payload = serde_json::to_vec(&serde_json::json!({ "type": "dc_ping" }))
+            .expect("static JSON serialization cannot fail");
+
+        let task = self.tokio_runtime.spawn(async move {
+            let mut interval = tokio::time::interval(DC_PING_INTERVAL);
+            // Skip the first immediate tick — peer just connected.
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+                let item = super::WebRtcSendItem::Json {
+                    data: ping_payload.clone(),
+                };
+                if tx.send(item).await.is_err() {
+                    // Send channel closed — peer disconnected.
+                    log::debug!(
+                        "[WebRTC] DC ping task exiting for {} (channel closed)",
+                        &bi[..bi.len().min(8)]
+                    );
+                    break;
+                }
+            }
+        });
+
+        self.dc_ping_tasks.insert(browser_identity.to_string(), task);
     }
 
     /// Poll for queued PTY output and send via WebRTC.
@@ -2605,9 +2806,11 @@ impl Hub {
 
         if !self.send_webrtc_raw(&msg.subscription_id, &msg.browser_identity, final_data.clone()) {
             log::warn!(
-                "[WebRTC] DataChannel not open for {}, skipping PTY output",
+                "[WebRTC] DataChannel not open for {}, cleaning up dead channel",
                 &msg.browser_identity[..msg.browser_identity.len().min(8)]
             );
+            // Immediate cleanup instead of waiting for CleanupTick.
+            self.cleanup_webrtc_channel(&msg.browser_identity, "send_failed");
             return;
         }
 
@@ -2700,6 +2903,13 @@ impl Hub {
                     data: final_data,
                 });
             }
+        }
+
+        // Immediately clean up dead peers instead of waiting for the 5-second
+        // CleanupTick. This prevents fd exhaustion from accumulating stale
+        // WebRTC channels that are already known to be dead.
+        for dead_id in &dead_peers {
+            self.cleanup_webrtc_channel(dead_id, "send_failed");
         }
     }
 
@@ -2810,8 +3020,11 @@ impl Hub {
 
     /// Handle incoming WebRTC offer from browser (decrypted).
     ///
-    /// Creates or reuses a WebRTC peer connection for the browser, processes
-    /// the SDP offer, encrypts the answer, and sends it back via ActionCable.
+    /// Channel setup (stale cleanup, creation, configuration) runs synchronously
+    /// on the event loop. The heavy work — SDP negotiation (ICE config fetch can
+    /// take 10+ seconds), answer encryption — runs in a spawned async task that
+    /// posts `HubEvent::WebRtcOfferCompleted` when done. This prevents the event
+    /// loop from freezing during ICE config HTTP requests.
     fn handle_webrtc_offer(&mut self, sdp: &str, browser_identity: &str) {
         use crate::channel::{ChannelConfig, WebRtcChannel};
 
@@ -2829,9 +3042,6 @@ impl Hub {
 
         if is_new_connection {
             // Clean up stale channels from the same device (same Olm key, different tab UUID).
-            // When a browser refreshes, it generates a new tab UUID but keeps its Olm identity key.
-            // The old channel's SCTP association may still be alive and sends to it will block
-            // the tick loop for 60+ seconds waiting for retransmit timeouts.
             let olm_key = crate::relay::extract_olm_key(browser_identity);
             let stale: Vec<String> = self
                 .webrtc_channels
@@ -2850,14 +3060,8 @@ impl Hub {
                 self.cleanup_webrtc_channel(&stale_id, "replaced");
             }
 
-            // Wait for the previous connection's sockets to be released before
-            // creating a replacement. Each WebRTC connection opens ~15 UDP sockets
-            // for ICE gathering; without this, rapid reconnection cycles (e.g. phone
-            // lock/unlock) accumulate sockets and exhaust the fd limit.
-            // 500ms timeout: enough for the common case where close just completed,
-            // but not long enough to block signaling. If the old connection hasn't
-            // detected the disconnect yet (ICE timeout takes 30-60s), waiting longer
-            // won't help — proceed and let cleanup happen in the background.
+            // Wait for the previous connection's sockets to be released.
+            // 500ms is short enough to not meaningfully block signaling.
             if let Some(mut close_rx) = self.webrtc_pending_closes.remove(olm_key) {
                 if *close_rx.borrow() {
                     log::debug!("[WebRTC] Previous connection already closed");
@@ -2893,7 +3097,6 @@ impl Hub {
                 .hub_event_tx(self.hub_event_tx.clone())
                 .build();
 
-            // Configure the channel with hub_id
             let config = ChannelConfig {
                 channel_name: "WebRtcChannel".to_string(),
                 hub_id: hub_id.clone(),
@@ -2905,7 +3108,7 @@ impl Hub {
                 cli_subscription: false,
             };
 
-            // Connect the channel (sets up config, this is sync-safe)
+            // Connect the channel (sets up config — fast, does not fetch ICE).
             if let Err(e) = tokio::task::block_in_place(|| {
                 self.tokio_runtime.block_on(channel.connect(config))
             }) {
@@ -2919,76 +3122,74 @@ impl Hub {
             // Track connection start time for timeout detection
             self.webrtc_connection_started
                 .insert(browser_identity.to_string(), Instant::now());
-
-            // NOTE: peer_connected is NOT fired here — it fires when the
-            // DataChannel actually opens (via HubEvent::DcOpened).
-            // This prevents PTY forwarders from starting before the DC is usable.
         }
 
-        // Handle the offer and get the answer
-        let channel = self.webrtc_channels.get(browser_identity)
-            .expect("WebRTC channel must exist after offer handling");
+        // Remove the channel from the HashMap to pass it owned to the async task.
+        // The task will re-insert it via HubEvent::WebRtcOfferCompleted.
+        let Some(channel) = self.webrtc_channels.remove(browser_identity) else {
+            log::error!("[WebRTC] Channel missing after setup for {}", &browser_identity[..browser_identity.len().min(8)]);
+            return;
+        };
 
-        match tokio::task::block_in_place(|| {
-            self.tokio_runtime
-                .block_on(channel.handle_sdp_offer(sdp, browser_identity))
-        }) {
-            Ok(answer_sdp) => {
-                log::info!(
-                    "[WebRTC] Created answer for browser {}",
-                    &browser_identity[..browser_identity.len().min(8)]
-                );
+        let crypto = self
+            .browser
+            .crypto_service
+            .clone()
+            .expect("crypto service required");
+        let event_tx = self.hub_event_tx.clone();
+        let sdp = sdp.to_string();
+        let browser_id = browser_identity.to_string();
+        let olm_key = crate::relay::extract_olm_key(browser_identity).to_string();
 
-                // Encrypt the answer with E2E encryption (synchronous via mutex)
-                let crypto = self
-                    .browser
-                    .crypto_service
-                    .clone()
-                    .expect("crypto service required");
+        // Spawn async task for SDP negotiation + answer encryption.
+        // This is the slow path: fetch_ice_config can take 10+ seconds.
+        self.tokio_runtime.spawn(async move {
+            let encrypted_answer = match channel.handle_sdp_offer(&sdp, &browser_id).await {
+                Ok(answer_sdp) => {
+                    log::info!(
+                        "[WebRTC] Created answer for browser {} (async)",
+                        &browser_id[..browser_id.len().min(8)]
+                    );
 
-                let answer_payload = serde_json::json!({
-                    "type": "answer",
-                    "sdp": answer_sdp,
-                });
-                let plaintext = serde_json::to_vec(&answer_payload).unwrap_or_default();
+                    let answer_payload = serde_json::json!({
+                        "type": "answer",
+                        "sdp": answer_sdp,
+                    });
+                    let plaintext = serde_json::to_vec(&answer_payload).unwrap_or_default();
 
-                match crypto.lock() {
-                    Ok(mut guard) => match guard.encrypt(&plaintext, crate::relay::extract_olm_key(browser_identity)) {
-                        Ok(envelope) => {
-                            let envelope_value = match serde_json::to_value(&envelope) {
-                                Ok(v) => v,
+                    match crypto.lock() {
+                        Ok(mut guard) => match guard.encrypt(&plaintext, &olm_key) {
+                            Ok(envelope) => match serde_json::to_value(&envelope) {
+                                Ok(v) => Some(v),
                                 Err(e) => {
-                                    log::error!(
-                                        "[WebRTC] Failed to serialize answer envelope: {e}"
-                                    );
-                                    return;
+                                    log::error!("[WebRTC] Failed to serialize answer envelope: {e}");
+                                    None
                                 }
-                            };
-
-                            // Relay encrypted answer through Lua → ActionCable
-                            let data = serde_json::json!({
-                                "browser_identity": browser_identity,
-                                "envelope": envelope_value,
-                            });
-                            if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
-                                log::error!("[WebRTC] Failed to fire outgoing_signal for answer: {e}");
-                            } else {
-                                log::info!("[WebRTC] Encrypted answer sent via Lua relay");
+                            },
+                            Err(e) => {
+                                log::error!("[WebRTC] Failed to encrypt answer: {e}");
+                                None
                             }
-                        }
+                        },
                         Err(e) => {
-                            log::error!("[WebRTC] Failed to encrypt answer: {e}");
+                            log::error!("[WebRTC] Crypto mutex poisoned: {e}");
+                            None
                         }
-                    },
-                    Err(e) => {
-                        log::error!("[WebRTC] Crypto mutex poisoned: {e}");
                     }
-                };
-            }
-            Err(e) => {
-                log::error!("[WebRTC] Failed to handle offer: {e}");
-            }
-        }
+                }
+                Err(e) => {
+                    log::error!("[WebRTC] Failed to handle offer (async): {e}");
+                    None
+                }
+            };
+
+            // Post result back to Hub event loop for Lua relay + channel re-insertion.
+            let _ = event_tx.send(super::events::HubEvent::WebRtcOfferCompleted {
+                browser_identity: browser_id,
+                channel,
+                encrypted_answer,
+            });
+        });
     }
 
     // === Web Push Notifications ===
@@ -3007,31 +3208,18 @@ impl Hub {
             "key": vapid.public_key_base64url(),
         });
 
-        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
-            let payload = match serde_json::to_vec(&msg) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::warn!("[WebPush] Failed to serialize vapid_pub: {e}");
-                    return;
-                }
-            };
-            let peer = crate::channel::PeerId(browser_identity.to_string());
-            match tokio::task::block_in_place(|| {
-                self.tokio_runtime.block_on(tokio::time::timeout(
-                    Duration::from_secs(2),
-                    channel.send_to(&payload, &peer),
-                ))
-            }) {
-                Ok(Ok(())) => {
-                    log::info!(
-                        "[WebPush] Sent VAPID public key to {}",
-                        &browser_identity[..browser_identity.len().min(8)]
-                    );
-                }
-                Ok(Err(e)) => log::warn!("[WebPush] Failed to send vapid_pub: {e}"),
-                Err(_) => log::warn!("[WebPush] vapid_pub send timed out"),
+        let payload = match serde_json::to_vec(&msg) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[WebPush] Failed to serialize vapid_pub: {e}");
+                return;
             }
-        }
+        };
+        self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: payload });
+        log::info!(
+            "[WebPush] Queued VAPID public key for {}",
+            &browser_identity[..browser_identity.len().min(8)]
+        );
     }
 
     /// Handle a push subscription from a browser.
@@ -3210,52 +3398,28 @@ impl Hub {
             "priv": vapid.private_key_base64url(),
         });
 
-        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
-            let payload = match serde_json::to_vec(&msg) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::warn!("[WebPush] Failed to serialize vapid_keys: {e}");
-                    return;
-                }
-            };
-            let peer = crate::channel::PeerId(browser_identity.to_string());
-            match tokio::task::block_in_place(|| {
-                self.tokio_runtime.block_on(tokio::time::timeout(
-                    Duration::from_secs(2),
-                    channel.send_to(&payload, &peer),
-                ))
-            }) {
-                Ok(Ok(())) => log::info!("[WebPush] Sent VAPID keypair to browser for copy"),
-                Ok(Err(e)) => log::warn!("[WebPush] Failed to send vapid_keys: {e}"),
-                Err(_) => log::warn!("[WebPush] vapid_keys send timed out"),
+        let payload = match serde_json::to_vec(&msg) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[WebPush] Failed to serialize vapid_keys: {e}");
+                return;
             }
-        }
+        };
+        self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: payload });
+        log::info!("[WebPush] Queued VAPID keypair for browser copy");
     }
 
     /// Send push subscription acknowledgment to browser.
     fn send_push_sub_ack(&self, browser_identity: &str) {
         let msg = serde_json::json!({ "type": "push_sub_ack" });
-
-        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
-            let payload = match serde_json::to_vec(&msg) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::warn!("[WebPush] Failed to serialize push_sub_ack: {e}");
-                    return;
-                }
-            };
-            let peer = crate::channel::PeerId(browser_identity.to_string());
-            match tokio::task::block_in_place(|| {
-                self.tokio_runtime.block_on(tokio::time::timeout(
-                    Duration::from_secs(2),
-                    channel.send_to(&payload, &peer),
-                ))
-            }) {
-                Ok(Err(e)) => log::warn!("[WebPush] push_sub_ack send failed: {e}"),
-                Err(_) => log::warn!("[WebPush] push_sub_ack send timed out"),
-                Ok(Ok(())) => {}
+        let payload = match serde_json::to_vec(&msg) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[WebPush] Failed to serialize push_sub_ack: {e}");
+                return;
             }
-        }
+        };
+        self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: payload });
     }
 
     /// Handle a test push request from the browser.
@@ -3347,27 +3511,14 @@ impl Hub {
     /// Send test push acknowledgment to browser.
     fn send_push_test_ack(&self, browser_identity: &str, count: usize) {
         let msg = serde_json::json!({ "type": "push_test_ack", "sent": count });
-
-        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
-            let payload = match serde_json::to_vec(&msg) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::warn!("[WebPush] Failed to serialize push_test_ack: {e}");
-                    return;
-                }
-            };
-            let peer = crate::channel::PeerId(browser_identity.to_string());
-            match tokio::task::block_in_place(|| {
-                self.tokio_runtime.block_on(tokio::time::timeout(
-                    Duration::from_secs(2),
-                    channel.send_to(&payload, &peer),
-                ))
-            }) {
-                Ok(Err(e)) => log::warn!("[WebPush] push_test_ack send failed: {e}"),
-                Err(_) => log::warn!("[WebPush] push_test_ack send timed out"),
-                Ok(Ok(())) => {}
+        let payload = match serde_json::to_vec(&msg) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[WebPush] Failed to serialize push_test_ack: {e}");
+                return;
             }
-        }
+        };
+        self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: payload });
     }
 
     /// Handle browser request to disable push notifications.
@@ -3389,26 +3540,14 @@ impl Hub {
 
         // Ack browser
         let msg = serde_json::json!({ "type": "push_disable_ack" });
-        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
-            let payload = match serde_json::to_vec(&msg) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::warn!("[WebPush] Failed to serialize push_disable_ack: {e}");
-                    return;
-                }
-            };
-            let peer = crate::channel::PeerId(browser_identity.to_string());
-            match tokio::task::block_in_place(|| {
-                self.tokio_runtime.block_on(tokio::time::timeout(
-                    Duration::from_secs(2),
-                    channel.send_to(&payload, &peer),
-                ))
-            }) {
-                Ok(Err(e)) => log::warn!("[WebPush] push_disable_ack send failed: {e}"),
-                Err(_) => log::warn!("[WebPush] push_disable_ack send timed out"),
-                Ok(Ok(())) => {}
+        let payload = match serde_json::to_vec(&msg) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[WebPush] Failed to serialize push_disable_ack: {e}");
+                return;
             }
-        }
+        };
+        self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: payload });
     }
 
     /// Handle push status check from the device settings page.
@@ -3442,31 +3581,18 @@ impl Hub {
             "vapid_pub": vapid_pub,
         });
 
-        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
-            let payload = match serde_json::to_vec(&response) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::warn!("[WebPush] Failed to serialize push_status: {e}");
-                    return;
-                }
-            };
-            let peer = crate::channel::PeerId(browser_identity.to_string());
-            match tokio::task::block_in_place(|| {
-                self.tokio_runtime.block_on(tokio::time::timeout(
-                    Duration::from_secs(2),
-                    channel.send_to(&payload, &peer),
-                ))
-            }) {
-                Ok(Ok(())) => {
-                    log::info!(
-                        "[WebPush] Sent push_status to {} (has_keys={has_keys}, subscribed={browser_subscribed})",
-                        &browser_identity[..browser_identity.len().min(8)]
-                    );
-                }
-                Ok(Err(e)) => log::warn!("[WebPush] push_status send failed: {e}"),
-                Err(_) => log::warn!("[WebPush] push_status send timed out"),
+        let payload = match serde_json::to_vec(&response) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("[WebPush] Failed to serialize push_status: {e}");
+                return;
             }
-        }
+        };
+        self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: payload });
+        log::info!(
+            "[WebPush] Queued push_status for {} (has_keys={has_keys}, subscribed={browser_subscribed})",
+            &browser_identity[..browser_identity.len().min(8)]
+        );
     }
 
     /// Notify Rails that this device's notifications_enabled flag changed.
@@ -3792,6 +3918,39 @@ impl Hub {
             &local_id,
             &server_url,
         )
+    }
+
+    // === Broker Demux Health Check ===
+
+    /// Check if the broker demux reader thread is still alive.
+    ///
+    /// Called every `CleanupTick` (5s). If the demux thread has exited
+    /// (socket EOF, decode error, or dropped channel), fires a Lua event
+    /// so the plugin layer can decide whether to reconnect the broker.
+    fn check_broker_demux_health(&mut self) {
+        let guard = match self.broker_connection.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(ref conn) = *guard else { return };
+
+        // Skip if forwarder was never installed — demux_alive starts false
+        // and would false-positive on every tick before install_forwarder().
+        if !conn.has_forwarder() {
+            return;
+        }
+
+        // Forwarder was installed; check if the demux thread is still running.
+        if conn.is_demux_alive() {
+            return;
+        }
+        drop(guard);
+
+        log::error!("[Broker] Demux reader thread died — broker output forwarding stopped");
+        let data = serde_json::json!({ "reason": "demux_thread_exited" });
+        if let Err(e) = self.lua.fire_json_event("broker_connection_lost", &data) {
+            log::error!("[Broker] Failed to fire broker_connection_lost: {e}");
+        }
     }
 }
 

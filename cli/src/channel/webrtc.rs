@@ -1149,6 +1149,229 @@ impl WebRtcChannel {
     }
 }
 
+/// Lightweight, cloneable send handle for a [`WebRtcChannel`].
+///
+/// Holds only the `Arc`-wrapped fields needed by the async send methods
+/// (`send_pty_raw`, `send_to`, `send_stream_raw`, `send_bundle_refresh`).
+/// Designed to be moved into a per-peer `tokio::spawn` task so that
+/// DataChannel sends run off the Hub event loop.
+#[derive(Clone)]
+pub struct WebRtcSender {
+    /// Peer connection (owns the SCTP transport).
+    peer_connection: Arc<Mutex<Option<PeerConnection>>>,
+    /// SCTP stream ID for `pc.send_data(channel_id, ...)`.
+    data_channel_id: Arc<Mutex<Option<u16>>>,
+    /// Optional Olm crypto for E2E encryption.
+    crypto_service: Option<CryptoService>,
+    /// Channel configuration (compression threshold, etc.).
+    config: Arc<Mutex<Option<ChannelConfig>>>,
+    /// Peer's Olm identity key for encryption.
+    peer_olm_key: Arc<Mutex<Option<String>>>,
+}
+
+impl std::fmt::Debug for WebRtcSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebRtcSender")
+            .field("crypto_service", &self.crypto_service.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WebRtcSender {
+    /// Send PTY output: compress, encrypt, send via DataChannel.
+    ///
+    /// Same logic as [`WebRtcChannel::send_pty_raw`] but operates on the
+    /// extracted Arc fields so it can run in a spawned task.
+    pub async fn send_pty_raw(
+        &self,
+        subscription_id: &str,
+        data: &[u8],
+    ) -> Result<(), ChannelError> {
+        let pc_guard = self.peer_connection.lock().await;
+        let pc = pc_guard
+            .as_ref()
+            .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
+
+        let dc_id = self.data_channel_id.lock().await
+            .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
+
+        let cs = self
+            .crypto_service
+            .as_ref()
+            .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
+
+        let config_guard = self.config.lock().await;
+        let threshold = config_guard
+            .as_ref()
+            .and_then(|c| c.compression_threshold);
+        drop(config_guard);
+
+        let (payload, was_compressed): (std::borrow::Cow<'_, [u8]>, bool) =
+            if let Some(threshold) = threshold {
+                let compressed = maybe_compress(data, Some(threshold))
+                    .map_err(|e| ChannelError::CompressionError(e.to_string()))?;
+                if compressed[0] == 0x1f {
+                    (std::borrow::Cow::Owned(compressed[1..].to_vec()), true)
+                } else {
+                    (std::borrow::Cow::Borrowed(data), false)
+                }
+            } else {
+                (std::borrow::Cow::Borrowed(data), false)
+            };
+
+        let peer_key = self.get_peer_olm_key().await?;
+
+        let sub_bytes = subscription_id.as_bytes();
+        let flags: u8 = if was_compressed { 0x01 } else { 0x00 };
+        let mut plaintext = Vec::with_capacity(3 + sub_bytes.len() + payload.len());
+        plaintext.push(CONTENT_PTY);
+        plaintext.push(flags);
+        plaintext.push(sub_bytes.len() as u8);
+        plaintext.extend_from_slice(sub_bytes);
+        plaintext.extend_from_slice(&payload);
+
+        let encrypted = cs
+            .lock()
+            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
+            .encrypt_binary(&plaintext, &peer_key)
+            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
+
+        pc.send_data(dc_id, &encrypted)
+            .await
+            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Send a JSON message: serialize, encrypt, send via DataChannel.
+    ///
+    /// Same logic as [`WebRtcChannel::send_to`] but for the extracted handle.
+    pub async fn send_json(
+        &self,
+        payload: &[u8],
+    ) -> Result<(), ChannelError> {
+        let pc_guard = self.peer_connection.lock().await;
+        let pc = pc_guard
+            .as_ref()
+            .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
+
+        let dc_id = self.data_channel_id.lock().await
+            .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
+
+        let cs = self
+            .crypto_service
+            .as_ref()
+            .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
+
+        let peer_key = self.get_peer_olm_key().await?;
+
+        // Wrap in CONTENT_MSG frame: [0x00][json bytes]
+        let mut plaintext = Vec::with_capacity(1 + payload.len());
+        plaintext.push(CONTENT_MSG);
+        plaintext.extend_from_slice(payload);
+
+        let encrypted = cs
+            .lock()
+            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
+            .encrypt_binary(&plaintext, &peer_key)
+            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
+
+        pc.send_data(dc_id, &encrypted)
+            .await
+            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Send a stream multiplexer frame via encrypted DataChannel.
+    pub async fn send_stream_raw(
+        &self,
+        frame_type: u8,
+        stream_id: u16,
+        payload: &[u8],
+    ) -> Result<(), ChannelError> {
+        let pc_guard = self.peer_connection.lock().await;
+        let pc = pc_guard
+            .as_ref()
+            .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
+
+        let dc_id = self.data_channel_id.lock().await
+            .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
+
+        let cs = self
+            .crypto_service
+            .as_ref()
+            .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
+
+        let peer_key = self.get_peer_olm_key().await?;
+
+        let stream_id_bytes = stream_id.to_be_bytes();
+        let mut plaintext = Vec::with_capacity(4 + payload.len());
+        plaintext.push(CONTENT_STREAM);
+        plaintext.push(frame_type);
+        plaintext.extend_from_slice(&stream_id_bytes);
+        plaintext.extend_from_slice(payload);
+
+        let encrypted = cs
+            .lock()
+            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
+            .encrypt_binary(&plaintext, &peer_key)
+            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
+
+        pc.send_data(dc_id, &encrypted)
+            .await
+            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Send a bundle refresh (type 2) via DataChannel (unencrypted).
+    pub async fn send_bundle_refresh(&self, bundle_bytes: &[u8]) -> Result<(), ChannelError> {
+        let pc_guard = self.peer_connection.lock().await;
+        let pc = pc_guard
+            .as_ref()
+            .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
+
+        let dc_id = self.data_channel_id.lock().await
+            .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
+
+        let mut frame = Vec::with_capacity(1 + bundle_bytes.len());
+        frame.push(crate::relay::MSG_TYPE_BUNDLE_REFRESH);
+        frame.extend_from_slice(bundle_bytes);
+
+        pc.send_data(dc_id, &frame)
+            .await
+            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Get the peer's Olm identity key.
+    async fn get_peer_olm_key(&self) -> Result<String, ChannelError> {
+        self.peer_olm_key
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| ChannelError::EncryptionError("No peer Olm key set".into()))
+    }
+}
+
+impl WebRtcChannel {
+    /// Create a [`WebRtcSender`] handle for off-event-loop async sends.
+    ///
+    /// The sender holds `Arc` clones of the fields needed for encryption
+    /// and DataChannel transmission. Safe to move into a `tokio::spawn` task.
+    pub fn sender(&self) -> WebRtcSender {
+        WebRtcSender {
+            peer_connection: Arc::clone(&self.peer_connection),
+            data_channel_id: Arc::clone(&self.data_channel_id),
+            crypto_service: self.crypto_service.clone(),
+            config: Arc::clone(&self.config),
+            peer_olm_key: Arc::clone(&self.peer_olm_key),
+        }
+    }
+}
+
 /// Handle an incoming DataChannel message: decrypt and route by content type.
 ///
 /// Extracted as a standalone async fn to avoid deep nesting in the event loop.

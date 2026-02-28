@@ -48,6 +48,7 @@ pub mod git;
 pub mod keyring;
 pub mod process;
 pub mod server;
+pub mod terminal;
 pub mod terminal_widget;
 
 // Re-export commonly used types

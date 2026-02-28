@@ -24,6 +24,7 @@ export class HandshakeManager {
    * @param {Function} callbacks.sendEncrypted - Send encrypted message via DataChannel
    * @param {Function} callbacks.emit - Emit event on Connection
    * @param {Function} callbacks.onComplete - Called when handshake finishes
+   * @param {Function} callbacks.onTimeout - Called when handshake times out (triggers reconnect)
    * @param {Function} callbacks.log - Debug logger (receives string)
    */
   constructor(callbacks) {
@@ -54,11 +55,13 @@ export class HandshakeManager {
 
     this.#timer = setTimeout(() => {
       if (!this.#complete) {
-        this.#callbacks.log("Handshake timeout")
+        this.#callbacks.log("Handshake timeout — triggering peer reconnect")
         this.#callbacks.emit("error", {
           reason: "handshake_timeout",
           message: "CLI did not respond to handshake",
         })
+        // Trigger recovery instead of leaving the connection stuck
+        this.#callbacks.onTimeout?.()
       }
     }, HANDSHAKE_TIMEOUT_MS)
   }

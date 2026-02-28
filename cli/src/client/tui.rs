@@ -51,7 +51,7 @@ pub enum TuiRequest {
 /// Output messages sent from Hub to TuiRunner.
 ///
 /// TuiRunner receives these through the output channel and processes them
-/// (feeding to vt100 parser, handling process exit, etc.).
+/// (feeding to AlacrittyParser, handling process exit, etc.).
 ///
 /// PTY-related variants carry optional `agent_index` and `pty_index` fields
 /// to identify which parser should receive the data. When `None`, data is
@@ -70,9 +70,9 @@ pub enum TuiOutput {
         data: Vec<u8>,
         /// Whether the inner PTY has kitty keyboard protocol active.
         ///
-        /// Carried alongside scrollback because vt100 silently consumes
-        /// the kitty CSI sequences in the snapshot bytes. The TUI needs
-        /// this to push kitty to the outer terminal on agent switch.
+        /// Carried alongside scrollback because the snapshot bytes are
+        /// ANSI output — the TUI needs to know the kitty state explicitly
+        /// to push the protocol to the outer terminal on agent switch.
         kitty_enabled: bool,
     },
 

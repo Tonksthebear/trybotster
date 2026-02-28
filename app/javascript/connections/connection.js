@@ -42,13 +42,18 @@ export class Connection {
   #subscribing = false      // Lock to prevent concurrent subscribe/unsubscribe
   #subscribeLock = null     // Promise-based lock (resolves when subscribe/unsubscribe finishes)
   #subscribeLockResolve = null
+  #subscribeAborted = false // Abort flag: lets #disconnectPeer() break out of in-flight subscribe
   #initRetryCount = 0       // Retry counter for failed initialize()
   #initRetryTimer = null    // Pending retry timer
   #peerReconnectTimer = null  // Pending peer reconnect timer
   #peerReconnectAttempts = 0  // Retry counter for peer reconnection
+  #nuclearReconnectTimer = null // Fallback reconnect when normal attempts exhausted
   #reacquirePromise = null    // Serializes concurrent reacquire() calls
   #handshake = null           // HandshakeManager instance
   #health = null              // HealthTracker instance
+  #dcPingTimer = null         // DataChannel heartbeat timer
+  #dcMissedPings = 0          // Consecutive unanswered DC pings
+  #ensureConnectedDebounceTimer = null // Debounce for #setBrowserStatus → ensureConnected
 
   constructor(key, options, manager) {
     this.key = key
@@ -75,6 +80,7 @@ export class Connection {
       sendEncrypted: (msg) => this.#sendEncrypted(msg),
       emit: (event, data) => this.emit(event, data),
       onComplete: () => this.#onHandshakeComplete(),
+      onTimeout: () => this.#disconnectPeer().then(() => this.#schedulePeerReconnect()),
       log,
     })
 
@@ -327,6 +333,12 @@ export class Connection {
   async #disconnectPeer() {
     const hubId = this.getHubId()
 
+    // Abort any in-flight subscribe immediately
+    this.#subscribeAborted = true
+
+    // Stop DC heartbeat
+    this.#stopDcHeartbeat()
+
     // Unsubscribe virtual channel first
     if (this.subscriptionId) {
       await this.unsubscribe()
@@ -376,6 +388,7 @@ export class Connection {
     }
 
     this.#subscribing = true
+    this.#subscribeAborted = false
     this.#subscribeLock = new Promise(resolve => { this.#subscribeLockResolve = resolve })
 
     try {
@@ -403,15 +416,30 @@ export class Connection {
       this.#setupSubscriptionEventListeners()
 
       const subscribeResult = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("Subscribe timeout — peer may be stale")), 5000)
+        const timer = setTimeout(() => {
+          // On timeout, check DC state immediately — if DC is closed,
+          // reject fast instead of waiting for the probe cycle.
+          reject(new Error("Subscribe timeout — peer may be stale"))
+        }, 3000)
+
+        // Check abort flag periodically so #disconnectPeer() can break
+        // us out without waiting for the full timeout.
+        const abortCheck = setInterval(() => {
+          if (this.#subscribeAborted) {
+            clearInterval(abortCheck)
+            clearTimeout(timer)
+            reject(new Error("Subscribe aborted — peer disconnecting"))
+          }
+        }, 100)
+
         bridge.send("subscribe", {
           hubId,
           channel: this.channelName(),
           params: this.channelParams(),
           subscriptionId,
         }).then(
-          (v) => { clearTimeout(timer); resolve(v) },
-          (e) => { clearTimeout(timer); reject(e) },
+          (v) => { clearInterval(abortCheck); clearTimeout(timer); resolve(v) },
+          (e) => { clearInterval(abortCheck); clearTimeout(timer); reject(e) },
         )
       })
 
@@ -552,7 +580,8 @@ export class Connection {
     this.#peerReconnectAttempts++
 
     if (this.#peerReconnectAttempts > 5) {
-      console.debug(`[${this.constructor.name}] Peer reconnect exhausted after ${this.#peerReconnectAttempts} attempts, waiting for health event`)
+      console.debug(`[${this.constructor.name}] Peer reconnect exhausted after ${this.#peerReconnectAttempts} attempts, scheduling nuclear fallback`)
+      this.#scheduleNuclearReconnect()
       return
     }
 
@@ -566,11 +595,33 @@ export class Connection {
     }, delay)
   }
 
+  /**
+   * Nuclear fallback: when normal reconnect attempts are exhausted,
+   * schedule a full teardown + reconnect every 30s. Recovers from
+   * states where health events stop arriving (frozen WebRTC, etc.).
+   */
+  #scheduleNuclearReconnect() {
+    if (this.#nuclearReconnectTimer) return
+
+    this.#nuclearReconnectTimer = setTimeout(() => {
+      this.#nuclearReconnectTimer = null
+      if (this.#handshake.complete) return // already recovered
+
+      console.debug(`[${this.constructor.name}] Nuclear reconnect: full teardown + reconnect`)
+      this.#peerReconnectAttempts = 0
+      this.#disconnectPeer().then(() => this.#ensureConnected()).catch(() => {})
+    }, 30000)
+  }
+
   /** Cancel pending peer reconnect timer. */
   #cancelPeerReconnect() {
     if (this.#peerReconnectTimer) {
       clearTimeout(this.#peerReconnectTimer)
       this.#peerReconnectTimer = null
+    }
+    if (this.#nuclearReconnectTimer) {
+      clearTimeout(this.#nuclearReconnectTimer)
+      this.#nuclearReconnectTimer = null
     }
     this.#peerReconnectAttempts = 0
   }
@@ -625,6 +676,21 @@ export class Connection {
     if (this.#peerReconnectTimer) {
       clearTimeout(this.#peerReconnectTimer)
       this.#peerReconnectTimer = null
+    }
+
+    // Cancel nuclear reconnect timer
+    if (this.#nuclearReconnectTimer) {
+      clearTimeout(this.#nuclearReconnectTimer)
+      this.#nuclearReconnectTimer = null
+    }
+
+    // Stop DC heartbeat
+    this.#stopDcHeartbeat()
+
+    // Cancel debounced ensureConnected
+    if (this.#ensureConnectedDebounceTimer) {
+      clearTimeout(this.#ensureConnectedDebounceTimer)
+      this.#ensureConnectedDebounceTimer = null
     }
 
     // Clear state immediately to prevent any new operations
@@ -949,6 +1015,15 @@ export class Connection {
       this.#health.handleCliDisconnected()
       return true
     }
+    // DC heartbeat: respond to CLI pings, track CLI pongs
+    if (message.type === "dc_ping") {
+      this.send("dc_pong").catch(() => {})
+      return true
+    }
+    if (message.type === "dc_pong") {
+      this.#dcMissedPings = 0
+      return true
+    }
     return false
   }
 
@@ -965,6 +1040,52 @@ export class Connection {
     this.#setState(ConnectionState.CONNECTED)
     this.#health.emitHealthChange()
     this.emit("connected", this)
+
+    // Start DC heartbeat now that the channel is confirmed working
+    this.#startDcHeartbeat()
+  }
+
+  // ========== DataChannel Heartbeat ==========
+
+  /**
+   * Start periodic DataChannel ping. Detects silently stalled connections
+   * where ICE reports "connected" but no application data flows.
+   */
+  #startDcHeartbeat() {
+    this.#stopDcHeartbeat()
+    this.#dcMissedPings = 0
+
+    this.#dcPingTimer = setInterval(() => {
+      // Check if previous pings went unanswered BEFORE sending next one.
+      // This way we send 3 pings, wait for any pong, then declare stalled.
+      if (this.#dcMissedPings >= 3) {
+        console.debug(`[${this.constructor.name}] DC heartbeat: ${this.#dcMissedPings} pings unanswered — connection stalled, reconnecting`)
+        this.#stopDcHeartbeat()
+        this.#disconnectPeer().then(() => this.#schedulePeerReconnect())
+        return
+      }
+
+      // Use #sendEncrypted directly to bypass send()'s auto-heal logic.
+      // A heartbeat on a broken channel should fail and trigger teardown,
+      // not attempt to re-subscribe (which would be re-entrant).
+      this.#sendEncrypted({ type: "dc_ping" }).then(() => {
+        this.#dcMissedPings++
+      }).catch(() => {
+        // Send failed — DC is definitely broken
+        console.debug(`[${this.constructor.name}] DC heartbeat: ping send failed, reconnecting`)
+        this.#stopDcHeartbeat()
+        this.#disconnectPeer().then(() => this.#schedulePeerReconnect())
+      })
+    }, 10000)
+  }
+
+  /** Stop DC heartbeat timer. */
+  #stopDcHeartbeat() {
+    if (this.#dcPingTimer) {
+      clearInterval(this.#dcPingTimer)
+      this.#dcPingTimer = null
+    }
+    this.#dcMissedPings = 0
   }
 
   /** Proxy cliStatus through HealthTracker for external access. */
@@ -1089,8 +1210,15 @@ export class Connection {
     this.#health.emitHealthChange()
 
     // Reactive readiness: when browser health changes, re-evaluate connection.
-    // ensureConnected gates on browser + CLI + crypto being ready.
-    this.#ensureConnected().catch(() => {})
+    // Debounced (100ms) so rapid AC flapping collapses into one evaluation
+    // instead of cascading reconnect loops.
+    if (this.#ensureConnectedDebounceTimer) {
+      clearTimeout(this.#ensureConnectedDebounceTimer)
+    }
+    this.#ensureConnectedDebounceTimer = setTimeout(() => {
+      this.#ensureConnectedDebounceTimer = null
+      this.#ensureConnected().catch(() => {})
+    }, 100)
   }
 
   #setConnectionMode(newMode) {

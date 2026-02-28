@@ -220,6 +220,7 @@ impl Agent {
                     shadow_screen,
                     kitty,
                     resize,
+                    true, // CLI PTY — detect OSC notifications
                     self.cli_pty.port(),
                 ))
             }
@@ -232,6 +233,7 @@ impl Agent {
                     shadow_screen,
                     kitty,
                     resize,
+                    false, // Server PTY — no OSC notification detection
                     server_pty.port(),
                 ))
             }

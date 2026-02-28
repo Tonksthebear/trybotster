@@ -284,4 +284,4 @@ pub use action_cable::{
 };
 pub use compression::{maybe_compress, maybe_decompress, should_compress_response};
 pub use reliable::{ReliableMessage, ReliableReceiver, ReliableSender, ReliableSession};
-pub use webrtc::{WebRtcChannel, WebRtcChannelBuilder, WebRtcConfig};
+pub use webrtc::{WebRtcChannel, WebRtcChannelBuilder, WebRtcConfig, WebRtcSender};

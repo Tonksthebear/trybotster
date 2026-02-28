@@ -35,7 +35,7 @@
 //!
 //! Clients call `pty.write_input()` directly rather than through Hub.
 
-// Rust guideline compliant 2026-01
+// Rust guideline compliant 2026-02
 
 use std::io::Write;
 use std::sync::{
@@ -45,7 +45,8 @@ use std::sync::{
 
 use tokio::sync::broadcast;
 
-use crate::agent::pty::{do_resize, PtyEvent, SharedPtyState};
+use crate::agent::pty::{do_resize, HubEventListener, PtyEvent, SharedPtyState};
+use crate::terminal::{generate_ansi_snapshot, AlacrittyParser};
 
 /// Handle for interacting with an agent's PTY sessions.
 ///
@@ -214,8 +215,8 @@ pub struct PtyHandle {
     /// Shadow terminal for clean ANSI snapshots on reconnect.
     ///
     /// Shared with `PtySession` and the reader thread. On connect,
-    /// `get_snapshot()` produces clean ANSI output with correct cursor.
-    shadow_screen: Arc<Mutex<vt100::Parser>>,
+    /// `get_snapshot()` produces clean ANSI output with correct cursor and SGR state.
+    shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
 
     /// Whether the inner PTY has kitty keyboard protocol active.
     ///
@@ -229,6 +230,24 @@ pub struct PtyHandle {
     /// capturing stale visible-screen content after a resize.
     resize_pending: Arc<AtomicBool>,
 
+    /// Whether OSC notification sequences should be detected and broadcast.
+    ///
+    /// `true` for CLI PTYs (pty_index 0), `false` for server PTYs (pty_index 1).
+    /// Passed directly to [`crate::agent::spawn::process_pty_bytes`] in
+    /// `feed_broker_output()`.
+    detect_notifs: bool,
+
+    /// Persistent cursor visibility state for transition-only event emission.
+    ///
+    /// [`crate::agent::spawn::process_pty_bytes`] only fires
+    /// [`PtyEvent::CursorVisibilityChanged`] when the state changes. The
+    /// reader thread maintains this as a local variable; the broker path
+    /// stores it here so it persists across `feed_broker_output()` calls.
+    ///
+    /// `Arc<Mutex<_>>` because `PtyHandle` is `Clone` and all clones must
+    /// share the same state.
+    last_cursor_visible: Arc<Mutex<Option<bool>>>,
+
     /// HTTP forwarding port for preview proxying.
     ///
     /// Primarily used by server PTYs (pty_index=1) to expose the dev server
@@ -239,6 +258,7 @@ pub struct PtyHandle {
 impl std::fmt::Debug for PtyHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PtyHandle")
+            .field("detect_notifs", &self.detect_notifs)
             .field("port", &self.port)
             .finish()
     }
@@ -258,14 +278,17 @@ impl PtyHandle {
     /// * `shared_state` - Direct access to PTY writer and state
     /// * `shadow_screen` - Shadow terminal for ANSI snapshots
     /// * `kitty_enabled` - Shared kitty keyboard protocol state flag
+    /// * `resize_pending` - Cleared when output arrives after a resize
+    /// * `detect_notifs` - Enable OSC notification detection (`true` for CLI, `false` for server)
     /// * `port` - HTTP forwarding port (for server PTYs), or `None`
     #[must_use]
     pub fn new(
         event_tx: broadcast::Sender<PtyEvent>,
         shared_state: Arc<Mutex<SharedPtyState>>,
-        shadow_screen: Arc<Mutex<vt100::Parser>>,
+        shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
         kitty_enabled: Arc<AtomicBool>,
         resize_pending: Arc<AtomicBool>,
+        detect_notifs: bool,
         port: Option<u16>,
     ) -> Self {
         Self {
@@ -274,6 +297,11 @@ impl PtyHandle {
             shadow_screen,
             kitty_enabled,
             resize_pending,
+            detect_notifs,
+            // Start as Some(true): alacritty initializes with SHOW_CURSOR set, matching
+            // spawn_reader_thread initialization to avoid a spurious
+            // CursorVisibilityChanged(true) on the very first broker output delivery.
+            last_cursor_visible: Arc::new(Mutex::new(Some(true))),
             port,
         }
     }
@@ -323,7 +351,8 @@ impl PtyHandle {
         self.kitty_enabled.load(Ordering::Relaxed)
     }
 
-    /// Locks the shadow screen and delegates to [`crate::agent::pty::snapshot_with_scrollback`].
+    /// Locks the shadow screen and delegates to
+    /// [`generate_ansi_snapshot`](crate::terminal::generate_ansi_snapshot).
     /// Appends the kitty keyboard push sequence when the inner PTY has
     /// activated kitty mode, so connecting terminals enter kitty mode.
     ///
@@ -331,18 +360,18 @@ impl PtyHandle {
     /// the snapshot skips the stale visible-screen content and clears instead.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
-        let mut parser = self
+        let parser = self
             .shadow_screen
             .lock()
             .expect("shadow_screen lock poisoned");
         let skip_visible = self.resize_pending.swap(false, Ordering::AcqRel);
-        let mut snapshot = crate::agent::pty::snapshot_with_scrollback(parser.screen_mut(), skip_visible);
+        let mut snapshot = generate_ansi_snapshot(&*parser, skip_visible);
 
         // Restore kitty keyboard protocol state in the snapshot.
-        // The vt100 shadow screen doesn't track kitty mode, so we append
-        // the push sequence from our own tracking of the raw PTY output.
-        let kitty = self.kitty_enabled.load(Ordering::Relaxed);
-        if kitty {
+        // alacritty tracks kitty mode internally, but the snapshot function
+        // doesn't emit the push sequence — append it so connecting terminals
+        // enter kitty mode.
+        if parser.kitty_enabled() {
             // CSI > 1 u = push kitty keyboard with DISAMBIGUATE_ESCAPE_CODES flag.
             snapshot.extend(b"\x1b[>1u");
         }
@@ -404,22 +433,28 @@ impl PtyHandle {
     // Broker relay injection
     // =========================================================================
 
-    /// Inject PTY output received from the broker (relay mode after Hub restart).
-    ///
-    /// Feeds `data` into the shadow screen so `get_snapshot()` reflects the
-    /// current terminal state, then broadcasts a `PtyEvent::Output` so all
-    /// forwarders (TUI, WebRTC, socket) receive the bytes transparently.
+    /// Inject PTY output received from the broker into this handle.
     ///
     /// Called by `Hub::handle_hub_event` when a `HubEvent::BrokerPtyOutput`
-    /// arrives for this session.
+    /// arrives for this session. Delegates entirely to
+    /// [`crate::agent::spawn::process_pty_bytes`], the canonical byte
+    /// processor, guaranteeing identical events and shadow-screen state
+    /// regardless of the originating source.
     pub fn feed_broker_output(&self, data: &[u8]) {
-        // Update shadow screen for future snapshot requests.
-        if let Ok(mut parser) = self.shadow_screen.lock() {
-            parser.process(data);
-        }
-        // Broadcast to all subscribed forwarders.
-        // Lagged receivers will skip missed frames — same behavior as a live PTY.
-        let _ = self.event_tx.send(PtyEvent::Output(data.to_vec()));
+        let mut lcv = self
+            .last_cursor_visible
+            .lock()
+            .expect("last_cursor_visible lock poisoned");
+        crate::agent::spawn::process_pty_bytes(
+            data,
+            &self.shadow_screen,
+            &self.event_tx,
+            &self.kitty_enabled,
+            &self.resize_pending,
+            self.detect_notifs,
+            &mut lcv,
+            "Broker",
+        );
     }
 }
 
@@ -439,7 +474,8 @@ mod tests {
         let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) = pty_session.get_direct_access();
         // Leak the session to keep the state alive for tests
         std::mem::forget(pty_session);
-        PtyHandle::new(event_tx, shared_state, shadow_screen, kitty_enabled, resize_pending, port)
+        // detect_notifs=true: test PTYs use CLI-session behavior
+        PtyHandle::new(event_tx, shared_state, shadow_screen, kitty_enabled, resize_pending, true, port)
     }
 
     #[test]

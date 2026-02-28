@@ -109,6 +109,84 @@ pub struct PtyNotificationEvent {
     pub notification: crate::agent::AgentNotification,
 }
 
+/// Item queued for a per-peer async send task.
+///
+/// The Hub event loop pushes these into a bounded `mpsc` channel instead of
+/// calling `block_in_place`. A dedicated `tokio::spawn` task per peer drains
+/// the channel and performs the actual async DataChannel send with timeout.
+#[derive(Debug)]
+pub(crate) enum WebRtcSendItem {
+    /// PTY output (hot path): subscription_id + raw data.
+    Pty {
+        /// Subscription ID for browser-side routing.
+        subscription_id: String,
+        /// Raw PTY data (already prefixed with 0x01 for terminal output).
+        data: Vec<u8>,
+    },
+    /// JSON control message from Lua `webrtc.send()`.
+    Json {
+        /// Serialized JSON bytes.
+        data: Vec<u8>,
+    },
+    /// Binary message from Lua `webrtc.send_binary()`.
+    Binary {
+        /// Raw binary data.
+        data: Vec<u8>,
+    },
+    /// Stream multiplexer frame.
+    Stream {
+        /// Frame type byte.
+        frame_type: u8,
+        /// Stream identifier.
+        stream_id: u16,
+        /// Frame payload.
+        payload: Vec<u8>,
+    },
+    /// Bundle refresh (ratchet restart, unencrypted).
+    BundleRefresh {
+        /// 161-byte DeviceKeyBundle.
+        bundle_bytes: Vec<u8>,
+    },
+}
+
+/// Per-peer send task state stored in the Hub.
+///
+/// When a WebRTC DataChannel opens, the Hub creates one of these per browser
+/// identity. The bounded sender feeds items to a spawned async task that
+/// performs the actual `send_pty_raw` / `send_to` calls with timeout.
+/// Dropping the sender causes the task to exit naturally.
+pub(crate) struct PeerSendState {
+    /// Bounded channel sender for queuing send items.
+    pub tx: tokio::sync::mpsc::Sender<WebRtcSendItem>,
+    /// Set to `true` when the send task detects a dead peer (timeout/error).
+    /// The event loop checks this to skip further sends (circuit breaker).
+    pub dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Handle for the spawned send task (aborted on cleanup).
+    pub task: tokio::task::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for PeerSendState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerSendState")
+            .field("dead", &self.dead.load(std::sync::atomic::Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Capacity of the per-peer send channel.
+///
+/// 256 items provides enough buffering for bursty PTY output while bounding
+/// memory usage (~1MB per peer at ~4KB per PTY chunk). When full, the event
+/// loop drops the oldest item (same behavior as the previous bounded channel).
+const PEER_SEND_CHANNEL_CAPACITY: usize = 256;
+
+/// Timeout for individual DataChannel sends in per-peer tasks.
+///
+/// Dead peers cause SCTP retransmit backpressure that can block `send_data()`
+/// for 60+ seconds. This timeout ensures the send task marks the peer as dead
+/// rather than blocking indefinitely.
+const PEER_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Maximum pending observer notifications before oldest are dropped.
 ///
 /// Prevents unbounded memory growth if observers are registered but
@@ -180,6 +258,21 @@ pub struct Hub {
     /// negotiation that never completes due to network issues).
     /// Connections that don't reach "Connected" within 30 seconds are cleaned up.
     webrtc_connection_started: std::collections::HashMap<String, Instant>,
+
+    /// Per-peer async send tasks, keyed by browser identity.
+    ///
+    /// Each entry has a bounded channel sender + a spawned task that drains
+    /// items and performs the actual async DataChannel send. Created when
+    /// `DcOpened` fires; dropped when the peer disconnects.
+    pub(crate) webrtc_send_tasks: std::collections::HashMap<String, PeerSendState>,
+
+    /// Periodic DataChannel ping tasks, keyed by browser identity.
+    ///
+    /// Each task sends `{ "type": "dc_ping" }` every 10 seconds through the
+    /// peer's send channel. The browser responds with `dc_pong`; if pongs
+    /// stop arriving, the browser detects the dead connection and reconnects.
+    /// Aborted when the peer disconnects (cleanup_webrtc_channel).
+    dc_ping_tasks: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
 
     /// Pending close notifications keyed by Olm identity key.
     ///
@@ -452,6 +545,8 @@ impl Hub {
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),
             webrtc_connection_started: std::collections::HashMap::new(),
+            webrtc_send_tasks: std::collections::HashMap::new(),
+            dc_ping_tasks: std::collections::HashMap::new(),
             webrtc_pending_closes: std::collections::HashMap::new(),
             webrtc_pty_output_tx,
             webrtc_pty_output_rx: Some(webrtc_pty_output_rx),
@@ -668,39 +763,35 @@ impl Hub {
             log::warn!("[broker] failed to set timeout: {e}");
         }
 
-        // Clone the stream before consuming `conn` into the mutex.
-        // The forwarder is started *after* the broker_reconnected Lua event fires
-        // (see below) so that BrokerSessionRegistered events are queued before any
-        // BrokerPtyOutput events the forwarder produces. This eliminates the race
-        // where output frames arrive before session routing is registered.
-        let stream_opt = match conn.try_clone_stream() {
-            Ok(s) => Some(s),
-            Err(e) => {
-                log::warn!("[broker] failed to clone socket for reader thread: {e}");
-                None
-            }
-        };
+        // Install the demux reader thread before storing conn.
+        //
+        // The demux thread is the sole reader of the broker socket. It routes:
+        //   PtyOutput / PtyExited   → hub_event_tx (HubEvent channel)
+        //   Control frames          → BrokerConnection::response_rx (channel)
+        //
+        // After install_forwarder(), read_response() no longer reads the socket
+        // directly, eliminating the race where the forwarder and read_response()
+        // both competed to consume the same Registered frame off the shared
+        // kernel receive buffer (which caused silent registration failure and
+        // zero TUI output).
+        //
+        // install_forwarder() is called BEFORE broker_reconnected fires so the
+        // demux thread is running when get_pty_snapshot_from_broker() calls
+        // read_response() inside the Lua callback — responses come through the
+        // channel, not the socket, so there is no contention.
+        if let Err(e) = conn.install_forwarder(self.hub_event_tx.clone()) {
+            log::warn!("[broker] failed to install demux reader: {e}; output forwarding disabled");
+        }
 
         // Store the connection before firing broker_reconnected so that
         // get_pty_snapshot_from_broker() works inside the Lua callback.
         *self.broker_connection.lock().unwrap() = Some(conn);
         log::info!("[broker] connected");
 
-        // Fire the Lua event synchronously while the forwarder thread does not
-        // yet exist. The callback queues BrokerSessionRegistered events and
-        // populates HandleCache. When the forwarder starts below, any
-        // BrokerPtyOutput it sends will arrive in the channel after those
-        // BrokerSessionRegistered events, eliminating the routing race.
         if is_reconnect {
             if let Err(e) = self.lua.fire_json_event("broker_reconnected", &serde_json::json!({})) {
                 log::warn!("[broker] broker_reconnected event error: {e}");
             }
-        }
-
-        // Start the output forwarder now that session routing is registered.
-        if let Some(stream) = stream_opt {
-            let event_tx = self.hub_event_tx.clone();
-            crate::broker::start_output_forwarder(stream, event_tx);
         }
     }
 
@@ -919,6 +1010,12 @@ impl Hub {
         // Close all stream multiplexers
         for (_id, mut mux) in self.stream_muxes.drain() {
             mux.close_all();
+        }
+
+        // Shut down per-peer send tasks (dropping sender causes task exit)
+        for (_id, state) in self.webrtc_send_tasks.drain() {
+            drop(state.tx);
+            state.task.abort();
         }
 
         // Disconnect all WebRTC channels (fire-and-forget to avoid deadlock)

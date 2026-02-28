@@ -13,8 +13,10 @@ path = "src/main.rs"
 # TUI framework
 ratatui = "0.30"
 crossterm = "0.29"
-# Terminal emulation - 0.16+ has working scrollback (fixes scrollback panic)
-vt100 = "0.16"
+# Terminal emulation - alacritty_terminal is battle-tested (Zed, iced_term),
+# handles all sequences vt100 silently drops, and gives direct cell-array access
+# for generating accurate ANSI snapshots on browser reconnect.
+alacritty_terminal = "0.25.1"
 
 # PTY handling
 portable-pty = "0.9"

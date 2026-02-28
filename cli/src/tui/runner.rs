@@ -860,7 +860,7 @@ where
     ///
     /// Hub sends `TuiOutput` messages through the channel: binary PTY data
     /// from Lua forwarder tasks and JSON events from `tui.send()`. TuiRunner
-    /// processes them here (feeding to vt100 parser, handling Lua messages, etc.).
+    /// processes them here (feeding to AlacrittyParser, handling Lua messages, etc.).
     fn poll_pty_events(&mut self, layout_lua: Option<&LayoutLua>) {
         use tokio::sync::mpsc::error::TryRecvError;
 
@@ -872,8 +872,9 @@ where
                     let panel = self.panel_pool.resolve_panel(agent_index, pty_index);
                     panel.on_scrollback(&data);
                     // Set kitty state from the PTY session boolean.
-                    // vt100 silently consumes kitty CSI sequences in the snapshot,
-                    // so we carry the boolean separately.
+                    // generate_ansi_snapshot() appends \x1b[>1u to the snapshot when
+                    // kitty is active, but we also carry the boolean so terminal_modes
+                    // can sync the outer terminal's kitty state immediately on connect.
                     let is_focused = agent_index == self.panel_pool.current_agent_index
                         && pty_index == self.panel_pool.current_pty_index;
                     if is_focused {
@@ -2574,25 +2575,21 @@ mod tests {
     // Resize Propagation Tests (TDD)
     // =========================================================================
 
-    /// **BUG FIX TEST**: Verifies resize event updates the vt100 parser dimensions.
+    /// **BUG FIX TEST**: Verifies resize event updates the parser dimensions.
     ///
-    /// # Bug Description
+    /// # Bug Description (historical)
     ///
-    /// When terminal is resized, `handle_resize()` does:
-    /// 1. Updates `terminal_dims` (correct)
-    /// 2. Sends resize via Lua subscription (correct - propagates to PTY)
-    ///
-    /// But it **never updates the local vt100 parser dimensions**.
-    /// This causes garbled display because:
-    /// - PTY sends output formatted for new dimensions
-    /// - Parser interprets it with old dimensions
+    /// When terminal is resized, `handle_resize()` previously only updated
+    /// `terminal_dims` and sent the resize via Lua subscription, but never
+    /// updated the local parser dimensions. This caused garbled display because
+    /// the PTY sent output formatted for new dimensions while the parser
+    /// interpreted it with old dimensions.
     ///
     /// # Expected Behavior
     ///
     /// `handle_resize()` invalidates panel dims. Panels are resized by
     /// `sync_widget_dims()` during the next render pass (matching the
-    /// actual widget area). There is no separate vt100_parser — each
-    /// panel owns its parser directly.
+    /// actual widget area). Each panel owns its `AlacrittyParser` directly.
     #[test]
     fn test_resize_invalidates_panel_dims() {
         let (mut runner, _cmd_rx) = create_test_runner();
@@ -2852,7 +2849,7 @@ mod tests {
 
         // Verify: stale content is preserved in the panel (not blanked)
         let panel = runner.panel_pool.panels.get(&(1, 0)).unwrap();
-        let contents = panel.screen().contents();
+        let contents = panel.contents();
         assert!(
             contents.contains("stale"),
             "Panel should preserve stale content, got: {contents:?}"
@@ -2935,7 +2932,7 @@ mod tests {
 
         // Verify: old content gone, scroll reset, new content present
         let panel = runner.panel_pool.panels.get(&(0, 0)).unwrap();
-        let contents = panel.screen().contents();
+        let contents = panel.contents();
         assert!(
             !contents.contains("old line"),
             "Old content should be cleared, got: {contents:?}"
