@@ -14,6 +14,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Term;
+use alacritty_terminal::vte::ansi::CursorShape;
 
 use ratatui::{
     buffer::Buffer,
@@ -172,31 +173,84 @@ fn render_grid(
     }
 }
 
-/// Render cursor at current position.
+/// Render cursor at current position using alacritty's `RenderableCursor`.
+///
+/// `RenderableCursor` (from [`Term::renderable_content`]) handles three things
+/// that raw `grid.cursor.point` does not:
+/// - Wide-character spacer adjustment (column moves left one for wide glyphs)
+/// - VI mode (uses `vi_mode_cursor.point` when VI is active)
+/// - Visibility (`CursorShape::Hidden` when DECTCEM is off)
+///
+/// Cursor shapes are rendered as ratatui buffer effects:
+/// - `Block` — reverse-video on the cell (or `CursorConfig::symbol` on a space)
+/// - `Beam` — thin left bar `▎` overlaid on the cell
+/// - `Underline` — underline modifier on the cell character (or `_` on a space)
+/// - `Hidden` — early return; nothing rendered
 fn render_cursor(
     term: &Term<NoopListener>,
     area: Rect,
     buf: &mut Buffer,
     cursor_config: &CursorConfig,
 ) {
-    let cursor_point = term.grid().cursor.point;
-    let cursor_col = cursor_point.column.0 as u16;
-    let cursor_row = cursor_point.line.0 as u16;
+    let renderable = term.renderable_content().cursor;
+
+    // CursorShape::Hidden means DECTCEM is off — skip rendering entirely.
+    if renderable.shape == CursorShape::Hidden {
+        return;
+    }
+
+    // renderable_content() corrects wide-char spacer position for us.
+    let cursor_col = renderable.point.column.0 as u16;
+    // line.0 is always non-negative for viewport cursor (scrollback is negative).
+    let cursor_row = renderable.point.line.0 as u16;
 
     let buf_x = area.x + cursor_col;
     let buf_y = area.y + cursor_row;
 
-    if buf_x < area.x + area.width && buf_y < area.y + area.height {
-        let buf_cell = &mut buf[(buf_x, buf_y)];
-        let grid = term.grid();
-        let cell = &grid[cursor_point];
+    if buf_x >= area.x + area.width || buf_y >= area.y + area.height {
+        return;
+    }
 
-        if cell.c != ' ' && cell.c != '\0' {
-            buf_cell.set_style(cursor_config.style.add_modifier(Modifier::REVERSED));
-        } else {
-            buf_cell.set_symbol(&cursor_config.symbol);
+    let buf_cell = &mut buf[(buf_x, buf_y)];
+    let grid = term.grid();
+    let cell = &grid[renderable.point];
+    let has_char = cell.c != ' ' && cell.c != '\0';
+
+    match renderable.shape {
+        CursorShape::Block => {
+            // Reverse-video on the cell character; solid block on a space.
+            if has_char {
+                buf_cell.set_style(cursor_config.style.add_modifier(Modifier::REVERSED));
+            } else {
+                buf_cell.set_symbol(&cursor_config.symbol);
+                buf_cell.set_style(cursor_config.style);
+            }
+        }
+        CursorShape::Beam => {
+            // Thin vertical bar at left edge of cell — preserves background color.
+            buf_cell.set_symbol("▎");
             buf_cell.set_style(cursor_config.style);
         }
+        CursorShape::Underline => {
+            // Underline the existing character (or a placeholder underscore).
+            if has_char {
+                buf_cell.set_style(cursor_config.style.add_modifier(Modifier::UNDERLINED));
+            } else {
+                buf_cell.set_symbol("_");
+                buf_cell.set_style(cursor_config.style);
+            }
+        }
+        // HollowBlock: used in vi-mode unfocused — render as reversed like Block.
+        CursorShape::HollowBlock => {
+            if has_char {
+                buf_cell.set_style(cursor_config.style.add_modifier(Modifier::REVERSED));
+            } else {
+                buf_cell.set_symbol(&cursor_config.symbol);
+                buf_cell.set_style(cursor_config.style);
+            }
+        }
+        // Hidden is already handled above.
+        CursorShape::Hidden => {}
     }
 }
 
