@@ -184,16 +184,6 @@ impl TerminalModes {
         self.inner_kitty_enabled
     }
 
-    /// Reset cursor shape to terminal default.
-    ///
-    /// Called when the focused panel changes or when the TUI exits, ensuring
-    /// the outer terminal cursor is left in its configured default state.
-    pub fn reset_cursor_style(&mut self) {
-        if self.outer_cursor_style.is_some() {
-            self.outer_cursor_style = None;
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[0q");
-        }
-    }
 }
 
 /// Map a [`CursorStyle`] to the corresponding DECSCUSR escape sequence bytes.
