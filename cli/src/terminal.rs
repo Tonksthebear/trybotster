@@ -306,9 +306,16 @@ pub fn generate_ansi_snapshot<L: EventListener>(
     // Reset all SGR attributes and move cursor home.
     out.extend_from_slice(b"\x1b[0m\x1b[H");
 
+    // Capture cursor visibility before any early return — must be applied in
+    // all paths so the browser reflects the correct cursor state on reconnect.
+    let cursor_hidden = !term.mode().contains(TermMode::SHOW_CURSOR);
+
     if skip_visible {
         // Blank screen — the app will redraw after receiving SIGWINCH.
         out.extend_from_slice(b"\x1b[2J\x1b[H");
+        if cursor_hidden {
+            out.extend_from_slice(b"\x1b[?25l");
+        }
         if wants_kitty {
             out.extend_from_slice(b"\x1b[>1u");
         }
@@ -348,6 +355,13 @@ pub fn generate_ansi_snapshot<L: EventListener>(
     let row = cursor.line.0 as usize + 1;
     let col = cursor.column.0 + 1;
     out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
+
+    // Restore cursor visibility. The default (after reconnect) is shown; only
+    // emit the hide sequence if the app has explicitly hidden it (e.g., vim in
+    // insert mode, less, htop). `\x1b[0m` does not affect DECTCEM.
+    if cursor_hidden {
+        out.extend_from_slice(b"\x1b[?25l");
+    }
 
     // Restore kitty keyboard protocol if the terminal had it active.
     // Appended here (not in callers) so both the broker snapshot path and the
@@ -685,6 +699,20 @@ mod tests {
         assert!(p.cursor_hidden());
         p.process(b"\x1b[?25h"); // DECTCEM show
         assert!(!p.cursor_hidden());
+    }
+
+    #[test]
+    fn snapshot_restores_cursor_visibility() {
+        // Cursor visible by default — snapshot must NOT contain hide sequence.
+        let p = AlacrittyParser::new_noop(24, 80, 100);
+        let snap = generate_ansi_snapshot(&p, false);
+        assert!(!snap.contains_slice(b"\x1b[?25l"), "visible cursor should not emit hide");
+
+        // After app hides cursor, snapshot must contain DECTCEM hide sequence.
+        let mut p = AlacrittyParser::new_noop(24, 80, 100);
+        p.process(b"\x1b[?25l");
+        let snap = generate_ansi_snapshot(&p, false);
+        assert!(snap.contains_slice(b"\x1b[?25l"), "hidden cursor must be preserved in snapshot");
     }
 
     #[test]
