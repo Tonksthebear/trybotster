@@ -382,54 +382,6 @@ pub fn scan_cursor_visibility(data: &[u8]) -> Option<bool> {
     result
 }
 
-/// Scan PTY output for OSC 0/2 window title sequences.
-///
-/// Returns the last title found in the buffer, or `None` if no title sequences
-/// were detected. We return only the last because rapid title updates (e.g.,
-/// shell prompt) mean only the final value matters.
-///
-/// Supports both BEL (0x07) and ST (ESC \) terminators.
-/// - OSC 0: `ESC ] 0 ; title BEL` — sets window title and icon name
-/// - OSC 2: `ESC ] 2 ; title BEL` — sets window title only
-pub fn scan_window_title(data: &[u8]) -> Option<String> {
-    let mut last_title = None;
-    let mut i = 0;
-
-    while i + 1 < data.len() {
-        if data[i] == 0x1b && data[i + 1] == b']' {
-            let osc_start = i + 2;
-            // Check for OSC 0; or OSC 2; prefix
-            let is_title = osc_start + 2 <= data.len()
-                && (data[osc_start] == b'0' || data[osc_start] == b'2')
-                && osc_start + 1 < data.len()
-                && data[osc_start + 1] == b';';
-
-            if is_title {
-                let title_start = osc_start + 2;
-                // Find terminator (BEL or ST)
-                let mut end = None;
-                for j in title_start..data.len() {
-                    if data[j] == 0x07 {
-                        end = Some((j, j + 1));
-                        break;
-                    } else if j + 1 < data.len() && data[j] == 0x1b && data[j + 1] == b'\\' {
-                        end = Some((j, j + 2));
-                        break;
-                    }
-                }
-                if let Some((content_end, skip_to)) = end {
-                    let title = String::from_utf8_lossy(&data[title_start..content_end]).to_string();
-                    last_title = Some(title);
-                    i = skip_to;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-
-    last_title
-}
 
 /// Scan PTY output for OSC 7 current working directory sequences.
 ///
@@ -1073,56 +1025,6 @@ mod tests {
         assert!(has_title, "Title should emit regardless of detect_notifs");
         assert!(has_cwd, "CWD should emit regardless of detect_notifs");
         assert!(!has_notification, "Notification should NOT emit when detect_notifs=false");
-    }
-
-    // =========================================================================
-    // Window Title Scanner Tests (OSC 0/2)
-    // =========================================================================
-
-    #[test]
-    fn test_scan_window_title_osc0_bel() {
-        let data = b"\x1b]0;My Terminal Title\x07";
-        assert_eq!(scan_window_title(data), Some("My Terminal Title".to_string()));
-    }
-
-    #[test]
-    fn test_scan_window_title_osc2_bel() {
-        let data = b"\x1b]2;Window Title Only\x07";
-        assert_eq!(scan_window_title(data), Some("Window Title Only".to_string()));
-    }
-
-    #[test]
-    fn test_scan_window_title_st_terminator() {
-        let data = b"\x1b]0;Title with ST\x1b\\";
-        assert_eq!(scan_window_title(data), Some("Title with ST".to_string()));
-    }
-
-    #[test]
-    fn test_scan_window_title_last_wins() {
-        let data = b"\x1b]0;First\x07\x1b]0;Second\x07";
-        assert_eq!(scan_window_title(data), Some("Second".to_string()));
-    }
-
-    #[test]
-    fn test_scan_window_title_empty() {
-        // Empty title (program clearing the title)
-        let data = b"\x1b]0;\x07";
-        assert_eq!(scan_window_title(data), Some(String::new()));
-    }
-
-    #[test]
-    fn test_scan_window_title_none() {
-        assert_eq!(scan_window_title(b"plain text"), None);
-        assert_eq!(scan_window_title(b"\x1b]9;notification\x07"), None);
-    }
-
-    #[test]
-    fn test_scan_window_title_embedded_in_output() {
-        let mut data = Vec::new();
-        data.extend(b"\x1b[32mgreen\x1b[0m");
-        data.extend(b"\x1b]0;~/projects/botster\x07");
-        data.extend(b"more output");
-        assert_eq!(scan_window_title(&data), Some("~/projects/botster".to_string()));
     }
 
     // =========================================================================

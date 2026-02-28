@@ -339,9 +339,9 @@ fn test_hub_reconnect_snapshot_and_output() {
         .expect("Hub A: register_pty must return a session_id");
 
     // Write the first payload through pipe1.  The broker's reader_loop reads
-    // its dup of read_end1, appends to the ring buffer, and sends a PtyOutput
-    // frame.  We do not consume that frame here; we only care that the ring
-    // buffer is populated by the time Hub B requests a snapshot.
+    // its dup of read_end1, feeds it into the AlacrittyParser, and sends a
+    // PtyOutput frame.  We do not consume that frame here; we only care that
+    // the parser has processed the bytes by the time Hub B requests a snapshot.
     let payload_a = b"hub-a-data\n";
     let written1 = unsafe {
         libc::write(
@@ -353,7 +353,7 @@ fn test_hub_reconnect_snapshot_and_output() {
     assert_eq!(written1 as usize, payload_a.len(), "pipe1 write must not short-write");
 
     // Give the broker reader_loop one generous scheduling quantum to read the
-    // pipe and append the bytes to the ring buffer.  200 ms is well above
+    // pipe and feed the bytes into the AlacrittyParser.  200 ms is well above
     // any realistic OS scheduling latency on a lightly loaded machine.
     std::thread::sleep(Duration::from_millis(200));
 
@@ -386,18 +386,21 @@ fn test_hub_reconnect_snapshot_and_output() {
     let (event_tx_b, mut event_rx_b) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
     conn_b.install_forwarder(event_tx_b).expect("Hub B: install_forwarder");
 
-    // ── 5. get_snapshot: ring buffer must contain Hub A's data ───────────────
+    // ── 5. get_snapshot: AlacrittyParser must have Hub A's data ──────────────
     //
-    // The broker's per-session ring buffer persists across Hub connections, so
-    // Hub B receives the bytes written during step 2 even though Hub A never
-    // consumed the PtyOutput frame.
+    // The broker's per-session AlacrittyParser persists across Hub connections,
+    // so Hub B receives a generated ANSI snapshot that includes the text written
+    // during step 2 — even though Hub A never consumed the PtyOutput frame.
+    // The snapshot is ANSI-formatted cell grid output, not raw bytes, so we
+    // search for the text content rather than the exact payload bytes.
     let snapshot = conn_b
         .get_snapshot(session_id1)
         .expect("Hub B: get_snapshot must succeed for the still-live session");
 
+    let snapshot_text = String::from_utf8_lossy(&snapshot);
     assert!(
-        snapshot.windows(payload_a.len()).any(|w| w == payload_a),
-        "ring-buffer snapshot must contain Hub A's payload — got {} bytes: {snapshot:?}",
+        snapshot_text.contains("hub-a-data"),
+        "snapshot must contain Hub A's payload text — got {} bytes: {snapshot:?}",
         snapshot.len()
     );
 
