@@ -424,6 +424,49 @@ The file executes top-to-bottom on load. No registration step — just create an
 Note: new plugin directories must exist at hub start for hot-reload to work — create the
 directory, restart once, then file changes reload automatically.
 
+### Multi-File Plugins (Optional)
+
+A single init.lua is fine for simple plugins. For complex ones, split the code
+across multiple files using a lua/ subdir:
+
+  {plugin-dir}/
+    init.lua
+    lua/
+      {name}/           ← namespace matches the plugin directory name
+        api.lua
+        config.lua
+
+If lua/ exists, Botster adds it to package.path automatically. On hot-reload and
+unload, the path entry and require() cache are cleaned up.
+
+Modules must live under lua/{name}/ so require() calls are namespaced and don't
+collide with other plugins. Example — splitting HTTP helpers into api.lua:
+
+  -- lua/my-plugin/api.lua
+  local M = {}
+
+  function M.post(url, body, token)
+    http.request({
+      method  = "POST",
+      url     = url,
+      headers = { ["Authorization"] = "Bearer " .. token,
+                  ["Content-Type"]  = "application/json" },
+      body    = body,
+    }, function(resp)
+      if resp.status ~= 200 then
+        log.warn("my-plugin: HTTP " .. resp.status)
+      end
+    end)
+  end
+
+  return M
+
+  -- init.lua
+  local api = require("my-plugin.api")
+
+  local token, _ = secrets.get("my-plugin", "api_token")
+  api.post("https://api.example.com/notify", json.encode({ text = "Agent started" }), token)
+
 ## Step 2: Decide What the Plugin Does
 
 Most plugins combine some of these building blocks:
