@@ -184,19 +184,26 @@ hooks.on("pty_notification", "github_question_notify", function(data)
 
     log.info(string.format("GitHub: posting %s notification for agent %s", notification_type, agent_key))
 
-    http.request(server_url .. "/api/hubs/" .. server_id .. "/notifications", {
-        method = "POST",
+    http.request({
+        method  = "POST",
+        url     = server_url .. "/api/hubs/" .. server_id .. "/notifications",
         headers = {
             ["Authorization"] = "Bearer " .. api_token,
-            ["Content-Type"] = "application/json",
+            ["Content-Type"]  = "application/json",
         },
         json = {
-            repo = agent.repo,
-            issue_number = agent:get_meta("issue_number"),
-            invocation_url = agent:get_meta("invocation_url"),
+            repo              = agent.repo,
+            issue_number      = agent:get_meta("issue_number"),
+            invocation_url    = agent:get_meta("invocation_url"),
             notification_type = notification_type,
         },
-    })
+    }, function(resp, err)
+        if err then
+            log.warn(string.format("GitHub: notification post failed: %s", tostring(err)))
+        elseif resp and resp.status >= 400 then
+            log.warn(string.format("GitHub: notification post returned %d", resp.status))
+        end
+    end)
 end)
 
 -- ============================================================================

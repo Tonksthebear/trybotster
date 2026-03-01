@@ -4,50 +4,56 @@
 //!
 //! # Synchronous API
 //!
-//! `http.get/post/put/delete` block until the response arrives. Suitable
-//! for init-time scripts that run before the tick loop starts.
-//!
-//! **Warning:** Sync calls freeze the entire Hub tick loop (WebRTC, PTY,
-//! timers) for the duration of the request. Use `http.request()` for
-//! runtime HTTP calls.
+//! `http.get/post/put/delete` block until the response arrives. Safe to use
+//! at init time (before the tick loop starts). When called from within an
+//! active tokio runtime they use [`tokio::task::block_in_place`] to avoid
+//! a "Cannot drop a runtime" panic, but they **still stall the event loop**
+//! for the full round-trip. Do not use sync methods from plugin callbacks.
 //!
 //! # Asynchronous API
 //!
-//! `http.request(method, url, opts, callback)` spawns a background thread
-//! and returns immediately. The callback fires on the next tick after the
-//! response arrives. This is the recommended API for production use.
+//! `http.request()` spawns an isolated background thread and returns
+//! immediately. The callback fires on the next Hub tick after the response
+//! arrives. **This is the only safe HTTP API for plugin callbacks.**
 //!
-//! # Usage in Lua
+//! Two calling conventions are accepted:
 //!
 //! ```lua
-//! -- Sync: simple GET (init-time only)
-//! local resp, err = http.get("https://api.example.com/data")
-//! if resp then
-//!     log.info("Status: " .. resp.status)
-//!     log.info("Body: " .. resp.body)
-//! end
-//!
-//! -- Async: non-blocking request (recommended)
+//! -- Positional form
 //! http.request("GET", "https://api.example.com/data", {}, function(resp, err)
-//!     if resp then
-//!         log.info("Status: " .. resp.status)
-//!     else
-//!         log.error("Request failed: " .. err)
-//!     end
+//!     if resp then log.info(resp.body) end
 //! end)
 //!
-//! -- Async: POST with JSON body
-//! http.request("POST", "https://api.example.com/data", {
-//!     json = { name = "bot", version = 1 },
+//! -- Table-first form (matches mcp_defaults.lua documentation)
+//! http.request({ method = "GET", url = "https://api.example.com/data" }, function(resp, err)
+//!     if resp then log.info(resp.body) end
+//! end)
+//!
+//! -- Table-first with options
+//! http.request({
+//!     method  = "POST",
+//!     url     = "https://api.example.com/data",
+//!     json    = { name = "bot", version = 1 },
 //!     headers = { ["Authorization"] = "Bearer token" },
+//!     timeout_ms = 35000,
 //! }, function(resp, err)
 //!     if resp then log.info("Created!") end
 //! end)
 //! ```
 //!
+//! # Synchronous API (init-time only)
+//!
+//! ```lua
+//! local resp, err = http.get("https://api.example.com/data")
+//! if resp then
+//!     log.info("Status: " .. resp.status)
+//!     log.info("Body: " .. resp.body)
+//! end
+//! ```
+//!
 //! # Error Handling
 //!
-//! Functions that can fail return two values following Lua convention:
+//! All functions return two values following Lua convention:
 //! - Success: `value, nil`
 //! - Failure: `nil, error_message`
 
@@ -56,7 +62,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use mlua::{Lua, LuaSerdeExt, Table, Value};
+use mlua::{Lua, LuaSerdeExt, MultiValue, Table, Value};
 
 /// Default request timeout in milliseconds.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -295,14 +301,43 @@ fn apply_opts(
     builder
 }
 
+/// Execute a blocking closure safely regardless of whether a tokio runtime is active.
+///
+/// Inside a tokio multi-threaded runtime, `reqwest::blocking` panics with
+/// "Cannot drop a runtime" if its internal `current_thread` runtime is torn
+/// down on a thread that already owns a runtime handle. [`tokio::task::block_in_place`]
+/// signals the scheduler to evacuate other tasks off the current thread before
+/// blocking, preventing the nested-runtime conflict.
+///
+/// Outside any tokio context (init-time scripts, unit tests) the closure is
+/// called directly — `block_in_place` is not available without a runtime.
+///
+/// **Important:** even with `block_in_place` the calling thread is blocked for
+/// the full request duration. Do not call sync HTTP methods from plugin callbacks;
+/// use `http.request()` instead.
+fn execute_blocking<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 /// Register the `http` table with synchronous and asynchronous HTTP functions.
 ///
 /// Creates a global `http` table with methods:
-/// - `http.get(url, opts?)` - Sync GET (blocks tick loop)
-/// - `http.post(url, opts?)` - Sync POST (blocks tick loop)
-/// - `http.put(url, opts?)` - Sync PUT (blocks tick loop)
-/// - `http.delete(url, opts?)` - Sync DELETE (blocks tick loop)
-/// - `http.request(method, url, opts, callback)` - Async request (non-blocking)
+/// - `http.get(url, opts?)` — Sync GET; safe at init time, blocks tick loop at runtime
+/// - `http.post(url, opts?)` — Sync POST; same caveat
+/// - `http.put(url, opts?)` — Sync PUT; same caveat
+/// - `http.delete(url, opts?)` — Sync DELETE; same caveat
+/// - `http.request(...)` — Async, non-blocking; **use this from plugin callbacks**
+///
+/// `http.request` accepts two calling conventions:
+/// - Positional:  `http.request("METHOD", "url"[, opts_table], callback)`
+/// - Table-first: `http.request({method="METHOD", url="url"[, ...]}, callback)`
 ///
 /// # Errors
 ///
@@ -325,19 +360,21 @@ pub fn register(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
                 );
             });
             let opts = parse_opts(lua, opts)?;
-            let client = reqwest::blocking::Client::builder()
-                .timeout(opts.timeout)
-                .build()
-                .map_err(|e| mlua::Error::external(format!("Failed to create HTTP client: {e}")))?;
-
-            let builder = apply_opts(client.get(&url), &opts);
-
-            match builder.send() {
+            let result = execute_blocking(|| {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(opts.timeout)
+                    .build()
+                    .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+                apply_opts(client.get(&url), &opts)
+                    .send()
+                    .map_err(|e| format!("HTTP GET failed: {e}"))
+            });
+            match result {
                 Ok(resp) => {
                     let table = build_response_table(lua, resp)?;
                     Ok((Some(table), None::<String>))
                 }
-                Err(e) => Ok((None::<Table>, Some(format!("HTTP GET failed: {e}")))),
+                Err(e) => Ok((None::<Table>, Some(e))),
             }
         })
         .map_err(|e| anyhow!("Failed to create http.get function: {e}"))?;
@@ -356,19 +393,21 @@ pub fn register(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
                 );
             });
             let opts = parse_opts(lua, opts)?;
-            let client = reqwest::blocking::Client::builder()
-                .timeout(opts.timeout)
-                .build()
-                .map_err(|e| mlua::Error::external(format!("Failed to create HTTP client: {e}")))?;
-
-            let builder = apply_opts(client.post(&url), &opts);
-
-            match builder.send() {
+            let result = execute_blocking(|| {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(opts.timeout)
+                    .build()
+                    .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+                apply_opts(client.post(&url), &opts)
+                    .send()
+                    .map_err(|e| format!("HTTP POST failed: {e}"))
+            });
+            match result {
                 Ok(resp) => {
                     let table = build_response_table(lua, resp)?;
                     Ok((Some(table), None::<String>))
                 }
-                Err(e) => Ok((None::<Table>, Some(format!("HTTP POST failed: {e}")))),
+                Err(e) => Ok((None::<Table>, Some(e))),
             }
         })
         .map_err(|e| anyhow!("Failed to create http.post function: {e}"))?;
@@ -387,19 +426,21 @@ pub fn register(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
                 );
             });
             let opts = parse_opts(lua, opts)?;
-            let client = reqwest::blocking::Client::builder()
-                .timeout(opts.timeout)
-                .build()
-                .map_err(|e| mlua::Error::external(format!("Failed to create HTTP client: {e}")))?;
-
-            let builder = apply_opts(client.put(&url), &opts);
-
-            match builder.send() {
+            let result = execute_blocking(|| {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(opts.timeout)
+                    .build()
+                    .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+                apply_opts(client.put(&url), &opts)
+                    .send()
+                    .map_err(|e| format!("HTTP PUT failed: {e}"))
+            });
+            match result {
                 Ok(resp) => {
                     let table = build_response_table(lua, resp)?;
                     Ok((Some(table), None::<String>))
                 }
-                Err(e) => Ok((None::<Table>, Some(format!("HTTP PUT failed: {e}")))),
+                Err(e) => Ok((None::<Table>, Some(e))),
             }
         })
         .map_err(|e| anyhow!("Failed to create http.put function: {e}"))?;
@@ -418,19 +459,21 @@ pub fn register(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
                 );
             });
             let opts = parse_opts(lua, opts)?;
-            let client = reqwest::blocking::Client::builder()
-                .timeout(opts.timeout)
-                .build()
-                .map_err(|e| mlua::Error::external(format!("Failed to create HTTP client: {e}")))?;
-
-            let builder = apply_opts(client.delete(&url), &opts);
-
-            match builder.send() {
+            let result = execute_blocking(|| {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(opts.timeout)
+                    .build()
+                    .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+                apply_opts(client.delete(&url), &opts)
+                    .send()
+                    .map_err(|e| format!("HTTP DELETE failed: {e}"))
+            });
+            match result {
                 Ok(resp) => {
                     let table = build_response_table(lua, resp)?;
                     Ok((Some(table), None::<String>))
                 }
-                Err(e) => Ok((None::<Table>, Some(format!("HTTP DELETE failed: {e}")))),
+                Err(e) => Ok((None::<Table>, Some(e))),
             }
         })
         .map_err(|e| anyhow!("Failed to create http.delete function: {e}"))?;
@@ -439,18 +482,129 @@ pub fn register(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
         .set("delete", delete_fn)
         .map_err(|e| anyhow!("Failed to set http.delete: {e}"))?;
 
-    // http.request(method, url, opts, callback) -> (request_id, nil) or (nil, error)
+    // http.request(...) -> (request_id, nil) or (nil, error)
     //
     // Async HTTP request. Spawns a background thread, returns immediately.
-    // The callback fires on the next tick after the response arrives:
+    // The callback fires on the next Hub tick after the response arrives:
     //   callback(response_table, nil)  -- on success
     //   callback(nil, error_string)    -- on failure
+    //
+    // Accepts two calling conventions:
+    //   Positional:  http.request("GET", "url"[, opts_table], callback)
+    //   Table-first: http.request({method="GET", url="url"[, ...]}, callback)
     //
     // Returns (nil, error_string) if the concurrency limit is reached.
     let request_fn = lua
         .create_function(
-            move |lua, (method, url, opts, callback): (String, String, Option<Table>, mlua::Function)| {
-                let opts = parse_opts(lua, opts)?;
+            move |lua, args: MultiValue| {
+                // ── Argument parsing ─────────────────────────────────────────
+                // Support both calling conventions by inspecting the first arg.
+                let mut args: Vec<Value> = args.into_iter().collect();
+                if args.is_empty() {
+                    return Err(mlua::Error::runtime(
+                        "http.request: expected at least 2 arguments",
+                    ));
+                }
+
+                let (method, url, opts, callback) = match args.remove(0) {
+                    // ── Table-first: http.request({method="GET", url="…"[, …]}, cb) ──
+                    Value::Table(opts_table) => {
+                        let method: String = opts_table.get("method").map_err(|_| {
+                            mlua::Error::runtime(
+                                "http.request: opts table must have a 'method' field (e.g. \"GET\")",
+                            )
+                        })?;
+                        let url: String = opts_table.get("url").map_err(|_| {
+                            mlua::Error::runtime(
+                                "http.request: opts table must have a 'url' field",
+                            )
+                        })?;
+                        let callback = match args.into_iter().next() {
+                            Some(Value::Function(f)) => f,
+                            _ => {
+                                return Err(mlua::Error::runtime(
+                                    "http.request: expected callback function as second argument",
+                                ));
+                            }
+                        };
+                        let opts = parse_opts(lua, Some(opts_table))?;
+                        (method, url, opts, callback)
+                    }
+
+                    // ── Positional: http.request("METHOD", "url"[, opts], cb) ──
+                    Value::String(method_str) => {
+                        let method = method_str.to_str().map_err(|_| {
+                            mlua::Error::runtime("http.request: method must be a valid string")
+                        })?.to_string();
+
+                        let url = match args.first() {
+                            Some(Value::String(_)) => match args.remove(0) {
+                                Value::String(s) => s.to_str().map_err(|_| {
+                                    mlua::Error::runtime(
+                                        "http.request: url must be a valid string",
+                                    )
+                                })?.to_string(),
+                                _ => unreachable!(),
+                            },
+                            _ => {
+                                return Err(mlua::Error::runtime(
+                                    "http.request: expected URL string as 2nd argument",
+                                ));
+                            }
+                        };
+
+                        // Remaining args: [opts_table?, callback]
+                        let (opts_table, callback) = match args.len() {
+                            0 => {
+                                return Err(mlua::Error::runtime(
+                                    "http.request: expected callback function",
+                                ));
+                            }
+                            1 => {
+                                // 3-arg form: method, url, callback (no opts)
+                                match args.remove(0) {
+                                    Value::Function(f) => (None, f),
+                                    _ => {
+                                        return Err(mlua::Error::runtime(
+                                            "http.request: 3rd argument must be a callback function",
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => {
+                                // 4-arg form: method, url, opts, callback
+                                let opts_table = match args.remove(0) {
+                                    Value::Table(t) => Some(t),
+                                    Value::Nil => None,
+                                    _ => {
+                                        return Err(mlua::Error::runtime(
+                                            "http.request: 3rd argument must be an opts table or nil",
+                                        ));
+                                    }
+                                };
+                                let callback = match args.remove(0) {
+                                    Value::Function(f) => f,
+                                    _ => {
+                                        return Err(mlua::Error::runtime(
+                                            "http.request: 4th argument must be a callback function",
+                                        ));
+                                    }
+                                };
+                                (opts_table, callback)
+                            }
+                        };
+
+                        let opts = parse_opts(lua, opts_table)?;
+                        (method, url, opts, callback)
+                    }
+
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "http.request: first argument must be a method string or an options table",
+                        ));
+                    }
+                };
+                // ── End argument parsing ──────────────────────────────────────
 
                 // Store callback in Lua registry
                 let callback_key = lua.create_registry_value(callback).map_err(|e| {
@@ -1048,8 +1202,137 @@ mod tests {
         assert_eq!(entries.pending_count(), 0);
     }
 
+    // ── http.request() calling convention tests ───────────────────────────
+
     #[test]
-    fn test_http_in_flight_decrements_after_completion() {
+    fn test_http_request_table_first_form_returns_id() {
+        let lua = Lua::new();
+        let registry = new_http_registry();
+        register(&lua, Arc::clone(&registry)).expect("Should register http primitives");
+
+        let (id, err): (Option<String>, Option<String>) = lua
+            .load(r#"return http.request(
+                { method = "GET", url = "not-a-valid-url" },
+                function(resp, err) end
+            )"#)
+            .eval()
+            .expect("http.request table-first form should be callable");
+
+        assert!(err.is_none(), "Should not error on valid call: {:?}", err);
+        let id = id.expect("Should return a request ID");
+        assert!(id.starts_with("http_"), "ID should start with 'http_', got: {id}");
+    }
+
+    #[test]
+    fn test_http_request_table_first_with_opts_returns_id() {
+        let lua = Lua::new();
+        let registry = new_http_registry();
+        register(&lua, Arc::clone(&registry)).expect("Should register http primitives");
+
+        let (id, err): (Option<String>, Option<String>) = lua
+            .load(r#"return http.request({
+                method     = "GET",
+                url        = "not-a-valid-url",
+                timeout_ms = 1000,
+                headers    = { ["X-Test"] = "yes" },
+            }, function(resp, err) end)"#)
+            .eval()
+            .expect("http.request table-first with opts should be callable");
+
+        assert!(err.is_none(), "Should not error on valid call: {:?}", err);
+        assert!(id.is_some(), "Should return a request ID");
+    }
+
+    #[test]
+    fn test_http_request_three_arg_form_returns_id() {
+        // Positional 3-arg form: http.request("METHOD", "url", callback)
+        let lua = Lua::new();
+        let registry = new_http_registry();
+        register(&lua, Arc::clone(&registry)).expect("Should register http primitives");
+
+        let (id, err): (Option<String>, Option<String>) = lua
+            .load(r#"return http.request("GET", "not-a-valid-url", function(resp, err) end)"#)
+            .eval()
+            .expect("http.request 3-arg form should be callable");
+
+        assert!(err.is_none(), "Should not error on valid 3-arg call: {:?}", err);
+        assert!(id.is_some(), "Should return a request ID");
+    }
+
+    #[test]
+    fn test_http_request_table_first_missing_method_returns_error() {
+        let lua = Lua::new();
+        register(&lua, new_http_registry()).expect("Should register http primitives");
+
+        let result: mlua::Result<(Option<String>, Option<String>)> = lua
+            .load(r#"return http.request({ url = "https://example.com" }, function() end)"#)
+            .eval();
+
+        // Should return a Lua runtime error (not a (nil, err) tuple)
+        assert!(result.is_err(), "Should error when 'method' field is missing");
+    }
+
+    #[test]
+    fn test_http_request_table_first_missing_url_returns_error() {
+        let lua = Lua::new();
+        register(&lua, new_http_registry()).expect("Should register http primitives");
+
+        let result: mlua::Result<(Option<String>, Option<String>)> = lua
+            .load(r#"return http.request({ method = "GET" }, function() end)"#)
+            .eval();
+
+        assert!(result.is_err(), "Should error when 'url' field is missing");
+    }
+
+    #[test]
+    fn test_http_request_wrong_first_arg_returns_error() {
+        let lua = Lua::new();
+        register(&lua, new_http_registry()).expect("Should register http primitives");
+
+        let result: mlua::Result<(Option<String>, Option<String>)> = lua
+            .load(r#"return http.request(42, "https://example.com", function() end)"#)
+            .eval();
+
+        assert!(result.is_err(), "Should error when first arg is not a string or table");
+    }
+
+    #[test]
+    fn test_http_request_table_first_async_error_callback() {
+        // End-to-end: table-first form fires the callback with an error for invalid URLs.
+        let lua = Lua::new();
+        let registry = new_http_registry();
+        register(&lua, Arc::clone(&registry)).expect("Should register http primitives");
+
+        lua.load(r#"
+            _test_result = nil
+            _test_err    = nil
+            http.request({ method = "GET", url = "not-a-valid-url", timeout_ms = 1000 }, function(resp, err)
+                _test_result = resp
+                _test_err    = err
+            end)
+        "#)
+        .exec()
+        .expect("http.request table-first should be callable");
+
+        // Wait for background thread
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let done = { !registry.lock().unwrap().responses.is_empty() };
+            if done { break; }
+            assert!(std::time::Instant::now() < deadline, "Background HTTP thread timed out");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let fired = poll_http_responses(&lua, &registry);
+        assert_eq!(fired, 1);
+
+        let err: Option<String> = lua.load(r#"return _test_err"#).eval().unwrap();
+        assert!(err.is_some(), "Callback should receive an error");
+        assert!(err.unwrap().contains("HTTP GET failed"));
+    }
+
+    #[test]
+    fn test_http_request_in_flight_decrements_after_completion() {
         let lua = Lua::new();
         let registry = new_http_registry();
         register(&lua, Arc::clone(&registry)).expect("Should register http primitives");
