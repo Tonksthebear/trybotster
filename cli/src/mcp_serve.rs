@@ -66,6 +66,11 @@ async fn connect_to_hub(
     delay_ms: u64,
     linear_backoff: bool,
 ) -> Result<tokio::net::UnixStream> {
+    if retries == 0 {
+        return Err(anyhow::anyhow!(
+            "connect_to_hub called with retries=0: {socket_path}"
+        ));
+    }
     let mut last_err: Option<std::io::Error> = None;
     for attempt in 0..retries {
         if attempt > 0 {
@@ -550,6 +555,26 @@ async fn run_session(
 
     write_task.abort();
     read_task.abort();
+
+    // If the hub disconnected, synthesize JSON-RPC errors for every in-flight
+    // request so Claude Code doesn't hang waiting for responses that will
+    // never arrive. The hub has no memory of the old session; pending calls
+    // from before the disconnect will never be fulfilled.
+    if matches!(exit, SessionExit::HubDisconnected) {
+        for (_, jsonrpc_id) in pending_calls.drain() {
+            let err = json!({
+                "jsonrpc": "2.0",
+                "id": jsonrpc_id,
+                "error": {
+                    "code": -32000,
+                    "message": "MCP server disconnected from hub — reconnecting"
+                }
+            });
+            writeln!(stdout, "{}", err)?;
+            stdout.flush()?;
+        }
+    }
+
     Ok(exit)
 }
 
