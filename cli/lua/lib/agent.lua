@@ -702,6 +702,9 @@ function Agent:info()
 
     return {
         id = key,
+        -- HandleCache index — clients MUST use this for PTY subscriptions,
+        -- not derive an index from local list position.
+        agent_index = self.agent_index,
         display_name = display_name,
         title = self.title,
         cwd = self.cwd,
@@ -857,7 +860,7 @@ function Agent.count()
 end
 
 --- Get info tables for all agents (for client broadcast).
--- @return array of info tables
+-- @return array of info tables sorted by agent_index (HandleCache order)
 function Agent.all_info()
     local result = {}
     local seen = {}
@@ -873,6 +876,17 @@ function Agent.all_info()
             result[#result + 1] = ghost_info
         end
     end
+    -- Sort by agent_index so clients receive agents in HandleCache order.
+    -- This ensures local list position == HandleCache index for PTY routing.
+    -- Agents with nil agent_index (edge case) sort last.
+    table.sort(result, function(a, b)
+        local ai = a.agent_index
+        local bi = b.agent_index
+        if ai == nil and bi == nil then return false end
+        if ai == nil then return false end
+        if bi == nil then return true end
+        return ai < bi
+    end)
     return result
 end
 

@@ -226,6 +226,17 @@ impl HandleCache {
         }
     }
 
+    /// Remove a worktree entry by branch name.
+    ///
+    /// Matches on branch rather than path to avoid string-equality fragility
+    /// (trailing slashes, symlink resolution, non-canonical forms).
+    /// Branch name is the stable, git-enforced unique key for a worktree.
+    pub fn remove_worktree_by_branch(&self, branch: &str) {
+        if let Ok(mut wt) = self.worktrees.write() {
+            wt.retain(|(_, b)| b != branch);
+        }
+    }
+
     // ============================================================
     // Connection URL Cache
     // ============================================================
@@ -279,5 +290,46 @@ mod tests {
     fn test_get_all_agents_empty() {
         let cache = HandleCache::new();
         assert!(cache.get_all_agents().is_empty());
+    }
+
+    #[test]
+    fn test_remove_worktree_by_branch_removes_matching_entry() {
+        let cache = HandleCache::new();
+        cache.set_worktrees(vec![
+            ("/worktrees/repo-feat".to_string(), "feature".to_string()),
+            ("/worktrees/repo-main".to_string(), "main".to_string()),
+        ]);
+
+        cache.remove_worktree_by_branch("feature");
+
+        let wt = cache.get_worktrees();
+        assert_eq!(wt.len(), 1);
+        assert_eq!(wt[0].1, "main");
+    }
+
+    #[test]
+    fn test_remove_worktree_by_branch_ignores_path_format() {
+        // Branch match is immune to path variations (trailing slash, etc.)
+        let cache = HandleCache::new();
+        cache.set_worktrees(vec![
+            ("/worktrees/repo-feat/".to_string(), "feature".to_string()),
+        ]);
+
+        // Passing a different path format — branch still matches
+        cache.remove_worktree_by_branch("feature");
+
+        assert!(cache.get_worktrees().is_empty());
+    }
+
+    #[test]
+    fn test_remove_worktree_by_branch_noop_when_not_found() {
+        let cache = HandleCache::new();
+        cache.set_worktrees(vec![
+            ("/worktrees/repo-main".to_string(), "main".to_string()),
+        ]);
+
+        cache.remove_worktree_by_branch("nonexistent");
+
+        assert_eq!(cache.get_worktrees().len(), 1);
     }
 }

@@ -1,0 +1,10 @@
+{
+  "id": 987654321,
+  "html_url": "https://github.com/owner/repo/pull/49#pullrequestreview-987654321",
+  "state": "APPROVED",
+  "body": "Looks great! Nice refactor.",
+  "submitted_at": "2025-01-15T14:00:00Z",
+  "user": {
+    "login": "botster[bot]"
+  }
+}

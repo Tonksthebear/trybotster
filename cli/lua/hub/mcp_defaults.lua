@@ -341,7 +341,11 @@ hub.state is an in-memory key-value store that survives require() reloads:
     headers = { ["Authorization"] = "Bearer " .. token,
                 ["Content-Type"]  = "application/json" },
     body    = json.encode({ text = "Agent started" }),
-  }, function(resp)
+  }, function(resp, err)
+    if err then
+      log.warn("HTTP error: " .. tostring(err))
+      return
+    end
     if resp.status ~= 200 then
       log.warn("HTTP error: " .. tostring(resp.status))
     end
@@ -355,21 +359,28 @@ hub.state is an in-memory key-value store that survives require() reloads:
 ## Connecting to External Services
 
 ActionCable (Rails):
-  local sub = action_cable.subscribe({
-    url = "wss://myapp.com/cable", channel = "MyChannel", params = { room = "x" },
-  }, function(event, data)
-    if event == "received" then log.info(json.encode(data)) end
-  end)
-  sub.perform("my_action", { payload = "..." })
-  sub.unsubscribe()
+  local conn = action_cable.connect()  -- connects to the hub's ActionCable endpoint
+  local ch = action_cable.subscribe(conn, "MyChannel", { room = "x" },
+    function(msg, channel_id)
+      log.info(json.encode(msg))
+    end)
+  action_cable.perform(ch, "my_action", { payload = "..." })
+  action_cable.close(conn)          -- closes connection and all its channels
+  -- action_cable.unsubscribe(ch)   -- or unsubscribe a single channel
+
+  -- With E2E crypto (auto-decrypts signal envelopes on this connection):
+  local crypto_conn = action_cable.connect({ crypto = true })
 
 Raw WebSocket:
-  local ws = websocket.connect("wss://...", {
-    on_message = function(msg) ... end,
-    on_close   = function(code, reason) ... end,
+  local ws, err = websocket.connect("wss://...", {
+    on_open    = function() log.info("connected") end,
+    on_message = function(msg) log.info(msg) end,
+    on_close   = function(code, reason) log.info("closed: " .. reason) end,
+    on_error   = function(e) log.warn("ws error: " .. e) end,
   })
-  ws.send("hello")
-  ws.close()
+  if err then log.error("websocket.connect failed: " .. tostring(err)) return end
+  websocket.send(ws, "hello")
+  websocket.close(ws)
 ]],
                 },
             },
@@ -424,6 +435,49 @@ The file executes top-to-bottom on load. No registration step — just create an
 Note: new plugin directories must exist at hub start for hot-reload to work — create the
 directory, restart once, then file changes reload automatically.
 
+### Multi-File Plugins (Optional)
+
+A single init.lua is fine for simple plugins. For complex ones, split the code
+across multiple files using a lua/ subdir:
+
+  {plugin-dir}/
+    init.lua
+    lua/
+      {name}/           ← namespace matches the plugin directory name
+        api.lua
+        config.lua
+
+If lua/ exists, Botster adds it to package.path automatically. On hot-reload and
+unload, the path entry and require() cache are cleaned up.
+
+Modules must live under lua/{name}/ so require() calls are namespaced and don't
+collide with other plugins. Example — splitting HTTP helpers into api.lua:
+
+  -- lua/my-plugin/api.lua
+  local M = {}
+
+  function M.post(url, body, token)
+    http.request({
+      method  = "POST",
+      url     = url,
+      headers = { ["Authorization"] = "Bearer " .. token,
+                  ["Content-Type"]  = "application/json" },
+      body    = body,
+    }, function(resp)
+      if resp.status ~= 200 then
+        log.warn("my-plugin: HTTP " .. resp.status)
+      end
+    end)
+  end
+
+  return M
+
+  -- init.lua
+  local api = require("my-plugin.api")
+
+  local token, _ = secrets.get("my-plugin", "api_token")
+  api.post("https://api.example.com/notify", json.encode({ text = "Agent started" }), token)
+
 ## Step 2: Decide What the Plugin Does
 
 Most plugins combine some of these building blocks:
@@ -456,7 +510,11 @@ Never hardcode tokens. Use the encrypted secrets store:
     method  = "GET",
     url     = "https://api.example.com/endpoint",
     headers = { ["Authorization"] = "Bearer " .. token },
-  }, function(resp)
+  }, function(resp, err)
+    if err then
+      log.warn("my-plugin: HTTP error: " .. tostring(err))
+      return
+    end
     if resp.status == 200 then
       local data = json.decode(resp.body)
       -- handle data
@@ -479,7 +537,8 @@ Use the state guard pattern:
     S._started = true
     S.poll_timer = timer.every(30, function()
       -- runs every 30 seconds
-      http.request({ method = "GET", url = "https://...", headers = {} }, function(resp)
+      http.request({ method = "GET", url = "https://...", headers = {} }, function(resp, err)
+        if err then log.warn("my-plugin: poll error: " .. tostring(err)) return end
         -- handle updates
       end)
     end)
@@ -539,7 +598,7 @@ The user can invoke this with Ctrl+P → "my-plugin-action".
   }, function(_args)
     local S = require("hub.state").get("my-plugin.state", {})
     return string.format(
-      "Plugin status: %s\nLast update: %s",
+      "Plugin status: %%s\nLast update: %%s",
       S.status or "unknown",
       tostring(S.last_updated or "never")
     )
@@ -567,7 +626,11 @@ The user can invoke this with Ctrl+P → "my-plugin-action".
       url    = "https://api.telegram.org/bot" .. token .. "/sendMessage",
       headers = { ["Content-Type"] = "application/json" },
       body   = json.encode({ chat_id = chat_id, text = text }),
-    }, function(resp)
+    }, function(resp, err)
+      if err then
+        log.warn("telegram: send error: " .. tostring(err))
+        return
+      end
       if resp.status ~= 200 then
         log.warn("telegram: send failed: " .. resp.status)
       end
@@ -608,6 +671,12 @@ The user can invoke this with Ctrl+P → "my-plugin-action".
 - Use state.get() + the _started guard for timers and one-time setup
 - Use function S._before_reload() to cancel timers before reload
 - MCP tools and hooks are automatically cleared before reload and re-registered after
+- For multi-file plugins: require sub-modules at load time into local variables (the
+  normal pattern). If a reload fails, the sub-module require() cache is cleared but
+  package.path is fully restored, so a subsequent successful reload works cleanly.
+  Plugins that lazily call require("my-plugin.api") inside functions after a failed
+  reload will get a fresh load from disk rather than the previous cached version —
+  correct behavior, but worth knowing if sub-module initialization has side effects.
 ]], layer, layer),
                 },
             },
@@ -801,6 +870,30 @@ Manual removal is only needed if you want to conditionally unregister at runtime
             },
         },
     }
+end)
+
+-- =============================================================================
+-- secrets_set (temporary setup tool — remove after use)
+-- =============================================================================
+
+mcp.tool("secrets_set", {
+    description = "Write an encrypted secret to the hub secrets store. Use for one-time plugin setup.",
+    input_schema = {
+        type = "object",
+        properties = {
+            namespace = { type = "string", description = "Secret namespace (e.g. 'telegram')" },
+            key       = { type = "string", description = "Secret key (e.g. 'bot_token')" },
+            value     = { type = "string", description = "Secret value to store encrypted" },
+        },
+        required = { "namespace", "key", "value" },
+    },
+}, function(params, _ctx)
+    local ok, err = secrets.set(params.namespace, params.key, params.value)
+    if ok then
+        return string.format("Stored %s/%s.", params.namespace, params.key)
+    else
+        return string.format("Failed: %s", tostring(err))
+    end
 end)
 
 log.info("MCP default prompts registered: botster-customize-tui, botster-customize-hub, botster-create-plugin, botster-customize-mcp")
