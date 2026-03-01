@@ -6,6 +6,14 @@
 --   agent - Restricted: no process spawn, no keyring, fs limited to improvements/
 local M = {}
 
+-- Remove a known string from package.path (plain match, no pattern escaping needed).
+local function remove_package_path(addition)
+    local start, finish = package.path:find(addition, 1, true)
+    if start then
+        package.path = package.path:sub(1, start - 1) .. package.path:sub(finish + 1)
+    end
+end
+
 -- Track which modules should never be reloaded
 local protected_modules = {
     ["hub.state"] = true,
@@ -114,6 +122,27 @@ function M.load_plugin(path, name)
     -- Register in package.loaded so reload works
     local module_key = "plugin." .. name
     package.loaded[module_key] = result or true
+
+    -- If the plugin has a lua/ subdir, prepend it to package.path so the plugin
+    -- can require() its own modules (e.g. require("my-plugin.api")).
+    -- Modules must live under lua/{name}/ to avoid collisions with other plugins.
+    -- The registry entry must already exist (pre-registered by hub/init.lua or
+    -- reload_plugin) so we can attach lua_path for later cleanup.
+    local plugin_dir = path:match("^(.+)/[^/]+$") or ""
+    if plugin_dir ~= "" then
+        local lua_dir = plugin_dir .. "/lua"
+        if fs.is_dir(lua_dir) then
+            local addition = lua_dir .. "/?.lua;" .. lua_dir .. "/?/init.lua;"
+            package.path = addition .. package.path
+            local st = require("hub.state")
+            local reg = st.get("plugin_registry", {})
+            if reg[name] then
+                reg[name].lua_path = addition
+            end
+            log.debug(string.format("Plugin %s: lua/ subdir added to package.path", name))
+        end
+    end
+
     log.info(string.format("Loaded plugin: %s from %s", name, path))
     return true
 end
@@ -144,6 +173,24 @@ function M.reload_plugin(name)
         end
     end
 
+    -- Clean up lua/ subdir package.path entry and require() cache from the previous
+    -- load before re-executing the plugin. load_plugin will re-add the path if the
+    -- lua/ subdir still exists after reload. Save old_lua_path so we can restore
+    -- package.path on failure (same symmetry as restoring package.loaded[module_key]).
+    local old_lua_path = entry.lua_path
+    if old_lua_path then
+        remove_package_path(old_lua_path)
+        entry.lua_path = nil
+        -- Purge require() cache for this plugin's namespace (convention: modules
+        -- must live under lua/{name}/, so all require keys start with "{name}.").
+        local prefix = name .. "."
+        for key in pairs(package.loaded) do
+            if key:sub(1, #prefix) == prefix then
+                package.loaded[key] = nil
+            end
+        end
+    end
+
     -- Batch MCP notifications: suppress mcp_tools_changed/mcp_prompts_changed during
     -- reset + re-registration, then emit exactly once per changed registry at the end.
     -- end_batch() runs even on load failure (registrations were cleared by reset,
@@ -165,8 +212,12 @@ function M.reload_plugin(name)
     if mcp then mcp.end_batch() end
 
     if not ok then
-        -- Restore old module on failure
+        -- Restore old module and lua/ package.path on failure
         package.loaded[module_key] = old
+        if old_lua_path then
+            entry.lua_path = old_lua_path
+            package.path = old_lua_path .. package.path
+        end
         return false, "Failed to reload plugin: " .. name
     end
 

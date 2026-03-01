@@ -239,9 +239,11 @@ commands.register("plugin:load", function(client, sub_id, command)
         return
     end
 
+    -- Pre-register so load_plugin can update the entry (e.g., lua_path)
+    registry[name] = { path = found.init_path }
     local ok = loader.load_plugin(found.init_path, name)
-    if ok then
-        registry[name] = { path = found.init_path }
+    if not ok then
+        registry[name] = nil
     end
     respond(client, sub_id, command.request_id, { ok = ok, plugin_name = name })
 end, { description = "Load a newly installed plugin" })

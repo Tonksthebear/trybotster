@@ -115,9 +115,11 @@ local function on_plugin_change(event)
             local init_path = event.path:match("^(.*/plugins/" .. name .. "/init%.lua)$")
             if init_path then
                 log.info(string.format("New plugin detected, loading: %s", name))
+                -- Pre-register so load_plugin can update the entry (e.g., lua_path)
+                registry[name] = { path = init_path }
                 local ok = loader.load_plugin(init_path, name)
-                if ok then
-                    registry[name] = { path = init_path }
+                if not ok then
+                    registry[name] = nil
                 end
             end
         end
