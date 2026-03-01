@@ -498,7 +498,9 @@ fn send_with_fd(stream: &UnixStream, data: &[u8], fd: RawFd) -> Result<()> {
         let cmsg = libc::CMSG_FIRSTHDR(&msg as *const _);
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size as libc::c_uint);
+        // CMSG_LEN returns u32 on both platforms, but cmsg_len is usize on Linux
+        // and u32 on macOS. Use `as _` to coerce portably.
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size as libc::c_uint) as _;
         let data_ptr = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
         std::ptr::write_unaligned(data_ptr, fd);
     }

@@ -6,14 +6,6 @@
 --   agent - Restricted: no process spawn, no keyring, fs limited to improvements/
 local M = {}
 
--- Remove a known string from package.path (plain match, no pattern escaping needed).
-local function remove_package_path(addition)
-    local start, finish = package.path:find(addition, 1, true)
-    if start then
-        package.path = package.path:sub(1, start - 1) .. package.path:sub(finish + 1)
-    end
-end
-
 -- Track which modules should never be reloaded
 local protected_modules = {
     ["hub.state"] = true,
@@ -74,9 +66,43 @@ function M.is_protected(module_name)
     return protected_modules[module_name] == true
 end
 
+-- Add a plugin's lua/ dir to package.path (idempotent).
+local function add_to_package_path(lua_dir)
+    local entry1 = lua_dir .. "/?.lua"
+    local entry2 = lua_dir .. "/?/init.lua"
+    if not package.path:find(entry1, 1, true) then
+        package.path = entry1 .. ";" .. entry2 .. ";" .. package.path
+    end
+end
+
+-- Remove a plugin's lua/ dir from package.path.
+local function remove_from_package_path(lua_dir)
+    local entry1 = lua_dir .. "/?.lua"
+    local entry2 = lua_dir .. "/?/init.lua"
+    local parts = {}
+    for part in (package.path .. ";"):gmatch("([^;]*);") do
+        if part ~= entry1 and part ~= entry2 and part ~= "" then
+            table.insert(parts, part)
+        end
+    end
+    package.path = table.concat(parts, ";")
+end
+
+-- Clear all package.loaded entries belonging to a plugin's namespace (e.g. "telegram.*").
+local function clear_plugin_namespace(name)
+    local prefix = name .. "."
+    for key in pairs(package.loaded) do
+        if key:sub(1, #prefix) == prefix then
+            package.loaded[key] = nil
+        end
+    end
+end
+
 --- Load a plugin by absolute path (not via require/package.path).
 -- Loads the file with full _ENV (same trust as user plugins), registers
 -- it in package.loaded so it can be reloaded by name.
+-- If the plugin directory contains a lua/ subdir, it is added to package.path
+-- so the plugin can require() its own modules (e.g. require("telegram.api")).
 -- @param path string Absolute path to the plugin's init.lua
 -- @param name string Plugin name (used for registration and logging)
 -- @return boolean success
@@ -123,24 +149,13 @@ function M.load_plugin(path, name)
     local module_key = "plugin." .. name
     package.loaded[module_key] = result or true
 
-    -- If the plugin has a lua/ subdir, prepend it to package.path so the plugin
-    -- can require() its own modules (e.g. require("my-plugin.api")).
-    -- Modules must live under lua/{name}/ to avoid collisions with other plugins.
-    -- The registry entry must already exist (pre-registered by hub/init.lua or
-    -- reload_plugin) so we can attach lua_path for later cleanup.
-    local plugin_dir = path:match("^(.+)/[^/]+$") or ""
-    if plugin_dir ~= "" then
-        local lua_dir = plugin_dir .. "/lua"
-        if fs.is_dir(lua_dir) then
-            local addition = lua_dir .. "/?.lua;" .. lua_dir .. "/?/init.lua;"
-            package.path = addition .. package.path
-            local st = require("hub.state")
-            local reg = st.get("plugin_registry", {})
-            if reg[name] then
-                reg[name].lua_path = addition
-            end
-            log.debug(string.format("Plugin %s: lua/ subdir added to package.path", name))
-        end
+    -- Add plugin's lua/ subdir to package.path if it exists, so the plugin
+    -- can require() its own modules namespaced by plugin name.
+    local plugin_dir = path:match("^(.*)/[^/]+$") or "."
+    local lua_dir = plugin_dir .. "/lua"
+    if fs.exists(lua_dir) and fs.is_dir(lua_dir) then
+        add_to_package_path(lua_dir)
+        log.info(string.format("Plugin %s: registered lua/ at %s", name, lua_dir))
     end
 
     log.info(string.format("Loaded plugin: %s from %s", name, path))
@@ -173,24 +188,6 @@ function M.reload_plugin(name)
         end
     end
 
-    -- Clean up lua/ subdir package.path entry and require() cache from the previous
-    -- load before re-executing the plugin. load_plugin will re-add the path if the
-    -- lua/ subdir still exists after reload. Save old_lua_path so we can restore
-    -- package.path on failure (same symmetry as restoring package.loaded[module_key]).
-    local old_lua_path = entry.lua_path
-    if old_lua_path then
-        remove_package_path(old_lua_path)
-        entry.lua_path = nil
-        -- Purge require() cache for this plugin's namespace (convention: modules
-        -- must live under lua/{name}/, so all require keys start with "{name}.").
-        local prefix = name .. "."
-        for key in pairs(package.loaded) do
-            if key:sub(1, #prefix) == prefix then
-                package.loaded[key] = nil
-            end
-        end
-    end
-
     -- Batch MCP notifications: suppress mcp_tools_changed/mcp_prompts_changed during
     -- reset + re-registration, then emit exactly once per changed registry at the end.
     -- end_batch() runs even on load failure (registrations were cleared by reset,
@@ -202,6 +199,12 @@ function M.reload_plugin(name)
         mcp.reset("@" .. entry.path)
     end
 
+    -- Remove plugin's lua/ path and namespace modules so stale require() cache
+    -- doesn't survive reload. load_plugin() re-adds the path after loading.
+    local plugin_dir = entry.path:match("^(.*)/[^/]+$") or "."
+    remove_from_package_path(plugin_dir .. "/lua")
+    clear_plugin_namespace(name)
+
     -- Clear old module
     package.loaded[module_key] = nil
 
@@ -212,16 +215,48 @@ function M.reload_plugin(name)
     if mcp then mcp.end_batch() end
 
     if not ok then
-        -- Restore old module and lua/ package.path on failure
+        -- Restore old module on failure
         package.loaded[module_key] = old
-        if old_lua_path then
-            entry.lua_path = old_lua_path
-            package.path = old_lua_path .. package.path
-        end
         return false, "Failed to reload plugin: " .. name
     end
 
     return true
+end
+
+--- Unload a plugin by name, cleaning up package.path and loaded modules.
+-- Runs _before_reload lifecycle hook, clears MCP registrations, removes the
+-- plugin's lua/ dir from package.path, and clears its namespace from package.loaded.
+-- @param name string Plugin name (e.g., "telegram")
+function M.unload_plugin(name)
+    local state = require("hub.state")
+    local registry = state.get("plugin_registry", {})
+    local entry = registry[name]
+
+    local module_key = "plugin." .. name
+    local old = package.loaded[module_key]
+
+    -- Lifecycle hook
+    if old and type(old) == "table" and old._before_reload then
+        local ok, err = pcall(old._before_reload)
+        if not ok then
+            log.warn(string.format("_before_reload failed for plugin %s: %s", name, tostring(err)))
+        end
+    end
+
+    -- Clear MCP registrations
+    if mcp and entry then
+        mcp.reset("@" .. entry.path)
+    end
+
+    -- Remove lua/ path and namespace modules
+    if entry then
+        local plugin_dir = entry.path:match("^(.*)/[^/]+$") or "."
+        remove_from_package_path(plugin_dir .. "/lua")
+    end
+    clear_plugin_namespace(name)
+    package.loaded[module_key] = nil
+
+    log.info(string.format("Unloaded plugin: %s", name))
 end
 
 -- ============================================================================
