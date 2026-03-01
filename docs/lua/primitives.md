@@ -2,6 +2,16 @@
 
 21 Rust modules are registered as Lua globals, plus `mcp` which is a pure Lua module. Core primitives load unconditionally; event-driven primitives require a HubEventSender.
 
+## Calling Conventions & Execution Models
+
+Primitives expose different calling patterns to control blocking semantics:
+
+- **Async (table-first, callbacks):** `http.request({...}, callback)`, `websocket.connect(url, {on_message=fn})`, `action_cable.subscribe(conn, ch, params, callback)` — non-blocking, safe everywhere. Callbacks run asynchronously when events arrive.
+- **Sync (positional shortcuts):** `http.get(url)`, `http.post(url, body)` — BLOCKING the event loop. Only safe at plugin load time (before hub starts). Using in callbacks breaks WebRTC health checks.
+- **Dedicated threads:** `websocket`, `action_cable` — spawn dedicated OS/async threads for I/O, keeping the hub event loop responsive.
+
+**Critical invariant:** The hub event loop runs inside tokio's `block_on()`. Any blocking operation (sync HTTP, file I/O) stalls the entire hub, preventing `dc_pong` responses from reaching the browser within 30 seconds. Browser times out and closes WebRTC connection. Always use async forms in callbacks and runtime code.
+
 ## Core Primitives (no HubEventSender needed)
 
 ### `log`
@@ -134,12 +144,23 @@ events.emit(event, data)          -- Lua-side emit; Rust also emits into this
 
 ### `http`
 ```lua
+-- Positional shortcuts (SYNC, BLOCKING - only safe at plugin load time, NOT in callbacks)
 http.get(url, headers?) -> {status, body, headers}
 http.post(url, body, headers?) -> {status, body, headers}
 http.put(url, body, headers?) -> {status, body, headers}
 http.delete(url, headers?) -> {status, body, headers}
-http.request(opts, callback)       -- async: opts = {method, url, body, headers}
+
+-- Table-first async form (RECOMMENDED for callbacks and runtime)
+http.request({method="POST", url="...", headers={}, body/json=...}, function(resp, err))
+  -- resp: {status, body, headers} on success, nil on error
+  -- err: error string on failure, nil on success
 ```
+
+**Calling convention guide:**
+- **Table-first** (`http.request({...}, callback)`) — async, non-blocking. Callback runs asynchronously when request completes. Safe everywhere, especially in event handlers and plugin callbacks.
+- **Positional** (`http.get(url)`, etc.) — sync, BLOCKING the event loop. Only safe at plugin load time (before the hub event loop starts). Using these in callbacks will stall the hub and break WebRTC health checks.
+
+**Critical gotcha:** Calling `http.get()` inside a callback blocks the entire hub event loop, preventing `dc_pong` responses from reaching the browser within the 30-second health check window. This triggers a WebRTC disconnect. See [[HTTP blocking calls break WebRTC health checks]] in the knowledge vault.
 
 ### `timer`
 ```lua
@@ -167,22 +188,34 @@ Use `poll = true` when OS-native watching (FSEvents on macOS) misses in-place fi
 ### `websocket`
 ```lua
 local conn_id = websocket.connect(url, {
-    on_open = fn(),
+    headers    = { ... },   -- optional
+    on_open    = fn(),
     on_message = fn(msg),
-    on_close = fn(),
-    on_error = fn(err)
+    on_close   = fn(code, reason),
+    on_error   = fn(err)
 })
-websocket.send(conn_id, msg)
-websocket.close(conn_id)
+websocket.send(conn_id, msg)    -- module function, NOT conn_id.send()
+websocket.close(conn_id)        -- module function, NOT conn_id.close()
+
+-- Both return (true, nil) or (nil, error_string)
 ```
+
+**Non-blocking:** Spawns connection on dedicated OS thread. Callbacks (`on_open`, `on_message`, etc.) are async and safe.
+
+**Critical gotcha:** `conn_id` is a string ID, not an object. `conn_id.send(msg)` and `conn_id.close()` do NOT exist — use `websocket.send(conn_id, msg)` and `websocket.close(conn_id)` (module functions, not methods).
 
 ### `action_cable`
 ```lua
-local conn = action_cable.connect(opts?)   -- opts: {url, token, ...}
-local channel_id = action_cable.subscribe(conn, channel, params, callback)
+local conn = action_cable.connect(opts?)   -- opts: {crypto=true, ...} - no URL arg, uses hub's default cable endpoint
+local channel_id = action_cable.subscribe(conn, channel_name, params, callback)
 action_cable.unsubscribe(channel_id)
 action_cable.perform(channel_id, action, data)
+action_cable.close(conn)
 ```
+
+**Non-blocking:** All operations are async. Channel subscriptions and messages route through `HubEvent` channel. Callbacks receive `(msg, channel_id)` asynchronously.
+
+**Key detail:** `action_cable.connect()` takes no URL argument — it auto-connects to the hub's Rails cable endpoint. The `crypto=true` option auto-decrypts signal envelopes for end-to-end encrypted messaging.
 
 ### `hub_discovery`
 ```lua
