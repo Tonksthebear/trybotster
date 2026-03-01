@@ -2,7 +2,13 @@
 
 class GithubGetIssueCommentsTool < ApplicationMCPTool
   tool_name "github_get_issue_comments"
-  description "Get all comments on a specific GitHub issue or pull request. Requires the repository in 'owner/repo' format and the issue number."
+  description <<~DESC
+    Get the general conversation comments on a GitHub issue or pull request.
+
+    This returns issue-style comments (the timeline thread) — NOT pull request
+    reviews or inline diff comments. For review summaries and inline code comments
+    on a PR, use github_get_pull_request_reviews instead.
+  DESC
 
   property :repo, type: "string", description: "Repository in 'owner/repo' format (e.g., 'octocat/Hello-World')", required: true
   property :issue_number, type: "integer", description: "Issue or PR number", required: true
