@@ -101,7 +101,23 @@ class GithubCreatePullRequestReviewTool < ApplicationMCPTool
     store_idempotency_response(response_text)
     render(text: response_text)
   rescue Octokit::UnprocessableEntity => e
-    report_error("Failed to submit review — #{e.message}. Ensure the PR is open and all comment line numbers refer to lines visible in the diff.")
+    msg = e.message.to_s
+    if msg.include?("not part of the pull request diff") || msg.include?("review thread line")
+      report_error(
+        "Inline comment rejected: one or more line numbers are not visible in the PR diff.\n\n" \
+        "Call github_get_pull_request_files first — it returns the diff with line numbers " \
+        "annotated on the left. Only use line numbers that appear in that output as inline " \
+        "comment targets. Lines that were deleted (shown without a number) cannot be commented on.\n\n" \
+        "GitHub error: #{msg}"
+      )
+    elsif msg.include?("Can not approve your own pull request") || msg.include?("Can not request changes on your own pull request")
+      report_error(
+        "GitHub does not allow the PR author to APPROVE or REQUEST_CHANGES on their own pull request. " \
+        "Use event: \"COMMENT\" instead — it works regardless of authorship."
+      )
+    else
+      report_error("Failed to submit review — #{msg}")
+    end
   rescue Octokit::Error => e
     report_error("Failed to submit review: #{e.message}")
   rescue => e
