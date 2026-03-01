@@ -129,7 +129,12 @@
       "Bash(bundle show:*)",
       "Bash(gem contents:*)",
       "Bash(bundle update:*)",
-      "Bash(bin/brakeman:*)"
+      "Bash(bin/brakeman:*)",
+      "mcp__trybotster__github_create_pull_request_review",
+      "Bash(rails runner:*)",
+      "Bash(__NEW_LINE_22a579afd971416c__ find:*)",
+      "mcp__trybotster__github_get_pull_request_files",
+      "mcp__github__pull_request_read"
     ],
     "deny": [],
     "ask": []
