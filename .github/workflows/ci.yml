@@ -92,8 +92,10 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build CLI
+        env:
+          BOTSTER_ENV: test
         working-directory: cli
-        run: cargo build
+        run: cargo test --no-run --lib --tests
 
       - name: Upload CLI binary
         uses: actions/upload-artifact@v4
