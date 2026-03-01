@@ -66,6 +66,55 @@ function M.is_protected(module_name)
     return protected_modules[module_name] == true
 end
 
+-- ============================================================================
+-- Plugin package.path helpers
+-- ============================================================================
+
+--- Return the directory portion of a file path (equivalent to dirname).
+-- @param path string  e.g. "/plugins/github/init.lua"
+-- @return string      e.g. "/plugins/github"
+local function plugin_dir(path)
+    return path:match("^(.*)/[^/]+$") or "."
+end
+
+--- Escape a string so it can be used as a literal Lua pattern.
+local function escape_pattern(s)
+    return s:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1")
+end
+
+--- Add a plugin's lua/ subdirectory to package.path (idempotent).
+-- Only adds the entry when the directory exists and is not already present.
+-- @param dir string  Plugin root directory (parent of init.lua)
+local function add_to_package_path(dir)
+    local subdir = dir .. "/lua"
+    if not fs.is_dir(subdir) then return end
+    local entry = subdir .. "/?.lua"
+    if not package.path:find(escape_pattern(entry)) then
+        package.path = entry .. ";" .. package.path
+    end
+end
+
+--- Remove a plugin's lua/ subdirectory from package.path.
+-- No-op if the entry is not present.
+-- @param dir string  Plugin root directory
+local function remove_from_package_path(dir)
+    local subdir = dir .. "/lua"
+    local entry = escape_pattern(subdir .. "/?.lua")
+    package.path = package.path:gsub(entry .. ";?", "")
+end
+
+--- Clear package.loaded entries belonging to a plugin namespace.
+-- Removes any key equal to `name` or starting with `name.`.
+-- @param name string  Plugin name (e.g. "github")
+local function clear_plugin_namespace(name)
+    local prefix = name .. "."
+    for k in pairs(package.loaded) do
+        if k == name or k:sub(1, #prefix) == prefix then
+            package.loaded[k] = nil
+        end
+    end
+end
+
 --- Load a plugin by absolute path (not via require/package.path).
 -- Loads the file with full _ENV (same trust as user plugins), registers
 -- it in package.loaded so it can be reloaded by name.
@@ -92,6 +141,10 @@ function M.load_plugin(path, name)
         log.error(msg)
         return false, msg
     end
+
+    -- Add the plugin's lua/ subdir to package.path so the plugin can
+    -- require() its own modules (e.g. require("github.api")).
+    add_to_package_path(plugin_dir(path))
 
     -- Batch MCP notifications so N mcp.tool()/mcp.prompt() calls emit at most
     -- one notification each instead of N. end_batch() always runs (via pcall)
@@ -154,6 +207,11 @@ function M.reload_plugin(name)
     if mcp then
         mcp.reset("@" .. entry.path)
     end
+
+    -- Remove the old package.path entry and any sub-module require() cache
+    -- so the fresh load starts from a clean state.
+    remove_from_package_path(plugin_dir(entry.path))
+    clear_plugin_namespace(name)
 
     -- Clear old module
     package.loaded[module_key] = nil
