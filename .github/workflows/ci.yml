@@ -65,9 +65,47 @@ jobs:
       - name: Lint code for consistent style
         run: bin/rubocop -f github
 
+  build-cli:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install packages
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            cli/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build CLI
+        working-directory: cli
+        run: cargo build
+
+      - name: Upload CLI binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: botster-cli
+          path: cli/target/debug/botster
+          retention-days: 1
+
   test:
     runs-on: ubuntu-latest
     environment: test
+    needs: [build-cli]
 
     services:
       postgres:
@@ -91,6 +129,15 @@ jobs:
 
       - name: Checkout code
         uses: actions/checkout@v6
+
+      - name: Download CLI binary
+        uses: actions/download-artifact@v4
+        with:
+          name: botster-cli
+          path: cli/target/debug/
+
+      - name: Make CLI executable
+        run: chmod +x cli/target/debug/botster
 
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
@@ -110,6 +157,7 @@ jobs:
   system-test:
     runs-on: ubuntu-latest
     environment: test
+    needs: [build-cli]
 
     services:
       postgres:
@@ -133,6 +181,15 @@ jobs:
 
       - name: Checkout code
         uses: actions/checkout@v6
+
+      - name: Download CLI binary
+        uses: actions/download-artifact@v4
+        with:
+          name: botster-cli
+          path: cli/target/debug/
+
+      - name: Make CLI executable
+        run: chmod +x cli/target/debug/botster
 
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
@@ -159,6 +216,7 @@ jobs:
 
   cli-test:
     runs-on: ubuntu-latest
+    needs: [build-cli]
 
     steps:
       - name: Install packages
@@ -193,7 +251,7 @@ jobs:
 
   ci:
     if: always()
-    needs: [scan_ruby, scan_js, lint, test, system-test, cli-test]
+    needs: [scan_ruby, scan_js, lint, build-cli, test, system-test, cli-test]
     runs-on: ubuntu-latest
     steps:
       - name: Check CI results
