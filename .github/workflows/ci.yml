@@ -93,7 +93,7 @@ jobs:
 
       - name: Build CLI
         working-directory: cli
-        run: cargo build && cargo build --release
+        run: cargo build
 
       - name: Upload CLI binary
         uses: actions/upload-artifact@v4
