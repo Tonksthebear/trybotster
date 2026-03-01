@@ -77,7 +77,7 @@ fn load_lua_ui_source(name: &str) -> Option<LayoutSource> {
 /// 2. User `~/.botster/lua/user/ui/` files (highest priority)
 pub(super) fn discover_ui_extensions(lua_base: &std::path::Path) -> Vec<ExtensionSource> {
     let mut extensions = Vec::new();
-    let ui_files = ["layout.lua", "keybindings.lua", "actions.lua"];
+    let ui_files = ["layout.lua", "keybindings.lua", "actions.lua", "events.lua"];
 
     // Plugin UI extensions: ~/.botster/plugins/*/ui/{layout,keybindings,actions}.lua
     // lua_base is ~/.botster/lua, plugins are at ~/.botster/plugins
@@ -399,7 +399,10 @@ impl HotReloader {
                         }
                     }
 
-                    // Watch user/ui directory for extension hot-reload
+                    // Watch user/ui directory for extension hot-reload.
+                    // ensure_customization_dirs() in LuaBootstrap::load() creates this dir
+                    // before HotReloader::new() runs, so exists() is true in normal flow.
+                    // The check is kept as a safety net for callers that skip LuaBootstrap.
                     let lua_base = resolve_lua_user_path();
                     let user_ui_dir = lua_base.join("user/ui");
                     if user_ui_dir.exists() {
@@ -536,7 +539,10 @@ impl HotReloader {
         // When a user override is deleted we must reload built-ins to restore any globals the
         // deleted extension had overridden.  Without this, stale Lua functions remain in the
         // Lua state even though their source file is gone.
-        let force_builtin_reload = user_override_deleted && !any_builtin_changed;
+        //
+        // No guard on any_builtin_changed: even if a built-in also changed in the same poll
+        // cycle we still need all four built-ins reloaded so no stale globals survive.
+        let force_builtin_reload = user_override_deleted;
 
         // Reload built-in files if they changed (or if a user override deletion forces it)
         if layout_changed || force_builtin_reload {
