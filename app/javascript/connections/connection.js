@@ -54,6 +54,9 @@ export class Connection {
   #dcPingTimer = null         // DataChannel heartbeat timer
   #dcMissedPings = 0          // Consecutive unanswered DC pings
   #ensureConnectedDebounceTimer = null // Debounce for #setBrowserStatus → ensureConnected
+  #visibilityHandler = null   // visibilitychange listener for phone unlock detection
+  #visibilityProbeTimer = null // One-shot pong timeout after visibility probe ping
+  #visibilityPongReceived = false // Cleared on probe send, set on any dc_pong
 
   constructor(key, options, manager) {
     this.key = key
@@ -109,6 +112,20 @@ export class Connection {
    * Sets up crypto + signaling; #connectSignaling() calls #ensureConnected() at the end.
    */
   async initialize() {
+    // Phone unlock / tab-switch recovery: when the page becomes visible after
+    // being hidden (screen lock, tab switch, app backgrounding), call
+    // #ensureConnected() immediately. connectPeer() already handles the dead
+    // peer cases — PC in terminal state, or connected PC with closed DC (iOS
+    // sleep quirk) — so this fires reconnect as soon as the screen turns on
+    // rather than waiting up to 15s for the ICE disconnected safety-net timer.
+    this.#visibilityHandler = () => {
+      if (!document.hidden) {
+        console.debug(`[${this.constructor.name}] Page visible — probing connection`)
+        this.#probeOnVisibility()
+      }
+    }
+    document.addEventListener("visibilitychange", this.#visibilityHandler)
+
     try {
       this.#setState(ConnectionState.LOADING)
 
@@ -555,6 +572,7 @@ export class Connection {
       ensureConnectedAsync: () => this.#ensureConnected(),
       disconnectPeer: () => this.#disconnectPeer(),
       handleHealthMessage: (msg) => this.#health.handleHealthMessage(msg),
+      probeOnVisibility: () => this.#probeOnVisibility(),
 
       // Session errors
       clearIdentity: () => { this.identityKey = null },
@@ -666,6 +684,16 @@ export class Connection {
    * NOTE: Cleanup is done asynchronously to avoid blocking other operations.
    */
   destroy() {
+    // Remove visibility handler and cancel any pending probe
+    if (this.#visibilityHandler) {
+      document.removeEventListener("visibilitychange", this.#visibilityHandler)
+      this.#visibilityHandler = null
+    }
+    if (this.#visibilityProbeTimer) {
+      clearTimeout(this.#visibilityProbeTimer)
+      this.#visibilityProbeTimer = null
+    }
+
     // Cancel any pending init retry
     if (this.#initRetryTimer) {
       clearTimeout(this.#initRetryTimer)
@@ -1022,6 +1050,11 @@ export class Connection {
     }
     if (message.type === "dc_pong") {
       this.#dcMissedPings = 0
+      this.#visibilityPongReceived = true
+      if (this.#visibilityProbeTimer) {
+        clearTimeout(this.#visibilityProbeTimer)
+        this.#visibilityProbeTimer = null
+      }
       return true
     }
     return false
@@ -1046,6 +1079,50 @@ export class Connection {
   }
 
   // ========== DataChannel Heartbeat ==========
+
+  /**
+   * Probe the DataChannel immediately on page-visibility restore.
+   *
+   * iOS (and some Android) browsers report PC/DC as "connected/open" for
+   * several seconds after phone unlock even when the ICE path is dead. A
+   * regular #ensureConnected() call sees a healthy-looking peer and returns
+   * early. This method sends an immediate ping and waits 2s for a pong —
+   * if none arrives the connection is torn down for a fresh reconnect.
+   *
+   * Falls back to #ensureConnected() when not in CONNECTED state (cold start,
+   * already disconnected, etc.).
+   */
+  #probeOnVisibility() {
+    if (this.state !== ConnectionState.CONNECTED) {
+      this.#ensureConnected().catch(() => {})
+      return
+    }
+
+    // Cancel any previous probe that hasn't resolved yet.
+    if (this.#visibilityProbeTimer) {
+      clearTimeout(this.#visibilityProbeTimer)
+      this.#visibilityProbeTimer = null
+    }
+
+    this.#visibilityPongReceived = false
+
+    this.#sendEncrypted({ type: "dc_ping" }).then(() => {
+      this.#dcMissedPings++
+      this.#visibilityProbeTimer = setTimeout(() => {
+        this.#visibilityProbeTimer = null
+        if (!this.#visibilityPongReceived) {
+          console.debug(`[${this.constructor.name}] Visibility probe: no pong in 2s — reconnecting`)
+          this.#stopDcHeartbeat()
+          this.#disconnectPeer().then(() => this.#schedulePeerReconnect())
+        }
+      }, 2000)
+    }).catch(() => {
+      // dc.send() threw — DC is already closed
+      console.debug(`[${this.constructor.name}] Visibility probe: ping send failed — reconnecting`)
+      this.#stopDcHeartbeat()
+      this.#disconnectPeer().then(() => this.#schedulePeerReconnect())
+    })
+  }
 
   /**
    * Start periodic DataChannel ping. Detects silently stalled connections

@@ -93,8 +93,8 @@ function M.load_plugin(path, name)
         return false, msg
     end
 
-    -- Batch MCP notifications so N mcp.tool() calls emit exactly one
-    -- mcp_tools_changed event instead of N. end_batch() always runs (via pcall)
+    -- Batch MCP notifications so N mcp.tool()/mcp.prompt() calls emit at most
+    -- one notification each instead of N. end_batch() always runs (via pcall)
     -- so batch mode is never left stuck on load error.
     if mcp then mcp.begin_batch() end
 
@@ -144,9 +144,10 @@ function M.reload_plugin(name)
         end
     end
 
-    -- Batch MCP notifications: suppress mcp_tools_changed during reset + re-registration,
-    -- then emit exactly once at the end. end_batch() runs even on load failure (tools
-    -- were cleared by reset, clients need one notification to reflect that).
+    -- Batch MCP notifications: suppress mcp_tools_changed/mcp_prompts_changed during
+    -- reset + re-registration, then emit exactly once per changed registry at the end.
+    -- end_batch() runs even on load failure (registrations were cleared by reset,
+    -- clients need one notification to reflect that).
     if mcp then mcp.begin_batch() end
 
     -- Clear MCP tools registered by this plugin (source = "@" .. path)

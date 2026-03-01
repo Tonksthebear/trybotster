@@ -247,6 +247,31 @@
           </div>
         </div>
       </div>
+
+      <%# Hub Controls — restart %>
+      <div class="max-w-4xl mx-auto px-4 pb-6 lg:pb-8">
+        <div class="border border-zinc-800 rounded-lg">
+          <div class="px-4 py-3 border-b border-zinc-800">
+            <h2 class="text-sm font-medium text-zinc-400">Hub Controls</h2>
+          </div>
+          <div class="px-4 py-4 flex items-center justify-between gap-4">
+            <div>
+              <p class="text-sm text-zinc-300 font-medium">Restart Hub</p>
+              <p class="text-xs text-zinc-500 mt-0.5">
+                Gracefully restarts the hub process. Running agents are preserved
+                and reconnect automatically within ~120 s.
+              </p>
+            </div>
+            <button type="button"
+                    data-action="hub-settings#restartHub"
+                    class="shrink-0 px-4 py-2 text-sm font-medium text-amber-400 hover:text-amber-300
+                           bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30
+                           rounded transition-colors">
+              Restart
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <%# Templates Tab %>

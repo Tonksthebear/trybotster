@@ -240,6 +240,12 @@ pub struct Hub {
     pub quit: bool,
     /// Whether to exec-restart after shutdown (for self-update).
     pub exec_restart: bool,
+    /// Whether shutdown was requested as a graceful restart.
+    ///
+    /// When `true`, `shutdown()` calls `disconnect_graceful()` on the broker
+    /// so it preserves PTY file descriptors across the restart window.
+    /// When `false` (plain quit), `kill_all` is sent and the broker exits.
+    pub graceful_shutdown: bool,
 
     // === Browser Relay ===
     /// Browser connection state and communication.
@@ -541,6 +547,7 @@ impl Hub {
             tokio_runtime,
             quit: false,
             exec_restart: false,
+            graceful_shutdown: false,
             browser: crate::relay::BrowserState::default(),
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),
@@ -952,14 +959,16 @@ impl Hub {
     pub fn shutdown(&mut self) {
         // Signal the PTY broker before any other cleanup.
         //
-        // - exec_restart = true  → graceful disconnect (broker keeps PTYs alive,
-        //   the new Hub instance will reconnect within the timeout window).
-        // - exec_restart = false → kill_all (no restart planned; broker should
-        //   kill children and exit to avoid orphan processes).
+        // - graceful_shutdown || exec_restart → disconnect_graceful(): broker
+        //   keeps PTY FDs alive for the reconnect window so agents survive.
+        //   The broker kills PTYs itself if the Hub does not reconnect within
+        //   its configured timeout (120 s by default).
+        // - plain quit (e.g., ctrl+c on headless) → kill_all(): broker kills
+        //   children immediately and exits, avoiding orphan processes.
         if let Ok(mut guard) = self.broker_connection.lock() {
             if let Some(conn) = guard.take() {
-                if self.exec_restart {
-                    log::info!("[broker] graceful disconnect (restart mode)");
+                if self.graceful_shutdown || self.exec_restart {
+                    log::info!("[broker] graceful disconnect — PTYs preserved for reconnect window");
                     conn.disconnect_graceful();
                 } else {
                     log::info!("[broker] kill_all (clean shutdown)");

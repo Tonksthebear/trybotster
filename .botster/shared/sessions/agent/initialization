@@ -12,15 +12,13 @@ botster_context() {
   echo "$val"
 }
 
-# Read task context — context.json in worktrees, env vars on main
-BOTSTER_PROMPT=$(botster_context "prompt")
+# Read task context — env vars take priority (set by hub at spawn time),
+# fall back to context.json (worktrees) then legacy BOTSTER_TASK_DESCRIPTION.
+BOTSTER_PROMPT="${BOTSTER_PROMPT:-$(botster_context "prompt")}"
 BOTSTER_PROMPT="${BOTSTER_PROMPT:-$BOTSTER_TASK_DESCRIPTION}"
 
-BOTSTER_ISSUE_NUMBER=$(botster_context "issue_number")
-BOTSTER_ISSUE_NUMBER="${BOTSTER_ISSUE_NUMBER:-$BOTSTER_ISSUE_NUMBER}"
-
-BOTSTER_BRANCH_NAME=$(botster_context "branch_name")
-BOTSTER_BRANCH_NAME="${BOTSTER_BRANCH_NAME:-$BOTSTER_BRANCH_NAME}"
+BOTSTER_ISSUE_NUMBER="${BOTSTER_ISSUE_NUMBER:-$(botster_context "issue_number")}"
+BOTSTER_BRANCH_NAME="${BOTSTER_BRANCH_NAME:-$(botster_context "branch_name")}"
 
 # Auto-trust the worktree in Claude config using botster's JSON tools
 botster json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"

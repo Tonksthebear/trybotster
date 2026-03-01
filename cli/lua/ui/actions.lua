@@ -129,6 +129,35 @@ function M.on_action(action, context)
           data = { type = "get_connection_code" },
         }},
       }
+    elseif selected == "restart_hub" then
+      -- Exec-restart: send the command and close the menu.
+      -- Do NOT include { op = "quit" } here — the TUI runs on a separate thread
+      -- and quits immediately, racing with Hub processing. If the TUI shutdown
+      -- flag fires before the Hub processes ExecRestart (a two-hop path
+      -- through hub_event_rx), hub.exec_restart stays false and shutdown()
+      -- calls kill_all() instead of disconnect_graceful() — killing agents.
+      -- Instead, let hub.quit = true propagate via the shared shutdown flag:
+      -- Hub processes restart_hub → ExecRestart → quit = true → exits →
+      -- shutdown.store(true) in run_with_hub → TUI sees it → exits cleanly,
+      -- then the process exec()-replaces itself and the hub/TUI come back.
+      return {
+        { op = "send_msg", data = {
+          subscriptionId = "tui_hub",
+          data = { type = "restart_hub" },
+        }},
+        set_mode_ops(base_mode(context)),
+      }
+    elseif selected == "dev_rebuild" then
+      -- Dev rebuild: cargo build in background, Hub exec-restarts on success.
+      -- Don't quit the TUI immediately — the Hub will exec-replace the process
+      -- once the build finishes, restarting TUI automatically.
+      return {
+        { op = "send_msg", data = {
+          subscriptionId = "tui_hub",
+          data = { type = "dev_rebuild" },
+        }},
+        set_mode_ops(base_mode(context)),
+      }
     else
       -- switch_session:N — switch to a specific PTY by index
       local session_idx = selected and string.match(selected, "^switch_session:(%d+)$")

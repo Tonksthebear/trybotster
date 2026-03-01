@@ -474,6 +474,97 @@ fn test_hub_reconnect_snapshot_and_output() {
     }
 }
 
+/// Regression test: `get_snapshot` must be delivered even while PTY output is
+/// flooding the writer channel.
+///
+/// # The bug this guards against
+///
+/// The original writer used a bounded `SyncChannel(256)`.  PTY reader threads
+/// filled it with output frames; when the broker then tried `try_send` for the
+/// `Snapshot` control response, the channel was full and the frame was silently
+/// dropped.  The Hub's `read_response()` then blocked forever on `recv()`,
+/// freezing the entire Hub event loop (WebRTC, TUI, everything).
+///
+/// The fix replaces the bounded channel with an unbounded one so control frames
+/// are always enqueued.  The writer delivers them in FIFO order; the Hub
+/// unblocks once the writer catches up — which takes milliseconds at socket
+/// copy speeds.
+///
+/// # How this test triggers the bug
+///
+/// 1. Register a pipe session.
+/// 2. Spawn a thread that writes enough data to fill the old 256-frame bound
+///    (256 × 4 096 B ≈ 1 MB) while the main thread concurrently calls
+///    `get_snapshot`.
+/// 3. If `get_snapshot` returns within the 10-second deadline, the fix holds.
+///    Before the fix the call would block indefinitely.
+#[test]
+fn test_ctrl_delivery_under_output_flood() {
+    let hub_id = format!("test-flood-{}", std::process::id());
+    let socket_path = broker_socket_path(&hub_id).expect("broker_socket_path");
+
+    let hub_id_clone = hub_id.clone();
+    let broker_thread = std::thread::spawn(move || {
+        let _ = crate::broker::run(&hub_id_clone, 2);
+    });
+
+    assert!(
+        wait_for_broker_socket(&socket_path, Duration::from_secs(2)),
+        "broker socket did not appear within 2 s"
+    );
+
+    let mut conn = BrokerConnection::connect(&socket_path).expect("connect");
+    conn.set_timeout(10).expect("set_timeout");
+
+    // event_rx intentionally unused — demux ignores send errors to a dropped
+    // receiver and keeps running, so the control-response path stays alive.
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
+    conn.install_forwarder(event_tx).expect("install_forwarder");
+
+    let (read_end, write_end) = make_pipe();
+
+    let session_id = conn
+        .register_pty("test-agent-flood", 0, 99999, 24, 80, read_end)
+        .expect("register_pty");
+
+    // Flood thread: write 256 × 4 096-byte chunks — enough to fill the old
+    // bounded channel — while the main thread concurrently calls get_snapshot.
+    // Returns write_end so the main thread can close it during cleanup.
+    let flood_handle = std::thread::spawn(move || {
+        let chunk = vec![b'X'; 4096];
+        for _ in 0..256 {
+            unsafe {
+                libc::write(
+                    write_end,
+                    chunk.as_ptr() as *const libc::c_void,
+                    chunk.len(),
+                );
+            }
+        }
+        write_end
+    });
+
+    // A brief pause lets the broker queue some output frames before we request
+    // the snapshot, maximising the chance the old bounded channel would be full.
+    std::thread::sleep(Duration::from_millis(50));
+
+    // get_snapshot MUST return within the 10-second broker read timeout.
+    // Before the fix this blocked indefinitely; after the fix it returns as
+    // soon as the writer delivers the Snapshot frame (milliseconds).
+    conn.get_snapshot(session_id)
+        .expect("get_snapshot must succeed even while output is flooding the writer channel");
+
+    let write_end = flood_handle.join().expect("flood thread");
+
+    conn.kill_all();
+    broker_thread.join().expect("broker thread must exit cleanly after kill_all");
+
+    unsafe {
+        libc::close(read_end);
+        libc::close(write_end);
+    }
+}
+
 /// Diagnostic: verify that `shutdown(SHUT_WR)` on one end of a Unix domain
 /// socketpair immediately unblocks a blocking `recvmsg` call on the other end.
 ///

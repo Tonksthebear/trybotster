@@ -135,6 +135,19 @@ impl Session {
 
 // ─── Broker ────────────────────────────────────────────────────────────────
 
+/// Shared writer channel — updated on every Hub connect and reconnect.
+///
+/// All PTY reader threads hold an `Arc` clone of this mutex so that a
+/// single update in `handle_connection` re-wires every surviving reader
+/// thread to the new Hub connection without restarting the threads.
+///
+/// During the reconnect window the inner `Option` is `None`; reader threads
+/// attempt to lock and find `None`, so PTY output is silently dropped until
+/// the Hub reconnects.  This is intentional — output produced between
+/// disconnect and reconnect is already captured in each session's
+/// `AlacrittyParser` ring buffer and replayed via `GetSnapshot`.
+type SharedWriter = Arc<Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>>;
+
 /// The broker state: all registered PTY sessions plus configuration.
 struct Broker {
     /// All active sessions, keyed by session_id.
@@ -143,6 +156,10 @@ struct Broker {
     key_map: HashMap<(String, usize), u32>,
     next_session_id: u32,
     reconnect_timeout: Duration,
+    /// Shared channel sender — updated at the start of every `handle_connection`
+    /// call so all reader threads automatically route output to the current
+    /// Hub connection.  Cleared to `None` on Hub disconnect.
+    shared_writer: SharedWriter,
 }
 
 impl Broker {
@@ -152,6 +169,7 @@ impl Broker {
             key_map: HashMap::new(),
             next_session_id: 1,
             reconnect_timeout: Duration::from_secs(timeout_secs),
+            shared_writer: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -163,13 +181,13 @@ impl Broker {
 
     /// Register a new session, spawning a reader thread for the PTY.
     ///
-    /// `output_tx` is used by the reader thread to send `PtyOutput` frames
-    /// back to the Hub connection handler.
+    /// The reader thread uses `self.shared_writer` — the same `Arc` shared by
+    /// all sessions — so a single update in `handle_connection` re-wires all
+    /// reader threads to the current Hub connection on reconnect.
     fn register(
         &mut self,
         fd: OwnedFd,
         reg: FdTransferPayload,
-        output_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     ) -> u32 {
         let session_id = self.alloc_session_id();
         let parser = Arc::new(Mutex::new(
@@ -178,10 +196,13 @@ impl Broker {
         let parser_clone = Arc::clone(&parser);
 
         // Reader thread: blocking read loop on the master PTY FD.
+        // Uses Arc::clone of shared_writer so a reconnect updates ALL reader
+        // threads with a single mutex write rather than stopping and restarting them.
         let raw: RawFd = std::os::unix::io::AsRawFd::as_raw_fd(&fd);
         let reader_sid = session_id;
+        let shared = Arc::clone(&self.shared_writer);
         let reader = thread::spawn(move || {
-            reader_loop(raw, reader_sid, parser_clone, output_tx);
+            reader_loop(raw, reader_sid, parser_clone, shared);
         });
 
         self.key_map.insert((reg.agent_key.clone(), reg.pty_index), session_id);
@@ -227,12 +248,21 @@ impl Broker {
 ///
 /// Reads from the master FD (borrowing, not owning), feeds bytes into the
 /// session's `AlacrittyParser`, and forwards encoded `PtyOutput` frames to the
-/// Hub connection handler via `output_tx`.
+/// Hub via `shared_writer`.
+///
+/// `shared_writer` is the broker-global `Arc<Mutex<Option<Sender>>>` updated by
+/// `handle_connection` on every Hub connect and reconnect.  Locking it before
+/// each send means a single mutex write re-wires all reader threads to the new
+/// Hub connection without stopping or restarting them.
+///
+/// During the reconnect window (`Option` is `None`) output is silently dropped
+/// but still fed into the `AlacrittyParser` so `GetSnapshot` returns accurate
+/// state when the Hub reconnects.
 fn reader_loop(
     fd: RawFd,
     session_id: u32,
     parser: Arc<Mutex<AlacrittyParser<NoopListener>>>,
-    output_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    shared_writer: SharedWriter,
 ) {
     let mut buf = [0u8; 4096];
     // Borrow-only File — ManuallyDrop prevents close on drop.
@@ -258,9 +288,14 @@ fn reader_loop(
                 if let Ok(mut p) = parser.lock() {
                     p.process(data);
                 }
-                // Forward to Hub (best-effort; drop if Hub is disconnected).
+                // Forward to Hub via the shared writer.  `None` during reconnect
+                // window — drop the frame (already captured in parser above).
                 let frame = encode_data(frame_type::PTY_OUTPUT, session_id, data);
-                let _ = output_tx.try_send(frame);
+                if let Ok(guard) = shared_writer.lock() {
+                    if let Some(ref tx) = *guard {
+                        let _ = tx.send(frame);
+                    }
+                }
             }
         }
     }
@@ -341,18 +376,47 @@ fn handle_connection(
 
     let sock_fd: RawFd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
 
-    // Bounded channel: broker reader → writer.  A backpressure bound of 256
-    // frames keeps memory bounded even if the Hub is slow.
-    let (output_tx, output_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
+    // Single unbounded channel — control responses and PTY output both flow
+    // through here.  The writer blocks on recv() until any frame arrives;
+    // no polling or timeouts are needed.
+    //
+    // Why unbounded rather than bounded?  The old bounded SyncChannel(256)
+    // caused a dead-lock: PTY output filled all 256 slots, then try_send for
+    // a Registered/Snapshot/Ack frame silently dropped it, and the Hub's
+    // read_response() blocked forever.  An unbounded channel enqueues the
+    // control frame behind the pending output frames; the writer delivers them
+    // in FIFO order, and the Hub's read_response() unblocks once the writer
+    // catches up — which takes milliseconds at socket copy speeds.
+    //
+    // Memory bound: output accumulates only when the Hub is not draining the
+    // socket.  In practice the Hub's demux thread runs independently and keeps
+    // the socket clear, so the in-memory queue stays near zero.
+    let (writer_tx, writer_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+    // Re-wire all existing reader threads to this Hub connection.
+    //
+    // On initial connect there are no sessions yet, so this is a no-op.
+    // On reconnect, surviving sessions' reader threads held the previous
+    // (dead) sender; updating the shared Arc here makes them route PTY
+    // output to the new Hub connection without stopping the threads.
+    {
+        let mut guard = broker
+            .shared_writer
+            .lock()
+            .expect("shared_writer mutex poisoned");
+        *guard = Some(writer_tx.clone());
+    }
 
     // Writer thread — sends encoded frames from broker sessions to the Hub.
+    // Blocks on recv() until a frame arrives; exits on channel disconnect or
+    // the empty-Vec sentinel that handle_connection sends on Hub disconnect.
     let write_stream = stream.try_clone().context("clone socket for writer")?;
     let writer = thread::spawn(move || {
         let mut ws = write_stream;
-        for frame in output_rx {
-            // An empty sentinel frame signals that the Hub has disconnected
-            // and the writer should exit.  Real PtyOutput / control frames
-            // are always non-empty (they have at minimum a 5-byte header).
+        for frame in writer_rx {
+            // Empty sentinel: main loop signals disconnect while reader-thread
+            // clones still keep the channel alive.  A zero-length Vec is never
+            // a valid encoded frame (all real frames have a ≥5-byte header).
             if frame.is_empty() {
                 break;
             }
@@ -399,13 +463,15 @@ fn handle_connection(
                     };
                     let agent_key = reg.agent_key.clone();
                     let pty_index = reg.pty_index;
-                    let session_id = broker.register(fd, reg, output_tx.clone());
+                    // register() spawns the reader thread using Arc::clone of
+                    // broker.shared_writer (already wired to this connection above).
+                    let session_id = broker.register(fd, reg);
                     let resp = encode_broker_control(&BrokerMessage::Registered {
                         agent_key,
                         pty_index,
                         session_id,
                     });
-                    let _ = output_tx.try_send(resp);
+                    let _ = writer_tx.send(resp);
                 }
 
                 BrokerFrame::PtyInput(session_id, data) => {
@@ -423,36 +489,45 @@ fn handle_connection(
                 }
 
                 BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) => {
-                    if let Some(sess) = broker.sessions.get(&session_id) {
+                    let frame = if let Some(sess) = broker.sessions.get(&session_id) {
                         let snapshot = sess
                             .parser
                             .lock()
                             .map(|p| generate_ansi_snapshot(&p, false))
                             .unwrap_or_default();
-                        let frame = encode_data(frame_type::SNAPSHOT, session_id, &snapshot);
-                        let _ = output_tx.try_send(frame);
-                    }
+                        encode_data(frame_type::SNAPSHOT, session_id, &snapshot)
+                    } else {
+                        log::warn!("[broker] GetSnapshot for unknown session {session_id}");
+                        encode_broker_control(&BrokerMessage::Error {
+                            message: format!("no session {session_id}"),
+                        })
+                    };
+                    let _ = writer_tx.send(frame);
                 }
 
                 BrokerFrame::HubControl(HubMessage::UnregisterPty { session_id }) => {
                     broker.unregister(session_id);
-                    let _ = output_tx.try_send(encode_broker_control(&BrokerMessage::Ack));
+                    let _ = writer_tx.send(encode_broker_control(&BrokerMessage::Ack));
                 }
 
                 BrokerFrame::HubControl(HubMessage::SetTimeout { seconds }) => {
                     broker.reconnect_timeout = Duration::from_secs(seconds);
-                    let _ = output_tx.try_send(encode_broker_control(&BrokerMessage::Ack));
+                    let _ = writer_tx.send(encode_broker_control(&BrokerMessage::Ack));
                 }
 
                 BrokerFrame::HubControl(HubMessage::KillAll) => {
                     broker.kill_all();
-                    drop(output_tx); // signal writer to exit
+                    // kill_all() joins all reader threads, so all writer_tx
+                    // clones are dropped.  Dropping our copy here closes the
+                    // last sender; the writer's recv() returns Disconnected
+                    // and the thread exits cleanly.
+                    drop(writer_tx);
                     let _ = writer.join();
                     return Ok(());
                 }
 
                 BrokerFrame::HubControl(HubMessage::Ping) => {
-                    let _ = output_tx.try_send(encode_broker_control(&BrokerMessage::Pong));
+                    let _ = writer_tx.send(encode_broker_control(&BrokerMessage::Pong));
                 }
 
                 _ => {
@@ -462,21 +537,24 @@ fn handle_connection(
         }
     }
 
-    // Hub disconnected — wake the writer thread so it exits.
+    // Hub disconnected — signal the writer thread to exit.
     //
-    // After the main loop exits, `output_tx` is dropped here.  Normally the
-    // writer's `for frame in output_rx` loop ends when ALL senders are gone.
-    // But reader_loop threads for live sessions still hold their own clones of
-    // `output_tx`; those threads may be blocked on `file.read()` and will not
-    // drop their clone until the session ends.  If we simply drop and join, the
-    // writer blocks forever — holding up `handle_connection` and preventing the
-    // broker from entering `wait_for_reconnect`.
-    //
-    // Fix: send an empty sentinel frame before dropping.  The writer thread
-    // breaks on the first empty frame (a zero-length `Vec` is never a valid
-    // encoded frame, so this cannot be confused with real PTY output).
-    let _ = output_tx.try_send(vec![]); // sentinel: signals writer to exit
-    drop(output_tx);
+    // Clear shared_writer first so reader threads stop queuing into the dead
+    // channel during the reconnect window.  Output is still captured by each
+    // session's AlacrittyParser and will be replayed via GetSnapshot when the
+    // Hub reconnects.
+    {
+        let mut guard = broker
+            .shared_writer
+            .lock()
+            .expect("shared_writer mutex poisoned");
+        *guard = None;
+    }
+
+    // Send the empty-Vec sentinel: the writer breaks on the first empty frame
+    // and exits without waiting for all reader-thread senders to disappear.
+    let _ = writer_tx.send(vec![]); // sentinel: empty Vec is never a valid frame
+    drop(writer_tx);
     let _ = writer.join();
 
     Ok(())

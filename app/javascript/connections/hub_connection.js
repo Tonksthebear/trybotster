@@ -218,6 +218,17 @@ export class HubConnection extends Connection {
     return this.send("get_connection_code");
   }
 
+  /**
+   * Request a graceful Hub restart.
+   *
+   * The broker keeps PTY file descriptors alive for the reconnect window
+   * (~120 s) so running agents survive the restart. After calling this the
+   * Hub will disconnect; reconnect by relaunching botster within that window.
+   */
+  restartHub() {
+    return this.send("restart_hub");
+  }
+
   // ========== File System API ==========
 
   /**

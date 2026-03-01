@@ -80,7 +80,7 @@ fn load_lua_ui_source(name: &str) -> Option<LayoutSource> {
 pub(super) fn discover_user_ui_overrides() -> Vec<ExtensionSource> {
     let mut overrides = Vec::new();
     let ui_dir = match dirs::home_dir() {
-        Some(home) => home.join(".botster").join("lua").join("ui"),
+        Some(home) => home.join(format!(".{}", crate::env::APP_NAME)).join("lua").join("ui"),
         None => return overrides,
     };
 
@@ -168,8 +168,8 @@ pub(super) fn discover_ui_extensions(lua_base: &std::path::Path) -> Vec<Extensio
 /// core UI modules (which use embedded or source tree).
 pub(super) fn resolve_lua_user_path() -> PathBuf {
     dirs::home_dir()
-        .map(|h| h.join(".botster").join("lua"))
-        .unwrap_or_else(|| PathBuf::from(".botster/lua"))
+        .map(|h| h.join(format!(".{}", crate::env::APP_NAME)).join("lua"))
+        .unwrap_or_else(|| PathBuf::from(format!(".{}/lua", crate::env::APP_NAME)))
 }
 
 /// Truncate an error message to a maximum length, adding ellipsis if needed.

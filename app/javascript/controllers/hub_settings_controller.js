@@ -992,6 +992,22 @@ export default class extends Controller {
     return str.charAt(0).toUpperCase() + str.slice(1);
   }
 
+  /**
+   * Trigger a graceful Hub restart.
+   *
+   * Sends `restart_hub` to the CLI so it sets the graceful-shutdown flag
+   * before disconnecting.  The broker keeps PTYs alive for ~120 s, allowing
+   * agents to survive.  The browser will naturally show a disconnected state
+   * until the Hub comes back online.
+   */
+  restartHub(event) {
+    if (!this.hub) return;
+    const btn = event.currentTarget;
+    btn.disabled = true;
+    btn.textContent = "Restarting…";
+    this.hub.restartHub();
+  }
+
   #escapeHtml(text) {
     const div = document.createElement("div");
     div.textContent = text;

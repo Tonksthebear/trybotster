@@ -127,6 +127,8 @@ local function build_menu_items(state)
   table.insert(items, { text = "── Hub ──", header = true })
   table.insert(items, { text = "New Agent", action = "new_agent" })
   table.insert(items, { text = "Show Connection Code", action = "show_connection_code" })
+  table.insert(items, { text = "Restart Hub", action = "restart_hub" })
+  table.insert(items, { text = "Dev Rebuild & Restart", action = "dev_rebuild" })
 
   return items
 end

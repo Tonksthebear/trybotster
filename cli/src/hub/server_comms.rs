@@ -393,6 +393,51 @@ impl Hub {
                         self.exec_restart = true;
                         self.quit = true;
                     }
+                    HubRequest::GracefulRestart => {
+                        log::info!("[Lua] Processing graceful-restart request — agents will survive");
+                        self.graceful_shutdown = true;
+                        self.quit = true;
+                    }
+                    HubRequest::DevRebuild => {
+                        // Run `cargo build` in the background. On success, fire ExecRestart so
+                        // the Hub exec-replaces itself with the freshly built binary. The broker
+                        // keeps PTY FDs alive across the exec so agents survive.
+                        //
+                        // On failure the Hub logs the error and keeps running — no agents
+                        // are disrupted.
+                        log::info!("[Dev] Starting cargo build — Hub will exec-restart on success");
+                        let tx = self.hub_event_tx.clone();
+                        // manifest_dir is the `cli/` directory, embedded at compile time.
+                        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+                        self.tokio_runtime.spawn(async move {
+                            let result = tokio::task::spawn_blocking(move || {
+                                std::process::Command::new("cargo")
+                                    .arg("build")
+                                    .arg("--manifest-path")
+                                    .arg(format!("{manifest_dir}/Cargo.toml"))
+                                    .status()
+                            })
+                            .await;
+
+                            match result {
+                                Ok(Ok(status)) if status.success() => {
+                                    log::info!("[Dev] cargo build succeeded — triggering exec-restart");
+                                    let _ = tx.send(
+                                        HubEvent::LuaHubRequest(HubRequest::ExecRestart),
+                                    );
+                                }
+                                Ok(Ok(status)) => {
+                                    log::error!("[Dev] cargo build failed with exit status: {status}");
+                                }
+                                Ok(Err(e)) => {
+                                    log::error!("[Dev] cargo build failed to launch: {e}");
+                                }
+                                Err(e) => {
+                                    log::error!("[Dev] cargo build task panicked: {e}");
+                                }
+                            }
+                        });
+                    }
                     HubRequest::HandleWebrtcOffer { browser_identity, sdp } => {
                         log::info!(
                             "[Lua] Processing WebRTC offer from {}",
