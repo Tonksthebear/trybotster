@@ -66,7 +66,21 @@ function M.is_protected(module_name)
     return protected_modules[module_name] == true
 end
 
--- Add a plugin's lua/ dir to package.path (idempotent).
+-- ============================================================================
+-- Plugin package.path helpers
+-- ============================================================================
+
+--- Return the directory portion of a file path (equivalent to dirname).
+-- @param path string  e.g. "/plugins/github/init.lua"
+-- @return string      e.g. "/plugins/github"
+local function plugin_dir(path)
+    return path:match("^(.*)/[^/]+$") or "."
+end
+
+--- Add a plugin's lua/ directory to package.path (idempotent).
+-- Adds both ?.lua and ?/init.lua patterns so sub-modules can be both flat
+-- files (github/api.lua) and directories (github/api/init.lua).
+-- @param lua_dir string  Full path to the plugin's lua/ directory
 local function add_to_package_path(lua_dir)
     local entry1 = lua_dir .. "/?.lua"
     local entry2 = lua_dir .. "/?/init.lua"
@@ -75,7 +89,9 @@ local function add_to_package_path(lua_dir)
     end
 end
 
--- Remove a plugin's lua/ dir from package.path.
+--- Remove a plugin's lua/ directory from package.path.
+-- Uses split-and-filter to avoid trailing-semicolon edge cases.
+-- @param lua_dir string  Full path to the plugin's lua/ directory
 local function remove_from_package_path(lua_dir)
     local entry1 = lua_dir .. "/?.lua"
     local entry2 = lua_dir .. "/?/init.lua"
@@ -88,12 +104,14 @@ local function remove_from_package_path(lua_dir)
     package.path = table.concat(parts, ";")
 end
 
--- Clear all package.loaded entries belonging to a plugin's namespace (e.g. "telegram.*").
+--- Clear package.loaded entries belonging to a plugin namespace.
+-- Removes any key equal to `name` or starting with `name.`.
+-- @param name string  Plugin name (e.g. "github")
 local function clear_plugin_namespace(name)
     local prefix = name .. "."
-    for key in pairs(package.loaded) do
-        if key:sub(1, #prefix) == prefix then
-            package.loaded[key] = nil
+    for k in pairs(package.loaded) do
+        if k == name or k:sub(1, #prefix) == prefix then
+            package.loaded[k] = nil
         end
     end
 end
@@ -127,6 +145,14 @@ function M.load_plugin(path, name)
         return false, msg
     end
 
+    -- Add the plugin's lua/ subdir to package.path before executing the chunk
+    -- so require() calls inside the plugin resolve at init time.
+    local lua_dir = plugin_dir(path) .. "/lua"
+    if fs.is_dir(lua_dir) then
+        add_to_package_path(lua_dir)
+        log.info(string.format("Plugin %s: registered lua/ at %s", name, lua_dir))
+    end
+
     -- Batch MCP notifications so N mcp.tool()/mcp.prompt() calls emit at most
     -- one notification each instead of N. end_batch() always runs (via pcall)
     -- so batch mode is never left stuck on load error.
@@ -148,16 +174,6 @@ function M.load_plugin(path, name)
     -- Register in package.loaded so reload works
     local module_key = "plugin." .. name
     package.loaded[module_key] = result or true
-
-    -- Add plugin's lua/ subdir to package.path if it exists, so the plugin
-    -- can require() its own modules namespaced by plugin name.
-    local plugin_dir = path:match("^(.*)/[^/]+$") or "."
-    local lua_dir = plugin_dir .. "/lua"
-    if fs.exists(lua_dir) and fs.is_dir(lua_dir) then
-        add_to_package_path(lua_dir)
-        log.info(string.format("Plugin %s: registered lua/ at %s", name, lua_dir))
-    end
-
     log.info(string.format("Loaded plugin: %s from %s", name, path))
     return true
 end
@@ -180,6 +196,19 @@ function M.reload_plugin(name)
     local module_key = "plugin." .. name
     local old = package.loaded[module_key]
 
+    -- Snapshot sub-module cache so we can fully restore it on failure.
+    -- If the new plugin partially executes before erroring, it may load some
+    -- sub-modules into package.loaded["name.*"]. Without a snapshot the old
+    -- module would subsequently require() those new (possibly incompatible)
+    -- versions rather than its own originals.
+    local old_namespace = {}
+    local ns_prefix = name .. "."
+    for k, v in pairs(package.loaded) do
+        if k == name or k:sub(1, #ns_prefix) == ns_prefix then
+            old_namespace[k] = v
+        end
+    end
+
     -- Lifecycle: cleanup before reload
     if old and type(old) == "table" and old._before_reload then
         local ok, err = pcall(old._before_reload)
@@ -199,12 +228,9 @@ function M.reload_plugin(name)
         mcp.reset("@" .. entry.path)
     end
 
-    -- Remove plugin's lua/ path and namespace modules so stale require() cache
-    -- doesn't survive reload. load_plugin() re-adds the path after loading.
-    -- Track whether the lua/ path was present so we can restore it on failure.
-    local plugin_dir = entry.path:match("^(.*)/[^/]+$") or "."
-    local lua_dir = plugin_dir .. "/lua"
-    local had_lua_path = package.path:find(lua_dir .. "/?.lua", 1, true) ~= nil
+    -- Remove the old package.path entry and sub-module cache so the fresh load
+    -- starts clean. load_plugin() re-adds the path after a successful load.
+    local lua_dir = plugin_dir(entry.path) .. "/lua"
     remove_from_package_path(lua_dir)
     clear_plugin_namespace(name)
 
@@ -218,12 +244,14 @@ function M.reload_plugin(name)
     if mcp then mcp.end_batch() end
 
     if not ok then
-        -- Restore old module and lua/ package.path on failure, symmetric with
-        -- package.loaded restore above.
+        -- Full rollback: restore the old module, its sub-module cache, and its
+        -- package.path entry so the still-running old module is unaffected by
+        -- the failed reload attempt.
         package.loaded[module_key] = old
-        if had_lua_path then
-            add_to_package_path(lua_dir)
+        for k, v in pairs(old_namespace) do
+            package.loaded[k] = v
         end
+        add_to_package_path(lua_dir)
         return false, "Failed to reload plugin: " .. name
     end
 
@@ -257,8 +285,7 @@ function M.unload_plugin(name)
 
     -- Remove lua/ path and namespace modules
     if entry then
-        local plugin_dir = entry.path:match("^(.*)/[^/]+$") or "."
-        remove_from_package_path(plugin_dir .. "/lua")
+        remove_from_package_path(plugin_dir(entry.path) .. "/lua")
     end
     clear_plugin_namespace(name)
     package.loaded[module_key] = nil
