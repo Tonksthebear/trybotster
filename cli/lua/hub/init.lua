@@ -142,12 +142,9 @@ if device_root or repo_root then
 
     if unified and unified.plugins then
         for _, plugin in ipairs(unified.plugins) do
-            -- Pre-register so load_plugin can update the entry (e.g., lua_path)
-            plugin_registry[plugin.name] = { path = plugin.init_path }
             if loader.load_plugin(plugin.init_path, plugin.name) then
                 loaded_plugin_names[plugin.name] = true
-            else
-                plugin_registry[plugin.name] = nil
+                plugin_registry[plugin.name] = { path = plugin.init_path }
             end
         end
     end

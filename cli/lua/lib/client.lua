@@ -371,24 +371,28 @@ function Client:handle_mcp_data(sub_id, command)
         -- Pass the caller's full context to tool handlers
         local context = sub and sub.caller_context or {}
 
-        local result, err = mcp.call_tool(tool_name, params, context)
-        if err then
-            self:send({
-                subscriptionId = sub_id,
-                type = "tool_result",
-                call_id = call_id,
-                is_error = true,
-                content = { { type = "text", text = err } },
-            })
-        else
-            self:send({
-                subscriptionId = sub_id,
-                type = "tool_result",
-                call_id = call_id,
-                is_error = false,
-                content = result,
-            })
-        end
+        -- Use callback form so proxied tools can respond asynchronously.
+        -- For local tools the callback fires synchronously (same tick).
+        -- For proxied tools it fires after the HTTP round-trip completes.
+        mcp.call_tool(tool_name, params, context, function(result, err)
+            if err then
+                self:send({
+                    subscriptionId = sub_id,
+                    type = "tool_result",
+                    call_id = call_id,
+                    is_error = true,
+                    content = { { type = "text", text = err } },
+                })
+            else
+                self:send({
+                    subscriptionId = sub_id,
+                    type = "tool_result",
+                    call_id = call_id,
+                    is_error = false,
+                    content = result,
+                })
+            end
+        end)
 
     elseif cmd_type == "prompts_list" then
         self:send({
