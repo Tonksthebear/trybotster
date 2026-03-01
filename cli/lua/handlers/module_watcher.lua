@@ -106,6 +106,9 @@ local function on_plugin_change(event)
 
         local registry = state.get("plugin_registry", {})
         if registry[name] then
+            -- Also reached on fresh plugin drop-in if the root watcher loaded it
+            -- first and this timer (set by the init.lua create event) fires after.
+            -- reload_plugin is safe and idempotent in that case.
             log.info(string.format("Plugin file changed, reloading: %s", name))
             local ok, err = loader.reload_plugin(name)
             if not ok then
@@ -175,11 +178,11 @@ local function make_plugin_root_handler(plugin_root_dir)
 
                 if fs.is_dir(expected_dir) and fs.exists(init_path) then
                     log.info(string.format("New plugin directory dropped in: %s", name))
-                    local ok = loader.load_plugin(init_path, name)
+                    local ok, load_err = loader.load_plugin(init_path, name)
                     if ok then
                         registry[name] = { path = init_path }
                     else
-                        log.error(string.format("Failed to auto-load plugin: %s", name))
+                        log.error(string.format("Failed to auto-load plugin %s: %s", name, tostring(load_err)))
                     end
                 end
             end)
@@ -271,7 +274,7 @@ local function setup_watches()
                 log.debug(string.format("Module watcher: watching plugin root %s", dir))
             end
         else
-            log.debug(string.format("Module watcher: plugin root does not exist yet, skipping: %s", dir))
+            log.warn(string.format("Module watcher: plugin root does not exist, auto-detection inactive for: %s", dir))
         end
     end
 

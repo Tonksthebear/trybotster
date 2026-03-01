@@ -290,7 +290,10 @@ function M.unload_plugin(name)
         end
     end
 
-    -- Clear MCP tools/prompts registered by this plugin (source = "@" .. path)
+    -- Clear MCP tools/prompts registered by this plugin (source = "@" .. path).
+    -- No begin_batch/end_batch needed: we only remove (never re-register), so
+    -- exactly one notification fires — unlike reload_plugin which suppresses the
+    -- intermediate "tools cleared" notification before re-registering.
     if mcp then
         mcp.reset("@" .. entry.path)
     end
