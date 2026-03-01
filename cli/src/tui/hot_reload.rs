@@ -41,7 +41,7 @@ pub(super) struct ExtensionSource {
 /// Load a Lua UI module by name.
 ///
 /// Returns the built-in source (embedded or source tree). User overrides
-/// in `~/.botster/lua/ui/` are loaded separately as extensions that layer
+/// in `~/.botster/lua/user/ui/` are loaded separately as extensions that layer
 /// on top — redefining only the functions they want to customize.
 fn load_lua_ui_source(name: &str) -> Option<LayoutSource> {
     let rel_path = format!("ui/{name}");
@@ -68,43 +68,6 @@ fn load_lua_ui_source(name: &str) -> Option<LayoutSource> {
 
     log::warn!("No {name} found");
     None
-}
-
-/// Discover user UI override files from `~/.botster/lua/ui/`.
-///
-/// These are loaded as extensions on top of the built-in UI modules,
-/// so they only need to redefine the functions they want to customize.
-/// For example, a user `layout.lua` containing only
-/// `function render_overlay(state) ... end` overrides just the overlay
-/// while `render()` stays built-in.
-pub(super) fn discover_user_ui_overrides() -> Vec<ExtensionSource> {
-    let mut overrides = Vec::new();
-    let ui_dir = match dirs::home_dir() {
-        Some(home) => home.join(format!(".{}", crate::env::APP_NAME)).join("lua").join("ui"),
-        None => return overrides,
-    };
-
-    if let Ok(entries) = std::fs::read_dir(&ui_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "lua") {
-                if let Ok(source) = std::fs::read_to_string(&path) {
-                    let name = path
-                        .file_stem()
-                        .map(|s| format!("user_ui_{}", s.to_string_lossy()))
-                        .unwrap_or_else(|| "user_ui".to_string());
-                    log::info!("Found user UI override: {}", path.display());
-                    overrides.push(ExtensionSource {
-                        name,
-                        source,
-                        fs_path: path.canonicalize().unwrap_or(path),
-                    });
-                }
-            }
-        }
-    }
-
-    overrides
 }
 
 /// Discover UI extension files from plugins and user directories.
@@ -160,6 +123,27 @@ pub(super) fn discover_ui_extensions(lua_base: &std::path::Path) -> Vec<Extensio
     }
 
     extensions
+}
+
+/// Return `true` if `path` is a `.lua` file inside the user override directory.
+///
+/// Matches `…/user/ui/*.lua` — the canonical override location for both
+/// release (`~/.botster/lua/user/ui/`) and debug (`~/.botster-dev/lua/user/ui/`) builds.
+pub(super) fn is_user_override_lua(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|e| e == "lua")
+        && path.parent().is_some_and(|p| p.ends_with("user/ui"))
+}
+
+/// Ensure the user customization directory exists (mkdir -p equivalent).
+///
+/// Creates `{lua_base}/user/ui/` so the file watcher can register it on
+/// startup, even before the user has placed any files there.
+/// Silently skips if the dir already exists; logs a warning on unexpected errors.
+pub(super) fn ensure_customization_dirs(lua_base: &std::path::Path) {
+    let dir = lua_base.join("user/ui");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("Failed to create customization dir {}: {e}", dir.display());
+    }
 }
 
 /// Resolve the user-level Lua path (`~/.botster/lua/`).
@@ -225,8 +209,9 @@ impl LuaBootstrap {
         let botster_api_source = load_lua_ui_source("botster.lua").map(|s| s.source);
 
         let lua_base = resolve_lua_user_path();
-        let mut extensions = discover_ui_extensions(&lua_base);
-        extensions.extend(discover_user_ui_overrides());
+        // Create customization dirs before watcher setup so the watcher can register them.
+        ensure_customization_dirs(&lua_base);
+        let extensions = discover_ui_extensions(&lua_base);
 
         Self {
             layout_source: layout.as_ref().map(|l| l.source.clone()),
@@ -414,16 +399,14 @@ impl HotReloader {
                         }
                     }
 
-                    // Watch user directories for extension hot-reload
+                    // Watch user/ui directory for extension hot-reload
                     let lua_base = resolve_lua_user_path();
-                    for subdir in ["ui", "user/ui"] {
-                        let dir = lua_base.join(subdir);
-                        if dir.exists() {
-                            if let Err(e) = watcher.watch(&dir, false) {
-                                log::warn!("Failed to watch {}: {e}", dir.display());
-                            } else {
-                                log::info!("Hot-reload watching: {}", dir.display());
-                            }
+                    let user_ui_dir = lua_base.join("user/ui");
+                    if user_ui_dir.exists() {
+                        if let Err(e) = watcher.watch(&user_ui_dir, false) {
+                            log::warn!("Failed to watch {}: {e}", user_ui_dir.display());
+                        } else {
+                            log::info!("Hot-reload watching: {}", user_ui_dir.display());
                         }
                     }
 
@@ -489,6 +472,18 @@ impl HotReloader {
             )
         };
 
+        // Includes Delete so extension removal triggers a revert.
+        // Only used for user/plugin extension paths — built-in files don't revert on delete.
+        let is_modify_or_delete = |evt: &crate::file_watcher::FileEvent| {
+            matches!(
+                evt.kind,
+                crate::file_watcher::FileEventKind::Create
+                    | crate::file_watcher::FileEventKind::Modify
+                    | crate::file_watcher::FileEventKind::Rename
+                    | crate::file_watcher::FileEventKind::Delete
+            )
+        };
+
         let layout_changed = events
             .iter()
             .any(|evt| is_modify(evt) && evt.path.file_name() == layout_path.file_name());
@@ -511,20 +506,23 @@ impl HotReloader {
                 .any(|evt| is_modify(evt) && evt.path.file_name() == e_path.file_name())
         });
 
-        // Check if any extension file changed
+        // Check if any tracked extension file changed or was deleted
         let extension_changed = self.extension_sources.iter().any(|ext| {
             events
                 .iter()
-                .any(|evt| is_modify(evt) && evt.path == ext.fs_path)
+                .any(|evt| is_modify_or_delete(evt) && evt.path == ext.fs_path)
         });
 
-        // Also check if a file changed in user/ui/ or the user override ui/ dir
-        let user_ui_changed = events.iter().any(|evt| {
-            is_modify(evt)
-                && evt.path.extension().is_some_and(|e| e == "lua")
-                && evt.path.parent().is_some_and(|p| {
-                    p.ends_with("user/ui") || p.ends_with(".botster/lua/ui")
-                })
+        // Also check if a .lua file changed or was deleted in the user/ui/ override directory
+        let user_ui_changed = events
+            .iter()
+            .any(|evt| is_modify_or_delete(evt) && is_user_override_lua(&evt.path));
+
+        // True when a user override .lua was deleted — built-ins must be reloaded to restore
+        // globals that the now-missing extension had overridden.
+        let user_override_deleted = events.iter().any(|evt| {
+            evt.kind == crate::file_watcher::FileEventKind::Delete
+                && is_user_override_lua(&evt.path)
         });
 
         let any_builtin_changed =
@@ -535,12 +533,17 @@ impl HotReloader {
             return false;
         }
 
-        // Reload built-in files if they changed
-        if layout_changed {
+        // When a user override is deleted we must reload built-ins to restore any globals the
+        // deleted extension had overridden.  Without this, stale Lua functions remain in the
+        // Lua state even though their source file is gone.
+        let force_builtin_reload = user_override_deleted && !any_builtin_changed;
+
+        // Reload built-in files if they changed (or if a user override deletion forces it)
+        if layout_changed || force_builtin_reload {
             self.reload_layout(layout_lua, &layout_path);
         }
 
-        if keybinding_changed {
+        if keybinding_changed || force_builtin_reload {
             if let Some(ref kb_path) = self.keybinding_fs_path {
                 match std::fs::read_to_string(kb_path) {
                     Ok(new_source) => {
@@ -556,7 +559,7 @@ impl HotReloader {
             }
         }
 
-        if actions_changed {
+        if actions_changed || force_builtin_reload {
             if let Some(ref a_path) = self.actions_fs_path {
                 match std::fs::read_to_string(a_path) {
                     Ok(new_source) => {
@@ -572,7 +575,7 @@ impl HotReloader {
             }
         }
 
-        if events_changed {
+        if events_changed || force_builtin_reload {
             if let Some(ref e_path) = self.events_fs_path {
                 match std::fs::read_to_string(e_path) {
                     Ok(new_source) => {
@@ -640,10 +643,9 @@ impl HotReloader {
     fn replay_extensions(&self, layout_lua: &mut Option<LayoutLua>) {
         let Some(ref lua) = layout_lua else { return };
 
-        // Re-discover extensions and user overrides (picks up new files)
+        // Re-discover extensions (picks up new files, drops deleted ones)
         let lua_base = resolve_lua_user_path();
-        let mut fresh_extensions = discover_ui_extensions(&lua_base);
-        fresh_extensions.extend(discover_user_ui_overrides());
+        let fresh_extensions = discover_ui_extensions(&lua_base);
 
         // Reload botster API
         if let Some(ref bs) = self.botster_api_source {
@@ -672,6 +674,9 @@ impl HotReloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    // ── truncate_error ──────────────────────────────────────────────────
 
     #[test]
     fn test_truncate_error_short() {
@@ -690,5 +695,79 @@ mod tests {
     fn test_truncate_error_multiline() {
         let msg = "first line\nsecond line\nthird line";
         assert_eq!(truncate_error(msg, 80), "first line");
+    }
+
+    // ── is_user_override_lua ────────────────────────────────────────────
+
+    #[test]
+    fn test_is_user_override_lua_release_build() {
+        let path = Path::new("/home/user/.botster/lua/user/ui/layout.lua");
+        assert!(is_user_override_lua(path));
+    }
+
+    #[test]
+    fn test_is_user_override_lua_debug_build() {
+        let path = Path::new("/home/user/.botster-dev/lua/user/ui/keybindings.lua");
+        assert!(is_user_override_lua(path));
+    }
+
+    #[test]
+    fn test_is_user_override_lua_rejects_non_lua_extension() {
+        let path = Path::new("/home/user/.botster/lua/user/ui/layout.txt");
+        assert!(!is_user_override_lua(path));
+    }
+
+    #[test]
+    fn test_is_user_override_lua_rejects_no_extension() {
+        let path = Path::new("/home/user/.botster/lua/user/ui/layout");
+        assert!(!is_user_override_lua(path));
+    }
+
+    #[test]
+    fn test_is_user_override_lua_rejects_wrong_parent_dir() {
+        let path = Path::new("/home/user/.botster-dev/lua/layout.lua");
+        assert!(!is_user_override_lua(path));
+    }
+
+    #[test]
+    fn test_is_user_override_lua_rejects_plugin_ui_dir() {
+        // plugin/ui/ ends with "ui" not "user/ui"
+        let path = Path::new("/home/user/.botster-dev/plugins/myplugin/ui/layout.lua");
+        assert!(!is_user_override_lua(path));
+    }
+
+    // ── ensure_customization_dirs ───────────────────────────────────────
+
+    #[test]
+    fn test_ensure_customization_dirs_creates_user_ui() {
+        let tmp = tempfile::TempDir::new().expect("Should create temp dir");
+        let lua_base = tmp.path().join("lua");
+
+        ensure_customization_dirs(&lua_base);
+
+        assert!(lua_base.join("user/ui").is_dir(), "user/ui/ must be created");
+    }
+
+    #[test]
+    fn test_ensure_customization_dirs_creates_intermediate_dirs() {
+        // lua_base itself does not exist — create_dir_all must handle it
+        let tmp = tempfile::TempDir::new().expect("Should create temp dir");
+        let lua_base = tmp.path().join("deeply").join("nested").join("lua");
+
+        ensure_customization_dirs(&lua_base);
+
+        assert!(lua_base.join("user/ui").is_dir());
+    }
+
+    #[test]
+    fn test_ensure_customization_dirs_is_idempotent() {
+        let tmp = tempfile::TempDir::new().expect("Should create temp dir");
+        let lua_base = tmp.path().join("lua");
+
+        // First call creates dir; second call must not error or clobber
+        ensure_customization_dirs(&lua_base);
+        ensure_customization_dirs(&lua_base);
+
+        assert!(lua_base.join("user/ui").is_dir());
     }
 }
