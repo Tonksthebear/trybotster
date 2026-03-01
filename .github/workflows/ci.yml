@@ -151,6 +151,7 @@ jobs:
           DB_USERNAME: postgres
           DB_PASSWORD: postgres
           RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
+          SKIP_CLI_BUILD: "1"
           # REDIS_URL: redis://localhost:6379/0
         run: bin/rails db:test:prepare test
 
@@ -203,6 +204,7 @@ jobs:
           DB_USERNAME: postgres
           DB_PASSWORD: postgres
           RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
+          SKIP_CLI_BUILD: "1"
           # REDIS_URL: redis://localhost:6379/0
         run: bin/rails db:test:prepare test:system
 
@@ -242,10 +244,12 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run CLI tests
+        env:
+          BOTSTER_ENV: test
         working-directory: cli
         run: |
           rm -rf ~/.botster
-          ./test.sh
+          cargo test --lib --tests -- --test-threads=1
 
   ci:
     if: always()
