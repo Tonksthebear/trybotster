@@ -73,6 +73,7 @@ class WorkerBridge {
       // Every event must include { event: "<name>" } so #dispatchEvent can route it.
       webrtcTransport.on("connection:state", (data) => this.#dispatchEvent({ event: "connection:state", ...data }))
       webrtcTransport.on("connection:mode", (data) => this.#dispatchEvent({ event: "connection:mode", ...data }))
+      webrtcTransport.on("connection:stalled", (data) => this.#dispatchEvent({ event: "connection:stalled", ...data }))
       webrtcTransport.on("subscription:message", (data) => this.#dispatchEvent({ event: "subscription:message", ...data }))
       webrtcTransport.on("subscription:confirmed", (data) => this.#dispatchEvent({ event: "subscription:confirmed", ...data }))
       webrtcTransport.on("health", (data) => this.#dispatchEvent({ event: "health", ...data }))

@@ -348,7 +348,7 @@ function Client:handle_hub_data(sub_id, command)
 end
 
 --- Handle MCP channel data messages.
--- Routes tool_call and tools_list requests from MCP bridge clients.
+-- Routes tools_list, tool_call, prompts_list, and prompt_get requests from MCP bridge clients.
 -- @param sub_id The subscription ID
 -- @param command The command message
 function Client:handle_mcp_data(sub_id, command)
@@ -389,6 +389,40 @@ function Client:handle_mcp_data(sub_id, command)
                 content = result,
             })
         end
+
+    elseif cmd_type == "prompts_list" then
+        self:send({
+            subscriptionId = sub_id,
+            type = "prompts_list",
+            prompts = mcp.list_prompts(),
+        })
+
+    elseif cmd_type == "prompt_get" then
+        local call_id = command.call_id
+        local prompt_name = command.name
+        local args = command.arguments or {}
+        local result, err = mcp.get_prompt(prompt_name, args)
+        if err then
+            self:send({
+                subscriptionId = sub_id,
+                type = "prompt_result",
+                call_id = call_id,
+                name = prompt_name,
+                is_error = true,
+                content = { { type = "text", text = err } },
+            })
+        else
+            self:send({
+                subscriptionId = sub_id,
+                type = "prompt_result",
+                call_id = call_id,
+                name = prompt_name,
+                is_error = false,
+                description = result.description,
+                messages = result.messages,
+            })
+        end
+
     else
         log.debug(string.format("Unknown MCP command: %s", tostring(cmd_type)))
     end

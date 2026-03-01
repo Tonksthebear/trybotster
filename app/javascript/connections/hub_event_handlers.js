@@ -61,6 +61,12 @@ export function setupHubEventListeners(bridge, hubId, cb) {
     await handleSessionRefreshed(event, cb)
   }))
 
+  // SCTP send buffer backing up — ICE path is dead during network transition
+  unsubs.push(bridge.on("connection:stalled", (event) => {
+    if (event.hubId !== hubId) return
+    cb.probeOnVisibility()
+  }))
+
   return unsubs
 }
 

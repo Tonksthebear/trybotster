@@ -230,6 +230,18 @@ commands.register("quit", function(_client, _sub_id, _command)
     hub.quit()
 end, { description = "Shut down the hub" })
 
+commands.register("restart_hub", function(_client, _sub_id, _command)
+    -- exec_restart: Hub exec()-replaces itself with a fresh binary instance.
+    -- The broker keeps PTY FDs alive during the reconnect window so agents
+    -- survive. hub.graceful_restart() only quits cleanly — it does NOT
+    -- relaunch the Hub, so nothing would come back automatically.
+    hub.exec_restart()
+end, { description = "Graceful restart — agents survive the Hub restarting" })
+
+commands.register("dev_rebuild", function(_client, _sub_id, _command)
+    hub.dev_rebuild()
+end, { description = "Dev: cargo build then exec-restart — agents survive (requires cargo on PATH)" })
+
 -- ============================================================================
 -- Update Commands
 -- ============================================================================

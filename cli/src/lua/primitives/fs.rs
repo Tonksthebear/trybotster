@@ -219,6 +219,46 @@ pub fn register(lua: &Lua) -> Result<()> {
         .set("mkdir", mkdir_fn)
         .map_err(|e| anyhow!("Failed to set fs.mkdir: {e}"))?;
 
+    // fs.list_dir(path) -> (array, nil) or (nil, error_string)
+    //
+    // Returns an array of entry names (strings) for the immediate children of
+    // `path`. Entries are not sorted. Does not recurse. Skips entries whose
+    // names are not valid UTF-8.
+    //
+    // Returns nil + error string if `path` does not exist or is not a directory.
+    let list_dir_fn = lua
+        .create_function(|lua, path: String| {
+            let p = Path::new(&path);
+            if !p.exists() {
+                return Ok((None::<mlua::Table>, Some("Path does not exist".to_string())));
+            }
+            if !p.is_dir() {
+                return Ok((None::<mlua::Table>, Some("Path is not a directory".to_string())));
+            }
+            match std::fs::read_dir(&path) {
+                Ok(entries) => {
+                    let table = lua.create_table()?;
+                    let mut i = 1i64;
+                    for entry in entries.flatten() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            table.set(i, name.to_string())?;
+                            i += 1;
+                        }
+                    }
+                    Ok((Some(table), None::<String>))
+                }
+                Err(e) => Ok((
+                    None::<mlua::Table>,
+                    Some(format!("Failed to list directory: {e}")),
+                )),
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create fs.list_dir function: {e}"))?;
+
+    fs_table
+        .set("list_dir", list_dir_fn)
+        .map_err(|e| anyhow!("Failed to set fs.list_dir: {e}"))?;
+
     // fs.rmdir(path) -> (true, nil) or (nil, error_string)
     //
     // Recursively removes a directory and all of its contents.
@@ -419,6 +459,43 @@ mod tests {
         let _: Function = fs_table.get("read").expect("fs.read should exist");
         let _: Function = fs_table.get("exists").expect("fs.exists should exist");
         let _: Function = fs_table.get("copy").expect("fs.copy should exist");
+        let _: Function = fs_table.get("list_dir").expect("fs.list_dir should exist");
+    }
+
+    #[test]
+    fn test_list_dir_returns_entries() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap().to_string();
+
+        // Write two files into the temp dir
+        std::fs::write(dir.path().join("alpha.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("beta.txt"), b"b").unwrap();
+
+        let (entries, err): (Option<mlua::Table>, Option<String>) = lua
+            .load(format!(r#"return fs.list_dir("{dir_str}")"#))
+            .eval()
+            .expect("fs.list_dir should be callable");
+
+        assert!(err.is_none(), "Unexpected error: {err:?}");
+        let entries = entries.expect("Should return a table");
+        assert_eq!(entries.len().unwrap(), 2, "Should list exactly 2 entries");
+    }
+
+    #[test]
+    fn test_list_dir_nonexistent_returns_error() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let (entries, err): (Option<mlua::Table>, Option<String>) = lua
+            .load(r#"return fs.list_dir("/nonexistent/path/that/does/not/exist")"#)
+            .eval()
+            .expect("fs.list_dir should be callable even on error");
+
+        assert!(entries.is_none());
+        assert!(err.is_some(), "Should return error for nonexistent path");
     }
 
     #[test]

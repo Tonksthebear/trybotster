@@ -190,7 +190,7 @@ impl PtySessionHandle {
     /// // Feed broker scrollback, then register via hub.register_agent()
     /// ```
     #[must_use]
-    pub fn new_ghost(rows: u16, cols: u16, hub_event_tx: HubEventSender) -> Self {
+    pub(crate) fn new_ghost(rows: u16, cols: u16, hub_event_tx: HubEventSender) -> Self {
         let session = PtySession::new(rows, cols);
         let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) =
             session.get_direct_access();

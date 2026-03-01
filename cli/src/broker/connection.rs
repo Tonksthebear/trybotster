@@ -415,7 +415,7 @@ impl BrokerConnection {
     /// Returns an error if the socket dup fails or the thread cannot be spawned.
     /// On error the forwarder is not installed — `read_response()` falls back to
     /// direct socket reads (output forwarding will be absent but commands work).
-    pub fn install_forwarder(
+    pub(crate) fn install_forwarder(
         &mut self,
         event_tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
     ) -> Result<()> {

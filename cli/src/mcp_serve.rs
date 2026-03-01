@@ -157,8 +157,14 @@ async fn run_async(socket_path: &str) -> Result<()> {
     });
 
     // Pending requests: maps a lookup key to the original JSON-RPC id.
-    // For tools/list: key is "tools_list"
-    // For tools/call: key is the call_id we generated
+    //
+    // Tools:
+    //   "tools_list"          — pending tools/list response
+    //   "call_{n}"            — pending tools/call response
+    //
+    // Prompts:
+    //   "prompts_list"        — pending prompts/list response
+    //   "prompt_get_{n}"      — pending prompts/get response
     let mut pending_calls: HashMap<String, Value> = HashMap::new();
     let mut call_counter: u64 = 0;
 
@@ -190,6 +196,9 @@ async fn run_async(socket_path: &str) -> Result<()> {
                                 "protocolVersion": "2025-03-26",
                                 "capabilities": {
                                     "tools": {
+                                        "listChanged": true
+                                    },
+                                    "prompts": {
                                         "listChanged": true
                                     }
                                 },
@@ -232,6 +241,41 @@ async fn run_async(socket_path: &str) -> Result<()> {
                             "type": "tool_call",
                             "call_id": call_id,
                             "name": tool_name,
+                            "arguments": arguments
+                        }));
+                        frame_tx.send(req_frame.encode())?;
+
+                        if let Some(id) = id {
+                            pending_calls.insert(call_id, id);
+                        }
+                    }
+
+                    "prompts/list" => {
+                        let req_frame = Frame::Json(json!({
+                            "subscriptionId": SUB_ID,
+                            "type": "prompts_list"
+                        }));
+                        frame_tx.send(req_frame.encode())?;
+
+                        if let Some(id) = id {
+                            pending_calls.insert("prompts_list".to_string(), id);
+                        }
+                    }
+
+                    "prompts/get" => {
+                        let params = parsed.get("params").cloned().unwrap_or(json!({}));
+                        let prompt_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+                        call_counter += 1;
+                        // Use a distinct prefix so prompt and tool pending keys never collide.
+                        let call_id = format!("prompt_get_{call_counter}");
+
+                        let req_frame = Frame::Json(json!({
+                            "subscriptionId": SUB_ID,
+                            "type": "prompt_get",
+                            "call_id": call_id,
+                            "name": prompt_name,
                             "arguments": arguments
                         }));
                         frame_tx.send(req_frame.encode())?;
@@ -329,6 +373,84 @@ async fn run_async(socket_path: &str) -> Result<()> {
                         let notification = json!({
                             "jsonrpc": "2.0",
                             "method": "notifications/tools/list_changed"
+                        });
+                        writeln!(stdout, "{}", notification)?;
+                        stdout.flush()?;
+                    }
+
+                    "prompts_list" => {
+                        if let Some(jsonrpc_id) = pending_calls.remove("prompts_list") {
+                            let prompts = hub_msg.get("prompts").cloned().unwrap_or(json!([]));
+
+                            // Map internal prompt shape to MCP wire shape.
+                            // Internal: { name, description, arguments: [{ name, description, required }] }
+                            // MCP:      { name, description, arguments: [{ name, description, required }] }
+                            // The shapes match — pass through directly.
+                            let response = json!({
+                                "jsonrpc": "2.0",
+                                "id": jsonrpc_id,
+                                "result": {
+                                    "prompts": prompts
+                                }
+                            });
+                            writeln!(stdout, "{}", response)?;
+                            stdout.flush()?;
+                        }
+                    }
+
+                    "prompt_result" => {
+                        let call_id = hub_msg
+                            .get("call_id")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("");
+                        if let Some(jsonrpc_id) = pending_calls.remove(call_id) {
+                            let is_error = hub_msg
+                                .get("is_error")
+                                .and_then(|e| e.as_bool())
+                                .unwrap_or(false);
+
+                            let response = if is_error {
+                                // Error path: return a standard JSON-RPC error
+                                let content =
+                                    hub_msg.get("content").cloned().unwrap_or(json!([]));
+                                let err_text = content
+                                    .as_array()
+                                    .and_then(|a| a.first())
+                                    .and_then(|c| c.get("text"))
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("prompt error");
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": jsonrpc_id,
+                                    "error": {
+                                        "code": -32603,
+                                        "message": err_text
+                                    }
+                                })
+                            } else {
+                                let description =
+                                    hub_msg.get("description").cloned().unwrap_or(json!(""));
+                                let messages =
+                                    hub_msg.get("messages").cloned().unwrap_or(json!([]));
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": jsonrpc_id,
+                                    "result": {
+                                        "description": description,
+                                        "messages": messages
+                                    }
+                                })
+                            };
+                            writeln!(stdout, "{}", response)?;
+                            stdout.flush()?;
+                        }
+                    }
+
+                    "prompts_list_changed" => {
+                        // Proactive notification to Claude that prompts have changed
+                        let notification = json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/prompts/list_changed"
                         });
                         writeln!(stdout, "{}", notification)?;
                         stdout.flush()?;

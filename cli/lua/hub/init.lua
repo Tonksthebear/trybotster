@@ -48,6 +48,11 @@ safe_require("lib.agent")
 safe_require("lib.commands")
 _G.mcp = safe_require("lib.mcp")
 
+-- Register built-in default MCP prompts. Loaded here so they are available
+-- before user.init runs, allowing users to override them by re-registering
+-- prompts with the same name (last registration wins).
+safe_require("hub.mcp_defaults")
+
 -- ============================================================================
 -- Handler Loading
 -- ============================================================================

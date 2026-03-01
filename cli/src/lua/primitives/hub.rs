@@ -54,6 +54,23 @@ pub enum HubRequest {
     Quit,
     /// Request update-and-restart (exec into new binary).
     ExecRestart,
+    /// Request a graceful restart: broker keeps PTYs alive for the reconnect
+    /// window so agents survive the Hub restarting.
+    ///
+    /// Unlike [`HubRequest::Quit`] (which sends `kill_all` to the broker),
+    /// this calls `disconnect_graceful()`, giving the user 120 s to rerun
+    /// `botster` before the broker times out and kills PTYs itself.
+    GracefulRestart,
+    /// Rebuild the CLI binary in the background, then exec-restart into it.
+    ///
+    /// Runs `cargo build` against the manifest embedded at compile time
+    /// ([`env!("CARGO_MANIFEST_DIR")`]). On success the Hub exec-replaces
+    /// itself with the freshly built binary; the broker preserves PTY FDs
+    /// across the restart so agents survive.
+    ///
+    /// On build failure the Hub logs an error and keeps running — no agents
+    /// are disrupted.  Intended for development iteration only.
+    DevRebuild,
     /// Handle an incoming WebRTC SDP offer from a browser.
     HandleWebrtcOffer {
         /// Browser identity key (e.g., `identityKey:tabId`).
@@ -610,11 +627,11 @@ pub(crate) fn register(
             .map_err(|e| anyhow!("Failed to set hub.create_ghost_pty: {e}"))?;
     }
 
-    // hub.quit() - Request Hub shutdown
-    let tx = hub_event_tx;
+    // hub.quit() - Request Hub shutdown (broker kills PTYs immediately).
+    let tx_quit = hub_event_tx.clone();
     let quit_fn = lua
         .create_function(move |_, ()| {
-            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            let guard = tx_quit.lock().expect("HubEventSender mutex poisoned");
             if let Some(ref sender) = *guard {
                 let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::Quit));
             } else {
@@ -626,6 +643,87 @@ pub(crate) fn register(
 
     hub.set("quit", quit_fn)
         .map_err(|e| anyhow!("Failed to set hub.quit: {e}"))?;
+
+    // hub.graceful_restart() - Request Hub shutdown with broker keeping PTYs
+    // alive so agents survive the restart.
+    //
+    // The broker will wait up to its configured timeout (120 s by default)
+    // for the Hub to reconnect.  If it does not, the broker kills PTYs and
+    // exits on its own.  Use this from the TUI / browser "Restart" action
+    // instead of hub.quit() when you intend to immediately relaunch botster.
+    let tx = hub_event_tx.clone();
+    let graceful_restart_fn = lua
+        .create_function(move |_, ()| {
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::GracefulRestart));
+            } else {
+                ::log::warn!(
+                    "[Hub] graceful_restart() called before hub_event_tx set — event dropped"
+                );
+            }
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create hub.graceful_restart function: {e}"))?;
+
+    hub.set("graceful_restart", graceful_restart_fn)
+        .map_err(|e| anyhow!("Failed to set hub.graceful_restart: {e}"))?;
+
+    // hub.exec_restart() - Exec-restart the Hub process: broker keeps PTYs alive
+    // across the exec() so agents survive.
+    //
+    // The Hub process replaces itself (execv) with a fresh instance of the same
+    // binary using the same arguments.  This is the correct primitive for the
+    // TUI "restart_hub" action: the broker stays alive during the reconnect
+    // window, the new Hub picks up ghost agents on startup, and the user sees
+    // their agents restored without manual intervention.
+    //
+    // Contrast with hub.graceful_restart(), which quits the Hub cleanly but
+    // does NOT re-exec — the user must manually relaunch botster.
+    let tx = hub_event_tx.clone();
+    let exec_restart_fn = lua
+        .create_function(move |_, ()| {
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::ExecRestart));
+            } else {
+                ::log::warn!(
+                    "[Hub] exec_restart() called before hub_event_tx set — event dropped"
+                );
+            }
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create hub.exec_restart function: {e}"))?;
+
+    hub.set("exec_restart", exec_restart_fn)
+        .map_err(|e| anyhow!("Failed to set hub.exec_restart: {e}"))?;
+
+    // hub.dev_rebuild() - Build the CLI binary then exec-restart into it.
+    //
+    // Runs `cargo build` in a background task using the manifest dir embedded
+    // at compile time. On success, fires ExecRestart so the Hub exec-replaces
+    // itself with the fresh binary while the broker preserves PTY FDs.
+    //
+    // On build failure the Hub logs the error and keeps running — no agents
+    // are disrupted. This is a development-time convenience primitive; it is
+    // safe to call in any environment but cargo must be on $PATH.
+    let tx_dev = hub_event_tx.clone();
+    let dev_rebuild_fn = lua
+        .create_function(move |_, ()| {
+            let guard = tx_dev.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::DevRebuild));
+            } else {
+                ::log::warn!(
+                    "[Hub] dev_rebuild() called before hub_event_tx set — event dropped"
+                );
+            }
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create hub.dev_rebuild function: {e}"))?;
+
+    hub.set("dev_rebuild", dev_rebuild_fn)
+        .map_err(|e| anyhow!("Failed to set hub.dev_rebuild: {e}"))?;
 
     // Ensure hub table is globally registered
     lua.globals()
@@ -680,6 +778,9 @@ mod tests {
         assert!(hub.contains_key("handle_webrtc_offer").unwrap());
         assert!(hub.contains_key("handle_ice_candidate").unwrap());
         assert!(hub.contains_key("quit").unwrap());
+        assert!(hub.contains_key("graceful_restart").unwrap());
+        assert!(hub.contains_key("exec_restart").unwrap());
+        assert!(hub.contains_key("dev_rebuild").unwrap());
     }
 
     #[test]
@@ -720,6 +821,69 @@ mod tests {
         match rx.try_recv() {
             Ok(HubEvent::LuaHubRequest(HubRequest::Quit)) => {}
             other => panic!("Expected LuaHubRequest(Quit), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_graceful_restart_sends_event() {
+        let lua = Lua::new();
+        let (tx, cache, hid, sid, state) = create_test_deps();
+
+        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
+
+        register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
+
+        lua.load("hub.graceful_restart()")
+            .exec()
+            .expect("Should send graceful_restart event");
+
+        match rx.try_recv() {
+            Ok(HubEvent::LuaHubRequest(HubRequest::GracefulRestart)) => {}
+            other => panic!("Expected LuaHubRequest(GracefulRestart), got: {other:?}"),
+        }
+    }
+
+    /// `hub.exec_restart()` sends `HubRequest::ExecRestart`, which causes the
+    /// Hub to re-exec itself after gracefully disconnecting the broker so agents
+    /// survive the restart.
+    #[test]
+    fn test_exec_restart_sends_event() {
+        let lua = Lua::new();
+        let (tx, cache, hid, sid, state) = create_test_deps();
+
+        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
+
+        register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
+
+        lua.load("hub.exec_restart()")
+            .exec()
+            .expect("Should send exec_restart event");
+
+        match rx.try_recv() {
+            Ok(HubEvent::LuaHubRequest(HubRequest::ExecRestart)) => {}
+            other => panic!("Expected LuaHubRequest(ExecRestart), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_dev_rebuild_sends_event() {
+        let lua = Lua::new();
+        let (tx, cache, hid, sid, state) = create_test_deps();
+
+        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender);
+
+        register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
+
+        lua.load("hub.dev_rebuild()")
+            .exec()
+            .expect("Should send dev_rebuild event");
+
+        match rx.try_recv() {
+            Ok(HubEvent::LuaHubRequest(HubRequest::DevRebuild)) => {}
+            other => panic!("Expected LuaHubRequest(DevRebuild), got: {other:?}"),
         }
     }
 

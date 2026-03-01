@@ -306,17 +306,19 @@ class WebRTCTransport {
       } else if (state === "disconnected") {
         // ICE disconnected is TRANSIENT — a single missed STUN check triggers it.
         // Don't restart ICE immediately; connectivity checks usually recover on their own.
-        // Safety net: if ICE stays disconnected for 15s without escalating to "failed",
+        // Safety net: if ICE stays disconnected for 5s without escalating to "failed",
         // clean up the peer so handlePeerDisconnected triggers a full reconnect.
+        // 5s is enough for transient blips; the visibilitychange handler in Connection
+        // handles phone-unlock faster than this timer in most cases.
         console.debug(`[WebRTCTransport] ICE disconnected (transient), waiting for recovery or failure`)
         if (!conn.iceDisconnectedTimer) {
           conn.iceDisconnectedTimer = setTimeout(() => {
             conn.iceDisconnectedTimer = null
             if (pc.iceConnectionState === "disconnected") {
-              console.debug(`[WebRTCTransport] ICE stuck disconnected for 15s, cleaning up peer`)
+              console.debug(`[WebRTCTransport] ICE stuck disconnected for 5s, cleaning up peer`)
               this.#cleanupPeer(hubId, conn)
             }
-          }, 15_000)
+          }, 5_000)
         }
       }
     }
@@ -617,6 +619,14 @@ class WebRTCTransport {
 
     const { data: encrypted } = await bridge.encryptBinary(String(hubId), plaintext)
     conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
+
+    // If the SCTP send buffer is backing up, the underlying ICE path is dead
+    // even though dc.readyState still reports "open". This happens during
+    // WiFi↔cellular transitions. Emit connection:stalled so the connection
+    // can detect it and probe immediately rather than waiting for heartbeat timeout.
+    if (conn.dataChannel.bufferedAmount > 4096) {
+      this.#emit("connection:stalled", { hubId })
+    }
   }
 
   /**

@@ -161,6 +161,17 @@ pub fn cleanup_orphaned_sockets() {
             continue;
         };
 
+        // Skip broker sockets (named "broker-{hub_id}.sock").
+        //
+        // Broker sockets are owned by the broker subprocess, which has no
+        // corresponding hub PID file. `is_hub_running("broker-{hub_id}")` would
+        // always return false and cause the socket to be incorrectly deleted
+        // while the broker is still running and holding live PTY FDs. The broker
+        // cleans up its own socket on exit (see `broker::run()`).
+        if hub_id.starts_with("broker-") {
+            continue;
+        }
+
         // If the hub has a live PID, keep its socket
         if is_hub_running(hub_id) {
             continue;
@@ -263,5 +274,61 @@ mod tests {
         assert!(found, "discover_running_hubs should find our test hub, got: {running:?}");
 
         cleanup_on_shutdown(&test_id);
+    }
+
+    /// Verifies that `cleanup_orphaned_sockets` does NOT delete broker sockets.
+    ///
+    /// Broker sockets are named `broker-{hub_id}.sock`. They have no matching
+    /// hub PID file, so `is_hub_running("broker-{hub_id}")` always returns false.
+    /// Without the `broker-` prefix guard introduced in the bug fix, the cleanup
+    /// would incorrectly delete the live broker socket, breaking hub restart recovery.
+    #[test]
+    fn test_cleanup_orphaned_sockets_preserves_broker_socket() {
+        let uid = unsafe { libc::getuid() };
+        let dir = PathBuf::from(format!("/tmp/botster-{uid}"));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Use process id for a unique broker socket name — no hub PID file will exist.
+        let hub_id = format!("_test_hub_{}", std::process::id());
+        let broker_sock = dir.join(format!("broker-{hub_id}.sock"));
+        fs::write(&broker_sock, b"").unwrap();
+
+        cleanup_orphaned_sockets();
+
+        assert!(
+            broker_sock.exists(),
+            "cleanup_orphaned_sockets must not delete broker socket: {}",
+            broker_sock.display()
+        );
+
+        let _ = fs::remove_file(&broker_sock);
+    }
+
+    /// Verifies that `cleanup_orphaned_sockets` removes stale hub sockets.
+    ///
+    /// A hub socket whose stem matches no live PID file is orphaned (e.g., left
+    /// behind by a crashed process). The cleanup must remove it so a restarted
+    /// hub can bind a fresh socket at the same path without EADDRINUSE.
+    #[test]
+    fn test_cleanup_orphaned_sockets_removes_stale_hub_socket() {
+        let uid = unsafe { libc::getuid() };
+        let dir = PathBuf::from(format!("/tmp/botster-{uid}"));
+        fs::create_dir_all(&dir).unwrap();
+
+        // Use a unique id with no corresponding PID file — simulates a crashed hub.
+        let stale_id = format!("_test_stale_{}", std::process::id());
+        let stale_sock = dir.join(format!("{stale_id}.sock"));
+        fs::write(&stale_sock, b"").unwrap();
+
+        // Precondition: no PID file exists for this id.
+        assert!(read_pid_file(&stale_id).is_none(), "test precondition: no PID file");
+
+        cleanup_orphaned_sockets();
+
+        assert!(
+            !stale_sock.exists(),
+            "cleanup_orphaned_sockets should remove stale hub socket: {}",
+            stale_sock.display()
+        );
     }
 }

@@ -888,15 +888,6 @@ where
                 }
                 Ok(TuiOutput::Output { agent_index, pty_index, data }) => {
                     self.dirty = true;
-                    let key = (
-                        agent_index.or(self.panel_pool.current_agent_index).unwrap_or(0),
-                        pty_index.or(self.panel_pool.current_pty_index).unwrap_or(0),
-                    );
-                    log::debug!(
-                        "PTY output: agent={:?} pty={:?} -> panel key={:?}, {} bytes, panel_exists={}",
-                        agent_index, pty_index, key, data.len(),
-                        self.panel_pool.panels.contains_key(&key)
-                    );
                     let panel = self.panel_pool.resolve_panel(agent_index, pty_index);
                     panel.on_output(&data);
                 }
@@ -2009,6 +2000,73 @@ mod tests {
         // 4. Close with Escape
         process_key_with_lua(&mut runner, make_key_escape(), &lua);
         assert_eq!(runner.mode(), "normal");
+    }
+
+    /// Verifies the `restart_hub` menu action sends the right message and does
+    /// NOT set `runner.quit`.
+    ///
+    /// # Bug context
+    ///
+    /// The original implementation returned `{ op = "quit" }` alongside the
+    /// `restart_hub` send_msg. The TUI thread calls `shutdown.store(true)` as
+    /// soon as `runner.quit` is set, which races with the hub's two-hop
+    /// GracefulRestart processing. If the shutdown flag fires first, the hub
+    /// calls `kill_all()` instead of `disconnect_graceful()`, killing the broker
+    /// and all agent PTYs.
+    ///
+    /// The fix removes `{ op = "quit" }` from the action, letting hub.quit = true
+    /// propagate via the shared shutdown flag after GracefulRestart completes.
+    ///
+    /// This test verifies:
+    /// 1. `runner.quit` is NOT set after selecting restart_hub (no race).
+    /// 2. A `restart_hub` message is sent to Hub.
+    /// 3. The menu is closed (mode returns to normal/insert, not "menu").
+    #[test]
+    fn test_e2e_restart_hub_does_not_quit_tui() {
+        let (mut runner, _output_tx, mut request_rx, shutdown) =
+            create_test_runner_with_mock_client();
+        let lua = make_test_layout_with_keybindings();
+
+        // Open menu and inject restart_hub as a menu item.
+        process_key_with_lua(&mut runner, make_key_ctrl('p'), &lua);
+        assert_eq!(runner.mode(), "menu");
+
+        runner.overlay_list_actions = vec!["restart_hub".to_string()];
+        runner.focused_list_id = Some("menu".to_string());
+        runner.widget_states.list_state("menu").set_selectable_count(1);
+
+        // Select restart_hub with Enter.
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
+
+        // Give the responder thread a moment to forward the message.
+        thread::sleep(Duration::from_millis(10));
+
+        // 1. TUI quit flag must NOT be set — hub controls shutdown.
+        assert!(!runner.quit, "restart_hub must not set runner.quit (would race with GracefulRestart)");
+
+        // 2. A restart_hub message must have been sent to Hub.
+        let mut found_restart = false;
+        while let Ok(req) = request_rx.try_recv() {
+            let msg = unwrap_lua_msg(req);
+            if let Some(data) = msg.get("data") {
+                if data.get("type").and_then(|t| t.as_str()) == Some("restart_hub") {
+                    found_restart = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_restart, "restart_hub action must send a restart_hub message to Hub");
+
+        // 3. Menu must be closed — mode exits "menu" so the operator sees a clean TUI
+        //    while waiting for Hub to process the graceful restart.
+        assert_ne!(
+            runner.mode(),
+            "menu",
+            "menu must close after restart_hub (mode was \"{}\")",
+            runner.mode()
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
     }
 
     // =========================================================================
