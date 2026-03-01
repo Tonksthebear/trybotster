@@ -610,3 +610,279 @@ class GithubSearchReposToolTest < ActiveSupport::TestCase
     end
   end
 end
+
+class GithubGetPullRequestFilesToolTest < ActiveSupport::TestCase
+  include MCPToolTestHelper
+
+  setup do
+    raw = JSON.parse(File.read(Rails.root.join("test/fixtures/github/pull_request_files.json")))
+    @files = raw.map { |f| mock_resource(convert_to_octokit_format(f)) }
+  end
+
+  test "returns changed file manifest on success" do
+    tool = GithubGetPullRequestFilesTool.new(repo: "owner/repo", pr_number: 49)
+    setup_tool_mocks(tool)
+
+    client = mock_octokit_client(:pull_request_files, @files)
+    with_installation_client(client) do
+      tool.perform
+      assert_nil tool.instance_variable_get(:@error)
+      rendered = tool.instance_variable_get(:@rendered)
+      assert rendered[:text]&.include?("Changed files in owner/repo#49")
+      assert rendered[:text]&.include?("app/models/user.rb")
+      assert rendered[:text]&.include?("app/controllers/users_controller.rb")
+      assert rendered[:text]&.include?("3 files")
+      # No patch content — agent reads files locally
+      assert_not rendered[:text]&.include?("@@")
+    end
+  end
+
+  test "shows per-file change counts and totals" do
+    tool = GithubGetPullRequestFilesTool.new(repo: "owner/repo", pr_number: 49)
+    setup_tool_mocks(tool)
+
+    client = mock_octokit_client(:pull_request_files, @files)
+    with_installation_client(client) do
+      tool.perform
+      rendered = tool.instance_variable_get(:@rendered)
+      # Per-file stats
+      assert rendered[:text]&.include?("+12")
+      assert rendered[:text]&.include?("+40")
+      # Totals line
+      assert rendered[:text]&.include?("Total:")
+    end
+  end
+
+  test "handles empty file list" do
+    tool = GithubGetPullRequestFilesTool.new(repo: "owner/repo", pr_number: 49)
+    setup_tool_mocks(tool)
+
+    client = mock_octokit_client(:pull_request_files, [])
+    with_installation_client(client) do
+      tool.perform
+      rendered = tool.instance_variable_get(:@rendered)
+      assert rendered[:text]&.include?("No changed files found")
+    end
+  end
+
+  test "returns error when app not installed" do
+    tool = GithubGetPullRequestFilesTool.new(repo: "owner/repo", pr_number: 49)
+    setup_tool_mocks(tool)
+
+    with_no_installation do
+      tool.perform
+      error = tool.instance_variable_get(:@error)
+      assert error&.include?("not installed")
+    end
+  end
+
+  test "validates repo format" do
+    tool = GithubGetPullRequestFilesTool.new(repo: "bad-format", pr_number: 49)
+    assert_not tool.valid?
+    assert_includes tool.errors[:repo], "must be in 'owner/repo' format"
+  end
+
+  test "validates pr_number is positive" do
+    tool = GithubGetPullRequestFilesTool.new(repo: "owner/repo", pr_number: 0)
+    assert_not tool.valid?
+    assert tool.errors[:pr_number].any?
+  end
+end
+
+class GithubCreatePullRequestReviewToolTest < ActiveSupport::TestCase
+  include MCPToolTestHelper
+
+  setup do
+    @review_data = symbolize_keys_deep(load_github_fixture("pull_request_review"))
+  end
+
+  test "submits APPROVE review on success" do
+    tool = GithubCreatePullRequestReviewTool.new(
+      repo: "owner/repo",
+      pr_number: 49,
+      event: "APPROVE",
+      body: "Looks great!"
+    )
+    setup_tool_mocks(tool)
+
+    client = mock_octokit_client(:create_pull_request_review, mock_resource(@review_data))
+    with_installation_client(client) do
+      tool.perform
+      assert_nil tool.instance_variable_get(:@error)
+      rendered = tool.instance_variable_get(:@rendered)
+      assert rendered[:text]&.include?("Approved")
+      assert rendered[:text]&.include?("owner/repo#49")
+    end
+  end
+
+  test "submits REQUEST_CHANGES review on success" do
+    tool = GithubCreatePullRequestReviewTool.new(
+      repo: "owner/repo",
+      pr_number: 49,
+      event: "REQUEST_CHANGES",
+      body: "Please fix the error handling."
+    )
+    setup_tool_mocks(tool)
+
+    review = mock_resource(@review_data.merge(state: "CHANGES_REQUESTED"))
+    client = mock_octokit_client(:create_pull_request_review, review)
+    with_installation_client(client) do
+      tool.perform
+      assert_nil tool.instance_variable_get(:@error)
+      rendered = tool.instance_variable_get(:@rendered)
+      assert rendered[:text]&.include?("Changes requested")
+    end
+  end
+
+  test "submits COMMENT review with inline comments" do
+    tool = GithubCreatePullRequestReviewTool.new(
+      repo: "owner/repo",
+      pr_number: 49,
+      event: "COMMENT",
+      body: "Some thoughts inline.",
+      comments: [
+        { "path" => "app/models/user.rb", "line" => 15, "body" => "Consider using a scope here." },
+        { "path" => "app/controllers/users_controller.rb", "line" => 3, "body" => "Missing authorization check." }
+      ]
+    )
+    setup_tool_mocks(tool)
+
+    client = mock_octokit_client(:create_pull_request_review, mock_resource(@review_data))
+    with_installation_client(client) do
+      tool.perform
+      assert_nil tool.instance_variable_get(:@error)
+      rendered = tool.instance_variable_get(:@rendered)
+      assert rendered[:text]&.include?("Inline comments: 2")
+    end
+  end
+
+  test "returns error when app not installed" do
+    tool = GithubCreatePullRequestReviewTool.new(
+      repo: "owner/repo", pr_number: 49, event: "APPROVE"
+    )
+    setup_tool_mocks(tool)
+
+    with_no_installation do
+      tool.perform
+      error = tool.instance_variable_get(:@error)
+      assert error&.include?("not installed")
+    end
+  end
+
+  test "validates repo format" do
+    tool = GithubCreatePullRequestReviewTool.new(repo: "bad", pr_number: 49, event: "APPROVE")
+    assert_not tool.valid?
+    assert_includes tool.errors[:repo], "must be in 'owner/repo' format"
+  end
+
+  test "validates event is one of the allowed values" do
+    tool = GithubCreatePullRequestReviewTool.new(repo: "owner/repo", pr_number: 49, event: "MERGE")
+    assert_not tool.valid?
+    assert_includes tool.errors[:event], "must be 'APPROVE', 'REQUEST_CHANGES', or 'COMMENT'"
+  end
+
+  test "validates body is required for REQUEST_CHANGES" do
+    tool = GithubCreatePullRequestReviewTool.new(repo: "owner/repo", pr_number: 49, event: "REQUEST_CHANGES")
+    assert_not tool.valid?
+    assert_includes tool.errors[:body], "is required when requesting changes"
+  end
+
+  test "allows APPROVE without body" do
+    tool = GithubCreatePullRequestReviewTool.new(repo: "owner/repo", pr_number: 49, event: "APPROVE")
+    assert tool.valid?
+  end
+
+  test "validates comment items have required fields" do
+    tool = GithubCreatePullRequestReviewTool.new(
+      repo: "owner/repo",
+      pr_number: 49,
+      event: "COMMENT",
+      comments: [ { "path" => "app/models/user.rb" } ]
+    )
+    assert_not tool.valid?
+    assert tool.errors[:comments].any? { |e| e.include?("missing 'line'") }
+    assert tool.errors[:comments].any? { |e| e.include?("missing 'body'") }
+  end
+
+  test "validates comment line must be positive" do
+    tool = GithubCreatePullRequestReviewTool.new(
+      repo: "owner/repo",
+      pr_number: 49,
+      event: "COMMENT",
+      comments: [ { "path" => "app/models/user.rb", "line" => 0, "body" => "nit" } ]
+    )
+    assert_not tool.valid?
+    assert tool.errors[:comments].any? { |e| e.include?("positive integer") }
+  end
+
+  test "returns cached response when idempotency key exists" do
+    cached_response = { success: true, text: "✅ Approved — owner/repo#49\n\n🔗 Review URL: https://github.com/owner/repo/pull/49#review-123" }.to_json
+
+    IdempotencyKey.create!(
+      key: "review-idempotency-key",
+      request_path: "github_create_pull_request_review",
+      request_params: { repo: "owner/repo", pr_number: 49, event: "APPROVE" }.to_json,
+      response_body: cached_response,
+      response_status: 200,
+      completed_at: Time.current
+    )
+
+    tool = GithubCreatePullRequestReviewTool.new(repo: "owner/repo", pr_number: 49, event: "APPROVE")
+    setup_tool_mocks(tool)
+    tool.define_singleton_method(:idempotency_key_from_request) { "review-idempotency-key" }
+
+    Github::App.stub :installation_id_for_repo, ->(*) { raise "API should not be called" } do
+      tool.perform
+      rendered = tool.instance_variable_get(:@rendered)
+      assert rendered[:text]&.include?("Approved")
+    end
+  end
+
+  test "stores idempotency response after successful review" do
+    tool = GithubCreatePullRequestReviewTool.new(
+      repo: "owner/repo", pr_number: 49, event: "APPROVE", body: "LGTM"
+    )
+    setup_tool_mocks(tool)
+
+    key_value = "review-store-key-#{SecureRandom.hex(8)}"
+    tool.define_singleton_method(:idempotency_key_from_request) { key_value }
+
+    client = mock_octokit_client(:create_pull_request_review, mock_resource(@review_data))
+    with_installation_client(client) do
+      tool.perform
+      assert_nil tool.instance_variable_get(:@error)
+    end
+
+    stored = IdempotencyKey.find_by(key: key_value)
+    assert stored.present?, "Idempotency key should be stored"
+    assert stored.completed?, "Idempotency key should be marked completed"
+  end
+
+  test "does not submit duplicate review on retry with same idempotency key" do
+    key_value = "review-retry-key-#{SecureRandom.hex(8)}"
+    api_call_count = 0
+    review_data = @review_data
+
+    mock_client = Object.new
+    mock_client.define_singleton_method(:create_pull_request_review) do |*_args, **_kwargs|
+      api_call_count += 1
+      resource = OpenStruct.new(review_data)
+      resource.define_singleton_method(:to_h) { review_data }
+      resource
+    end
+
+    tool1 = GithubCreatePullRequestReviewTool.new(repo: "owner/repo", pr_number: 49, event: "APPROVE")
+    setup_tool_mocks(tool1)
+    tool1.define_singleton_method(:idempotency_key_from_request) { key_value }
+    with_installation_client(mock_client) { tool1.perform }
+
+    assert_equal 1, api_call_count
+
+    tool2 = GithubCreatePullRequestReviewTool.new(repo: "owner/repo", pr_number: 49, event: "APPROVE")
+    setup_tool_mocks(tool2)
+    tool2.define_singleton_method(:idempotency_key_from_request) { key_value }
+    with_installation_client(mock_client) { tool2.perform }
+
+    assert_equal 1, api_call_count, "Retry should not call the GitHub API again"
+  end
+end
