@@ -26,6 +26,7 @@ const AGENT_ENV_KEYS: &[(&str, &str)] = &[
     ("agent_key", "BOTSTER_AGENT_KEY"),
     ("hub_id", "BOTSTER_HUB_ID"),
     ("worktree_path", "BOTSTER_WORKTREE_PATH"),
+    ("prompt", "BOTSTER_PROMPT"),
 ];
 
 /// Run the context command.

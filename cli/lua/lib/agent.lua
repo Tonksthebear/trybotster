@@ -90,12 +90,24 @@ function Agent.new(config)
 
     local key = self:agent_key()
 
-    -- Write context.json to worktree for init scripts and post-mortem inspection.
-    -- Skip on main checkout (where .git is a directory) to avoid polluting the
-    -- repo's .botster/ config directory. In worktrees, .git is a file.
+    -- Compute context.json path for broker restart recovery.
+    -- Worktree agents (.git is a file): <worktree>/.botster/context.json
+    -- Main-branch agents (.git is a directory): <data_dir>/.botster/agents/<key>/context.json
+    --
+    -- Both paths are written so all agents survive a graceful Hub restart.
+    -- The file is removed in Agent:close() so closed agents do not reappear as ghosts.
     local git_path = config.worktree_path .. "/.git"
-    self._has_context_file = fs.exists(git_path) and not fs.is_dir(git_path)
-    if self._has_context_file then
+    local is_worktree = fs.exists(git_path) and not fs.is_dir(git_path)
+    self._is_worktree = is_worktree
+    if is_worktree then
+        self._context_path = config.worktree_path .. "/.botster/context.json"
+    else
+        local data_dir = config.data_dir and config.data_dir() or nil
+        if data_dir then
+            self._context_path = data_dir .. "/.botster/agents/" .. key .. "/context.json"
+        end
+    end
+    if self._context_path then
         self:_sync_context_json()
     end
 
@@ -256,21 +268,25 @@ function Agent:get_meta(key)
 end
 
 --- Sync context.json with current agent state.
--- Only writes if the agent has a context file (i.e., running in a worktree).
+-- Writes to _context_path (set at creation). No-op if path was not computed
+-- (broker unavailable at startup or data_dir not configured).
 function Agent:_sync_context_json()
-    if not self._has_context_file then return end
+    if not self._context_path then return end
     local context = {
         repo = self.repo,
         branch_name = self.branch_name,
+        worktree_path = self.worktree_path,
         prompt = self.prompt,
         metadata = self.metadata,
+        profile_name = self.profile_name,
         created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
     }
-    local context_dir = self.worktree_path .. "/.botster"
-    if not fs.exists(context_dir) then
+    -- Derive parent directory from the full context path
+    local context_dir = self._context_path:match("^(.+)/[^/]+$")
+    if context_dir and not fs.exists(context_dir) then
         fs.mkdir(context_dir)
     end
-    local ok, err = pcall(fs.write, context_dir .. "/context.json", json.encode(context))
+    local ok, err = pcall(fs.write, self._context_path, json.encode(context))
     if not ok then
         log.warn(string.format("Failed to sync context.json: %s", tostring(err)))
     end
@@ -304,6 +320,13 @@ function Agent:close(delete_worktree)
 
     -- Remove from registry
     agents[key] = nil
+
+    -- Remove context file so this agent is not resurrected as a ghost on restart.
+    -- Worktree agents: <worktree>/.botster/context.json
+    -- Main-branch agents: <data_dir>/.botster/agents/<key>/context.json
+    if self._context_path and fs.exists(self._context_path) then
+        pcall(fs.delete, self._context_path)
+    end
 
     -- Queue worktree deletion if requested
     if delete_worktree then
@@ -616,6 +639,9 @@ function Agent:build_env(base_env)
     env.BOTSTER_WORKTREE_PATH = self.worktree_path
     env.BOTSTER_AGENT_KEY = self:agent_key()
     env.BOTSTER_HUB_ID = hub.server_id() or ""
+    if self.prompt and self.prompt ~= "" then
+        env.BOTSTER_PROMPT = self.prompt
+    end
     -- Fire filter hook for customization
     env = hooks.call("filter_agent_env", env, self) or env
     return env
@@ -684,7 +710,7 @@ function Agent:info()
         metadata = self.metadata,
         branch_name = self.branch_name,
         worktree_path = self.worktree_path,
-        in_worktree = self._has_context_file,
+        in_worktree = self._is_worktree or false,
         status = self.status,
         -- New: ordered sessions array
         sessions = sessions_info,
