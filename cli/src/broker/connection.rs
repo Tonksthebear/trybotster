@@ -320,7 +320,10 @@ impl BrokerConnection {
     pub fn kill_all(mut self) {
         let frame = encode_hub_control(&HubMessage::KillAll);
         let _ = self.stream.write_all(&frame);
-        // Drop closes the socket; broker cleans up and exits.
+        // shutdown(Both) invalidates all dup'd FDs including the demux thread's
+        // copy, so the broker's recvmsg sees EOF immediately.  Without this,
+        // install_forwarder's dup keeps the socket alive and the broker hangs.
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
         drop(self);
     }
 
