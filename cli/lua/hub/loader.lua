@@ -285,8 +285,7 @@ function M.unload_plugin(name)
 
     -- Remove lua/ path and namespace modules
     if entry then
-        local plugin_dir = entry.path:match("^(.*)/[^/]+$") or "."
-        remove_from_package_path(plugin_dir .. "/lua")
+        remove_from_package_path(plugin_dir(entry.path) .. "/lua")
     end
     clear_plugin_namespace(name)
     package.loaded[module_key] = nil
