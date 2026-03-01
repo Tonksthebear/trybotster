@@ -550,6 +550,26 @@ async fn run_session(
 
     write_task.abort();
     read_task.abort();
+
+    // If the hub disconnected, synthesize JSON-RPC errors for every in-flight
+    // request so Claude Code doesn't hang waiting for responses that will
+    // never arrive. The hub has no memory of the old session; pending calls
+    // from before the disconnect will never be fulfilled.
+    if matches!(exit, SessionExit::HubDisconnected) {
+        for (_, jsonrpc_id) in pending_calls.drain() {
+            let err = json!({
+                "jsonrpc": "2.0",
+                "id": jsonrpc_id,
+                "error": {
+                    "code": -32000,
+                    "message": "MCP server disconnected from hub — reconnecting"
+                }
+            });
+            writeln!(stdout, "{}", err)?;
+            stdout.flush()?;
+        }
+    }
+
     Ok(exit)
 }
 
