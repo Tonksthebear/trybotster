@@ -632,8 +632,8 @@ class GithubGetPullRequestFilesToolTest < ActiveSupport::TestCase
       assert rendered[:text]&.include?("app/models/user.rb")
       assert rendered[:text]&.include?("app/controllers/users_controller.rb")
       assert rendered[:text]&.include?("3 files")
-      # No patch content — agent reads files locally
-      assert_not rendered[:text]&.include?("@@")
+      # Patch content is included with annotated line numbers for inline review comments
+      assert rendered[:text]&.include?("@@")
     end
   end
 

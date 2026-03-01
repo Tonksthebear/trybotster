@@ -207,13 +207,16 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     device_token = device.create_device_token!(name: token_name)
     api_key = device_token.token
 
+    log_file_path = File.join(temp_dir, "botster.log")
+
     env = {
       "BOTSTER_ENV" => "system_test",
       "BOTSTER_CONFIG_DIR" => temp_dir,
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_TOKEN" => api_key,
       "BOTSTER_HUB_ID" => hub.identifier,
-      "BOTSTER_WORKTREE_BASE" => worktree_base
+      "BOTSTER_WORKTREE_BASE" => worktree_base,
+      "BOTSTER_LOG_FILE" => log_file_path
     }
 
     # By default, set BOTSTER_REPO explicitly. Tests can opt out with
@@ -243,8 +246,6 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
 
     stdout_w.close
     stderr_w.close
-
-    log_file_path = File.join(temp_dir, "botster.log")
 
     cli = CliTestHelper::CliProcess.new(
       pid: pid,
