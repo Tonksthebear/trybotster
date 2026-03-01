@@ -586,11 +586,7 @@ impl Hub {
                 match result {
                     Ok(()) => {
                         log::info!("[Worktree] Async deletion complete: {} ({})", branch, path);
-                        // Remove the deleted worktree from HandleCache so
-                        // worktree.list() / worktree.find() reflect the deletion.
-                        let mut worktrees = self.handle_cache.get_worktrees();
-                        worktrees.retain(|(p, _)| p != &path);
-                        self.handle_cache.set_worktrees(worktrees);
+                        self.handle_cache.remove_worktree_by_branch(&branch);
                     }
                     Err(e) => {
                         log::error!("[Worktree] Async deletion failed for {}: {}", branch, e);
