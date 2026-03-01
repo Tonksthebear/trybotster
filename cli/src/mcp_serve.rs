@@ -66,6 +66,11 @@ async fn connect_to_hub(
     delay_ms: u64,
     linear_backoff: bool,
 ) -> Result<tokio::net::UnixStream> {
+    if retries == 0 {
+        return Err(anyhow::anyhow!(
+            "connect_to_hub called with retries=0: {socket_path}"
+        ));
+    }
     let mut last_err: Option<std::io::Error> = None;
     for attempt in 0..retries {
         if attempt > 0 {
