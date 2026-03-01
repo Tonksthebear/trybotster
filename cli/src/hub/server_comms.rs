@@ -549,18 +549,47 @@ impl Hub {
                         });
                     }
                     WorktreeRequest::Delete { path, branch } => {
-                        log::info!("[Lua] Processing worktree.delete({}, {})", path, branch);
-                        let manager = WorktreeManager::new(self.config.worktree_base.clone());
-                        if let Err(e) = manager.delete_worktree_by_path(
-                            std::path::Path::new(&path),
-                            &branch,
-                        ) {
-                            log::error!("[Lua] Failed to delete worktree: {e}");
-                        } else {
-                            if let Err(e) = self.load_available_worktrees() {
-                                log::warn!("Failed to refresh worktrees after deletion: {e}");
-                            }
-                        }
+                        log::info!(
+                            "[Lua] Dispatching async worktree.delete({}, {})",
+                            path, branch
+                        );
+                        let worktree_base = self.config.worktree_base.clone();
+                        let event_tx = self.hub_event_tx.clone();
+                        let path_clone = path.clone();
+                        let branch_clone = branch.clone();
+
+                        self.tokio_runtime.spawn(async move {
+                            let result = tokio::task::spawn_blocking(move || {
+                                let manager = WorktreeManager::new(worktree_base);
+                                manager.delete_worktree_by_path(
+                                    std::path::Path::new(&path_clone),
+                                    &branch_clone,
+                                )
+                            }).await;
+
+                            let outcome = match result {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(e)) => Err(e.to_string()),
+                                Err(e) => Err(format!("spawn_blocking panicked: {e}")),
+                            };
+
+                            let _ = event_tx.send(super::events::HubEvent::WorktreeDeleteCompleted {
+                                path,
+                                branch,
+                                result: outcome,
+                            });
+                        });
+                    }
+                }
+            }
+            HubEvent::WorktreeDeleteCompleted { path, branch, result } => {
+                match result {
+                    Ok(()) => {
+                        log::info!("[Worktree] Async deletion complete: {} ({})", branch, path);
+                        self.handle_cache.remove_worktree_by_branch(&branch);
+                    }
+                    Err(e) => {
+                        log::error!("[Worktree] Async deletion failed for {}: {}", branch, e);
                     }
                 }
             }
@@ -841,10 +870,6 @@ impl Hub {
                 let mut worktrees = self.handle_cache.get_worktrees();
                 worktrees.push((path_str.clone(), result.branch.clone()));
                 self.handle_cache.set_worktrees(worktrees);
-
-                if let Err(e) = self.load_available_worktrees() {
-                    log::warn!("Failed to refresh worktrees after creation: {e}");
-                }
 
                 let event_data = serde_json::json!({
                     "agent_key": result.agent_key,

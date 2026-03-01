@@ -517,10 +517,20 @@ fn handle_connection(
 
                 BrokerFrame::HubControl(HubMessage::KillAll) => {
                     broker.kill_all();
-                    // kill_all() joins all reader threads, so all writer_tx
-                    // clones are dropped.  Dropping our copy here closes the
-                    // last sender; the writer's recv() returns Disconnected
-                    // and the thread exits cleanly.
+                    // With SharedWriter, the channel has two senders: the
+                    // local `writer_tx` and the clone stored in shared_writer.
+                    // kill_all() only joins reader threads (which hold Arc clones
+                    // of shared_writer, not writer_tx clones), so the clone in
+                    // shared_writer still keeps the channel alive.  Clear it first
+                    // so that dropping writer_tx leaves zero senders and the
+                    // writer's for-loop exits via Disconnected rather than hanging.
+                    {
+                        let mut guard = broker
+                            .shared_writer
+                            .lock()
+                            .expect("shared_writer mutex poisoned");
+                        *guard = None;
+                    }
                     drop(writer_tx);
                     let _ = writer.join();
                     return Ok(());
@@ -551,8 +561,10 @@ fn handle_connection(
         *guard = None;
     }
 
-    // Send the empty-Vec sentinel: the writer breaks on the first empty frame
-    // and exits without waiting for all reader-thread senders to disappear.
+    // Send the empty-Vec sentinel so the writer exits immediately rather than
+    // draining any PTY output frames queued just before the Hub disconnected.
+    // Dropping writer_tx after clearing shared_writer also disconnects the channel,
+    // but the sentinel avoids writing stale output to the now-closed socket.
     let _ = writer_tx.send(vec![]); // sentinel: empty Vec is never a valid frame
     drop(writer_tx);
     let _ = writer.join();
