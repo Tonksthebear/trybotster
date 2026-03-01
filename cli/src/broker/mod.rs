@@ -517,10 +517,21 @@ fn handle_connection(
 
                 BrokerFrame::HubControl(HubMessage::KillAll) => {
                     broker.kill_all();
-                    // kill_all() joins all reader threads, so all writer_tx
-                    // clones are dropped.  Dropping our copy here closes the
-                    // last sender; the writer's recv() returns Disconnected
-                    // and the thread exits cleanly.
+                    // kill_all() joins all reader threads; their SharedWriter
+                    // Arc clones are dropped, but broker.shared_writer still
+                    // holds a writer_tx clone inside its Option.  Clear it
+                    // first so the clone is dropped before we touch writer_tx.
+                    {
+                        let mut guard = broker
+                            .shared_writer
+                            .lock()
+                            .expect("shared_writer mutex poisoned");
+                        *guard = None;
+                    }
+                    // Sentinel unblocks the writer immediately without waiting
+                    // for the channel to observe Disconnected.  Then drop our
+                    // copy; zero senders remain and the writer exits cleanly.
+                    let _ = writer_tx.send(vec![]);
                     drop(writer_tx);
                     let _ = writer.join();
                     return Ok(());
