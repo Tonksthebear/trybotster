@@ -306,7 +306,7 @@ pub(crate) enum HubEvent {
     /// The main loop removes the worktree from `HandleCache` on success so
     /// `worktree.list()` / `worktree.find()` reflect the deletion immediately.
     WorktreeDeleteCompleted {
-        /// Filesystem path of the deleted worktree (used to remove from cache).
+        /// Filesystem path of the deleted worktree (retained for logging context).
         path: String,
         /// Branch name that was deleted (for logging).
         branch: String,
