@@ -93,7 +93,7 @@ jobs:
 
       - name: Build CLI
         working-directory: cli
-        run: cargo build
+        run: cargo build && cargo build --release
 
       - name: Upload CLI binary
         uses: actions/upload-artifact@v4
@@ -244,10 +244,8 @@ jobs:
       - name: Run CLI tests
         working-directory: cli
         run: |
-          # Ensure no config file exists that would interfere with tests
           rm -rf ~/.botster
-          # Run tests with single thread to avoid env var race conditions
-          cargo test --all-targets -- --test-threads=1
+          ./test.sh
 
   ci:
     if: always()
