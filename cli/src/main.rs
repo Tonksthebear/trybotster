@@ -762,6 +762,75 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
 
 /// File writer that truncates when the log exceeds a size cap.
 ///
+/// Maximum number of log files retained per process label (hub, tui, attach, cli).
+///
+/// On each startup the oldest files beyond this count are deleted before the
+/// new log is created, so the total never exceeds this value.
+const MAX_LOG_FILES_PER_LABEL: usize = 10;
+
+/// Returns the current UTC time as a sortable `YYYYMMDD-HHMMSS` string.
+///
+/// Uses only `std::time` — no external date crate needed. The format is
+/// intentionally lexicographically sortable so that plain filename sorting
+/// gives chronological order, which [`rotate_logs`] relies on.
+fn timestamp_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400; // days since 1970-01-01 (UTC)
+    // Gregorian calendar decomposition.
+    // Algorithm: http://howardhinnant.github.io/date_algorithms.html ("civil_from_days")
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;                                    // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // year of era [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);             // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153;                                   // month prime [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1;                          // day [1, 31]
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };                // month [1, 12]
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}{mo:02}{d:02}-{h:02}{m:02}{s:02}")
+}
+
+/// Deletes the oldest `botster-{label}-*.log` files in `dir` so that creating
+/// one new file will not push the total past `keep`.
+///
+/// Filenames sort chronologically because they embed a `YYYYMMDD-HHMMSS`
+/// timestamp, so a plain lexicographic sort is sufficient.  Errors (missing
+/// dir, permission denied, etc.) are silently ignored — log rotation failure
+/// must never crash the hub.
+fn rotate_logs(dir: &std::path::Path, label: &str, keep: usize) {
+    let prefix = format!("botster-{label}-");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut matches: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".log") {
+                Some(e.path())
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Oldest files are at the front after ascending sort.
+    matches.sort_unstable();
+    // Delete enough old files so the new one keeps us at or below `keep`.
+    let delete_count = matches.len().saturating_sub(keep.saturating_sub(1));
+    for path in matches.into_iter().take(delete_count) {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// Prevents unbounded log growth during long-running hub sessions.
 /// When the cap is exceeded, the file is truncated and logging resumes
 /// from the beginning with a rotation marker.
@@ -804,8 +873,9 @@ fn main() -> Result<()> {
     // reconnects. Every production WebRTC server raises this.
     raise_fd_limit();
 
-    // MCP serve uses stderr for logging (stdout is the MCP JSON-RPC channel).
-    // Skip file logging to avoid truncating the hub's log file.
+    // MCP serve writes logs to stderr because stdout is the JSON-RPC channel.
+    // All other commands write to a timestamped file so concurrent processes
+    // (hub, attach, tui) never overwrite each other's logs.
     let cli = Cli::parse();
     let is_mcp_serve = matches!(cli.command, Commands::McpServe { .. } | Commands::Context { .. });
 
@@ -815,24 +885,43 @@ fn main() -> Result<()> {
             .format_timestamp_secs()
             .init();
     } else {
-        // Set up file logging so TUI doesn't interfere with log output
-        // Use BOTSTER_LOG_FILE or BOTSTER_CONFIG_DIR/botster.log or fallback
+        // Each non-MCP process (hub, tui, attach) gets its own timestamped log
+        // file so concurrent processes and sequential runs never overwrite each
+        // other.  BOTSTER_LOG_FILE bypasses this for scripted overrides.
+        let log_label = match &cli.command {
+            Commands::Start { headless: true } => "hub",
+            Commands::Start { .. } => "tui",
+            Commands::Attach { .. } => "attach",
+            _ => "cli",
+        };
         let log_path = if let Ok(path) = std::env::var("BOTSTER_LOG_FILE") {
+            // Explicit path override: use as-is, skip rotation.
             std::path::PathBuf::from(path)
-        } else if let Ok(config_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
-            std::path::PathBuf::from(config_dir).join("botster.log")
         } else if botster::env::is_any_test() {
-            // Test mode: use project tmp/ to avoid leaking outside the project
+            // Test mode: single stable path inside the project so test runs
+            // don't scatter timestamped files outside the repo.
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .map(|p| p.join("tmp/botster.log"))
                 .unwrap_or_else(|| std::path::PathBuf::from("/tmp/botster.log"))
         } else {
-            std::path::PathBuf::from("/tmp/botster.log")
+            let log_dir = if let Ok(config_dir) = std::env::var("BOTSTER_CONFIG_DIR") {
+                std::path::PathBuf::from(config_dir).join("logs")
+            } else {
+                std::path::PathBuf::from("/tmp")
+            };
+            std::fs::create_dir_all(&log_dir)
+                .unwrap_or_else(|e| panic!("Failed to create log dir {log_dir:?}: {e}"));
+            // Trim stale logs before creating the new file so we stay at or
+            // below MAX_LOG_FILES_PER_LABEL total per label type.
+            rotate_logs(&log_dir, log_label, MAX_LOG_FILES_PER_LABEL);
+            log_dir.join(format!("botster-{log_label}-{}.log", timestamp_now()))
         };
         let log_file = std::fs::File::create(&log_path)
-            .unwrap_or_else(|_| panic!("Failed to create log file at {:?}", log_path));
-        let capped_writer = CappedFileWriter::new(log_file, 10 * 1024 * 1024); // 10 MB
+            .unwrap_or_else(|e| panic!("Failed to create log file at {log_path:?}: {e}"));
+        // 10 MB cap — large enough for a full session, small enough to avoid
+        // runaway disk use on long-lived hub processes.
+        let capped_writer = CappedFileWriter::new(log_file, 10 * 1024 * 1024);
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .target(env_logger::Target::Pipe(Box::new(capped_writer)))
             .format_timestamp_secs()
@@ -969,5 +1058,55 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Verifies the bespoke Gregorian algorithm in `timestamp_now` against a
+    /// set of known Unix timestamps and their expected `YYYYMMDD-HHMMSS` output.
+    ///
+    /// Each tuple is `(unix_secs, expected_str)`.  Values were independently
+    /// verified against the POSIX calendar.
+    #[test]
+    fn timestamp_now_known_values() {
+        // Thin wrapper that accepts a fixed epoch second rather than reading
+        // the wall clock, so we can test deterministically.
+        fn fmt_secs(secs: u64) -> String {
+            let s = secs % 60;
+            let m = (secs / 60) % 60;
+            let h = (secs / 3600) % 24;
+            let days = secs / 86400;
+            let z = days as i64 + 719_468;
+            let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+            let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+            let y = yoe + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+            let y = if mo <= 2 { y + 1 } else { y };
+            format!("{y:04}{mo:02}{d:02}-{h:02}{m:02}{s:02}")
+        }
+
+        let cases: &[(u64, &str)] = &[
+            (0,          "19700101-000000"), // Unix epoch
+            (86399,      "19700101-235959"), // last second of day 0
+            (86400,      "19700102-000000"), // first second of day 1
+            (951782400,  "20000229-000000"), // 2000-02-29 (Y2K leap year)
+            (1000000000, "20010909-014640"), // round billion
+            (1709251200, "20240301-000000"), // 2024-03-01 (leap year boundary)
+            (1740787200, "20250301-000000"), // 2025-03-01 (non-leap)
+            (1772323200, "20260301-000000"), // 2026-03-01 (current project date)
+        ];
+
+        for &(secs, expected) in cases {
+            assert_eq!(
+                fmt_secs(secs),
+                expected,
+                "timestamp mismatch for unix_secs={secs}"
+            );
+        }
+    }
 }
 
