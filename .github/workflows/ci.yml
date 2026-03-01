@@ -95,7 +95,7 @@ jobs:
         env:
           BOTSTER_ENV: test
         working-directory: cli
-        run: cargo test --no-run --lib --tests
+        run: cargo test --no-run --lib --bins --tests
 
       - name: Upload CLI binary
         uses: actions/upload-artifact@v4
