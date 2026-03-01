@@ -223,8 +223,12 @@ function M.reload_plugin(name)
     if mcp then mcp.end_batch() end
 
     if not ok then
-        -- Restore old module on failure
+        -- Restore old module and its package.path entry so the still-running
+        -- old module can continue to require() its sub-modules from disk.
+        -- Sub-module cache entries (cleared by clear_plugin_namespace) are not
+        -- restored — require() will reload them lazily from the path.
         package.loaded[module_key] = old
+        add_to_package_path(plugin_dir(entry.path))
         return false, "Failed to reload plugin: " .. name
     end
 
