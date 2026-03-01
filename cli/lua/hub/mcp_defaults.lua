@@ -651,6 +651,12 @@ The user can invoke this with Ctrl+P → "my-plugin-action".
 - Use state.get() + the _started guard for timers and one-time setup
 - Use function S._before_reload() to cancel timers before reload
 - MCP tools and hooks are automatically cleared before reload and re-registered after
+- For multi-file plugins: require sub-modules at load time into local variables (the
+  normal pattern). If a reload fails, the sub-module require() cache is cleared but
+  package.path is fully restored, so a subsequent successful reload works cleanly.
+  Plugins that lazily call require("my-plugin.api") inside functions after a failed
+  reload will get a fresh load from disk rather than the previous cached version —
+  correct behavior, but worth knowing if sub-module initialization has side effects.
 ]], layer, layer),
                 },
             },
