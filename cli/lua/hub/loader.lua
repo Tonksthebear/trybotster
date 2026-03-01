@@ -189,6 +189,19 @@ function M.reload_plugin(name)
     local module_key = "plugin." .. name
     local old = package.loaded[module_key]
 
+    -- Snapshot sub-module cache so we can fully restore it on failure.
+    -- If the new plugin partially executes before erroring, it may load some
+    -- sub-modules into package.loaded["name.*"]. Without a snapshot the old
+    -- module would subsequently require() those new (possibly incompatible)
+    -- versions rather than its own originals.
+    local old_namespace = {}
+    local ns_prefix = name .. "."
+    for k, v in pairs(package.loaded) do
+        if k == name or k:sub(1, #ns_prefix) == ns_prefix then
+            old_namespace[k] = v
+        end
+    end
+
     -- Lifecycle: cleanup before reload
     if old and type(old) == "table" and old._before_reload then
         local ok, err = pcall(old._before_reload)
@@ -223,11 +236,13 @@ function M.reload_plugin(name)
     if mcp then mcp.end_batch() end
 
     if not ok then
-        -- Restore old module and its package.path entry so the still-running
-        -- old module can continue to require() its sub-modules from disk.
-        -- Sub-module cache entries (cleared by clear_plugin_namespace) are not
-        -- restored — require() will reload them lazily from the path.
+        -- Full rollback: restore the old module, its sub-module cache, and its
+        -- package.path entry so the still-running old module is unaffected by
+        -- the failed reload attempt.
         package.loaded[module_key] = old
+        for k, v in pairs(old_namespace) do
+            package.loaded[k] = v
+        end
         add_to_package_path(plugin_dir(entry.path))
         return false, "Failed to reload plugin: " .. name
     end
