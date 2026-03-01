@@ -64,6 +64,7 @@ export class HealthTracker {
         this.#callbacks.getErrorCode() === "session_invalid") return
 
     const newStatus = CLI_STATUS_MAP[message.cli] || this.#cliStatus
+
     if (newStatus === this.#cliStatus) return
 
     const prevStatus = this.#cliStatus
@@ -88,8 +89,7 @@ export class HealthTracker {
     }
 
     // Hub went offline — tear down WebRTC, keep signaling for health
-    if ((newStatus === CliStatus.DISCONNECTED || newStatus === CliStatus.OFFLINE) &&
-        !INACTIVE.has(prevStatus)) {
+    if (INACTIVE.has(newStatus) && !INACTIVE.has(prevStatus)) {
       this.#callbacks.disconnectPeer()
       this.#callbacks.emit("cliDisconnected")
       this.#callbacks.setState(ConnectionState.CLI_DISCONNECTED)

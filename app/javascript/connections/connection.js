@@ -927,7 +927,7 @@ export class Connection {
         try {
           await this.#sendEncrypted({ type, ...data })
           return true
-        } catch {
+        } catch (retryError) {
           return false
         }
       }
