@@ -299,6 +299,21 @@ pub(crate) enum HubEvent {
         agent_key: String,
     },
 
+    /// Async worktree deletion completed.
+    ///
+    /// Sent by the `spawn_blocking` task in the `WorktreeRequest::Delete`
+    /// handler after `delete_worktree_by_path` finishes (success or failure).
+    /// The main loop removes the worktree from `HandleCache` on success so
+    /// `worktree.list()` / `worktree.find()` reflect the deletion immediately.
+    WorktreeDeleteCompleted {
+        /// Filesystem path of the deleted worktree (used to remove from cache).
+        path: String,
+        /// Branch name that was deleted (for logging).
+        branch: String,
+        /// `Ok(())` on success, `Err(message)` on failure.
+        result: Result<(), String>,
+    },
+
     /// Async WebRTC offer handling completed — SDP answer is ready.
     ///
     /// Sent by the spawned task in `handle_webrtc_offer` after ICE config
