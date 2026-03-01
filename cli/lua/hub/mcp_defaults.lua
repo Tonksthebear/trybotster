@@ -539,7 +539,7 @@ The user can invoke this with Ctrl+P → "my-plugin-action".
   }, function(_args)
     local S = require("hub.state").get("my-plugin.state", {})
     return string.format(
-      "Plugin status: %s\nLast update: %s",
+      "Plugin status: %%s\nLast update: %%s",
       S.status or "unknown",
       tostring(S.last_updated or "never")
     )
@@ -801,6 +801,30 @@ Manual removal is only needed if you want to conditionally unregister at runtime
             },
         },
     }
+end)
+
+-- =============================================================================
+-- secrets_set (temporary setup tool — remove after use)
+-- =============================================================================
+
+mcp.tool("secrets_set", {
+    description = "Write an encrypted secret to the hub secrets store. Use for one-time plugin setup.",
+    input_schema = {
+        type = "object",
+        properties = {
+            namespace = { type = "string", description = "Secret namespace (e.g. 'telegram')" },
+            key       = { type = "string", description = "Secret key (e.g. 'bot_token')" },
+            value     = { type = "string", description = "Secret value to store encrypted" },
+        },
+        required = { "namespace", "key", "value" },
+    },
+}, function(params, _ctx)
+    local ok, err = secrets.set(params.namespace, params.key, params.value)
+    if ok then
+        return string.format("Stored %s/%s.", params.namespace, params.key)
+    else
+        return string.format("Failed: %s", tostring(err))
+    end
 end)
 
 log.info("MCP default prompts registered: botster-customize-tui, botster-customize-hub, botster-create-plugin, botster-customize-mcp")
