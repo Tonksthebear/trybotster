@@ -610,13 +610,17 @@ fn test_existing_session_routes_to_hub_b_after_reconnect() {
     );
 
     // ── 7. Cleanup ────────────────────────────────────────────────────────────
+    //
+    // Close write_end1 BEFORE kill_all so the broker's reader_loop sees EOF on
+    // the pipe and its blocking read() returns, allowing handle.join() to
+    // succeed.  Closing the broker's dup of read_end1 from kill_all does NOT
+    // interrupt a blocking read() on Linux — only closing all write ends does.
+    unsafe { libc::close(write_end1); }
+
     conn_b.kill_all();
     broker_thread.join().expect("broker thread must exit cleanly");
 
-    unsafe {
-        libc::close(read_end1);
-        libc::close(write_end1);
-    }
+    unsafe { libc::close(read_end1); }
 }
 
 /// Regression test: `get_snapshot` must be delivered even while PTY output is
@@ -701,13 +705,15 @@ fn test_ctrl_delivery_under_output_flood() {
 
     let write_end = flood_handle.join().expect("flood thread");
 
+    // Close write_end BEFORE kill_all so the broker reader_loop sees EOF and
+    // its blocking read() returns, allowing the broker to join the reader
+    // thread cleanly.  Same ordering requirement as the other pipeline tests.
+    unsafe { libc::close(write_end); }
+
     conn.kill_all();
     broker_thread.join().expect("broker thread must exit cleanly after kill_all");
 
-    unsafe {
-        libc::close(read_end);
-        libc::close(write_end);
-    }
+    unsafe { libc::close(read_end); }
 }
 
 /// Diagnostic: verify that `shutdown(SHUT_WR)` on one end of a Unix domain
