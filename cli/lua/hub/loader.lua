@@ -259,38 +259,53 @@ function M.reload_plugin(name)
 end
 
 --- Unload a plugin by name, cleaning up package.path and loaded modules.
--- Runs _before_reload lifecycle hook, clears MCP registrations, removes the
--- plugin's lua/ dir from package.path, and clears its namespace from package.loaded.
--- @param name string Plugin name (e.g., "telegram")
+--
+-- Runs the plugin's `_before_unload` lifecycle hook (if defined), clears MCP
+-- tools/prompts registered by this plugin, removes the plugin's lua/ dir from
+-- package.path, clears its namespace from package.loaded, and removes it from
+-- the plugin registry.
+--
+-- This is the counterpart to `load_plugin` — call it when a plugin directory
+-- is removed so stale MCP registrations and lifecycle hooks don't linger.
+--
+-- @param name string Plugin name (e.g., "github")
+-- @return boolean success
+-- @return string|nil error message on failure
 function M.unload_plugin(name)
     local state = require("hub.state")
     local registry = state.get("plugin_registry", {})
     local entry = registry[name]
+    if not entry then
+        return false, "Plugin not found in registry: " .. name
+    end
 
     local module_key = "plugin." .. name
-    local old = package.loaded[module_key]
+    local mod = package.loaded[module_key]
 
-    -- Lifecycle hook
-    if old and type(old) == "table" and old._before_reload then
-        local ok, err = pcall(old._before_reload)
+    -- Lifecycle: let the plugin clean up before being removed
+    if mod and type(mod) == "table" and mod._before_unload then
+        local ok, err = pcall(mod._before_unload)
         if not ok then
-            log.warn(string.format("_before_reload failed for plugin %s: %s", name, tostring(err)))
+            log.warn(string.format("_before_unload failed for plugin %s: %s", name, tostring(err)))
         end
     end
 
-    -- Clear MCP registrations
-    if mcp and entry then
+    -- Clear MCP tools/prompts registered by this plugin (source = "@" .. path)
+    if mcp then
         mcp.reset("@" .. entry.path)
     end
 
-    -- Remove lua/ path and namespace modules
-    if entry then
-        remove_from_package_path(plugin_dir(entry.path) .. "/lua")
-    end
+    -- Remove plugin's lua/ dir from package.path and clear namespace modules
+    -- so stale require() cache doesn't survive unload
+    remove_from_package_path(plugin_dir(entry.path) .. "/lua")
     clear_plugin_namespace(name)
     package.loaded[module_key] = nil
 
+    -- Remove from registry
+    registry[name] = nil
+
     log.info(string.format("Unloaded plugin: %s", name))
+    return true
 end
 
 -- ============================================================================
