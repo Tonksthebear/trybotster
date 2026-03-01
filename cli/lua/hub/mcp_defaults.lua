@@ -341,7 +341,11 @@ hub.state is an in-memory key-value store that survives require() reloads:
     headers = { ["Authorization"] = "Bearer " .. token,
                 ["Content-Type"]  = "application/json" },
     body    = json.encode({ text = "Agent started" }),
-  }, function(resp)
+  }, function(resp, err)
+    if err then
+      log.warn("HTTP error: " .. tostring(err))
+      return
+    end
     if resp.status ~= 200 then
       log.warn("HTTP error: " .. tostring(resp.status))
     end
@@ -355,21 +359,28 @@ hub.state is an in-memory key-value store that survives require() reloads:
 ## Connecting to External Services
 
 ActionCable (Rails):
-  local sub = action_cable.subscribe({
-    url = "wss://myapp.com/cable", channel = "MyChannel", params = { room = "x" },
-  }, function(event, data)
-    if event == "received" then log.info(json.encode(data)) end
-  end)
-  sub.perform("my_action", { payload = "..." })
-  sub.unsubscribe()
+  local conn = action_cable.connect()  -- connects to the hub's ActionCable endpoint
+  local ch = action_cable.subscribe(conn, "MyChannel", { room = "x" },
+    function(msg, channel_id)
+      log.info(json.encode(msg))
+    end)
+  action_cable.perform(ch, "my_action", { payload = "..." })
+  action_cable.close(conn)          -- closes connection and all its channels
+  -- action_cable.unsubscribe(ch)   -- or unsubscribe a single channel
+
+  -- With E2E crypto (auto-decrypts signal envelopes on this connection):
+  local crypto_conn = action_cable.connect({ crypto = true })
 
 Raw WebSocket:
-  local ws = websocket.connect("wss://...", {
-    on_message = function(msg) ... end,
-    on_close   = function(code, reason) ... end,
+  local ws, err = websocket.connect("wss://...", {
+    on_open    = function() log.info("connected") end,
+    on_message = function(msg) log.info(msg) end,
+    on_close   = function(code, reason) log.info("closed: " .. reason) end,
+    on_error   = function(e) log.warn("ws error: " .. e) end,
   })
-  ws.send("hello")
-  ws.close()
+  if err then log.error("websocket.connect failed: " .. tostring(err)) return end
+  websocket.send(ws, "hello")
+  websocket.close(ws)
 ]],
                 },
             },
@@ -499,7 +510,11 @@ Never hardcode tokens. Use the encrypted secrets store:
     method  = "GET",
     url     = "https://api.example.com/endpoint",
     headers = { ["Authorization"] = "Bearer " .. token },
-  }, function(resp)
+  }, function(resp, err)
+    if err then
+      log.warn("my-plugin: HTTP error: " .. tostring(err))
+      return
+    end
     if resp.status == 200 then
       local data = json.decode(resp.body)
       -- handle data
@@ -522,7 +537,8 @@ Use the state guard pattern:
     S._started = true
     S.poll_timer = timer.every(30, function()
       -- runs every 30 seconds
-      http.request({ method = "GET", url = "https://...", headers = {} }, function(resp)
+      http.request({ method = "GET", url = "https://...", headers = {} }, function(resp, err)
+        if err then log.warn("my-plugin: poll error: " .. tostring(err)) return end
         -- handle updates
       end)
     end)
@@ -610,7 +626,11 @@ The user can invoke this with Ctrl+P → "my-plugin-action".
       url    = "https://api.telegram.org/bot" .. token .. "/sendMessage",
       headers = { ["Content-Type"] = "application/json" },
       body   = json.encode({ chat_id = chat_id, text = text }),
-    }, function(resp)
+    }, function(resp, err)
+      if err then
+        log.warn("telegram: send error: " .. tostring(err))
+        return
+      end
       if resp.status ~= 200 then
         log.warn("telegram: send failed: " .. resp.status)
       end
