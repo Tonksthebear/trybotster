@@ -509,15 +509,15 @@ pub fn register(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
                 let (method, url, opts, callback) = match args.remove(0) {
                     // ── Table-first: http.request({method="GET", url="…"[, …]}, cb) ──
                     Value::Table(opts_table) => {
-                        let method: String = opts_table.get("method").map_err(|_| {
-                            mlua::Error::runtime(
-                                "http.request: opts table must have a 'method' field (e.g. \"GET\")",
-                            )
+                        let method: String = opts_table.get("method").map_err(|e| {
+                            mlua::Error::runtime(format!(
+                                "http.request: 'method' field error: {e} (expected a string, e.g. \"GET\")"
+                            ))
                         })?;
-                        let url: String = opts_table.get("url").map_err(|_| {
-                            mlua::Error::runtime(
-                                "http.request: opts table must have a 'url' field",
-                            )
+                        let url: String = opts_table.get("url").map_err(|e| {
+                            mlua::Error::runtime(format!(
+                                "http.request: 'url' field error: {e} (expected a string)"
+                            ))
                         })?;
                         let callback = match args.into_iter().next() {
                             Some(Value::Function(f)) => f,
