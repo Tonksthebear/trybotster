@@ -58,9 +58,7 @@ class GithubCreatePullRequestReviewTool < ApplicationMCPTool
     end
 
     client = ::Github::App.installation_client(installation_id)
-
     client_info = detect_client_type
-    render(text: "Submitting #{event} review on #{repo}##{pr_number} (via #{client_info})...")
 
     review_options = { event: event }
     review_options[:body] = body.to_s + attribution_footer if body.present?
@@ -86,7 +84,7 @@ class GithubCreatePullRequestReviewTool < ApplicationMCPTool
       "#{event_label} — #{repo}##{pr_number}",
       "",
       "🔗 Review URL: #{review[:html_url]}",
-      "   Submitted by: [bot] (#{client_info})"
+      "   Submitted via: #{client_info}"
     ]
 
     if inline_count > 0
