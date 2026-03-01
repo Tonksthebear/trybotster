@@ -15,8 +15,9 @@
 -- If found, the agent is notified instead of spawning a new one.
 --
 -- MCP token: on load, fetches a scoped MCP token from the Rails server
--- using the hub's auth, stores it in encrypted secrets, and injects it
--- into agent environments via the filter_agent_env hook.
+-- using the hub's auth, stores it in encrypted secrets, and registers
+-- the remote MCP server as a proxy via mcp.proxy() — merging its tools
+-- into botster-mcp so agents need only one MCP server entry.
 --
 -- Uses a separate ActionCable connection without crypto (GitHub
 -- events are plaintext over TLS, no E2E encryption needed).
@@ -37,8 +38,8 @@ end
 --- Fetch a scoped MCP token from the Rails server and store it in secrets.
 -- Uses the hub's API bearer token for auth. The MCP token is scoped to
 -- agent-level operations only (GitHub tools, memory, etc.).
+-- Synchronous — used once at plugin load before the event loop is busy.
 local function ensure_mcp_token()
-    -- Check if we already have a cached token
     local cached = secrets.get("github", "mcp_token")
     if cached then
         log.debug("GitHub plugin: using cached MCP token")
@@ -77,20 +78,96 @@ local function ensure_mcp_token()
     end
 end
 
+--- Asynchronously fetch a fresh MCP token and store it in secrets.
+-- Used for mid-session token refresh (e.g. after a 401 from the MCP server).
+-- @param callback function(ok bool) Called when the fetch completes.
+local function fetch_mcp_token_async(callback)
+    local api_token = hub.api_token()
+    if not api_token then
+        log.warn("GitHub plugin: no API token available, cannot refresh MCP token")
+        if callback then callback(false) end
+        return
+    end
+
+    local server_url = config.server_url()
+    http.request({
+        method  = "POST",
+        url     = server_url .. "/integrations/github/mcp_tokens",
+        headers = {
+            ["Authorization"] = "Bearer " .. api_token,
+            ["Content-Type"]  = "application/json",
+        },
+        body = "{}",
+    }, function(resp, err)
+        if err then
+            log.warn(string.format("GitHub plugin: MCP token refresh failed: %s", tostring(err)))
+            if callback then callback(false) end
+            return
+        end
+        if resp.status ~= 200 and resp.status ~= 201 then
+            log.warn(string.format("GitHub plugin: MCP token refresh returned %d", resp.status))
+            if callback then callback(false) end
+            return
+        end
+        local body = json.decode(resp.body)
+        if body and body.token then
+            secrets.set("github", "mcp_token", body.token)
+            if body.mcp_url then
+                secrets.set("github", "mcp_url", body.mcp_url)
+            end
+            log.info("GitHub plugin: MCP token refreshed and stored")
+            if callback then callback(true) end
+        else
+            log.warn("GitHub plugin: MCP token refresh response missing token field")
+            if callback then callback(false) end
+        end
+    end)
+end
+
 ensure_mcp_token()
 
--- Inject MCP token into agent environments so agents can use the MCP server.
-hooks.intercept("filter_agent_env", "github_mcp_token", function(env)
-    local token = secrets.get("github", "mcp_token")
-    if token then
-        env.BOTSTER_MCP_TOKEN = token
+-- ============================================================================
+-- MCP Proxy Setup
+-- ============================================================================
+
+-- Forward-declared so on_mcp_auth_error (below) can reference it as an upvalue.
+local setup_mcp_proxy
+
+--- Handle a 401 from the remote MCP server: clear the stale token and re-fetch.
+-- mcp.call_tool() invokes this when it receives a 401 response for a proxied tool.
+local function on_mcp_auth_error()
+    log.warn("GitHub plugin: MCP token rejected (401) — clearing token and re-fetching")
+    -- Only clear the token; the MCP URL is stable and doesn't expire.
+    -- Clearing mcp_url here would cause setup_mcp_proxy() to bail if the refresh
+    -- response omits it (e.g. the endpoint only returns token on re-issue).
+    secrets.set("github", "mcp_token", nil)
+    fetch_mcp_token_async(function(ok)
+        if ok then setup_mcp_proxy() end
+    end)
+end
+
+--- Fetch the cached MCP URL + token and register the remote server as a proxy.
+-- Safe to call repeatedly (refresh semantics — re-fetches the remote tool list).
+setup_mcp_proxy = function()
+    local mcp_url   = secrets.get("github", "mcp_url")
+    local mcp_token = secrets.get("github", "mcp_token")
+    if not mcp_url or not mcp_token then
+        log.debug("GitHub plugin: no MCP URL/token cached, skipping proxy setup")
+        return
     end
-    local mcp_url = secrets.get("github", "mcp_url")
-    if mcp_url then
-        env.BOTSTER_MCP_URL = mcp_url
-    end
-    return env
-end)
+    mcp.proxy(mcp_url, { token = mcp_token, on_auth_error = on_mcp_auth_error })
+end
+
+setup_mcp_proxy()
+
+-- Refresh the proxied tool list every 10 minutes so changes on the Rails side
+-- propagate without a full plugin reload. Timer is guarded against double-registration
+-- across hot-reloads via hub.state.
+local _proxy_state = require("hub.state").get("github.mcp_proxy", {})
+if not _proxy_state._started then
+    _proxy_state._started = true
+    _proxy_state.refresh_timer = timer.every(600, setup_mcp_proxy)
+end
 
 -- ============================================================================
 -- Agent Matching
@@ -251,4 +328,14 @@ action_cable.subscribe(conn, "Github::EventsChannel",
 )
 
 log.info(string.format("GitHub plugin loaded for %s", repo))
-return {}
+
+-- loader.lua calls _before_reload on the plugin's return value (package.loaded["plugin.github"]).
+-- That's this table — not hub.state tables, which are never called by the loader.
+return {
+    _before_reload = function()
+        if _proxy_state._started then
+            timer.cancel(_proxy_state.refresh_timer)
+            _proxy_state._started = false
+        end
+    end,
+}

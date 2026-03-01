@@ -474,6 +474,144 @@ fn test_hub_reconnect_snapshot_and_output() {
     }
 }
 
+/// Prove that an existing session's live output routes to Hub B after reconnect
+/// via `SharedWriter` — without registering a new pipe.
+///
+/// # The gap this fills
+///
+/// `test_hub_reconnect_snapshot_and_output` verifies ring-buffer snapshot recovery
+/// and live output from a *freshly registered* `pipe2`.  It does NOT verify that
+/// the **original** `pipe1` session routes to Hub B after reconnect, which is the
+/// actual agent-survival scenario: the agent's PTY is still running and producing
+/// output; Hub B must receive that output without re-registering anything.
+///
+/// # What `SharedWriter` provides
+///
+/// Before the fix, each `handle_connection` call stored the per-connection
+/// `writer_tx` in reader thread closures at spawn time.  After Hub A disconnected
+/// its receiver was dead, so pipe1 output was silently dropped on Hub B.
+///
+/// With `SharedWriter`, all reader threads share a single `Arc<Mutex<Option<Sender>>>`.
+/// `handle_connection` updates the inner `Option` at connection time, instantly
+/// re-wiring every surviving reader thread to the new Hub connection.
+///
+/// # Scenario
+///
+/// ```text
+/// Hub A  → connect (no forwarder) → register_pty(pipe1) → disconnect
+///                                                            ↓
+///                                             broker keeps pipe1 reader alive
+///                                                            ↓
+/// Hub B  → connect → install_forwarder
+///       → write to pipe1 (same write_end still open)
+///       → receives BrokerPtyOutput(session_id1) ← proves SharedWriter re-wire
+/// ```
+#[test]
+fn test_existing_session_routes_to_hub_b_after_reconnect() {
+    // Unique socket name avoids collision with parallel tests in the same process.
+    let hub_id = format!("test-existing-{}", std::process::id());
+    let socket_path = broker_socket_path(&hub_id).expect("broker_socket_path must succeed");
+
+    // ── 1. Start broker with a 10-second reconnect window ────────────────────
+    let hub_id_clone = hub_id.clone();
+    let broker_thread = std::thread::spawn(move || {
+        let _ = crate::broker::run(&hub_id_clone, 10);
+    });
+
+    assert!(
+        wait_for_broker_socket(&socket_path, Duration::from_secs(2)),
+        "broker socket did not appear within 2 s"
+    );
+
+    // ── 2. Hub A: connect WITHOUT forwarder, register pipe1 ──────────────────
+    //
+    // No forwarder means a single socket FD; when `disconnect_graceful` calls
+    // `shutdown(SHUT_RDWR)` the broker sees EOF immediately and enters the
+    // reconnect window — no dup keeps the socket alive.
+    let (read_end1, write_end1) = make_pipe();
+
+    let mut conn_a = BrokerConnection::connect(&socket_path).expect("Hub A: connect");
+    let session_id1 = conn_a
+        .register_pty("test-agent-existing", 0, 99999, 24, 80, read_end1)
+        .expect("Hub A: register_pty");
+
+    // ── 3. Hub A disconnects (simulating exec-restart) ────────────────────────
+    //
+    // `disconnect_graceful` calls `shutdown(SHUT_RDWR)` before dropping.
+    // The explicit shutdown sends a FIN to the broker guaranteeing it exits
+    // `handle_connection` even if its receive buffer has unread frames.
+    conn_a.disconnect_graceful();
+    std::thread::sleep(Duration::from_millis(50));
+
+    // ── 4. Hub B: connect and install forwarder ───────────────────────────────
+    //
+    // After reconnect, `handle_connection` calls `*shared_writer = Some(writer_tx_b)`
+    // before processing any frames.  The pipe1 reader thread — still alive and
+    // blocking in `file.read()` — will use this new sender for all future output.
+    let mut conn_b = BrokerConnection::connect(&socket_path).expect("Hub B: connect");
+    conn_b.set_timeout(10).expect("Hub B: set_timeout");
+
+    let (event_tx_b, mut event_rx_b) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
+    conn_b.install_forwarder(event_tx_b).expect("Hub B: install_forwarder");
+
+    // ── 5. Write to the ORIGINAL pipe1 after Hub B is connected ──────────────
+    //
+    // This is the real agent-survival scenario: the existing PTY (Claude, a shell,
+    // etc.) keeps writing output after the Hub restarts.  Hub B must receive it
+    // without any new registration.
+    let payload = b"surviving-agent-output\n";
+    let written = unsafe {
+        libc::write(
+            write_end1,
+            payload.as_ptr() as *const libc::c_void,
+            payload.len(),
+        )
+    };
+    assert_eq!(written as usize, payload.len(), "pipe1 write must not short-write");
+
+    // ── 6. Hub B must receive BrokerPtyOutput for the original session ────────
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let received: Vec<u8> = rt.block_on(async {
+        let mut accumulated = Vec::new();
+        // 3-second deadline: the pipe1 reader thread unblocks instantly on write,
+        // encodes the frame, and delivers it via SharedWriter → Hub B's socket.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or(Duration::ZERO);
+            match tokio::time::timeout(remaining, event_rx_b.recv()).await {
+                Ok(Some(HubEvent::BrokerPtyOutput { session_id: sid, data })) => {
+                    assert_eq!(
+                        sid, session_id1,
+                        "SharedWriter must route pipe1 output to Hub B under session_id1"
+                    );
+                    accumulated.extend_from_slice(&data);
+                    if accumulated.windows(payload.len()).any(|w| w == payload) {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        accumulated
+    });
+
+    assert!(
+        received.windows(payload.len()).any(|w| w == payload),
+        "Hub B must receive pipe1 output after reconnect — SharedWriter re-wire failed; got: {received:?}"
+    );
+
+    // ── 7. Cleanup ────────────────────────────────────────────────────────────
+    conn_b.kill_all();
+    broker_thread.join().expect("broker thread must exit cleanly");
+
+    unsafe {
+        libc::close(read_end1);
+        libc::close(write_end1);
+    }
+}
+
 /// Regression test: `get_snapshot` must be delivered even while PTY output is
 /// flooding the writer channel.
 ///

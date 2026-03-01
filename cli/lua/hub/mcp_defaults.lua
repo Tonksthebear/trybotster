@@ -424,6 +424,49 @@ The file executes top-to-bottom on load. No registration step — just create an
 Note: new plugin directories must exist at hub start for hot-reload to work — create the
 directory, restart once, then file changes reload automatically.
 
+### Multi-File Plugins (Optional)
+
+A single init.lua is fine for simple plugins. For complex ones, split the code
+across multiple files using a lua/ subdir:
+
+  {plugin-dir}/
+    init.lua
+    lua/
+      {name}/           ← namespace matches the plugin directory name
+        api.lua
+        config.lua
+
+If lua/ exists, Botster adds it to package.path automatically. On hot-reload and
+unload, the path entry and require() cache are cleaned up.
+
+Modules must live under lua/{name}/ so require() calls are namespaced and don't
+collide with other plugins. Example — splitting HTTP helpers into api.lua:
+
+  -- lua/my-plugin/api.lua
+  local M = {}
+
+  function M.post(url, body, token)
+    http.request({
+      method  = "POST",
+      url     = url,
+      headers = { ["Authorization"] = "Bearer " .. token,
+                  ["Content-Type"]  = "application/json" },
+      body    = body,
+    }, function(resp)
+      if resp.status ~= 200 then
+        log.warn("my-plugin: HTTP " .. resp.status)
+      end
+    end)
+  end
+
+  return M
+
+  -- init.lua
+  local api = require("my-plugin.api")
+
+  local token, _ = secrets.get("my-plugin", "api_token")
+  api.post("https://api.example.com/notify", json.encode({ text = "Agent started" }), token)
+
 ## Step 2: Decide What the Plugin Does
 
 Most plugins combine some of these building blocks:
@@ -539,7 +582,7 @@ The user can invoke this with Ctrl+P → "my-plugin-action".
   }, function(_args)
     local S = require("hub.state").get("my-plugin.state", {})
     return string.format(
-      "Plugin status: %s\nLast update: %s",
+      "Plugin status: %%s\nLast update: %%s",
       S.status or "unknown",
       tostring(S.last_updated or "never")
     )
@@ -608,6 +651,12 @@ The user can invoke this with Ctrl+P → "my-plugin-action".
 - Use state.get() + the _started guard for timers and one-time setup
 - Use function S._before_reload() to cancel timers before reload
 - MCP tools and hooks are automatically cleared before reload and re-registered after
+- For multi-file plugins: require sub-modules at load time into local variables (the
+  normal pattern). If a reload fails, the sub-module require() cache is cleared but
+  package.path is fully restored, so a subsequent successful reload works cleanly.
+  Plugins that lazily call require("my-plugin.api") inside functions after a failed
+  reload will get a fresh load from disk rather than the previous cached version —
+  correct behavior, but worth knowing if sub-module initialization has side effects.
 ]], layer, layer),
                 },
             },
@@ -801,6 +850,30 @@ Manual removal is only needed if you want to conditionally unregister at runtime
             },
         },
     }
+end)
+
+-- =============================================================================
+-- secrets_set (temporary setup tool — remove after use)
+-- =============================================================================
+
+mcp.tool("secrets_set", {
+    description = "Write an encrypted secret to the hub secrets store. Use for one-time plugin setup.",
+    input_schema = {
+        type = "object",
+        properties = {
+            namespace = { type = "string", description = "Secret namespace (e.g. 'telegram')" },
+            key       = { type = "string", description = "Secret key (e.g. 'bot_token')" },
+            value     = { type = "string", description = "Secret value to store encrypted" },
+        },
+        required = { "namespace", "key", "value" },
+    },
+}, function(params, _ctx)
+    local ok, err = secrets.set(params.namespace, params.key, params.value)
+    if ok then
+        return string.format("Stored %s/%s.", params.namespace, params.key)
+    else
+        return string.format("Failed: %s", tostring(err))
+    end
 end)
 
 log.info("MCP default prompts registered: botster-customize-tui, botster-customize-hub, botster-create-plugin, botster-customize-mcp")
