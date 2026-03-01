@@ -142,8 +142,12 @@ local function process_context_file(context_path, in_worktree, ghost_infos, seen
 
     -- Build a ghost info table matching Agent:info() structure so the TUI
     -- can render this agent. Status "ghost" lets clients style it differently.
+    -- agent_index is the HandleCache position returned by hub.register_agent()
+    -- and MUST be included so the TUI uses the server-authoritative index for
+    -- PTY forwarder creation rather than deriving it from local list position.
     local ghost_info = {
         id           = agent_key,
+        agent_index  = agent_idx,
         display_name = ctx.branch_name or agent_key,
         title        = nil,
         cwd          = wt_path,
