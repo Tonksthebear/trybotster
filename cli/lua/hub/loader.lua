@@ -201,8 +201,11 @@ function M.reload_plugin(name)
 
     -- Remove plugin's lua/ path and namespace modules so stale require() cache
     -- doesn't survive reload. load_plugin() re-adds the path after loading.
+    -- Track whether the lua/ path was present so we can restore it on failure.
     local plugin_dir = entry.path:match("^(.*)/[^/]+$") or "."
-    remove_from_package_path(plugin_dir .. "/lua")
+    local lua_dir = plugin_dir .. "/lua"
+    local had_lua_path = package.path:find(lua_dir .. "/?.lua", 1, true) ~= nil
+    remove_from_package_path(lua_dir)
     clear_plugin_namespace(name)
 
     -- Clear old module
@@ -215,8 +218,12 @@ function M.reload_plugin(name)
     if mcp then mcp.end_batch() end
 
     if not ok then
-        -- Restore old module on failure
+        -- Restore old module and lua/ package.path on failure, symmetric with
+        -- package.loaded restore above.
         package.loaded[module_key] = old
+        if had_lua_path then
+            add_to_package_path(lua_dir)
+        end
         return false, "Failed to reload plugin: " .. name
     end
 
