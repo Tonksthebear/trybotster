@@ -1,0 +1,29 @@
+[
+  {
+    "filename": "app/models/user.rb",
+    "status": "modified",
+    "additions": 12,
+    "deletions": 3,
+    "changes": 15,
+    "previous_filename": null,
+    "patch": "@@ -10,6 +10,15 @@ class User < ApplicationRecord\n   validates :email, presence: true\n+\n+  def full_name\n+    \"#{first_name} #{last_name}\"\n+  end\n+\n+  def admin?\n+    role == 'admin'\n+  end\n-  def name\n-    username\n-  end"
+  },
+  {
+    "filename": "app/controllers/users_controller.rb",
+    "status": "added",
+    "additions": 40,
+    "deletions": 0,
+    "changes": 40,
+    "previous_filename": null,
+    "patch": "@@ -0,0 +1,40 @@\n+class UsersController < ApplicationController\n+  def index\n+    @users = User.all\n+  end\n+end"
+  },
+  {
+    "filename": "test/models/user_test.rb",
+    "status": "modified",
+    "additions": 8,
+    "deletions": 0,
+    "changes": 8,
+    "previous_filename": null,
+    "patch": "@@ -20,0 +21,8 @@ class UserTest < ActiveSupport::TestCase\n+  test 'full_name returns first and last' do\n+    user = users(:one)\n+    assert_equal \"#{user.first_name} #{user.last_name}\", user.full_name\n+  end"
+  }
+]
