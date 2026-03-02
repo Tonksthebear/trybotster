@@ -20,6 +20,25 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+/// Hub runtime manifest persisted under `{config_dir}/hubs/{hub_id}/manifest.json`.
+///
+/// This artifact lets child sessions (for example `botster mcp-serve`) resolve
+/// a live hub socket by server-assigned ID instead of trusting inherited env.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HubManifest {
+    /// Stable local hub hash ID (matches socket filename stem).
+    pub hub_id: String,
+    /// Optional server-assigned hub ID (`hub.server_id()` in Lua).
+    pub server_id: Option<String>,
+    /// Absolute socket path for the hub.
+    pub socket_path: String,
+    /// PID of the hub process that wrote this manifest.
+    pub pid: u32,
+    /// Last write timestamp (unix seconds).
+    pub updated_at: u64,
+}
 
 /// Get the per-hub directory path.
 ///
@@ -36,6 +55,11 @@ pub fn hub_dir(hub_id: &str) -> Result<PathBuf> {
 /// Get the PID file path for a hub.
 pub fn pid_file_path(hub_id: &str) -> Result<PathBuf> {
     Ok(hub_dir(hub_id)?.join("hub.pid"))
+}
+
+/// Get the manifest file path for a hub.
+pub fn manifest_path(hub_id: &str) -> Result<PathBuf> {
+    Ok(hub_dir(hub_id)?.join("manifest.json"))
 }
 
 /// Get the Unix socket path for a hub.
@@ -65,6 +89,71 @@ pub fn write_pid_file(hub_id: &str) -> Result<()> {
         .with_context(|| format!("Failed to write PID file: {}", path.display()))?;
     log::info!("Wrote PID file: {} (pid={})", path.display(), pid);
     Ok(())
+}
+
+/// Write or update the hub runtime manifest.
+pub fn write_manifest(hub_id: &str, server_id: Option<&str>) -> Result<()> {
+    let socket = socket_path(hub_id)?;
+    let path = manifest_path(hub_id)?;
+    let manifest = HubManifest {
+        hub_id: hub_id.to_string(),
+        server_id: server_id
+            .filter(|s| !s.is_empty())
+            .map(std::string::ToString::to_string),
+        socket_path: socket.to_string_lossy().into_owned(),
+        pid: std::process::id(),
+        updated_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    let content =
+        serde_json::to_string_pretty(&manifest).context("Failed to serialize hub manifest")?;
+    fs::write(&path, content)
+        .with_context(|| format!("Failed to write hub manifest: {}", path.display()))?;
+    Ok(())
+}
+
+/// Read a hub runtime manifest.
+///
+/// Returns `None` if the manifest is missing or invalid JSON.
+pub fn read_manifest(hub_id: &str) -> Option<HubManifest> {
+    let path = manifest_path(hub_id).ok()?;
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Return true if a manifest appears live (PID alive + socket exists).
+fn manifest_is_live(manifest: &HubManifest) -> bool {
+    let pid_alive = unsafe { libc::kill(manifest.pid as libc::pid_t, 0) == 0 };
+    let socket_alive = PathBuf::from(&manifest.socket_path).exists();
+    pid_alive && socket_alive
+}
+
+/// Resolve a hub socket by server-assigned hub ID using persisted manifests.
+///
+/// Returns `None` when no manifest matches the server ID.
+pub fn resolve_socket_for_server_id(server_id: &str) -> Option<PathBuf> {
+    let hubs_dir = crate::config::Config::config_dir().ok()?.join("hubs");
+    let entries = fs::read_dir(&hubs_dir).ok()?;
+
+    for entry in entries.flatten() {
+        if !entry.file_type().map_or(false, |t| t.is_dir()) {
+            continue;
+        }
+        let hub_id = entry.file_name().to_string_lossy().into_owned();
+        let Some(manifest) = read_manifest(&hub_id) else {
+            continue;
+        };
+        if manifest.server_id.as_deref() == Some(server_id) {
+            if !manifest_is_live(&manifest) {
+                cleanup_stale_files(&manifest.hub_id);
+                continue;
+            }
+            return Some(PathBuf::from(manifest.socket_path));
+        }
+    }
+    None
 }
 
 /// Read the PID from a hub's PID file.
@@ -126,6 +215,9 @@ pub fn cleanup_on_shutdown(hub_id: &str) {
         let _ = fs::remove_file(&path);
     }
     if let Ok(path) = socket_path(hub_id) {
+        let _ = fs::remove_file(&path);
+    }
+    if let Ok(path) = manifest_path(hub_id) {
         let _ = fs::remove_file(&path);
     }
     log::info!("Cleaned up daemon files for hub {}", &hub_id[..hub_id.len().min(8)]);
@@ -262,6 +354,31 @@ mod tests {
         cleanup_on_shutdown(&test_id);
         assert!(read_pid_file(&test_id).is_none());
         assert!(!is_hub_running(&test_id));
+    }
+
+    #[test]
+    fn test_manifest_round_trip() {
+        let test_id = format!("_test_manifest_{}", std::process::id());
+        write_manifest(&test_id, Some("123")).unwrap();
+        let manifest = read_manifest(&test_id).expect("manifest should exist");
+        assert_eq!(manifest.hub_id, test_id);
+        assert_eq!(manifest.server_id.as_deref(), Some("123"));
+        assert!(manifest.socket_path.ends_with(".sock"));
+        assert!(manifest.updated_at > 0);
+        cleanup_on_shutdown(&manifest.hub_id);
+    }
+
+    #[test]
+    fn test_resolve_socket_for_server_id() {
+        let test_id = format!("_test_server_lookup_{}", std::process::id());
+        write_manifest(&test_id, Some("hub-server-id-xyz")).unwrap();
+        // Make the socket path exist so liveness check passes.
+        let socket = socket_path(&test_id).unwrap();
+        fs::write(&socket, b"").unwrap();
+        let socket =
+            resolve_socket_for_server_id("hub-server-id-xyz").expect("socket should resolve");
+        assert!(socket.to_string_lossy().ends_with(&format!("/{test_id}.sock")));
+        cleanup_on_shutdown(&test_id);
     }
 
     #[test]

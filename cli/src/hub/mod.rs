@@ -868,6 +868,9 @@ impl Hub {
         if let Err(e) = daemon::write_pid_file(&self.hub_identifier) {
             log::warn!("Failed to write PID file: {e}");
         }
+        if let Err(e) = daemon::write_manifest(&self.hub_identifier, self.botster_id.as_deref()) {
+            log::warn!("Failed to write hub manifest: {e}");
+        }
 
         // Start socket server
         match daemon::socket_path(&self.hub_identifier) {
