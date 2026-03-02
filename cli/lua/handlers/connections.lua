@@ -18,7 +18,10 @@ local stats = state.get("connections.stats", {
     total_connections = 0,
     total_messages = 0,
     total_disconnections = 0,
+    agent_list_broadcasts = 0,
+    agent_list_deduped = 0,
 })
+local last_agent_list_snapshot = state.get("connections.last_agent_list_snapshot", nil)
 
 -- ============================================================================
 -- Client Registry
@@ -85,6 +88,8 @@ local function get_stats()
         total_connections = stats.total_connections,
         total_messages = stats.total_messages,
         total_disconnections = stats.total_disconnections,
+        agent_list_broadcasts = stats.agent_list_broadcasts,
+        agent_list_deduped = stats.agent_list_deduped,
     }
 end
 
@@ -96,6 +101,20 @@ end
 -- @param event_name The event name (for logging)
 -- @param event_data The data to merge into the message
 local function broadcast_hub_event(event_name, event_data)
+    -- Coalesce identical agent_list payloads to reduce subscription churn.
+    if event_name == "agent_list" then
+        local ok, snapshot = pcall(json.encode, event_data.agents or {})
+        if ok then
+            if last_agent_list_snapshot == snapshot then
+                stats.agent_list_deduped = stats.agent_list_deduped + 1
+                log.debug("Deduped agent_list broadcast (payload unchanged)")
+                return
+            end
+            last_agent_list_snapshot = snapshot
+            state.set("connections.last_agent_list_snapshot", snapshot)
+        end
+    end
+
     local broadcast_count = 0
 
     for _, client in pairs(clients) do
@@ -117,6 +136,9 @@ local function broadcast_hub_event(event_name, event_data)
     end
 
     if broadcast_count > 0 then
+        if event_name == "agent_list" then
+            stats.agent_list_broadcasts = stats.agent_list_broadcasts + 1
+        end
         log.debug(string.format("Broadcast %s to %d subscription(s)", event_name, broadcast_count))
     end
 end
@@ -286,8 +308,10 @@ end
 hooks.on("pty_title_changed", "update_agent_title", function(info)
     local agent = info.agent_key and Agent.get(info.agent_key)
     if agent then
-        agent.title = info.title
-        broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+        if agent.title ~= info.title then
+            agent.title = info.title
+            broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+        end
     end
 end)
 
@@ -295,8 +319,10 @@ end)
 hooks.on("pty_cwd_changed", "update_agent_cwd", function(info)
     local agent = info.agent_key and Agent.get(info.agent_key)
     if agent then
-        agent.cwd = info.cwd
-        broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+        if agent.cwd ~= info.cwd then
+            agent.cwd = info.cwd
+            broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+        end
     end
 end)
 

@@ -103,7 +103,7 @@ fn test_full_pipeline_pty_output_reaches_subscriber() {
     conn.set_timeout(10).expect("set_timeout");
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
-    conn.install_forwarder(event_tx).expect("install_forwarder");
+    conn.install_forwarder(event_tx.into()).expect("install_forwarder");
 
     // ── 3. Create a pipe pair ─────────────────────────────────────────────────
     //
@@ -387,7 +387,7 @@ fn test_hub_reconnect_snapshot_and_output() {
     conn_b.set_timeout(10).expect("Hub B: set_timeout");
 
     let (event_tx_b, mut event_rx_b) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
-    conn_b.install_forwarder(event_tx_b).expect("Hub B: install_forwarder");
+    conn_b.install_forwarder(event_tx_b.into()).expect("Hub B: install_forwarder");
 
     // ── 5. get_snapshot: AlacrittyParser must have Hub A's data ──────────────
     //
@@ -559,7 +559,7 @@ fn test_existing_session_routes_to_hub_b_after_reconnect() {
     conn_b.set_timeout(10).expect("Hub B: set_timeout");
 
     let (event_tx_b, mut event_rx_b) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
-    conn_b.install_forwarder(event_tx_b).expect("Hub B: install_forwarder");
+    conn_b.install_forwarder(event_tx_b.into()).expect("Hub B: install_forwarder");
 
     // ── 5. Write to the ORIGINAL pipe1 after Hub B is connected ──────────────
     //
@@ -668,7 +668,7 @@ fn test_ctrl_delivery_under_output_flood() {
     // event_rx intentionally unused — demux ignores send errors to a dropped
     // receiver and keeps running, so the control-response path stays alive.
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
-    conn.install_forwarder(event_tx).expect("install_forwarder");
+    conn.install_forwarder(event_tx.into()).expect("install_forwarder");
 
     let (read_end, write_end) = make_pipe();
 

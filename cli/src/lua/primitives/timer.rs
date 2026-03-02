@@ -34,7 +34,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::hub::events::HubEvent;
 
@@ -69,7 +68,7 @@ pub struct TimerEntries {
     /// When `Some`, `timer.after()` and `timer.every()` spawn tokio tasks
     /// that send [`HubEvent::TimerFired`] instead of relying on deadline
     /// scanning in [`poll_timers`].
-    hub_event_tx: Option<UnboundedSender<HubEvent>>,
+    hub_event_tx: Option<crate::hub::events::HubEventTx>,
     /// Tokio runtime handle for spawning timer tasks from sync Lua closures.
     tokio_handle: Option<tokio::runtime::Handle>,
 }
@@ -114,7 +113,7 @@ impl TimerEntries {
     /// `timer.every()` spawn tokio tasks instead of relying on deadline polling.
     pub(crate) fn set_event_channel(
         &mut self,
-        tx: UnboundedSender<HubEvent>,
+        tx: crate::hub::events::HubEventTx,
         handle: tokio::runtime::Handle,
     ) {
         self.hub_event_tx = Some(tx);

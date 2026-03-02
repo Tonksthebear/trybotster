@@ -1009,7 +1009,7 @@ mod tests {
     fn setup_with_channel() -> (HubEventSender, tokio::sync::mpsc::UnboundedReceiver<HubEvent>) {
         let tx = new_hub_event_sender();
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        *tx.lock().unwrap() = Some(sender);
+        *tx.lock().unwrap() = Some(sender.into());
         (tx, receiver)
     }
 

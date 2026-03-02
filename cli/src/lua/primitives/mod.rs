@@ -69,7 +69,7 @@ use crate::hub::handle_cache::HandleCache;
 ///
 /// If a Lua closure fires before the sender is set (shouldn't happen in
 /// practice), the event is dropped with a warning log.
-pub(crate) type HubEventSender = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>>>;
+pub(crate) type HubEventSender = Arc<Mutex<Option<crate::hub::events::HubEventTx>>>;
 
 /// Create a new `HubEventSender` (initially `None`).
 #[must_use]

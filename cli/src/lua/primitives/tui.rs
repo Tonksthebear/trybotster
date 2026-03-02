@@ -185,7 +185,7 @@ mod tests {
         let tx = new_hub_event_sender();
         register(&lua, tx.clone()).expect("Should register tui primitives");
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        *tx.lock().unwrap() = Some(sender);
+        *tx.lock().unwrap() = Some(sender.into());
         (lua, receiver)
     }
 

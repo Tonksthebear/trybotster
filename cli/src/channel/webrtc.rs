@@ -142,11 +142,11 @@ pub struct WebRtcChannelBuilder {
     server_url: Option<String>,
     api_key: Option<String>,
     crypto_service: Option<CryptoService>,
-    signal_tx: Option<mpsc::UnboundedSender<OutgoingSignal>>,
-    stream_frame_tx: Option<mpsc::UnboundedSender<StreamIncoming>>,
-    pty_input_tx: Option<mpsc::UnboundedSender<PtyInputIncoming>>,
-    file_input_tx: Option<mpsc::UnboundedSender<FileInputIncoming>>,
-    hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
+    signal_tx: Option<mpsc::Sender<OutgoingSignal>>,
+    stream_frame_tx: Option<mpsc::Sender<StreamIncoming>>,
+    pty_input_tx: Option<mpsc::Sender<PtyInputIncoming>>,
+    file_input_tx: Option<mpsc::Sender<FileInputIncoming>>,
+    hub_event_tx: Option<crate::hub::events::HubEventTx>,
 }
 
 impl std::fmt::Debug for WebRtcChannelBuilder {
@@ -208,28 +208,28 @@ impl WebRtcChannelBuilder {
 
     /// Set the outgoing signal sender for ICE candidate relay via ActionCable.
     #[must_use]
-    pub fn signal_tx(mut self, tx: mpsc::UnboundedSender<OutgoingSignal>) -> Self {
+    pub fn signal_tx(mut self, tx: mpsc::Sender<OutgoingSignal>) -> Self {
         self.signal_tx = Some(tx);
         self
     }
 
     /// Set the stream frame sender for TCP stream multiplexer frames.
     #[must_use]
-    pub fn stream_frame_tx(mut self, tx: mpsc::UnboundedSender<StreamIncoming>) -> Self {
+    pub fn stream_frame_tx(mut self, tx: mpsc::Sender<StreamIncoming>) -> Self {
         self.stream_frame_tx = Some(tx);
         self
     }
 
     /// Set the PTY input sender for binary PTY input from browser.
     #[must_use]
-    pub fn pty_input_tx(mut self, tx: mpsc::UnboundedSender<PtyInputIncoming>) -> Self {
+    pub fn pty_input_tx(mut self, tx: mpsc::Sender<PtyInputIncoming>) -> Self {
         self.pty_input_tx = Some(tx);
         self
     }
 
     /// Set the file input sender for file transfers from browser.
     #[must_use]
-    pub fn file_input_tx(mut self, tx: mpsc::UnboundedSender<FileInputIncoming>) -> Self {
+    pub fn file_input_tx(mut self, tx: mpsc::Sender<FileInputIncoming>) -> Self {
         self.file_input_tx = Some(tx);
         self
     }
@@ -238,7 +238,7 @@ impl WebRtcChannelBuilder {
     #[must_use]
     pub(crate) fn hub_event_tx(
         mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
+        tx: crate::hub::events::HubEventTx,
     ) -> Self {
         self.hub_event_tx = Some(tx);
         self
@@ -290,13 +290,13 @@ pub struct WebRtcChannel {
     /// Optional crypto service for E2E encryption.
     crypto_service: Option<CryptoService>,
     /// Sender for outgoing signals (ICE candidates) to relay via ActionCable.
-    signal_tx: Option<mpsc::UnboundedSender<OutgoingSignal>>,
+    signal_tx: Option<mpsc::Sender<OutgoingSignal>>,
     /// Sender for incoming stream multiplexer frames.
-    stream_frame_tx: Option<mpsc::UnboundedSender<StreamIncoming>>,
+    stream_frame_tx: Option<mpsc::Sender<StreamIncoming>>,
     /// Sender for incoming PTY input from browser (binary, bypasses JSON/Lua).
-    pty_input_tx: Option<mpsc::UnboundedSender<PtyInputIncoming>>,
+    pty_input_tx: Option<mpsc::Sender<PtyInputIncoming>>,
     /// Sender for incoming file transfers from browser.
-    file_input_tx: Option<mpsc::UnboundedSender<FileInputIncoming>>,
+    file_input_tx: Option<mpsc::Sender<FileInputIncoming>>,
     /// WebRTC peer connection (rustrtc — Clone wraps Arc internally).
     peer_connection: Arc<Mutex<Option<PeerConnection>>>,
     /// WebRTC data channel (set by event loop when browser creates it).
@@ -323,7 +323,7 @@ pub struct WebRtcChannel {
     /// Event channel sender for DC opened notifications.
     /// When set, the event loop sends `HubEvent::DcOpened` instead of
     /// setting the atomic bool.
-    hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
+    hub_event_tx: Option<crate::hub::events::HubEventTx>,
     /// Set to `true` when the connection closes (pc/dc sockets released).
     /// Uses `watch` so late subscribers see the value even if the close already happened.
     close_complete_tx: tokio::sync::watch::Sender<bool>,
@@ -618,10 +618,21 @@ impl WebRtcChannel {
                             };
 
                             if let Some(ref tx) = ice_signal_tx {
-                                let _ = tx.send(OutgoingSignal::Ice {
+                                match tx.try_send(OutgoingSignal::Ice {
                                     browser_identity: ice_browser_id.clone(),
                                     envelope,
-                                });
+                                }) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        log::warn!(
+                                            "[WebRTC] Outgoing signal queue full; dropping ICE candidate for {}",
+                                            &ice_browser_id[..ice_browser_id.len().min(8)]
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        log::warn!("[WebRTC] Signal queue closed; dropping ICE candidate");
+                                    }
+                                }
                             } else {
                                 log::warn!("[WebRTC] No signal_tx -- cannot relay ICE candidate");
                             }
@@ -682,6 +693,7 @@ impl WebRtcChannel {
                                 let stream_tx = stream_frame_tx.clone();
                                 let pty_tx = pty_input_tx.clone();
                                 let file_tx = file_input_tx.clone();
+                                let hub_tx = hub_event_tx.clone();
                                 let dc_reader = Arc::clone(&dc);
                                 let dc_closed_signal = Arc::clone(&dc_closed);
 
@@ -700,6 +712,7 @@ impl WebRtcChannel {
                                                     &stream_tx,
                                                     &pty_tx,
                                                     &file_tx,
+                                                    &hub_tx,
                                                     &mut chunk_assemblies,
                                                 )
                                                 .await;
@@ -1383,9 +1396,10 @@ async fn handle_dc_message(
     decrypt_failures: &Arc<AtomicU32>,
     recv_tx: &Arc<Mutex<Option<mpsc::Sender<RawIncoming>>>>,
     peers: &Arc<RwLock<HashSet<PeerId>>>,
-    stream_frame_tx: &Option<mpsc::UnboundedSender<StreamIncoming>>,
-    pty_input_tx: &Option<mpsc::UnboundedSender<PtyInputIncoming>>,
-    file_input_tx: &Option<mpsc::UnboundedSender<FileInputIncoming>>,
+    stream_frame_tx: &Option<mpsc::Sender<StreamIncoming>>,
+    pty_input_tx: &Option<mpsc::Sender<PtyInputIncoming>>,
+    file_input_tx: &Option<mpsc::Sender<FileInputIncoming>>,
+    hub_event_tx: &Option<crate::hub::events::HubEventTx>,
     chunk_assemblies: &mut std::collections::HashMap<u8, FileChunkAssembly>,
 ) {
     // Every DataChannel message is a binary Olm frame:
@@ -1452,7 +1466,15 @@ async fn handle_dc_message(
             // Parse "terminal_{agent}_{pty}" and send directly to PTY
             if let Some(incoming) = parse_pty_input_sub_id(sub_id, payload, browser_identity.to_string()) {
                 if let Some(ref tx) = pty_input_tx {
-                    let _ = tx.send(incoming);
+                    match tx.try_send(incoming) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            notify_ingress_backpressure(hub_event_tx, browser_identity, "pty_input_queue_full");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            log::debug!("[WebRTC-DC] PTY input queue closed");
+                        }
+                    }
                 }
             } else {
                 log::warn!(
@@ -1472,12 +1494,20 @@ async fn handle_dc_message(
             let payload = plaintext[4..].to_vec();
 
             if let Some(ref tx) = stream_frame_tx {
-                let _ = tx.send(StreamIncoming {
+                match tx.try_send(StreamIncoming {
                     browser_identity: browser_identity.to_string(),
                     frame_type,
                     stream_id,
                     payload,
-                });
+                }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        notify_ingress_backpressure(hub_event_tx, browser_identity, "stream_frame_queue_full");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        log::debug!("[WebRTC-DC] Stream frame queue closed");
+                    }
+                }
             }
             return;
         }
@@ -1514,12 +1544,20 @@ async fn handle_dc_message(
             // Parse sub_id for agent/pty routing
             if let Some(pty_info) = parse_pty_input_sub_id(sub_id, Vec::new(), browser_identity.to_string()) {
                 if let Some(ref tx) = file_input_tx {
-                    let _ = tx.send(FileInputIncoming {
+                    match tx.try_send(FileInputIncoming {
                         agent_index: pty_info.agent_index,
                         pty_index: pty_info.pty_index,
                         filename,
                         data,
-                    });
+                    }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            notify_ingress_backpressure(hub_event_tx, browser_identity, "file_input_queue_full");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            log::debug!("[WebRTC-DC] File input queue closed");
+                        }
+                    }
                 }
             } else {
                 log::warn!(
@@ -1595,12 +1633,20 @@ async fn handle_dc_message(
                 if is_end {
                     // Single chunk with both START and END (small file sent as chunk)
                     if let Some(ref tx) = file_input_tx {
-                        let _ = tx.send(FileInputIncoming {
+                        match tx.try_send(FileInputIncoming {
                             agent_index: assembly.agent_index,
                             pty_index: assembly.pty_index,
                             filename: assembly.filename,
                             data: assembly.data,
-                        });
+                        }) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                notify_ingress_backpressure(hub_event_tx, browser_identity, "file_input_queue_full");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                log::debug!("[WebRTC-DC] File input queue closed");
+                            }
+                        }
                     }
                 } else {
                     if let Some(replaced) = chunk_assemblies.remove(&transfer_id) {
@@ -1632,12 +1678,20 @@ async fn handle_dc_message(
                         assembly.data.len()
                     );
                     if let Some(ref tx) = file_input_tx {
-                        let _ = tx.send(FileInputIncoming {
+                        match tx.try_send(FileInputIncoming {
                             agent_index: assembly.agent_index,
                             pty_index: assembly.pty_index,
                             filename: assembly.filename,
                             data: assembly.data,
-                        });
+                        }) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                notify_ingress_backpressure(hub_event_tx, browser_identity, "file_input_queue_full");
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                log::debug!("[WebRTC-DC] File input queue closed");
+                            }
+                        }
                     }
                 }
             }
@@ -1682,6 +1736,24 @@ fn parse_pty_input_sub_id(sub_id: &str, data: Vec<u8>, browser_identity: String)
         })
     } else {
         None
+    }
+}
+
+fn notify_ingress_backpressure(
+    hub_event_tx: &Option<crate::hub::events::HubEventTx>,
+    browser_identity: &str,
+    source: &'static str,
+) {
+    log::warn!(
+        "[WebRTC-DC] Ingress queue backpressure from {} for {}",
+        source,
+        &browser_identity[..browser_identity.len().min(8)]
+    );
+    if let Some(tx) = hub_event_tx {
+        let _ = tx.send(crate::hub::events::HubEvent::WebRtcIngressBackpressure {
+            browser_identity: browser_identity.to_string(),
+            source,
+        });
     }
 }
 

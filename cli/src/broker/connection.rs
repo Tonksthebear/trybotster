@@ -14,7 +14,7 @@
 //!                                             │   └── spawn broker subprocess
 //!                                             ▼
 //!                                     set_timeout(120)
-//!                                     install_forwarder(event_tx)
+//!                                     install_forwarder(event_tx.into())
 //!
 //! PTY spawn ──register_pty(key, idx, pid, rows, cols, fd)──► BrokerMessage::Registered
 //!
@@ -420,7 +420,7 @@ impl BrokerConnection {
     /// direct socket reads (output forwarding will be absent but commands work).
     pub(crate) fn install_forwarder(
         &mut self,
-        event_tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
+        event_tx: crate::hub::events::HubEventTx,
     ) -> Result<()> {
         let reader_stream = self.stream.try_clone()
             .context("dup broker socket for demux reader")?;
@@ -714,7 +714,7 @@ mod tests {
 fn demux_reader(
     stream: UnixStream,
     response_tx: std::sync::mpsc::Sender<BrokerFrame>,
-    event_tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
+    event_tx: crate::hub::events::HubEventTx,
 ) {
     let mut decoder = BrokerFrameDecoder::new();
     let mut stream = stream;
@@ -889,7 +889,7 @@ mod integration_tests {
 
         // Create event channel and install forwarder BEFORE registration.
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
-        conn.install_forwarder(event_tx).unwrap();
+        conn.install_forwarder(event_tx.into()).unwrap();
 
         // Register PTY — this must succeed (Registered routed to read_response via channel).
         let session_id = conn.register_pty("test-agent", 0, 0, 24, 80, pipe_read).unwrap();
@@ -920,7 +920,7 @@ mod integration_tests {
 
         let mut conn = BrokerConnection::from_stream(client_stream);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
-        conn.install_forwarder(event_tx).unwrap();
+        conn.install_forwarder(event_tx.into()).unwrap();
 
         // Mock broker: send a PtyOutput frame.
         std::thread::spawn(move || {
@@ -1054,7 +1054,7 @@ mod integration_tests {
 
         let mut conn = BrokerConnection::from_stream(client_stream);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
-        conn.install_forwarder(event_tx).unwrap();
+        conn.install_forwarder(event_tx.into()).unwrap();
 
         let snapshot = conn.get_snapshot(1).unwrap();
         assert_eq!(snapshot, b"screen-data", "snapshot data should match");

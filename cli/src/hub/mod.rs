@@ -68,6 +68,13 @@ use crate::git::WorktreeManager;
 use crate::lua::LuaRuntime;
 use crate::lua::primitives::SharedServerId;
 
+const WEBRTC_PTY_OUTPUT_QUEUE_CAPACITY: usize = 2048;
+const WEBRTC_OUTGOING_SIGNAL_QUEUE_CAPACITY: usize = 512;
+const WEBRTC_STREAM_FRAME_QUEUE_CAPACITY: usize = 1024;
+const WEBRTC_PTY_INPUT_QUEUE_CAPACITY: usize = 2048;
+const WEBRTC_FILE_INPUT_QUEUE_CAPACITY: usize = 128;
+const WORKTREE_RESULT_QUEUE_CAPACITY: usize = 256;
+
 /// Queued PTY output message for WebRTC delivery.
 ///
 /// Spawned forwarder tasks queue these messages; the main loop drains and sends.
@@ -293,11 +300,11 @@ pub struct Hub {
     /// Sender for PTY output messages from forwarder tasks.
     ///
     /// Forwarder tasks send PTY output here; main loop drains and sends via WebRTC.
-    pub webrtc_pty_output_tx: tokio::sync::mpsc::UnboundedSender<WebRtcPtyOutput>,
+    pub webrtc_pty_output_tx: tokio::sync::mpsc::Sender<WebRtcPtyOutput>,
     /// Receiver for PTY output messages.
     ///
     /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
-    pub webrtc_pty_output_rx: Option<tokio::sync::mpsc::UnboundedReceiver<WebRtcPtyOutput>>,
+    pub webrtc_pty_output_rx: Option<tokio::sync::mpsc::Receiver<WebRtcPtyOutput>>,
 
     /// Active PTY forwarder task handles for cleanup on unsubscribe.
     ///
@@ -309,32 +316,32 @@ pub struct Hub {
     /// Cloned for each new WebRTC channel. The async `on_ice_candidate` callback
     /// encrypts the candidate and sends it here. `poll_outgoing_signals()` drains
     /// the receiver and relays via `ChannelHandle::perform("signal", ...)`.
-    pub webrtc_outgoing_signal_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::OutgoingSignal>,
+    pub webrtc_outgoing_signal_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::OutgoingSignal>,
     /// Receiver for outgoing WebRTC signals. Drained in `tick()`.
     ///
     /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
-    webrtc_outgoing_signal_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::OutgoingSignal>>,
+    webrtc_outgoing_signal_rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::OutgoingSignal>>,
 
     /// TCP stream multiplexers per browser identity for preview tunneling.
     stream_muxes: std::collections::HashMap<String, crate::relay::stream_mux::StreamMultiplexer>,
     /// Receiver for incoming stream frames from WebRTC DataChannels.
     ///
     /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
-    stream_frame_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::StreamIncoming>>,
+    stream_frame_rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::StreamIncoming>>,
     /// Sender for incoming stream frames (cloned into each WebRtcChannel).
-    pub stream_frame_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::StreamIncoming>,
+    pub stream_frame_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::StreamIncoming>,
     /// Receiver for binary PTY input from WebRTC DataChannels (bypasses JSON/Lua).
     ///
     /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
-    pty_input_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::PtyInputIncoming>>,
+    pty_input_rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::PtyInputIncoming>>,
     /// Sender for binary PTY input (cloned into each WebRtcChannel).
-    pub pty_input_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::PtyInputIncoming>,
+    pub pty_input_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::PtyInputIncoming>,
     /// Receiver for file transfers from browser via WebRTC DataChannels.
     ///
     /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
-    file_input_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::channel::webrtc::FileInputIncoming>>,
+    file_input_rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::FileInputIncoming>>,
     /// Sender for file transfers (cloned into each WebRtcChannel).
-    pub file_input_tx: tokio::sync::mpsc::UnboundedSender<crate::channel::webrtc::FileInputIncoming>,
+    pub file_input_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::FileInputIncoming>,
     /// Temp files from browser paste/drop, keyed by agent session key.
     /// Cleaned up when the agent is closed.
     paste_files: std::collections::HashMap<String, Vec<std::path::PathBuf>>,
@@ -453,7 +460,11 @@ pub struct Hub {
     /// Sender for the unified event bus. Cloned to background producers
     /// (HTTP threads, WebSocket threads, timer tasks, etc.) so they can
     /// deliver events to the Hub event loop without polling.
-    pub(crate) hub_event_tx: tokio::sync::mpsc::UnboundedSender<events::HubEvent>,
+    pub(crate) hub_event_tx: events::HubEventTx,
+    /// Metrics for the unified Hub event bus (enqueue/dequeue/pending/high-water).
+    pub(crate) hub_event_metrics: Arc<events::HubEventMetrics>,
+    /// Last time hub event bus metrics were emitted to logs.
+    pub(crate) hub_event_metrics_last_log: Instant,
     /// Receiver for the unified event bus. Extracted into the `select!`
     /// loop by `run_event_loop()`.
     hub_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<events::HubEvent>>,
@@ -515,19 +526,27 @@ impl Hub {
         // Create handle cache for thread-safe agent handle access
         let handle_cache = Arc::new(handle_cache::HandleCache::new());
         // Create channel for WebRTC PTY output from forwarder tasks
-        let (webrtc_pty_output_tx, webrtc_pty_output_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (webrtc_pty_output_tx, webrtc_pty_output_rx) =
+            tokio::sync::mpsc::channel(WEBRTC_PTY_OUTPUT_QUEUE_CAPACITY);
         // Create channel for outgoing WebRTC signals (ICE candidates from async callbacks)
-        let (webrtc_outgoing_signal_tx, webrtc_outgoing_signal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (webrtc_outgoing_signal_tx, webrtc_outgoing_signal_rx) =
+            tokio::sync::mpsc::channel(WEBRTC_OUTGOING_SIGNAL_QUEUE_CAPACITY);
         // Create channel for incoming stream multiplexer frames from WebRTC DataChannels
-        let (stream_frame_tx, stream_frame_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stream_frame_tx, stream_frame_rx) =
+            tokio::sync::mpsc::channel(WEBRTC_STREAM_FRAME_QUEUE_CAPACITY);
         // Create channel for binary PTY input from WebRTC DataChannels
-        let (pty_input_tx, pty_input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (pty_input_tx, pty_input_rx) =
+            tokio::sync::mpsc::channel(WEBRTC_PTY_INPUT_QUEUE_CAPACITY);
         // Create channel for file transfers from browser via WebRTC DataChannels
-        let (file_input_tx, file_input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (file_input_tx, file_input_rx) =
+            tokio::sync::mpsc::channel(WEBRTC_FILE_INPUT_QUEUE_CAPACITY);
         // Create channel for async worktree creation results
-        let (worktree_result_tx, worktree_result_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (worktree_result_tx, worktree_result_rx) =
+            tokio::sync::mpsc::channel(WORKTREE_RESULT_QUEUE_CAPACITY);
         // Unified event bus for background producers (HTTP, WS, timers, etc.)
-        let (hub_event_tx, hub_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (hub_event_raw_tx, hub_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub_event_metrics = Arc::new(events::HubEventMetrics::default());
+        let hub_event_tx = events::HubEventTx::new(hub_event_raw_tx, Arc::clone(&hub_event_metrics));
 
         // Initialize Lua scripting runtime
         let mut lua = LuaRuntime::new()?;
@@ -591,6 +610,8 @@ impl Hub {
             worktree_result_tx,
             worktree_result_rx: Some(worktree_result_rx),
             hub_event_tx,
+            hub_event_metrics,
+            hub_event_metrics_last_log: Instant::now(),
             hub_event_rx: Some(hub_event_rx),
         })
     }

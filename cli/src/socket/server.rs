@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use tokio::net::UnixListener;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 use crate::hub::events::HubEvent;
@@ -37,7 +36,7 @@ impl SocketServer {
     /// Returns an error if the socket cannot be bound.
     pub(crate) fn start(
         socket_path: PathBuf,
-        hub_event_tx: UnboundedSender<HubEvent>,
+        hub_event_tx: crate::hub::events::HubEventTx,
     ) -> Result<Self> {
         // Validate socket path length against OS limit (104 bytes on macOS, 108 on Linux)
         let path_len = socket_path.as_os_str().len();
@@ -92,7 +91,7 @@ impl SocketServer {
     /// Accept loop — runs as a tokio task.
     async fn accept_loop(
         listener: UnixListener,
-        hub_event_tx: UnboundedSender<HubEvent>,
+        hub_event_tx: crate::hub::events::HubEventTx,
         socket_path: PathBuf,
     ) {
         loop {
@@ -163,7 +162,7 @@ mod tests {
         let sock_path = tmp.path().join("test.sock");
         let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
 
-        let server = SocketServer::start(sock_path.clone(), hub_tx).unwrap();
+        let server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
 
         let _stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
 
@@ -195,7 +194,7 @@ mod tests {
         let sock_path = tmp.path().join("test.sock");
         let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
 
-        let _server = SocketServer::start(sock_path.clone(), hub_tx).unwrap();
+        let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
 
         // Consume connect event, grab client_id
@@ -244,7 +243,7 @@ mod tests {
         let sock_path = tmp.path().join("test.sock");
         let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
 
-        let _server = SocketServer::start(sock_path.clone(), hub_tx).unwrap();
+        let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
 
         // Consume connect event
@@ -277,7 +276,7 @@ mod tests {
         let sock_path = tmp.path().join("test.sock");
         let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
 
-        let _server = SocketServer::start(sock_path.clone(), hub_tx).unwrap();
+        let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
 
         let conn = match tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
@@ -318,7 +317,7 @@ mod tests {
         let sock_path = tmp.path().join("test.sock");
         let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
 
-        let _server = SocketServer::start(sock_path.clone(), hub_tx).unwrap();
+        let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
 
         let connected_id = match tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
@@ -348,7 +347,7 @@ mod tests {
         let sock_path = tmp.path().join("test.sock");
         let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
 
-        let _server = SocketServer::start(sock_path.clone(), hub_tx).unwrap();
+        let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
 
         let _s1 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         let _s2 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
@@ -374,7 +373,7 @@ mod tests {
         let sock_path = tmp.path().join("test.sock");
         let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
 
-        let _server = SocketServer::start(sock_path.clone(), hub_tx).unwrap();
+        let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
 
         // Consume connect event
@@ -409,7 +408,7 @@ mod tests {
         let sock_path = tmp.path().join("test.sock");
         let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
 
-        let _server = SocketServer::start(sock_path.clone(), hub_tx).unwrap();
+        let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
 
         let conn = match tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
@@ -445,7 +444,7 @@ mod tests {
         let sock_path = tmp.path().join(long_name).join("test.sock");
 
         let (hub_tx, _hub_rx) = mpsc::unbounded_channel::<HubEvent>();
-        let result = SocketServer::start(sock_path, hub_tx);
+        let result = SocketServer::start(sock_path, hub_tx.into());
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("too long"), "Error should mention path too long: {err_msg}");

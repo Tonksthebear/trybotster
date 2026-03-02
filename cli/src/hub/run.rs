@@ -209,6 +209,9 @@ pub(crate) fn run_event_loop(
                         None => std::future::pending().await,
                     }
                 } => {
+                    let kind = event.kind();
+                    let bytes = event.approx_size_bytes();
+                    hub.hub_event_metrics.record_dequeue(kind, bytes);
                     hub.handle_hub_event(event);
                 }
             }

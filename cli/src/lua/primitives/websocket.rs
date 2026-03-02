@@ -123,7 +123,7 @@ pub struct WebSocketRegistryInner {
     next_id: u64,
     /// Event channel sender for instant delivery to the Hub event loop.
     /// `None` in tests that don't wire up the full event bus.
-    hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
+    hub_event_tx: Option<crate::hub::events::HubEventTx>,
 }
 
 impl Default for WebSocketRegistryInner {
@@ -153,7 +153,7 @@ impl WebSocketRegistryInner {
     /// Set the Hub event channel sender for event-driven delivery.
     pub(crate) fn set_hub_event_tx(
         &mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
+        tx: crate::hub::events::HubEventTx,
     ) {
         self.hub_event_tx = Some(tx);
     }
