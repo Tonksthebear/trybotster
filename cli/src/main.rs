@@ -607,6 +607,58 @@ fn resolve_hub_id_for_cwd() -> Option<String> {
     Some(botster::hub::hub_id_for_repo(&repo_path))
 }
 
+/// Resolve a socket path for `mcp-serve` with liveness checks.
+///
+/// Resolution order:
+/// 1. Explicit `--socket` argument (must exist).
+/// 2. Hub manifest lookup by server-assigned `hub_id` from context/env.
+/// 3. `hub_socket` from context/env (must exist).
+/// 4. CWD-derived hub ID socket path (must exist).
+fn resolve_mcp_serve_socket(explicit_socket: Option<String>) -> Result<String> {
+    use botster::hub::daemon;
+    use std::path::Path;
+
+    let socket_exists = |path: &str| -> bool { Path::new(path).exists() };
+
+    if let Some(path) = explicit_socket {
+        if socket_exists(&path) {
+            return Ok(path);
+        }
+        anyhow::bail!("Provided --socket does not exist: {path}");
+    }
+
+    let ctx = commands::context::build();
+
+    if let Some(server_id) = ctx.get("hub_id").filter(|s| !s.is_empty()) {
+        if let Some(path) = daemon::resolve_socket_for_server_id(server_id) {
+            let path = path.to_string_lossy().into_owned();
+            if socket_exists(&path) {
+                return Ok(path);
+            }
+            log::warn!(
+                "mcp-serve: manifest socket for hub_id={} is stale: {}",
+                server_id,
+                path
+            );
+        }
+    }
+
+    if let Some(path) = ctx.get("hub_socket").filter(|s| !s.is_empty()) {
+        if socket_exists(path) {
+            return Ok(path.clone());
+        }
+        log::warn!("mcp-serve: context hub_socket is stale: {}", path);
+    }
+
+    let hub_id = resolve_hub_id_for_cwd()
+        .ok_or_else(|| anyhow::anyhow!("Cannot detect repo or working directory"))?;
+    let path = daemon::socket_path(&hub_id)?;
+    if !path.exists() {
+        anyhow::bail!("No running hub found for this directory. Start one with: botster start");
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
 ///
 /// Discovers a running hub (by directory or explicit `--hub` arg),
 /// connects to its socket, and runs the TUI with a bridge adapter.
@@ -1032,39 +1084,7 @@ fn main() -> Result<()> {
             run_attach(hub_arg)?;
         }
         Commands::McpServe { socket } => {
-            let socket_path = match socket {
-                Some(s) => s,
-                None => {
-                    // Resolution order for socket path when --socket is not provided:
-                    //
-                    // 1. BOTSTER_HUB_SOCKET env var — injected by the hub when spawning PTY
-                    //    sessions. Claude Code inherits this from the PTY shell environment.
-                    //
-                    // 2. hub_socket field in .botster/context.json — persisted at agent
-                    //    creation time as a fallback for cases where the env var is not
-                    //    inherited (e.g., shell resets, non-login shells).
-                    //
-                    // 3. CWD auto-discovery — derives hub_id from git rev-parse --show-toplevel.
-                    //    This fails in worktrees because the worktree path hashes to a different
-                    //    hub_id than the main repo where the hub is running. Kept as last resort
-                    //    for non-agent use cases (e.g., user running mcp-serve manually).
-                    let ctx = commands::context::build();
-                    if let Some(s) = ctx.get("hub_socket").filter(|s| !s.is_empty()) {
-                        s.clone()
-                    } else {
-                        // Auto-discover from CWD as last resort
-                        let hub_id = resolve_hub_id_for_cwd()
-                            .ok_or_else(|| anyhow::anyhow!("Cannot detect repo or working directory"))?;
-                        let path = botster::hub::daemon::socket_path(&hub_id)?;
-                        if !path.exists() {
-                            anyhow::bail!(
-                                "No running hub found for this directory. Start one with: botster start"
-                            );
-                        }
-                        path.to_string_lossy().into_owned()
-                    }
-                }
-            };
+            let socket_path = resolve_mcp_serve_socket(socket)?;
             botster::mcp_serve::run(&socket_path)?;
         }
         Commands::Context { key } => {
@@ -1127,4 +1147,3 @@ mod tests {
         }
     }
 }
-

@@ -197,7 +197,7 @@ function M.on_action(action, context)
         return {
           { op = "send_msg", data = {
             subscriptionId = "tui_hub",
-            data = { type = "reopen_worktree", path = wt.path, branch = wt.branch },
+            data = { type = "reopen_worktree", path = wt.path, branch = wt.branch, profile = _tui_state.pending_fields.profile },
           }},
           set_mode_ops(base_mode(context)),
         }

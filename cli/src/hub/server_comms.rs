@@ -4013,6 +4013,13 @@ impl Hub {
         self.botster_id = Some(botster_id.clone());
         // Sync to shared copy for Lua primitives
         *self.shared_server_id.lock().expect("SharedServerId mutex poisoned") = Some(botster_id);
+        // Keep runtime manifest aligned with server-assigned hub ID.
+        if let Err(e) = crate::hub::daemon::write_manifest(
+            &self.hub_identifier,
+            self.botster_id.as_deref(),
+        ) {
+            log::warn!("Failed to refresh hub manifest after server registration: {e}");
+        }
     }
 
     /// Initialize web push state from encrypted storage.
