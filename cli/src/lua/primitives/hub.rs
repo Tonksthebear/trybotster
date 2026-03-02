@@ -531,9 +531,28 @@ pub(crate) fn register(
             .create_function(
                 move |_, (session_id, log_path, cap_bytes): (u32, String, u64)| {
                     // Path validation: must stay within the workspace sessions tree.
-                    // Checking for these components prevents arbitrary paths being
-                    // passed to the broker (defence-in-depth alongside Lua-layer checks).
-                    if !log_path.contains("workspaces/") || !log_path.contains("sessions/") {
+                    //
+                    // Component-level checks prevent crafted paths that satisfy a
+                    // naive substring match (e.g. "/tmp/evil-workspaces/x") from
+                    // being passed to the broker:
+                    //   1. Must be absolute (starts with '/').
+                    //   2. Must contain a path component exactly equal to "workspaces".
+                    //   3. Must contain a path component exactly equal to "sessions".
+                    //   4. Must not contain ".." traversal components.
+                    //
+                    // These four checks together ensure the path stays inside the
+                    // intended directory tree without requiring the file to exist yet
+                    // (the broker creates it on first write).
+                    let path = std::path::Path::new(&log_path);
+                    let components: Vec<_> = path
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect();
+                    let is_absolute = path.is_absolute();
+                    let has_workspaces = components.iter().any(|c| c == "workspaces");
+                    let has_sessions = components.iter().any(|c| c == "sessions");
+                    let has_traversal = components.iter().any(|c| c == "..");
+                    if !is_absolute || !has_workspaces || !has_sessions || has_traversal {
                         ::log::warn!(
                             "[Broker] pty_tee rejected unsafe path: {log_path}"
                         );
@@ -851,7 +870,7 @@ mod tests {
         assert!(hub.contains_key("pty_tee").unwrap());
     }
 
-    /// `hub.pty_tee` with a path missing "workspaces/" must return nil.
+    /// `hub.pty_tee` with a path missing the "workspaces" component must return nil.
     #[test]
     fn test_pty_tee_rejects_unsafe_path() {
         let lua = Lua::new();
@@ -859,7 +878,7 @@ mod tests {
 
         register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
 
-        // Path lacks required "workspaces/" component.
+        // Path lacks required "workspaces" component.
         let result: LuaValue = lua
             .load(r#"return hub.pty_tee(1, "/tmp/bad/path/pty-0.log", 0)"#)
             .eval()
@@ -867,7 +886,7 @@ mod tests {
         assert!(result.is_nil(), "unsafe path must return nil");
     }
 
-    /// `hub.pty_tee` with a path missing "sessions/" must return nil.
+    /// `hub.pty_tee` with a path missing the "sessions" component must return nil.
     #[test]
     fn test_pty_tee_rejects_path_without_sessions() {
         let lua = Lua::new();
@@ -875,12 +894,60 @@ mod tests {
 
         register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
 
-        // Path has "workspaces/" but not "sessions/".
+        // Path has "workspaces" component but not "sessions".
         let result: LuaValue = lua
             .load(r#"return hub.pty_tee(1, "/data/workspaces/my-agent/pty-0.log", 0)"#)
             .eval()
             .unwrap();
-        assert!(result.is_nil(), "path without sessions/ must return nil");
+        assert!(result.is_nil(), "path without sessions component must return nil");
+    }
+
+    /// A crafted path that contains "workspaces" as a substring of a directory name
+    /// (e.g. "evil-workspaces") must be rejected — component-level check required.
+    #[test]
+    fn test_pty_tee_rejects_workspaces_as_substring() {
+        let lua = Lua::new();
+        let (tx, cache, hid, sid, state) = create_test_deps();
+
+        register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
+
+        // "evil-workspaces" satisfies a naive contains("workspaces/") check but is
+        // not the exact "workspaces" path component — must be rejected.
+        let result: LuaValue = lua
+            .load(r#"return hub.pty_tee(1, "/tmp/evil-workspaces/x/sessions/0/pty-0.log", 0)"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil(), "substring match on component name must be rejected");
+    }
+
+    /// A path with ".." traversal components must be rejected.
+    #[test]
+    fn test_pty_tee_rejects_path_traversal() {
+        let lua = Lua::new();
+        let (tx, cache, hid, sid, state) = create_test_deps();
+
+        register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
+
+        let result: LuaValue = lua
+            .load(r#"return hub.pty_tee(1, "/data/workspaces/agent/../../../etc/sessions/0/pty-0.log", 0)"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil(), "path traversal must be rejected");
+    }
+
+    /// A relative path (no leading '/') must be rejected.
+    #[test]
+    fn test_pty_tee_rejects_relative_path() {
+        let lua = Lua::new();
+        let (tx, cache, hid, sid, state) = create_test_deps();
+
+        register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
+
+        let result: LuaValue = lua
+            .load(r#"return hub.pty_tee(1, "workspaces/agent/sessions/0/pty-0.log", 0)"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil(), "relative path must be rejected");
     }
 
     /// `hub.pty_tee` returns nil when the broker is not connected.

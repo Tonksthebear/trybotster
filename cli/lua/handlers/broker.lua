@@ -164,23 +164,32 @@ local function process_context_file(context_path, in_worktree, ghost_infos, seen
         local session_id = tonumber(meta["broker_session_" .. ghost_pty_index])
         if session_id then
             local snapshot = hub.get_pty_snapshot_from_broker(session_id)
-            if snapshot and #snapshot > 0 then
+            if snapshot ~= nil then
                 -- ── Graceful restart ──────────────────────────────────────
-                -- Live broker session confirmed; snapshot is the source of truth.
-                -- Do NOT replay the log — that would duplicate history.
-                local feed_ok, feed_err = pcall(function() handle:feed_output(snapshot) end)
-                if feed_ok then
-                    log.info(string.format(
-                        "[broker] Graceful: replayed %d snapshot bytes → %s pty=%d",
-                        #snapshot, agent_key, ghost_pty_index))
+                -- Live broker session confirmed (snapshot non-nil, even if empty).
+                -- Empty snapshot = agent just started with no output yet — still
+                -- graceful; do NOT fall through to log replay (would create false
+                -- orphan events).  Do NOT replay the log either way — that would
+                -- duplicate history that the broker already holds.
+                if #snapshot > 0 then
+                    local feed_ok, feed_err = pcall(function() handle:feed_output(snapshot) end)
+                    if feed_ok then
+                        log.info(string.format(
+                            "[broker] Graceful: replayed %d snapshot bytes → %s pty=%d",
+                            #snapshot, agent_key, ghost_pty_index))
+                    else
+                        log.warn(string.format(
+                            "[broker] Graceful: feed_output failed for %s pty=%d: %s",
+                            agent_key, ghost_pty_index, tostring(feed_err)))
+                    end
                 else
-                    log.warn(string.format(
-                        "[broker] Graceful: feed_output failed for %s pty=%d: %s",
-                        agent_key, ghost_pty_index, tostring(feed_err)))
+                    log.info(string.format(
+                        "[broker] Graceful: empty snapshot for %s pty=%d (no output yet)",
+                        agent_key, ghost_pty_index))
                 end
             else
                 -- ── Hard restart (orphaned session) ───────────────────────
-                -- Broker has no live session; reconstruct from tee logs.
+                -- Broker returned nil — session is gone; reconstruct from tee logs.
                 any_orphaned = true
                 local log_path = meta["tee_log_path_" .. ghost_pty_index]
                 if log_path and (fs.exists(log_path) or fs.exists(log_path .. ".1")) then
@@ -360,7 +369,10 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
         local session_id = broker_sessions[tostring(ghost_pty_index)]
         if session_id then
             local snapshot = hub.get_pty_snapshot_from_broker(session_id)
-            if snapshot and #snapshot > 0 then
+            -- nil = session gone (orphaned); empty string = session alive, no output yet.
+            -- Only feed bytes when there is something to feed; both cases are graceful here
+            -- because the workspace-store path has already confirmed the session exists.
+            if snapshot ~= nil and #snapshot > 0 then
                 local ok5, err = pcall(function() handle:feed_output(snapshot) end)
                 if ok5 then
                     log.info(string.format(
