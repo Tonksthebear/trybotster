@@ -1303,6 +1303,14 @@ impl Hub {
         for (browser_identity, reason) in to_cleanup {
             self.cleanup_webrtc_channel(&browser_identity, reason);
         }
+
+        // Prune webrtc_pending_closes entries whose disconnect has already completed.
+        // Entries are normally consumed when the same device sends a new offer (removed
+        // and awaited in the offer handler). If the browser disconnects and never
+        // reconnects, the entry would otherwise accumulate indefinitely. Any entry
+        // whose receiver is already `true` (disconnect finished) is safe to drop.
+        self.webrtc_pending_closes
+            .retain(|_, close_rx| !*close_rx.borrow());
     }
 
     /// Clean up a single WebRTC channel and its associated resources.
@@ -1313,27 +1321,35 @@ impl Hub {
     /// 3. Aborts any PTY forwarder tasks for this browser
     /// 4. Notifies Lua of peer disconnection
     fn cleanup_webrtc_channel(&mut self, browser_identity: &str, reason: &str) {
+        // Guard against duplicate cleanup calls (e.g. handle_webrtc_send and
+        // poll_webrtc_pty_output both detecting the same dead channel in the
+        // same tick). If the channel is already gone this is a no-op — we must
+        // not fire peer_disconnected a second time or the browser JS state
+        // machine will enter an unrecoverable state and stop reconnecting.
+        let Some(mut channel) = self.webrtc_channels.remove(browser_identity) else {
+            log::debug!(
+                "[WebRTC] cleanup_webrtc_channel({}) called but channel already removed (duplicate skipped)",
+                &browser_identity[..browser_identity.len().min(8)]
+            );
+            return;
+        };
+
         log::info!(
             "[WebRTC] Cleaning up {} channel: {}",
             reason,
             &browser_identity[..browser_identity.len().min(8)]
         );
 
-        // Remove the channel and track its close notification.
-        // The state handler (Disconnected/Failed) already takes pc/dc and spawns
-        // a close task — disconnect() here is belt-and-suspenders. We store the
-        // close_complete Notify so the offer handler can await socket release
+        // Track close notification so the offer handler can await socket release
         // before creating a replacement channel (prevents fd exhaustion).
-        if let Some(mut channel) = self.webrtc_channels.remove(browser_identity) {
-            let close_rx = channel.close_receiver();
-            let olm_key = crate::relay::extract_olm_key(browser_identity).to_string();
-            self.webrtc_pending_closes.insert(olm_key, close_rx);
+        let close_rx = channel.close_receiver();
+        let olm_key = crate::relay::extract_olm_key(browser_identity).to_string();
+        self.webrtc_pending_closes.insert(olm_key, close_rx);
 
-            self.tokio_runtime.spawn(async move {
-                channel.disconnect().await;
-                log::debug!("[WebRTC] Channel disconnect completed");
-            });
-        }
+        self.tokio_runtime.spawn(async move {
+            channel.disconnect().await;
+            log::debug!("[WebRTC] Channel disconnect completed");
+        });
 
         // Remove connection start time tracking
         self.webrtc_connection_started.remove(browser_identity);

@@ -102,14 +102,18 @@ end
 
 --- Build HTTP headers for a remote MCP server request.
 -- @param token string|nil Bearer token for Authorization header
+-- @param session_id string|nil MCP session ID (required after initialize handshake)
 -- @return table HTTP headers
-local function build_headers(token)
+local function build_headers(token, session_id)
     local h = {
         ["Content-Type"] = "application/json",
         ["Accept"]       = "application/json",
     }
     if token then
         h["Authorization"] = "Bearer " .. token
+    end
+    if session_id then
+        h["Mcp-Session-Id"] = session_id
     end
     return h
 end
@@ -281,7 +285,7 @@ function M.call_tool(name, params, context, callback)
         http.request({
             method  = "POST",
             url     = proxy.url,
-            headers = build_headers(proxy.token),
+            headers = build_headers(proxy.token, proxy.session_id),
             body    = body,
         }, function(resp, http_err)
             if http_err then
@@ -385,19 +389,50 @@ function M.proxy(url, opts)
     local source       = caller_source()
     local proxy_id     = url
 
-    local body = json.encode({
+    local init_body = json.encode({
         jsonrpc = "2.0",
         id      = 1,
-        method  = "tools/list",
-        params  = {},
+        method  = "initialize",
+        params  = {
+            protocolVersion = "2024-11-05",
+            capabilities    = {},
+            clientInfo      = { name = "botster", version = "1.0" },
+        },
     })
 
+    -- Step 1: initialize to obtain Mcp-Session-Id, then fetch tools/list.
     http.request({
         method  = "POST",
         url     = url,
         headers = build_headers(token),
-        body    = body,
-    }, function(resp, http_err)
+        body    = init_body,
+    }, function(init_resp, init_err)
+        if init_err then
+            log.warn(string.format("mcp.proxy: initialize failed for %s: %s", url, tostring(init_err)))
+            return
+        end
+        if init_resp.status ~= 200 then
+            log.warn(string.format("mcp.proxy: initialize returned HTTP %d for %s", init_resp.status, url))
+            return
+        end
+
+        local session_id = init_resp.headers and (
+            init_resp.headers["mcp-session-id"] or init_resp.headers["Mcp-Session-Id"]
+        )
+
+        local list_body = json.encode({
+            jsonrpc = "2.0",
+            id      = 2,
+            method  = "tools/list",
+            params  = {},
+        })
+
+        http.request({
+            method  = "POST",
+            url     = url,
+            headers = build_headers(token, session_id),
+            body    = list_body,
+        }, function(resp, http_err)
         if http_err then
             log.warn(string.format("mcp.proxy: failed to connect to %s: %s", url, tostring(http_err)))
             return
@@ -463,6 +498,7 @@ function M.proxy(url, opts)
         proxies[proxy_id] = {
             url           = url,
             token         = token,
+            session_id    = session_id,
             source        = registered_source,
             tool_names    = tool_names,
             on_auth_error = on_auth_error or prev_on_auth_error,
@@ -474,7 +510,8 @@ function M.proxy(url, opts)
             "mcp.proxy: registered %d tools from %s",
             #tool_names, url
         ))
-    end)
+        end) -- tools/list callback
+    end) -- initialize callback
 end
 
 --- Remove a proxy and all of its registered tools.
