@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSetBuilder};
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -56,15 +57,15 @@ impl WorktreeManager {
     /// Copy files from `source_repo` to `dest` matching glob patterns in `patterns_file`.
     ///
     /// Reads one glob pattern per line from `patterns_file` (ignoring blanks and
-    /// `#`-comments), then uses `git ls-files` to enumerate only tracked files in
-    /// `source_repo`, copying every matching file into `dest` while preserving
-    /// relative paths.
+    /// `#`-comments), then walks `source_repo` and copies every matching file into
+    /// `dest`, preserving relative paths.
     ///
-    /// Using `git ls-files` instead of a recursive filesystem walk is intentional:
-    /// it automatically respects `.gitignore`, which prevents traversing large
-    /// build artifact directories (e.g., `cli/target/` can exceed 65 GB with
-    /// ~300 K object files). A naive `read_dir` walk over those paths caused
-    /// macOS jetsam to SIGKILL the hub process under VFS cache pressure.
+    /// The walk skips any directory that git considers ignored (e.g., `cli/target/`,
+    /// `node_modules/`). This is intentional: a naive full filesystem walk over a
+    /// 65 GB `cli/target/` with ~300 K object files caused macOS jetsam to SIGKILL
+    /// the hub under VFS cache pressure. Individual gitignored files inside tracked
+    /// directories (credentials, `.key` files, `.env`) are still found — pruning
+    /// happens at the directory level only.
     pub fn copy_from_patterns(
         source_repo: &Path,
         dest: &Path,
@@ -106,57 +107,17 @@ impl WorktreeManager {
         }
         let globset = builder.build()?;
 
-        // `git ls-files` enumerates only tracked files, so .gitignore is respected
-        // for free. This is O(tracked files) rather than O(all files on disk).
-        let output = std::process::Command::new("git")
-            .arg("ls-files")
-            .current_dir(source_repo)
-            .output()
-            .context("Failed to run git ls-files")?;
+        // Collect the set of gitignored top-level directories so the walk can prune
+        // them before recursing. One subprocess call; the result is a small set of
+        // directory names (e.g., {"cli/target", "node_modules"}).
+        //
+        // `--ignored --others --exclude-standard --directory` lists directories that
+        // are entirely gitignored, with a trailing slash (e.g., "cli/target/"). We
+        // store them as absolute paths for fast membership testing during the walk.
+        let ignored_dirs = git_ignored_directories(source_repo);
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("git ls-files failed: {}", stderr);
-        }
-
-        let file_list = String::from_utf8_lossy(&output.stdout);
         let mut copied: usize = 0;
-
-        for rel_path_str in file_list.lines() {
-            let rel_path = std::path::Path::new(rel_path_str);
-            if !globset.is_match(rel_path) {
-                continue;
-            }
-
-            let src = source_repo.join(rel_path);
-            let dest_path = dest.join(rel_path);
-
-            if let Some(parent) = dest_path.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    log::warn!(
-                        "Failed to create parent directory for {}: {}",
-                        dest_path.display(),
-                        e
-                    );
-                    continue;
-                }
-            }
-
-            match fs::copy(&src, &dest_path) {
-                Ok(_) => {
-                    log::info!("Copied: {} to {}", rel_path_str, dest_path.display());
-                    copied += 1;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to copy {} to {}: {} - continuing",
-                        src.display(),
-                        dest_path.display(),
-                        e
-                    );
-                }
-            }
-        }
+        copy_matching_files(source_repo, dest, source_repo, &globset, &ignored_dirs, &mut copied)?;
 
         log::info!("Copied {} file(s) into {}", copied, dest.display());
         Ok(())
@@ -744,6 +705,139 @@ impl WorktreeManager {
         log::info!("Successfully deleted worktree for issue #{}", issue_number);
         Ok(())
     }
+}
+
+/// Returns the set of absolute paths for directories that git considers entirely
+/// ignored (e.g., `cli/target/`, `node_modules/`).
+///
+/// Uses `git ls-files --ignored --others --exclude-standard --directory` which
+/// lists ignored untracked directory entries with a trailing slash. These are the
+/// directories the walk in [`copy_matching_files`] should skip to avoid touching
+/// hundreds of thousands of gitignored build artifacts.
+///
+/// Returns an empty set on any error so the walk degrades gracefully (slower but
+/// still correct).
+fn git_ignored_directories(repo: &Path) -> HashSet<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "--ignored",
+            "--others",
+            "--exclude-standard",
+            "--directory",
+        ])
+        .current_dir(repo)
+        .output();
+
+    match output {
+        Err(e) => {
+            log::warn!("git ls-files --directory failed, walk will not prune ignored dirs: {}", e);
+            HashSet::new()
+        }
+        Ok(out) if !out.status.success() => {
+            log::warn!(
+                "git ls-files --directory exited {:?}, walk will not prune ignored dirs",
+                out.status.code()
+            );
+            HashSet::new()
+        }
+        Ok(out) => {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                // Each entry has a trailing slash; strip it and resolve to absolute path.
+                .map(|l| repo.join(l.trim_end_matches('/')))
+                .collect()
+        }
+    }
+}
+
+/// Recursively copy files matching `globset` from `current_dir` into `dest_root`,
+/// skipping any directory whose absolute path appears in `ignored_dirs`.
+///
+/// `source_root` is the repository root; it is used to derive relative paths for
+/// glob matching and destination mirroring.
+fn copy_matching_files(
+    source_root: &Path,
+    dest_root: &Path,
+    current_dir: &Path,
+    globset: &globset::GlobSet,
+    ignored_dirs: &HashSet<PathBuf>,
+    copied: &mut usize,
+) -> Result<()> {
+    if !current_dir.is_dir() {
+        return Ok(());
+    }
+
+    let entries = match fs::read_dir(current_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!("Failed to read directory {}: {}", current_dir.display(), e);
+            return Ok(());
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("Failed to read dir entry: {}", e);
+                continue;
+            }
+        };
+        let path = entry.path();
+
+        // Skip .git metadata directory.
+        if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
+            continue;
+        }
+
+        if path.is_dir() {
+            // Skip directories that git marks as entirely ignored (e.g., cli/target/).
+            // This avoids stat-ing hundreds of thousands of build artifacts.
+            if ignored_dirs.contains(&path) {
+                log::debug!("Skipping gitignored directory: {}", path.display());
+                continue;
+            }
+            copy_matching_files(source_root, dest_root, &path, globset, ignored_dirs, copied)?;
+        } else {
+            let rel_path = path
+                .strip_prefix(source_root)
+                .context("Failed to get relative path")?;
+
+            if !globset.is_match(rel_path) {
+                continue;
+            }
+
+            let dest_path = dest_root.join(rel_path);
+            if let Some(parent) = dest_path.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    log::warn!(
+                        "Failed to create parent dir for {}: {}",
+                        dest_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            }
+
+            match fs::copy(&path, &dest_path) {
+                Ok(_) => {
+                    log::info!("Copied: {} to {}", rel_path.display(), dest_path.display());
+                    *copied += 1;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to copy {} to {}: {} - continuing",
+                        path.display(),
+                        dest_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Checks whether a path is a git worktree (has a `.git` file, not directory).
