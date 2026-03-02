@@ -11,18 +11,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Returns the path for debug logging.
-/// In test mode, writes to project tmp/ to avoid leaking outside the project.
-fn debug_log_path() -> PathBuf {
-    if crate::env::is_any_test() {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .map(|p| p.join("tmp/botster_debug.log"))
-            .unwrap_or_else(|| PathBuf::from("/tmp/botster_debug.log"))
-    } else {
-        PathBuf::from("/tmp/botster_debug.log")
-    }
-}
 
 /// Manages git worktrees for agent sessions.
 #[derive(Debug)]
@@ -68,8 +56,15 @@ impl WorktreeManager {
     /// Copy files from `source_repo` to `dest` matching glob patterns in `patterns_file`.
     ///
     /// Reads one glob pattern per line from `patterns_file` (ignoring blanks and
-    /// `#`-comments), then recursively walks `source_repo` and copies every
-    /// matching file into `dest`, preserving relative paths.
+    /// `#`-comments), then uses `git ls-files` to enumerate only tracked files in
+    /// `source_repo`, copying every matching file into `dest` while preserving
+    /// relative paths.
+    ///
+    /// Using `git ls-files` instead of a recursive filesystem walk is intentional:
+    /// it automatically respects `.gitignore`, which prevents traversing large
+    /// build artifact directories (e.g., `cli/target/` can exceed 65 GB with
+    /// ~300 K object files). A naive `read_dir` walk over those paths caused
+    /// macOS jetsam to SIGKILL the hub process under VFS cache pressure.
     pub fn copy_from_patterns(
         source_repo: &Path,
         dest: &Path,
@@ -111,109 +106,59 @@ impl WorktreeManager {
         }
         let globset = builder.build()?;
 
-        Self::copy_matching_files(source_repo, dest, source_repo, &globset)?;
+        // `git ls-files` enumerates only tracked files, so .gitignore is respected
+        // for free. This is O(tracked files) rather than O(all files on disk).
+        let output = std::process::Command::new("git")
+            .arg("ls-files")
+            .current_dir(source_repo)
+            .output()
+            .context("Failed to run git ls-files")?;
 
-        log::info!("Copied {} pattern(s) into {}", patterns.len(), dest.display());
-        Ok(())
-    }
-
-    /// Recursively copy files matching the globset
-    fn copy_matching_files(
-        source_root: &Path,
-        dest_root: &Path,
-        current_dir: &Path,
-        globset: &globset::GlobSet,
-    ) -> Result<()> {
-        if !current_dir.is_dir() {
-            return Ok(());
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git ls-files failed: {}", stderr);
         }
 
-        let read_result = fs::read_dir(current_dir);
-        if let Err(e) = &read_result {
-            log::warn!("Failed to read directory {}: {}", current_dir.display(), e);
-            return Ok(()); // Continue despite errors
-        }
+        let file_list = String::from_utf8_lossy(&output.stdout);
+        let mut copied: usize = 0;
 
-        for entry in read_result.expect("checked is_ok() above") {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(err) => {
-                    log::warn!("Failed to read entry: {}", err);
-                    continue;
-                }
-            };
-            let path = entry.path();
-
-            // Skip .git directory
-            if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
+        for rel_path_str in file_list.lines() {
+            let rel_path = std::path::Path::new(rel_path_str);
+            if !globset.is_match(rel_path) {
                 continue;
             }
 
-            // Get relative path from source root
-            let rel_path = path
-                .strip_prefix(source_root)
-                .context("Failed to get relative path")?;
+            let src = source_repo.join(rel_path);
+            let dest_path = dest.join(rel_path);
 
-            if path.is_dir() {
-                // Recurse into directories
-                Self::copy_matching_files(source_root, dest_root, &path, globset)?;
-            } else {
-                log::debug!(
-                    "Checking file: {} (rel_path: {})",
-                    path.display(),
-                    rel_path.display()
-                );
-                if globset.is_match(rel_path) {
-                    // Copy matching file
-                    let dest_path = dest_root.join(rel_path);
+            if let Some(parent) = dest_path.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    log::warn!(
+                        "Failed to create parent directory for {}: {}",
+                        dest_path.display(),
+                        e
+                    );
+                    continue;
+                }
+            }
 
-                    // Create parent directories if needed
-                    if let Some(parent) = dest_path.parent() {
-                        if let Err(e) = fs::create_dir_all(parent) {
-                            log::warn!(
-                                "Failed to create parent directory for {}: {}",
-                                dest_path.display(),
-                                e
-                            );
-                            continue;
-                        }
-                    }
-
-                    // Copy file, but continue on error
-                    match fs::copy(&path, &dest_path) {
-                        Ok(_) => {
-                            log::info!("Copied: {} to {}", rel_path.display(), dest_path.display());
-
-                            // Also append to debug file
-                            let debug_msg = format!(
-                                "COPIED: {} -> {}\n",
-                                rel_path.display(),
-                                dest_path.display()
-                            );
-                            use std::io::Write;
-                            if let Ok(mut file) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(debug_log_path())
-                            {
-                                let _ = file.write_all(debug_msg.as_bytes());
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Failed to copy {} to {}: {} - continuing with remaining files",
-                                path.display(),
-                                dest_path.display(),
-                                e
-                            );
-                        }
-                    }
-                } else {
-                    log::debug!("Skipping (no match): {}", rel_path.display());
+            match fs::copy(&src, &dest_path) {
+                Ok(_) => {
+                    log::info!("Copied: {} to {}", rel_path_str, dest_path.display());
+                    copied += 1;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to copy {} to {}: {} - continuing",
+                        src.display(),
+                        dest_path.display(),
+                        e
+                    );
                 }
             }
         }
 
+        log::info!("Copied {} file(s) into {}", copied, dest.display());
         Ok(())
     }
 
