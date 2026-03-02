@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "digest"
+
 module Hubs
   # WebRTC configuration endpoint
   #
@@ -96,23 +98,38 @@ module Hubs
     # Fetch temporary TURN credentials from metered.co API
     # Returns array of all STUN/TURN servers (metered returns multiple)
     def fetch_metered_credentials
-      response = Net::HTTP.get_response(
-        URI("https://#{ENV['METERED_DOMAIN']}/api/v1/turn/credentials?apiKey=#{ENV['METERED_SECRET_KEY']}")
-      )
+      domain = ENV["METERED_DOMAIN"]
+      api_key = ENV["METERED_SECRET_KEY"]
+      cache_key = "webrtc:metered:#{domain}:#{Digest::SHA256.hexdigest(api_key)}"
 
-      return [] unless response.is_a?(Net::HTTPSuccess)
+      Rails.cache.fetch(cache_key, expires_in: 5.minutes, race_condition_ttl: 10.seconds) do
+        uri = URI::HTTPS.build(
+          host: domain,
+          path: "/api/v1/turn/credentials",
+          query: URI.encode_www_form(apiKey: api_key)
+        )
 
-      credentials = JSON.parse(response.body)
-      return [] if credentials.empty?
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = true
+        http.open_timeout = 2
+        http.read_timeout = 2
+        http.write_timeout = 2 if http.respond_to?(:write_timeout=)
+        response = http.get(uri.request_uri)
 
-      # Metered returns array of server configs (STUN + multiple TURN variants)
-      # Map all of them to ice_server format
-      credentials.map do |cred|
-        {
-          urls: cred["urls"] || cred["url"],
-          username: cred["username"],
-          credential: cred["credential"]
-        }.compact
+        next [] unless response.is_a?(Net::HTTPSuccess)
+
+        credentials = JSON.parse(response.body)
+        next [] if credentials.empty?
+
+        # Metered returns array of server configs (STUN + multiple TURN variants)
+        # Map all of them to ice_server format
+        credentials.map do |cred|
+          {
+            urls: cred["urls"] || cred["url"],
+            username: cred["username"],
+            credential: cred["credential"]
+          }.compact
+        end
       end
     rescue StandardError => e
       Rails.logger.error "[WebRTC] Failed to fetch metered.co credentials: #{e.message}"
