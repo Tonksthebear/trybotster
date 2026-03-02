@@ -122,6 +122,15 @@ pub struct HttpAsyncEntries {
     /// Event channel sender for instant delivery to the Hub event loop.
     /// `None` in tests that don't wire up the full event bus.
     hub_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
+    /// Shared HTTP client reused across all async requests.
+    ///
+    /// `reqwest::blocking::Client` is an `Arc` internally — cloning it is cheap
+    /// and shares the underlying connection pool. Each thread receives a clone so
+    /// connections to the same host (e.g. Telegram polling every 5 s) are
+    /// reused instead of opening a fresh TCP socket on every request. Per-request
+    /// timeouts are applied via `RequestBuilder::timeout()`, which overrides the
+    /// client-level setting for that specific call.
+    client: reqwest::blocking::Client,
 }
 
 impl Default for HttpAsyncEntries {
@@ -132,6 +141,7 @@ impl Default for HttpAsyncEntries {
             next_id: 0,
             in_flight: 0,
             hub_event_tx: None,
+            client: reqwest::blocking::Client::new(),
         }
     }
 }
@@ -642,28 +652,14 @@ pub fn register(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
                 let thread_timeout = opts.timeout;
                 let thread_request_id = request_id.clone();
                 let thread_registry = Arc::clone(&registry);
+                // Clone the shared client — cheap (Arc internally) and shares the connection pool.
+                let thread_client = registry.lock().expect("HttpAsyncEntries mutex poisoned").client.clone();
 
                 // Spawn with Builder so we can handle spawn failure
                 let spawn_result = std::thread::Builder::new()
                     .name(format!("http-{thread_method}-{}", &thread_request_id))
                     .spawn(move || {
-                        // Build client inside the thread (avoids tokio-in-tokio panic)
-                        let client = match reqwest::blocking::Client::builder()
-                            .timeout(thread_timeout)
-                            .build()
-                        {
-                            Ok(c) => c,
-                            Err(e) => {
-                                let mut entries =
-                                    thread_registry.lock().expect("HttpAsyncEntries mutex poisoned");
-                                entries.emit_response(CompletedHttpResponse {
-                                    request_id: thread_request_id,
-                                    result: Err(format!("Failed to create HTTP client: {e}")),
-                                });
-                                entries.in_flight = entries.in_flight.saturating_sub(1);
-                                return;
-                            }
-                        };
+                        let client = thread_client;
 
                         let mut builder = match thread_method.as_str() {
                             "GET" => client.get(&thread_url),
@@ -683,6 +679,9 @@ pub fn register(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
                                 return;
                             }
                         };
+
+                        // Apply per-request timeout — overrides the shared client's default.
+                        builder = builder.timeout(thread_timeout);
 
                         // Apply headers
                         for (k, v) in &thread_headers {
