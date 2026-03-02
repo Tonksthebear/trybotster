@@ -3240,6 +3240,168 @@ mod tests {
         }
     }
 
+    /// Regression test for broker restart resurrection classification:
+    /// `hub.get_pty_snapshot_from_broker(session_id) == ""` means the broker
+    /// session is alive with no buffered output yet. This must remain graceful
+    /// (not orphaned), and must not trigger tee log replay.
+    #[test]
+    fn test_broker_reconnected_empty_snapshot_is_graceful_not_orphaned() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree_base = tmp.path().join("worktree-base");
+        std::fs::create_dir_all(&worktree_base).expect("create worktree base");
+
+        // Mirror Hub bootstrapping so globals used by handlers/broker.lua
+        // (`hub`, `worktree`, etc.) exist before loading hub/init.lua.
+        runtime
+            .register_hub_primitives(
+                std::sync::Arc::new(crate::hub::handle_cache::HandleCache::new()),
+                worktree_base.clone(),
+                "test-hub".to_string(),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                std::sync::Arc::new(std::sync::RwLock::new(crate::hub::state::HubState::new(
+                    worktree_base,
+                ))),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+            )
+            .expect("register hub/worktree primitives");
+
+        // Keep hub/init side effects isolated to a temp data dir.
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("create temp data dir");
+        runtime
+            .lua()
+            .globals()
+            .set("__test_data_dir", data_dir.to_string_lossy().to_string())
+            .expect("set __test_data_dir");
+        runtime
+            .lua()
+            .load("config.data_dir = function() return __test_data_dir end")
+            .exec()
+            .expect("override config.data_dir for test");
+        let repo_lua_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lua");
+        runtime
+            .update_package_path(&repo_lua_dir)
+            .expect("prepend repo lua dir to package.path");
+        let init_src = std::fs::read_to_string(repo_lua_dir.join("hub/init.lua"))
+            .expect("read repo hub/init.lua");
+        runtime
+            .load_string("hub/init.lua", &init_src)
+            .expect("load hub/init.lua");
+
+        let wt_path = tmp.path().join("wt-empty-snapshot");
+        let ctx_dir = wt_path.join(".botster");
+        std::fs::create_dir_all(&ctx_dir).expect("create .botster dir");
+
+        // Create a tee log file so a wrong orphaned-path classification would
+        // attempt replay via fs.read_bytes(), which we count below.
+        let tee_log_path = tmp.path().join("logs").join("pty-0.log");
+        std::fs::create_dir_all(tee_log_path.parent().expect("log parent"))
+            .expect("create log parent");
+        std::fs::write(&tee_log_path, b"unexpected replay")
+            .expect("write tee log fixture");
+
+        let context = serde_json::json!({
+            "repo": "owner/repo",
+            "branch_name": "empty-snapshot",
+            "metadata": {
+                "broker_session_0": "123",
+                "broker_pty_rows_0": "24",
+                "broker_pty_cols_0": "80",
+                "tee_log_path_0": tee_log_path.to_string_lossy().to_string(),
+            }
+        });
+        std::fs::write(
+            ctx_dir.join("context.json"),
+            serde_json::to_vec(&context).expect("serialize context"),
+        )
+        .expect("write context.json");
+
+        runtime
+            .lua()
+            .load(&format!(
+                r#"
+                -- Keep this test isolated: only scan the synthetic worktree.
+                config.data_dir = nil
+                worktree.list = function()
+                    return {{ {{ path = "{worktree_path}" }} }}
+                end
+
+                _test_read_bytes_calls = 0
+                _test_feed_calls = 0
+
+                -- If orphaned-path replay is mistakenly triggered for empty snapshots,
+                -- replay_tee_log() will call fs.read_bytes().
+                fs.read_bytes = function(_path)
+                    _test_read_bytes_calls = _test_read_bytes_calls + 1
+                    return nil, "unexpected read_bytes in empty-snapshot graceful path"
+                end
+
+                hub.get_pty_snapshot_from_broker = function(_session_id)
+                    return "" -- alive broker session with no output yet
+                end
+
+                hub.create_ghost_pty = function(_agent_key, _pty_index, _session_id, _rows, _cols)
+                    return {{
+                        feed_output = function(_self, _data)
+                            _test_feed_calls = _test_feed_calls + 1
+                        end
+                    }}
+                end
+
+                hub.register_agent = function(_agent_key, _handles)
+                    return 0
+                end
+            "#,
+                worktree_path = wt_path.to_string_lossy(),
+            ))
+            .exec()
+            .expect("install broker_reconnected test stubs");
+
+        runtime
+            .fire_json_event("broker_reconnected", &serde_json::json!({}))
+            .expect("fire broker_reconnected");
+
+        let read_bytes_calls: i64 = runtime
+            .lua()
+            .load("return _test_read_bytes_calls")
+            .eval()
+            .expect("read _test_read_bytes_calls");
+        assert_eq!(
+            read_bytes_calls, 0,
+            "Empty snapshot must not trigger tee replay/log reads"
+        );
+
+        let feed_calls: i64 = runtime
+            .lua()
+            .load("return _test_feed_calls")
+            .eval()
+            .expect("read _test_feed_calls");
+        assert_eq!(
+            feed_calls, 0,
+            "Empty snapshot has no bytes; feed_output should not be called"
+        );
+
+        let orphaned: bool = runtime
+            .lua()
+            .load(
+                r#"
+                local state = require("hub.state")
+                local reg = state.get("ghost_agent_registry", {})
+                local ghost = reg["owner-repo-empty-snapshot"]
+                assert(ghost ~= nil, "Expected ghost agent to be registered")
+                return ghost.orphaned
+            "#,
+            )
+            .eval()
+            .expect("read ghost.orphaned");
+        assert!(
+            !orphaned,
+            "Empty snapshot should classify as graceful (orphaned=false)"
+        );
+    }
+
     // =========================================================================
     // PTY Input Notification Gating Tests
     // =========================================================================
