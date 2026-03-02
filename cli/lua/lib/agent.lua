@@ -113,6 +113,10 @@ function Agent.new(config)
             self._context_path = data_dir .. "/.botster/agents/" .. key .. "/context.json"
         end
     end
+    -- Build environment variables
+    local env = self:build_env(config.env)
+    self.hub_socket = env.BOTSTER_HUB_SOCKET
+
     if self._context_path then
         self:_sync_context_json()
     end
@@ -134,8 +138,6 @@ function Agent.new(config)
         ws.append_event(data_dir, self._workspace_id, self._session_uuid, "created")
     end
 
-    -- Build environment variables
-    local env = self:build_env(config.env)
 
     -- Determine dimensions
     local rows = 24
@@ -301,6 +303,7 @@ function Agent:_sync_context_json()
             repo = self.repo,
             branch_name = self.branch_name,
             worktree_path = self.worktree_path,
+            hub_socket = self.hub_socket,
             prompt = self.prompt,
             metadata = self.metadata,
             profile_name = self.profile_name,
@@ -759,6 +762,13 @@ function Agent:build_env(base_env)
     env.BOTSTER_WORKTREE_PATH = self.worktree_path
     env.BOTSTER_AGENT_KEY = self:agent_key()
     env.BOTSTER_HUB_ID = hub.server_id() or ""
+    local local_hub_id = hub.hub_id and hub.hub_id() or nil
+    if local_hub_id and hub_discovery and hub_discovery.socket_path then
+        local ok, socket_path = pcall(hub_discovery.socket_path, local_hub_id)
+        if ok and type(socket_path) == "string" and socket_path ~= "" then
+            env.BOTSTER_HUB_SOCKET = socket_path
+        end
+    end
     if self.prompt and self.prompt ~= "" then
         env.BOTSTER_PROMPT = self.prompt
     end
