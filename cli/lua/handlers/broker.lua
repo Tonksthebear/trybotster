@@ -168,6 +168,162 @@ local function process_context_file(context_path, in_worktree, ghost_infos, seen
     ghost_infos[#ghost_infos + 1] = ghost_info
 end
 
+--- Process a single Central Session Store session manifest and append a ghost_info.
+-- Mirrors process_context_file() but reads from the new workspace/session structure.
+-- Marks the session "suspended" before attempting resurrection, then updates to
+-- "active" (resurrected) or "orphaned" based on whether the broker confirms the session.
+-- @param record table  One entry from workspace_store.scan_active_sessions()
+-- @param ghost_infos table  Array to append the resulting ghost_info to
+-- @param seen_keys table    Set of agent_keys already processed (prevents duplicates)
+local function process_session_manifest(record, ghost_infos, seen_keys)
+    local sess         = record.manifest
+    local workspace_id = record.workspace_id
+    local session_uuid = record.session_uuid
+    local data_dir     = record.data_dir
+
+    local agent_key = sess.agent_key
+    if not agent_key or agent_key == "" or agent_key == "-" then
+        log.debug(string.format("[broker] Skipping session %s: missing agent_key", session_uuid))
+        return
+    end
+    if seen_keys[agent_key] then
+        log.debug(string.format("[broker] Skipping session %s: %s already processed",
+            session_uuid, agent_key))
+        return
+    end
+    -- Mark seen immediately (before broker interaction) so a second session manifest
+    -- for the same agent_key is skipped even if this one ends up orphaned.
+    -- Matches the same-tick deduplication used by process_context_file().
+    seen_keys[agent_key] = true
+
+    -- Require workspace_store inside the handler body (hot-reload safe)
+    local ws = require("lib.workspace_store")
+
+    -- Mark suspended before touching the broker so a crash mid-resurrection
+    -- leaves the session in "suspended" rather than "active".
+    sess.status     = "suspended"
+    sess.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+    ws.write_session(data_dir, workspace_id, session_uuid, sess)
+
+    -- Build ghost PTY handles from the structured broker_sessions table.
+    local broker_sessions = sess.broker_sessions or {}
+    local pty_dimensions  = sess.pty_dimensions  or {}
+    local ghost_handles   = {}
+    local pty_index       = 0
+
+    while true do
+        local session_id = broker_sessions[tostring(pty_index)]
+        if not session_id then break end
+
+        local dims = pty_dimensions[tostring(pty_index)] or {}
+        local rows = dims.rows or 24
+        local cols = dims.cols or 80
+
+        local ok3, handle = pcall(
+            hub.create_ghost_pty, agent_key, pty_index, session_id, rows, cols
+        )
+        if ok3 and handle then
+            ghost_handles[#ghost_handles + 1] = handle
+        else
+            log.warn(string.format(
+                "[broker] create_ghost_pty failed for %s pty=%d: %s",
+                agent_key, pty_index, tostring(handle)
+            ))
+            break
+        end
+        pty_index = pty_index + 1
+    end
+
+    -- No ghost handles → broker does not hold this session; mark orphaned.
+    if #ghost_handles == 0 then
+        log.debug(string.format("[broker] No broker sessions confirmed for workspace session %s / %s",
+            workspace_id, session_uuid))
+        sess.status     = "orphaned"
+        sess.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+        ws.write_session(data_dir, workspace_id, session_uuid, sess)
+        ws.append_event(data_dir, workspace_id, session_uuid, "orphaned")
+        return
+    end
+
+    -- Register ghost handles in HandleCache.
+    local ok4, agent_idx = pcall(hub.register_agent, agent_key, ghost_handles)
+    if not ok4 then
+        log.warn(string.format(
+            "[broker] register_agent failed for %s: %s", agent_key, tostring(agent_idx)
+        ))
+        sess.status     = "orphaned"
+        sess.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+        ws.write_session(data_dir, workspace_id, session_uuid, sess)
+        ws.append_event(data_dir, workspace_id, session_uuid, "orphaned")
+        return
+    end
+
+    -- Replay broker scrollback into ghost shadow screens.
+    for i, handle in ipairs(ghost_handles) do
+        local ghost_pty_index = i - 1
+        local session_id = broker_sessions[tostring(ghost_pty_index)]
+        if session_id then
+            local snapshot = hub.get_pty_snapshot_from_broker(session_id)
+            if snapshot and #snapshot > 0 then
+                local ok5, err = pcall(function() handle:feed_output(snapshot) end)
+                if ok5 then
+                    log.info(string.format(
+                        "[broker] Replayed %d bytes → %s pty=%d (workspace store)",
+                        #snapshot, agent_key, ghost_pty_index))
+                else
+                    log.warn(string.format(
+                        "[broker] feed_output failed for %s pty=%d: %s",
+                        agent_key, ghost_pty_index, tostring(err)))
+                end
+            end
+        end
+    end
+
+    -- Session confirmed alive → mark active and log event.
+    sess.status     = "active"
+    sess.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+    ws.write_session(data_dir, workspace_id, session_uuid, sess)
+    ws.append_event(data_dir, workspace_id, session_uuid, "resurrected")
+
+    log.info(string.format(
+        "[broker] Ghost agent from workspace store: %s (%d ptys, index=%d, ws=%s)",
+        agent_key, #ghost_handles, agent_idx, workspace_id
+    ))
+
+    -- Convert structured broker_sessions back to flat metadata keys so the ghost
+    -- info is compatible with the existing ghost_registry / Agent.all_info() format.
+    local ghost_meta = {}
+    for k, v in pairs(broker_sessions) do
+        ghost_meta["broker_session_" .. k] = tostring(v)
+    end
+    for k, dims in pairs(pty_dimensions) do
+        if dims.rows then ghost_meta["broker_pty_rows_" .. k] = tostring(dims.rows) end
+        if dims.cols  then ghost_meta["broker_pty_cols_" .. k] = tostring(dims.cols)  end
+    end
+
+    local ghost_info = {
+        id            = agent_key,
+        agent_index   = agent_idx,
+        display_name  = sess.branch or agent_key,
+        title         = nil,
+        cwd           = sess.worktree_path,
+        profile_name  = sess.profile_name,
+        repo          = sess.repo,
+        metadata      = ghost_meta,
+        branch_name   = sess.branch,
+        worktree_path = sess.worktree_path,
+        in_worktree   = sess.worktree_path ~= nil,
+        status        = "ghost",
+        sessions      = {},
+        notification  = false,
+        has_server_pty = false,
+        server_running = false,
+        port          = nil,
+        created_at    = nil,
+    }
+    ghost_infos[#ghost_infos + 1] = ghost_info
+end
+
 events.on("broker_reconnected", function()
     log.info("[broker] Hub restarted — scanning for surviving agents")
 
@@ -202,6 +358,21 @@ events.on("broker_reconnected", function()
                 log.debug(string.format("[broker] Could not list %s: %s", agents_dir, tostring(entries)))
             end
         end
+    end
+
+    -- Scan Central Session Store for active sessions not already processed via
+    -- legacy context.json files. The seen_keys guard prevents double-resurrection
+    -- when both the old context.json and a new session manifest exist (transition period).
+    if data_dir then
+        local ws = require("lib.workspace_store")
+        local active_sessions = ws.scan_active_sessions(data_dir)
+        log.info(string.format("[broker] Workspace store: %d active session(s) found",
+            #active_sessions))
+        for _, record in ipairs(active_sessions) do
+            process_session_manifest(record, ghost_infos, seen_keys)
+        end
+    else
+        log.debug("[broker] No data_dir configured; skipping workspace store scan")
     end
 
     -- Surface ghost agents in the TUI by firing agent_created for each and
