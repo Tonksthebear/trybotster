@@ -506,6 +506,73 @@ pub(crate) fn register(
             .map_err(|e| anyhow!("Failed to set hub.register_pty_with_broker stub: {e}"))?;
     }
 
+    // hub.pty_tee(session_id, log_path, cap_bytes) → true | nil
+    //
+    // Arms a file tee on an existing broker session.  After this call the
+    // broker writes a copy of every PTY output byte to `log_path`.  The tee
+    // survives Hub reconnects without needing to be re-armed.
+    //
+    // Path validation (Hub-side, before sending to broker):
+    //   - Must contain "workspaces/" path component
+    //   - Must contain "sessions/" path component
+    //   These two constraints ensure the path stays within the workspace
+    //   sessions directory and is not an arbitrary filesystem location.
+    //
+    // Arguments:
+    //   session_id: integer  — value returned by register_pty_with_broker
+    //   log_path:   string   — absolute path ending in pty-0.log
+    //   cap_bytes:  integer  — rotation threshold (0 → broker default 10 MiB)
+    //
+    // Returns true on success, nil if the broker is not connected or the
+    // path fails validation.
+    {
+        let broker_tee = Arc::clone(&broker_connection);
+        let pty_tee_fn = lua
+            .create_function(
+                move |_, (session_id, log_path, cap_bytes): (u32, String, u64)| {
+                    // Path validation: must stay within the workspace sessions tree.
+                    // Checking for these components prevents arbitrary paths being
+                    // passed to the broker (defence-in-depth alongside Lua-layer checks).
+                    if !log_path.contains("workspaces/") || !log_path.contains("sessions/") {
+                        ::log::warn!(
+                            "[Broker] pty_tee rejected unsafe path: {log_path}"
+                        );
+                        return Ok(LuaNil);
+                    }
+
+                    let mut guard = broker_tee.lock().map_err(|_| {
+                        LuaError::runtime("pty_tee: broker_connection mutex poisoned")
+                    })?;
+                    match guard.as_mut() {
+                        Some(conn) => match conn.arm_tee(session_id, &log_path, cap_bytes) {
+                            Ok(()) => {
+                                ::log::info!(
+                                    "[Broker] Tee armed: session={session_id} path={log_path}"
+                                );
+                                Ok(LuaValue::Boolean(true))
+                            }
+                            Err(e) => {
+                                ::log::warn!(
+                                    "[Broker] pty_tee arm failed for session {session_id}: {e}"
+                                );
+                                Ok(LuaNil)
+                            }
+                        },
+                        None => {
+                            ::log::debug!(
+                                "[Broker] pty_tee: broker not connected, skipping session {session_id}"
+                            );
+                            Ok(LuaNil)
+                        }
+                    }
+                },
+            )
+            .map_err(|e| anyhow!("Failed to create hub.pty_tee function: {e}"))?;
+
+        hub.set("pty_tee", pty_tee_fn)
+            .map_err(|e| anyhow!("Failed to set hub.pty_tee: {e}"))?;
+    }
+
     // hub.get_pty_snapshot_from_broker(session_id) → string | nil
     //
     // Fetches the scrollback ring buffer for a broker-held session. Lua calls
@@ -781,6 +848,55 @@ mod tests {
         assert!(hub.contains_key("graceful_restart").unwrap());
         assert!(hub.contains_key("exec_restart").unwrap());
         assert!(hub.contains_key("dev_rebuild").unwrap());
+        assert!(hub.contains_key("pty_tee").unwrap());
+    }
+
+    /// `hub.pty_tee` with a path missing "workspaces/" must return nil.
+    #[test]
+    fn test_pty_tee_rejects_unsafe_path() {
+        let lua = Lua::new();
+        let (tx, cache, hid, sid, state) = create_test_deps();
+
+        register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
+
+        // Path lacks required "workspaces/" component.
+        let result: LuaValue = lua
+            .load(r#"return hub.pty_tee(1, "/tmp/bad/path/pty-0.log", 0)"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil(), "unsafe path must return nil");
+    }
+
+    /// `hub.pty_tee` with a path missing "sessions/" must return nil.
+    #[test]
+    fn test_pty_tee_rejects_path_without_sessions() {
+        let lua = Lua::new();
+        let (tx, cache, hid, sid, state) = create_test_deps();
+
+        register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
+
+        // Path has "workspaces/" but not "sessions/".
+        let result: LuaValue = lua
+            .load(r#"return hub.pty_tee(1, "/data/workspaces/my-agent/pty-0.log", 0)"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil(), "path without sessions/ must return nil");
+    }
+
+    /// `hub.pty_tee` returns nil when the broker is not connected.
+    #[test]
+    fn test_pty_tee_returns_nil_when_broker_disconnected() {
+        let lua = Lua::new();
+        let (tx, cache, hid, sid, state) = create_test_deps();
+
+        // test_broker() returns Arc<Mutex<None>> — broker not connected.
+        register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
+
+        let result: LuaValue = lua
+            .load(r#"return hub.pty_tee(1, "/data/workspaces/key/sessions/0/pty-0.log", 0)"#)
+            .eval()
+            .unwrap();
+        assert!(result.is_nil(), "disconnected broker must return nil");
     }
 
     #[test]

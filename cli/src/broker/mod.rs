@@ -76,6 +76,125 @@ use protocol::{
 /// Maximum path length for a Unix domain socket (macOS kernel limit).
 const MAX_SOCK_PATH: usize = 104;
 
+/// Default rotation cap: 10 MiB.
+///
+/// Matches the default passed from Lua (`10 * 1024 * 1024`).  Callers can
+/// override via `HubMessage::ArmTee { cap_bytes }`.
+const DEFAULT_TEE_CAP_BYTES: u64 = 10 * 1024 * 1024;
+
+// ─── Tee ───────────────────────────────────────────────────────────────────
+
+/// File tee attached to a PTY reader thread.
+///
+/// Appends a copy of every PTY output byte to `log_path`.  A single rotation
+/// is applied when `bytes_written >= cap_bytes`:
+///
+/// - `pty-0.log` is renamed to `pty-0.log.1` (overwriting any prior `.1`).
+/// - A fresh `pty-0.log` is opened.
+///
+/// Write failures set `degraded = true` and are logged; the read loop is
+/// never crashed by tee I/O errors.
+struct TeeState {
+    /// Absolute path of the active log file (e.g., `.../pty-0.log`).
+    log_path: PathBuf,
+    /// Open file handle — append-only.
+    file: std::fs::File,
+    /// Bytes written to the current `log_path` (reset after rotation).
+    bytes_written: u64,
+    /// Maximum bytes before rotation.
+    cap_bytes: u64,
+    /// Set on the first write failure; subsequent writes are skipped.
+    degraded: bool,
+}
+
+impl TeeState {
+    /// Open (or create) the tee log file and return a ready [`TeeState`].
+    ///
+    /// Creates any missing parent directories.  Initialises `bytes_written`
+    /// from the existing file length so rotation accounting is correct when
+    /// the Hub re-arms an existing session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if directory creation or file open fails.
+    fn open(log_path: PathBuf, cap_bytes: u64) -> anyhow::Result<Self> {
+        if let Some(dir) = log_path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create tee log dir: {}", dir.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("open tee log: {}", log_path.display()))?;
+        // Track pre-existing bytes so rotation fires at the right threshold.
+        let bytes_written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self {
+            log_path,
+            file,
+            bytes_written,
+            cap_bytes,
+            degraded: false,
+        })
+    }
+
+    /// Write `data` to the tee, rotating at `cap_bytes` first if needed.
+    ///
+    /// Sets `degraded = true` on any I/O failure; subsequent calls are
+    /// no-ops so the reader loop can continue without special casing.
+    fn write_data(&mut self, data: &[u8]) {
+        if self.degraded {
+            return;
+        }
+
+        // Rotate before writing if the cap would be reached.
+        if self.bytes_written + data.len() as u64 >= self.cap_bytes {
+            let rotated = PathBuf::from(format!("{}.1", self.log_path.display()));
+            // Rename current → .1 (overwrite any prior rotation).  Ignore
+            // rename errors — we still try to open a fresh file below.
+            let _ = std::fs::rename(&self.log_path, &rotated);
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.log_path)
+            {
+                Ok(fresh) => {
+                    self.file = fresh;
+                    self.bytes_written = 0;
+                    log::info!(
+                        "[broker] tee rotated: {}",
+                        self.log_path.display()
+                    );
+                }
+                Err(e) => {
+                    log::error!(
+                        "[broker] tee rotation failed for {}: {e}",
+                        self.log_path.display()
+                    );
+                    self.degraded = true;
+                    return;
+                }
+            }
+        }
+
+        if let Err(e) = self.file.write_all(data) {
+            log::error!(
+                "[broker] tee write failed for {}: {e}",
+                self.log_path.display()
+            );
+            self.degraded = true;
+            return;
+        }
+        self.bytes_written += data.len() as u64;
+    }
+}
+
+/// Broker-global tee state for a session, shared between the main thread
+/// (which arms it on `ArmTee`) and the reader thread (which writes it).
+///
+/// `None` until `ArmTee` is received; may be replaced by a later `ArmTee`.
+type SharedTee = Arc<Mutex<Option<TeeState>>>;
+
 // ─── Session ───────────────────────────────────────────────────────────────
 
 /// Broker-side state for a single PTY session.
@@ -93,6 +212,12 @@ struct Session {
     /// `generate_ansi_snapshot()` directly from parsed cell state instead of
     /// storing raw bytes in a separate ring buffer.
     parser: Arc<Mutex<AlacrittyParser<NoopListener>>>,
+    /// File tee shared with the reader thread.
+    ///
+    /// Set to `Some` when `HubMessage::ArmTee` is received.  The reader
+    /// thread writes to it on every output chunk; the main thread replaces it
+    /// on re-arm without stopping the reader.
+    tee: SharedTee,
     /// Reader thread handle — joined on shutdown.
     reader: Option<thread::JoinHandle<()>>,
 }
@@ -201,8 +326,13 @@ impl Broker {
         let raw: RawFd = std::os::unix::io::AsRawFd::as_raw_fd(&fd);
         let reader_sid = session_id;
         let shared = Arc::clone(&self.shared_writer);
+        // Shared tee — None until ArmTee is received.  The reader thread
+        // acquires this on each output chunk; the main thread replaces it on
+        // re-arm without stopping the reader.
+        let shared_tee: SharedTee = Arc::new(Mutex::new(None));
+        let tee_clone = Arc::clone(&shared_tee);
         let reader = thread::spawn(move || {
-            reader_loop(raw, reader_sid, parser_clone, shared);
+            reader_loop(raw, reader_sid, parser_clone, shared, tee_clone);
         });
 
         self.key_map.insert((reg.agent_key.clone(), reg.pty_index), session_id);
@@ -213,6 +343,7 @@ impl Broker {
             master_fd: fd,
             child_pid: reg.child_pid,
             parser,
+            tee: shared_tee,
             reader: Some(reader),
         });
 
@@ -247,8 +378,8 @@ impl Broker {
 /// PTY reader loop — runs in a dedicated thread per session.
 ///
 /// Reads from the master FD (borrowing, not owning), feeds bytes into the
-/// session's `AlacrittyParser`, and forwards encoded `PtyOutput` frames to the
-/// Hub via `shared_writer`.
+/// session's `AlacrittyParser`, optionally tees them to a log file, and
+/// forwards encoded `PtyOutput` frames to the Hub via `shared_writer`.
 ///
 /// `shared_writer` is the broker-global `Arc<Mutex<Option<Sender>>>` updated by
 /// `handle_connection` on every Hub connect and reconnect.  Locking it before
@@ -256,16 +387,25 @@ impl Broker {
 /// Hub connection without stopping or restarting them.
 ///
 /// During the reconnect window (`Option` is `None`) output is silently dropped
-/// but still fed into the `AlacrittyParser` so `GetSnapshot` returns accurate
-/// state when the Hub reconnects.
+/// **but still written to the tee log** so the log file captures output even
+/// while the Hub is down.  The `AlacrittyParser` also continues to receive
+/// bytes so `GetSnapshot` returns accurate state when the Hub reconnects.
+///
+/// `shared_tee` starts as `None` and is set to `Some` when the Hub sends
+/// `HubMessage::ArmTee`.  The main thread replaces it on re-arm without
+/// stopping this loop.
 fn reader_loop(
     fd: RawFd,
     session_id: u32,
     parser: Arc<Mutex<AlacrittyParser<NoopListener>>>,
     shared_writer: SharedWriter,
+    shared_tee: SharedTee,
 ) {
     let mut buf = [0u8; 4096];
     // Borrow-only File — ManuallyDrop prevents close on drop.
+    // SAFETY: fd is a valid master PTY FD owned by this session for the
+    // lifetime of the reader thread.  ManuallyDrop ensures we do not close
+    // it (ownership remains with the Session struct).
     let mut file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
 
     loop {
@@ -284,12 +424,22 @@ fn reader_loop(
             }
             Ok(n) => {
                 let data = &buf[..n];
+
                 // Feed into the parser so GetSnapshot can generate from cell state.
                 if let Ok(mut p) = parser.lock() {
                     p.process(data);
                 }
+
+                // Write to tee log (if armed).  Runs even during the Hub
+                // reconnect window so the log captures output while Hub is down.
+                if let Ok(mut tee_guard) = shared_tee.lock() {
+                    if let Some(ref mut tee) = *tee_guard {
+                        tee.write_data(data);
+                    }
+                }
+
                 // Forward to Hub via the shared writer.  `None` during reconnect
-                // window — drop the frame (already captured in parser above).
+                // window — drop the frame (already captured in parser and tee above).
                 let frame = encode_data(frame_type::PTY_OUTPUT, session_id, data);
                 if let Ok(guard) = shared_writer.lock() {
                     if let Some(ref tx) = *guard {
@@ -536,6 +686,49 @@ fn handle_connection(
                     return Ok(());
                 }
 
+                BrokerFrame::HubControl(HubMessage::ArmTee { session_id, log_path, cap_bytes }) => {
+                    // Arm (or re-arm) the file tee for this session.
+                    //
+                    // The SharedTee Arc is shared with the reader thread; replacing
+                    // its contents here re-wires the tee without stopping the reader.
+                    // cap_bytes defaults to DEFAULT_TEE_CAP_BYTES when the caller
+                    // passes 0 (Lua may omit the argument).
+                    let effective_cap = if cap_bytes == 0 { DEFAULT_TEE_CAP_BYTES } else { cap_bytes };
+                    let resp = if let Some(sess) = broker.sessions.get(&session_id) {
+                        match TeeState::open(PathBuf::from(&log_path), effective_cap) {
+                            Ok(tee) => {
+                                match sess.tee.lock() {
+                                    Ok(mut guard) => {
+                                        *guard = Some(tee);
+                                        log::info!(
+                                            "[broker] tee armed: session={session_id} path={log_path} cap={effective_cap}"
+                                        );
+                                        encode_broker_control(&BrokerMessage::Ack)
+                                    }
+                                    Err(_) => {
+                                        log::error!("[broker] tee mutex poisoned for session {session_id}");
+                                        encode_broker_control(&BrokerMessage::Error {
+                                            message: format!("tee mutex poisoned for session {session_id}"),
+                                        })
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("[broker] ArmTee failed for session {session_id}: {e}");
+                                encode_broker_control(&BrokerMessage::Error {
+                                    message: format!("ArmTee failed: {e}"),
+                                })
+                            }
+                        }
+                    } else {
+                        log::warn!("[broker] ArmTee for unknown session {session_id}");
+                        encode_broker_control(&BrokerMessage::Error {
+                            message: format!("no session {session_id}"),
+                        })
+                    };
+                    let _ = writer_tx.send(resp);
+                }
+
                 BrokerFrame::HubControl(HubMessage::Ping) => {
                     let _ = writer_tx.send(encode_broker_control(&BrokerMessage::Pong));
                 }
@@ -693,4 +886,174 @@ pub fn run(hub_id: &str, timeout_secs: u64) -> Result<()> {
     let _ = std::fs::remove_file(&socket_path);
     log::info!("[broker] exiting");
     Ok(())
+}
+
+// ─── TeeState unit tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tee_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_tee(dir: &TempDir, cap_bytes: u64) -> TeeState {
+        let path = dir.path().join("sessions").join("0").join("pty-0.log");
+        TeeState::open(path, cap_bytes).expect("TeeState::open should succeed")
+    }
+
+    /// Data written to the tee appears verbatim in the log file.
+    #[test]
+    fn tee_writes_data_to_log() {
+        let dir = TempDir::new().unwrap();
+        let mut tee = make_tee(&dir, DEFAULT_TEE_CAP_BYTES);
+
+        tee.write_data(b"hello");
+        tee.write_data(b" world");
+
+        // Flush via drop — the File buffers nothing, but let's re-read.
+        let log_path = dir.path().join("sessions").join("0").join("pty-0.log");
+        let content = std::fs::read(&log_path).unwrap();
+        assert_eq!(content, b"hello world");
+    }
+
+    /// Binary PTY escape sequences survive the tee without corruption.
+    #[test]
+    fn tee_preserves_binary_data() {
+        let dir = TempDir::new().unwrap();
+        let mut tee = make_tee(&dir, DEFAULT_TEE_CAP_BYTES);
+
+        let esc: Vec<u8> = vec![0x1b, 0x5b, b'2', b'J', 0x1b, 0x5b, b'H', 0x00, 0xff];
+        tee.write_data(&esc);
+
+        let log_path = dir.path().join("sessions").join("0").join("pty-0.log");
+        assert_eq!(std::fs::read(&log_path).unwrap(), esc);
+    }
+
+    /// Rotation fires when `bytes_written >= cap_bytes`:
+    /// - `pty-0.log` is renamed to `pty-0.log.1`
+    /// - a fresh `pty-0.log` is created with just the new data.
+    #[test]
+    fn tee_rotates_at_cap() {
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().join("sessions").join("0");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let log_path = log_dir.join("pty-0.log");
+        let rotated_path = log_dir.join("pty-0.log.1");
+
+        // Cap of 5 bytes so we can trigger rotation cheaply.
+        let mut tee = TeeState::open(log_path.clone(), 5).unwrap();
+
+        tee.write_data(b"abcde"); // 5 bytes — exactly at cap, rotation fires on next write
+        tee.write_data(b"X");    // triggers rotation before writing "X"
+
+        // After rotation: .log.1 contains "abcde", .log contains "X".
+        assert!(rotated_path.exists(), "pty-0.log.1 should exist after rotation");
+        assert_eq!(std::fs::read(&rotated_path).unwrap(), b"abcde");
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"X");
+        assert_eq!(tee.bytes_written, 1);
+    }
+
+    /// A second rotation overwrites the previous `.log.1`.
+    ///
+    /// Rotation fires when `bytes_written + incoming >= cap`.  With cap=3 and
+    /// starting from an empty file (bytes_written=0), the first `write_data(b"aaa")`
+    /// triggers rotation immediately (0+3 >= 3) — the empty file is renamed to
+    /// `.log.1` and "aaa" is written to the fresh `.log`.
+    ///
+    /// Sequence (cap=3):
+    /// 1. write "aaa": rotate (empty → .log.1), write "aaa" → .log="aaa", bw=3
+    /// 2. write "B":   rotate ("aaa" → .log.1), write "B" → .log="B",   bw=1
+    /// 3. write "cc":  rotate ("B" → .log.1),   write "cc" → .log="cc",  bw=2
+    /// 4. write "D":   rotate ("cc" → .log.1),  write "D" → .log="D",   bw=1
+    #[test]
+    fn tee_second_rotation_overwrites_dot_one() {
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().join("sessions").join("0");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let log_path = log_dir.join("pty-0.log");
+        let rotated_path = log_dir.join("pty-0.log.1");
+
+        let mut tee = TeeState::open(log_path.clone(), 3).unwrap();
+
+        tee.write_data(b"aaa");
+        tee.write_data(b"B");
+        tee.write_data(b"cc");
+        tee.write_data(b"D");
+
+        // After the 4th rotation: .log.1 holds "cc" (from step 4), .log holds "D".
+        assert_eq!(std::fs::read(&rotated_path).unwrap(), b"cc");
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"D");
+    }
+
+    /// `bytes_written` is initialised from the existing file length so re-arming
+    /// an in-progress session does not reset the rotation counter to zero.
+    #[test]
+    fn tee_open_accounts_for_existing_file_length() {
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().join("sessions").join("0");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let log_path = log_dir.join("pty-0.log");
+
+        // Pre-populate the log with 8 bytes — simulates a session that ran before
+        // the Hub restarted and re-armed the tee.
+        std::fs::write(&log_path, b"12345678").unwrap();
+
+        let tee = TeeState::open(log_path, DEFAULT_TEE_CAP_BYTES).unwrap();
+        assert_eq!(tee.bytes_written, 8, "bytes_written should reflect pre-existing content");
+    }
+
+    /// Once `degraded`, subsequent `write_data` calls are no-ops (no panic, no crash).
+    #[test]
+    fn tee_degraded_write_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let mut tee = make_tee(&dir, DEFAULT_TEE_CAP_BYTES);
+
+        tee.degraded = true;
+        tee.write_data(b"should be ignored");
+
+        let log_path = dir.path().join("sessions").join("0").join("pty-0.log");
+        assert_eq!(
+            std::fs::read(&log_path).unwrap(),
+            b"",
+            "Degraded tee must not write anything"
+        );
+    }
+
+    /// `ArmTee` with an unknown session_id must leave the tee map untouched
+    /// and return an error response.  Test via the SharedTee directly rather
+    /// than a full broker socket.
+    #[test]
+    fn shared_tee_none_before_arm() {
+        let shared: SharedTee = Arc::new(Mutex::new(None));
+        assert!(
+            shared.lock().unwrap().is_none(),
+            "SharedTee must start as None before ArmTee"
+        );
+    }
+
+    /// The SharedTee Arc is clone-safe: arming from the main thread is
+    /// visible to the reader thread clone immediately.
+    #[test]
+    fn shared_tee_arm_visible_across_clones() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("sessions").join("0").join("pty-0.log");
+
+        let shared: SharedTee = Arc::new(Mutex::new(None));
+        let reader_clone = Arc::clone(&shared);
+
+        // Arm from the "main thread" side.
+        let tee = TeeState::open(log_path.clone(), DEFAULT_TEE_CAP_BYTES).unwrap();
+        *shared.lock().unwrap() = Some(tee);
+
+        // Verify the "reader thread" clone sees the armed tee and can write through it.
+        {
+            let mut guard = reader_clone.lock().unwrap();
+            if let Some(ref mut t) = *guard {
+                t.write_data(b"visible");
+            } else {
+                panic!("Reader clone did not see the armed tee");
+            }
+        }
+
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"visible");
+    }
 }
