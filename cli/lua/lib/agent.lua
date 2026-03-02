@@ -223,6 +223,11 @@ function Agent.new(config)
         -- The broker holds a dup of the master FD and ring-buffers output so the
         -- Hub can replay scrollback after reconnecting. Session IDs are persisted
         -- in metadata (written to context.json) so they survive a Hub restart.
+        --
+        -- After registration we arm a file tee so PTY output is also written to
+        -- disk.  The tee log survives a hard restart (broker + Hub both down)
+        -- and is replayed into the ghost shadow screen by broker_reconnected.
+        local data_dir = config.data_dir and config.data_dir() or nil
         for i, handle in ipairs(ordered_handles) do
             local pty_index = i - 1  -- 0-based to match Rust PtyHandle indexing
             local ok2, session_id = pcall(hub.register_pty_with_broker, handle, key, pty_index)
@@ -238,6 +243,32 @@ function Agent.new(config)
                 end
                 log.info(string.format("Agent %s: pty_index %d registered with broker → session %d",
                     key, pty_index, session_id))
+
+                -- Arm the file tee for hard-restart resurrection.
+                -- Path: <data_dir>/workspaces/<key>/sessions/<pty_index>/pty-0.log
+                -- The broker validates nothing; path safety is ensured here and by
+                -- the hub.pty_tee primitive (which requires "workspaces/" + "sessions/").
+                if data_dir then
+                    local log_path = data_dir
+                        .. "/workspaces/" .. key
+                        .. "/sessions/" .. tostring(pty_index)
+                        .. "/pty-0.log"
+                    local pcall_ok, tee_result = pcall(hub.pty_tee, session_id, log_path, 10 * 1024 * 1024)
+                    if pcall_ok and tee_result then
+                        self:set_meta("tee_log_path_" .. pty_index, log_path)
+                        log.info(string.format(
+                            "Agent %s: tee armed for pty_index %d → %s",
+                            key, pty_index, log_path))
+                    else
+                        log.warn(string.format(
+                            "Agent %s: tee arm failed for pty_index %d",
+                            key, pty_index))
+                    end
+                else
+                    log.debug(string.format(
+                        "Agent %s: skipping tee for pty_index %d (data_dir not configured)",
+                        key, pty_index))
+                end
             elseif not ok2 then
                 log.warn(string.format("Agent %s: broker registration failed for pty_index %d: %s",
                     key, pty_index, tostring(session_id)))
@@ -620,6 +651,26 @@ function Agent:add_session(session_config)
         end
         log.info(string.format("Agent %s: pty_index %d registered with broker → session %d",
             key, new_pty_index, session_id))
+
+        -- Arm file tee (same logic as Agent.new()).
+        local data_dir = config.data_dir and config.data_dir() or nil
+        if data_dir then
+            local log_path = data_dir
+                .. "/workspaces/" .. key
+                .. "/sessions/" .. tostring(new_pty_index)
+                .. "/pty-0.log"
+            local pcall_ok, tee_result = pcall(hub.pty_tee, session_id, log_path, 10 * 1024 * 1024)
+            if pcall_ok and tee_result then
+                self:set_meta("tee_log_path_" .. new_pty_index, log_path)
+                log.info(string.format(
+                    "Agent %s: tee armed for pty_index %d → %s",
+                    key, new_pty_index, log_path))
+            else
+                log.warn(string.format(
+                    "Agent %s: tee arm failed for pty_index %d",
+                    key, new_pty_index))
+            end
+        end
     elseif not ok2 then
         log.warn(string.format("Agent %s: broker registration failed for pty_index %d: %s",
             key, new_pty_index, tostring(session_id)))

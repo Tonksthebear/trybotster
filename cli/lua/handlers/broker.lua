@@ -26,6 +26,48 @@ local function derive_agent_key(repo, branch_name)
     return repo_safe .. "-" .. branch_safe
 end
 
+--- Replay a PTY log file into a ghost handle's shadow screen.
+--
+-- Reads `log_path` (and `log_path .. ".1"` if it exists, replaying the older
+-- rotated file first) and feeds the raw bytes into `handle:feed_output()`.
+-- This reconstructs terminal state for hard-restart scenarios where the broker
+-- is no longer running and cannot provide a live snapshot.
+--
+-- @param handle    PtySessionHandle  Ghost handle to replay into
+-- @param log_path  string            Absolute path to the active log file
+-- @param agent_key string            For log messages only
+-- @param pty_index number            For log messages only
+local function replay_tee_log(handle, log_path, agent_key, pty_index)
+    -- Replay rotated file first (older content), then current file.
+    local files_to_replay = {}
+    local rotated = log_path .. ".1"
+    if fs.exists(rotated) then
+        files_to_replay[#files_to_replay + 1] = rotated
+    end
+    if fs.exists(log_path) then
+        files_to_replay[#files_to_replay + 1] = log_path
+    end
+
+    for _, path in ipairs(files_to_replay) do
+        local ok, content = pcall(fs.read_bytes, path)
+        if ok and content and #content > 0 then
+            local feed_ok, feed_err = pcall(function() handle:feed_output(content) end)
+            if feed_ok then
+                log.info(string.format(
+                    "[broker] Replayed %d bytes from log %s → %s pty=%d",
+                    #content, path, agent_key, pty_index))
+            else
+                log.warn(string.format(
+                    "[broker] feed_output failed replaying %s for %s pty=%d: %s",
+                    path, agent_key, pty_index, tostring(feed_err)))
+            end
+        else
+            log.debug(string.format(
+                "[broker] Could not read tee log %s: %s", path, tostring(content)))
+        end
+    end
+end
+
 --- Process a single context.json file and append a ghost_info to the list.
 -- @param context_path string  Absolute path to the context.json file
 -- @param in_worktree boolean  True for worktree agents, false for main-branch agents
@@ -101,34 +143,83 @@ local function process_context_file(context_path, in_worktree, ghost_infos, seen
         return
     end
 
-    -- Replay broker scrollback into each ghost handle's vt100 shadow screen.
-    -- Browsers that connect before the real agent respawns will see the
-    -- correct terminal state via get_snapshot().
+    -- Determine restart type per PTY and populate shadow screens accordingly.
+    --
+    -- Graceful restart (broker alive, session confirmed):
+    --   hub.get_pty_snapshot_from_broker() returns the live snapshot.
+    --   Feed it in and DO NOT replay the log — prevents duplicating history.
+    --
+    -- Hard restart (session orphaned — broker restarted or timed out):
+    --   Snapshot returns nil.  Replay pty-0.log.1 (if exists) then pty-0.log
+    --   using the path stored in metadata from when the tee was armed.
+    --   Apply the manifest PTY dimensions before replay (already used above
+    --   when creating the ghost handle).
+    --
+    -- Missing log on orphaned session:
+    --   Graceful fallback — show empty history and append a tee_missing event
+    --   to events.jsonl so operators know why history is absent.
+    local any_orphaned = false
     for i, handle in ipairs(ghost_handles) do
         local ghost_pty_index = i - 1
         local session_id = tonumber(meta["broker_session_" .. ghost_pty_index])
         if session_id then
             local snapshot = hub.get_pty_snapshot_from_broker(session_id)
-            if snapshot and #snapshot > 0 then
-                local ok5, err = pcall(function() handle:feed_output(snapshot) end)
-                if ok5 then
-                    log.info(string.format(
-                        "[broker] Replayed %d bytes → %s pty=%d",
-                        #snapshot, agent_key, ghost_pty_index
-                    ))
+            if snapshot ~= nil then
+                -- ── Graceful restart ──────────────────────────────────────
+                -- Live broker session confirmed (snapshot non-nil, even if empty).
+                -- Empty snapshot = agent just started with no output yet — still
+                -- graceful; do NOT fall through to log replay (would create false
+                -- orphan events).  Do NOT replay the log either way — that would
+                -- duplicate history that the broker already holds.
+                if #snapshot > 0 then
+                    local feed_ok, feed_err = pcall(function() handle:feed_output(snapshot) end)
+                    if feed_ok then
+                        log.info(string.format(
+                            "[broker] Graceful: replayed %d snapshot bytes → %s pty=%d",
+                            #snapshot, agent_key, ghost_pty_index))
+                    else
+                        log.warn(string.format(
+                            "[broker] Graceful: feed_output failed for %s pty=%d: %s",
+                            agent_key, ghost_pty_index, tostring(feed_err)))
+                    end
                 else
+                    log.info(string.format(
+                        "[broker] Graceful: empty snapshot for %s pty=%d (no output yet)",
+                        agent_key, ghost_pty_index))
+                end
+            else
+                -- ── Hard restart (orphaned session) ───────────────────────
+                -- Broker returned nil — session is gone; reconstruct from tee logs.
+                any_orphaned = true
+                local log_path = meta["tee_log_path_" .. ghost_pty_index]
+                if log_path and (fs.exists(log_path) or fs.exists(log_path .. ".1")) then
+                    replay_tee_log(handle, log_path, agent_key, ghost_pty_index)
+                else
+                    -- No tee log available — show empty history, record event.
                     log.warn(string.format(
-                        "[broker] feed_output failed for %s pty=%d: %s",
-                        agent_key, ghost_pty_index, tostring(err)
-                    ))
+                        "[broker] Hard restart: no tee log for %s pty=%d — history unavailable",
+                        agent_key, ghost_pty_index))
+                    -- Append a machine-readable event so operators can diagnose.
+                    if log_path then
+                        local events_path = log_path:match("^(.+)/pty%-%d+%.log$")
+                        if events_path then
+                            local event = json.encode({
+                                event = "tee_missing",
+                                at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+                                agent_key = agent_key,
+                                pty_index = ghost_pty_index,
+                            })
+                            pcall(fs.append, events_path .. "/events.jsonl", event .. "\n")
+                        end
+                    end
                 end
             end
         end
     end
 
     log.info(string.format(
-        "[broker] Ghost agent registered: %s (%d ptys, index=%d, in_worktree=%s)",
-        agent_key, #ghost_handles, agent_idx, tostring(in_worktree)
+        "[broker] Ghost agent registered: %s (%d ptys, index=%d, in_worktree=%s, orphaned=%s)",
+        agent_key, #ghost_handles, agent_idx, tostring(in_worktree), tostring(any_orphaned)
     ))
 
     -- Use worktree_path from context if available.
@@ -145,6 +236,10 @@ local function process_context_file(context_path, in_worktree, ghost_infos, seen
     -- agent_index is the HandleCache position returned by hub.register_agent()
     -- and MUST be included so the TUI uses the server-authoritative index for
     -- PTY forwarder creation rather than deriving it from local list position.
+    --
+    -- "orphaned" is set when the broker had no live sessions for this agent,
+    -- meaning history was reconstructed from tee logs (or is empty if logs
+    -- were missing).  The TUI can use this to show a read-only/orphaned badge.
     local ghost_info = {
         id           = agent_key,
         agent_index  = agent_idx,
@@ -158,6 +253,7 @@ local function process_context_file(context_path, in_worktree, ghost_infos, seen
         worktree_path = wt_path,
         in_worktree  = in_worktree,
         status       = "ghost",
+        orphaned     = any_orphaned,
         sessions     = {},
         notification = false,
         has_server_pty = false,
@@ -273,7 +369,10 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
         local session_id = broker_sessions[tostring(ghost_pty_index)]
         if session_id then
             local snapshot = hub.get_pty_snapshot_from_broker(session_id)
-            if snapshot and #snapshot > 0 then
+            -- nil = session gone (orphaned); empty string = session alive, no output yet.
+            -- Only feed bytes when there is something to feed; both cases are graceful here
+            -- because the workspace-store path has already confirmed the session exists.
+            if snapshot ~= nil and #snapshot > 0 then
                 local ok5, err = pcall(function() handle:feed_output(snapshot) end)
                 if ok5 then
                     log.info(string.format(
