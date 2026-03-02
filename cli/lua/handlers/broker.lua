@@ -172,6 +172,11 @@ end
 -- Mirrors process_context_file() but reads from the new workspace/session structure.
 -- Marks the session "suspended" before attempting resurrection, then updates to
 -- "active" (resurrected) or "orphaned" based on whether the broker confirms the session.
+--
+-- seen_keys is only claimed once the broker confirms at least one live ghost handle.
+-- Orphaned sessions do not claim the key, so a subsequent manifest for the same
+-- agent_key (e.g., a fresher session) can still attempt resurrection.
+--
 -- @param record table  One entry from workspace_store.scan_active_sessions()
 -- @param ghost_infos table  Array to append the resulting ghost_info to
 -- @param seen_keys table    Set of agent_keys already processed (prevents duplicates)
@@ -191,10 +196,9 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
             session_uuid, agent_key))
         return
     end
-    -- Mark seen immediately (before broker interaction) so a second session manifest
-    -- for the same agent_key is skipped even if this one ends up orphaned.
-    -- Matches the same-tick deduplication used by process_context_file().
-    seen_keys[agent_key] = true
+    -- NOTE: seen_keys is NOT set here. We only claim the slot once the broker
+    -- confirms at least one live ghost handle (see below). Orphaned sessions must
+    -- not block a subsequent manifest for the same agent_key from being tried.
 
     -- Require workspace_store inside the handler body (hot-reload safe)
     local ws = require("lib.workspace_store")
@@ -235,6 +239,7 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
     end
 
     -- No ghost handles → broker does not hold this session; mark orphaned.
+    -- Do NOT claim seen_keys — another manifest for this agent_key may succeed.
     if #ghost_handles == 0 then
         log.debug(string.format("[broker] No broker sessions confirmed for workspace session %s / %s",
             workspace_id, session_uuid))
@@ -244,6 +249,10 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
         ws.append_event(data_dir, workspace_id, session_uuid, "orphaned")
         return
     end
+
+    -- Broker confirmed live handles. Claim the key slot now to prevent a second
+    -- manifest for the same agent_key from also calling register_agent.
+    seen_keys[agent_key] = true
 
     -- Register ghost handles in HandleCache.
     local ok4, agent_idx = pcall(hub.register_agent, agent_key, ghost_handles)

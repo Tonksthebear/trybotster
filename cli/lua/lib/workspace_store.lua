@@ -176,37 +176,41 @@ end
 
 --- Write (or update) a workspace manifest.
 -- Creates the workspace directory if it does not yet exist.
+-- Returns true on success, false on any failure.
 -- @param data_dir string
 -- @param workspace_id string
 -- @param manifest table
+-- @return boolean success
 function M.write_workspace(data_dir, workspace_id, manifest)
     local dir = M.workspace_dir(data_dir, workspace_id)
-    if not ensure_dir(dir) then return end
+    if not ensure_dir(dir) then return false end
     local ok, content = pcall(json.encode, manifest)
     if not ok then
         log.warn(string.format("[workspace_store] write_workspace: json.encode failed: %s",
             tostring(content)))
-        return
+        return false
     end
-    write_atomic(M.workspace_manifest_path(data_dir, workspace_id), content)
+    return write_atomic(M.workspace_manifest_path(data_dir, workspace_id), content)
 end
 
 --- Write (or update) a session manifest.
 -- Creates the session directory if it does not yet exist.
+-- Returns true on success, false on any failure.
 -- @param data_dir string
 -- @param workspace_id string
 -- @param session_uuid string
 -- @param manifest table
+-- @return boolean success
 function M.write_session(data_dir, workspace_id, session_uuid, manifest)
     local dir = M.session_dir(data_dir, workspace_id, session_uuid)
-    if not ensure_dir(dir) then return end
+    if not ensure_dir(dir) then return false end
     local ok, content = pcall(json.encode, manifest)
     if not ok then
         log.warn(string.format("[workspace_store] write_session: json.encode failed: %s",
             tostring(content)))
-        return
+        return false
     end
-    write_atomic(M.session_manifest_path(data_dir, workspace_id, session_uuid), content)
+    return write_atomic(M.session_manifest_path(data_dir, workspace_id, session_uuid), content)
 end
 
 --- Append an event record to a session's events.jsonl.
@@ -240,7 +244,11 @@ function M.read_session(data_dir, workspace_id, session_uuid)
     return manifest
 end
 
---- Scan the workspaces directory for sessions with status == "active".
+--- Scan the workspaces directory for sessions eligible for resurrection.
+-- Returns sessions with status == "active" or status == "suspended".
+-- "suspended" sessions result from a Hub crash mid-resurrection and must be
+-- retried on the next restart; treating them identically to "active" prevents
+-- them from becoming permanently unrecoverable.
 -- Returns an array of records, each with fields:
 --   workspace_id, session_uuid, manifest (decoded table), data_dir
 -- @param data_dir string
@@ -272,7 +280,7 @@ function M.scan_active_sessions(data_dir)
 
         for _, session_uuid in ipairs(sess_entries) do
             local manifest = M.read_session(data_dir, workspace_id, session_uuid)
-            if manifest and manifest.status == "active" then
+            if manifest and (manifest.status == "active" or manifest.status == "suspended") then
                 results[#results + 1] = {
                     workspace_id = workspace_id,
                     session_uuid = session_uuid,
@@ -377,8 +385,14 @@ function M.migrate(data_dir)
             updated_at    = now,
         }
 
-        M.write_workspace(data_dir, workspace_id, workspace_manifest)
-        M.write_session(data_dir, workspace_id, session_uuid, session_manifest)
+        local ws_ok   = M.write_workspace(data_dir, workspace_id, workspace_manifest)
+        local sess_ok = M.write_session(data_dir, workspace_id, session_uuid, session_manifest)
+        if not ws_ok or not sess_ok then
+            log.warn(string.format(
+                "[workspace_store] migrate: manifest write failed for %s — preserving original",
+                context_path))
+            return
+        end
         M.append_event(data_dir, workspace_id, session_uuid, "migrated")
 
         local ok3, del_err = pcall(fs.delete, context_path)
