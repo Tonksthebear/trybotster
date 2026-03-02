@@ -103,6 +103,25 @@ pub enum HubMessage {
 
     /// Keepalive.
     Ping,
+
+    /// Arm a file tee on an existing PTY session.
+    ///
+    /// After this command the broker's reader thread writes a copy of every
+    /// PTY output byte to `log_path` in addition to forwarding it to the Hub.
+    /// The file is opened once with `O_APPEND|O_CREAT`; a single rotation is
+    /// applied when `bytes_written >= cap_bytes` (rename `.log` → `.log.1`,
+    /// then open a fresh `.log`).  The tee persists across Hub reconnects
+    /// without needing to be re-armed.
+    ///
+    /// Write failures mark the tee as degraded rather than crashing the read loop.
+    ArmTee {
+        /// Opaque session identifier returned by `BrokerMessage::Registered`.
+        session_id: u32,
+        /// Absolute path for the log file (e.g., `.../workspaces/<key>/sessions/0/pty-0.log`).
+        log_path: String,
+        /// Maximum bytes before rotation (e.g., 10 MiB = 10_485_760).
+        cap_bytes: u64,
+    },
 }
 
 /// Messages sent from Broker to Hub in `BrokerControl` frames (JSON payload).
@@ -518,6 +537,46 @@ mod tests {
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
         assert!(matches!(&frames[0], BrokerFrame::HubControl(HubMessage::KillAll)));
+    }
+
+    #[test]
+    fn hub_control_arm_tee_round_trip() {
+        let msg = HubMessage::ArmTee {
+            session_id: 12,
+            log_path: "/data/workspaces/my-agent/sessions/0/pty-0.log".into(),
+            cap_bytes: 5 * 1024 * 1024,
+        };
+        let encoded = encode_hub_control(&msg);
+        let mut dec = BrokerFrameDecoder::new();
+        let frames = dec.feed(&encoded).unwrap();
+        assert_eq!(frames.len(), 1);
+        if let BrokerFrame::HubControl(HubMessage::ArmTee { session_id, log_path, cap_bytes }) =
+            &frames[0]
+        {
+            assert_eq!(*session_id, 12);
+            assert_eq!(log_path, "/data/workspaces/my-agent/sessions/0/pty-0.log");
+            assert_eq!(*cap_bytes, 5 * 1024 * 1024);
+        } else {
+            panic!("expected HubControl(ArmTee)");
+        }
+    }
+
+    #[test]
+    fn hub_control_arm_tee_zero_cap_round_trip() {
+        // cap_bytes = 0 is the sentinel for "use broker default"; must survive round-trip.
+        let msg = HubMessage::ArmTee {
+            session_id: 1,
+            log_path: "/data/workspaces/k/sessions/0/pty-0.log".into(),
+            cap_bytes: 0,
+        };
+        let encoded = encode_hub_control(&msg);
+        let frames = BrokerFrameDecoder::new().feed(&encoded).unwrap();
+        assert_eq!(frames.len(), 1);
+        if let BrokerFrame::HubControl(HubMessage::ArmTee { cap_bytes, .. }) = &frames[0] {
+            assert_eq!(*cap_bytes, 0);
+        } else {
+            panic!("expected HubControl(ArmTee)");
+        }
     }
 
     #[test]
