@@ -224,6 +224,42 @@ impl BrokerConnection {
         }
     }
 
+    // ── Tee control ──────────────────────────────────────────────────────────
+
+    /// Arm (or re-arm) a file tee on a broker session.
+    ///
+    /// After this call the broker's reader thread writes a copy of every PTY
+    /// output byte to `log_path` in addition to forwarding it to the Hub.
+    /// The tee survives Hub reconnects without needing to be re-armed.
+    ///
+    /// `log_path` must be an absolute path that contains both `workspaces/`
+    /// and `sessions/` as path components (enforced by the Lua primitive
+    /// layer before this call; the broker trusts the Hub).
+    ///
+    /// `cap_bytes` is the rotation threshold.  Pass `0` to use the broker's
+    /// built-in default (10 MiB).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write or response read fails, or the broker
+    /// replies with an error frame (e.g., session not found, I/O failure
+    /// creating the log directory).
+    pub fn arm_tee(&mut self, session_id: u32, log_path: &str, cap_bytes: u64) -> Result<()> {
+        let frame = encode_hub_control(&HubMessage::ArmTee {
+            session_id,
+            log_path: log_path.to_owned(),
+            cap_bytes,
+        });
+        self.stream.write_all(&frame).context("send ArmTee")?;
+        match self.read_response()? {
+            BrokerFrame::BrokerControl(BrokerMessage::Ack) => Ok(()),
+            BrokerFrame::BrokerControl(BrokerMessage::Error { message }) => {
+                bail!("arm_tee error: {message}")
+            }
+            other => bail!("unexpected broker response to ArmTee: {other:?}"),
+        }
+    }
+
     // ── PTY control ─────────────────────────────────────────────────────────
 
     /// Resize a PTY session via the broker.

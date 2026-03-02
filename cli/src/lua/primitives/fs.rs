@@ -53,7 +53,9 @@ use mlua::Lua;
 ///
 /// Creates a global `fs` table with methods:
 /// - `fs.write(path, content)` - Write string content to a file (creates parent dirs)
-/// - `fs.read(path)` - Read file contents as a string
+/// - `fs.read(path)` - Read file contents as a UTF-8 string
+/// - `fs.read_bytes(path)` - Read file contents as raw bytes (binary-safe Lua string)
+/// - `fs.append(path, content)` - Append string content to a file (creates if absent)
 /// - `fs.exists(path)` - Check if a file exists
 /// - `fs.copy(src, dst)` - Copy a file
 /// - `fs.listdir(path)` - List entries in a directory
@@ -431,6 +433,72 @@ pub fn register(lua: &Lua) -> Result<()> {
         .set("resolve_safe", resolve_safe_fn)
         .map_err(|e| anyhow!("Failed to set fs.resolve_safe: {e}"))?;
 
+    // fs.read_bytes(path) -> (content, nil) or (nil, error_string)
+    //
+    // Reads the entire file contents as raw bytes returned as a Lua string.
+    // Unlike fs.read(), no UTF-8 decoding is attempted, making this safe for
+    // binary data such as PTY log files containing terminal escape sequences.
+    let read_bytes_fn = lua
+        .create_function(|lua, path: String| {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    // mlua strings are byte arrays — safe for arbitrary binary content.
+                    let lua_str = lua.create_string(&bytes)?;
+                    Ok((Some(lua_str), None::<String>))
+                }
+                Err(e) => Ok((None::<mlua::String>, Some(format!("Failed to read file: {e}")))),
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create fs.read_bytes function: {e}"))?;
+
+    fs_table
+        .set("read_bytes", read_bytes_fn)
+        .map_err(|e| anyhow!("Failed to set fs.read_bytes: {e}"))?;
+
+    // fs.append(path, content) -> (true, nil) or (nil, error_string)
+    //
+    // Opens the file in O_APPEND|O_CREAT mode and writes content at the end.
+    // Creates parent directories if they do not already exist.
+    // Unlike fs.write(), existing file contents are never overwritten.
+    let append_fn = lua
+        .create_function(|_, (path, content): (String, String)| {
+            use std::io::Write as IoWrite;
+
+            let file_path = Path::new(&path);
+            // Create parent directories if needed.
+            if let Some(parent) = file_path.parent() {
+                if !parent.exists() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        return Ok((
+                            None::<bool>,
+                            Some(format!("Failed to create parent directories: {e}")),
+                        ));
+                    }
+                }
+            }
+
+            let result = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(file_path);
+
+            match result {
+                Ok(mut file) => match file.write_all(content.as_bytes()) {
+                    Ok(()) => Ok((Some(true), None::<String>)),
+                    Err(e) => Ok((None::<bool>, Some(format!("Failed to append to file: {e}")))),
+                },
+                Err(e) => Ok((
+                    None::<bool>,
+                    Some(format!("Failed to open file for append: {e}")),
+                )),
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create fs.append function: {e}"))?;
+
+    fs_table
+        .set("append", append_fn)
+        .map_err(|e| anyhow!("Failed to set fs.append: {e}"))?;
+
     // Register the table globally
     lua.globals()
         .set("fs", fs_table)
@@ -457,9 +525,95 @@ mod tests {
         // Verify all functions exist
         let _: Function = fs_table.get("write").expect("fs.write should exist");
         let _: Function = fs_table.get("read").expect("fs.read should exist");
+        let _: Function = fs_table.get("read_bytes").expect("fs.read_bytes should exist");
+        let _: Function = fs_table.get("append").expect("fs.append should exist");
         let _: Function = fs_table.get("exists").expect("fs.exists should exist");
         let _: Function = fs_table.get("copy").expect("fs.copy should exist");
         let _: Function = fs_table.get("list_dir").expect("fs.list_dir should exist");
+    }
+
+    #[test]
+    fn test_read_bytes_binary_roundtrip() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pty-0.log");
+        // Write binary data that would be invalid UTF-8 (terminal escape sequences).
+        let binary_data: Vec<u8> = vec![0x1b, 0x5b, 0x48, 0x00, 0xff, b'A'];
+        std::fs::write(&path, &binary_data).unwrap();
+        let path_str = path.to_str().unwrap();
+
+        let (content, err): (Option<mlua::String>, Option<String>) = lua
+            .load(format!(r#"return fs.read_bytes("{path_str}")"#))
+            .eval()
+            .expect("fs.read_bytes should be callable");
+
+        assert!(err.is_none(), "Unexpected error: {err:?}");
+        let content = content.expect("Should return byte string");
+        assert_eq!(content.as_bytes(), binary_data.as_slice());
+    }
+
+    #[test]
+    fn test_read_bytes_nonexistent_returns_error() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let (content, err): (Option<mlua::String>, Option<String>) = lua
+            .load(r#"return fs.read_bytes("/nonexistent/path/pty-0.log")"#)
+            .eval()
+            .expect("fs.read_bytes should be callable");
+
+        assert!(content.is_none());
+        assert!(err.is_some(), "Should return error for nonexistent path");
+    }
+
+    #[test]
+    fn test_append_creates_file_and_accumulates() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let path_str = path.to_str().unwrap();
+
+        // File does not exist yet — first append should create it.
+        let (ok, err): (Option<bool>, Option<String>) = lua
+            .load(format!(r#"return fs.append("{path_str}", "line1\n")"#))
+            .eval()
+            .expect("fs.append should be callable");
+        assert_eq!(ok, Some(true));
+        assert!(err.is_none());
+
+        // Second append should add to the file, not overwrite.
+        let (ok2, err2): (Option<bool>, Option<String>) = lua
+            .load(format!(r#"return fs.append("{path_str}", "line2\n")"#))
+            .eval()
+            .expect("fs.append should be callable");
+        assert_eq!(ok2, Some(true));
+        assert!(err2.is_none());
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "line1\nline2\n", "Both lines should be present");
+    }
+
+    #[test]
+    fn test_append_creates_parent_directories() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a").join("b").join("events.jsonl");
+        let path_str = path.to_str().unwrap();
+
+        let (ok, err): (Option<bool>, Option<String>) = lua
+            .load(format!(r#"return fs.append("{path_str}", "hello\n")"#))
+            .eval()
+            .expect("fs.append should be callable");
+
+        assert_eq!(ok, Some(true));
+        assert!(err.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
     }
 
     #[test]
