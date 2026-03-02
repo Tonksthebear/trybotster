@@ -1603,6 +1603,13 @@ async fn handle_dc_message(
                         });
                     }
                 } else {
+                    if let Some(replaced) = chunk_assemblies.remove(&transfer_id) {
+                        log::warn!(
+                            "[WebRTC-DC] Replaced in-progress file transfer on transfer_id={} (dropped {} bytes)",
+                            transfer_id,
+                            replaced.data.len()
+                        );
+                    }
                     chunk_assemblies.insert(transfer_id, assembly);
                 }
             } else {

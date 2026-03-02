@@ -82,6 +82,7 @@ function buildControlFrame(payload) {
 const ICE_RESTART_DELAY_MS = 1000        // Wait before first restart attempt
 const ICE_RESTART_MAX_ATTEMPTS = 3       // Max restarts before full reconnect
 const ICE_RESTART_BACKOFF_MULTIPLIER = 2 // Exponential backoff
+const STALLED_EVENT_COOLDOWN_MS = 2000   // Throttle repeated stalled notifications
 
 class WebRTCTransport {
   #connections = new Map() // hubId -> { pc, dataChannel, state, subscriptions }
@@ -190,6 +191,9 @@ class WebRTCTransport {
       iceDisconnectedTimer: null,
       iceDisrupted: false,
       decryptFailures: 0,
+      activeFileTransferIds: new Set(),
+      nextFileTransferId: 0,
+      lastStalledAt: 0,
       // Start true — ActionCable buffers messages until confirmed.
       // Set false by disconnected callback, true again by connected.
       signalingConnected: true,
@@ -625,7 +629,11 @@ class WebRTCTransport {
     // WiFi↔cellular transitions. Emit connection:stalled so the connection
     // can detect it and probe immediately rather than waiting for heartbeat timeout.
     if (conn.dataChannel.bufferedAmount > 4096) {
-      this.#emit("connection:stalled", { hubId })
+      const now = Date.now()
+      if (!conn.lastStalledAt || now - conn.lastStalledAt >= STALLED_EVENT_COOLDOWN_MS) {
+        conn.lastStalledAt = now
+        this.#emit("connection:stalled", { hubId })
+      }
     }
   }
 
@@ -672,7 +680,7 @@ class WebRTCTransport {
       // Middle:      [0x04][transfer_id][flags=0][chunk data]
       // Last:        [0x04][transfer_id][flags=END][chunk data]
       const CONTENT_FILE_CHUNK = 0x04
-      const transferId = Math.floor(Math.random() * 256)
+      const transferId = this.#allocateFileTransferId(conn)
       // Header = everything before the file data (content type + sub_id + filename metadata)
       const headerLen = 1 + 1 + subIdBytes.length + 2 + filenameBytes.length
       const header = plaintext.slice(1, headerLen) // skip the 0x03 content type byte
@@ -680,33 +688,37 @@ class WebRTCTransport {
       // Chunk size for file data (leave room for chunk envelope + header in first chunk)
       const dataChunkSize = chunkLimit - 4 // [0x04][transferId][flags][...data]
 
-      let pos = 0
-      while (pos < fileData.length) {
-        const isFirst = pos === 0
-        const end = Math.min(pos + (isFirst ? dataChunkSize - header.length : dataChunkSize), fileData.length)
-        const isLast = end >= fileData.length
-        const flags = (isFirst ? 0x01 : 0) | (isLast ? 0x02 : 0)
+      try {
+        let pos = 0
+        while (pos < fileData.length) {
+          const isFirst = pos === 0
+          const end = Math.min(pos + (isFirst ? dataChunkSize - header.length : dataChunkSize), fileData.length)
+          const isLast = end >= fileData.length
+          const flags = (isFirst ? 0x01 : 0) | (isLast ? 0x02 : 0)
 
-        let chunk
-        if (isFirst) {
-          // First chunk includes the original file header (sub_id, filename)
-          chunk = new Uint8Array(3 + header.length + (end - pos))
-          chunk[0] = CONTENT_FILE_CHUNK
-          chunk[1] = transferId
-          chunk[2] = flags
-          chunk.set(header, 3)
-          chunk.set(fileData.slice(pos, end), 3 + header.length)
-        } else {
-          chunk = new Uint8Array(3 + (end - pos))
-          chunk[0] = CONTENT_FILE_CHUNK
-          chunk[1] = transferId
-          chunk[2] = flags
-          chunk.set(fileData.slice(pos, end), 3)
+          let chunk
+          if (isFirst) {
+            // First chunk includes the original file header (sub_id, filename)
+            chunk = new Uint8Array(3 + header.length + (end - pos))
+            chunk[0] = CONTENT_FILE_CHUNK
+            chunk[1] = transferId
+            chunk[2] = flags
+            chunk.set(header, 3)
+            chunk.set(fileData.slice(pos, end), 3 + header.length)
+          } else {
+            chunk = new Uint8Array(3 + (end - pos))
+            chunk[0] = CONTENT_FILE_CHUNK
+            chunk[1] = transferId
+            chunk[2] = flags
+            chunk.set(fileData.slice(pos, end), 3)
+          }
+
+          const { data: encrypted } = await bridge.encryptBinary(String(hubId), chunk)
+          conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
+          pos = end
         }
-
-        const { data: encrypted } = await bridge.encryptBinary(String(hubId), chunk)
-        conn.dataChannel.send(encrypted instanceof Uint8Array ? encrypted.buffer : encrypted)
-        pos = end
+      } finally {
+        conn.activeFileTransferIds.delete(transferId)
       }
     }
   }
@@ -921,6 +933,9 @@ class WebRTCTransport {
     conn.iceRestartAttempts = 0
     conn.decryptFailures = 0
     conn.pendingCandidates = []
+    conn.activeFileTransferIds.clear()
+    conn.nextFileTransferId = 0
+    conn.lastStalledAt = 0
   }
 
   /**
@@ -1409,6 +1424,20 @@ class WebRTCTransport {
       console.debug(`[WebRTCTransport] Subscription confirmed: ${subscriptionId}`)
       pending.resolve()
     }
+  }
+
+  #allocateFileTransferId(conn) {
+    for (let i = 0; i < 256; i++) {
+      const candidate = conn.nextFileTransferId & 0xFF
+      conn.nextFileTransferId = (candidate + 1) & 0xFF
+
+      if (!conn.activeFileTransferIds.has(candidate)) {
+        conn.activeFileTransferIds.add(candidate)
+        return candidate
+      }
+    }
+
+    throw new Error("Too many concurrent file transfers")
   }
 }
 
