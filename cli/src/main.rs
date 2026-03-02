@@ -1035,16 +1035,34 @@ fn main() -> Result<()> {
             let socket_path = match socket {
                 Some(s) => s,
                 None => {
-                    // Auto-discover: same logic as `botster attach`
-                    let hub_id = resolve_hub_id_for_cwd()
-                        .ok_or_else(|| anyhow::anyhow!("Cannot detect repo or working directory"))?;
-                    let path = botster::hub::daemon::socket_path(&hub_id)?;
-                    if !path.exists() {
-                        anyhow::bail!(
-                            "No running hub found for this directory. Start one with: botster start"
-                        );
+                    // Resolution order for socket path when --socket is not provided:
+                    //
+                    // 1. BOTSTER_HUB_SOCKET env var — injected by the hub when spawning PTY
+                    //    sessions. Claude Code inherits this from the PTY shell environment.
+                    //
+                    // 2. hub_socket field in .botster/context.json — persisted at agent
+                    //    creation time as a fallback for cases where the env var is not
+                    //    inherited (e.g., shell resets, non-login shells).
+                    //
+                    // 3. CWD auto-discovery — derives hub_id from git rev-parse --show-toplevel.
+                    //    This fails in worktrees because the worktree path hashes to a different
+                    //    hub_id than the main repo where the hub is running. Kept as last resort
+                    //    for non-agent use cases (e.g., user running mcp-serve manually).
+                    let ctx = commands::context::build();
+                    if let Some(s) = ctx.get("hub_socket").filter(|s| !s.is_empty()) {
+                        s.clone()
+                    } else {
+                        // Auto-discover from CWD as last resort
+                        let hub_id = resolve_hub_id_for_cwd()
+                            .ok_or_else(|| anyhow::anyhow!("Cannot detect repo or working directory"))?;
+                        let path = botster::hub::daemon::socket_path(&hub_id)?;
+                        if !path.exists() {
+                            anyhow::bail!(
+                                "No running hub found for this directory. Start one with: botster start"
+                            );
+                        }
+                        path.to_string_lossy().into_owned()
                     }
-                    path.to_string_lossy().into_owned()
                 }
             };
             botster::mcp_serve::run(&socket_path)?;
