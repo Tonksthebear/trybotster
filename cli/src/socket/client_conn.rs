@@ -5,8 +5,9 @@
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::mpsc::{self, UnboundedSender, UnboundedReceiver};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::hub::events::HubEvent;
 use super::framing::{Frame, FrameDecoder};
@@ -18,7 +19,11 @@ pub struct SocketClientConn {
     /// Unique identifier for this client.
     client_id: String,
     /// Sender for outgoing frames to this client.
-    frame_tx: UnboundedSender<Vec<u8>>,
+    frame_tx: Sender<Vec<u8>>,
+    /// Hub event sender used to request disconnect/restart on queue overflow.
+    hub_event_tx: crate::hub::events::HubEventTx,
+    /// Ensures we only request forced disconnect once per connection.
+    disconnect_requested: AtomicBool,
     /// Handle to the read task (for cleanup).
     read_handle: JoinHandle<()>,
     /// Handle to the write task (for cleanup).
@@ -34,6 +39,11 @@ impl std::fmt::Debug for SocketClientConn {
 }
 
 impl SocketClientConn {
+    /// Upper bound for queued outbound frames per socket client.
+    ///
+    /// This prevents unbounded memory growth when a client is slow to read.
+    const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
+
     /// Create a new connection handler for an accepted socket.
     ///
     /// Spawns read and write tasks:
@@ -42,16 +52,16 @@ impl SocketClientConn {
     pub(crate) fn new(
         client_id: String,
         stream: UnixStream,
-        hub_event_tx: UnboundedSender<HubEvent>,
+        hub_event_tx: crate::hub::events::HubEventTx,
     ) -> Self {
         let (read_half, write_half) = stream.into_split();
-        let (frame_tx, frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(Self::OUTBOUND_QUEUE_CAPACITY);
 
         let read_client_id = client_id.clone();
         let read_handle = tokio::spawn(Self::read_loop(
             read_client_id,
             read_half,
-            hub_event_tx,
+            hub_event_tx.clone(),
         ));
 
         let write_client_id = client_id.clone();
@@ -64,6 +74,8 @@ impl SocketClientConn {
         Self {
             client_id,
             frame_tx,
+            hub_event_tx,
+            disconnect_requested: AtomicBool::new(false),
             read_handle,
             write_handle,
         }
@@ -74,14 +86,14 @@ impl SocketClientConn {
     /// The frame is encoded and queued for the write task.
     /// Returns `false` if the write channel is closed (client disconnected).
     pub fn send_frame(&self, frame: &Frame) -> bool {
-        self.frame_tx.send(frame.encode()).is_ok()
+        self.try_send_encoded(frame.encode())
     }
 
     /// Send pre-encoded bytes to this client.
     ///
     /// Useful when the frame is already encoded (e.g., from a PTY forwarder).
     pub fn send_raw(&self, encoded: Vec<u8>) -> bool {
-        self.frame_tx.send(encoded).is_ok()
+        self.try_send_encoded(encoded)
     }
 
     /// Client identifier.
@@ -92,8 +104,35 @@ impl SocketClientConn {
     /// Get a clone of the frame sender for direct use by forwarder tasks.
     ///
     /// The sender accepts pre-encoded frame bytes (from `Frame::encode()`).
-    pub fn frame_sender(&self) -> UnboundedSender<Vec<u8>> {
+    pub fn frame_sender(&self) -> Sender<Vec<u8>> {
         self.frame_tx.clone()
+    }
+
+    fn try_send_encoded(&self, encoded: Vec<u8>) -> bool {
+        match self.frame_tx.try_send(encoded) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                log::warn!(
+                    "[Socket] Outbound queue full for {}, forcing reconnect",
+                    self.client_id
+                );
+                self.request_forced_disconnect();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    fn request_forced_disconnect(&self) {
+        if self
+            .disconnect_requested
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let _ = self.hub_event_tx.send(HubEvent::SocketClientDisconnected {
+                client_id: self.client_id.clone(),
+            });
+        }
     }
 
     /// Disconnect this client, aborting read/write tasks.
@@ -106,7 +145,7 @@ impl SocketClientConn {
     async fn read_loop(
         client_id: String,
         mut reader: tokio::net::unix::OwnedReadHalf,
-        hub_event_tx: UnboundedSender<HubEvent>,
+        hub_event_tx: crate::hub::events::HubEventTx,
     ) {
         let mut decoder = FrameDecoder::new();
         let mut buf = [0u8; 64 * 1024]; // 64KB read buffer
@@ -156,7 +195,7 @@ impl SocketClientConn {
     fn dispatch_frame(
         client_id: &str,
         frame: Frame,
-        hub_event_tx: &UnboundedSender<HubEvent>,
+        hub_event_tx: &crate::hub::events::HubEventTx,
     ) -> bool {
         let event = match frame {
             Frame::Json(msg) => HubEvent::SocketMessage {
@@ -186,7 +225,7 @@ impl SocketClientConn {
     async fn write_loop(
         client_id: String,
         mut writer: tokio::net::unix::OwnedWriteHalf,
-        mut frame_rx: UnboundedReceiver<Vec<u8>>,
+        mut frame_rx: Receiver<Vec<u8>>,
     ) {
         while let Some(data) = frame_rx.recv().await {
             if let Err(e) = writer.write_all(&data).await {

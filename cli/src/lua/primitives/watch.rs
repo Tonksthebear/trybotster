@@ -12,8 +12,6 @@
 //! local id = watch.directory("/path/to/dir", {
 //!     recursive = true,       -- default: true
 //!     pattern = "*.lua",      -- optional glob filter
-//!     poll = true,            -- use mtime polling instead of OS events (default: false)
-//!     poll_interval = 2.0,    -- poll interval in seconds (default: 2.0)
 //! }, function(event)
 //!     -- event.path = "/path/to/dir/file.txt"
 //!     -- event.kind = "create" | "modify" | "rename" | "delete"
@@ -39,7 +37,6 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use globset::{Glob, GlobMatcher};
 use mlua::prelude::*;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 use crate::file_watcher::{FileEventKind, FileWatcher};
@@ -81,7 +78,7 @@ pub struct WatcherEntries {
     ///
     /// When set, new watches spawn a blocking forwarder task that sends
     /// `HubEvent::UserFileWatch` instead of relying on periodic polling.
-    hub_event_tx: Option<UnboundedSender<HubEvent>>,
+    hub_event_tx: Option<crate::hub::events::HubEventTx>,
     /// Tokio runtime handle for spawning blocking forwarder tasks.
     ///
     /// Needed because `watch.directory()` may be called during initialization
@@ -105,7 +102,7 @@ impl WatcherEntries {
     /// Set the Hub event channel and tokio handle for event-driven delivery.
     pub(crate) fn set_hub_event_tx(
         &mut self,
-        tx: UnboundedSender<HubEvent>,
+        tx: crate::hub::events::HubEventTx,
         handle: tokio::runtime::Handle,
     ) {
         self.hub_event_tx = Some(tx);
@@ -216,16 +213,6 @@ pub fn register(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
                 .as_ref()
                 .and_then(|t| t.get::<String>("pattern").ok());
 
-            let use_poll = opts
-                .as_ref()
-                .and_then(|t| t.get::<bool>("poll").ok())
-                .unwrap_or(false);
-
-            let poll_interval_secs: f64 = opts
-                .as_ref()
-                .and_then(|t| t.get::<f64>("poll_interval").ok())
-                .unwrap_or(2.0);
-
             // Compile glob pattern if provided
             let glob = match &pattern {
                 Some(pat) => {
@@ -237,14 +224,7 @@ pub fn register(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
                 None => None,
             };
 
-            // Create the file watcher (poll-based or OS-native)
-            let mut watcher = if use_poll {
-                let interval = std::time::Duration::from_secs_f64(poll_interval_secs);
-                FileWatcher::new_poll(interval)
-            } else {
-                FileWatcher::new()
-            }
-            .map_err(|e| {
+            let mut watcher = FileWatcher::new().map_err(|e| {
                 LuaError::external(format!("watch.directory: failed to create watcher: {e}"))
             })?;
 
@@ -315,12 +295,11 @@ pub fn register(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
             );
 
             log::info!(
-                "[watch] Started watching '{}' (id={}, recursive={}, pattern={:?}, poll={})",
+                "[watch] Started watching '{}' (id={}, recursive={}, pattern={:?})",
                 path,
                 id,
                 recursive,
                 pattern,
-                use_poll
             );
 
             Ok(id)

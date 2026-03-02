@@ -117,10 +117,10 @@ pub struct WorktreeCreateResult {
 }
 
 /// Channel type for receiving async worktree creation results.
-pub type WorktreeResultReceiver = tokio::sync::mpsc::UnboundedReceiver<WorktreeCreateResult>;
+pub type WorktreeResultReceiver = tokio::sync::mpsc::Receiver<WorktreeCreateResult>;
 
 /// Channel type for sending async worktree creation results.
-pub type WorktreeResultSender = tokio::sync::mpsc::UnboundedSender<WorktreeCreateResult>;
+pub type WorktreeResultSender = tokio::sync::mpsc::Sender<WorktreeCreateResult>;
 
 /// Register worktree primitives with the Lua state.
 ///
@@ -550,7 +550,7 @@ mod tests {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        *tx.lock().unwrap() = Some(sender);
+        *tx.lock().unwrap() = Some(sender.into());
         let cache = Arc::new(HandleCache::new());
         let base = PathBuf::from("/tmp/test-worktrees");
 
@@ -575,7 +575,7 @@ mod tests {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        *tx.lock().unwrap() = Some(sender);
+        *tx.lock().unwrap() = Some(sender.into());
         let cache = Arc::new(HandleCache::new());
         let base = PathBuf::from("/tmp/test-worktrees");
 
@@ -632,7 +632,7 @@ mod tests {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        *tx.lock().unwrap() = Some(sender);
+        *tx.lock().unwrap() = Some(sender.into());
         let cache = Arc::new(HandleCache::new());
         let base = PathBuf::from("/tmp/test-worktrees");
 

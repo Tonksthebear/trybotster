@@ -19,6 +19,10 @@ use crate::lua::primitives::action_cable::ActionCableRequest;
 use crate::lua::primitives::hub_client::HubClientRequest;
 use crate::lua::primitives::worktree::WorktreeRequest;
 use crate::socket::client_conn::SocketClientConn;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 /// Event from a background producer delivered to the Hub event loop.
 ///
@@ -71,6 +75,18 @@ pub(crate) enum HubEvent {
     DcOpened {
         /// Browser identity key for the peer whose DC just opened.
         browser_identity: String,
+    },
+
+    /// A bounded WebRTC ingress queue filled up for a browser peer.
+    ///
+    /// Indicates the Hub is no longer keeping up with inbound frames from that
+    /// peer. The channel should be cleaned up so the browser reconnects and
+    /// re-synchronizes state from a clean baseline.
+    WebRtcIngressBackpressure {
+        /// Browser identity for the overloaded WebRTC connection.
+        browser_identity: String,
+        /// Queue/source label for diagnostics.
+        source: &'static str,
     },
 
     /// Lua timer has fired (one-shot or repeating iteration).
@@ -329,3 +345,241 @@ pub(crate) enum HubEvent {
     },
 }
 
+impl HubEvent {
+    #[must_use]
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::HttpResponse(_) => "http_response",
+            Self::WebSocketEvent(_) => "websocket_event",
+            Self::PtyNotification(_) => "pty_notification",
+            Self::PtyOscEvent { .. } => "pty_osc_event",
+            Self::PtyProcessExited { .. } => "pty_process_exited",
+            Self::DcOpened { .. } => "dc_opened",
+            Self::WebRtcIngressBackpressure { .. } => "webrtc_ingress_backpressure",
+            Self::TimerFired { .. } => "timer_fired",
+            Self::AcChannelMessage { .. } => "ac_channel_message",
+            Self::WebRtcMessage { .. } => "webrtc_message",
+            Self::UserFileWatch { .. } => "user_file_watch",
+            Self::CleanupTick => "cleanup_tick",
+            Self::WebRtcSend(_) => "webrtc_send",
+            Self::TuiSend(_) => "tui_send",
+            Self::LuaPtyRequest(_) => "lua_pty_request",
+            Self::LuaHubRequest(_) => "lua_hub_request",
+            Self::LuaConnectionRequest(_) => "lua_connection_request",
+            Self::LuaWorktreeRequest(_) => "lua_worktree_request",
+            Self::LuaActionCableRequest(_) => "lua_action_cable_request",
+            Self::LuaHubClientRequest(_) => "lua_hub_client_request",
+            Self::HubClientMessage { .. } => "hub_client_message",
+            Self::HubClientDisconnected { .. } => "hub_client_disconnected",
+            Self::LuaPushRequest { .. } => "lua_push_request",
+            Self::PushSubscriptionsExpired { .. } => "push_subscriptions_expired",
+            Self::SocketClientConnected { .. } => "socket_client_connected",
+            Self::SocketClientDisconnected { .. } => "socket_client_disconnected",
+            Self::SocketMessage { .. } => "socket_message",
+            Self::SocketPtyInput { .. } => "socket_pty_input",
+            Self::SocketSend(_) => "socket_send",
+            Self::MessageDelivered { .. } => "message_delivered",
+            Self::BrokerPtyOutput { .. } => "broker_pty_output",
+            Self::BrokerPtyExited { .. } => "broker_pty_exited",
+            Self::BrokerSessionRegistered { .. } => "broker_session_registered",
+            Self::AgentUnregistered { .. } => "agent_unregistered",
+            Self::WorktreeDeleteCompleted { .. } => "worktree_delete_completed",
+            Self::WebRtcOfferCompleted { .. } => "webrtc_offer_completed",
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn approx_size_bytes(&self) -> usize {
+        const BASE: usize = 32;
+        match self {
+            Self::WebRtcMessage {
+                browser_identity,
+                payload,
+            } => BASE + browser_identity.len() + payload.len(),
+            Self::SocketPtyInput { client_id, data, .. } => BASE + client_id.len() + data.len(),
+            Self::BrokerPtyOutput { data, .. } => BASE + data.len(),
+            Self::SocketMessage { client_id, msg } => BASE + client_id.len() + msg.to_string().len(),
+            Self::HubClientMessage {
+                connection_id,
+                message,
+            } => BASE + connection_id.len() + message.to_string().len(),
+            Self::AcChannelMessage { channel_id, message } => {
+                BASE + channel_id.len() + message.to_string().len()
+            }
+            Self::UserFileWatch { watch_id, events } => BASE + watch_id.len() + (events.len() * 48),
+            Self::PushSubscriptionsExpired { identities } => {
+                BASE + identities.iter().map(std::string::String::len).sum::<usize>()
+            }
+            Self::LuaPushRequest { payload } => BASE + payload.to_string().len(),
+            _ => BASE,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HubEventTypeSnapshot {
+    pub enqueue_ok: u64,
+    pub enqueue_failed: u64,
+    pub dequeue: u64,
+    pub pending: usize,
+    pub pending_high_water: usize,
+    pub bytes_pending: usize,
+    pub bytes_high_water: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HubEventMetricsSnapshot {
+    pub enqueue_ok_total: u64,
+    pub enqueue_failed_total: u64,
+    pub dequeue_total: u64,
+    pub pending_total: usize,
+    pub pending_high_water_total: usize,
+    pub bytes_pending_total: usize,
+    pub bytes_high_water_total: usize,
+    pub by_type: BTreeMap<&'static str, HubEventTypeSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct HubEventTypeMetrics {
+    enqueue_ok: u64,
+    enqueue_failed: u64,
+    dequeue: u64,
+    pending: usize,
+    pending_high_water: usize,
+    bytes_pending: usize,
+    bytes_high_water: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct HubEventMetrics {
+    enqueue_ok_total: AtomicU64,
+    enqueue_failed_total: AtomicU64,
+    dequeue_total: AtomicU64,
+    pending_total: AtomicUsize,
+    pending_high_water_total: AtomicUsize,
+    bytes_pending_total: AtomicUsize,
+    bytes_high_water_total: AtomicUsize,
+    by_type: Mutex<BTreeMap<&'static str, HubEventTypeMetrics>>,
+}
+
+impl HubEventMetrics {
+    fn bump_high_water(atom: &AtomicUsize, value: usize) {
+        let mut current = atom.load(Ordering::Relaxed);
+        while value > current {
+            match atom.compare_exchange(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(updated) => current = updated,
+            }
+        }
+    }
+
+    pub(crate) fn record_enqueue(&self, kind: &'static str, bytes: usize) {
+        self.enqueue_ok_total.fetch_add(1, Ordering::Relaxed);
+        let pending = self.pending_total.fetch_add(1, Ordering::Relaxed) + 1;
+        Self::bump_high_water(&self.pending_high_water_total, pending);
+
+        let bytes_pending = self.bytes_pending_total.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        Self::bump_high_water(&self.bytes_high_water_total, bytes_pending);
+
+        if let Ok(mut map) = self.by_type.lock() {
+            let entry = map.entry(kind).or_default();
+            entry.enqueue_ok += 1;
+            entry.pending += 1;
+            entry.pending_high_water = entry.pending_high_water.max(entry.pending);
+            entry.bytes_pending += bytes;
+            entry.bytes_high_water = entry.bytes_high_water.max(entry.bytes_pending);
+        }
+    }
+
+    pub(crate) fn record_enqueue_failed(&self, kind: &'static str, bytes: usize) {
+        self.enqueue_failed_total.fetch_add(1, Ordering::Relaxed);
+        self.pending_total.fetch_sub(1, Ordering::Relaxed);
+        self.bytes_pending_total.fetch_sub(bytes, Ordering::Relaxed);
+
+        if let Ok(mut map) = self.by_type.lock() {
+            let entry = map.entry(kind).or_default();
+            entry.enqueue_failed += 1;
+            entry.pending = entry.pending.saturating_sub(1);
+            entry.bytes_pending = entry.bytes_pending.saturating_sub(bytes);
+        }
+    }
+
+    pub(crate) fn record_dequeue(&self, kind: &'static str, bytes: usize) {
+        self.dequeue_total.fetch_add(1, Ordering::Relaxed);
+        self.pending_total.fetch_sub(1, Ordering::Relaxed);
+        self.bytes_pending_total.fetch_sub(bytes, Ordering::Relaxed);
+
+        if let Ok(mut map) = self.by_type.lock() {
+            let entry = map.entry(kind).or_default();
+            entry.dequeue += 1;
+            entry.pending = entry.pending.saturating_sub(1);
+            entry.bytes_pending = entry.bytes_pending.saturating_sub(bytes);
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> HubEventMetricsSnapshot {
+        let by_type = if let Ok(map) = self.by_type.lock() {
+            map.iter()
+                .map(|(k, v)| {
+                    (
+                        *k,
+                        HubEventTypeSnapshot {
+                            enqueue_ok: v.enqueue_ok,
+                            enqueue_failed: v.enqueue_failed,
+                            dequeue: v.dequeue,
+                            pending: v.pending,
+                            pending_high_water: v.pending_high_water,
+                            bytes_pending: v.bytes_pending,
+                            bytes_high_water: v.bytes_high_water,
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+
+        HubEventMetricsSnapshot {
+            enqueue_ok_total: self.enqueue_ok_total.load(Ordering::Relaxed),
+            enqueue_failed_total: self.enqueue_failed_total.load(Ordering::Relaxed),
+            dequeue_total: self.dequeue_total.load(Ordering::Relaxed),
+            pending_total: self.pending_total.load(Ordering::Relaxed),
+            pending_high_water_total: self.pending_high_water_total.load(Ordering::Relaxed),
+            bytes_pending_total: self.bytes_pending_total.load(Ordering::Relaxed),
+            bytes_high_water_total: self.bytes_high_water_total.load(Ordering::Relaxed),
+            by_type,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HubEventTx {
+    inner: mpsc::UnboundedSender<HubEvent>,
+    metrics: Arc<HubEventMetrics>,
+}
+
+impl HubEventTx {
+    #[must_use]
+    pub(crate) fn new(inner: mpsc::UnboundedSender<HubEvent>, metrics: Arc<HubEventMetrics>) -> Self {
+        Self { inner, metrics }
+    }
+
+    pub(crate) fn send(&self, event: HubEvent) -> Result<(), mpsc::error::SendError<HubEvent>> {
+        let kind = event.kind();
+        let bytes = event.approx_size_bytes();
+        self.metrics.record_enqueue(kind, bytes);
+        if let Err(e) = self.inner.send(event) {
+            self.metrics.record_enqueue_failed(kind, bytes);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+}
+
+impl From<mpsc::UnboundedSender<HubEvent>> for HubEventTx {
+    fn from(inner: mpsc::UnboundedSender<HubEvent>) -> Self {
+        Self::new(inner, Arc::new(HubEventMetrics::default()))
+    }
+}

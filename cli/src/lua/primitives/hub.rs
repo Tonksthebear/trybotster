@@ -812,7 +812,7 @@ mod tests {
         let (tx, cache, hid, sid, state) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        *tx.lock().unwrap() = Some(sender);
+        *tx.lock().unwrap() = Some(sender.into());
 
         register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
 
@@ -830,7 +830,7 @@ mod tests {
         let (tx, cache, hid, sid, state) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        *tx.lock().unwrap() = Some(sender);
+        *tx.lock().unwrap() = Some(sender.into());
 
         register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
 
@@ -853,7 +853,7 @@ mod tests {
         let (tx, cache, hid, sid, state) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        *tx.lock().unwrap() = Some(sender);
+        *tx.lock().unwrap() = Some(sender.into());
 
         register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
 
@@ -873,7 +873,7 @@ mod tests {
         let (tx, cache, hid, sid, state) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        *tx.lock().unwrap() = Some(sender);
+        *tx.lock().unwrap() = Some(sender.into());
 
         register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
 
@@ -916,7 +916,7 @@ mod tests {
         let (tx, cache, hid, sid, state) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        *tx.lock().unwrap() = Some(sender);
+        *tx.lock().unwrap() = Some(sender.into());
 
         register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
 
@@ -942,7 +942,7 @@ mod tests {
         let (tx, cache, hid, sid, state) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        *tx.lock().unwrap() = Some(sender);
+        *tx.lock().unwrap() = Some(sender.into());
 
         register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
 

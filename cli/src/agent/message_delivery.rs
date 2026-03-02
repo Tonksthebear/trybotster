@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{broadcast, mpsc, Notify};
+use tokio::sync::{broadcast, Notify};
 
 use super::pty::events::PtyEvent;
 use super::pty::SharedPtyState;
@@ -162,7 +162,7 @@ pub(crate) fn spawn_delivery_task(
     delivery: Arc<MessageDeliveryState>,
     shared_state: Arc<Mutex<SharedPtyState>>,
     event_tx: broadcast::Sender<PtyEvent>,
-    hub_event_tx: Option<mpsc::UnboundedSender<crate::hub::events::HubEvent>>,
+    hub_event_tx: Option<crate::hub::events::HubEventTx>,
     kitty_enabled: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     // Clone the atomic timestamp once — read directly without locking SharedPtyState.

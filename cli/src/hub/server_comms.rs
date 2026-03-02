@@ -193,6 +193,39 @@ impl Hub {
                 self.poll_pty_observers();
                 self.ratchet_restarted_peers.clear();
                 self.check_broker_demux_health();
+                if self.hub_event_metrics_last_log.elapsed() >= std::time::Duration::from_secs(30) {
+                    let m = self.hub_event_metrics.snapshot();
+                    let by_type = m
+                        .by_type
+                        .iter()
+                        .filter(|(_, s)| s.enqueue_ok > 0 || s.pending > 0)
+                        .map(|(kind, s)| {
+                            format!(
+                                "{kind}:ok={} fail={} deq={} pend={} hwm={} bytes={} bytes_hwm={}",
+                                s.enqueue_ok,
+                                s.enqueue_failed,
+                                s.dequeue,
+                                s.pending,
+                                s.pending_high_water,
+                                s.bytes_pending,
+                                s.bytes_high_water
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    log::info!(
+                        "[HubEventMetrics] enqueue_ok={} dequeue={} failed={} pending={} pending_hwm={} bytes_pending={} bytes_hwm={} by_type=[{}]",
+                        m.enqueue_ok_total,
+                        m.dequeue_total,
+                        m.enqueue_failed_total,
+                        m.pending_total,
+                        m.pending_high_water_total,
+                        m.bytes_pending_total,
+                        m.bytes_high_water_total,
+                        by_type
+                    );
+                    self.hub_event_metrics_last_log = std::time::Instant::now();
+                }
             }
             HubEvent::DcOpened { browser_identity } => {
                 log::info!(
@@ -235,6 +268,17 @@ impl Hub {
                 if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
                     log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
                 }
+            }
+            HubEvent::WebRtcIngressBackpressure {
+                browser_identity,
+                source,
+            } => {
+                log::warn!(
+                    "[WebRTC] Ingress backpressure from {} for {}; cleaning up peer",
+                    source,
+                    &browser_identity[..browser_identity.len().min(8)]
+                );
+                self.cleanup_webrtc_channel(&browser_identity, source);
             }
             HubEvent::WebRtcSend(send_req) => {
                 use crate::lua::primitives::WebRtcSendRequest;
@@ -536,16 +580,21 @@ impl Hub {
                                 Err(e) => Err(format!("spawn_blocking panicked: {e}")),
                             };
 
-                            let _ = result_tx.send(WorktreeCreateResult {
-                                agent_key: agent_key_clone,
-                                branch,
-                                result: outcome,
-                                metadata,
-                                prompt,
-                                profile_name,
-                                client_rows,
-                                client_cols,
-                            });
+                            if result_tx
+                                .try_send(WorktreeCreateResult {
+                                    agent_key: agent_key_clone,
+                                    branch,
+                                    result: outcome,
+                                    metadata,
+                                    prompt,
+                                    profile_name,
+                                    client_rows,
+                                    client_cols,
+                                })
+                                .is_err()
+                            {
+                                log::warn!("[Worktree] Result queue full/closed; dropping async result");
+                            }
                         });
                     }
                     WorktreeRequest::Delete { path, branch } => {
@@ -918,7 +967,7 @@ impl Hub {
     pub fn handle_webrtc_pty_output_batch(
         &mut self,
         first: WebRtcPtyOutput,
-        rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<WebRtcPtyOutput>>,
+        rx: &mut Option<tokio::sync::mpsc::Receiver<WebRtcPtyOutput>>,
     ) {
         // Process the first message directly to preserve ordering.
         self.process_single_pty_output(first);
@@ -2022,6 +2071,7 @@ impl Hub {
 
         // Spawn forwarder task
         let output_tx = self.webrtc_pty_output_tx.clone();
+        let hub_event_tx = self.hub_event_tx.clone();
         let peer_id = req.peer_id.clone();
         let agent_index = req.agent_index;
         let pty_index = req.pty_index;
@@ -2073,18 +2123,29 @@ impl Hub {
                     raw_message.extend_from_slice(&(num_chunks as u16).to_le_bytes());
                     raw_message.extend(chunk);
 
-                    if output_tx
-                        .send(WebRtcPtyOutput {
-                            subscription_id: subscription_id.clone(),
-                            browser_identity: peer_id.clone(),
-                            data: raw_message,
-                            agent_index,
-                            pty_index,
-                        })
-                        .is_err()
-                    {
-                        log::trace!("[Lua] PTY output queue closed during snapshot send");
-                        return;
+                    match output_tx.try_send(WebRtcPtyOutput {
+                        subscription_id: subscription_id.clone(),
+                        browser_identity: peer_id.clone(),
+                        data: raw_message,
+                        agent_index,
+                        pty_index,
+                    }) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            log::warn!(
+                                "[Lua] WebRTC PTY output queue full during snapshot send for {}",
+                                &peer_id[..peer_id.len().min(8)]
+                            );
+                            let _ = hub_event_tx.send(super::events::HubEvent::WebRtcIngressBackpressure {
+                                browser_identity: peer_id.clone(),
+                                source: "pty_output_snapshot_queue_full",
+                            });
+                            return;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            log::trace!("[Lua] PTY output queue closed during snapshot send");
+                            return;
+                        }
                     }
                 }
             }
@@ -2107,18 +2168,29 @@ impl Hub {
                         raw_message.extend(&prefix);
                         raw_message.extend(&data);
 
-                        if output_tx
-                            .send(WebRtcPtyOutput {
-                                subscription_id: subscription_id.clone(),
-                                browser_identity: peer_id.clone(),
-                                data: raw_message,
-                                agent_index,
-                                pty_index,
-                            })
-                            .is_err()
-                        {
-                            log::trace!("[Lua] PTY output queue closed, stopping forwarder");
-                            break;
+                        match output_tx.try_send(WebRtcPtyOutput {
+                            subscription_id: subscription_id.clone(),
+                            browser_identity: peer_id.clone(),
+                            data: raw_message,
+                            agent_index,
+                            pty_index,
+                        }) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                log::warn!(
+                                    "[Lua] WebRTC PTY output queue full for {}; forcing reconnect",
+                                    &peer_id[..peer_id.len().min(8)]
+                                );
+                                let _ = hub_event_tx.send(super::events::HubEvent::WebRtcIngressBackpressure {
+                                    browser_identity: peer_id.clone(),
+                                    source: "pty_output_queue_full",
+                                });
+                                break;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                log::trace!("[Lua] PTY output queue closed, stopping forwarder");
+                                break;
+                            }
                         }
                     }
                     Ok(PtyEvent::ProcessExited { exit_code }) => {
@@ -2427,6 +2499,7 @@ impl Hub {
         let pty_index = req.pty_index;
         let active_flag = req.active_flag;
         let client_id = req.client_id.clone();
+        let hub_event_tx = self.hub_event_tx.clone();
 
         let _guard = self.tokio_runtime.enter();
         let task = tokio::spawn(async move {
@@ -2445,9 +2518,22 @@ impl Hub {
                     kitty_enabled,
                     data: snapshot,
                 };
-                if frame_tx.send(frame.encode()).is_err() {
-                    log::trace!("[Lua-Socket] Frame channel closed before snapshot sent");
-                    return;
+                match frame_tx.try_send(frame.encode()) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        log::warn!(
+                            "[Lua-Socket] Outbound queue full for {}, forcing reconnect",
+                            client_id
+                        );
+                        let _ = hub_event_tx.send(super::events::HubEvent::SocketClientDisconnected {
+                            client_id: client_id.clone(),
+                        });
+                        return;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        log::trace!("[Lua-Socket] Frame channel closed before snapshot sent");
+                        return;
+                    }
                 }
             }
 
@@ -2468,9 +2554,22 @@ impl Hub {
                             pty_index: pty_index as u16,
                             data,
                         };
-                        if frame_tx.send(frame.encode()).is_err() {
-                            log::trace!("[Lua-Socket] Frame channel closed, stopping forwarder");
-                            break;
+                        match frame_tx.try_send(frame.encode()) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                log::warn!(
+                                    "[Lua-Socket] Outbound queue full for {}, forcing reconnect",
+                                    client_id
+                                );
+                                let _ = hub_event_tx.send(super::events::HubEvent::SocketClientDisconnected {
+                                    client_id: client_id.clone(),
+                                });
+                                break;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                log::trace!("[Lua-Socket] Frame channel closed, stopping forwarder");
+                                break;
+                            }
                         }
                     }
                     Ok(PtyEvent::ProcessExited { exit_code }) => {
@@ -2483,7 +2582,7 @@ impl Hub {
                             pty_index: pty_index as u16,
                             exit_code,
                         };
-                        let _ = frame_tx.send(frame.encode());
+                        let _ = frame_tx.try_send(frame.encode());
                         break;
                     }
                     Ok(PtyEvent::KittyChanged(enabled)) => {
@@ -2494,7 +2593,7 @@ impl Hub {
                             "agent_index": agent_index,
                             "pty_index": pty_index,
                         }));
-                        let _ = frame_tx.send(frame.encode());
+                        let _ = frame_tx.try_send(frame.encode());
                     }
                     Ok(PtyEvent::FocusRequested) => {
                         let frame = Frame::Json(serde_json::json!({
@@ -2502,7 +2601,7 @@ impl Hub {
                             "agent_index": agent_index,
                             "pty_index": pty_index,
                         }));
-                        let _ = frame_tx.send(frame.encode());
+                        let _ = frame_tx.try_send(frame.encode());
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -4357,7 +4456,7 @@ mod tests {
         };
 
         // Step 1: PTY forwarder sends output
-        hub.webrtc_pty_output_tx.send(msg).unwrap();
+        hub.webrtc_pty_output_tx.try_send(msg).unwrap();
 
         // Step 2: Extract rx (as run_event_loop does before select!)
         let mut rx = hub.webrtc_pty_output_rx.take();
@@ -4400,7 +4499,7 @@ mod tests {
         // Send 5 messages
         for i in 0..5u8 {
             hub.webrtc_pty_output_tx
-                .send(super::WebRtcPtyOutput {
+                .try_send(super::WebRtcPtyOutput {
                     subscription_id: "sub_test".to_string(),
                     browser_identity: "test-browser-identity".to_string(),
                     data: vec![0x01, 0x41 + i],

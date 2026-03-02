@@ -109,6 +109,23 @@ function Client:handle_subscribe(msg)
 
     local agent_index = params.agent_index
     local pty_index = params.pty_index
+    local existing_sub = self.subscriptions[sub_id]
+    local existing_forwarder = self.forwarders[sub_id]
+    local forwarder_active = false
+    if existing_forwarder then
+        local ok, active = pcall(function()
+            if existing_forwarder.is_active then
+                return existing_forwarder:is_active()
+            end
+            return true
+        end)
+        if ok and active then
+            forwarder_active = true
+        else
+            -- Drop stale/inactive forwarder handles so reconnect subscribe can rebuild.
+            self.forwarders[sub_id] = nil
+        end
+    end
 
     log.info(string.format("Subscribe: %s -> %s (peer=%s, agent=%s, pty=%s, rows=%s, cols=%s)",
         sub_id:sub(1, 16), channel, self.peer_id:sub(1, 8),
@@ -121,6 +138,15 @@ function Client:handle_subscribe(msg)
         agent_index = agent_index,
         pty_index = pty_index,
     }
+
+    -- If this is a no-op terminal re-subscribe for an already-active forwarder,
+    -- avoid rebuilding the forwarder/snapshot path; only refresh dimensions.
+    local is_terminal_resubscribe = channel == "terminal"
+        and existing_sub ~= nil
+        and existing_sub.channel == "terminal"
+        and existing_sub.agent_index == agent_index
+        and existing_sub.pty_index == pty_index
+        and forwarder_active
 
     -- Send subscription confirmation immediately
     -- Browser waits for this before allowing input
@@ -144,19 +170,27 @@ function Client:handle_subscribe(msg)
 
     -- Channel-specific setup
     if channel == "terminal" then
-        -- Register with pty_clients for dimension tracking.
-        -- This resizes the PTY before the forwarder is created.
-        if agent_index ~= nil and pty_index ~= nil then
-            local rows = params.rows or 24
-            local cols = params.cols or 80
-            if rows < 2 or cols < 2 then
-                log.warn(string.format(
-                    "Suspicious terminal dimensions from %s: %dx%d (agent=%d, pty=%d)",
-                    self.peer_id:sub(1, 8), cols, rows, agent_index, pty_index))
-            end
-            pty_clients.register(agent_index, pty_index, self.peer_id, rows, cols)
+        local rows = params.rows or 24
+        local cols = params.cols or 80
+        if rows < 2 or cols < 2 then
+            log.warn(string.format(
+                "Suspicious terminal dimensions from %s: %dx%d (agent=%d, pty=%d)",
+                self.peer_id:sub(1, 8), cols, rows, agent_index, pty_index))
         end
-        self:setup_terminal_subscription(sub_id, agent_index, pty_index)
+
+        -- Always keep PTY dimensions fresh, but avoid forwarder churn on no-op re-subscribe.
+        if agent_index ~= nil and pty_index ~= nil then
+            if is_terminal_resubscribe then
+                pty_clients.update(agent_index, pty_index, self.peer_id, rows, cols)
+                log.debug(string.format(
+                    "Deduped terminal re-subscribe: %s -> %d:%d",
+                    sub_id:sub(1, 16), agent_index, pty_index))
+            else
+                -- First subscribe (or recovered state): register + create forwarder.
+                pty_clients.register(agent_index, pty_index, self.peer_id, rows, cols)
+                self:setup_terminal_subscription(sub_id, agent_index, pty_index)
+            end
+        end
     elseif channel == "hub" then
         -- Send initial agent and worktree lists
         log.info(string.format("Hub subscription from %s...", self.peer_id:sub(1, 8)))

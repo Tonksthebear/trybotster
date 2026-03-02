@@ -1449,7 +1449,8 @@ impl LuaRuntime {
     #[cfg(test)]
     pub(crate) fn setup_test_event_channel(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::hub::events::HubEvent> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        *self.hub_event_sender.lock().expect("HubEventSender mutex poisoned") = Some(tx);
+        *self.hub_event_sender.lock().expect("HubEventSender mutex poisoned") =
+            Some(crate::hub::events::HubEventTx::from(tx));
         rx
     }
 
@@ -1464,7 +1465,7 @@ impl LuaRuntime {
     /// timer, and watcher registries.
     pub(crate) fn set_hub_event_tx(
         &mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<crate::hub::events::HubEvent>,
+        tx: crate::hub::events::HubEventTx,
         tokio_handle: tokio::runtime::Handle,
     ) {
         // Fill the shared HubEventSender for all 6 event-driven Lua primitives
