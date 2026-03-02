@@ -99,16 +99,39 @@ function Agent.new(config)
     local git_path = config.worktree_path .. "/.git"
     local is_worktree = fs.exists(git_path) and not fs.is_dir(git_path)
     self._is_worktree = is_worktree
+
+    -- Resolve device data_dir for workspace store and main-branch context path.
+    -- Agent.new() receives a `config` parameter that shadows the global `config`,
+    -- so access the global via _G to get the actual device data directory.
+    local data_dir = _G.config and _G.config.data_dir and _G.config.data_dir() or nil
+    self._data_dir = data_dir
+
     if is_worktree then
         self._context_path = config.worktree_path .. "/.botster/context.json"
     else
-        local data_dir = config.data_dir and config.data_dir() or nil
         if data_dir then
             self._context_path = data_dir .. "/.botster/agents/" .. key .. "/context.json"
         end
     end
     if self._context_path then
         self:_sync_context_json()
+    end
+
+    -- Initialize Central Session Store (Phase 1: Workspace Architecture).
+    -- Writes workspace + session manifests alongside the legacy context.json so
+    -- broker_reconnected can use either path for ghost resurrection.
+    -- IDs are stored on the instance so they persist across metadata syncs.
+    if data_dir then
+        local ws = require("lib.workspace_store")
+        ws.init_dir(data_dir)
+        self._workspace_id = ws.generate_workspace_id()
+        self._session_uuid = ws.generate_session_uuid()
+        -- Write initial manifests now; broker_sessions will be filled in by
+        -- subsequent set_meta() calls from the broker registration loop below,
+        -- each of which re-calls _sync_context_json() → _sync_session_manifest().
+        self:_sync_workspace_manifest()
+        self:_sync_session_manifest()
+        ws.append_event(data_dir, self._workspace_id, self._session_uuid, "created")
     end
 
     -- Build environment variables
@@ -268,27 +291,111 @@ function Agent:get_meta(key)
 end
 
 --- Sync context.json with current agent state.
--- Writes to _context_path (set at creation). No-op if path was not computed
--- (broker unavailable at startup or data_dir not configured).
+-- Writes to _context_path (set at creation). Legacy context.json write is
+-- skipped when no path was computed, but the Central Session Store manifest
+-- is always synced so broker_sessions accumulate even without a context path.
 function Agent:_sync_context_json()
-    if not self._context_path then return end
-    local context = {
-        repo = self.repo,
-        branch_name = self.branch_name,
-        worktree_path = self.worktree_path,
-        prompt = self.prompt,
-        metadata = self.metadata,
-        profile_name = self.profile_name,
-        created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
-    }
-    -- Derive parent directory from the full context path
-    local context_dir = self._context_path:match("^(.+)/[^/]+$")
-    if context_dir and not fs.exists(context_dir) then
-        fs.mkdir(context_dir)
+    -- Legacy context.json (worktree or data_dir/agents/key/context.json)
+    if self._context_path then
+        local context = {
+            repo = self.repo,
+            branch_name = self.branch_name,
+            worktree_path = self.worktree_path,
+            prompt = self.prompt,
+            metadata = self.metadata,
+            profile_name = self.profile_name,
+            created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
+        }
+        -- Derive parent directory from the full context path
+        local context_dir = self._context_path:match("^(.+)/[^/]+$")
+        if context_dir and not fs.exists(context_dir) then
+            fs.mkdir(context_dir)
+        end
+        local ok, err = pcall(fs.write, self._context_path, json.encode(context))
+        if not ok then
+            log.warn(string.format("Failed to sync context.json: %s", tostring(err)))
+        end
     end
-    local ok, err = pcall(fs.write, self._context_path, json.encode(context))
+
+    -- Central Session Store manifest — always sync so broker_sessions accumulate
+    -- in the session manifest on every set_meta() call, regardless of whether a
+    -- legacy context.json path exists.
+    self:_sync_session_manifest()
+end
+
+--- Sync the Central Session Store session manifest with current agent state.
+-- No-op when workspace IDs were not initialised (data_dir not configured).
+function Agent:_sync_session_manifest()
+    if not self._data_dir or not self._workspace_id or not self._session_uuid then return end
+    local ws = require("lib.workspace_store")
+
+    -- Collect broker_sessions and pty_dimensions from metadata flat keys.
+    local broker_sessions = {}
+    local pty_dimensions  = {}
+    local idx = 0
+    while true do
+        local sid = self.metadata["broker_session_" .. idx]
+        if not sid then break end
+        broker_sessions[tostring(idx)] = tonumber(sid)
+        local rows = tonumber(self.metadata["broker_pty_rows_" .. idx])
+        local cols = tonumber(self.metadata["broker_pty_cols_" .. idx])
+        if rows and cols then
+            pty_dimensions[tostring(idx)] = { rows = rows, cols = cols }
+        end
+        idx = idx + 1
+    end
+
+    local manifest = {
+        uuid          = self._session_uuid,
+        workspace_id  = self._workspace_id,
+        agent_key     = self:agent_key(),
+        type          = "agent",
+        role          = "developer",
+        repo          = self.repo,
+        branch        = self.branch_name,
+        worktree_path = self.worktree_path,
+        profile_name  = self.profile_name,
+        status        = (self.status == "running") and "active" or self.status,
+        broker_sessions = broker_sessions,
+        pty_dimensions  = pty_dimensions,
+        created_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
+        updated_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+    }
+
+    local ok, err = pcall(ws.write_session,
+        self._data_dir, self._workspace_id, self._session_uuid, manifest)
     if not ok then
-        log.warn(string.format("Failed to sync context.json: %s", tostring(err)))
+        log.warn(string.format("Failed to sync session manifest: %s", tostring(err)))
+    end
+end
+
+--- Sync the Central Session Store workspace manifest with current agent state.
+-- No-op when workspace IDs were not initialised (data_dir not configured).
+function Agent:_sync_workspace_manifest()
+    if not self._data_dir or not self._workspace_id then return end
+    local ws = require("lib.workspace_store")
+
+    local issue_number = self.metadata.issue_number
+    local title
+    if issue_number then
+        title = self.repo .. " — issue #" .. tostring(issue_number)
+    else
+        title = self.repo .. " — " .. self.branch_name
+    end
+
+    local manifest = {
+        id           = self._workspace_id,
+        title        = title,
+        repo         = self.repo,
+        issue_number = issue_number,
+        status       = "active",
+        created_at   = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
+        updated_at   = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+    }
+
+    local ok, err = pcall(ws.write_workspace, self._data_dir, self._workspace_id, manifest)
+    if not ok then
+        log.warn(string.format("Failed to sync workspace manifest: %s", tostring(err)))
     end
 end
 
@@ -326,6 +433,19 @@ function Agent:close(delete_worktree)
     -- Main-branch agents: <data_dir>/.botster/agents/<key>/context.json
     if self._context_path and fs.exists(self._context_path) then
         pcall(fs.delete, self._context_path)
+    end
+
+    -- Mark the Central Session Store session as closed so broker_reconnected
+    -- does not attempt to resurrect it after the next Hub restart.
+    if self._data_dir and self._workspace_id and self._session_uuid then
+        local ws = require("lib.workspace_store")
+        local manifest = ws.read_session(self._data_dir, self._workspace_id, self._session_uuid)
+        if manifest then
+            manifest.status     = "closed"
+            manifest.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+            pcall(ws.write_session,
+                self._data_dir, self._workspace_id, self._session_uuid, manifest)
+        end
     end
 
     -- Queue worktree deletion if requested

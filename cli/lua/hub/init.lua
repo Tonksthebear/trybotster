@@ -154,6 +154,33 @@ if not next(loaded_plugin_names) then
     log.debug("No plugins found")
 end
 
+-- ============================================================================
+-- Workspace Store Init + Migration (Phase 1: Central Session Store)
+-- ============================================================================
+-- Ensure the workspaces directory exists and migrate any old context.json files
+-- before the broker handler loads so resurrected sessions find new-format manifests.
+
+do
+    local ws_data_dir = (config.data_dir and config.data_dir()) or nil
+    if ws_data_dir then
+        local ws_ok, ws = pcall(require, "lib.workspace_store")
+        if ws_ok then
+            -- Ensure top-level workspaces/ directory exists.
+            pcall(ws.init_dir, ws_data_dir)
+            -- Migrate any surviving legacy context.json files once, then delete them.
+            -- Idempotent: already-migrated files are absent and the scan is a no-op.
+            local mig_ok, mig_err = pcall(ws.migrate, ws_data_dir)
+            if not mig_ok then
+                log.warn(string.format("Workspace store migration error: %s", tostring(mig_err)))
+            end
+        else
+            log.warn(string.format("Could not load lib.workspace_store: %s", tostring(ws)))
+        end
+    else
+        log.debug("No data_dir configured; skipping workspace store init and migration")
+    end
+end
+
 -- Load broker restart recovery handler (creates ghost PTYs on Hub restart)
 safe_require("handlers.broker")
 
