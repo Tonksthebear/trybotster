@@ -38,7 +38,7 @@ local port_state = state.get("agent_port_state", { next_port = 8080 })
 --   worktree_path   string   (required)
 --   prompt          string   (optional)  task description
 --   metadata        table    (optional)  plugin key-value store (e.g., issue_number, invocation_url)
---   dedup_key       string   (optional)  opaque workspace identity (e.g. "github:owner/repo#42")
+--   dedup_key       string   (optional)  opaque workspace identity (set by plugins)
 --   workspace_title string   (optional)  human-readable workspace title
 --   workspace_metadata table (optional)  plugin data stored on workspace manifest
 --   sessions        array    (required)  ordered session configs from config resolver:

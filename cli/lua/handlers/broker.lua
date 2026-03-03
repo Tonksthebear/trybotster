@@ -240,15 +240,16 @@ local function process_context_file(context_path, in_worktree, ghost_infos, seen
     -- "orphaned" is set when the broker had no live sessions for this agent,
     -- meaning history was reconstructed from tee logs (or is empty if logs
     -- were missing).  The TUI can use this to show a read-only/orphaned badge.
-    -- Derive dedup_key from legacy context fields
+    -- Let plugins build dedup_key from legacy context fields via interceptor hook.
+    -- Core must not hardcode plugin-specific key formats.
     local legacy_dedup_key = nil
     if ctx.repo then
-        local issue_num = meta and meta.issue_number or nil
-        if issue_num then
-            legacy_dedup_key = "github:" .. ctx.repo .. "#" .. tostring(issue_num)
-        elseif ctx.branch_name then
-            legacy_dedup_key = "github:" .. ctx.repo .. ":" .. ctx.branch_name
-        end
+        local result = hooks.call("build_dedup_key", {
+            repo = ctx.repo,
+            issue_number = meta and meta.issue_number or nil,
+            branch_name = ctx.branch_name,
+        })
+        legacy_dedup_key = result and result.dedup_key
     end
 
     local ghost_info = {
