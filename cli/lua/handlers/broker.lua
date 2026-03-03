@@ -243,6 +243,7 @@ local function process_context_file(context_path, in_worktree, ghost_infos, seen
     local ghost_info = {
         id           = agent_key,
         agent_index  = agent_idx,
+        workspace_id = nil,
         display_name = ctx.branch_name or agent_key,
         title        = nil,
         cwd          = wt_path,
@@ -304,6 +305,7 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
     sess.status     = "suspended"
     sess.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
     ws.write_session(data_dir, workspace_id, session_uuid, sess)
+    ws.refresh_workspace_status(data_dir, workspace_id)
 
     -- Build ghost PTY handles from the structured broker_sessions table.
     local broker_sessions = sess.broker_sessions or {}
@@ -342,6 +344,7 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
         sess.status     = "orphaned"
         sess.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
         ws.write_session(data_dir, workspace_id, session_uuid, sess)
+        ws.refresh_workspace_status(data_dir, workspace_id)
         ws.append_event(data_dir, workspace_id, session_uuid, "orphaned")
         return
     end
@@ -359,6 +362,7 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
         sess.status     = "orphaned"
         sess.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
         ws.write_session(data_dir, workspace_id, session_uuid, sess)
+        ws.refresh_workspace_status(data_dir, workspace_id)
         ws.append_event(data_dir, workspace_id, session_uuid, "orphaned")
         return
     end
@@ -391,6 +395,7 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
     sess.status     = "active"
     sess.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
     ws.write_session(data_dir, workspace_id, session_uuid, sess)
+    ws.refresh_workspace_status(data_dir, workspace_id)
     ws.append_event(data_dir, workspace_id, session_uuid, "resurrected")
 
     log.info(string.format(
@@ -412,6 +417,7 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
     local ghost_info = {
         id            = agent_key,
         agent_index   = agent_idx,
+        workspace_id  = workspace_id,
         display_name  = sess.branch or agent_key,
         title         = nil,
         cwd           = sess.worktree_path,

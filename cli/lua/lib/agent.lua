@@ -128,7 +128,23 @@ function Agent.new(config)
     if data_dir then
         local ws = require("lib.workspace_store")
         ws.init_dir(data_dir)
-        self._workspace_id = ws.generate_workspace_id()
+        local issue_number = metadata and metadata.issue_number and tonumber(metadata.issue_number) or nil
+        local workspace_id = nil
+        local ok_ws, ws_id = pcall(function()
+            local id = ws.ensure_workspace(data_dir, {
+                repo = self.repo,
+                issue_number = issue_number,
+                branch_name = self.branch_name,
+                created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
+            })
+            return id
+        end)
+        if ok_ws then
+            workspace_id = ws_id
+        else
+            log.warn(string.format("Failed to ensure workspace manifest: %s", tostring(ws_id)))
+        end
+        self._workspace_id = workspace_id or ws.generate_workspace_id()
         self._session_uuid = ws.generate_session_uuid()
         -- Write initial manifests now; broker_sessions will be filled in by
         -- subsequent set_meta() calls from the broker registration loop below,
@@ -354,6 +370,7 @@ function Agent:_sync_context_json()
     -- Central Session Store manifest — always sync so broker_sessions accumulate
     -- in the session manifest on every set_meta() call, regardless of whether a
     -- legacy context.json path exists.
+    self:_sync_workspace_manifest()
     self:_sync_session_manifest()
 end
 
@@ -400,7 +417,9 @@ function Agent:_sync_session_manifest()
         self._data_dir, self._workspace_id, self._session_uuid, manifest)
     if not ok then
         log.warn(string.format("Failed to sync session manifest: %s", tostring(err)))
+        return
     end
+    pcall(ws.refresh_workspace_status, self._data_dir, self._workspace_id)
 end
 
 --- Sync the Central Session Store workspace manifest with current agent state.
@@ -408,6 +427,7 @@ end
 function Agent:_sync_workspace_manifest()
     if not self._data_dir or not self._workspace_id then return end
     local ws = require("lib.workspace_store")
+    local current = ws.read_workspace(self._data_dir, self._workspace_id) or {}
 
     local issue_number = self.metadata.issue_number
     local title
@@ -422,15 +442,18 @@ function Agent:_sync_workspace_manifest()
         title        = title,
         repo         = self.repo,
         issue_number = issue_number,
-        status       = "active",
-        created_at   = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
+        ad_hoc_key   = issue_number and nil or self.branch_name,
+        status       = current.status or "active",
+        created_at   = current.created_at or os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
         updated_at   = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
     }
 
     local ok, err = pcall(ws.write_workspace, self._data_dir, self._workspace_id, manifest)
     if not ok then
         log.warn(string.format("Failed to sync workspace manifest: %s", tostring(err)))
+        return
     end
+    pcall(ws.refresh_workspace_status, self._data_dir, self._workspace_id)
 end
 
 --- Close the agent and clean up resources.
@@ -479,6 +502,7 @@ function Agent:close(delete_worktree)
             manifest.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
             pcall(ws.write_session,
                 self._data_dir, self._workspace_id, self._session_uuid, manifest)
+            pcall(ws.refresh_workspace_status, self._data_dir, self._workspace_id)
         end
     end
 
@@ -892,6 +916,7 @@ function Agent:info()
         profile_name = self.profile_name,
         repo = self.repo,
         metadata = self.metadata,
+        workspace_id = self._workspace_id,
         branch_name = self.branch_name,
         worktree_path = self.worktree_path,
         in_worktree = self._is_worktree or false,

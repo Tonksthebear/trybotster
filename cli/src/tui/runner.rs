@@ -1699,6 +1699,10 @@ mod tests {
             "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
+        lua.preload_module(
+            "ui.workspace_helpers",
+            include_str!("../../lua/ui/workspace_helpers.lua"),
+        ).expect("workspace_helpers.lua should preload");
         lua.load_keybindings(kb_source)
             .expect("test keybindings should load");
         lua.load_actions(actions_source)
@@ -3263,6 +3267,10 @@ mod tests {
             "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil, active_pty_index = 0 }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
+        lua.preload_module(
+            "ui.workspace_helpers",
+            include_str!("../../lua/ui/workspace_helpers.lua"),
+        ).expect("workspace_helpers.lua should preload");
         lua.load_keybindings(kb_source).expect("keybindings.lua should load");
         lua.load_actions(actions_source).expect("actions.lua should load");
         lua.load_events(events_source).expect("events.lua should load");
