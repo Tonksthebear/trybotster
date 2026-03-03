@@ -176,6 +176,7 @@ end
 -- @param profile_name string    Profile to use for config resolution
 -- @param metadata table|nil     Plugin metadata (e.g., issue_number, invocation_url)
 -- @return Agent|nil             The created agent, or nil on error
+-- @return string|nil            Error message (nil on success)
 local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, profile_name, metadata)
     local repo = config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
     local repo_root = worktree.repo_root()
@@ -191,10 +192,11 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
         profile = profile_name,
     })
     if not resolved then
-        log.error(string.format("Config resolution failed for profile '%s': %s",
-            tostring(profile_name), tostring(err)))
+        local msg = string.format("Config resolution failed for profile '%s': %s",
+            tostring(profile_name), tostring(err))
+        log.error(msg)
         notify_lifecycle(agent_key, "failed", { error = tostring(err) })
-        return nil
+        return nil, msg
     end
 
     local sessions = build_sessions_from_resolved(resolved)
@@ -224,11 +226,12 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
     })
 
     if not ok then
-        log.error(string.format("Failed to spawn agent for %s: %s",
-            branch_name, tostring(agent)))
+        local msg = string.format("Failed to spawn agent for %s: %s",
+            branch_name, tostring(agent))
+        log.error(msg)
         -- Broadcast failure status
         notify_lifecycle(agent_key, "failed", { error = tostring(agent) })
-        return nil
+        return nil, msg
     end
 
     -- Notify via hooks (connections.lua observes and broadcasts to clients)
