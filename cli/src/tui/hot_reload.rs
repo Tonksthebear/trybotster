@@ -257,6 +257,13 @@ impl LuaBootstrap {
                     Err(e) => log::warn!("Failed to load Lua keybindings: {e}"),
                 }
             }
+            match lua.preload_module(
+                "ui.workspace_helpers",
+                include_str!("../../lua/ui/workspace_helpers.lua"),
+            ) {
+                Ok(()) => log::info!("Lua workspace helpers preloaded"),
+                Err(e) => log::warn!("Failed to preload workspace helpers: {e}"),
+            }
             if let Some(actions_source) = &self.actions_source {
                 match lua.load_actions(actions_source) {
                     Ok(()) => log::info!("Lua actions loaded"),

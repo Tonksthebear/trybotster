@@ -14,6 +14,7 @@
  *   - stateChange - { state, prevState, error }
  *   - error - { reason, message }
  *   - agentList - Array of agents
+ *   - workspaceList - Array of workspace groups (from agent_list message)
  *   - worktreeList - Array of worktrees
  *   - agentCreated - New agent data
  *   - agentDeleted - { id }
@@ -65,7 +66,9 @@ export class HubConnection extends HubRoute {
       case "agent_list": {
         // Handle Lua's empty table {} serializing as object instead of array
         const agents = Array.isArray(message.agents) ? message.agents : [];
+        const workspaces = Array.isArray(message.workspaces) ? message.workspaces : [];
         this.emit("agentList", agents);
+        this.emit("workspaceList", workspaces);
         // Sync app badge with notification count from agent list
         this.#updateAppBadge(agents);
         break;
@@ -336,6 +339,14 @@ export class HubConnection extends HubRoute {
    */
   onAgentList(callback) {
     return this.on("agentList", callback);
+  }
+
+  /**
+   * Subscribe to workspace list updates.
+   * Workspaces arrive alongside agent_list messages.
+   */
+  onWorkspaceList(callback) {
+    return this.on("workspaceList", callback);
   }
 
   /**
