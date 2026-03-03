@@ -608,26 +608,53 @@ fn resolve_hub_id_for_cwd() -> Option<String> {
 ///
 /// Resolution order:
 /// 1. Explicit `--socket` argument (must exist).
-/// 2. Local hub manifest for the current repo/cwd-derived hub ID.
+/// 2. Injected `BOTSTER_HUB_SOCKET` / `botster context hub_socket`.
+/// 3. Injected manifest path (`BOTSTER_HUB_MANIFEST_PATH` / context) lookup.
+///
+/// Intentionally does not perform cwd-based hub discovery; spawned agent sessions
+/// must resolve from injected parent-hub context.
 fn resolve_mcp_serve_socket(explicit_socket: Option<String>) -> Result<String> {
-    use botster::hub::daemon;
+    use botster::hub::daemon::HubManifest;
+
+    let socket_exists = |path: &str| std::path::Path::new(path).exists();
 
     if let Some(path) = explicit_socket {
-        if std::path::Path::new(&path).exists() {
+        if socket_exists(&path) {
             return Ok(path);
         }
         anyhow::bail!("Provided --socket does not exist: {path}");
     }
 
-    let hub_id = resolve_hub_id_for_cwd().ok_or_else(|| anyhow::anyhow!(
-        "Cannot detect repo or working directory"
-    ))?;
-    let socket_path = daemon::resolve_socket_for_hub_id(&hub_id).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No running hub manifest found for this directory. Start one with: botster start"
-        )
-    })?;
-    Ok(socket_path.to_string_lossy().into_owned())
+    if let Ok(path) = std::env::var("BOTSTER_HUB_SOCKET") {
+        if !path.is_empty() && socket_exists(&path) {
+            return Ok(path);
+        }
+    }
+
+    let ctx = commands::context::build();
+    if let Some(path) = ctx.get("hub_socket") {
+        if !path.is_empty() && socket_exists(path) {
+            return Ok(path.clone());
+        }
+    }
+
+    let manifest_path = std::env::var("BOTSTER_HUB_MANIFEST_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| ctx.get("hub_manifest_path").cloned());
+    if let Some(path) = manifest_path {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read hub manifest at {path}"))?;
+        let manifest: HubManifest = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse hub manifest JSON at {path}"))?;
+        if socket_exists(&manifest.socket_path) {
+            return Ok(manifest.socket_path);
+        }
+    }
+
+    anyhow::bail!(
+        "Unable to resolve hub socket for mcp-serve. Expected --socket, BOTSTER_HUB_SOCKET, or BOTSTER_HUB_MANIFEST_PATH from the parent hub."
+    );
 }
 
 ///
