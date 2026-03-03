@@ -414,6 +414,23 @@ local function handle_delete_agent(agent_key, delete_worktree)
     -- Broadcast: stopping
     notify_lifecycle(agent_key, "stopping")
 
+    -- Guard: skip worktree deletion if other agents are still running in it
+    if delete_worktree then
+        local wt_path = agent.worktree_path
+        local still_running = {}
+        for _, other in ipairs(Agent.list()) do
+            if other:agent_key() ~= agent_key and other.worktree_path == wt_path then
+                still_running[#still_running + 1] = other:agent_key()
+            end
+        end
+        if #still_running > 0 then
+            log.warn(string.format(
+                "Cannot delete worktree — agent(s) [%s] still running in it",
+                table.concat(still_running, ", ")))
+            delete_worktree = false
+        end
+    end
+
     -- Close the agent (kills PTY sessions)
     agent:close(delete_worktree)
 
