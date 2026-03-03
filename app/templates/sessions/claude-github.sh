@@ -45,10 +45,15 @@ fi
 # ---------------------------------------------------------------------------
 # Registers the local hub MCP bridge so agents can use plugin-provided tools
 # (orchestrator, custom plugin tools, etc.) via the Botster hub.
-# The mcp-serve subcommand auto-discovers the hub socket from the cwd.
+# Prefer injected hub socket context from the parent hub.
 
 echo "Registering botster hub MCP tools..."
-claude mcp add botster-hub -- botster mcp-serve
+HUB_SOCKET="$(botster context hub_socket)"
+if [ -n "$HUB_SOCKET" ]; then
+  claude mcp add botster-hub -- botster mcp-serve --socket "$HUB_SOCKET"
+else
+  claude mcp add botster-hub -- botster mcp-serve
+fi
 
 # ---------------------------------------------------------------------------
 # Launch
