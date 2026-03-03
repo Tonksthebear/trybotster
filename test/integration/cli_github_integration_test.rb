@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "digest"
 require_relative "cli_integration_test_case"
 
 # Tests the GitHub plugin integration: message → ActionCable → Lua plugin → agent spawn.
@@ -196,6 +197,8 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     @test_temp_dirs << worktree_base
     @git_repo_path = temp_dir
     @worktree_base = worktree_base
+    local_hub_identifier = Digest::SHA256.hexdigest(File.realpath(temp_dir))[0, 32]
+    hub.update_column(:identifier, local_hub_identifier) if hub.identifier != local_hub_identifier
 
     # Create device token for CLI authentication
     token_name = "CLI Test Token #{SecureRandom.hex(4)}"
@@ -214,7 +217,6 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
       "BOTSTER_CONFIG_DIR" => temp_dir,
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_TOKEN" => api_key,
-      "BOTSTER_HUB_ID" => hub.identifier,
       "BOTSTER_WORKTREE_BASE" => worktree_base,
       "BOTSTER_LOG_FILE" => log_file_path
     }
