@@ -204,22 +204,19 @@ fn ensure_hub_named(config: &mut Config) -> Result<()> {
         return Ok(());
     }
 
-    // Compute hub_identifier using the same logic as Hub::new()
-    let (hub_id, repo_path) = if let Ok(id) = std::env::var("BOTSTER_HUB_ID") {
-        (id, None)
-    } else {
-        match botster::WorktreeManager::detect_current_repo() {
-            Ok((path, _)) => {
-                let id = hub_id_for_repo(&path);
-                let canonical = path.canonicalize().unwrap_or(path);
-                (id, Some(canonical.to_string_lossy().to_string()))
-            }
-            Err(_) => {
-                let cwd = std::env::current_dir()?;
-                let id = hub_id_for_repo(&cwd);
-                let canonical = cwd.canonicalize().unwrap_or(cwd);
-                (id, Some(canonical.to_string_lossy().to_string()))
-            }
+    // Compute local hub_identifier using repo/cwd hash (must match Hub::new()).
+    // Do not source from BOTSTER_HUB_ID: that env value may be server-assigned.
+    let (hub_id, repo_path) = match botster::WorktreeManager::detect_current_repo() {
+        Ok((path, _)) => {
+            let id = hub_id_for_repo(&path);
+            let canonical = path.canonicalize().unwrap_or(path);
+            (id, Some(canonical.to_string_lossy().to_string()))
+        }
+        Err(_) => {
+            let cwd = std::env::current_dir()?;
+            let id = hub_id_for_repo(&cwd);
+            let canonical = cwd.canonicalize().unwrap_or(cwd);
+            (id, Some(canonical.to_string_lossy().to_string()))
         }
     };
 
@@ -607,56 +604,30 @@ fn resolve_hub_id_for_cwd() -> Option<String> {
     Some(botster::hub::hub_id_for_repo(&repo_path))
 }
 
-/// Resolve a socket path for `mcp-serve` with liveness checks.
+/// Resolve a socket path for `mcp-serve`.
 ///
 /// Resolution order:
 /// 1. Explicit `--socket` argument (must exist).
-/// 2. Hub manifest lookup by server-assigned `hub_id` from context/env.
-/// 3. `hub_socket` from context/env (must exist).
-/// 4. CWD-derived hub ID socket path (must exist).
+/// 2. Local hub manifest for the current repo/cwd-derived hub ID.
 fn resolve_mcp_serve_socket(explicit_socket: Option<String>) -> Result<String> {
     use botster::hub::daemon;
-    use std::path::Path;
-
-    let socket_exists = |path: &str| -> bool { Path::new(path).exists() };
 
     if let Some(path) = explicit_socket {
-        if socket_exists(&path) {
+        if std::path::Path::new(&path).exists() {
             return Ok(path);
         }
         anyhow::bail!("Provided --socket does not exist: {path}");
     }
 
-    let ctx = commands::context::build();
-
-    if let Some(server_id) = ctx.get("hub_id").filter(|s| !s.is_empty()) {
-        if let Some(path) = daemon::resolve_socket_for_server_id(server_id) {
-            let path = path.to_string_lossy().into_owned();
-            if socket_exists(&path) {
-                return Ok(path);
-            }
-            log::warn!(
-                "mcp-serve: manifest socket for hub_id={} is stale: {}",
-                server_id,
-                path
-            );
-        }
-    }
-
-    if let Some(path) = ctx.get("hub_socket").filter(|s| !s.is_empty()) {
-        if socket_exists(path) {
-            return Ok(path.clone());
-        }
-        log::warn!("mcp-serve: context hub_socket is stale: {}", path);
-    }
-
-    let hub_id = resolve_hub_id_for_cwd()
-        .ok_or_else(|| anyhow::anyhow!("Cannot detect repo or working directory"))?;
-    let path = daemon::socket_path(&hub_id)?;
-    if !path.exists() {
-        anyhow::bail!("No running hub found for this directory. Start one with: botster start");
-    }
-    Ok(path.to_string_lossy().into_owned())
+    let hub_id = resolve_hub_id_for_cwd().ok_or_else(|| anyhow::anyhow!(
+        "Cannot detect repo or working directory"
+    ))?;
+    let socket_path = daemon::resolve_socket_for_hub_id(&hub_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No running hub manifest found for this directory. Start one with: botster start"
+        )
+    })?;
+    Ok(socket_path.to_string_lossy().into_owned())
 }
 
 ///
@@ -684,33 +655,24 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
         botster::hub::hub_id_for_repo(&repo_path)
     };
 
-    // Check if hub is running
-    if !daemon::is_hub_running(&hub_id) {
-        // Try to find any running hub
+    let socket_path = if let Some(path) = daemon::resolve_socket_for_hub_id(&hub_id) {
+        path
+    } else {
         let running = daemon::discover_running_hubs();
         if running.is_empty() {
             anyhow::bail!(
-                "No running hub found for this directory.\n\
+                "No running hub manifest found for this directory.\n\
                  Start one with: botster start --headless"
             );
         } else {
-            eprintln!("No running hub found for this directory.");
+            eprintln!("No running hub manifest found for this directory.");
             eprintln!("Running hubs:");
             for (id, pid) in &running {
                 eprintln!("  {} (pid={})", &id[..id.len().min(8)], pid);
             }
             anyhow::bail!("Use --hub <id> to specify which hub to attach to.");
         }
-    }
-
-    let socket_path = daemon::socket_path(&hub_id)?;
-    if !socket_path.exists() {
-        anyhow::bail!(
-            "Hub is running (pid={}) but socket not found at {}",
-            daemon::read_pid_file(&hub_id).unwrap_or(0),
-            socket_path.display()
-        );
-    }
+    };
 
     println!("Connecting to hub {}...", &hub_id[..hub_id.len().min(8)]);
 
@@ -1007,20 +969,24 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Start { headless } => {
+            // Strict singleton policy: one live hub per directory-local hub ID.
+            let existing_hub = resolve_hub_id_for_cwd().and_then(|id| {
+                botster::hub::daemon::resolve_socket_for_hub_id(&id).map(|socket| (id, socket))
+            });
+
             if headless {
+                if let Some((hub_id, socket)) = existing_hub {
+                    anyhow::bail!(
+                        "Hub already running for this directory (hub_id={}, socket={}). \
+                         Use `botster attach --hub {}` or stop the existing hub first.",
+                        hub_id,
+                        socket.display(),
+                        hub_id
+                    );
+                }
                 run_headless()?;
             } else {
-                // If a hub is already running for this directory AND has a
-                // socket, attach to it (tmux-like behavior). If the socket
-                // is missing (legacy hub started before socket support),
-                // fall through to starting a new TUI.
-                let can_attach = resolve_hub_id_for_cwd().is_some_and(|id| {
-                    botster::hub::daemon::is_hub_running(&id)
-                        && botster::hub::daemon::socket_path(&id)
-                            .map(|p| p.exists())
-                            .unwrap_or(false)
-                });
-                if can_attach {
+                if existing_hub.is_some() {
                     println!("Hub already running — attaching...");
                     run_attach(None)?;
                 } else {

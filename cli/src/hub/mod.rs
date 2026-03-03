@@ -511,24 +511,21 @@ impl Hub {
         let state = Arc::new(RwLock::new(HubState::new(config.worktree_base.clone())));
         let tokio_runtime = tokio::runtime::Runtime::new()?;
 
-        // Generate stable hub_identifier: env var > repo path hash > cwd hash
-        let hub_identifier = if let Ok(id) = std::env::var("BOTSTER_HUB_ID") {
-            log::info!("Hub identifier (from env): {}...", &id[..id.len().min(8)]);
-            id
-        } else {
-            match WorktreeManager::detect_current_repo() {
-                Ok((repo_path, _)) => {
-                    let id = hub_id_for_repo(&repo_path);
-                    log::info!("Hub identifier (from repo): {}...", &id[..8]);
-                    id
-                }
-                Err(_) => {
-                    // Not in a git repo — derive hub ID from current working directory
-                    let cwd = std::env::current_dir()?;
-                    let id = hub_id_for_repo(&cwd);
-                    log::info!("Hub identifier (from cwd): {}...", &id[..8]);
-                    id
-                }
+        // Generate stable local hub_identifier from repo path (or cwd fallback).
+        // Never source this from BOTSTER_HUB_ID: that env value may be a server
+        // ID and must not influence local socket naming.
+        let hub_identifier = match WorktreeManager::detect_current_repo() {
+            Ok((repo_path, _)) => {
+                let id = hub_id_for_repo(&repo_path);
+                log::info!("Hub identifier (from repo): {}...", &id[..8]);
+                id
+            }
+            Err(_) => {
+                // Not in a git repo — derive hub ID from current working directory
+                let cwd = std::env::current_dir()?;
+                let id = hub_id_for_repo(&cwd);
+                log::info!("Hub identifier (from cwd): {}...", &id[..8]);
+                id
             }
         };
 
