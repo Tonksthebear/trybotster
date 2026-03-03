@@ -244,6 +244,268 @@ function M.read_session(data_dir, workspace_id, session_uuid)
     return manifest
 end
 
+--- Read and decode a workspace manifest.
+-- @param data_dir string
+-- @param workspace_id string
+-- @return table|nil manifest table, or nil on error
+function M.read_workspace(data_dir, workspace_id)
+    local path = M.workspace_manifest_path(data_dir, workspace_id)
+    local ok, content = pcall(fs.read, path)
+    if not ok or not content then return nil end
+    local ok2, manifest = pcall(json.decode, content)
+    if not ok2 or not manifest then return nil end
+    return manifest
+end
+
+--- Build a workspace title from identity fields.
+-- @param repo string
+-- @param issue_number number|nil
+-- @param branch_name string|nil
+-- @return string
+local function workspace_title(repo, issue_number, branch_name)
+    if issue_number then
+        return repo .. " — issue #" .. tostring(issue_number)
+    end
+    if branch_name and branch_name ~= "" then
+        return repo .. " — " .. branch_name
+    end
+    return repo .. " — ad-hoc"
+end
+
+--- Find an existing workspace manifest matching repo + issue or ad-hoc key.
+-- Issue workspaces match on (repo, issue_number).
+-- Ad-hoc workspaces match on (repo, ad_hoc_key) where ad_hoc_key defaults to branch.
+-- @param data_dir string
+-- @param opts table { repo, issue_number, branch_name }
+-- @return string|nil workspace_id
+-- @return table|nil manifest
+function M.find_workspace(data_dir, opts)
+    local repo = opts and opts.repo or nil
+    if not repo or repo == "" then return nil, nil end
+
+    local issue_number = opts and opts.issue_number and tonumber(opts.issue_number) or nil
+    local branch_name = opts and opts.branch_name or nil
+    local ad_hoc_key = branch_name or "main"
+
+    local ws_dir = M.workspaces_dir(data_dir)
+    if not fs.exists(ws_dir) then return nil, nil end
+
+    local entries, err = fs.list_dir(ws_dir)
+    if not entries then
+        log.debug(string.format("[workspace_store] find_workspace: could not list %s: %s",
+            ws_dir, tostring(err)))
+        return nil, nil
+    end
+
+    for _, workspace_id in ipairs(entries) do
+        local manifest = M.read_workspace(data_dir, workspace_id)
+        if manifest and manifest.repo == repo then
+            local m_issue = manifest.issue_number and tonumber(manifest.issue_number) or nil
+            if issue_number then
+                if m_issue == issue_number then
+                    return workspace_id, manifest
+                end
+            else
+                local m_ad_hoc = manifest.ad_hoc_key or manifest.branch
+                if m_issue == nil and m_ad_hoc == ad_hoc_key then
+                    return workspace_id, manifest
+                end
+            end
+        end
+    end
+
+    return nil, nil
+end
+
+--- Find or create a workspace manifest for a new session.
+-- Uses issue-based identity when issue_number is present; otherwise ad-hoc by branch_name.
+-- @param data_dir string
+-- @param opts table { repo, issue_number, branch_name, created_at }
+-- @return string|nil workspace_id
+-- @return table|nil manifest
+-- @return boolean created_new
+function M.ensure_workspace(data_dir, opts)
+    local repo = opts and opts.repo or "unknown/repo"
+    local issue_number = opts and opts.issue_number and tonumber(opts.issue_number) or nil
+    local branch_name = opts and opts.branch_name or "main"
+
+    local existing_id, existing_manifest = M.find_workspace(data_dir, {
+        repo = repo,
+        issue_number = issue_number,
+        branch_name = branch_name,
+    })
+    if existing_id then
+        return existing_id, existing_manifest, false
+    end
+
+    local workspace_id = M.generate_workspace_id()
+    local now = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+    local manifest = {
+        id           = workspace_id,
+        title        = workspace_title(repo, issue_number, branch_name),
+        repo         = repo,
+        issue_number = issue_number,
+        ad_hoc_key   = issue_number and nil or branch_name,
+        status       = "active",
+        created_at   = opts and opts.created_at or now,
+        updated_at   = now,
+    }
+
+    local ok = M.write_workspace(data_dir, workspace_id, manifest)
+    if not ok then
+        return nil, nil, false
+    end
+    return workspace_id, manifest, true
+end
+
+--- Read and decode all session manifests for a workspace.
+-- @param data_dir string
+-- @param workspace_id string
+-- @return array
+function M.read_workspace_sessions(data_dir, workspace_id)
+    local out = {}
+    local sessions_dir = M.workspace_dir(data_dir, workspace_id) .. "/sessions"
+    if not fs.exists(sessions_dir) then return out end
+
+    local entries, err = fs.list_dir(sessions_dir)
+    if not entries then
+        log.debug(string.format("[workspace_store] read_workspace_sessions: could not list %s: %s",
+            sessions_dir, tostring(err)))
+        return out
+    end
+
+    for _, session_uuid in ipairs(entries) do
+        local manifest = M.read_session(data_dir, workspace_id, session_uuid)
+        if manifest then
+            out[#out + 1] = {
+                session_uuid = session_uuid,
+                manifest = manifest,
+            }
+        end
+    end
+    return out
+end
+
+--- Derive workspace status from its session statuses.
+-- Rules:
+--   active     -> any session active
+--   orphaned   -> any session orphaned (when none active)
+--   closed     -> all closed
+--   suspended  -> everything else (including pending/unknown mixes)
+-- @param statuses array<string>
+-- @return string
+function M.derive_workspace_status(statuses)
+    local total = 0
+    local counts = {
+        active = 0,
+        suspended = 0,
+        orphaned = 0,
+        closed = 0,
+    }
+
+    for _, status in ipairs(statuses or {}) do
+        local s = tostring(status or "")
+        total = total + 1
+        if counts[s] ~= nil then
+            counts[s] = counts[s] + 1
+        end
+    end
+
+    if total == 0 then return "suspended" end
+    if counts.active > 0 then return "active" end
+    if counts.orphaned > 0 then return "orphaned" end
+    if counts.closed == total then return "closed" end
+    return "suspended"
+end
+
+--- Compute workspace status from session manifests without writing.
+-- @param data_dir string
+-- @param workspace_id string
+-- @return string|nil status
+function M.compute_workspace_status(data_dir, workspace_id)
+    local sessions = M.read_workspace_sessions(data_dir, workspace_id)
+    local statuses = {}
+    for _, rec in ipairs(sessions) do
+        statuses[#statuses + 1] = rec.manifest.status
+    end
+    return M.derive_workspace_status(statuses)
+end
+
+--- Recompute and persist one workspace manifest's status from session manifests.
+-- @param data_dir string
+-- @param workspace_id string
+-- @return string|nil status
+function M.refresh_workspace_status(data_dir, workspace_id)
+    local manifest = M.read_workspace(data_dir, workspace_id)
+    if not manifest then return nil end
+
+    local computed = M.compute_workspace_status(data_dir, workspace_id)
+    if not computed then return nil end
+    if manifest.status == computed then
+        return manifest.status
+    end
+
+    manifest.status = computed
+    manifest.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+    M.write_workspace(data_dir, workspace_id, manifest)
+    return manifest.status
+end
+
+--- Build grouped workspace payload for agent_list broadcasts.
+-- @param data_dir string
+-- @param agents array Agent.info()-style tables
+-- @return array workspaces
+function M.build_workspace_groups(data_dir, agents)
+    local grouped = {}
+    local by_id = {}
+    local agent_list = agents or {}
+
+    for _, agent in ipairs(agent_list) do
+        local workspace_id = agent.workspace_id
+        if workspace_id then
+            if not by_id[workspace_id] then
+                local manifest = M.read_workspace(data_dir, workspace_id) or {
+                    id = workspace_id,
+                    title = workspace_title(agent.repo or "unknown/repo", nil, agent.branch_name),
+                    repo = agent.repo,
+                    issue_number = agent.metadata and agent.metadata.issue_number or nil,
+                    status = "active",
+                    created_at = nil,
+                    updated_at = nil,
+                }
+
+                -- Read-only status derivation for payloads: avoid write-on-read churn.
+                local status = M.compute_workspace_status(data_dir, workspace_id)
+                if status then
+                    manifest.status = status
+                end
+
+                by_id[workspace_id] = {
+                    id = workspace_id,
+                    title = manifest.title,
+                    repo = manifest.repo,
+                    issue_number = manifest.issue_number,
+                    status = manifest.status,
+                    created_at = manifest.created_at,
+                    updated_at = manifest.updated_at,
+                    agents = {},
+                }
+                grouped[#grouped + 1] = by_id[workspace_id]
+            end
+            by_id[workspace_id].agents[#by_id[workspace_id].agents + 1] = agent.id
+        end
+    end
+
+    table.sort(grouped, function(a, b)
+        if a.created_at and b.created_at and a.created_at ~= b.created_at then
+            return a.created_at < b.created_at
+        end
+        return tostring(a.id) < tostring(b.id)
+    end)
+
+    return grouped
+end
+
 --- Scan the workspaces directory for sessions eligible for resurrection.
 -- Returns sessions with status == "active" or status == "suspended".
 -- "suspended" sessions result from a Hub crash mid-resurrection and must be
@@ -343,6 +605,7 @@ function M.migrate(data_dir)
             title        = ws_title,
             repo         = ctx.repo,
             issue_number = issue_number,
+            ad_hoc_key   = issue_number and nil or ctx.branch_name,
             status       = "active",
             created_at   = ctx.created_at or now,
             updated_at   = now,

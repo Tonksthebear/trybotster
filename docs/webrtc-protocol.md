@@ -190,10 +190,21 @@ List of all agents. Sent on HubChannel subscription and on request.
 {
   "type": "agent_list",
   "subscriptionId": "sub_1_1234567890",
+  "workspaces": [
+    {
+      "id": "ws-1730000000000-abcdef",
+      "title": "owner/repo — issue #42",
+      "repo": "owner/repo",
+      "issue_number": 42,
+      "status": "active",
+      "agents": ["owner-repo-botster-issue-42"]
+    }
+  ],
   "agents": [
     {
       "index": 0,
       "id": "session-key-here",
+      "workspace_id": "ws-1730000000000-abcdef",
       "repo": "owner/repo",
       "issue_number": 42,
       "branch_name": "botster-issue-42",
@@ -209,6 +220,7 @@ List of all agents. Sent on HubChannel subscription and on request.
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `workspaces` | array | Grouped workspace metadata (may be empty `[]`) |
 | `agents` | array | List of agent objects (empty array `[]` if none) |
 
 **Agent object fields:**
@@ -217,6 +229,7 @@ List of all agents. Sent on HubChannel subscription and on request.
 |-------|------|----------|-------------|
 | `index` | integer | Yes | Agent index (0-based) |
 | `id` | string | Yes | Session key |
+| `workspace_id` | string | No | Owning workspace ID for grouping |
 | `repo` | string | No | Repository in `owner/repo` format |
 | `issue_number` | integer | No | GitHub issue number |
 | `branch_name` | string | No | Git branch name |

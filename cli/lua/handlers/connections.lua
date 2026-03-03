@@ -9,6 +9,7 @@
 local state = require("hub.state")
 local Agent = require("lib.agent")
 local pty_clients = require("lib.pty_clients")
+local AgentListPayload = require("lib.agent_list_payload")
 
 -- Shared client registry - all transports register here
 local clients = state.get("connections.clients", {})
@@ -103,7 +104,12 @@ end
 local function broadcast_hub_event(event_name, event_data)
     -- Coalesce identical agent_list payloads to reduce subscription churn.
     if event_name == "agent_list" then
-        local ok, snapshot = pcall(json.encode, event_data.agents or {})
+        local payload = AgentListPayload.build(event_data and event_data.agents or nil)
+        event_data = {
+            agents = payload.agents,
+            workspaces = payload.workspaces,
+        }
+        local ok, snapshot = pcall(json.encode, event_data)
         if ok then
             if last_agent_list_snapshot == snapshot then
                 stats.agent_list_deduped = stats.agent_list_deduped + 1

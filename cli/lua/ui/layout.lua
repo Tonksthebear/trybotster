@@ -47,7 +47,129 @@ local function get_selected_agent()
 end
 
 -- =============================================================================
--- Helper: Build agent list items from state
+-- Helper: Workspace status display (Phase 3)
+-- =============================================================================
+
+local WORKSPACE_STATUS_ICON = {
+  -- Agent lifecycle statuses (client-side derived)
+  running           = { text = "●", style = { fg = "green" } },
+  failed            = { text = "●", style = { fg = "red" } },
+  creating_worktree = { text = "○", style = { fg = "yellow" } },
+  spawning_ptys     = { text = "○", style = { fg = "yellow" } },
+  stopping          = { text = "○", style = { fg = "yellow" } },
+  removing_worktree = { text = "○", style = { fg = "yellow" } },
+  exited            = { text = "●", style = "dim" },
+  idle              = { text = "·", style = "dim" },
+  -- Server-provided workspace statuses (workspace_store manifest)
+  active            = { text = "●", style = { fg = "green" } },
+  suspended         = { text = "○", style = { fg = "yellow" } },
+  orphaned          = { text = "●", style = "dim" },
+  closed            = { text = "·", style = "dim" },
+}
+
+-- =============================================================================
+-- Helper: Build list items from workspace-grouped state (Phase 3)
+-- =============================================================================
+
+--- Build display items from _tui_state.flat_list for the left panel.
+-- Each item corresponds to a flat_list entry (creating indicator, workspace
+-- header, or agent row). Returns nil when flat_list is not yet populated.
+local function build_list_items()
+  local flat = _tui_state and _tui_state.flat_list
+  if not flat then return nil end
+
+  local agents_by_id = {}
+  for _, a in ipairs(_tui_state and _tui_state.agents or {}) do
+    agents_by_id[a.id] = a
+  end
+
+  local items = {}
+  local pf = _tui_state and _tui_state.pending_fields
+
+  for _, entry in ipairs(flat) do
+    if entry.type == "creating" then
+      -- In-progress agent creation indicator
+      local stages = {
+        creating_worktree = "Creating worktree...",
+        copying_config    = "Copying config...",
+        spawning_agent    = "Starting agent...",
+        spawning          = "Starting agent...",
+        ready             = "Ready",
+      }
+      local c_id    = pf and pf.creating_agent_id
+      local c_stage = pf and pf.creating_agent_stage
+      if c_id then
+        items[#items+1] = {
+          text = {
+            { text = "-> " },
+            { text = string.format("%s (%s)", c_id, stages[c_stage] or "..."),
+              style = { fg = "cyan" } },
+          },
+        }
+      end
+
+    elseif entry.type == "workspace_header" then
+      -- Workspace group header: arrow + title + status + count
+      local icon    = WORKSPACE_STATUS_ICON[entry.status] or WORKSPACE_STATUS_ICON.idle
+      local arrow   = entry.collapsed and "▶ " or "▼ "
+      local count   = string.format("  %d session%s",
+        entry.agent_count, entry.agent_count == 1 and "" or "s")
+      items[#items+1] = {
+        text = {
+          { text = arrow, style = "dim" },
+          { text = entry.title },
+        },
+        secondary = {
+          icon,
+          { text = count, style = "dim" },
+        },
+      }
+
+    elseif entry.type == "agent" then
+      -- Agent row: indented under workspace header
+      local agent = agents_by_id[entry.agent_id]
+      if agent then
+        local name         = agent.display_name or agent.branch_name or entry.agent_id
+        local notification = agent.notification
+        local text
+        if notification then
+          text = {
+            { text = "  " },
+            { text = "● ", style = { fg = "yellow" } },
+            { text = name },
+          }
+        else
+          text = {
+            { text = "  " },
+            { text = name },
+          }
+        end
+
+        local item = { text = text }
+        -- Secondary: profile · branch (when branch differs from display name)
+        local parts = {}
+        if agent.profile_name then parts[#parts+1] = agent.profile_name end
+        if agent.branch_name and agent.branch_name ~= name then
+          parts[#parts+1] = agent.branch_name
+        end
+        if #parts > 0 then
+          item.secondary = { { text = "  " .. table.concat(parts, " · "), style = "dim" } }
+        end
+        items[#items+1] = item
+      else
+        -- Agent not in cache yet; show placeholder
+        items[#items+1] = {
+          text = { { text = "  " }, { text = entry.agent_id, style = "dim" } },
+        }
+      end
+    end
+  end
+
+  return items
+end
+
+-- =============================================================================
+-- Helper: Build agent list items from state (legacy / fallback)
 -- =============================================================================
 local function build_agent_items(state)
   local items = {}
@@ -147,24 +269,35 @@ local function build_worktree_items()
   return items
 end
 
---- Main layout: agent list + terminal panel.
+--- Main layout: workspace/agent list + terminal panel.
 function render(state)
   local agents = _tui_state and _tui_state.agents or {}
   local agent_count = #agents
   local creating = get_creating_agent()
   local sa = get_selected_agent()
 
-  -- Agent list title: count + poll indicator
+  -- List title: session count + poll indicator
   local poll_icon = state.seconds_since_poll < 1 and "*" or "o"
-  local agent_title = {
-    { text = string.format(" Agents (%d) ", agent_count) },
+  local list_title = {
+    { text = string.format(" Sessions (%d) ", agent_count) },
     { text = poll_icon .. " ", style = { fg = "cyan" } },
   }
 
-  -- Agent list: selection offset accounts for creating indicator
-  local agent_selected = _tui_state.selected_agent_index
-  if agent_selected and creating then
-    agent_selected = agent_selected + 1
+  -- Determine list items and cursor position.
+  -- Phase 3: use workspace-grouped flat_list when available.
+  -- Fallback: legacy flat agent list (before workspace events arrive).
+  local list_items
+  local list_cursor
+  if _tui_state and _tui_state.flat_list then
+    list_items  = build_list_items() or {}
+    list_cursor = _tui_state.list_cursor_pos
+  else
+    list_items = build_agent_items(state)
+    -- Legacy cursor: selected_agent_index offset by creating indicator
+    list_cursor = _tui_state and _tui_state.selected_agent_index
+    if list_cursor and creating then
+      list_cursor = list_cursor + 1
+    end
   end
 
   -- Terminal title: branch name, session view, scroll indicator, mode
@@ -199,7 +332,7 @@ function render(state)
 
   -- Build terminal panel: always show selected agent only
   local terminal_props = {}
-  if _tui_state.selected_agent_index then
+  if _tui_state and _tui_state.selected_agent_index then
     terminal_props.agent_index = _tui_state.selected_agent_index
     terminal_props.pty_index = _tui_state.active_pty_index or 0
   end
@@ -215,10 +348,10 @@ function render(state)
     children = {
       {
         type = "list",
-        block = { title = agent_title, borders = "all" },
+        block = { title = list_title, borders = "all" },
         props = {
-          items = build_agent_items(state),
-          selected = agent_selected,
+          items = list_items,
+          selected = list_cursor,
         },
       },
       terminal_panel,

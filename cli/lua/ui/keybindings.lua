@@ -39,8 +39,8 @@ local shared_bindings = {
   ["ctrl+r"]         = "refresh_agents",
 }
 
--- Normal mode: no agent selected, only shared modifier bindings
-M.normal = {}
+-- Normal mode: no agent selected, shared modifier bindings + enter for list select
+M.normal = { ["enter"] = "list_select" }
 for k, v in pairs(shared_bindings) do M.normal[k] = v end
 
 -- Insert mode: agent selected, PTY forwarding, only shared modifier bindings

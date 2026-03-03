@@ -141,6 +141,27 @@ impl LayoutLua {
             .map_err(|e| anyhow!("Failed to load UI extension '{name}': {e}"))
     }
 
+    /// Preload a Lua module table into `package.loaded`.
+    ///
+    /// This lets embedded include_str! modules be resolved by `require()`
+    /// without filesystem access.
+    pub fn preload_module(&self, name: &str, lua_source: &str) -> Result<()> {
+        let module: LuaTable = self
+            .lua
+            .load(lua_source)
+            .eval()
+            .map_err(|e| anyhow!("Failed to eval module '{name}': {e}"))?;
+        let loaded: LuaTable = self
+            .lua
+            .load("return package.loaded")
+            .eval()
+            .map_err(|e| anyhow!("Failed to get package.loaded: {e}"))?;
+        loaded
+            .set(name, module)
+            .map_err(|e| anyhow!("Failed to preload module '{name}': {e}"))?;
+        Ok(())
+    }
+
     /// Call Lua `render(state)` and return the render tree.
     pub fn call_render(&self, ctx: &RenderContext) -> Result<RenderNode> {
         let state = render_context_to_lua(&self.lua, ctx)?;
@@ -1111,6 +1132,10 @@ mod tests {
             "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil, active_pty_index = 0 }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
+        lua.preload_module(
+            "ui.workspace_helpers",
+            include_str!("../../lua/ui/workspace_helpers.lua"),
+        ).expect("workspace_helpers.lua should preload");
         lua.load_keybindings(kb_source).expect("keybindings.lua should load");
         lua.load_actions(actions_source).expect("actions.lua should load");
         lua.load_events(events_source).expect("events.lua should load");
@@ -1367,10 +1392,13 @@ mod tests {
         let actions_source = include_str!("../../lua/ui/actions.lua");
         let events_source = include_str!("../../lua/ui/events.lua");
         let botster_source = include_str!("../../lua/ui/botster.lua");
+        let ws_helpers_source = include_str!("../../lua/ui/workspace_helpers.lua");
 
         // Mirror the exact init order from runner.rs run()
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         lua.load_keybindings(kb_source).expect("keybindings.lua should load");
+        lua.preload_module("ui.workspace_helpers", ws_helpers_source)
+            .expect("workspace_helpers preload should succeed");
         lua.load_actions(actions_source).expect("actions.lua should load");
         lua.load_events(events_source).expect("events.lua should load");
         lua.load_extension(
@@ -1514,6 +1542,10 @@ mod tests {
             "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil, active_pty_index = 0 }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
+        lua.preload_module(
+            "ui.workspace_helpers",
+            include_str!("../../lua/ui/workspace_helpers.lua"),
+        ).expect("workspace_helpers.lua should preload");
         lua.load_keybindings(kb_source).expect("keybindings.lua should load");
         lua.load_actions(actions_source).expect("actions.lua should load");
         lua.load_events(events_source).expect("events.lua should load");
@@ -1794,12 +1826,13 @@ mod tests {
         assert!(ops.iter().any(|op| op["op"] == "set_mode" && op["mode"] == "insert"),
             "Should enter insert mode");
 
-        // Verify: layout renders the agent
+        // Verify: layout renders the agent (workspace header + agent row)
         let render_ctx = make_test_ctx("insert");
         let tree = lua.call_render(&render_ctx).unwrap();
         let items = extract_sidebar_items(&tree);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0], "main", "Sidebar should show the agent");
+        assert_eq!(items.len(), 2, "Should have workspace header + agent row");
+        assert!(items[0].contains("main"), "First item should be workspace header containing 'main'");
+        assert!(items[1].contains("main"), "Second item should be agent row containing 'main'");
     }
 
     /// Full end-to-end: new worktree flow with all lifecycle stages visible.
@@ -1871,12 +1904,12 @@ mod tests {
         });
         lua.call_on_hub_event("agent_created", &event, &ctx).unwrap();
 
-        // Creating indicator gone, agent in list
+        // Creating indicator gone, agent in list (workspace header + agent row)
         let tree = lua.call_render(&render_ctx).unwrap();
         let items = extract_sidebar_items(&tree);
-        assert_eq!(items.len(), 1, "Should have 1 agent, no creating indicator");
-        assert_eq!(items[0], "botster-issue-42",
-            "Should show agent display name, not creating indicator");
+        assert_eq!(items.len(), 2, "Should have workspace header + agent row, no creating indicator");
+        assert!(items[1].contains("botster-issue-42"),
+            "Agent row should show agent display name, not creating indicator");
     }
 
     /// Failed creation should clear the creating indicator.
