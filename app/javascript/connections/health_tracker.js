@@ -39,7 +39,7 @@ export class HealthTracker {
    * @param {Function} callbacks.getSubscriptionId - Get current subscription ID
    * @param {Function} callbacks.getErrorCode - Get current error code
    * @param {Function} callbacks.getBrowserStatus - Get current browser status
-   * @param {Function} callbacks.notifyManager - Notify ConnectionManager subscribers
+   * @param {Function} callbacks.notifyManager - Notify HubConnectionManager subscribers
    * @param {Function} callbacks.log - Debug logger
    */
   constructor(callbacks) {

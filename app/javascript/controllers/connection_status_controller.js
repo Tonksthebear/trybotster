@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { ConnectionManager, HubConnection, BrowserStatus, CliStatus, ConnectionMode } from "connections";
+import { HubConnectionManager, HubConnection, BrowserStatus, CliStatus, ConnectionMode } from "connections";
 
 /**
  * Connection Status Controller
@@ -67,7 +67,7 @@ export default class extends Controller {
       const key = this.#getConnectionKey();
       const options = this.#getConnectionOptions();
 
-      this.connection = await ConnectionManager.acquire(ConnectionClass, key, options);
+      this.connection = await HubConnectionManager.acquire(ConnectionClass, key, options);
 
       // Guard: if disconnected during async acquire, release and bail
       if (this.#disconnected) {

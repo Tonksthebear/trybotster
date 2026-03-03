@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { ConnectionManager, HubConnection } from "connections";
+import { HubConnectionManager, HubConnection } from "connections";
 
 /**
  * Hub Settings Controller
@@ -57,7 +57,7 @@ export default class extends Controller {
     this.deviceTree = null;           // cached device tree
     this.repoTree = null;             // cached repo tree
 
-    ConnectionManager.acquire(HubConnection, this.hubIdValue, {
+    HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
     }).then((hub) => {
       this.hub = hub;

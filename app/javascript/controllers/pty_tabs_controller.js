@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { ConnectionManager, HubConnection } from "connections";
+import { HubConnectionManager, HubConnection } from "connections";
 
 /**
  * Dynamic PTY Tab Controller
@@ -63,7 +63,7 @@ export default class extends Controller {
   async #initConnection() {
     if (!this.hubIdValue) return;
 
-    this.#hubConn = await ConnectionManager.acquire(
+    this.#hubConn = await HubConnectionManager.acquire(
       HubConnection,
       this.hubIdValue,
       { hubId: this.hubIdValue },

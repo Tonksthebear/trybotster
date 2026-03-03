@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { ConnectionManager, HubConnection } from "connections";
+import { HubConnectionManager, HubConnection } from "connections";
 
 /**
  * Delete Agent Modal Controller
@@ -17,7 +17,7 @@ export default class extends Controller {
   connect() {
     if (!this.hubIdValue) return;
 
-    this.#hubReady = ConnectionManager.acquire(HubConnection, this.hubIdValue, {
+    this.#hubReady = HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
     }).then((hub) => {
       this.hub = hub;

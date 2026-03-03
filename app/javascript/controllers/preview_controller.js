@@ -24,7 +24,7 @@
  */
 
 import { Controller } from "@hotwired/stimulus";
-import { ConnectionManager, PreviewConnection } from "connections";
+import { HubConnectionManager, PreviewConnection } from "connections";
 
 export default class extends Controller {
   static targets = ["iframe", "status", "error"];
@@ -58,14 +58,14 @@ export default class extends Controller {
     try {
       this.#updateStatus("Connecting...", "default");
 
-      // Acquire preview connection via ConnectionManager
+      // Acquire preview connection via HubConnectionManager
       const key = PreviewConnection.key(
         this.hubIdValue,
         this.agentIndexValue,
         this.ptyIndexValue,
       );
 
-      this.#connection = await ConnectionManager.acquire(
+      this.#connection = await HubConnectionManager.acquire(
         PreviewConnection,
         key,
         {

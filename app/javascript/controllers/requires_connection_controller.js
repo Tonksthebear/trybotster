@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { ConnectionManager } from "connections/connection_manager";
+import { HubConnectionManager } from "connections/hub_connection_manager";
 
 /**
  * RequiresConnectionController - Disables elements when a connection isn't available.
@@ -29,7 +29,7 @@ export default class extends Controller {
       return;
     }
 
-    this.unsubscribe = ConnectionManager.subscribe(
+    this.unsubscribe = HubConnectionManager.subscribe(
       this.keyValue,
       ({ state }) => {
         this.#updateDisabled(state !== "connected");

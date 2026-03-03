@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { ConnectionManager, HubConnection } from "connections";
+import { HubConnectionManager, HubConnection } from "connections";
 
 /**
  * Hub Setup Banner Controller
@@ -26,7 +26,7 @@ export default class extends Controller {
     this.unsubscribers = [];
     this.configured = null; // null = unknown, true/false = known
 
-    ConnectionManager.acquire(HubConnection, this.hubIdValue, {
+    HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
     }).then((hub) => {
       this.hub = hub;

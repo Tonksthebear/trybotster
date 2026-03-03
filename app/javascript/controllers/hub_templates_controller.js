@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { ConnectionManager, HubConnection } from "connections";
+import { HubConnectionManager, HubConnection } from "connections";
 
 /**
  * Hub Templates Controller
@@ -37,7 +37,7 @@ export default class extends Controller {
     this.installedDevice = new Set();  // plugin names installed at device scope
     this.installedRepo = new Set();    // plugin names installed at repo scope
 
-    ConnectionManager.acquire(HubConnection, this.hubIdValue, {
+    HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
     }).then((hub) => {
       this.hub = hub;

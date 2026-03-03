@@ -1,6 +1,6 @@
 import { Controller } from "@hotwired/stimulus";
 import { Restty } from "restty";
-import { ConnectionManager, HubConnection } from "connections";
+import { HubConnectionManager, HubConnection } from "connections";
 import { WebRtcPtyTransport } from "transport/webrtc_pty_transport";
 import { usePresence } from "lib/use_presence";
 
@@ -14,8 +14,9 @@ import { usePresence } from "lib/use_presence";
  * Init sequence:
  *   1. Acquire HubConnection (establishes WebRTC peer)
  *   2. Create Restty with transport (loads WASM, renders canvas)
- *   3. onBackend fires (WASM ready) → connectPty()
- *   4. connectPty() → transport.connect() → acquires TerminalConnection → data flows
+ *   3. onBackend fires (WASM ready)
+ *   4. onTermSize (debounced) → connectPty()
+ *   5. connectPty() → transport.connect() → acquires TerminalConnection → data flows
  *
  * Mobile: Tap vs swipe detection prevents virtual keyboard from appearing
  * during scroll. Only deliberate taps (< 10px movement) trigger keyboard.
@@ -23,6 +24,7 @@ import { usePresence } from "lib/use_presence";
  * Restty handles: GPU rendering, auto-resize, touch selection, font shaping.
  */
 export default class extends Controller {
+  static CONNECT_ON_RESIZE_DEBOUNCE_MS = 30;
   static targets = ["container", "dropZone", "toast"];
 
   static values = {
@@ -44,6 +46,10 @@ export default class extends Controller {
   #present = true;
   #connected = false;
   #teardownPresence = null;
+  #backendReady = false;
+  #connectPtyRequested = false;
+  #connectPtyTimer = null;
+  #pendingSize = null;
 
   connect() {
     this.#disconnected = false;
@@ -74,6 +80,13 @@ export default class extends Controller {
 
     this.#overlay?.remove();
     this.#overlay = null;
+    this.#backendReady = false;
+    this.#connectPtyRequested = false;
+    if (this.#connectPtyTimer) {
+      clearTimeout(this.#connectPtyTimer);
+      this.#connectPtyTimer = null;
+    }
+    this.#pendingSize = null;
   }
 
   /**
@@ -110,6 +123,13 @@ export default class extends Controller {
 
   async #initTerminal() {
     if (!this.hubIdValue) return;
+    this.#backendReady = false;
+    this.#connectPtyRequested = false;
+    if (this.#connectPtyTimer) {
+      clearTimeout(this.#connectPtyTimer);
+      this.#connectPtyTimer = null;
+    }
+    this.#pendingSize = null;
 
     const isMobile = "ontouchstart" in window;
     const container = this.hasContainerTarget
@@ -117,7 +137,7 @@ export default class extends Controller {
       : this.element;
 
     // 1. Acquire hub connection (establishes WebRTC peer)
-    this.#hubConn = await ConnectionManager.acquire(
+    this.#hubConn = await HubConnectionManager.acquire(
       HubConnection,
       this.hubIdValue,
       { hubId: this.hubIdValue },
@@ -206,18 +226,42 @@ export default class extends Controller {
             }
           },
           onBackend: () => {
-            this.#restty?.connectPty();
+            this.#backendReady = true;
             if (!isMobile) this.#restty?.focus();
           },
+          onTermSize: (cols, rows) => {
+            this.#onTermSize(cols, rows);
+          },
           // Restty handles resize internally — calls ptyTransport.resize()
-          // directly on grid change and on connect (restty-chunk.js:61035).
-          // No onTermSize handler needed.
+          // directly on grid change and on connect.
         },
       },
     });
 
     // 4. Intercept file paste/drop — capture phase beats Restty's imeInput handler
     this.#bindFileDrop(container);
+  }
+
+  #onTermSize(cols, rows) {
+    if (this.#connectPtyRequested || this.#disconnected || !this.#backendReady) return;
+
+    this.#pendingSize = { cols, rows };
+    if (this.#connectPtyTimer) {
+      clearTimeout(this.#connectPtyTimer);
+    }
+
+    this.#connectPtyTimer = setTimeout(() => {
+      this.#connectPtyTimer = null;
+      if (this.#connectPtyRequested || this.#disconnected || !this.#backendReady) return;
+      const size = this.#pendingSize;
+      if (!size || size.cols <= 1 || size.rows <= 1) return;
+
+      console.debug(
+        `[terminal_display] connectPty ready hub=${this.hubIdValue} agent=${this.agentIndexValue} pty=${this.ptyIndexValue} size=${size.cols}x${size.rows}`,
+      );
+      this.#connectPtyRequested = true;
+      this.#restty?.connectPty();
+    }, this.constructor.CONNECT_ON_RESIZE_DEBOUNCE_MS);
   }
 
   static MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
@@ -468,7 +512,7 @@ export default class extends Controller {
             <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
             <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
           </svg>
-          Reconnecting…
+          Connecting…
         </div>
       `;
       container.appendChild(this.#overlay);

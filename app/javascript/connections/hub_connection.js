@@ -21,15 +21,15 @@
  *   - profileList - Array of profile names
  *
  * Usage:
- *   const hub = await ConnectionManager.acquire(HubConnection, hubId, { hubId });
+ *   const hub = await HubConnectionManager.acquire(HubConnection, hubId, { hubId });
  *   hub.on("agentList", (agents) => render(agents));
  *   hub.on("connected", () => hub.requestAgents());
  *   hub.requestAgents();
  */
 
-import { Connection } from "connections/connection";
+import { HubRoute } from "connections/hub_route";
 
-export class HubConnection extends Connection {
+export class HubConnection extends HubRoute {
   // ========== Connection overrides ==========
 
   channelName() {
