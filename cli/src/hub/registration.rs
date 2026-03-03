@@ -63,6 +63,14 @@ pub fn register_hub_with_server(
     device_id: Option<i64>,
     hub_name: Option<&str>,
 ) -> String {
+    // `BOTSTER_HUB_ID` targets an existing server hub record (used by system tests
+    // and explicit integrations). Keep socket/process identity local-only; this
+    // value only affects server registration/heartbeat identity.
+    let server_identifier = std::env::var("BOTSTER_HUB_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| local_identifier.to_string());
+
     // Detect repo: env var > git detection (optional — not stored on server)
     let repo_name: Option<String> = std::env::var("BOTSTER_REPO")
         .ok()
@@ -79,7 +87,7 @@ pub fn register_hub_with_server(
     // POST /hubs to register and get server-assigned ID
     let url = format!("{server_url}/hubs");
     let mut payload = serde_json::json!({
-        "identifier": local_identifier,
+        "identifier": server_identifier,
         "device_id": device_id,
     });
     if let Some(ref repo) = repo_name {
@@ -125,8 +133,8 @@ pub fn register_hub_with_server(
     }
 
     // Fallback to local identifier if registration fails
-    log::info!("Using local identifier as fallback: {local_identifier}");
-    local_identifier.to_string()
+    log::info!("Using fallback identifier: {server_identifier}");
+    server_identifier
 }
 
 /// Initialize CryptoService for E2E encryption (vodozemac Olm).

@@ -113,10 +113,9 @@ module CliTestHelper
     def connection_url(timeout: 15)
       return @cached_url if @cached_url
 
-      url_path = File.join(@temp_dir, "hubs", @hub.identifier, "connection_url.txt")
-
       wait_until?(timeout: timeout, poll: 0.3) do
-        if File.exist?(url_path)
+        url_path = resolve_connection_url_path
+        if url_path && File.exist?(url_path)
           content = File.read(url_path).strip
           if content.present?
             @cached_url = content
@@ -146,6 +145,16 @@ module CliTestHelper
     end
 
     private
+
+    def resolve_connection_url_path
+      # Local hub directory is repo/cwd-derived and may not match server-facing
+      # hub identifiers (e.g., BOTSTER_HUB_ID in system tests).
+      direct = File.join(@temp_dir, "hubs", @hub.identifier, "connection_url.txt")
+      return direct if File.exist?(direct)
+
+      matches = Dir.glob(File.join(@temp_dir, "hubs", "*", "connection_url.txt"))
+      matches.first
+    end
 
     def cleanup_socket_file
       uid = Process.uid
