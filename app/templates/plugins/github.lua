@@ -173,8 +173,51 @@ end
 -- Agent Matching
 -- ============================================================================
 
---- Find an existing agent that matches a GitHub event by metadata.
--- Searches all running agents for matching repo + issue_number.
+--- Build a GitHub-scoped dedup key for workspace identity.
+-- @param r string "owner/repo"
+-- @param issue_number number|nil
+-- @param branch_name string|nil
+-- @return string
+local function github_dedup_key(r, issue_number, branch_name)
+    if issue_number then
+        return "github:" .. r .. "#" .. tostring(issue_number)
+    end
+    return "github:" .. r .. ":" .. (branch_name or "main")
+end
+
+--- Build a human-readable workspace title.
+-- @param r string "owner/repo"
+-- @param issue_number number|nil
+-- @param branch_name string|nil
+-- @return string
+local function github_workspace_title(r, issue_number, branch_name)
+    if issue_number then
+        return r .. " — issue #" .. tostring(issue_number)
+    end
+    if branch_name and branch_name ~= "" then
+        return r .. " — " .. branch_name
+    end
+    return r .. " — ad-hoc"
+end
+
+-- ============================================================================
+-- Dedup Key Interceptor (used by core migration, hub_commands, broker)
+-- ============================================================================
+-- Core modules call hooks.call("build_dedup_key", { repo, issue_number, branch_name })
+-- to let plugins build dedup keys opaquely. This interceptor claims repo-based
+-- data and returns GitHub-formatted keys. Without this, core uses a generic fallback.
+
+hooks.intercept("build_dedup_key", "github_dedup", function(context)
+    if not context or not context.repo then return context end
+    return {
+        dedup_key = github_dedup_key(context.repo, context.issue_number, context.branch_name),
+        title = github_workspace_title(context.repo, context.issue_number, context.branch_name),
+        metadata = { repo = context.repo, issue_number = context.issue_number },
+    }
+end)
+
+--- Find an existing agent that matches a GitHub event by dedup_key.
+-- Searches all running agents for matching workspace identity.
 --
 -- @param event_repo string "owner/repo"
 -- @param payload table The event payload
@@ -183,21 +226,16 @@ local function find_matching_agent(event_repo, payload)
     local issue_number = payload.issue_number
     if not issue_number then return nil end
 
-    for _, agent in ipairs(Agent.find_by_meta("issue_number", issue_number)) do
-        if agent.repo == event_repo then
-            return agent
-        end
-    end
+    local dk = github_dedup_key(event_repo, issue_number)
+    local matches = Agent.find_by_dedup_key(dk)
+    if #matches > 0 then return matches[1] end
 
     -- PR routing: if this came from a PR routed to an issue, check the target
     local ctx = payload.structured_context
     if ctx and ctx.routed_to and ctx.routed_to.number then
-        local target = ctx.routed_to.number
-        for _, agent in ipairs(Agent.find_by_meta("issue_number", target)) do
-            if agent.repo == event_repo then
-                return agent
-            end
-        end
+        local target_dk = github_dedup_key(event_repo, ctx.routed_to.number)
+        local target_matches = Agent.find_by_dedup_key(target_dk)
+        if #target_matches > 0 then return target_matches[1] end
     end
 
     return nil
@@ -298,17 +336,16 @@ action_cable.subscribe(conn, "Github::EventsChannel",
         local event_repo = message.repo or repo
 
         if message.event_type == "agent_cleanup" then
-            -- PR closed or issue closed — delete matching agents by metadata
+            -- PR closed or issue closed — delete matching agents by dedup_key
             if payload.issue_number then
-                local matches = Agent.find_by_meta("issue_number", payload.issue_number)
+                local dk = github_dedup_key(event_repo, payload.issue_number)
+                local matches = Agent.find_by_dedup_key(dk)
                 for _, agent in ipairs(matches) do
-                    if agent.repo == event_repo then
-                        events.emit("command_message", {
-                            type = "delete_agent",
-                            agent_id = agent:agent_key(),
-                            delete_worktree = false,
-                        })
-                    end
+                    events.emit("command_message", {
+                        type = "delete_agent",
+                        agent_id = agent:agent_key(),
+                        delete_worktree = false,
+                    })
                 end
             end
         else
@@ -317,14 +354,20 @@ action_cable.subscribe(conn, "Github::EventsChannel",
             if existing then
                 notify_agent(existing, payload)
             else
+                local issue_num = payload.issue_number
+                local dk = github_dedup_key(event_repo, issue_num)
+                local title = github_workspace_title(event_repo, issue_num)
                 events.emit("command_message", {
                     type = "create_agent",
-                    issue_or_branch = payload.issue_number and tostring(payload.issue_number),
+                    issue_or_branch = issue_num and tostring(issue_num),
                     prompt = payload.prompt or payload.context or payload.comment_body,
                     repo = event_repo,
                     metadata = {
-                        issue_number = payload.issue_number,
+                        issue_number = issue_num,
                         invocation_url = payload.issue_url,
+                        dedup_key = dk,
+                        workspace_title = title,
+                        workspace_metadata = { repo = event_repo, issue_number = issue_num },
                     },
                 })
             end
@@ -344,5 +387,7 @@ return {
             timer.cancel(_proxy_state.refresh_timer)
             _proxy_state._started = false
         end
+        -- Unregister interceptor so it gets re-registered on reload
+        hooks.unintercept("build_dedup_key", "github_dedup")
     end,
 }

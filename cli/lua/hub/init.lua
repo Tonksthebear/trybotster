@@ -173,6 +173,11 @@ do
             if not mig_ok then
                 log.warn(string.format("Workspace store migration error: %s", tostring(mig_err)))
             end
+            -- Convert v1 workspace manifests (repo/issue_number) to dedup_key format.
+            local mig2_ok, mig2_err = pcall(ws.migrate_v2, ws_data_dir)
+            if not mig2_ok then
+                log.warn(string.format("Workspace store v2 migration error: %s", tostring(mig2_err)))
+            end
         else
             log.warn(string.format("Could not load lib.workspace_store: %s", tostring(ws)))
         end
