@@ -203,12 +203,20 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
     -- are set when the client subscribes to the terminal channel via pty_clients.
     local dims = { rows = 24, cols = 80 }
 
+    -- Extract workspace fields from metadata (set by plugins) before passing to Agent.new
+    local dedup_key = metadata and metadata.dedup_key or nil
+    local workspace_title = metadata and metadata.workspace_title or nil
+    local workspace_metadata = metadata and metadata.workspace_metadata or nil
+
     local ok, agent = pcall(Agent.new, {
         repo = repo,
         branch_name = branch_name,
         worktree_path = wt_path,
         prompt = prompt,
         metadata = metadata,
+        dedup_key = dedup_key,
+        workspace_title = workspace_title,
+        workspace_metadata = workspace_metadata,
         sessions = sessions,
         dims = dims,
         agent_key = agent_key,
@@ -465,17 +473,23 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
     if msg_type == "create_agent" then
         local issue_or_branch = message.issue_or_branch or message.branch
 
-        -- Check if any agents already exist for this issue/repo — notify them
+        -- Check if any agents already exist for this workspace — notify them
         if issue_or_branch then
-            local repo = message.repo or config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
-            local issue_number, _ = parse_issue_or_branch(issue_or_branch)
-
-            -- Search by metadata (repo + issue_number)
+            local meta = message.metadata or {}
             local existing = {}
-            if issue_number then
-                for _, agent in ipairs(Agent.find_by_meta("issue_number", issue_number)) do
-                    if agent.repo == repo then
-                        existing[#existing + 1] = agent
+
+            -- Prefer dedup_key from plugin metadata for matching
+            if meta.dedup_key then
+                existing = Agent.find_by_dedup_key(meta.dedup_key)
+            else
+                -- Fallback: legacy match by issue_number + repo
+                local repo = message.repo or config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
+                local issue_number, _ = parse_issue_or_branch(issue_or_branch)
+                if issue_number then
+                    for _, agent in ipairs(Agent.find_by_meta("issue_number", issue_number)) do
+                        if agent.repo == repo then
+                            existing[#existing + 1] = agent
+                        end
                     end
                 end
             end
