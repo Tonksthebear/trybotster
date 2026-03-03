@@ -130,6 +130,9 @@ pub struct SessionInfo {
 pub struct AgentInfo {
     /// Unique agent identifier (session key).
     pub id: String,
+    /// Owning workspace identifier for grouped UI rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     /// Repository name in "owner/repo" format.
     pub repo: Option<String>,
     /// GitHub issue number the agent is working on.
@@ -304,6 +307,7 @@ mod tests {
         let msg = TerminalMessage::Agents {
             agents: vec![AgentInfo {
                 id: "test-id".to_string(),
+                workspace_id: Some("ws-123".to_string()),
                 repo: Some("owner/repo".to_string()),
                 issue_number: Some(42),
                 branch_name: Some("botster-issue-42".to_string()),
