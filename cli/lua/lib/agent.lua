@@ -38,6 +38,9 @@ local port_state = state.get("agent_port_state", { next_port = 8080 })
 --   worktree_path   string   (required)
 --   prompt          string   (optional)  task description
 --   metadata        table    (optional)  plugin key-value store (e.g., issue_number, invocation_url)
+--   dedup_key       string   (optional)  opaque workspace identity (e.g. "github:owner/repo#42")
+--   workspace_title string   (optional)  human-readable workspace title
+--   workspace_metadata table (optional)  plugin data stored on workspace manifest
 --   sessions        array    (required)  ordered session configs from config resolver:
 --                              { name, command, init_script, notifications, forward_port }
 --   env             table    (optional)  base environment variables
@@ -69,6 +72,13 @@ function Agent.new(config)
         metadata.invocation_url = config.invocation_url
     end
 
+    -- Derive dedup_key fallback from agent_key if not provided by plugin
+    local dedup_key = config.dedup_key
+    if not dedup_key or dedup_key == "" then
+        local fallback_key = config.agent_key or (config.repo:gsub("/", "-") .. "-" .. config.branch_name:gsub("/", "-"))
+        dedup_key = "local:" .. fallback_key
+    end
+
     local self = setmetatable({
         _agent_key = config.agent_key,  -- explicit key (may include suffix for multi-agent)
         repo = config.repo,
@@ -76,6 +86,9 @@ function Agent.new(config)
         worktree_path = config.worktree_path,
         prompt = config.prompt,
         metadata = metadata,
+        dedup_key = dedup_key,
+        _workspace_title = config.workspace_title,
+        _workspace_metadata = config.workspace_metadata or {},
         profile_name = config.profile_name,
         created_at = os.time(),
         status = "running",
@@ -128,13 +141,12 @@ function Agent.new(config)
     if data_dir then
         local ws = require("lib.workspace_store")
         ws.init_dir(data_dir)
-        local issue_number = metadata and metadata.issue_number and tonumber(metadata.issue_number) or nil
         local workspace_id = nil
         local ok_ws, ws_id = pcall(function()
             local id = ws.ensure_workspace(data_dir, {
-                repo = self.repo,
-                issue_number = issue_number,
-                branch_name = self.branch_name,
+                dedup_key = self.dedup_key,
+                title = self._workspace_title or self.dedup_key,
+                metadata = self._workspace_metadata,
                 created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
             })
             return id
@@ -429,23 +441,14 @@ function Agent:_sync_workspace_manifest()
     local ws = require("lib.workspace_store")
     local current = ws.read_workspace(self._data_dir, self._workspace_id) or {}
 
-    local issue_number = self.metadata.issue_number
-    local title
-    if issue_number then
-        title = self.repo .. " — issue #" .. tostring(issue_number)
-    else
-        title = self.repo .. " — " .. self.branch_name
-    end
-
     local manifest = {
-        id           = self._workspace_id,
-        title        = title,
-        repo         = self.repo,
-        issue_number = issue_number,
-        ad_hoc_key   = issue_number and nil or self.branch_name,
-        status       = current.status or "active",
-        created_at   = current.created_at or os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
-        updated_at   = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+        id         = self._workspace_id,
+        title      = self._workspace_title or current.title or self.dedup_key,
+        dedup_key  = self.dedup_key,
+        status     = current.status or "active",
+        created_at = current.created_at or os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
+        updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+        metadata   = current.metadata or self._workspace_metadata or {},
     }
 
     local ok, err = pcall(ws.write_workspace, self._data_dir, self._workspace_id, manifest)
@@ -916,6 +919,7 @@ function Agent:info()
         profile_name = self.profile_name,
         repo = self.repo,
         metadata = self.metadata,
+        dedup_key = self.dedup_key,
         workspace_id = self._workspace_id,
         branch_name = self.branch_name,
         worktree_path = self.worktree_path,
@@ -1002,6 +1006,19 @@ function Agent.find_by_meta(key, value)
     local result = {}
     for _, agent in ipairs(Agent.list()) do
         if agent.metadata and agent.metadata[key] == value then
+            result[#result + 1] = agent
+        end
+    end
+    return result
+end
+
+--- Find all running agents matching a dedup_key.
+-- @param dedup_key string  Opaque workspace identity string
+-- @return array of Agent instances
+function Agent.find_by_dedup_key(dedup_key)
+    local result = {}
+    for _, agent in ipairs(Agent.list()) do
+        if agent.dedup_key == dedup_key then
             result[#result + 1] = agent
         end
     end
