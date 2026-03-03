@@ -37,6 +37,7 @@ use mlua::Lua;
 /// - `hub_discovery.list()` — Discover all running hubs on this machine
 /// - `hub_discovery.is_running(hub_id)` — Check if a specific hub is running
 /// - `hub_discovery.socket_path(hub_id)` — Get the socket path for a hub
+/// - `hub_discovery.manifest_path(hub_id)` — Get the manifest path for a hub
 ///
 /// # Errors
 ///
@@ -106,6 +107,22 @@ pub(crate) fn register(lua: &Lua) -> Result<()> {
         .set("socket_path", socket_path_fn)
         .map_err(|e| anyhow!("Failed to set hub_discovery.socket_path: {e}"))?;
 
+    // hub_discovery.manifest_path(hub_id) -> string
+    //
+    // Returns the runtime manifest path for the given hub ID.
+    let manifest_path_fn = lua
+        .create_function(|_, hub_id: String| {
+            let path = crate::hub::daemon::manifest_path(&hub_id)
+                .map(|p| p.to_string_lossy().into_owned())
+                .map_err(|e| mlua::Error::external(format!("Failed to get manifest path: {e}")))?;
+            Ok(path)
+        })
+        .map_err(|e| anyhow!("Failed to create hub_discovery.manifest_path function: {e}"))?;
+
+    table
+        .set("manifest_path", manifest_path_fn)
+        .map_err(|e| anyhow!("Failed to set hub_discovery.manifest_path: {e}"))?;
+
     lua.globals()
         .set("hub_discovery", table)
         .map_err(|e| anyhow!("Failed to register hub_discovery table globally: {e}"))?;
@@ -135,6 +152,9 @@ mod tests {
         let _: Function = table
             .get("socket_path")
             .expect("hub_discovery.socket_path should exist");
+        let _: Function = table
+            .get("manifest_path")
+            .expect("hub_discovery.manifest_path should exist");
     }
 
     #[test]
