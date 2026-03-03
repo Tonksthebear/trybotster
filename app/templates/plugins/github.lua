@@ -200,6 +200,22 @@ local function github_workspace_title(r, issue_number, branch_name)
     return r .. " — ad-hoc"
 end
 
+-- ============================================================================
+-- Dedup Key Interceptor (used by core migration, hub_commands, broker)
+-- ============================================================================
+-- Core modules call hooks.call("build_dedup_key", { repo, issue_number, branch_name })
+-- to let plugins build dedup keys opaquely. This interceptor claims repo-based
+-- data and returns GitHub-formatted keys. Without this, core uses a generic fallback.
+
+hooks.intercept("build_dedup_key", "github_dedup", function(context)
+    if not context or not context.repo then return context end
+    return {
+        dedup_key = github_dedup_key(context.repo, context.issue_number, context.branch_name),
+        title = github_workspace_title(context.repo, context.issue_number, context.branch_name),
+        metadata = { repo = context.repo, issue_number = context.issue_number },
+    }
+end)
+
 --- Find an existing agent that matches a GitHub event by dedup_key.
 -- Searches all running agents for matching workspace identity.
 --
@@ -371,5 +387,7 @@ return {
             timer.cancel(_proxy_state.refresh_timer)
             _proxy_state._started = false
         end
+        -- Unregister interceptor so it gets re-registered on reload
+        hooks.unintercept("build_dedup_key", "github_dedup")
     end,
 }

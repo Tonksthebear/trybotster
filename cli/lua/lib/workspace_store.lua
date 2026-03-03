@@ -259,7 +259,7 @@ end
 
 --- Find an existing workspace manifest matching a dedup key.
 -- @param data_dir string
--- @param dedup_key string  Opaque identity string (e.g. "github:owner/repo#42")
+-- @param dedup_key string  Opaque identity string constructed by plugins
 -- @return string|nil workspace_id
 -- @return table|nil manifest
 function M.find_workspace(data_dir, dedup_key)
@@ -557,15 +557,28 @@ function M.migrate(data_dir)
         local issue_number = meta.issue_number
         local now          = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
 
-        -- Workspace manifest (dedup_key format)
-        local dedup_key
-        local ws_title
-        if issue_number then
-            dedup_key = "github:" .. ctx.repo .. "#" .. tostring(issue_number)
-            ws_title = ctx.repo .. " — issue #" .. tostring(issue_number)
-        else
-            dedup_key = "github:" .. ctx.repo .. ":" .. ctx.branch_name
-            ws_title = ctx.repo .. " — " .. ctx.branch_name
+        -- Let plugins build dedup_key from legacy fields via interceptor hook.
+        -- If no plugin claims ownership, use a generic fallback format.
+        local migrate_ctx = {
+            repo = ctx.repo,
+            issue_number = issue_number,
+            branch_name = ctx.branch_name,
+        }
+        local result = hooks.call("build_dedup_key", migrate_ctx)
+        local dedup_key = result and result.dedup_key
+        local ws_title = result and result.title
+        local ws_metadata = result and result.metadata
+
+        if not dedup_key then
+            -- Generic fallback: no plugin claimed this data
+            if issue_number then
+                dedup_key = ctx.repo .. "#" .. tostring(issue_number)
+                ws_title = ctx.repo .. " — issue #" .. tostring(issue_number)
+            else
+                dedup_key = ctx.repo .. ":" .. ctx.branch_name
+                ws_title = ctx.repo .. " — " .. ctx.branch_name
+            end
+            ws_metadata = { repo = ctx.repo, issue_number = issue_number }
         end
 
         local workspace_manifest = {
@@ -575,7 +588,7 @@ function M.migrate(data_dir)
             status     = "active",
             created_at = ctx.created_at or now,
             updated_at = now,
-            metadata   = { repo = ctx.repo, issue_number = issue_number },
+            metadata   = ws_metadata or { repo = ctx.repo, issue_number = issue_number },
         }
 
         -- Lift flat broker_session_N / broker_pty_rows_N keys into structured tables
@@ -682,12 +695,25 @@ function M.migrate_v2(data_dir)
     for _, workspace_id in ipairs(entries) do
         local manifest = M.read_workspace(data_dir, workspace_id)
         if manifest and not manifest.dedup_key and manifest.repo then
-            local dedup_key
-            if manifest.issue_number then
-                dedup_key = "github:" .. manifest.repo .. "#" .. tostring(manifest.issue_number)
-            else
-                local branch = manifest.ad_hoc_key or "main"
-                dedup_key = "github:" .. manifest.repo .. ":" .. branch
+            -- Let plugins build dedup_key via interceptor hook (same as migrate).
+            local migrate_ctx = {
+                repo = manifest.repo,
+                issue_number = manifest.issue_number,
+                branch_name = manifest.ad_hoc_key or manifest.branch,
+            }
+            local result = hooks.call("build_dedup_key", migrate_ctx)
+            local dedup_key = result and result.dedup_key
+            local ws_metadata = result and result.metadata
+
+            if not dedup_key then
+                -- Generic fallback
+                if manifest.issue_number then
+                    dedup_key = manifest.repo .. "#" .. tostring(manifest.issue_number)
+                else
+                    local branch = manifest.ad_hoc_key or manifest.branch or "main"
+                    dedup_key = manifest.repo .. ":" .. branch
+                end
+                ws_metadata = { repo = manifest.repo, issue_number = manifest.issue_number }
             end
 
             local migrated = {
@@ -697,7 +723,7 @@ function M.migrate_v2(data_dir)
                 status     = manifest.status,
                 created_at = manifest.created_at,
                 updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
-                metadata   = { repo = manifest.repo, issue_number = manifest.issue_number },
+                metadata   = ws_metadata or { repo = manifest.repo, issue_number = manifest.issue_number },
             }
 
             M.write_workspace(data_dir, workspace_id, migrated)
