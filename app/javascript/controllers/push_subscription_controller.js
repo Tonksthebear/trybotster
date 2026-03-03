@@ -1,7 +1,7 @@
 import { Controller } from "@hotwired/stimulus";
 import { Turbo } from "@hotwired/turbo-rails";
 import bridge from "workers/bridge";
-import { ConnectionManager } from "connections/connection_manager";
+import { HubConnectionManager } from "connections/hub_connection_manager";
 import { HubConnection } from "connections/hub_connection";
 
 /**
@@ -82,7 +82,7 @@ export default class extends Controller {
     this.#setStatus("checking");
 
     try {
-      this.#hubConn = await ConnectionManager.acquire(
+      this.#hubConn = await HubConnectionManager.acquire(
         HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
       );
 
@@ -172,13 +172,13 @@ export default class extends Controller {
       // Connection is already acquired from #queryPushStatus — reuse it.
       // If not connected yet, acquire fresh.
       if (!this.#hubConn) {
-        this.#hubConn = await ConnectionManager.acquire(
+        this.#hubConn = await HubConnectionManager.acquire(
           HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
         );
       }
 
       if (this.hasSourceHubIdValue && this.sourceHubIdValue) {
-        this.#sourceHubConn = await ConnectionManager.acquire(
+        this.#sourceHubConn = await HubConnectionManager.acquire(
           HubConnection, this.sourceHubIdValue, { hubId: this.sourceHubIdValue }
         );
       }
@@ -223,7 +223,7 @@ export default class extends Controller {
 
     try {
       if (!this.#hubConn) {
-        this.#hubConn = await ConnectionManager.acquire(
+        this.#hubConn = await HubConnectionManager.acquire(
           HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
         );
       }
@@ -260,7 +260,7 @@ export default class extends Controller {
     this.#setStatus("disabling");
     try {
       if (!this.#hubConn) {
-        this.#hubConn = await ConnectionManager.acquire(
+        this.#hubConn = await HubConnectionManager.acquire(
           HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
         );
       }
@@ -286,7 +286,7 @@ export default class extends Controller {
     this.#setStatus("testing");
     try {
       if (!this.#hubConn) {
-        this.#hubConn = await ConnectionManager.acquire(
+        this.#hubConn = await HubConnectionManager.acquire(
           HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
         );
       }

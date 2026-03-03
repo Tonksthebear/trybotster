@@ -24,6 +24,18 @@ use crate::hub::{registration, Hub, WebRtcPtyOutput};
 use crate::notifications::push::send_push_direct;
 
 impl Hub {
+    /// Build a single-line preview for ICE candidate logging.
+    fn ice_candidate_preview(candidate: &str) -> String {
+        const MAX: usize = 220;
+        let single_line = candidate.replace('\n', " ").replace('\r', " ");
+        let char_count = single_line.chars().count();
+        if char_count <= MAX {
+            return single_line;
+        }
+        let truncated: String = single_line.chars().take(MAX).collect();
+        format!("{truncated}...<truncated,len={char_count}>")
+    }
+
     /// Legacy polling entrypoint — calls all poll functions + flush.
     ///
     /// Only available in tests. Production uses `run_event_loop()` which drives
@@ -263,10 +275,14 @@ impl Hub {
 
                     // Spawn periodic DC ping task for liveness detection.
                     self.spawn_dc_ping_task(&browser_identity);
-                }
-
-                if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
-                    log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
+                    if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
+                        log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
+                    }
+                } else {
+                    log::warn!(
+                        "[WebRTC] DcOpened for unknown peer {}, ignoring stale open event",
+                        &browser_identity[..browser_identity.len().min(8)]
+                    );
                 }
             }
             HubEvent::WebRtcIngressBackpressure {
@@ -490,10 +506,19 @@ impl Hub {
                         self.handle_webrtc_offer(&sdp, &browser_identity);
                     }
                     HubRequest::HandleIceCandidate { browser_identity, candidate } => {
+                        const MAX_QUEUED_ICE_PER_BROWSER: usize = 128;
                         let candidate_str = candidate
                             .get("candidate")
                             .and_then(|c| c.as_str())
                             .unwrap_or("");
+                        if candidate_str.is_empty() {
+                            // Browser "end-of-candidates" marker. Not an ICE candidate.
+                            log::debug!(
+                                "[Lua] Ignoring empty ICE candidate for {}",
+                                &browser_identity[..browser_identity.len().min(8)]
+                            );
+                            return;
+                        }
                         let sdp_mid = candidate.get("sdpMid").and_then(|m| m.as_str());
                         let sdp_mline_index = candidate
                             .get("sdpMLineIndex")
@@ -506,8 +531,35 @@ impl Hub {
                                     channel.handle_ice_candidate(candidate_str, sdp_mid, sdp_mline_index),
                                 )
                             }) {
-                                log::warn!("[Lua] Failed to add ICE candidate: {e}");
+                                log::warn!(
+                                    "[Lua] Failed to add ICE candidate for {}: {} (mid={:?}, mline={:?}, candidate='{}')",
+                                    &browser_identity[..browser_identity.len().min(8)],
+                                    e,
+                                    sdp_mid,
+                                    sdp_mline_index,
+                                    Self::ice_candidate_preview(candidate_str),
+                                );
                             }
+                        } else if self.webrtc_offer_generation.contains_key(&browser_identity) {
+                            let current_generation = self
+                                .webrtc_offer_generation
+                                .get(&browser_identity)
+                                .copied()
+                                .unwrap_or(0);
+                            let queue = self
+                                .webrtc_pending_ice_candidates
+                                .entry(browser_identity.clone())
+                                .or_default();
+                            queue.push((current_generation, candidate));
+                            if queue.len() > MAX_QUEUED_ICE_PER_BROWSER {
+                                let dropped = queue.len() - MAX_QUEUED_ICE_PER_BROWSER;
+                                queue.drain(..dropped);
+                            }
+                            log::debug!(
+                                "[Lua] Queued ICE candidate while offer in flight for {} (queued={})",
+                                &browser_identity[..browser_identity.len().min(8)],
+                                queue.len()
+                            );
                         } else {
                             log::warn!(
                                 "[Lua] ICE candidate for unknown browser {}",
@@ -709,11 +761,87 @@ impl Hub {
                     );
                 }
             }
-            HubEvent::WebRtcOfferCompleted { browser_identity, channel, encrypted_answer } => {
-                // Re-insert the channel that was removed for async SDP processing.
-                // May overwrite a newer channel if a second offer arrived during
-                // async work — acceptable race, latest connection wins.
-                self.webrtc_channels.insert(browser_identity.clone(), channel);
+            HubEvent::WebRtcOfferCompleted {
+                browser_identity,
+                offer_generation,
+                mut channel,
+                encrypted_answer,
+            } => {
+                let current_generation = self
+                    .webrtc_offer_generation
+                    .get(&browser_identity)
+                    .copied()
+                    .unwrap_or(0);
+                if offer_generation != current_generation {
+                    log::info!(
+                        "[WebRTC] Discarding stale offer completion for {} (got gen {}, current gen {})",
+                        &browser_identity[..browser_identity.len().min(8)],
+                        offer_generation,
+                        current_generation
+                    );
+                    self.tokio_runtime.spawn(async move {
+                        channel.disconnect().await;
+                    });
+                    return;
+                }
+
+                if let Some(mut replaced) = self.webrtc_channels.insert(browser_identity.clone(), channel) {
+                    log::warn!(
+                        "[WebRTC] Replaced existing channel on offer completion for {}, disconnecting replaced channel",
+                        &browser_identity[..browser_identity.len().min(8)]
+                    );
+                    self.tokio_runtime.spawn(async move {
+                        replaced.disconnect().await;
+                    });
+                }
+
+                if let Some(candidates) = self.webrtc_pending_ice_candidates.remove(&browser_identity) {
+                    if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
+                        for (candidate_generation, candidate) in candidates {
+                            if candidate_generation != offer_generation {
+                                log::debug!(
+                                    "[WebRTC] Dropping stale queued ICE candidate for {} (candidate gen {}, current gen {})",
+                                    &browser_identity[..browser_identity.len().min(8)],
+                                    candidate_generation,
+                                    offer_generation
+                                );
+                                continue;
+                            }
+                            let candidate_str = candidate
+                                .get("candidate")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("");
+                            if candidate_str.is_empty() {
+                                log::debug!(
+                                    "[WebRTC] Ignoring empty queued ICE candidate for {}",
+                                    &browser_identity[..browser_identity.len().min(8)]
+                                );
+                                continue;
+                            }
+                            let sdp_mid = candidate.get("sdpMid").and_then(|m| m.as_str());
+                            let sdp_mline_index = candidate
+                                .get("sdpMLineIndex")
+                                .and_then(|i| i.as_u64())
+                                .map(|i| i as u16);
+
+                            if let Err(e) = tokio::task::block_in_place(|| {
+                                self.tokio_runtime.block_on(
+                                    channel.handle_ice_candidate(candidate_str, sdp_mid, sdp_mline_index),
+                                )
+                            }) {
+                                log::warn!(
+                                    "[WebRTC] Failed to apply queued ICE candidate for {}: {} (gen={}, mid={:?}, mline={:?}, candidate='{}')",
+                                    &browser_identity[..browser_identity.len().min(8)],
+                                    e,
+                                    candidate_generation,
+                                    sdp_mid,
+                                    sdp_mline_index,
+                                    Self::ice_candidate_preview(candidate_str),
+                                );
+                            }
+                        }
+                    }
+                }
 
                 if let Some(envelope_value) = encrypted_answer {
                     let data = serde_json::json!({
@@ -1402,6 +1530,9 @@ impl Hub {
 
         // Remove connection start time tracking
         self.webrtc_connection_started.remove(browser_identity);
+        // Remove offer generation tracking for fully-cleaned channels.
+        self.webrtc_offer_generation.remove(browser_identity);
+        self.webrtc_pending_ice_candidates.remove(browser_identity);
 
         // Stop per-peer send task (dropping sender causes task exit)
         if let Some(state) = self.webrtc_send_tasks.remove(browser_identity) {
@@ -3325,6 +3456,14 @@ impl Hub {
         let sdp = sdp.to_string();
         let browser_id = browser_identity.to_string();
         let olm_key = crate::relay::extract_olm_key(browser_identity).to_string();
+        let offer_generation = {
+            let entry = self
+                .webrtc_offer_generation
+                .entry(browser_id.clone())
+                .or_insert(0);
+            *entry += 1;
+            *entry
+        };
 
         // Spawn async task for SDP negotiation + answer encryption.
         // This is the slow path: fetch_ice_config can take 10+ seconds.
@@ -3371,6 +3510,7 @@ impl Hub {
             // Post result back to Hub event loop for Lua relay + channel re-insertion.
             let _ = event_tx.send(super::events::HubEvent::WebRtcOfferCompleted {
                 browser_identity: browser_id,
+                offer_generation,
                 channel,
                 encrypted_answer,
             });

@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { ConnectionManager, HubConnection } from "connections";
+import { HubConnectionManager, HubConnection } from "connections";
 
 /**
  * Shows a prominent QR scan prompt when the connection needs pairing.
@@ -23,7 +23,7 @@ export default class extends Controller {
 
   async #acquireConnection() {
     try {
-      this.connection = await ConnectionManager.acquire(
+      this.connection = await HubConnectionManager.acquire(
         HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
       );
 

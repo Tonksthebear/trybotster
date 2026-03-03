@@ -15,9 +15,10 @@
  *   CLI PTY → WebRTC DataChannel → TerminalConnection.onOutput → onData → Restty WASM
  *   Restty input → sendInput() → TerminalConnection.sendInput → WebRTC → CLI PTY
  */
-import { ConnectionManager, TerminalConnection } from "connections";
+import { HubConnectionManager, TerminalConnection } from "connections";
 
 export class WebRtcPtyTransport {
+  static #RESIZE_DEBOUNCE_MS = 30;
   #hubId;
   #agentIndex;
   #ptyIndex;
@@ -29,6 +30,8 @@ export class WebRtcPtyTransport {
   #onReconnect = null;
   #onConnect = null;
   #onDisconnect = null;
+  #pendingResize = null; // { cols, rows }
+  #pendingResizeTimer = null;
 
   constructor({ hubId, agentIndex, ptyIndex }) {
     this.#hubId = hubId;
@@ -42,6 +45,9 @@ export class WebRtcPtyTransport {
    */
   async connect(options) {
     this.#callbacks = options.callbacks;
+    console.debug(
+      `[WebRtcPtyTransport] connect start hub=${this.#hubId} agent=${this.#agentIndex} pty=${this.#ptyIndex} size=${options.cols}x${options.rows}`,
+    );
 
     const termKey = TerminalConnection.key(
       this.#hubId,
@@ -49,7 +55,7 @@ export class WebRtcPtyTransport {
       this.#ptyIndex,
     );
 
-    this.#terminalConn = await ConnectionManager.acquire(
+    this.#terminalConn = await HubConnectionManager.acquire(
       TerminalConnection,
       termKey,
       {
@@ -61,10 +67,22 @@ export class WebRtcPtyTransport {
       },
     );
 
+    // Restty is reconstructed on view teardown/navigation. Force a fresh
+    // terminal subscribe so CLI replays snapshot/scrollback for this mount.
+    await this.#terminalConn.subscribe({ force: true });
+
     this.#wireEvents();
+    console.debug(
+      `[WebRtcPtyTransport] connect ready hub=${this.#hubId} agent=${this.#agentIndex} pty=${this.#ptyIndex}`,
+    );
   }
 
   disconnect() {
+    if (this.#pendingResizeTimer) {
+      clearTimeout(this.#pendingResizeTimer);
+      this.#pendingResizeTimer = null;
+      this.#pendingResize = null;
+    }
     this.#unsubscribers.forEach((unsub) => unsub());
     this.#unsubscribers = [];
     this.#callbacks = null;
@@ -84,7 +102,19 @@ export class WebRtcPtyTransport {
 
   resize(cols, rows) {
     if (!this.#terminalConn?.isConnected()) return false;
-    this.#terminalConn.sendResize(cols, rows);
+    this.#pendingResize = { cols, rows };
+
+    if (this.#pendingResizeTimer) {
+      clearTimeout(this.#pendingResizeTimer);
+    }
+
+    this.#pendingResizeTimer = setTimeout(() => {
+      const pending = this.#pendingResize;
+      this.#pendingResizeTimer = null;
+      this.#pendingResize = null;
+      if (!pending || !this.#terminalConn?.isConnected()) return;
+      this.#terminalConn.sendResize(pending.cols, pending.rows);
+    }, WebRtcPtyTransport.#RESIZE_DEBOUNCE_MS);
     return true;
   }
 

@@ -51,13 +51,13 @@ class FileInputTest < ApplicationSystemTestCase
 
       (async function() {
         try {
-          var { ConnectionManager } = await import("connections/connection_manager");
+          var { HubConnectionManager } = await import("connections/hub_connection_manager");
           var key = "terminal:" + hubId + ":0:0";
 
           // Wait for TerminalConnection to be created by terminal_display_controller
           var conn = null;
           for (var i = 0; i < 50; i++) {
-            conn = ConnectionManager.get(key);
+            conn = HubConnectionManager.get(key);
             if (conn && conn.isConnected()) break;
             conn = null;
             await new Promise(r => setTimeout(r, 200));
@@ -117,12 +117,12 @@ class FileInputTest < ApplicationSystemTestCase
 
       (async function() {
         try {
-          var { ConnectionManager } = await import("connections/connection_manager");
+          var { HubConnectionManager } = await import("connections/hub_connection_manager");
           var key = "terminal:" + hubId + ":0:0";
 
           var conn = null;
           for (var i = 0; i < 50; i++) {
-            conn = ConnectionManager.get(key);
+            conn = HubConnectionManager.get(key);
             if (conn && conn.isConnected()) break;
             conn = null;
             await new Promise(r => setTimeout(r, 200));

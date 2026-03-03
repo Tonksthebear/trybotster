@@ -22,6 +22,7 @@
 
 use async_trait::async_trait;
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -812,13 +813,65 @@ impl WebRtcChannel {
 
         // Parse the candidate SDP string (browser sends "candidate:..." format)
         let sdp_str = candidate.trim_start_matches("candidate:");
-        let ice_candidate = IceCandidate::from_sdp(sdp_str)
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to parse ICE candidate: {e}")))?;
+        let ice_candidate = match IceCandidate::from_sdp(sdp_str) {
+            Ok(parsed) => parsed,
+            Err(parse_err) => {
+                // Retry with hostname->IP rewrite for mDNS host candidates
+                // (e.g. "xxxx.local"), which some parsers reject.
+                if let Some(rewritten) = Self::rewrite_hostname_candidate_to_ip(sdp_str).await {
+                    match IceCandidate::from_sdp(&rewritten) {
+                        Ok(parsed) => {
+                            log::debug!(
+                                "[WebRTC] Rewrote hostname ICE candidate to IP for parser compatibility"
+                            );
+                            parsed
+                        }
+                        Err(rewrite_err) => {
+                            return Err(ChannelError::ConnectionFailed(format!(
+                                "Failed to parse ICE candidate: {parse_err}; rewrite parse failed: {rewrite_err}"
+                            )));
+                        }
+                    }
+                } else {
+                    return Err(ChannelError::ConnectionFailed(format!(
+                        "Failed to parse ICE candidate: {parse_err}"
+                    )));
+                }
+            }
+        };
 
         pc.add_ice_candidate(ice_candidate)
             .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to add ICE candidate: {e}")))?;
 
         Ok(())
+    }
+
+    /// Rewrite a hostname ICE candidate to an IP candidate when possible.
+    ///
+    /// Browser ICE can include mDNS host candidates (`*.local`) for privacy.
+    /// This keeps compatibility with parsers that only accept numeric IPs.
+    async fn rewrite_hostname_candidate_to_ip(candidate_sdp: &str) -> Option<String> {
+        let mut parts: Vec<String> = candidate_sdp
+            .split_whitespace()
+            .map(std::string::ToString::to_string)
+            .collect();
+
+        // candidate:<foundation> <component> <transport> <priority> <address> <port> ...
+        if parts.len() < 6 {
+            return None;
+        }
+
+        let host = parts[4].clone();
+        let port: u16 = parts[5].parse().ok()?;
+
+        if host.parse::<IpAddr>().is_ok() {
+            return None;
+        }
+
+        let mut resolved = tokio::net::lookup_host((host.as_str(), port)).await.ok()?;
+        let ip = resolved.next()?.ip().to_string();
+        parts[4] = ip;
+        Some(parts.join(" "))
     }
 
     /// Get the peer's Olm identity key for encrypting messages.

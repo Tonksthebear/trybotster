@@ -338,6 +338,8 @@ pub(crate) enum HubEvent {
     WebRtcOfferCompleted {
         /// Browser identity for channel re-insertion and signal routing.
         browser_identity: String,
+        /// Offer generation captured when async processing started.
+        offer_generation: u64,
         /// The WebRTC channel to re-insert into the HashMap.
         channel: crate::channel::WebRtcChannel,
         /// Encrypted answer envelope, ready for Lua relay. `None` on failure.

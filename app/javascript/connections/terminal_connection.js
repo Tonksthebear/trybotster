@@ -19,19 +19,24 @@
  *
  * Usage:
  *   const key = TerminalConnection.key(hubId, agentIndex, ptyIndex);
- *   const term = await ConnectionManager.acquire(TerminalConnection, key, {
+ *   const term = await HubConnectionManager.acquire(TerminalConnection, key, {
  *     hubId, agentIndex, ptyIndex
  *   });
  *   term.onOutput((data) => terminal.write(data));
  *   term.sendInput("ls -la\n");
  */
 
-import { Connection } from "connections/connection";
+import { HubRoute } from "connections/hub_route";
 
-export class TerminalConnection extends Connection {
+export class TerminalConnection extends HubRoute {
   // Snapshot buffering: chunks are held until all arrive, preventing garbled
   // output from partial delivery if the connection drops mid-snapshot.
   #snapshotBuffer = null; // { id, total, chunks: Map<index, Uint8Array>, timer }
+  // Backlog output that can arrive before transport wires onOutput().
+  #earlyOutputBuffer = [];
+  #earlyOutputBytes = 0;
+  static #EARLY_OUTPUT_MAX_BYTES = 2 * 1024 * 1024;
+  static #EARLY_OUTPUT_MAX_ITEMS = 512;
 
   constructor(key, options, manager) {
     super(key, options, manager);
@@ -86,7 +91,7 @@ export class TerminalConnection extends Connection {
           const prefix = message.data[0];
           if (prefix === 0x01) {
             const terminalData = message.data.slice(1);
-            this.emit("output", terminalData);
+            this.#emitOutput(terminalData);
           } else if (prefix === 0x02) {
             this.#handleSnapshotChunk(message.data);
           } else {
@@ -104,7 +109,7 @@ export class TerminalConnection extends Connection {
 
       case "output":
       case "scrollback":
-        this.#emitOutput(message.data, message.compressed);
+        this.#emitDecodedOutput(message.data, message.compressed);
         break;
 
       case "pty_closed":
@@ -134,6 +139,10 @@ export class TerminalConnection extends Connection {
   }
 
   sendResize(cols, rows) {
+    // Keep local geometry in sync with live terminal size so snapshot cursor
+    // validation uses current bounds instead of stale subscribe-time values.
+    this.options.cols = cols;
+    this.options.rows = rows;
     return this.send("resize", { cols, rows });
   }
 
@@ -152,6 +161,8 @@ export class TerminalConnection extends Connection {
       clearTimeout(this.#snapshotBuffer.timer);
       this.#snapshotBuffer = null;
     }
+    this.#earlyOutputBuffer = [];
+    this.#earlyOutputBytes = 0;
     super.destroy();
   }
 
@@ -215,7 +226,7 @@ export class TerminalConnection extends Connection {
 
       this.#snapshotBuffer = null;
       console.debug(`[TerminalConnection] Snapshot ${snapshotId.toString(16)} complete: ${totalChunks} chunks, ${totalLen} bytes`);
-      this.emit("output", this.#validateSnapshotCursor(combined));
+      this.#emitOutput(this.#validateSnapshotCursor(combined));
     }
   }
 
@@ -252,15 +263,15 @@ export class TerminalConnection extends Connection {
     return data;
   }
 
-  async #emitOutput(data, compressed) {
+  async #emitDecodedOutput(data, compressed) {
     if (!data) return;
 
     try {
       const text = compressed ? await this.#decompress(data) : data;
-      this.emit("output", text);
+      this.#emitOutput(text);
     } catch (error) {
       console.error("[TerminalConnection] Failed to decompress:", error);
-      this.emit("output", data);
+      this.#emitOutput(data);
     }
   }
 
@@ -279,7 +290,9 @@ export class TerminalConnection extends Connection {
   // ========== Event helpers ==========
 
   onOutput(callback) {
-    return this.on("output", callback);
+    const unsubscribe = this.on("output", callback);
+    this.#flushEarlyOutput();
+    return unsubscribe;
   }
 
   onConnected(callback) {
@@ -305,5 +318,41 @@ export class TerminalConnection extends Connection {
 
   static key(hubId, agentIndex, ptyIndex = 0) {
     return `terminal:${hubId}:${agentIndex}:${ptyIndex}`;
+  }
+
+  #emitOutput(data) {
+    const listeners = this.subscribers.get("output");
+    if (listeners && listeners.size > 0) {
+      this.emit("output", data);
+      return;
+    }
+
+    const bytes = this.#outputByteLength(data);
+    this.#earlyOutputBuffer.push(data);
+    this.#earlyOutputBytes += bytes;
+
+    while (
+      this.#earlyOutputBuffer.length > TerminalConnection.#EARLY_OUTPUT_MAX_ITEMS ||
+      this.#earlyOutputBytes > TerminalConnection.#EARLY_OUTPUT_MAX_BYTES
+    ) {
+      const dropped = this.#earlyOutputBuffer.shift();
+      this.#earlyOutputBytes -= this.#outputByteLength(dropped);
+    }
+  }
+
+  #flushEarlyOutput() {
+    if (this.#earlyOutputBuffer.length === 0) return;
+    const buffered = this.#earlyOutputBuffer;
+    this.#earlyOutputBuffer = [];
+    this.#earlyOutputBytes = 0;
+    for (const chunk of buffered) {
+      this.emit("output", chunk);
+    }
+  }
+
+  #outputByteLength(data) {
+    if (data instanceof Uint8Array) return data.byteLength;
+    if (typeof data === "string") return data.length;
+    return 0;
   }
 }

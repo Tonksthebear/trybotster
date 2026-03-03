@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { ConnectionManager, HubConnection } from "connections";
+import { HubConnectionManager, HubConnection } from "connections";
 
 /**
  * Agent List Controller
@@ -63,7 +63,7 @@ export default class extends Controller {
     // agentsValueChanged fires automatically on connect if value differs from default,
     // so persisted data from turbo-permanent renders without explicit call
 
-    ConnectionManager.acquire(HubConnection, this.hubIdValue, {
+    HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
     }).then(async (hub) => {
       if (this.#disconnected) {

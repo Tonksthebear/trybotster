@@ -57,7 +57,9 @@ class HubCommandChannel < ApplicationCable::Channel
   end
 
   def heartbeat(data)
-    @hub.update!(alive: true, last_seen_at: Time.current)
+    updated_hub = Hub.update(@hub.id, alive: true, last_seen_at: Time.current)
+    raise ActiveRecord::RecordInvalid, updated_hub if updated_hub.errors.any?
+    @hub = updated_hub
 
     Rails.logger.debug "[HubCommandChannel] Heartbeat from hub=#{@hub.id}"
   end

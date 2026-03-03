@@ -1,9 +1,9 @@
 /**
- * Connection constants — shared by Connection, HealthTracker, and HubEventHandlers.
+ * Connection constants — shared by HubRoute, HealthTracker, and HubEventHandlers.
  *
- * Extracted to break circular dependency: connection.js imports the managers,
- * managers import these constants. A direct import back to connection.js would
- * hit TDZ (temporal dead zone) because connection.js hasn't finished evaluating.
+ * Extracted to break circular dependency: HubRoute imports managers/constants
+ * and manager internals import these constants. Keeping shared enums in this
+ * leaf module avoids TDZ (temporal dead zone) issues during evaluation.
  */
 
 // Connection state (combines browser subscription + CLI handshake status)

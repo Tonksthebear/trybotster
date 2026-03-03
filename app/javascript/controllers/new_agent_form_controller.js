@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { ConnectionManager } from "connections/connection_manager";
+import { HubConnectionManager } from "connections/hub_connection_manager";
 import { HubConnection } from "connections/hub_connection";
 
 /**
@@ -8,7 +8,7 @@ import { HubConnection } from "connections/hub_connection";
  * Step 1: Select existing worktree or enter new branch/issue
  * Step 2: Select profile, optional initial prompt, submit
  *
- * Uses ConnectionManager to acquire connection for sending commands
+ * Uses HubConnectionManager to acquire connection for sending commands
  * and receiving worktree list and profile list updates.
  */
 export default class extends Controller {
@@ -40,7 +40,7 @@ export default class extends Controller {
     this.unsubscribers = [];
 
     // Acquire connection to get worktree list and send commands
-    ConnectionManager.acquire(HubConnection, this.hubIdValue, {
+    HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
       hubId: this.hubIdValue,
     }).then(async (hub) => {
       this.hub = hub;

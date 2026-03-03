@@ -4,10 +4,10 @@
  * Architecture:
  * - Main thread (bridge.js) proxies all crypto operations
  * - Crypto Worker (olm_crypto.js) - SharedWorker handling vodozemac Olm crypto
- * - Transport: WebRTCTransport in main thread (RTCPeerConnection not available in Workers)
+ * - Transport: HubPeerConnection in main thread (RTCPeerConnection not available in Workers)
  *
  * The main thread talks directly to crypto SharedWorker for encrypt/decrypt,
- * and to WebRTCTransport for send/receive.
+ * and to HubPeerConnection for send/receive.
  */
 
 // Singleton instance
@@ -66,10 +66,10 @@ class WorkerBridge {
 
       // 2. Create WebRTC transport (runs in main thread - RTCPeerConnection not available in Workers)
       console.debug(`[WorkerBridge] Using WebRTC transport`)
-      const { default: transport } = await import("transport/webrtc")
+      const { default: transport } = await import("transport/hub_peer_connection")
       webrtcTransport = transport
 
-      // Wire up event forwarding from WebRTCTransport.
+      // Wire up event forwarding from HubPeerConnection.
       // Every event must include { event: "<name>" } so #dispatchEvent can route it.
       webrtcTransport.on("connection:state", (data) => this.#dispatchEvent({ event: "connection:state", ...data }))
       webrtcTransport.on("connection:mode", (data) => this.#dispatchEvent({ event: "connection:mode", ...data }))
@@ -362,8 +362,8 @@ class WorkerBridge {
     }
     this.#eventListeners.get(eventName).add(callback)
 
-    // Events flow: WebRTCTransport → bridge.#dispatchEvent → local listeners.
-    // Do NOT also register with WebRTCTransport directly (set up in #doInit).
+    // Events flow: HubPeerConnection → bridge.#dispatchEvent → local listeners.
+    // Do NOT also register with HubPeerConnection directly (set up in #doInit).
 
     // Return unsubscribe function
     return () => {

@@ -20,18 +20,18 @@
  *
  * Usage:
  *   const key = PreviewConnection.key(hubId, agentIndex, ptyIndex);
- *   const preview = await ConnectionManager.acquire(PreviewConnection, key, {
+ *   const preview = await HubConnectionManager.acquire(PreviewConnection, key, {
  *     hubId, agentIndex, ptyIndex, port: 3000
  *   });
  *   const response = await preview.fetch({ method: "GET", path: "/" });
  */
 
-import { Connection } from "connections/connection"
+import { HubRoute } from "connections/hub_route"
 import { StreamMultiplexer } from "transport/stream_mux"
 import { serializeRequest, HttpResponseParser } from "transport/http_codec"
 import bridge from "workers/bridge"
 
-export class PreviewConnection extends Connection {
+export class PreviewConnection extends HubRoute {
   #mux = null
   #streamFrameUnsub = null
 

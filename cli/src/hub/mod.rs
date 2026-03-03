@@ -297,6 +297,21 @@ pub struct Hub {
     /// signal fires before anyone is waiting.
     webrtc_pending_closes: std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>,
 
+    /// Monotonic offer generation per browser identity.
+    ///
+    /// Each new WebRTC offer increments the browser's generation. Async
+    /// `WebRtcOfferCompleted` events include the generation they started with,
+    /// allowing the hub to discard stale completions instead of re-inserting
+    /// outdated channels.
+    webrtc_offer_generation: std::collections::HashMap<String, u64>,
+
+    /// ICE candidates that arrived before the peer channel was re-attached.
+    ///
+    /// During async offer negotiation the channel is temporarily removed from
+    /// `webrtc_channels`. Remote ICE can arrive in that window; queue it here
+    /// and drain after `WebRtcOfferCompleted` to avoid dropping connectivity.
+    webrtc_pending_ice_candidates: std::collections::HashMap<String, Vec<(u64, serde_json::Value)>>,
+
     /// Sender for PTY output messages from forwarder tasks.
     ///
     /// Forwarder tasks send PTY output here; main loop drains and sends via WebRTC.
@@ -574,6 +589,8 @@ impl Hub {
             webrtc_send_tasks: std::collections::HashMap::new(),
             dc_ping_tasks: std::collections::HashMap::new(),
             webrtc_pending_closes: std::collections::HashMap::new(),
+            webrtc_offer_generation: std::collections::HashMap::new(),
+            webrtc_pending_ice_candidates: std::collections::HashMap::new(),
             webrtc_pty_output_tx,
             webrtc_pty_output_rx: Some(webrtc_pty_output_rx),
             pty_forwarders: std::collections::HashMap::new(),
@@ -1058,6 +1075,7 @@ impl Hub {
             });
         }
         self.webrtc_connection_started.clear();
+        self.webrtc_pending_ice_candidates.clear();
 
         // Persist crypto session state to disk on shutdown
         if let Some(ref cs) = self.browser.crypto_service {

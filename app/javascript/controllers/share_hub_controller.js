@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus"
-import { ConnectionManager, HubConnection } from "connections"
+import { HubConnectionManager, HubConnection } from "connections"
 
 export default class extends Controller {
   static values = { hubId: String }
@@ -33,7 +33,7 @@ export default class extends Controller {
     this.showLoading()
 
     try {
-      const hub = await ConnectionManager.acquire(HubConnection, this.hubIdValue, {
+      const hub = await HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
         hubId: this.hubIdValue
       })
 
