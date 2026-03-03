@@ -24,10 +24,13 @@
 --   overlay_actions, selected_agent
 --
 -- Client-side state (_tui_state):
---   mode, input_buffer, list_selected, agents, pending_fields, available_worktrees
+--   mode, input_buffer, list_selected, agents, pending_fields, available_worktrees,
+--   flat_list, list_cursor_pos, workspaces, _ws_collapsed
 --
 -- Note: _tui_state.list_selected is 0-based. Lua tables are 1-based,
 -- so add 1 when indexing into Lua arrays (e.g., overlay_actions[list_selected + 1]).
+
+local ws_helpers = require("ui.workspace_helpers")
 
 local M = {}
 
@@ -73,6 +76,49 @@ local function agent_index_for(agent_id)
     if a.id == agent_id then return i - 1 end
   end
   return nil
+end
+
+-- =============================================================================
+-- Workspace flat_list helpers (Phase 3)
+-- =============================================================================
+
+local function rebuild_flat_list()
+  ws_helpers.rebuild_nav_flat_list(_tui_state)
+end
+
+--- Get the flat_list item at the current cursor position.
+local function current_cursor_item()
+  local pos = _tui_state.list_cursor_pos
+  if pos == nil then return nil end
+  local flat = _tui_state.flat_list or {}
+  return flat[pos + 1]  -- 1-based Lua
+end
+
+--- Focus an agent by id, returning ops for terminal focus + mode switch + notification clear.
+local function focus_agent_ops(agent_id, context)
+  local idx = agent_index_for(agent_id)
+  if idx == nil then return {} end
+
+  local agent = nil
+  for _, a in ipairs(_tui_state.agents) do
+    if a.id == agent_id then agent = a; break end
+  end
+  if not agent then return {} end
+
+  _tui_state.selected_agent_index = idx
+  _tui_state.active_pty_index = 0
+
+  local ops = {
+    { op = "focus_terminal", agent_id = agent_id, pty_index = 0, agent_index = idx },
+    set_mode_ops("insert"),
+  }
+  if agent.notification then
+    table.insert(ops, { op = "send_msg", data = {
+      subscriptionId = "tui_hub",
+      data = { type = "clear_notification", agent_index = idx },
+    }})
+  end
+  return ops
 end
 
 --- Dispatch an action string with context, returning compound ops or nil.
@@ -173,6 +219,19 @@ function M.on_action(action, context)
     return { set_mode_ops(base_mode(context)) }
   end
 
+  -- === Workspace collapse toggle (normal mode Enter on workspace header) ===
+  if action == "list_select" and _tui_state.mode == "normal" then
+    local item = current_cursor_item()
+    if item and item.type == "workspace_header" then
+      _tui_state._ws_collapsed = _tui_state._ws_collapsed or {}
+      _tui_state._ws_collapsed[item.workspace_id] = not item.collapsed
+      rebuild_flat_list()
+      return {}
+    end
+    -- On agent: no additional action (already focused by select_next/previous)
+    return nil
+  end
+
   -- === Worktree selection ===
   -- List is 0-based: 0 = "Use Main Branch", 1 = "Create New Worktree", 2+ = existing worktrees
   if action == "list_select" and _tui_state.mode == "new_agent_select_worktree" then
@@ -241,7 +300,7 @@ function M.on_action(action, context)
   if action == "list_select" and _tui_state.mode == "remove_session_select" then
     -- list index is 0-based, and we skipped index 0 (agent session) in the overlay,
     -- so the actual pty_index is list_index + 1
-    local pty_index = (data.index or 0) + 1
+    local pty_index = (_tui_state.list_selected or 0) + 1
     if context.selected_agent then
       return {
         { op = "send_msg", data = {
@@ -377,18 +436,45 @@ function M.on_action(action, context)
     return { set_mode_ops(base_mode(context)) }
   end
 
-  -- === Agent navigation ===
+  -- === Agent/workspace navigation (Phase 3: flat_list aware) ===
+
   if action == "select_next" then
+    -- Phase 3: navigate through the flat_list (workspace headers + agents)
+    local flat = _tui_state.flat_list
+    if flat and #flat > 0 then
+      local current_pos = _tui_state.list_cursor_pos
+      local next_pos
+      if current_pos == nil then
+        next_pos = 0
+      else
+        next_pos = (current_pos + 1) % #flat
+      end
+      -- Skip "creating" items — they're display-only
+      local item = flat[next_pos + 1]
+      if item and item.type == "creating" then
+        next_pos = (next_pos + 1) % #flat
+        item = flat[next_pos + 1]
+      end
+      _tui_state.list_cursor_pos = next_pos
+
+      if item and item.type == "agent" then
+        return focus_agent_ops(item.agent_id, context)
+      end
+      -- Landed on workspace header: switch to normal mode so Enter toggles collapse
+      return { set_mode_ops("normal") }
+    end
+
+    -- Fallback: legacy flat agent navigation (before workspace data arrives)
     local agents = _tui_state.agents
     if #agents == 0 then return nil end
-    local current_idx = _tui_state.selected_agent_index  -- 0-based or nil
+    local current_idx = _tui_state.selected_agent_index
     local next_idx
     if current_idx then
       next_idx = (current_idx + 1) % #agents
     else
       next_idx = 0
     end
-    local next_agent = agents[next_idx + 1]  -- Lua 1-based
+    local next_agent = agents[next_idx + 1]
     if not next_agent then return nil end
     _tui_state.selected_agent_index = next_idx
     _tui_state.active_pty_index = 0
@@ -406,16 +492,42 @@ function M.on_action(action, context)
   end
 
   if action == "select_previous" then
+    -- Phase 3: navigate through the flat_list
+    local flat = _tui_state.flat_list
+    if flat and #flat > 0 then
+      local current_pos = _tui_state.list_cursor_pos
+      local prev_pos
+      if current_pos == nil then
+        prev_pos = #flat - 1
+      else
+        prev_pos = (current_pos - 1 + #flat) % #flat
+      end
+      -- Skip "creating" items
+      local item = flat[prev_pos + 1]
+      if item and item.type == "creating" then
+        prev_pos = (prev_pos - 1 + #flat) % #flat
+        item = flat[prev_pos + 1]
+      end
+      _tui_state.list_cursor_pos = prev_pos
+
+      if item and item.type == "agent" then
+        return focus_agent_ops(item.agent_id, context)
+      end
+      -- Landed on workspace header: switch to normal mode so Enter toggles collapse
+      return { set_mode_ops("normal") }
+    end
+
+    -- Fallback: legacy flat agent navigation
     local agents = _tui_state.agents
     if #agents == 0 then return nil end
-    local current_idx = _tui_state.selected_agent_index  -- 0-based or nil
+    local current_idx = _tui_state.selected_agent_index
     local prev_idx
     if current_idx then
       prev_idx = (current_idx - 1 + #agents) % #agents
     else
       prev_idx = #agents - 1
     end
-    local prev_agent = agents[prev_idx + 1]  -- Lua 1-based
+    local prev_agent = agents[prev_idx + 1]
     if not prev_agent then return nil end
     _tui_state.selected_agent_index = prev_idx
     _tui_state.active_pty_index = 0
