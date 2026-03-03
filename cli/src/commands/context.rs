@@ -7,7 +7,7 @@
 //! # Sources (higher priority wins)
 //!
 //! 1. Worktree `.botster/context.json` — repo, branch_name, prompt, metadata.*
-//! 2. Agent env vars — agent_key, hub_id, hub_socket, worktree_path
+//! 2. Agent env vars — agent_key, hub_id, hub_socket, hub_manifest_path, worktree_path
 //!
 //! # Examples
 //!
@@ -26,6 +26,7 @@ const AGENT_ENV_KEYS: &[(&str, &str)] = &[
     ("agent_key", "BOTSTER_AGENT_KEY"),
     ("hub_id", "BOTSTER_HUB_ID"),
     ("hub_socket", "BOTSTER_HUB_SOCKET"),
+    ("hub_manifest_path", "BOTSTER_HUB_MANIFEST_PATH"),
     ("worktree_path", "BOTSTER_WORKTREE_PATH"),
     ("prompt", "BOTSTER_PROMPT"),
 ];
@@ -67,7 +68,7 @@ fn build_from_json(worktree_ctx: Option<serde_json::Value>) -> BTreeMap<String, 
     // 1. Load worktree-level context (lower priority, loaded first)
     if let Some(ref json) = worktree_ctx {
         // Top-level string fields
-        for field in &["repo", "branch_name", "prompt", "hub_socket"] {
+        for field in &["repo", "branch_name", "prompt", "hub_socket", "hub_manifest_path"] {
             if let Some(val) = json.get(*field).and_then(|v| v.as_str()) {
                 if !val.is_empty() {
                     ctx.insert((*field).to_string(), val.to_string());
