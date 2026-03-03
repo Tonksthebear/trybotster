@@ -246,10 +246,12 @@ end
 -- Uses Agent registry for rich metadata (repo, issue, branch, status, etc.).
 -- @param sub_id The subscription ID to send to
 function Client:send_agent_list(sub_id)
+    local payload = require("lib.agent_list_payload").build(Agent.all_info())
     self:send({
         subscriptionId = sub_id,
         type = "agent_list",
-        agents = Agent.all_info(),
+        agents = payload.agents,
+        workspaces = payload.workspaces,
     })
 end
 
