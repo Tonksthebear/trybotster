@@ -156,6 +156,18 @@ pub fn resolve_socket_for_server_id(server_id: &str) -> Option<PathBuf> {
     None
 }
 
+/// Resolve a hub socket by local hub ID using its persisted runtime manifest.
+///
+/// Returns `None` when the manifest is missing or stale (dead PID / missing socket).
+pub fn resolve_socket_for_hub_id(hub_id: &str) -> Option<PathBuf> {
+    let manifest = read_manifest(hub_id)?;
+    if !manifest_is_live(&manifest) {
+        cleanup_stale_files(&manifest.hub_id);
+        return None;
+    }
+    Some(PathBuf::from(manifest.socket_path))
+}
+
 /// Read the PID from a hub's PID file.
 ///
 /// Returns `None` if the file doesn't exist or can't be parsed.
@@ -378,6 +390,18 @@ mod tests {
         let socket =
             resolve_socket_for_server_id("hub-server-id-xyz").expect("socket should resolve");
         assert!(socket.to_string_lossy().ends_with(&format!("/{test_id}.sock")));
+        cleanup_on_shutdown(&test_id);
+    }
+
+    #[test]
+    fn test_resolve_socket_for_hub_id() {
+        let test_id = format!("_test_local_lookup_{}", std::process::id());
+        write_manifest(&test_id, Some("ignored-server-id")).unwrap();
+        // Make the socket path exist so liveness check passes.
+        let socket = socket_path(&test_id).unwrap();
+        fs::write(&socket, b"").unwrap();
+        let resolved = resolve_socket_for_hub_id(&test_id).expect("socket should resolve");
+        assert!(resolved.to_string_lossy().ends_with(&format!("/{test_id}.sock")));
         cleanup_on_shutdown(&test_id);
     }
 

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "digest"
 require_relative "wait_helper"
 
 # Helper module for spawning and managing CLI instances in system tests.
@@ -31,6 +32,7 @@ module CliTestHelper
 
   CLI_PATH = Rails.root.join("cli").freeze
   CLI_BINARY = CLI_PATH.join("target/debug/botster").freeze
+  HUB_ID_HEX_LENGTH = 32
 
   # Represents a running CLI instance
   class CliProcess
@@ -113,10 +115,9 @@ module CliTestHelper
     def connection_url(timeout: 15)
       return @cached_url if @cached_url
 
-      url_path = File.join(@temp_dir, "hubs", @hub.identifier, "connection_url.txt")
-
       wait_until?(timeout: timeout, poll: 0.3) do
-        if File.exist?(url_path)
+        url_path = resolve_connection_url_path
+        if url_path && File.exist?(url_path)
           content = File.read(url_path).strip
           if content.present?
             @cached_url = content
@@ -146,6 +147,16 @@ module CliTestHelper
     end
 
     private
+
+    def resolve_connection_url_path
+      # Local hub directory is repo/cwd-derived and may not match server-facing
+      # hub identifiers.
+      direct = File.join(@temp_dir, "hubs", @hub.identifier, "connection_url.txt")
+      return direct if File.exist?(direct)
+
+      matches = Dir.glob(File.join(@temp_dir, "hubs", "*", "connection_url.txt"))
+      matches.first
+    end
 
     def cleanup_socket_file
       uid = Process.uid
@@ -179,6 +190,10 @@ module CliTestHelper
 
     # Create temp directory for CLI data
     temp_dir = Dir.mktmpdir("cli_test_")
+    # Match CLI local hub identity (repo/cwd hash) without env overrides.
+    # This keeps tests aligned with production behavior.
+    local_hub_identifier = local_hub_id_for_path(temp_dir)
+    hub.update_column(:identifier, local_hub_identifier) if hub.identifier != local_hub_identifier
 
     # Create device token for CLI authentication
     device_token = create_device_token_for_hub(hub)
@@ -196,7 +211,6 @@ module CliTestHelper
       "BOTSTER_CONFIG_DIR" => temp_dir,
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_TOKEN" => api_key,  # Use BOTSTER_TOKEN (takes precedence over BOTSTER_API_KEY)
-      "BOTSTER_HUB_ID" => hub.identifier,  # Use string identifier for find_or_initialize_by lookup
       "BOTSTER_REPO" => "test/repo",  # Optional — used for GitHub event subscription
       "RUST_LOG" => options[:log_level] || "info,botster=debug"
     }
@@ -335,6 +349,13 @@ module CliTestHelper
       fingerprint: SecureRandom.hex(8).scan(/../).join(":")
     )
     device.create_device_token!(name: name)
+  end
+
+  def local_hub_id_for_path(path)
+    canonical = File.realpath(path)
+    Digest::SHA256.hexdigest(canonical)[0, HUB_ID_HEX_LENGTH]
+  rescue Errno::ENOENT
+    Digest::SHA256.hexdigest(File.expand_path(path))[0, HUB_ID_HEX_LENGTH]
   end
 
   def cli_binary_current?
