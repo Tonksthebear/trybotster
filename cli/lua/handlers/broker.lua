@@ -240,10 +240,22 @@ local function process_context_file(context_path, in_worktree, ghost_infos, seen
     -- "orphaned" is set when the broker had no live sessions for this agent,
     -- meaning history was reconstructed from tee logs (or is empty if logs
     -- were missing).  The TUI can use this to show a read-only/orphaned badge.
+    -- Derive dedup_key from legacy context fields
+    local legacy_dedup_key = nil
+    if ctx.repo then
+        local issue_num = meta and meta.issue_number or nil
+        if issue_num then
+            legacy_dedup_key = "github:" .. ctx.repo .. "#" .. tostring(issue_num)
+        elseif ctx.branch_name then
+            legacy_dedup_key = "github:" .. ctx.repo .. ":" .. ctx.branch_name
+        end
+    end
+
     local ghost_info = {
         id           = agent_key,
         agent_index  = agent_idx,
         workspace_id = nil,
+        dedup_key    = legacy_dedup_key,
         display_name = ctx.branch_name or agent_key,
         title        = nil,
         cwd          = wt_path,
@@ -414,10 +426,15 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
         if dims.cols  then ghost_meta["broker_pty_cols_" .. k] = tostring(dims.cols)  end
     end
 
+    -- Read workspace manifest for dedup_key
+    local ws_manifest = ws.read_workspace(data_dir, workspace_id)
+    local dedup_key = ws_manifest and ws_manifest.dedup_key or nil
+
     local ghost_info = {
         id            = agent_key,
         agent_index   = agent_idx,
         workspace_id  = workspace_id,
+        dedup_key     = dedup_key,
         display_name  = sess.branch or agent_key,
         title         = nil,
         cwd           = sess.worktree_path,

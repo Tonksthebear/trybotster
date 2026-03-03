@@ -257,35 +257,13 @@ function M.read_workspace(data_dir, workspace_id)
     return manifest
 end
 
---- Build a workspace title from identity fields.
--- @param repo string
--- @param issue_number number|nil
--- @param branch_name string|nil
--- @return string
-local function workspace_title(repo, issue_number, branch_name)
-    if issue_number then
-        return repo .. " — issue #" .. tostring(issue_number)
-    end
-    if branch_name and branch_name ~= "" then
-        return repo .. " — " .. branch_name
-    end
-    return repo .. " — ad-hoc"
-end
-
---- Find an existing workspace manifest matching repo + issue or ad-hoc key.
--- Issue workspaces match on (repo, issue_number).
--- Ad-hoc workspaces match on (repo, ad_hoc_key) where ad_hoc_key defaults to branch.
+--- Find an existing workspace manifest matching a dedup key.
 -- @param data_dir string
--- @param opts table { repo, issue_number, branch_name }
+-- @param dedup_key string  Opaque identity string (e.g. "github:owner/repo#42")
 -- @return string|nil workspace_id
 -- @return table|nil manifest
-function M.find_workspace(data_dir, opts)
-    local repo = opts and opts.repo or nil
-    if not repo or repo == "" then return nil, nil end
-
-    local issue_number = opts and opts.issue_number and tonumber(opts.issue_number) or nil
-    local branch_name = opts and opts.branch_name or nil
-    local ad_hoc_key = branch_name or "main"
+function M.find_workspace(data_dir, dedup_key)
+    if not dedup_key or dedup_key == "" then return nil, nil end
 
     local ws_dir = M.workspaces_dir(data_dir)
     if not fs.exists(ws_dir) then return nil, nil end
@@ -299,18 +277,8 @@ function M.find_workspace(data_dir, opts)
 
     for _, workspace_id in ipairs(entries) do
         local manifest = M.read_workspace(data_dir, workspace_id)
-        if manifest and manifest.repo == repo then
-            local m_issue = manifest.issue_number and tonumber(manifest.issue_number) or nil
-            if issue_number then
-                if m_issue == issue_number then
-                    return workspace_id, manifest
-                end
-            else
-                local m_ad_hoc = manifest.ad_hoc_key or manifest.branch
-                if m_issue == nil and m_ad_hoc == ad_hoc_key then
-                    return workspace_id, manifest
-                end
-            end
+        if manifest and manifest.dedup_key == dedup_key then
+            return workspace_id, manifest
         end
     end
 
@@ -318,22 +286,20 @@ function M.find_workspace(data_dir, opts)
 end
 
 --- Find or create a workspace manifest for a new session.
--- Uses issue-based identity when issue_number is present; otherwise ad-hoc by branch_name.
+-- Callers provide the dedup_key and title; the store matches opaquely.
 -- @param data_dir string
--- @param opts table { repo, issue_number, branch_name, created_at }
+-- @param opts table { dedup_key, title, metadata, created_at }
 -- @return string|nil workspace_id
 -- @return table|nil manifest
 -- @return boolean created_new
 function M.ensure_workspace(data_dir, opts)
-    local repo = opts and opts.repo or "unknown/repo"
-    local issue_number = opts and opts.issue_number and tonumber(opts.issue_number) or nil
-    local branch_name = opts and opts.branch_name or "main"
+    local dedup_key = opts and opts.dedup_key
+    if not dedup_key or dedup_key == "" then
+        log.warn("[workspace_store] ensure_workspace: missing dedup_key")
+        return nil, nil, false
+    end
 
-    local existing_id, existing_manifest = M.find_workspace(data_dir, {
-        repo = repo,
-        issue_number = issue_number,
-        branch_name = branch_name,
-    })
+    local existing_id, existing_manifest = M.find_workspace(data_dir, dedup_key)
     if existing_id then
         return existing_id, existing_manifest, false
     end
@@ -341,14 +307,13 @@ function M.ensure_workspace(data_dir, opts)
     local workspace_id = M.generate_workspace_id()
     local now = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
     local manifest = {
-        id           = workspace_id,
-        title        = workspace_title(repo, issue_number, branch_name),
-        repo         = repo,
-        issue_number = issue_number,
-        ad_hoc_key   = issue_number and nil or branch_name,
-        status       = "active",
-        created_at   = opts and opts.created_at or now,
-        updated_at   = now,
+        id         = workspace_id,
+        title      = opts.title or dedup_key,
+        dedup_key  = dedup_key,
+        status     = "active",
+        created_at = opts.created_at or now,
+        updated_at = now,
+        metadata   = opts.metadata or {},
     }
 
     local ok = M.write_workspace(data_dir, workspace_id, manifest)
@@ -466,12 +431,12 @@ function M.build_workspace_groups(data_dir, agents)
             if not by_id[workspace_id] then
                 local manifest = M.read_workspace(data_dir, workspace_id) or {
                     id = workspace_id,
-                    title = workspace_title(agent.repo or "unknown/repo", nil, agent.branch_name),
-                    repo = agent.repo,
-                    issue_number = agent.metadata and agent.metadata.issue_number or nil,
+                    title = agent.dedup_key or (agent.repo or "unknown/repo") .. " — " .. (agent.branch_name or "main"),
+                    dedup_key = agent.dedup_key,
                     status = "active",
                     created_at = nil,
                     updated_at = nil,
+                    metadata = {},
                 }
 
                 -- Read-only status derivation for payloads: avoid write-on-read churn.
@@ -483,11 +448,11 @@ function M.build_workspace_groups(data_dir, agents)
                 by_id[workspace_id] = {
                     id = workspace_id,
                     title = manifest.title,
-                    repo = manifest.repo,
-                    issue_number = manifest.issue_number,
+                    dedup_key = manifest.dedup_key,
                     status = manifest.status,
                     created_at = manifest.created_at,
                     updated_at = manifest.updated_at,
+                    metadata = manifest.metadata or {},
                     agents = {},
                 }
                 grouped[#grouped + 1] = by_id[workspace_id]
@@ -592,23 +557,25 @@ function M.migrate(data_dir)
         local issue_number = meta.issue_number
         local now          = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
 
-        -- Workspace manifest
+        -- Workspace manifest (dedup_key format)
+        local dedup_key
         local ws_title
         if issue_number then
+            dedup_key = "github:" .. ctx.repo .. "#" .. tostring(issue_number)
             ws_title = ctx.repo .. " — issue #" .. tostring(issue_number)
         else
+            dedup_key = "github:" .. ctx.repo .. ":" .. ctx.branch_name
             ws_title = ctx.repo .. " — " .. ctx.branch_name
         end
 
         local workspace_manifest = {
-            id           = workspace_id,
-            title        = ws_title,
-            repo         = ctx.repo,
-            issue_number = issue_number,
-            ad_hoc_key   = issue_number and nil or ctx.branch_name,
-            status       = "active",
-            created_at   = ctx.created_at or now,
-            updated_at   = now,
+            id         = workspace_id,
+            title      = ws_title,
+            dedup_key  = dedup_key,
+            status     = "active",
+            created_at = ctx.created_at or now,
+            updated_at = now,
+            metadata   = { repo = ctx.repo, issue_number = issue_number },
         }
 
         -- Lift flat broker_session_N / broker_pty_rows_N keys into structured tables
@@ -697,6 +664,49 @@ function M.migrate(data_dir)
     if count > 0 then
         log.info(string.format(
             "[workspace_store] Migration complete: %d context.json file(s) migrated", count))
+    end
+end
+
+--- Migrate v1 workspace manifests (repo/issue_number/ad_hoc_key) to dedup_key format.
+-- Scans all workspace manifests. If a manifest has `repo` but no `dedup_key`,
+-- converts to the new schema. Idempotent: already-converted manifests are skipped.
+-- @param data_dir string
+function M.migrate_v2(data_dir)
+    local ws_dir = M.workspaces_dir(data_dir)
+    if not fs.exists(ws_dir) then return end
+
+    local entries, _ = fs.list_dir(ws_dir)
+    if not entries then return end
+
+    local count = 0
+    for _, workspace_id in ipairs(entries) do
+        local manifest = M.read_workspace(data_dir, workspace_id)
+        if manifest and not manifest.dedup_key and manifest.repo then
+            local dedup_key
+            if manifest.issue_number then
+                dedup_key = "github:" .. manifest.repo .. "#" .. tostring(manifest.issue_number)
+            else
+                local branch = manifest.ad_hoc_key or "main"
+                dedup_key = "github:" .. manifest.repo .. ":" .. branch
+            end
+
+            local migrated = {
+                id         = manifest.id,
+                title      = manifest.title,
+                dedup_key  = dedup_key,
+                status     = manifest.status,
+                created_at = manifest.created_at,
+                updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+                metadata   = { repo = manifest.repo, issue_number = manifest.issue_number },
+            }
+
+            M.write_workspace(data_dir, workspace_id, migrated)
+            count = count + 1
+        end
+    end
+
+    if count > 0 then
+        log.info(string.format("[workspace_store] migrate_v2: %d workspace(s) converted to dedup_key", count))
     end
 end
 

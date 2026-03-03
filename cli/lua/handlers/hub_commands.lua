@@ -77,29 +77,51 @@ handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
 
             if event_type == "create_agent" then
                 local payload = message.payload or {}
+                local cmd_repo = config.env("BOTSTER_REPO") or hub.detect_repo()
+                local issue_num = payload.issue_number
+                -- Build dedup_key and title if we have enough context
+                local dk = nil
+                local ws_title = nil
+                if cmd_repo and issue_num then
+                    dk = "github:" .. cmd_repo .. "#" .. tostring(issue_num)
+                    ws_title = cmd_repo .. " — issue #" .. tostring(issue_num)
+                elseif cmd_repo then
+                    dk = "github:" .. cmd_repo .. ":main"
+                end
                 events.emit("command_message", {
                     type = "create_agent",
-                    issue_or_branch = payload.issue_number and tostring(payload.issue_number),
+                    issue_or_branch = issue_num and tostring(issue_num),
                     prompt = payload.prompt or payload.context or payload.comment_body,
-                    repo = config.env("BOTSTER_REPO") or hub.detect_repo(),
+                    repo = cmd_repo,
                     metadata = {
-                        issue_number = payload.issue_number,
+                        issue_number = issue_num,
                         invocation_url = payload.issue_url,
+                        dedup_key = dk,
+                        workspace_title = ws_title,
+                        workspace_metadata = cmd_repo and { repo = cmd_repo, issue_number = issue_num } or nil,
                     },
                 })
             elseif event_type == "agent_cleanup" then
                 local payload = message.payload or {}
-                local repo = config.env("BOTSTER_REPO") or hub.detect_repo() or ""
+                local cmd_repo = config.env("BOTSTER_REPO") or hub.detect_repo() or ""
                 if payload.issue_number then
-                    local matches = Agent.find_by_meta("issue_number", payload.issue_number)
-                    for _, agent in ipairs(matches) do
-                        if agent.repo == repo then
-                            events.emit("command_message", {
-                                type = "delete_agent",
-                                agent_id = agent:agent_key(),
-                                delete_worktree = false,
-                            })
+                    -- Match by dedup_key, falling back to legacy metadata match
+                    local dk = "github:" .. cmd_repo .. "#" .. tostring(payload.issue_number)
+                    local matches = Agent.find_by_dedup_key(dk)
+                    if #matches == 0 then
+                        -- Fallback for agents created before dedup_key migration
+                        for _, agent in ipairs(Agent.find_by_meta("issue_number", payload.issue_number)) do
+                            if agent.repo == cmd_repo then
+                                matches[#matches + 1] = agent
+                            end
                         end
+                    end
+                    for _, agent in ipairs(matches) do
+                        events.emit("command_message", {
+                            type = "delete_agent",
+                            agent_id = agent:agent_key(),
+                            delete_worktree = false,
+                        })
                     end
                 end
             else
