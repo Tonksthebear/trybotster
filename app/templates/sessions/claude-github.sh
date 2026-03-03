@@ -49,7 +49,7 @@ fi
 
 echo "Registering botster hub MCP tools..."
 HUB_SOCKET="$(botster context hub_socket)"
-if [ -n "$HUB_SOCKET" ]; then
+if [ -n "$HUB_SOCKET" ] && [ -S "$HUB_SOCKET" ]; then
   claude mcp add botster-hub -- botster mcp-serve --socket "$HUB_SOCKET"
 else
   claude mcp add botster-hub -- botster mcp-serve
