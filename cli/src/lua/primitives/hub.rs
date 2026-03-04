@@ -796,35 +796,6 @@ pub(crate) fn register(
         .set("hub", hub)
         .map_err(|e| anyhow!("Failed to register hub table globally: {e}"))?;
 
-    // Backward-compatible aliases for Lua handlers not yet updated (Phase 5-6 scope).
-    // These will be removed once the Lua side is updated to use the new names.
-    lua.load(
-        r#"
-        hub.register_agent = function(agent_key, sessions)
-            -- Legacy: register first session handle with agent_key as UUID placeholder
-            local handle = sessions[1]
-            if handle then
-                return hub.register_session(agent_key, handle, { agent_key = agent_key })
-            end
-            return nil
-        end
-        hub.unregister_agent = function(agent_key)
-            return hub.unregister_session(agent_key)
-        end
-        hub.create_ghost_pty = function(agent_key, _pty_index, session_id, rows, cols)
-            return hub.create_ghost_session(agent_key, session_id, rows, cols)
-        end
-        -- Legacy: 3-arg form (handle, key, pty_index) → 2-arg form (handle, key).
-        -- pty_index is silently dropped (single-PTY model).
-        local _new_register_pty = hub.register_pty_with_broker
-        hub.register_pty_with_broker = function(handle, key_or_uuid, _pty_index)
-            return _new_register_pty(handle, key_or_uuid)
-        end
-        "#,
-    )
-    .exec()
-    .map_err(|e| anyhow!("Failed to register backward-compat hub aliases: {e}"))?;
-
     Ok(())
 }
 

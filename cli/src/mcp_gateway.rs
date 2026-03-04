@@ -1,9 +1,8 @@
 //! MCP gateway — rmcp SDK-based stdio server bridging to the hub socket.
 //!
-//! Replaces the hand-rolled JSON-RPC bridge in `mcp_serve.rs` with the
-//! official Rust MCP SDK (`rmcp`). The SDK handles JSON-RPC framing,
-//! method dispatch, and id correlation. This module routes tool/prompt
-//! requests through the existing hub socket `mcp` channel to Lua.
+//! Uses the official Rust MCP SDK (`rmcp`) for JSON-RPC framing, method
+//! dispatch, and id correlation. Routes tool/prompt requests through the
+//! hub socket `mcp` channel to Lua.
 //!
 //! Launched by Claude Code as: `botster mcp-serve --socket /path/to/hub.sock`
 

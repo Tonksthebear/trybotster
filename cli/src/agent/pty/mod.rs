@@ -85,14 +85,6 @@ const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
 /// start missing events. Set high enough to handle bursts of output.
 const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
 
-/// PTY index constants for channel routing.
-pub mod pty_index {
-    /// CLI PTY index (main agent process).
-    pub const CLI: usize = 0;
-    /// Server PTY index (dev server process).
-    pub const SERVER: usize = 1;
-}
-
 /// Event listener that routes alacritty terminal events to the PTY broadcast channel.
 ///
 /// Installed on hub-side shadow screens so that title changes detected by the

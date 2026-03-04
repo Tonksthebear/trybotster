@@ -159,7 +159,7 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
         .set("send_binary", send_binary_fn)
         .map_err(|e| anyhow!("Failed to set socket.send_binary: {e}"))?;
 
-    // socket.create_pty_forwarder({ client_id, agent_index, pty_index, subscription_id })
+    // socket.create_pty_forwarder({ client_id, session_uuid, subscription_id })
     //
     // Creates a PTY forwarder that streams output as Frame::PtyOutput to a socket client.
     let tx_fwd = hub_event_tx_for_pty.clone();

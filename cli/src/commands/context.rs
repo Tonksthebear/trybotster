@@ -56,7 +56,7 @@ pub fn run(key: Option<&str>) -> Result<()> {
 /// Priority: agent-level (env vars) > worktree-level (context.json).
 /// Metadata keys from context.json are flattened into the top-level namespace.
 ///
-/// Public so `mcp_serve` can pass the full context at subscribe time.
+/// Public so `mcp_gateway` can pass the full context at subscribe time.
 pub fn build() -> BTreeMap<String, String> {
     build_from_json(load_context_json())
 }
