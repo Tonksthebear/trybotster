@@ -70,7 +70,7 @@ webrtc.on_peer_disconnected(fn(peer_id))
 webrtc.on_message(fn(peer_id, msg_table))
 webrtc.send(peer_id, table)
 webrtc.send_binary(peer_id, data)
-webrtc.create_pty_forwarder(opts) -- opts: {agent_index, pty_index, peer_id, ...}
+webrtc.create_pty_forwarder(opts) -- opts: {session_uuid, subscription_id, peer_id, prefix, ...}
 ```
 
 ### `tui`

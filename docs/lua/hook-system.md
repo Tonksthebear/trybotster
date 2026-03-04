@@ -33,7 +33,7 @@ Interceptors run in priority order. Each receives the (possibly transformed) out
 | `agent_created` | `connections.lua` | Agent spawned, broadcasts to all clients |
 | `agent_deleted` | `connections.lua` | Agent removed, broadcasts to all clients |
 | `agent_lifecycle` | `connections.lua` | Lifecycle stage changes (creating_worktree, etc.) |
-| `_pty_notification_raw` | `connections.lua` | Internal: enriches raw notification with focus/index |
+| `_pty_notification_raw` | `connections.lua` | Internal: enriches raw notification with focus state |
 | `pty_notification` | `connections.lua` | Sends web push notification |
 | `pty_title_changed` | `connections.lua` | OSC 0/2 title change -> updates agent.title, broadcasts |
 | `pty_cwd_changed` | `connections.lua` | OSC 7 cwd change -> updates agent.cwd, broadcasts |
@@ -81,7 +81,7 @@ These are `LuaRuntime` methods called from the Rust event loop that invoke Lua c
 | `call_webrtc_message(peer_id, msg)` | `webrtc.on_message` | `HubEvent::WebRtcMessage` |
 | `notify_pty_notification(info)` | `hooks.notify("_pty_notification_raw", ...)` | `HubEvent::PtyNotification` |
 | `notify_pty_osc_event(...)` | `hooks.notify("pty_title_changed"/"pty_cwd_changed"/"pty_prompt")` | `HubEvent::PtyOscEvent` |
-| `notify_pty_input(agent_index)` | `_on_pty_input(agent_index)` global | PTY input on notification-active agents |
+| `notify_pty_input(session_uuid)` | `_on_pty_input(session_uuid)` global | PTY input on notification-active sessions |
 | `emit_event(event, data)` | `events.emit(event, data)` | Various `HubEvent` variants |
 | `notify_tui_connected()` | `tui.on_connected` | TUI connect |
 | `notify_tui_disconnected()` | `tui.on_disconnected` | TUI disconnect |
@@ -99,6 +99,6 @@ These are `LuaRuntime` methods called from the Rust event loop that invoke Lua c
 
 | Function | Purpose |
 |----------|---------|
-| `_on_pty_input(agent_index)` | PTY input hot path, clears notifications |
-| `_clear_agent_notification(agent_index)` | Explicit notification clear |
-| `_set_pty_focused(agent_index, pty_index, peer_id, focused)` | Focus state tracking |
+| `_on_pty_input(session_uuid)` | PTY input hot path, clears notifications |
+| `_clear_session_notification(session_uuid)` | Explicit notification clear |
+| `_set_pty_focused(session_uuid, peer_id, focused)` | Focus state tracking |
