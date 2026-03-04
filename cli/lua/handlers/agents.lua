@@ -206,8 +206,8 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
     local dims = { rows = 24, cols = 80 }
 
     -- Extract workspace fields from metadata (set by plugins) before passing to Agent.new
-    local dedup_key = metadata and metadata.dedup_key or nil
-    local workspace_title = metadata and metadata.workspace_title or nil
+    local workspace_name = metadata and metadata.workspace or nil
+    local workspace_id = metadata and metadata.workspace_id or nil
     local workspace_metadata = metadata and metadata.workspace_metadata or nil
 
     local ok, agent = pcall(Agent.new, {
@@ -216,8 +216,8 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
         worktree_path = wt_path,
         prompt = prompt,
         metadata = metadata,
-        dedup_key = dedup_key,
-        workspace_title = workspace_title,
+        workspace = workspace_name,
+        workspace_id = workspace_id,
         workspace_metadata = workspace_metadata,
         sessions = sessions,
         dims = dims,
@@ -499,11 +499,11 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
             local meta = message.metadata or {}
             local existing = {}
 
-            -- Prefer dedup_key from plugin metadata for matching
-            if meta.dedup_key then
-                existing = Agent.find_by_dedup_key(meta.dedup_key)
+            -- Match by workspace name from plugin metadata
+            if meta.workspace then
+                existing = Agent.find_by_workspace(meta.workspace)
             else
-                -- Fallback: legacy match by issue_number + repo
+                -- Fallback: match by issue_number + repo
                 local repo = message.repo or config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
                 local issue_number, _ = parse_issue_or_branch(issue_or_branch)
                 if issue_number then

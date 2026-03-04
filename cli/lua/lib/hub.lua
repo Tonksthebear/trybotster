@@ -358,12 +358,17 @@ end
 -- @param issue_or_branch string Issue number or branch name
 -- @param prompt string|nil Task prompt
 -- @param profile string|nil Config profile name
+-- @param workspace string|nil Workspace name (e.g. "owner/repo#42")
 -- @return string Result message
-function Hub:create_agent(issue_or_branch, prompt, profile)
+function Hub:create_agent(issue_or_branch, prompt, profile, workspace)
     if self._is_local then
         local agents_handler = require("handlers.agents")
+        local metadata = nil
+        if workspace then
+            metadata = { workspace = workspace }
+        end
         local agent, err = agents_handler.handle_create_agent(
-            issue_or_branch, prompt, nil, nil, profile
+            issue_or_branch, prompt, nil, nil, profile, metadata
         )
         if agent then
             return "Agent created: " .. agent:agent_key()
@@ -379,6 +384,7 @@ function Hub:create_agent(issue_or_branch, prompt, profile)
         issue_or_branch = issue_or_branch,
         prompt = prompt,
         profile = profile,
+        workspace = workspace,
     }, 60000)
 
     if result.error then
