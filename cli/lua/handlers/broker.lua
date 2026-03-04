@@ -211,7 +211,8 @@ local function process_context_file(context_path, in_worktree, ghost_infos, seen
         display_name   = ctx.branch_name or agent_key,
         title          = nil,
         cwd            = wt_path,
-        profile_name   = ctx.profile_name,
+        agent_name     = ctx.agent_name or ctx.profile_name,
+        profile_name   = ctx.agent_name or ctx.profile_name,  -- backward compat
         repo           = ctx.repo,
         metadata       = meta,
         branch_name    = ctx.branch_name,
@@ -363,7 +364,8 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
         display_name   = sess.branch or agent_key,
         title          = nil,
         cwd            = sess.worktree_path,
-        profile_name   = sess.profile_name,
+        agent_name     = sess.agent_name or sess.profile_name,
+        profile_name   = sess.agent_name or sess.profile_name,  -- backward compat
         repo           = sess.repo,
         metadata       = ghost_meta,
         branch_name    = sess.branch,
