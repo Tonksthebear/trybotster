@@ -29,8 +29,7 @@ export default class extends Controller {
 
   static values = {
     hubId: String,
-    agentIndex: Number,
-    ptyIndex: { type: Number, default: 0 },
+    sessionUuid: String,
   };
 
   #restty = null;
@@ -161,8 +160,7 @@ export default class extends Controller {
     // 2. Create transport (stores params, no connection yet)
     this.#transport = new WebRtcPtyTransport({
       hubId: this.hubIdValue,
-      agentIndex: this.agentIndexValue,
-      ptyIndex: this.ptyIndexValue,
+      sessionUuid: this.sessionUuidValue,
     });
     this.#transport.onReconnect = () => this.#restty?.clearScreen();
     this.#transport.onConnect = () => {
@@ -175,7 +173,7 @@ export default class extends Controller {
       this.#restty?.setMouseMode("auto");
       this.#hideOverlay();
       // Viewing the terminal clears any pending notification badge
-      this.#hubConn?.clearNotification(this.agentIndexValue);
+      this.#hubConn?.clearNotification(this.sessionUuidValue);
       this.#connected = true;
       this.#updateFocus();
     };
@@ -265,7 +263,7 @@ export default class extends Controller {
       if (!size || size.cols <= 1 || size.rows <= 1) return;
 
       console.debug(
-        `[terminal_display] connectPty ready hub=${this.hubIdValue} agent=${this.agentIndexValue} pty=${this.ptyIndexValue} size=${size.cols}x${size.rows}`,
+        `[terminal_display] connectPty ready hub=${this.hubIdValue} session=${this.sessionUuidValue} size=${size.cols}x${size.rows}`,
       );
       this.#connectPtyRequested = true;
       this.#restty?.connectPty();

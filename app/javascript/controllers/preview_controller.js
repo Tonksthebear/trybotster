@@ -16,8 +16,8 @@
  * Usage:
  *   <div data-controller="preview"
  *        data-preview-hub-id-value="123"
- *        data-preview-agent-index-value="0"
- *        data-preview-scope-value="/hubs/123/agents/0/1/preview">
+ *        data-preview-session-uuid-value="abc-123"
+ *        data-preview-scope-value="/hubs/123/sessions/abc-123/preview">
  *     <iframe data-preview-target="iframe"></iframe>
  *     <span data-preview-target="status"></span>
  *   </div>
@@ -30,8 +30,7 @@ export default class extends Controller {
   static targets = ["iframe", "status", "error"];
   static values = {
     hubId: String,
-    agentIndex: Number,
-    ptyIndex: { type: Number, default: 1 },
+    sessionUuid: String,
     scope: String,
     initialUrl: { type: String, default: "/" },
     port: { type: Number, default: 3000 },
@@ -61,8 +60,7 @@ export default class extends Controller {
       // Acquire preview connection via HubConnectionManager
       const key = PreviewConnection.key(
         this.hubIdValue,
-        this.agentIndexValue,
-        this.ptyIndexValue,
+        this.sessionUuidValue,
       );
 
       this.#connection = await HubConnectionManager.acquire(
@@ -70,8 +68,7 @@ export default class extends Controller {
         key,
         {
           hubId: this.hubIdValue,
-          agentIndex: this.agentIndexValue,
-          ptyIndex: this.ptyIndexValue,
+          sessionUuid: this.sessionUuidValue,
           port: this.portValue,
         },
       );

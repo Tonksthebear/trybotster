@@ -2,7 +2,7 @@
 // Intercepts HTTP requests and proxies them through the E2E WebSocket connection
 // via postMessage to the preview shell page.
 
-const SW_VERSION = '<%= Digest::MD5.hexdigest(File.read(Rails.root.join("app/views/hubs/agents/previews/service_worker.js.erb")))[0..7] %>';
+const SW_VERSION = '<%= Digest::MD5.hexdigest(File.read(Rails.root.join("app/views/hubs/sessions/previews/service_worker.js.erb")))[0..7] %>';
 const SCOPE = '<%= @proxy_base %>';
 
 // Take control immediately
@@ -67,7 +67,7 @@ self.addEventListener('fetch', (event) => {
   let relativePath;
 
   if (url.pathname.startsWith(scopePath + '/')) {
-    // Preview-scoped request: /hubs/123/agents/0/1/preview/api/users -> /api/users
+    // Preview-scoped request: /hubs/123/sessions/abc-uuid/preview/api/users -> /api/users
     relativePath = url.pathname.slice(scopePath.length) || '/';
   } else if (url.pathname.startsWith('/assets/')) {
     // Asset request - only proxy if from proxied iframe content, NOT from shell page

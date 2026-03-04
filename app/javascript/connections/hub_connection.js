@@ -161,14 +161,10 @@ export class HubConnection extends HubRoute {
 
   /**
    * Clear the notification flag on a session.
-   * Accepts session_uuid (preferred) or agent_index (legacy Rails views).
-   * @param {string|number} sessionUuidOrAgentIndex - Session UUID string or agent index number
+   * @param {string} sessionUuid - Session UUID
    */
-  clearNotification(sessionUuidOrAgentIndex) {
-    if (typeof sessionUuidOrAgentIndex === "string") {
-      return this.send("clear_notification", { session_uuid: sessionUuidOrAgentIndex });
-    }
-    return this.send("clear_notification", { agent_index: sessionUuidOrAgentIndex });
+  clearNotification(sessionUuid) {
+    return this.send("clear_notification", { session_uuid: sessionUuid });
   }
 
   /**
@@ -199,14 +195,12 @@ export class HubConnection extends HubRoute {
   }
 
   /**
-   * Remove a PTY session from a running agent.
-   * @param {string} agentId - Agent key
-   * @param {number} ptyIndex - 0-based PTY index to remove (must be > 0)
+   * Remove a session.
+   * @param {string} sessionUuid - Session UUID to remove
    */
-  removeSession(agentId, ptyIndex) {
+  removeSession(sessionUuid) {
     return this.send("remove_session", {
-      agent_id: agentId,
-      pty_index: ptyIndex,
+      session_uuid: sessionUuid,
     });
   }
 
