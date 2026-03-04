@@ -51,6 +51,8 @@ mod server_comms;
 pub mod state;
 
 pub use actions::HubAction;
+pub use agent_handle::{SessionHandle, SessionType};
+// Legacy alias for downstream code still referencing AgentPtys.
 pub use agent_handle::AgentPtys;
 pub use state::{HubState, SharedHubState};
 
@@ -87,10 +89,8 @@ pub struct WebRtcPtyOutput {
     pub browser_identity: String,
     /// Raw PTY data (already prefixed with 0x01 for terminal output).
     pub data: Vec<u8>,
-    /// Agent index for hook context.
-    pub agent_index: usize,
-    /// PTY index for hook context.
-    pub pty_index: usize,
+    /// Session UUID for hook context.
+    pub session_uuid: String,
 }
 
 /// Pending observer notification for PTY output.
@@ -362,11 +362,11 @@ pub struct Hub {
     paste_files: std::collections::HashMap<String, Vec<std::path::PathBuf>>,
 
     // === Handle Cache ===
-    /// Thread-safe cache of agent handles for non-blocking client access.
+    /// Thread-safe cache of session handles for non-blocking client access.
     ///
-    /// Updated by Lua via `hub.register_agent()` and `hub.unregister_agent()`.
-    /// `HandleCache::get_agent()` reads from this cache directly, allowing clients
-    /// to access agent handles without blocking commands - safe from any thread.
+    /// Updated by Lua via `hub.register_session()` and `hub.unregister_session()`.
+    /// `HandleCache::get_session()` reads from this cache directly, allowing clients
+    /// to access session handles without blocking commands - safe from any thread.
     pub handle_cache: Arc<handle_cache::HandleCache>,
 
     // === Lua Scripting ===
@@ -434,12 +434,12 @@ pub struct Hub {
     /// `None` if the broker has not been started or the connection failed.
     pub broker_connection: crate::broker::SharedBrokerConnection,
 
-    /// Maps broker session IDs to their owning agent and PTY index.
+    /// Maps broker session IDs to session UUIDs.
     ///
     /// Populated when Lua fires `HubEvent::BrokerSessionRegistered` after
     /// calling `hub.register_pty_with_broker()`. Used to route incoming
     /// `HubEvent::BrokerPtyOutput` frames to the correct `PtyHandle`.
-    broker_sessions: std::collections::HashMap<u32, (String, usize)>,
+    broker_sessions: std::collections::HashMap<u32, String>,
 
     // === TUI via Lua (Hub-side Processing) ===
     /// Sender for TUI output messages to TuiRunner.

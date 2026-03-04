@@ -168,17 +168,14 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
             let client_id: String = opts
                 .get("client_id")
                 .map_err(|_| LuaError::runtime("client_id is required"))?;
-            let agent_index: usize = opts
-                .get("agent_index")
-                .map_err(|_| LuaError::runtime("agent_index is required"))?;
-            let pty_index: usize = opts
-                .get("pty_index")
-                .map_err(|_| LuaError::runtime("pty_index is required"))?;
+            let session_uuid: String = opts
+                .get("session_uuid")
+                .map_err(|_| LuaError::runtime("session_uuid is required"))?;
             let subscription_id: String = opts
                 .get("subscription_id")
                 .map_err(|_| LuaError::runtime("subscription_id is required"))?;
 
-            let forwarder_id = format!("{}:{}:{}", client_id, agent_index, pty_index);
+            let forwarder_id = format!("{}:{}", client_id, session_uuid);
             let active_flag = Arc::new(Mutex::new(true));
 
             let guard = tx_fwd.lock().expect("HubEventSender mutex poisoned");
@@ -186,8 +183,7 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
                 let _ = sender.send(HubEvent::LuaPtyRequest(
                     PtyRequest::CreateSocketForwarder(CreateSocketForwarderRequest {
                         client_id: client_id.clone(),
-                        agent_index,
-                        pty_index,
+                        session_uuid: session_uuid.clone(),
                         subscription_id,
                         active_flag: Arc::clone(&active_flag),
                     }),
@@ -197,8 +193,7 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
             Ok(PtyForwarder {
                 id: forwarder_id,
                 peer_id: client_id,
-                agent_index,
-                pty_index,
+                session_uuid,
                 active: active_flag,
             })
         })

@@ -1,27 +1,27 @@
-//! Thread-safe cache of agent PTY handles for read-only access.
+//! Thread-safe cache of session PTY handles for read-only access.
 //!
-//! Lua manages agent lifecycle and updates the cache via
-//! `hub.register_agent()` / `hub.unregister_agent()`.
-//! Clients call `HandleCache::get_agent()` to read directly without
+//! Lua manages session lifecycle and updates the cache via
+//! `hub.register_session()` / `hub.unregister_session()`.
+//! Clients call `HandleCache::get_session()` to read directly without
 //! sending commands.
 //!
 //! # Why This Exists
 //!
-//! PTY I/O operations need non-blocking access to agent handles. Blocking
+//! PTY I/O operations need non-blocking access to session handles. Blocking
 //! commands from Hub's thread would deadlock. HandleCache provides direct,
-//! non-blocking access. Lua updates the cache on agent lifecycle events.
+//! non-blocking access. Lua updates the cache on session lifecycle events.
 //!
 //! # Lua Migration
 //!
-//! Agent metadata (repo, issue, status) is managed by Lua. HandleCache
-//! only stores PTY handles (agent_key + Vec<PtyHandle>). Lua enriches
-//! the PTY-level data with its own agent registry.
+//! Session metadata (repo, issue, status) is managed by Lua. HandleCache
+//! only stores PTY handles (session_uuid + PtyHandle). Lua enriches
+//! the PTY-level data with its own session registry.
 //!
 //! # Usage
 //!
-//! - **Hub tick loop**: `HandleCache::get_agent()` reads directly
+//! - **Hub tick loop**: `HandleCache::get_session()` reads directly
 //! - **TuiRunner PTY I/O**: Hub reads from cache to forward input/resize
-//! - **Lua primitives**: `hub.register_agent()` / `hub.unregister_agent()` manage cache
+//! - **Lua primitives**: `hub.register_session()` / `hub.unregister_session()` manage cache
 //!
 //! # Design Principle
 //!
@@ -29,15 +29,16 @@
 //! - HubState contains mutable, non-Sync data (owned by Hub thread)
 //! - HandleCache contains cloneable handles (shared across threads)
 
+use std::collections::HashMap;
 use std::sync::RwLock;
 
-use super::agent_handle::AgentPtys;
+use super::agent_handle::SessionHandle;
 
-/// Thread-safe cache of agent PTY handles and shared read-only data.
+/// Thread-safe cache of session PTY handles and shared read-only data.
 ///
-/// Stores `AgentPtys` instances (agent_key + PTY handles) and other data
+/// Stores `SessionHandle` instances (session_uuid + PtyHandle) and other data
 /// that clients need to read without sending blocking commands through Hub.
-/// Agent metadata (repo, issue, status) is managed by Lua, not cached here.
+/// Session metadata (repo, issue, status) is managed by Lua, not cached here.
 ///
 /// # Thread Safety
 ///
@@ -48,18 +49,24 @@ use super::agent_handle::AgentPtys;
 ///
 /// # Cached Data
 ///
-/// - **Agent PTY handles**: Updated by Lua via `hub.register_agent()` / `hub.unregister_agent()`
-/// - **Worktrees**: Updated when Hub loads worktrees (menu open, agent lifecycle)
+/// - **Session PTY handles**: Updated by Lua via `hub.register_session()` / `hub.unregister_session()`
+/// - **Worktrees**: Updated when Hub loads worktrees (menu open, session lifecycle)
 /// - **Connection URL**: Updated when Hub generates/refreshes the device key bundle
 #[derive(Debug, Default)]
 pub struct HandleCache {
-    /// Agent handles indexed by display order.
-    agents: RwLock<Vec<AgentPtys>>,
+    /// Session handles keyed by session UUID.
+    sessions: RwLock<HashMap<String, SessionHandle>>,
 
-    /// Available worktrees for agent creation.
+    /// Display ordering of session UUIDs.
+    ///
+    /// Maintains the order in which sessions should appear in the UI.
+    /// New sessions are appended; removals shift remaining items.
+    order: RwLock<Vec<String>>,
+
+    /// Available worktrees for session creation.
     ///
     /// Each tuple contains (path, branch_name). Hub updates this when
-    /// worktrees are loaded (e.g., opening New Agent modal, agent lifecycle).
+    /// worktrees are loaded (e.g., opening New Agent modal, session lifecycle).
     worktrees: RwLock<Vec<(String, String)>>,
 
     /// Cached connection URL for browser pairing.
@@ -74,59 +81,74 @@ impl HandleCache {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            agents: RwLock::new(Vec::new()),
+            sessions: RwLock::new(HashMap::new()),
+            order: RwLock::new(Vec::new()),
             worktrees: RwLock::new(Vec::new()),
             connection_url: RwLock::new(None),
         }
     }
 
-    /// Get agent handle by display index.
+    /// Get session handle by UUID.
     ///
-    /// Returns `None` if index is out of bounds or lock is poisoned.
+    /// Returns `None` if UUID is not found or lock is poisoned.
     /// This is a direct read - no command channel involved.
     #[must_use]
-    pub fn get_agent(&self, index: usize) -> Option<AgentPtys> {
-        self.agents
+    pub fn get_session(&self, uuid: &str) -> Option<SessionHandle> {
+        self.sessions
             .read()
             .ok()?
-            .get(index)
+            .get(uuid)
             .cloned()
     }
 
-    /// Get an agent handle by its key string.
+    /// Get session handle by display index (for TUI navigation).
     ///
-    /// Performs a linear scan of the cache — suitable for the low-frequency
-    /// broker output path (at most one lookup per output frame).
-    ///
-    /// Returns `None` if no agent with `key` is registered or the lock is
-    /// poisoned.
+    /// Looks up the UUID in the order vec, then fetches from the map.
+    /// Returns `None` if index is out of bounds or lock is poisoned.
     #[must_use]
-    pub fn get_agent_by_key(&self, key: &str) -> Option<AgentPtys> {
-        self.agents
+    pub fn get_session_by_index(&self, index: usize) -> Option<SessionHandle> {
+        let order = self.order.read().ok()?;
+        let uuid = order.get(index)?;
+        self.sessions.read().ok()?.get(uuid).cloned()
+    }
+
+    /// Get a session handle by its agent_key (display label).
+    ///
+    /// Performs a scan of the cache — suitable for low-frequency lookups.
+    /// Returns `None` if no session with that key is registered.
+    #[must_use]
+    pub fn get_session_by_key(&self, key: &str) -> Option<SessionHandle> {
+        self.sessions
             .read()
             .ok()?
-            .iter()
-            .find(|a| a.agent_key() == key)
+            .values()
+            .find(|s| s.agent_key() == key)
             .cloned()
     }
 
-    /// Get all agent handles.
+    /// Get all session handles in display order.
     ///
     /// Returns empty vec if lock is poisoned.
     #[must_use]
-    pub fn get_all_agents(&self) -> Vec<AgentPtys> {
-        self.agents
-            .read()
-            .map(|agents| agents.clone())
-            .unwrap_or_default()
+    pub fn get_all_sessions(&self) -> Vec<SessionHandle> {
+        let Ok(order) = self.order.read() else {
+            return Vec::new();
+        };
+        let Ok(sessions) = self.sessions.read() else {
+            return Vec::new();
+        };
+        order
+            .iter()
+            .filter_map(|uuid| sessions.get(uuid).cloned())
+            .collect()
     }
 
-    /// Get the number of cached agents.
+    /// Get the number of cached sessions.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.agents
+        self.sessions
             .read()
-            .map(|agents| agents.len())
+            .map(|s| s.len())
             .unwrap_or(0)
     }
 
@@ -136,69 +158,80 @@ impl HandleCache {
         self.len() == 0
     }
 
-    /// Replace all agent handles.
-    ///
-    /// Called by Hub to sync the entire cache with current state.
-    pub fn set_all(&self, handles: Vec<AgentPtys>) {
-        if let Ok(mut agents) = self.agents.write() {
-            *agents = handles;
-        }
+    /// Get the display index for a session UUID.
+    #[must_use]
+    pub fn index_of(&self, uuid: &str) -> Option<usize> {
+        self.order
+            .read()
+            .ok()?
+            .iter()
+            .position(|u| u == uuid)
     }
 
-    /// Add or update an agent handle.
+    /// Add or update a session handle.
     ///
-    /// If an agent with the same key exists, it's replaced.
-    /// Returns the index where the agent was placed.
-    pub fn add_agent(&self, handle: AgentPtys) -> Option<usize> {
-        let mut agents = self.agents.write().ok()?;
-        let key = handle.agent_key().to_string();
+    /// If a session with the same UUID exists, it's replaced (order preserved).
+    /// New sessions are appended to the end of the order list.
+    pub fn add_session(&self, handle: SessionHandle) {
+        let uuid = handle.session_uuid().to_string();
 
-        // Check if agent already exists
-        if let Some(idx) = agents.iter().position(|a| a.agent_key() == key) {
-            agents[idx] = handle;
-            Some(idx)
-        } else {
-            let idx = agents.len();
-            agents.push(handle);
-            Some(idx)
+        if let Ok(mut sessions) = self.sessions.write() {
+            sessions.insert(uuid.clone(), handle);
         }
-    }
 
-    /// Remove an agent by key.
-    ///
-    /// Returns true if the agent was found and removed.
-    pub fn remove_agent(&self, key: &str) -> bool {
-        let Ok(mut agents) = self.agents.write() else {
-            return false;
-        };
-        if let Some(idx) = agents.iter().position(|a| a.agent_key() == key) {
-            agents.remove(idx);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Update an agent's stored index to match its actual position.
-    ///
-    /// Called after `add_agent()` to fix up the `agent_index` field,
-    /// which may differ from the actual position on replace.
-    pub fn update_agent_index(&self, key: &str, index: usize) {
-        if let Ok(mut agents) = self.agents.write() {
-            if let Some(agent) = agents.iter_mut().find(|a| a.agent_key() == key) {
-                agent.set_agent_index(index);
+        // Add to order if not already present
+        if let Ok(mut order) = self.order.write() {
+            if !order.contains(&uuid) {
+                order.push(uuid);
             }
         }
     }
 
-    /// Find agent index by key.
+    /// Remove a session by UUID.
+    ///
+    /// Returns true if the session was found and removed.
+    pub fn remove_session(&self, uuid: &str) -> bool {
+        let removed = if let Ok(mut sessions) = self.sessions.write() {
+            sessions.remove(uuid).is_some()
+        } else {
+            false
+        };
+
+        if removed {
+            if let Ok(mut order) = self.order.write() {
+                order.retain(|u| u != uuid);
+            }
+        }
+
+        removed
+    }
+
+    // =========================================================================
+    // Legacy compatibility methods (delegate to new UUID-based methods)
+    // =========================================================================
+
+    /// Get agent handle by display index.
+    ///
+    /// Legacy compatibility — delegates to `get_session_by_index()`.
     #[must_use]
-    pub fn find_agent_index(&self, key: &str) -> Option<usize> {
-        self.agents
-            .read()
-            .ok()?
-            .iter()
-            .position(|a| a.agent_key() == key)
+    pub fn get_agent(&self, index: usize) -> Option<SessionHandle> {
+        self.get_session_by_index(index)
+    }
+
+    /// Get an agent handle by its key string.
+    ///
+    /// Legacy compatibility — delegates to `get_session_by_key()`.
+    #[must_use]
+    pub fn get_agent_by_key(&self, key: &str) -> Option<SessionHandle> {
+        self.get_session_by_key(key)
+    }
+
+    /// Get all agent handles.
+    ///
+    /// Legacy compatibility — delegates to `get_all_sessions()`.
+    #[must_use]
+    pub fn get_all_agents(&self) -> Vec<SessionHandle> {
+        self.get_all_sessions()
     }
 
     // ============================================================
@@ -219,7 +252,7 @@ impl HandleCache {
     /// Update the cached worktree list.
     ///
     /// Called by Hub when worktrees are loaded (e.g., opening New Agent modal,
-    /// after agent lifecycle events).
+    /// after session lifecycle events).
     pub fn set_worktrees(&self, worktrees: Vec<(String, String)>) {
         if let Ok(mut wt) = self.worktrees.write() {
             *wt = worktrees;
@@ -269,9 +302,6 @@ impl HandleCache {
 mod tests {
     use super::*;
 
-    // Note: These tests use a mock AgentPtys. Full integration tests
-    // will be added after AgentPtys is available.
-
     #[test]
     fn test_new_cache_is_empty() {
         let cache = HandleCache::new();
@@ -280,16 +310,22 @@ mod tests {
     }
 
     #[test]
-    fn test_get_agent_out_of_bounds() {
+    fn test_get_session_not_found() {
         let cache = HandleCache::new();
-        assert!(cache.get_agent(0).is_none());
-        assert!(cache.get_agent(100).is_none());
+        assert!(cache.get_session("nonexistent").is_none());
     }
 
     #[test]
-    fn test_get_all_agents_empty() {
+    fn test_get_session_by_index_out_of_bounds() {
         let cache = HandleCache::new();
-        assert!(cache.get_all_agents().is_empty());
+        assert!(cache.get_session_by_index(0).is_none());
+        assert!(cache.get_session_by_index(100).is_none());
+    }
+
+    #[test]
+    fn test_get_all_sessions_empty() {
+        let cache = HandleCache::new();
+        assert!(cache.get_all_sessions().is_empty());
     }
 
     #[test]

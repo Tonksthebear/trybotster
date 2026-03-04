@@ -2244,16 +2244,15 @@ mod tests {
         let mut rx = runtime.setup_test_event_channel();
 
         runtime.lua().load(r#"
-            hub.write_pty(0, 0, "hello")
+            hub.write_pty("test-session-uuid", "hello")
         "#).exec().unwrap();
 
         let event = rx.try_recv().expect("Should receive event");
         assert!(rx.try_recv().is_err(), "No more events expected");
 
         match event {
-            HubEvent::LuaPtyRequest(PtyRequest::WritePty { agent_index, pty_index, data }) => {
-                assert_eq!(agent_index, 0);
-                assert_eq!(pty_index, 0);
+            HubEvent::LuaPtyRequest(PtyRequest::WritePty { session_uuid, data }) => {
+                assert_eq!(session_uuid, "test-session-uuid");
                 assert_eq!(data, b"hello");
             }
             _ => panic!("Expected LuaPtyRequest WritePty event"),
@@ -2266,16 +2265,15 @@ mod tests {
         let mut rx = runtime.setup_test_event_channel();
 
         runtime.lua().load(r#"
-            hub.resize_pty(1, 0, 50, 100)
+            hub.resize_pty("resize-session-uuid", 50, 100)
         "#).exec().unwrap();
 
         let event = rx.try_recv().expect("Should receive event");
         assert!(rx.try_recv().is_err(), "No more events expected");
 
         match event {
-            HubEvent::LuaPtyRequest(PtyRequest::ResizePty { agent_index, pty_index, rows, cols }) => {
-                assert_eq!(agent_index, 1);
-                assert_eq!(pty_index, 0);
+            HubEvent::LuaPtyRequest(PtyRequest::ResizePty { session_uuid, rows, cols }) => {
+                assert_eq!(session_uuid, "resize-session-uuid");
                 assert_eq!(rows, 50);
                 assert_eq!(cols, 100);
             }
@@ -2291,8 +2289,7 @@ mod tests {
         runtime.lua().load(r#"
             forwarder = webrtc.create_pty_forwarder({
                 peer_id = "test-browser",
-                agent_index = 0,
-                pty_index = 0,
+                session_uuid = "fwd-session-uuid",
                 subscription_id = "sub_1_test",
             })
         "#).exec().unwrap();
@@ -2303,8 +2300,7 @@ mod tests {
         match event {
             HubEvent::LuaPtyRequest(PtyRequest::CreateForwarder(req)) => {
                 assert_eq!(req.peer_id, "test-browser");
-                assert_eq!(req.agent_index, 0);
-                assert_eq!(req.pty_index, 0);
+                assert_eq!(req.session_uuid, "fwd-session-uuid");
                 assert_eq!(req.subscription_id, "sub_1_test");
             }
             _ => panic!("Expected LuaPtyRequest CreateForwarder event"),
@@ -2318,14 +2314,13 @@ mod tests {
         runtime.lua().load(r#"
             forwarder = webrtc.create_pty_forwarder({
                 peer_id = "browser-xyz",
-                agent_index = 2,
-                pty_index = 1,
+                session_uuid = "handle-session-uuid",
                 subscription_id = "sub_2_test",
             })
         "#).exec().unwrap();
 
         let id: String = runtime.lua().load("return forwarder:id()").eval().unwrap();
-        assert_eq!(id, "browser-xyz:2:1");
+        assert_eq!(id, "browser-xyz:handle-session-uuid");
 
         let active: bool = runtime.lua().load("return forwarder:is_active()").eval().unwrap();
         assert!(active);
@@ -3342,14 +3337,22 @@ mod tests {
                     return "" -- alive broker session with no output yet
                 end
 
-                hub.create_ghost_pty = function(_agent_key, _pty_index, _session_id, _rows, _cols)
+                hub.create_ghost_session = function(_session_uuid, _session_id, _rows, _cols)
                     return {{
                         feed_output = function(_self, _data)
                             _test_feed_calls = _test_feed_calls + 1
                         end
                     }}
                 end
+                -- Backward compat alias for Lua handlers not yet updated (Phase 5-6 scope)
+                hub.create_ghost_pty = function(_agent_key, _pty_index, _session_id, _rows, _cols)
+                    return hub.create_ghost_session(_agent_key, _session_id, _rows, _cols)
+                end
 
+                hub.register_session = function(_session_uuid, _handle, _metadata)
+                    return 0
+                end
+                -- Backward compat alias for Lua handlers not yet updated (Phase 5-6 scope)
                 hub.register_agent = function(_agent_key, _handles)
                     return 0
                 end

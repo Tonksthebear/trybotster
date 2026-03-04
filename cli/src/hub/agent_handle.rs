@@ -1,25 +1,26 @@
-//! Agent handle for client-to-agent PTY access.
+//! Session handle for client-to-PTY access.
 //!
-//! `AgentPtys` provides thread-safe access to an agent's PTY sessions.
-//! It is a lightweight wrapper around PTY handles -- agent metadata (repo,
-//! issue, status, etc.) is now managed by Lua, not Rust.
+//! `SessionHandle` provides thread-safe access to a session's single PTY.
+//! It is a lightweight wrapper around a PTY handle -- session metadata
+//! (repo, issue, status, etc.) is managed by Lua, not Rust.
 //!
-//! # How to Get Agent Handles
+//! # How to Get Session Handles
 //!
-//! Clients use `HandleCache::get_agent()` to read agent handles directly.
+//! Clients use `HandleCache::get_session()` to read session handles directly.
 //! This is non-blocking and safe from any thread:
 //!
 //! ```text
-//! HandleCache::get_agent(idx) → Option<AgentPtys>
+//! HandleCache::get_session(uuid) → Option<SessionHandle>
 //! ```
 //!
 //! # Hierarchy
 //!
 //! ```text
-//! AgentPtys
-//!   ├── agent_key() → &str
-//!   ├── get_pty(0) → Option<&PtyHandle>  (CLI PTY)
-//!   └── get_pty(1) → Option<&PtyHandle>  (Server PTY)
+//! SessionHandle
+//!   ├── session_uuid() → &str     (primary key)
+//!   ├── agent_key() → &str        (display label)
+//!   ├── session_type() → SessionType
+//!   └── pty() → &PtyHandle        (single PTY)
 //!
 //! PtyHandle
 //!   ├── subscribe() → broadcast::Receiver<PtyEvent>
@@ -27,15 +28,10 @@
 //!   └── resize(rows, cols) → resizes PTY
 //! ```
 //!
-//! # PTY Indexing
-//!
-//! PTYs are accessed by index:
-//! - Index 0: CLI PTY (always present)
-//! - Index 1: Server PTY (present when server is running)
-//!
+//! Each session is exactly one PTY. No pty_index anywhere.
 //! Clients call `pty.write_input()` directly rather than through Hub.
 
-// Rust guideline compliant 2026-02
+// Rust guideline compliant 2026-03
 
 use std::io::Write;
 use std::sync::{
@@ -48,123 +44,122 @@ use tokio::sync::broadcast;
 use crate::agent::pty::{do_resize, HubEventListener, PtyEvent, SharedPtyState};
 use crate::terminal::{generate_ansi_snapshot, AlacrittyParser};
 
-/// Handle for interacting with an agent's PTY sessions.
+/// Session type distinguishing agents (AI-driven) from accessories (plain PTY).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum SessionType {
+    /// AI-driven agent session (Claude, Codex, etc.)
+    #[default]
+    Agent,
+    /// Accessory session (Rails server, REPL, shell, log tail).
+    Accessory,
+}
+
+impl std::fmt::Display for SessionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Agent => write!(f, "agent"),
+            Self::Accessory => write!(f, "accessory"),
+        }
+    }
+}
+
+/// Handle for interacting with a session's single PTY.
 ///
-/// Clients obtain this via `HandleCache::get_agent()`, which reads
+/// Clients obtain this via `HandleCache::get_session()`, which reads
 /// directly from the cache (non-blocking, safe from any thread).
 ///
-/// Agent metadata (repo, issue, status, etc.) is managed by Lua.
+/// Session metadata (repo, issue, status, etc.) is managed by Lua.
 /// This handle only provides PTY access for I/O operations.
 ///
 /// # Thread Safety
 ///
-/// `AgentPtys` is `Clone` + `Send` + `Sync`, allowing it to be passed
+/// `SessionHandle` is `Clone` + `Send` + `Sync`, allowing it to be passed
 /// across threads and shared between async tasks.
 ///
-/// # PTY Access
+/// # Session UUID
 ///
-/// PTYs are accessed by index via `get_pty()`:
-/// - Index 0: CLI PTY (always present)
-/// - Index 1: Server PTY (present when server is running)
+/// The `session_uuid` (format: "sess-{timestamp}-{hex}") is the primary key
+/// for addressing this session throughout the system. The `agent_key` is
+/// retained as a human-readable display label.
 #[derive(Debug, Clone)]
-pub struct AgentPtys {
-    /// Agent session key (e.g., "owner-repo-42").
+pub struct SessionHandle {
+    /// Session UUID — primary key for all addressing.
+    session_uuid: String,
+
+    /// Human-readable display label (e.g., "owner-repo-42").
     agent_key: String,
 
-    /// PTY handles for this agent.
-    ///
-    /// - ptys[0]: CLI PTY (always present)
-    /// - ptys[1]: Server PTY (if server is running)
-    ptys: Vec<PtyHandle>,
+    /// Whether this is an agent or accessory session.
+    session_type: SessionType,
 
-    /// Index of this agent in the Hub's agent list.
-    ///
-    /// Used for index-based navigation in clients.
-    agent_index: usize,
+    /// Optional workspace identifier for grouping sessions.
+    workspace_id: Option<String>,
+
+    /// Single PTY handle for this session.
+    pty: PtyHandle,
 }
 
-impl AgentPtys {
-    /// Create a new agent handle.
-    ///
-    /// Called internally by Hub when building `HandleCache`.
+impl SessionHandle {
+    /// Create a new session handle.
     ///
     /// # Arguments
     ///
-    /// * `agent_key` - Agent session key (e.g., "owner-repo-42")
-    /// * `ptys` - Vector of PTY handles (index 0 = CLI, index 1 = Server if present)
-    /// * `agent_index` - Index of this agent in the Hub's ordered agent list
-    ///
-    /// # Panics
-    ///
-    /// Panics if `ptys` is empty. At minimum, the CLI PTY must be present.
+    /// * `session_uuid` - Stable UUID (e.g., "sess-1234567890-abcdef")
+    /// * `agent_key` - Human-readable display label
+    /// * `session_type` - Agent or Accessory
+    /// * `workspace_id` - Optional workspace for grouping
+    /// * `pty` - Single PTY handle
     #[must_use]
     pub fn new(
+        session_uuid: impl Into<String>,
         agent_key: impl Into<String>,
-        ptys: Vec<PtyHandle>,
-        agent_index: usize,
+        session_type: SessionType,
+        workspace_id: Option<String>,
+        pty: PtyHandle,
     ) -> Self {
-        assert!(!ptys.is_empty(), "AgentPtys requires at least one PTY (CLI PTY)");
-
         Self {
+            session_uuid: session_uuid.into(),
             agent_key: agent_key.into(),
-            ptys,
-            agent_index,
+            session_type,
+            workspace_id,
+            pty,
         }
     }
 
-    /// Get the agent session key.
+    /// Get the session UUID (primary key).
+    #[must_use]
+    pub fn session_uuid(&self) -> &str {
+        &self.session_uuid
+    }
+
+    /// Get the human-readable display label.
     #[must_use]
     pub fn agent_key(&self) -> &str {
         &self.agent_key
     }
 
-    /// Get the agent's index in the Hub's ordered agent list.
-    ///
-    /// Used for index-based navigation in clients.
+    /// Get the session type.
     #[must_use]
-    pub fn agent_index(&self) -> usize {
-        self.agent_index
+    pub fn session_type(&self) -> SessionType {
+        self.session_type
     }
 
-    /// Update the agent's index.
-    ///
-    /// Used after `HandleCache::add_agent()` to fix up the index to match
-    /// the actual position (which may differ on replace).
-    pub fn set_agent_index(&mut self, index: usize) {
-        self.agent_index = index;
+    /// Get the optional workspace ID.
+    #[must_use]
+    pub fn workspace_id(&self) -> Option<&str> {
+        self.workspace_id.as_deref()
     }
 
-    /// Get PTY handle by index.
-    ///
-    /// - Index 0: CLI PTY (always present)
-    /// - Index 1: Server PTY (if server is running)
-    ///
-    /// Returns `None` if index is out of bounds.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Get CLI PTY
-    /// let cli_pty = handle.get_pty(0).unwrap();
-    ///
-    /// // Get server PTY (may be None)
-    /// if let Some(server_pty) = handle.get_pty(1) {
-    ///     // Server is running
-    /// }
-    /// ```
+    /// Get the PTY handle.
     #[must_use]
-    pub fn get_pty(&self, pty_index: usize) -> Option<&PtyHandle> {
-        self.ptys.get(pty_index)
-    }
-
-    /// Get the number of PTYs available.
-    ///
-    /// Returns 1 if only CLI PTY, 2 if server PTY also exists.
-    #[must_use]
-    pub fn pty_count(&self) -> usize {
-        self.ptys.len()
+    pub fn pty(&self) -> &PtyHandle {
+        &self.pty
     }
 }
+
+// Keep the old name as a type alias during transition so downstream code
+// that references `AgentPtys` still compiles while we migrate call sites.
+pub type AgentPtys = SessionHandle;
 
 /// Handle for interacting with a PTY session.
 ///
@@ -178,14 +173,14 @@ impl AgentPtys {
 /// # Example
 ///
 /// ```ignore
-/// let handle = handle_cache.get_agent(0).unwrap();
-/// let pty = handle.get_pty(0).unwrap();
+/// let handle = handle_cache.get_session("sess-abc123").unwrap();
+/// let pty = handle.pty();
 ///
 /// // Subscribe to output events
 /// let mut rx = pty.subscribe();
 ///
 /// // Send input directly to PTY
-/// pty.write_input(b"ls -la\n")?;
+/// pty.write_input_direct(b"ls -la\n")?;
 ///
 /// while let Ok(event) = rx.recv().await {
 ///     match event {
@@ -193,11 +188,6 @@ impl AgentPtys {
 ///         PtyEvent::Resized { rows, cols } => update_size(rows, cols),
 ///         // ...
 ///     }
-/// }
-///
-/// // Get the HTTP forwarding port (for server PTY)
-/// if let Some(port) = pty.port() {
-///     println!("Dev server on port {}", port);
 /// }
 /// ```
 #[derive(Clone)]
@@ -232,7 +222,7 @@ pub struct PtyHandle {
 
     /// Whether OSC notification sequences should be detected and broadcast.
     ///
-    /// `true` for CLI PTYs (pty_index 0), `false` for server PTYs (pty_index 1).
+    /// `true` for agent PTYs, `false` for accessory PTYs.
     /// Passed directly to [`crate::agent::spawn::process_pty_bytes`] in
     /// `feed_broker_output()`.
     detect_notifs: bool,
@@ -250,8 +240,8 @@ pub struct PtyHandle {
 
     /// HTTP forwarding port for preview proxying.
     ///
-    /// Primarily used by server PTYs (pty_index=1) to expose the dev server
-    /// port for HTTP preview. `None` for CLI PTYs or if no port assigned.
+    /// Used by accessory sessions running dev servers to expose the port
+    /// for HTTP preview. `None` for agent sessions or if no port assigned.
     port: Option<u16>,
 }
 
@@ -279,8 +269,8 @@ impl PtyHandle {
     /// * `shadow_screen` - Shadow terminal for ANSI snapshots
     /// * `kitty_enabled` - Shared kitty keyboard protocol state flag
     /// * `resize_pending` - Cleared when output arrives after a resize
-    /// * `detect_notifs` - Enable OSC notification detection (`true` for CLI, `false` for server)
-    /// * `port` - HTTP forwarding port (for server PTYs), or `None`
+    /// * `detect_notifs` - Enable OSC notification detection
+    /// * `port` - HTTP forwarding port, or `None`
     #[must_use]
     pub fn new(
         event_tx: broadcast::Sender<PtyEvent>,
@@ -312,7 +302,6 @@ impl PtyHandle {
     /// - `Output(Vec<u8>)` - Terminal output data
     /// - `Resized { rows, cols }` - PTY was resized
     /// - `ProcessExited { exit_code }` - PTY process exited
-    /// - `ProcessExited { exit_code }` - PTY process exited
     ///
     /// # Lagging
     ///
@@ -327,17 +316,7 @@ impl PtyHandle {
     /// Get the HTTP forwarding port for this PTY.
     ///
     /// Returns the port allocated for HTTP preview proxying, or `None` if
-    /// no port has been assigned. This is primarily used for server PTYs
-    /// (pty_index=1) running dev servers.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let server_pty = agent_handle.get_pty(1).unwrap();
-    /// if let Some(port) = server_pty.port() {
-    ///     // Proxy HTTP requests to localhost:port
-    /// }
-    /// ```
+    /// no port has been assigned.
     #[must_use]
     pub fn port(&self) -> Option<u16> {
         self.port
@@ -466,76 +445,55 @@ mod tests {
         let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) = pty_session.get_direct_access();
         // Leak the session to keep the state alive for tests
         std::mem::forget(pty_session);
-        // detect_notifs=true: test PTYs use CLI-session behavior
+        // detect_notifs=true: test PTYs use agent session behavior
         PtyHandle::new(event_tx, shared_state, shadow_screen, kitty_enabled, resize_pending, true, port)
     }
 
     #[test]
-    fn test_agent_handle_creation() {
-        let ptys = vec![create_test_pty()];
-        let handle = AgentPtys::new("agent-123", ptys, 0);
+    fn test_session_handle_creation() {
+        let pty = create_test_pty();
+        let handle = SessionHandle::new(
+            "sess-1234-abcd",
+            "agent-123",
+            SessionType::Agent,
+            None,
+            pty,
+        );
 
+        assert_eq!(handle.session_uuid(), "sess-1234-abcd");
         assert_eq!(handle.agent_key(), "agent-123");
-        assert_eq!(handle.agent_index(), 0);
-        assert_eq!(handle.pty_count(), 1);
+        assert_eq!(handle.session_type(), SessionType::Agent);
+        assert!(handle.workspace_id().is_none());
     }
 
     #[test]
-    fn test_agent_handle_with_server_pty() {
-        let ptys = vec![create_test_pty(), create_test_pty()];
-        let handle = AgentPtys::new("agent-123", ptys, 0);
+    fn test_session_handle_with_workspace() {
+        let pty = create_test_pty();
+        let handle = SessionHandle::new(
+            "sess-5678-ef01",
+            "agent-456",
+            SessionType::Accessory,
+            Some("ws-1".to_string()),
+            pty,
+        );
 
-        assert_eq!(handle.pty_count(), 2);
-        assert!(handle.get_pty(0).is_some());
-        assert!(handle.get_pty(1).is_some());
+        assert_eq!(handle.session_type(), SessionType::Accessory);
+        assert_eq!(handle.workspace_id(), Some("ws-1"));
     }
 
     #[test]
-    fn test_get_pty_index_based_access() {
-        let ptys = vec![create_test_pty()];
-        let handle = AgentPtys::new("agent-123", ptys, 0);
+    fn test_session_handle_pty_access() {
+        let pty = create_test_pty();
+        let handle = SessionHandle::new(
+            "sess-1234-abcd",
+            "agent-123",
+            SessionType::Agent,
+            None,
+            pty,
+        );
 
-        // Index 0 is CLI PTY (always present)
-        assert!(handle.get_pty(0).is_some());
-
-        // Index 1 is Server PTY (not present in this case)
-        assert!(handle.get_pty(1).is_none());
-
-        // Index 2+ always None
-        assert!(handle.get_pty(2).is_none());
-        assert!(handle.get_pty(99).is_none());
-    }
-
-    #[test]
-    fn test_get_pty_with_server() {
-        let ptys = vec![create_test_pty(), create_test_pty()];
-        let handle = AgentPtys::new("agent-123", ptys, 0);
-
-        // Both PTYs present
-        assert!(handle.get_pty(0).is_some());
-        assert!(handle.get_pty(1).is_some());
-        assert!(handle.get_pty(2).is_none());
-    }
-
-    #[test]
-    fn test_pty_count() {
-        // Without server PTY
-        let ptys = vec![create_test_pty()];
-        let handle = AgentPtys::new("agent-123", ptys, 0);
-        assert_eq!(handle.pty_count(), 1);
-
-        // With server PTY
-        let ptys = vec![create_test_pty(), create_test_pty()];
-        let handle = AgentPtys::new("agent-456", ptys, 1);
-        assert_eq!(handle.pty_count(), 2);
-        assert_eq!(handle.agent_index(), 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "AgentPtys requires at least one PTY")]
-    fn test_agent_handle_panics_on_empty_ptys() {
-        let ptys: Vec<PtyHandle> = vec![];
-        let _ = AgentPtys::new("agent-123", ptys, 0);
+        // PTY is always accessible
+        assert!(handle.pty().port().is_none());
     }
 
     #[test]
@@ -549,4 +507,14 @@ mod tests {
         assert_eq!(handle_with_port.port(), Some(8080));
     }
 
+    #[test]
+    fn test_session_type_display() {
+        assert_eq!(SessionType::Agent.to_string(), "agent");
+        assert_eq!(SessionType::Accessory.to_string(), "accessory");
+    }
+
+    #[test]
+    fn test_session_type_default() {
+        assert_eq!(SessionType::default(), SessionType::Agent);
+    }
 }

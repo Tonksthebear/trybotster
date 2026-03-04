@@ -80,7 +80,7 @@ async fn test_agent_spawns_with_echo_command() {
         port: None,
         context: String::new(),
     };
-    let result = agent.cli_pty.spawn(config);
+    let result = agent.pty.spawn(config);
 
     // Should succeed in spawning
     assert!(result.is_ok());
@@ -89,7 +89,7 @@ async fn test_agent_spawns_with_echo_command() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Verify PTY is spawned and has a master
-    assert!(agent.cli_pty.is_spawned());
+    assert!(agent.pty.is_spawned());
 }
 
 #[test]

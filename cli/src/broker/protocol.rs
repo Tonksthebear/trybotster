@@ -133,10 +133,8 @@ pub enum BrokerMessage {
     /// `session_id` is the u32 token the Hub must use for all subsequent
     /// `PtyInput` frames and control messages targeting this PTY.
     Registered {
-        /// Agent key that owns this session.
-        agent_key: String,
-        /// PTY index within the agent (0 = CLI, 1 = server, …).
-        pty_index: usize,
+        /// Session UUID identifying this session.
+        session_uuid: String,
         /// Opaque session identifier assigned by the broker.
         session_id: u32,
     },
@@ -151,10 +149,8 @@ pub enum BrokerMessage {
     PtyExited {
         /// Opaque session identifier.
         session_id: u32,
-        /// Agent key that owned the session.
-        agent_key: String,
-        /// PTY index within the agent.
-        pty_index: usize,
+        /// Session UUID that owned the session.
+        session_uuid: String,
         /// `None` if killed by signal.
         exit_code: Option<i32>,
     },
@@ -179,15 +175,13 @@ pub enum BrokerMessage {
 ///
 /// Wire layout:
 /// ```text
-/// [u8: key_len] [key_bytes…] [u8: pty_index] [u32 LE: child_pid]
+/// [u8: uuid_len] [uuid_bytes…] [u32 LE: child_pid]
 /// [u16 LE: rows] [u16 LE: cols]
 /// ```
 #[derive(Debug, Clone)]
 pub struct FdTransferPayload {
-    /// Agent key identifying this session in the Hub.
-    pub agent_key: String,
-    /// PTY index within the agent (0 = CLI, 1 = server, …).
-    pub pty_index: usize,
+    /// Session UUID identifying this session in the Hub.
+    pub session_uuid: String,
     /// PID of the child process for monitoring and SIGKILL on timeout.
     pub child_pid: u32,
     /// Initial terminal row count.
@@ -201,28 +195,19 @@ impl FdTransferPayload {
     ///
     /// # Errors
     ///
-    /// Returns an error if `agent_key` exceeds 255 bytes or `pty_index` exceeds 255,
-    /// as both are stored as `u8` in the wire format.
+    /// Returns an error if `session_uuid` exceeds 255 bytes.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        let key = self.agent_key.as_bytes();
+        let key = self.session_uuid.as_bytes();
         if key.len() > u8::MAX as usize {
             bail!(
-                "FdTransfer agent_key too long: {} bytes (max {})",
+                "FdTransfer session_uuid too long: {} bytes (max {})",
                 key.len(),
                 u8::MAX
             );
         }
-        if self.pty_index > u8::MAX as usize {
-            bail!(
-                "FdTransfer pty_index too large: {} (max {})",
-                self.pty_index,
-                u8::MAX
-            );
-        }
-        let mut buf = Vec::with_capacity(1 + key.len() + 1 + 4 + 2 + 2);
+        let mut buf = Vec::with_capacity(1 + key.len() + 4 + 2 + 2);
         buf.push(key.len() as u8);
         buf.extend_from_slice(key);
-        buf.push(self.pty_index as u8);
         buf.extend_from_slice(&self.child_pid.to_le_bytes());
         buf.extend_from_slice(&self.rows.to_le_bytes());
         buf.extend_from_slice(&self.cols.to_le_bytes());
@@ -235,7 +220,7 @@ impl FdTransferPayload {
             bail!("FdTransfer payload is empty");
         }
         let key_len = payload[0] as usize;
-        let min_len = 1 + key_len + 1 + 4 + 2 + 2;
+        let min_len = 1 + key_len + 4 + 2 + 2;
         if payload.len() < min_len {
             bail!(
                 "FdTransfer payload too short: {} bytes, expected >= {}",
@@ -243,19 +228,17 @@ impl FdTransferPayload {
                 min_len
             );
         }
-        let agent_key =
+        let session_uuid =
             std::str::from_utf8(&payload[1..1 + key_len])
-                .map_err(|e| anyhow!("FdTransfer agent_key is not UTF-8: {e}"))?
+                .map_err(|e| anyhow!("FdTransfer session_uuid is not UTF-8: {e}"))?
                 .to_owned();
         let mut off = 1 + key_len;
-        let pty_index = payload[off] as usize;
-        off += 1;
         let child_pid = u32::from_le_bytes([payload[off], payload[off+1], payload[off+2], payload[off+3]]);
         off += 4;
         let rows = u16::from_le_bytes([payload[off], payload[off+1]]);
         off += 2;
         let cols = u16::from_le_bytes([payload[off], payload[off+1]]);
-        Ok(Self { agent_key, pty_index, child_pid, rows, cols })
+        Ok(Self { session_uuid, child_pid, rows, cols })
     }
 }
 
@@ -432,8 +415,7 @@ mod tests {
     #[test]
     fn broker_control_round_trip() {
         let msg = BrokerMessage::Registered {
-            agent_key: "my-agent".into(),
-            pty_index: 0,
+            session_uuid: "sess-1234-abcd".into(),
             session_id: 42,
         };
         let encoded = encode_broker_control(&msg);
@@ -460,16 +442,14 @@ mod tests {
     #[test]
     fn fd_transfer_payload_round_trip() {
         let reg = FdTransferPayload {
-            agent_key: "test-agent".into(),
-            pty_index: 1,
+            session_uuid: "sess-1234-abcd".into(),
             child_pid: 12345,
             rows: 24,
             cols: 80,
         };
         let encoded = reg.encode().unwrap();
         let decoded = FdTransferPayload::decode(&encoded).unwrap();
-        assert_eq!(decoded.agent_key, "test-agent");
-        assert_eq!(decoded.pty_index, 1);
+        assert_eq!(decoded.session_uuid, "sess-1234-abcd");
         assert_eq!(decoded.child_pid, 12345);
         assert_eq!(decoded.rows, 24);
         assert_eq!(decoded.cols, 80);
@@ -636,8 +616,7 @@ mod tests {
     fn broker_control_pty_exited_round_trip() {
         let msg = BrokerMessage::PtyExited {
             session_id: 3,
-            agent_key: "agent-xyz".into(),
-            pty_index: 1,
+            session_uuid: "sess-1234-abcd".into(),
             exit_code: Some(0),
         };
         let encoded = encode_broker_control(&msg);
@@ -645,12 +624,11 @@ mod tests {
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
         if let BrokerFrame::BrokerControl(BrokerMessage::PtyExited {
-            session_id, agent_key, pty_index, exit_code,
+            session_id, session_uuid, exit_code,
         }) = &frames[0]
         {
             assert_eq!(*session_id, 3);
-            assert_eq!(agent_key, "agent-xyz");
-            assert_eq!(*pty_index, 1);
+            assert_eq!(session_uuid, "sess-1234-abcd");
             assert_eq!(*exit_code, Some(0));
         } else {
             panic!("expected BrokerControl(PtyExited)");
@@ -662,8 +640,7 @@ mod tests {
         // exit_code = None represents a signal kill.
         let msg = BrokerMessage::PtyExited {
             session_id: 7,
-            agent_key: "k".into(),
-            pty_index: 0,
+            session_uuid: "k".into(),
             exit_code: None,
         };
         let encoded = encode_broker_control(&msg);
@@ -711,8 +688,7 @@ mod tests {
     #[test]
     fn fd_transfer_frame_wrapping() {
         let reg = FdTransferPayload {
-            agent_key: "wrap-test".into(),
-            pty_index: 2,
+            session_uuid: "wrap-test".into(),
             child_pid: 9999,
             rows: 50,
             cols: 220,
@@ -724,8 +700,7 @@ mod tests {
         let frames = BrokerFrameDecoder::new().feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
         if let BrokerFrame::FdTransfer(p) = &frames[0] {
-            assert_eq!(p.agent_key, "wrap-test");
-            assert_eq!(p.pty_index, 2);
+            assert_eq!(p.session_uuid, "wrap-test");
             assert_eq!(p.child_pid, 9999);
             assert_eq!(p.rows, 50);
             assert_eq!(p.cols, 220);
@@ -739,40 +714,26 @@ mod tests {
     #[test]
     fn fd_transfer_payload_empty_key() {
         let reg = FdTransferPayload {
-            agent_key: String::new(),
-            pty_index: 0,
+            session_uuid: String::new(),
             child_pid: 1,
             rows: 24,
             cols: 80,
         };
         let encoded = reg.encode().unwrap();
         let decoded = FdTransferPayload::decode(&encoded).unwrap();
-        assert_eq!(decoded.agent_key, "");
+        assert_eq!(decoded.session_uuid, "");
         assert_eq!(decoded.child_pid, 1);
     }
 
     #[test]
     fn fd_transfer_payload_key_too_long_error() {
         let reg = FdTransferPayload {
-            agent_key: "x".repeat(256),
-            pty_index: 0,
+            session_uuid: "x".repeat(256),
             child_pid: 1,
             rows: 24,
             cols: 80,
         };
-        assert!(reg.encode().is_err(), "agent_key > 255 bytes must fail");
-    }
-
-    #[test]
-    fn fd_transfer_payload_pty_index_too_large_error() {
-        let reg = FdTransferPayload {
-            agent_key: "ok".into(),
-            pty_index: 256,
-            child_pid: 1,
-            rows: 24,
-            cols: 80,
-        };
-        assert!(reg.encode().is_err(), "pty_index > 255 must fail");
+        assert!(reg.encode().is_err(), "session_uuid > 255 bytes must fail");
     }
 
     #[test]
