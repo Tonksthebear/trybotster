@@ -775,10 +775,25 @@ function M.migrate_v3(data_dir)
 
         local dk = manifest.dedup_key
         if dk:sub(1, 6) == "local:" then
-            -- Per-agent workspace artifacts — delete the workspace
+            -- Per-agent workspace artifacts — delete the entire workspace directory
+            -- so scan_active_sessions() does not pick up orphaned session manifests.
             local ws_path = M.workspace_dir(data_dir, workspace_id)
-            -- Remove manifest file
+            -- Delete session files first, then session dirs, then workspace manifest/dir
+            local sessions_dir = ws_path .. "/sessions"
+            if fs.exists(sessions_dir) then
+                local sess_entries, _ = fs.list_dir(sessions_dir)
+                if sess_entries then
+                    for _, sess_id in ipairs(sess_entries) do
+                        local sess_path = sessions_dir .. "/" .. sess_id
+                        pcall(fs.delete, sess_path .. "/manifest.json")
+                        pcall(fs.delete, sess_path .. "/events.jsonl")
+                        pcall(fs.rmdir, sess_path)
+                    end
+                end
+                pcall(fs.rmdir, sessions_dir)
+            end
             pcall(fs.delete, M.workspace_manifest_path(data_dir, workspace_id))
+            pcall(fs.rmdir, ws_path)
             deleted = deleted + 1
             log.info(string.format("[workspace_store] migrate_v3: deleted local workspace %s (%s)",
                 workspace_id, dk))
