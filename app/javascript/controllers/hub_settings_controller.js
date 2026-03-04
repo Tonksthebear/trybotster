@@ -6,7 +6,7 @@ import { HubConnectionManager, HubConnection } from "connections";
  *
  * Manages .botster/ config tree editing via E2E encrypted DataChannel to CLI.
  * Dynamically scans the .botster/ directory structure and renders a tree
- * navigation with Shared and Profiles sections.
+ * navigation with Agents, Accessories, Workspaces, and Plugins sections.
  *
  * State management:
  *   - Tree panel: data-view = loading | tree | empty | disconnected
@@ -290,75 +290,45 @@ export default class extends Controller {
     }
   }
 
-  async addSession(event) {
-    const basePath = event.currentTarget.dataset.basePath;
-    if (!basePath || !this.hub) return;
-
-    const fsScope = this.#fsScope();
-
-    // Get existing session names in this scope for duplicate checking
-    const existingSessions = this.#sessionsForBasePath(basePath);
-
-    const name = await this.#promptUser(
-      "Add Session",
-      "Enter a name for the new session (lowercase, no spaces):",
-      (val) => {
-        if (existingSessions.includes(val)) return `Session '${val}' already exists here`;
-        return null;
-      },
-    );
-    if (!name) return;
-
-    try {
-      const sessionDir = `${basePath}/${name}`;
-      await this.hub.mkDir(sessionDir, fsScope);
-      const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
-      await this.hub.writeFile(`${sessionDir}/initialization`, defaultInit, fsScope);
-      await this.scanTree();
-      this.#selectFileByPath(`${sessionDir}/initialization`);
-    } catch (error) {
-      this.#showError(`Failed to create session: ${error.message}`);
-    }
-  }
-
-  async addProfile(event) {
+  async addAgent() {
     if (!this.hub) return;
 
     const fsScope = this.#fsScope();
-    const prefix = this.configScope === "device" ? "profiles" : ".botster/profiles";
+    const prefix = this.#configPrefix();
 
     const name = await this.#promptUser(
-      "Add Profile",
-      "Enter a name for the new profile (lowercase, no spaces):",
+      "Add Agent",
+      "Enter a name for the new agent (lowercase, no spaces):",
     );
     if (!name) return;
 
     try {
-      await this.hub.mkDir(`${prefix}/${name}`, fsScope);
-      await this.hub.mkDir(`${prefix}/${name}/sessions`, fsScope);
+      await this.hub.mkDir(`${prefix}agents/${name}`, fsScope);
+      const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
+      await this.hub.writeFile(`${prefix}agents/${name}/initialization`, defaultInit, fsScope);
       await this.scanTree();
-      this.#scrollToProfile(name);
+      this.#scrollToSection(`agents-${name}`);
     } catch (error) {
-      this.#showError(`Failed to create profile: ${error.message}`);
+      this.#showError(`Failed to create agent: ${error.message}`);
     }
   }
 
-  async removeProfile(event) {
-    const profileName = event.currentTarget.dataset.profileName;
-    if (!profileName || !this.hub) return;
+  async removeAgent(event) {
+    const agentName = event.currentTarget.dataset.agentName;
+    if (!agentName || !this.hub) return;
 
     const confirmed = await this.#confirmUser(
-      "Remove Profile",
-      `Delete profile "${profileName}" and all its sessions? This cannot be undone.`,
+      "Remove Agent",
+      `Delete agent "${agentName}" and its configuration? This cannot be undone.`,
     );
     if (!confirmed) return;
 
     const fsScope = this.#fsScope();
-    const prefix = this.configScope === "device" ? "profiles" : ".botster/profiles";
+    const prefix = this.#configPrefix();
 
     try {
-      await this.hub.rmDir(`${prefix}/${profileName}`, fsScope);
-      if (this.currentFilePath?.startsWith(`${prefix}/${profileName}/`)) {
+      await this.hub.rmDir(`${prefix}agents/${agentName}`, fsScope);
+      if (this.currentFilePath?.includes(`/agents/${agentName}/`)) {
         this.currentFilePath = null;
         this.originalContent = null;
         this.editorPanelTarget.dataset.editor = "empty";
@@ -366,7 +336,57 @@ export default class extends Controller {
       }
       await this.scanTree();
     } catch (error) {
-      this.#showError(`Failed to remove profile: ${error.message}`);
+      this.#showError(`Failed to remove agent: ${error.message}`);
+    }
+  }
+
+  async addAccessory() {
+    if (!this.hub) return;
+
+    const fsScope = this.#fsScope();
+    const prefix = this.#configPrefix();
+
+    const name = await this.#promptUser(
+      "Add Accessory",
+      "Enter a name for the new accessory (lowercase, no spaces):",
+    );
+    if (!name) return;
+
+    try {
+      await this.hub.mkDir(`${prefix}accessories/${name}`, fsScope);
+      const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
+      await this.hub.writeFile(`${prefix}accessories/${name}/initialization`, defaultInit, fsScope);
+      await this.scanTree();
+      this.#scrollToSection(`accessories-${name}`);
+    } catch (error) {
+      this.#showError(`Failed to create accessory: ${error.message}`);
+    }
+  }
+
+  async removeAccessory(event) {
+    const accessoryName = event.currentTarget.dataset.accessoryName;
+    if (!accessoryName || !this.hub) return;
+
+    const confirmed = await this.#confirmUser(
+      "Remove Accessory",
+      `Delete accessory "${accessoryName}" and its configuration? This cannot be undone.`,
+    );
+    if (!confirmed) return;
+
+    const fsScope = this.#fsScope();
+    const prefix = this.#configPrefix();
+
+    try {
+      await this.hub.rmDir(`${prefix}accessories/${accessoryName}`, fsScope);
+      if (this.currentFilePath?.includes(`/accessories/${accessoryName}/`)) {
+        this.currentFilePath = null;
+        this.originalContent = null;
+        this.editorPanelTarget.dataset.editor = "empty";
+        this.editorTitleTarget.textContent = "Select a file";
+      }
+      await this.scanTree();
+    } catch (error) {
+      this.#showError(`Failed to remove accessory: ${error.message}`);
     }
   }
 
@@ -381,16 +401,13 @@ export default class extends Controller {
     btn.disabled = true;
 
     try {
-      // Initialize directory structure and write template.
-      // dest is relative to the scope root (e.g., "shared/sessions/agent/initialization").
+      // dest is relative to the scope root (e.g., "agents/claude/initialization").
       const parentDir = dest.replace(/\/[^/]+$/, "");
       if (this.configScope === "device") {
         await this.hub.mkDir(parentDir, "device");
-        await this.hub.mkDir("profiles", "device");
         await this.hub.writeFile(dest, content, "device");
       } else {
         await this.hub.mkDir(`.botster/${parentDir}`);
-        await this.hub.mkDir(".botster/profiles");
         await this.hub.writeFile(`.botster/${dest}`, content);
       }
 
@@ -419,43 +436,79 @@ export default class extends Controller {
     const fsScope = scope === "device" ? "device" : undefined;
 
     try {
-      const tree = { shared: null, profiles: {} };
+      const tree = { agents: {}, accessories: {}, workspaces: {}, plugins: {}, files: {} };
+      const prefix = scope === "device" ? "" : ".botster/";
 
+      // Check if config root exists
       if (scope === "device") {
-        // Device scope: root is ~/.botster/, check shared/ and profiles/
-        const sharedStat = await this.hub.statFile("shared", fsScope).catch(() => ({ exists: false }));
-        if (!sharedStat.exists) {
-          // Check if profiles exist at least
-          const profilesStat = await this.hub.statFile("profiles", fsScope).catch(() => ({ exists: false }));
-          if (!profilesStat.exists) {
-            this.treePanelTarget.dataset.view = "empty";
-            return;
-          }
-        }
-
-        if (sharedStat.exists) {
-          tree.shared = await this.#scanScopeWithFs("shared", fsScope);
-        }
-
-        const profileEntries = await this.#listDirs("profiles", fsScope);
-        for (const profileName of profileEntries) {
-          tree.profiles[profileName] = await this.#scanScopeWithFs(`profiles/${profileName}`, fsScope);
+        // Device scope: check if agents/ or any config dir exists
+        const [agentsStat, accessoriesStat, pluginsStat, workspacesStat] = await Promise.all([
+          this.hub.statFile("agents", fsScope).catch(() => ({ exists: false })),
+          this.hub.statFile("accessories", fsScope).catch(() => ({ exists: false })),
+          this.hub.statFile("plugins", fsScope).catch(() => ({ exists: false })),
+          this.hub.statFile("workspaces", fsScope).catch(() => ({ exists: false })),
+        ]);
+        if (!agentsStat.exists && !accessoriesStat.exists && !pluginsStat.exists && !workspacesStat.exists) {
+          this.treePanelTarget.dataset.view = "empty";
+          return;
         }
       } else {
-        // Repo scope: root is repo root, check .botster/
+        // Repo scope: check .botster/ exists
         const botsterStat = await this.hub.statFile(".botster").catch(() => ({ exists: false }));
         if (!botsterStat.exists) {
           this.treePanelTarget.dataset.view = "empty";
           return;
         }
-
-        tree.shared = await this.#scanScopeWithFs(".botster/shared", fsScope);
-
-        const profileEntries = await this.#listDirs(".botster/profiles", fsScope);
-        for (const profileName of profileEntries) {
-          tree.profiles[profileName] = await this.#scanScopeWithFs(`.botster/profiles/${profileName}`, fsScope);
-        }
       }
+
+      // Scan all sections in parallel
+      const [agentNames, accessoryNames, workspaceEntries, pluginNames, wsInclude, wsTeardown] = await Promise.all([
+        this.#listDirs(`${prefix}agents`, fsScope),
+        this.#listDirs(`${prefix}accessories`, fsScope),
+        this.#listFiles(`${prefix}workspaces`, fsScope, ".json"),
+        this.#listDirs(`${prefix}plugins`, fsScope),
+        this.hub.statFile(`${prefix}workspace_include`, fsScope).catch(() => ({ exists: false })),
+        this.hub.statFile(`${prefix}workspace_teardown`, fsScope).catch(() => ({ exists: false })),
+      ]);
+
+      tree.files.workspace_include = wsInclude.exists;
+      tree.files.workspace_teardown = wsTeardown.exists;
+
+      // Scan agents (each has initialization file)
+      await Promise.all(
+        agentNames.map(async (name) => {
+          const agentPath = `${prefix}agents/${name}`;
+          const initStat = await this.hub.statFile(`${agentPath}/initialization`, fsScope).catch(() => ({ exists: false }));
+          tree.agents[name] = { initialization: initStat.exists };
+        }),
+      );
+
+      // Scan accessories (each has initialization + optional port_forward)
+      await Promise.all(
+        accessoryNames.map(async (name) => {
+          const accPath = `${prefix}accessories/${name}`;
+          const [initStat, pfStat] = await Promise.all([
+            this.hub.statFile(`${accPath}/initialization`, fsScope).catch(() => ({ exists: false })),
+            this.hub.statFile(`${accPath}/port_forward`, fsScope).catch(() => ({ exists: false })),
+          ]);
+          tree.accessories[name] = { initialization: initStat.exists, port_forward: pfStat.exists };
+        }),
+      );
+
+      // Scan workspaces (.json files)
+      for (const fileName of workspaceEntries) {
+        tree.workspaces[fileName.replace(/\.json$/, "")] = { file: `${prefix}workspaces/${fileName}` };
+      }
+
+      // Scan plugins (only include plugins that have init.lua)
+      await Promise.all(
+        pluginNames.map(async (name) => {
+          const initStat = await this.hub.statFile(`${prefix}plugins/${name}/init.lua`, fsScope).catch(() => ({ exists: false }));
+          if (initStat.exists) {
+            tree.plugins[name] = { init: true };
+          }
+        }),
+      );
 
       this.tree = tree;
       // Cache for scope switching
@@ -473,54 +526,23 @@ export default class extends Controller {
     }
   }
 
-  async #scanScopeWithFs(basePath, fsScope) {
-    const scope = { files: {}, sessions: {}, plugins: {} };
-
-    // Scan workspace files, session dirs, and plugin dirs in parallel
-    const [, , sessionNames, pluginNames] = await Promise.all([
-      ...["workspace_include", "workspace_teardown"].map(async (fileName) => {
-        const stat = await this.hub.statFile(`${basePath}/${fileName}`, fsScope).catch(() => ({ exists: false }));
-        scope.files[fileName] = stat.exists;
-      }),
-      this.#listDirs(`${basePath}/sessions`, fsScope),
-      this.#listDirs(`${basePath}/plugins`, fsScope),
-    ]);
-
-    // Scan sessions (init + port_forward per session)
-    await Promise.all(
-      sessionNames.map(async (sessionName) => {
-        const sessionPath = `${basePath}/sessions/${sessionName}`;
-        const [initStat, pfStat] = await Promise.all([
-          this.hub.statFile(`${sessionPath}/initialization`, fsScope).catch(() => ({ exists: false })),
-          this.hub.statFile(`${sessionPath}/port_forward`, fsScope).catch(() => ({ exists: false })),
-        ]);
-        scope.sessions[sessionName] = {
-          initialization: initStat.exists,
-          port_forward: pfStat.exists,
-        };
-      }),
-    );
-
-    // Scan plugins (only include plugins that have init.lua)
-    await Promise.all(
-      pluginNames.map(async (pluginName) => {
-        const initStat = await this.hub
-          .statFile(`${basePath}/plugins/${pluginName}/init.lua`, fsScope)
-          .catch(() => ({ exists: false }));
-        if (initStat.exists) {
-          scope.plugins[pluginName] = { init: true };
-        }
-      }),
-    );
-
-    return scope;
-  }
-
   async #listDirs(path, fsScope) {
     try {
       const result = await this.hub.listDir(path, fsScope);
       return (result.entries || [])
         .filter((e) => e.type === "dir")
+        .map((e) => e.name)
+        .sort();
+    } catch {
+      return [];
+    }
+  }
+
+  async #listFiles(path, fsScope, ext) {
+    try {
+      const result = await this.hub.listDir(path, fsScope);
+      return (result.entries || [])
+        .filter((e) => e.type === "file" && (!ext || e.name.endsWith(ext)))
         .map((e) => e.name)
         .sort();
     } catch {
@@ -537,17 +559,15 @@ export default class extends Controller {
 
     try {
       if (this.configScope === "device") {
-        // Device: create shared/ and profiles/ under ~/.botster/
-        await this.hub.mkDir("shared/sessions/agent", fsScope);
-        await this.hub.mkDir("profiles", fsScope);
+        // Device: create agents/claude/ under ~/.botster/
+        await this.hub.mkDir("agents/claude", fsScope);
         const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
-        await this.hub.writeFile("shared/sessions/agent/initialization", defaultInit, fsScope);
+        await this.hub.writeFile("agents/claude/initialization", defaultInit, fsScope);
       } else {
-        // Repo: create .botster/ structure
-        await this.hub.mkDir(".botster/shared/sessions/agent");
-        await this.hub.mkDir(".botster/profiles");
+        // Repo: create .botster/agents/claude/
+        await this.hub.mkDir(".botster/agents/claude");
         const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
-        await this.hub.writeFile(".botster/shared/sessions/agent/initialization", defaultInit);
+        await this.hub.writeFile(".botster/agents/claude/initialization", defaultInit);
       }
       this.scanTree();
     } catch (error) {
@@ -559,43 +579,103 @@ export default class extends Controller {
     const container = this.treeContainerTarget;
     const newContainer = container.cloneNode(false);
 
-    const isDevice = this.configScope === "device";
-    const sharedBase = isDevice ? "shared" : ".botster/shared";
-    const profilesBase = isDevice ? "profiles" : ".botster/profiles";
+    const prefix = this.#configPrefix();
 
-    // Shared section
-    if (this.tree.shared) {
-      newContainer.appendChild(this.#renderSection("Shared", sharedBase, this.tree.shared));
+    // Top-level workspace files
+    const hasFiles = this.tree.files.workspace_include || this.tree.files.workspace_teardown;
+    if (hasFiles || Object.keys(this.tree.agents).length > 0) {
+      const filesSection = document.createElement("div");
+      filesSection.className = "mb-3";
+
+      const filesList = document.createElement("div");
+      filesList.className = "space-y-1";
+
+      for (const [fileName, exists] of Object.entries(this.tree.files)) {
+        const status = exists ? "exists" : "missing";
+        filesList.appendChild(this.#renderFileEntry(`${prefix}${fileName}`, fileName, status));
+      }
+
+      filesSection.appendChild(filesList);
+      newContainer.appendChild(filesSection);
     }
 
-    // Profiles section
-    const profileNames = Object.keys(this.tree.profiles).sort();
-    if (profileNames.length > 0) {
+    // Agents section
+    const agentNames = Object.keys(this.tree.agents).sort();
+    if (agentNames.length > 0) {
       const header = document.createElement("div");
       header.className = "mt-2";
-      header.innerHTML = `<h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">Profiles</h2>`;
+      header.innerHTML = `<h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">Agents</h2>`;
       newContainer.appendChild(header);
 
-      for (const name of profileNames) {
-        newContainer.appendChild(
-          this.#renderSection(
-            this.#capitalize(name),
-            `${profilesBase}/${name}`,
-            this.tree.profiles[name],
-            { sharedScope: this.tree.shared, profileName: name },
-          ),
-        );
+      for (const name of agentNames) {
+        newContainer.appendChild(this.#renderAgentSection(name, prefix));
       }
     }
 
-    // Add profile button
-    const addBtn = document.createElement("button");
-    addBtn.type = "button";
-    addBtn.id = "add-profile-btn";
-    addBtn.className = "w-full mt-2 px-3 py-2 text-xs font-medium text-zinc-500 hover:text-zinc-300 border border-dashed border-zinc-700 hover:border-zinc-600 rounded-lg transition-colors";
-    addBtn.textContent = "+ Add Profile";
-    addBtn.dataset.action = "hub-settings#addProfile";
-    newContainer.appendChild(addBtn);
+    // Add agent button
+    const addAgentBtn = document.createElement("button");
+    addAgentBtn.type = "button";
+    addAgentBtn.id = "add-agent-btn";
+    addAgentBtn.className = "w-full mt-2 px-3 py-2 text-xs font-medium text-zinc-500 hover:text-zinc-300 border border-dashed border-zinc-700 hover:border-zinc-600 rounded-lg transition-colors";
+    addAgentBtn.textContent = "+ Add Agent";
+    addAgentBtn.dataset.action = "hub-settings#addAgent";
+    newContainer.appendChild(addAgentBtn);
+
+    // Accessories section
+    const accessoryNames = Object.keys(this.tree.accessories).sort();
+    if (accessoryNames.length > 0) {
+      const header = document.createElement("div");
+      header.className = "mt-4";
+      header.innerHTML = `<h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">Accessories</h2>`;
+      newContainer.appendChild(header);
+
+      for (const name of accessoryNames) {
+        newContainer.appendChild(this.#renderAccessorySection(name, prefix));
+      }
+    }
+
+    // Add accessory button
+    const addAccBtn = document.createElement("button");
+    addAccBtn.type = "button";
+    addAccBtn.id = "add-accessory-btn";
+    addAccBtn.className = "w-full mt-2 px-3 py-2 text-xs font-medium text-zinc-500 hover:text-zinc-300 border border-dashed border-zinc-700 hover:border-zinc-600 rounded-lg transition-colors";
+    addAccBtn.textContent = "+ Add Accessory";
+    addAccBtn.dataset.action = "hub-settings#addAccessory";
+    newContainer.appendChild(addAccBtn);
+
+    // Workspaces section
+    const workspaceNames = Object.keys(this.tree.workspaces).sort();
+    if (workspaceNames.length > 0) {
+      const header = document.createElement("div");
+      header.className = "mt-4";
+      header.innerHTML = `<h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">Workspaces</h2>`;
+      newContainer.appendChild(header);
+
+      const list = document.createElement("div");
+      list.className = "space-y-1";
+      for (const name of workspaceNames) {
+        const ws = this.tree.workspaces[name];
+        list.appendChild(this.#renderFileEntry(ws.file, `${name}.json`, "exists"));
+      }
+      newContainer.appendChild(list);
+    }
+
+    // Plugins section
+    const pluginNames = Object.keys(this.tree.plugins).sort();
+    if (pluginNames.length > 0) {
+      const header = document.createElement("div");
+      header.className = "mt-4";
+      header.innerHTML = `<h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">Plugins</h2>`;
+      newContainer.appendChild(header);
+
+      const list = document.createElement("div");
+      list.className = "space-y-1";
+      for (const name of pluginNames) {
+        const pluginPath = `${prefix}plugins/${name}/init.lua`;
+        list.appendChild(this.#renderFileEntry(pluginPath, `${name}/init.lua`, "exists"));
+      }
+      newContainer.appendChild(list);
+    }
 
     window.Turbo.morphElements(container, newContainer, {
       morphStyle: "innerHTML",
@@ -609,132 +689,79 @@ export default class extends Controller {
     }
   }
 
-  #renderSection(title, basePath, scope, options = {}) {
-    const { sharedScope, profileName } = options;
-    const isProfile = !!profileName;
-
+  #renderAgentSection(name, prefix) {
     const section = document.createElement("div");
-    section.id = `section-${(profileName || "shared").replace(/[^a-zA-Z0-9-]/g, "-")}`;
+    section.id = `section-agents-${name.replace(/[^a-zA-Z0-9-]/g, "-")}`;
     section.className = "mb-3 group/section data-[flash]:ring-1 data-[flash]:ring-primary-500/30 data-[flash]:rounded-lg";
 
-    if (isProfile) {
-      section.dataset.profile = profileName;
-    }
-
-    // Section header — profiles get a remove button
+    // Header with remove button
     const headerDiv = document.createElement("div");
     headerDiv.className = "flex items-center justify-between mb-2";
-    headerDiv.innerHTML = `<h3 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">${this.#escapeHtml(title)}</h3>`;
+    headerDiv.innerHTML = `<h3 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">${this.#escapeHtml(this.#capitalize(name))}</h3>`;
 
-    if (isProfile) {
-      const removeBtn = document.createElement("button");
-      removeBtn.type = "button";
-      removeBtn.className =
-        "text-zinc-700 hover:text-red-400 transition-colors opacity-0 group-hover/section:opacity-100";
-      removeBtn.title = "Remove profile";
-      removeBtn.dataset.action = "hub-settings#removeProfile";
-      removeBtn.dataset.profileName = profileName;
-      removeBtn.innerHTML = `<svg class="size-3.5" viewBox="0 0 20 20" fill="currentColor">
-        <path fill-rule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.52.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clip-rule="evenodd"/>
-      </svg>`;
-      headerDiv.appendChild(removeBtn);
-    }
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className =
+      "text-zinc-700 hover:text-red-400 transition-colors opacity-0 group-hover/section:opacity-100";
+    removeBtn.title = "Remove agent";
+    removeBtn.dataset.action = "hub-settings#removeAgent";
+    removeBtn.dataset.agentName = name;
+    removeBtn.innerHTML = `<svg class="size-3.5" viewBox="0 0 20 20" fill="currentColor">
+      <path fill-rule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.52.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clip-rule="evenodd"/>
+    </svg>`;
+    headerDiv.appendChild(removeBtn);
 
     section.appendChild(headerDiv);
 
     const list = document.createElement("div");
     list.className = "space-y-1";
 
-    // Workspace files
-    for (const [fileName, exists] of Object.entries(scope.files)) {
-      const status = this.#fileStatus(exists, sharedScope?.files?.[fileName]);
-      list.appendChild(this.#renderFileEntry(`${basePath}/${fileName}`, fileName, status));
-    }
-
-    // Sessions
-    const sessionNames = Object.keys(scope.sessions).sort((a, b) => {
-      if (a === "agent") return -1;
-      if (b === "agent") return 1;
-      return a.localeCompare(b);
-    });
-
-    if (sessionNames.length > 0) {
-      const sessHeader = document.createElement("div");
-      sessHeader.className = "mt-2 mb-1";
-      sessHeader.innerHTML = `<span class="text-xs text-zinc-600 uppercase tracking-wider">Sessions</span>`;
-      list.appendChild(sessHeader);
-
-      for (const sessionName of sessionNames) {
-        const session = scope.sessions[sessionName];
-        const sessionPath = `${basePath}/sessions/${sessionName}`;
-        const sharedSession = sharedScope?.sessions?.[sessionName];
-
-        const initStatus = this.#fileStatus(session.initialization, sharedSession?.initialization);
-        list.appendChild(
-          this.#renderFileEntry(`${sessionPath}/initialization`, `${sessionName}/initialization`, initStatus),
-        );
-
-        list.appendChild(
-          this.#renderPortForwardToggle(`${sessionPath}/port_forward`, sessionName, session.port_forward),
-        );
-      }
-    }
-
-    // Plugins
-    const pluginNames = Object.keys(scope.plugins || {}).sort();
-    if (pluginNames.length > 0) {
-      const plugHeader = document.createElement("div");
-      plugHeader.className = "mt-2 mb-1";
-      plugHeader.innerHTML = `<span class="text-xs text-zinc-600 uppercase tracking-wider">Plugins</span>`;
-      list.appendChild(plugHeader);
-
-      for (const pluginName of pluginNames) {
-        const plugin = scope.plugins[pluginName];
-        const pluginPath = `${basePath}/plugins/${pluginName}/init.lua`;
-        const sharedPlugin = sharedScope?.plugins?.[pluginName];
-        const status = this.#fileStatus(plugin.init, sharedPlugin?.init);
-        list.appendChild(this.#renderFileEntry(pluginPath, `${pluginName}/init.lua`, status));
-      }
-    }
-
-    // Agent session warning — resolved config must include agent
-    const hasAgent = !!scope.sessions?.agent;
-    const hasAgentInShared = !!sharedScope?.sessions?.agent;
-    if (isProfile && !hasAgent && !hasAgentInShared) {
-      const warning = document.createElement("p");
-      warning.className = "text-xs text-amber-400 mt-2 px-2.5";
-      warning.textContent = "Missing agent session — required for this profile to work";
-      list.appendChild(warning);
-    } else if (!isProfile && !hasAgent) {
-      const warning = document.createElement("p");
-      warning.className = "text-xs text-amber-400 mt-2 px-2.5";
-      warning.textContent = "No agent session — profiles without their own will not work";
-      list.appendChild(warning);
-    }
-
-    // Add session button
-    const addSessionBtn = document.createElement("button");
-    addSessionBtn.type = "button";
-    addSessionBtn.className = "w-full mt-1 px-2 py-1.5 text-xs text-zinc-600 hover:text-zinc-400 transition-colors text-left";
-    addSessionBtn.textContent = "+ Add session";
-    addSessionBtn.dataset.action = "hub-settings#addSession";
-    addSessionBtn.dataset.basePath = `${basePath}/sessions`;
-    list.appendChild(addSessionBtn);
+    const agentPath = `${prefix}agents/${name}`;
+    const agent = this.tree.agents[name];
+    const initStatus = agent.initialization ? "exists" : "missing";
+    list.appendChild(this.#renderFileEntry(`${agentPath}/initialization`, "initialization", initStatus));
 
     section.appendChild(list);
     return section;
   }
 
-  /**
-   * Determine the display status for a file entry.
-   * @param {boolean} exists - Whether the file exists in this scope
-   * @param {boolean} [existsInShared] - Whether the file exists in shared (undefined for shared scope)
-   * @returns {"exists"|"override"|"inherited"|"missing"}
-   */
-  #fileStatus(exists, existsInShared) {
-    if (exists) return existsInShared !== undefined ? "override" : "exists";
-    if (existsInShared) return "inherited";
-    return "missing";
+  #renderAccessorySection(name, prefix) {
+    const section = document.createElement("div");
+    section.id = `section-accessories-${name.replace(/[^a-zA-Z0-9-]/g, "-")}`;
+    section.className = "mb-3 group/section data-[flash]:ring-1 data-[flash]:ring-primary-500/30 data-[flash]:rounded-lg";
+
+    // Header with remove button
+    const headerDiv = document.createElement("div");
+    headerDiv.className = "flex items-center justify-between mb-2";
+    headerDiv.innerHTML = `<h3 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">${this.#escapeHtml(this.#capitalize(name))}</h3>`;
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className =
+      "text-zinc-700 hover:text-red-400 transition-colors opacity-0 group-hover/section:opacity-100";
+    removeBtn.title = "Remove accessory";
+    removeBtn.dataset.action = "hub-settings#removeAccessory";
+    removeBtn.dataset.accessoryName = name;
+    removeBtn.innerHTML = `<svg class="size-3.5" viewBox="0 0 20 20" fill="currentColor">
+      <path fill-rule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.52.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clip-rule="evenodd"/>
+    </svg>`;
+    headerDiv.appendChild(removeBtn);
+
+    section.appendChild(headerDiv);
+
+    const list = document.createElement("div");
+    list.className = "space-y-1";
+
+    const accPath = `${prefix}accessories/${name}`;
+    const acc = this.tree.accessories[name];
+    const initStatus = acc.initialization ? "exists" : "missing";
+    list.appendChild(this.#renderFileEntry(`${accPath}/initialization`, "initialization", initStatus));
+
+    // Port forward toggle
+    list.appendChild(this.#renderPortForwardToggle(`${accPath}/port_forward`, name, acc.port_forward));
+
+    section.appendChild(list);
+    return section;
   }
 
   #renderFileEntry(filePath, label, status) {
@@ -750,8 +777,6 @@ export default class extends Controller {
 
     const styles = {
       exists: "bg-emerald-500/10 text-emerald-400",
-      override: "bg-amber-500/10 text-amber-400",
-      inherited: "bg-sky-500/10 text-sky-400",
       missing: "bg-zinc-700/50 text-zinc-500",
     };
 
@@ -765,7 +790,7 @@ export default class extends Controller {
     return btn;
   }
 
-  #renderPortForwardToggle(filePath, sessionName, enabled) {
+  #renderPortForwardToggle(filePath, name, enabled) {
     const div = document.createElement("div");
     div.id = `pf-toggle-${filePath.replace(/[^a-zA-Z0-9-]/g, "-")}`;
     div.className = "flex items-center justify-between px-2.5 py-1";
@@ -773,7 +798,7 @@ export default class extends Controller {
     const id = `pf-${filePath.replace(/[/.]/g, "-")}`;
     div.innerHTML = `
       <div class="flex items-center gap-2">
-        <label for="${id}" class="text-xs text-zinc-500 cursor-pointer">${this.#escapeHtml(sessionName)}/port_forward</label>
+        <label for="${id}" class="text-xs text-zinc-500 cursor-pointer">port_forward</label>
         <span class="text-[10px] text-emerald-400/70 ${enabled ? "" : "hidden"}" data-pf-hint="${id}">$PORT available</span>
       </div>
       <div class="group relative inline-flex w-9 shrink-0 rounded-full p-0.5
@@ -907,7 +932,7 @@ export default class extends Controller {
         return;
       }
     } else if (!/^[a-z][a-z0-9_-]*$/.test(value)) {
-      // Default strict naming validation (for session/profile names)
+      // Default strict naming validation (for agent/accessory names)
       this.promptErrorTarget.textContent =
         "Must start with a letter. Only lowercase letters, numbers, hyphens, or underscores.";
       return;
@@ -934,9 +959,9 @@ export default class extends Controller {
     }
   }
 
-  #scrollToProfile(name) {
+  #scrollToSection(key) {
     const section = this.treeContainerTarget.querySelector(
-      `[data-profile="${CSS.escape(name)}"]`,
+      `#section-${CSS.escape(key)}`,
     );
     if (section) {
       section.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -959,28 +984,15 @@ export default class extends Controller {
     if (filePath.endsWith("/initialization")) {
       return meta.session_files?.initialization?.default || "#!/bin/bash\n";
     }
+    if (filePath.endsWith(".json")) {
+      return '{\n  "agents": [],\n  "accessories": []\n}\n';
+    }
     return "";
   }
 
-  /**
-   * Get existing session names for a sessions/ basePath by looking up the tree data.
-   * Repo scope: ".botster/shared/sessions" or ".botster/profiles/standard/sessions"
-   * Device scope: "shared/sessions" or "profiles/standard/sessions"
-   */
-  #sessionsForBasePath(basePath) {
-    if (!this.tree) return [];
-
-    // Match shared sessions (repo or device path format)
-    if (basePath.match(/(?:^|\.botster\/)shared\//)) {
-      return Object.keys(this.tree.shared?.sessions || {});
-    }
-
-    // Match profile sessions (repo or device path format)
-    const match = basePath.match(/(?:\.botster\/)?profiles\/([^/]+)\//);
-    if (match) {
-      return Object.keys(this.tree.profiles?.[match[1]]?.sessions || {});
-    }
-    return [];
+  /** Return the path prefix for the current config scope. */
+  #configPrefix() {
+    return this.configScope === "device" ? "" : ".botster/";
   }
 
   /** Return the fs scope string to pass to hub methods. */

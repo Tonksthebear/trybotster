@@ -22,19 +22,35 @@ commands.register("list_worktrees", function(client, sub_id, _command)
     client:send_worktree_list(sub_id)
 end, { description = "Send worktree list to client" })
 
+commands.register("list_configs", function(client, sub_id, _command)
+    local ConfigResolver = require("lib.config_resolver")
+    local device_root = config.data_dir and config.data_dir() or nil
+    local repo_root = worktree.repo_root()
+    local agents = ConfigResolver.list_agents(device_root, repo_root)
+    local accessories = ConfigResolver.list_accessories(device_root, repo_root)
+    local workspaces = ConfigResolver.list_workspaces(device_root, repo_root)
+    client:send({
+        subscriptionId = sub_id,
+        type = "configs",
+        agents = agents,
+        accessories = accessories,
+        workspaces = workspaces,
+    })
+end, { description = "List available agents, accessories, and workspaces" })
+
+-- Backward compat: list_profiles → list_configs
 commands.register("list_profiles", function(client, sub_id, _command)
     local ConfigResolver = require("lib.config_resolver")
     local device_root = config.data_dir and config.data_dir() or nil
     local repo_root = worktree.repo_root()
-    local profiles = ConfigResolver.list_profiles_all(device_root, repo_root)
-    local shared_agent = ConfigResolver.has_agent_without_profile(device_root, repo_root)
+    local agents = ConfigResolver.list_agents(device_root, repo_root)
     client:send({
         subscriptionId = sub_id,
         type = "profiles",
-        profiles = profiles,
-        shared_agent = shared_agent,
+        profiles = agents,
+        shared_agent = #agents > 0,
     })
-end, { description = "List available config profiles" })
+end, { description = "List available config profiles (deprecated, use list_configs)" })
 
 -- ============================================================================
 -- Agent Lifecycle Commands
@@ -44,7 +60,8 @@ commands.register("create_agent", function(client, _sub_id, command)
     local issue_or_branch = command.issue_or_branch or command.branch
     local prompt = command.prompt
     local from_worktree = command.from_worktree
-    local profile = command.profile
+    -- Accept both "agent_name" (new) and "profile" (legacy)
+    local agent_name = command.agent_name or command.profile
     local workspace = command.workspace
 
     local metadata = nil
@@ -52,25 +69,42 @@ commands.register("create_agent", function(client, _sub_id, command)
         metadata = { workspace = workspace }
     end
 
-    require("handlers.agents").handle_create_agent(issue_or_branch, prompt, from_worktree, client, profile, metadata)
-    log.info(string.format("Create agent request: %s (profile: %s, workspace: %s)",
-        tostring(issue_or_branch or "main"), tostring(profile or "auto"), tostring(workspace or "none")))
-end, { description = "Create a new agent (with optional worktree, profile, and workspace)" })
+    -- If a workspace config name is provided, load the manifest
+    if command.workspace_config then
+        metadata = metadata or {}
+        local ConfigResolver = require("lib.config_resolver")
+        local device_root = config.data_dir and config.data_dir() or nil
+        local repo_root = worktree.repo_root()
+        local resolved = ConfigResolver.resolve_all({
+            device_root = device_root,
+            repo_root = repo_root,
+            require_agent = false,
+        })
+        if resolved and resolved.workspaces[command.workspace_config] then
+            metadata.workspace_config = resolved.workspaces[command.workspace_config]
+        end
+    end
+
+    require("handlers.agents").handle_create_agent(issue_or_branch, prompt, from_worktree, client, agent_name, metadata)
+    log.info(string.format("Create agent request: %s (agent: %s, workspace: %s)",
+        tostring(issue_or_branch or "main"), tostring(agent_name or "auto"), tostring(workspace or "none")))
+end, { description = "Create a new agent (with optional worktree, agent name, and workspace)" })
 
 commands.register("create_accessory", function(client, _sub_id, command)
-    local session_name = command.session_name or command.name
+    -- Accept both "accessory_name" (new) and "session_name" (legacy)
+    local accessory_name = command.accessory_name or command.session_name or command.name
     local workspace = command.workspace
-    local profile = command.profile
+    local agent_name = command.agent_name or command.profile
     local metadata = command.metadata
 
-    if not session_name then
-        log.warn("create_accessory missing session_name")
+    if not accessory_name then
+        log.warn("create_accessory missing accessory_name")
         return
     end
 
-    require("handlers.agents").handle_create_accessory(workspace, session_name, profile, metadata)
+    require("handlers.agents").handle_create_accessory(workspace, accessory_name, agent_name, metadata)
     log.info(string.format("Create accessory request: %s (workspace: %s)",
-        session_name, tostring(workspace or "none")))
+        accessory_name, tostring(workspace or "none")))
 end, { description = "Create an accessory session (no AI autonomy)" })
 
 commands.register("rename_workspace", function(client, sub_id, command)
@@ -104,7 +138,8 @@ commands.register("reopen_worktree", function(client, _sub_id, command)
     local prompt = command.prompt
 
     if path then
-        require("handlers.agents").handle_create_agent(branch, prompt, path, client, command.profile)
+        local agent_name = command.agent_name or command.profile
+        require("handlers.agents").handle_create_agent(branch, prompt, path, client, agent_name)
         log.info(string.format("Reopen worktree request: %s", path))
     else
         log.warn("reopen_worktree missing path")

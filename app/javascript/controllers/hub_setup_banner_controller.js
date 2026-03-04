@@ -4,9 +4,9 @@ import { HubConnectionManager, HubConnection } from "connections";
 /**
  * Hub Setup Banner Controller
  *
- * Shows a warning banner when a hub has no session configuration.
- * Listens for profileList events from the hub connection to detect
- * whether shared agent + profiles exist.
+ * Shows a warning banner when a hub has no agent configuration.
+ * Listens for agentConfig events from the hub connection to detect
+ * whether any agents are configured.
  *
  * Offers one-click "Quick Setup" that installs the recommended
  * session template directly from the hub show page.
@@ -32,8 +32,8 @@ export default class extends Controller {
       this.hub = hub;
 
       this.unsubscribers.push(
-        this.hub.on("profileList", ({ profiles, sharedAgent }) => {
-          this.configured = sharedAgent || profiles.length > 0;
+        this.hub.on("agentConfig", ({ agents }) => {
+          this.configured = agents.length > 0;
           this.#updateVisibility();
         }),
       );
@@ -47,7 +47,7 @@ export default class extends Controller {
 
       this.unsubscribers.push(
         this.hub.onConnected(() => {
-          this.hub.requestProfiles();
+          this.hub.requestAgentConfig();
         }),
       );
     });
@@ -68,9 +68,9 @@ export default class extends Controller {
     this.#showStatus("Installing...");
 
     try {
-      // Initialize .botster/ structure first
-      await this.hub.mkDir(".botster/shared/sessions/agent");
-      await this.hub.mkDir(".botster/profiles");
+      // Initialize .botster/ structure — new agents/ layout
+      const parentDir = this.templateDestValue.replace(/\/[^/]+$/, "");
+      await this.hub.mkDir(`.botster/${parentDir}`);
 
       // Write the template content
       await this.hub.writeFile(
@@ -81,8 +81,8 @@ export default class extends Controller {
       this.configured = true;
       this.#updateVisibility();
 
-      // Refresh profiles so other controllers pick up the change
-      this.hub.requestProfiles();
+      // Refresh agent config so other controllers pick up the change
+      this.hub.requestAgentConfig();
     } catch (error) {
       this.#showStatus(`Failed: ${error.message}`);
     }

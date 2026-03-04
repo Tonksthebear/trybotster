@@ -19,7 +19,7 @@
  *   - agentCreated - New agent data
  *   - agentDeleted - { id }
  *   - connectionCode - { url, qr_ascii }
- *   - profileList - Array of profile names
+ *   - agentConfig - { agents, accessories, workspaces }
  *
  * Usage:
  *   const hub = await HubConnectionManager.acquire(HubConnection, hubId, { hubId });
@@ -92,10 +92,11 @@ export class HubConnection extends HubRoute {
         this.emit("connectionCode", message);
         break;
 
-      case "profiles":
-        this.emit("profileList", {
-          profiles: Array.isArray(message.profiles) ? message.profiles : [],
-          sharedAgent: !!message.shared_agent,
+      case "agent_config":
+        this.emit("agentConfig", {
+          agents: Array.isArray(message.agents) ? message.agents : [],
+          accessories: Array.isArray(message.accessories) ? message.accessories : [],
+          workspaces: Array.isArray(message.workspaces) ? message.workspaces : [],
         });
         break;
 
@@ -176,10 +177,10 @@ export class HubConnection extends HubRoute {
   }
 
   /**
-   * Request list of config profiles from CLI.
+   * Request agent/accessory/workspace config from CLI.
    */
-  requestProfiles() {
-    return this.send("list_profiles");
+  requestAgentConfig() {
+    return this.send("list_agent_config");
   }
 
   /**
