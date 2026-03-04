@@ -34,8 +34,9 @@ class FileInputTest < ApplicationSystemTestCase
     create_agent_via_ui
 
     # Navigate to agent page
-    first("[data-agent-list-target='list'] a[href*='/agents/']", wait: 15).click
-    find("[data-controller='terminal-display']", wait: 15)
+    first("[data-agent-list-target='list'] a[href*='/sessions/']", wait: 15).click
+    terminal_el = find("[data-controller='terminal-display']", wait: 15)
+    session_uuid = terminal_el["data-terminal-display-session-uuid-value"]
 
     # Inject a hidden file input and attach the test PNG via Capybara
     fixture_path = Rails.root.join("test/fixtures/files/test_image.png")
@@ -45,14 +46,15 @@ class FileInputTest < ApplicationSystemTestCase
     # Send via TerminalConnection (not HubConnection — correct sub_id routing).
     # Capybara's .drop() doesn't work here because Chrome's synthetic DragEvent
     # doesn't populate dataTransfer.files. We use attach_file + sendFile instead.
-    result = page.driver.browser.execute_async_script(<<~JS, @hub.id.to_s)
+    result = page.driver.browser.execute_async_script(<<~JS, @hub.id.to_s, session_uuid)
       var done = arguments[arguments.length - 1];
       var hubId = arguments[0];
+      var sessionUuid = arguments[1];
 
       (async function() {
         try {
           var { HubConnectionManager } = await import("connections/hub_connection_manager");
-          var key = "terminal:" + hubId + ":0:0";
+          var key = "terminal:" + hubId + ":" + sessionUuid;
 
           // Wait for TerminalConnection to be created by terminal_display_controller
           var conn = null;
@@ -100,8 +102,9 @@ class FileInputTest < ApplicationSystemTestCase
     sign_in_and_connect
     create_agent_via_ui
 
-    first("[data-agent-list-target='list'] a[href*='/agents/']", wait: 15).click
-    find("[data-controller='terminal-display']", wait: 15)
+    first("[data-agent-list-target='list'] a[href*='/sessions/']", wait: 15).click
+    terminal_el = find("[data-controller='terminal-display']", wait: 15)
+    session_uuid = terminal_el["data-terminal-display-session-uuid-value"]
 
     # Use the 360KB test image — exceeds Chrome's 256KB SCTP max-message-size,
     # which forces the browser to use application-level chunking (CONTENT_FILE_CHUNK).
@@ -111,14 +114,15 @@ class FileInputTest < ApplicationSystemTestCase
     page.execute_script("document.body.insertAdjacentHTML('beforeend', '<input type=\"file\" id=\"test-file-input\">')")
     attach_file("test-file-input", fixture_path.to_s, make_visible: true)
 
-    result = page.driver.browser.execute_async_script(<<~JS, @hub.id.to_s)
+    result = page.driver.browser.execute_async_script(<<~JS, @hub.id.to_s, session_uuid)
       var done = arguments[arguments.length - 1];
       var hubId = arguments[0];
+      var sessionUuid = arguments[1];
 
       (async function() {
         try {
           var { HubConnectionManager } = await import("connections/hub_connection_manager");
-          var key = "terminal:" + hubId + ":0:0";
+          var key = "terminal:" + hubId + ":" + sessionUuid;
 
           var conn = null;
           for (var i = 0; i < 50; i++) {
