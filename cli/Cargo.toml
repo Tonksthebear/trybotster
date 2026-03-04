@@ -101,6 +101,9 @@ rustrtc = "0.3"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 
+# MCP SDK — official Rust MCP server implementation (JSON-RPC framing, method dispatch)
+rmcp = { version = "1.1", features = ["transport-io"] }
+
 [dev-dependencies]
 tempfile = "3.23"
 portable-pty = "0.9"
