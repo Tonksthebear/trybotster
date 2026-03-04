@@ -137,7 +137,6 @@ function M.rebuild_nav_flat_list(tui_state)
           type = "agent",
           workspace_id = ws.id,
           agent_id = agent.id,
-          agent_index = agent.agent_index,
         }
       end
     end

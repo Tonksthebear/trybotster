@@ -2511,7 +2511,7 @@ mod tests {
         );
     }
 
-    /// Verifies Ctrl+] produces toggle_pty action via Lua.
+    /// Verifies Ctrl+] is unbound (no toggle_pty in single-PTY model).
     #[test]
     fn test_e2e_pty_toggle_keybinding() {
         let lua = make_test_layout_with_keybindings();
@@ -2522,8 +2522,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.as_ref().map(|a| a.action.as_str()),
-            Some("toggle_pty"),
-            "Ctrl+] should be toggle_pty"
+            None,
+            "Ctrl+] should be unbound in single-PTY model"
         );
     }
 
