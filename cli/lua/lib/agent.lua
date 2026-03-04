@@ -129,6 +129,7 @@ function Agent.new(config)
     -- Build environment variables
     local env = self:build_env(config.env)
     self.hub_socket = env.BOTSTER_HUB_SOCKET
+    self.hub_manifest_path = env.BOTSTER_HUB_MANIFEST_PATH
 
     if self._context_path then
         self:_sync_context_json()
@@ -363,6 +364,7 @@ function Agent:_sync_context_json()
             branch_name = self.branch_name,
             worktree_path = self.worktree_path,
             hub_socket = self.hub_socket,
+            hub_manifest_path = self.hub_manifest_path,
             prompt = self.prompt,
             metadata = self.metadata,
             profile_name = self.profile_name,
@@ -845,6 +847,12 @@ function Agent:build_env(base_env)
         local ok, socket_path = pcall(hub_discovery.socket_path, local_hub_id)
         if ok and type(socket_path) == "string" and socket_path ~= "" then
             env.BOTSTER_HUB_SOCKET = socket_path
+        end
+    end
+    if local_hub_id and hub_discovery and hub_discovery.manifest_path then
+        local ok, manifest_path = pcall(hub_discovery.manifest_path, local_hub_id)
+        if ok and type(manifest_path) == "string" and manifest_path ~= "" then
+            env.BOTSTER_HUB_MANIFEST_PATH = manifest_path
         end
     end
     if self.prompt and self.prompt ~= "" then
