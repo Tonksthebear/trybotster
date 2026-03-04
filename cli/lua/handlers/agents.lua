@@ -1,24 +1,18 @@
 -- Agent lifecycle handler (hot-reloadable)
 --
--- Orchestrates agent creation and deletion with full lifecycle broadcasting.
+-- Orchestrates agent and accessory creation/deletion with full lifecycle broadcasting.
 --
 -- Responsibilities:
 -- - Parse issue-or-branch input into branch_name
 -- - Find or create worktrees
 -- - Resolve config profiles via ConfigResolver
--- - Spawn agents via Agent.new() (which handles PTY, env, prompt files)
+-- - Spawn agents (single PTY) via Agent.new()
+-- - Spawn accessories (single PTY, no AI autonomy) via Agent.new()
 -- - Broadcast agent lifecycle events to connected clients
 --
--- Lifecycle stages (broadcast to all clients):
--- - creating_worktree: Worktree creation started
--- - spawning_ptys: PTY session spawning started
--- - running: Agent fully operational
--- - stopping: Agent shutdown initiated
--- - removing_worktree: Worktree deletion queued
--- - deleted: Agent fully cleaned up
---
--- The Agent class (lib.agent) does the heavy lifting. This handler is
--- the orchestration layer that connects incoming requests to the Agent API.
+-- Single-PTY model: each Agent instance has exactly one PTY.
+-- Agents have AI autonomy. Accessories are plain PTY sessions.
+-- Session UUID is the primary key for everything.
 
 local Agent = require("lib.agent")
 local ConfigResolver = require("lib.config_resolver")
@@ -28,9 +22,6 @@ local ConfigResolver = require("lib.config_resolver")
 -- ============================================================================
 
 --- Parse an issue-or-branch string into structured fields.
--- If the input is a bare number, treat it as an issue number and derive
--- the branch name. Otherwise treat it as a literal branch name.
---
 -- @param issue_or_branch string  Issue number or branch name
 -- @return issue_number number|nil
 -- @return branch_name string
@@ -44,8 +35,6 @@ local function parse_issue_or_branch(issue_or_branch)
 end
 
 --- Build the agent key for duplicate checking.
--- Matches Agent:agent_key() format: repo with "/" replaced by "-", plus branch_name.
---
 -- @param repo string  "owner/repo"
 -- @param branch_name string
 -- @return string
@@ -56,16 +45,15 @@ local function build_agent_key(repo, branch_name)
 end
 
 --- Find the next available agent key by appending a suffix if needed.
--- If base_key is free, returns it as-is. Otherwise tries base_key-2, -3, etc.
---
+-- Uses Agent.find_by_agent_key to check for existing agents by key.
 -- @param base_key string  The base agent key
 -- @return string          An unused agent key
 local function next_available_key(base_key)
-    if not Agent.get(base_key) then
+    if not Agent.find_by_agent_key(base_key) then
         return base_key
     end
     local i = 2
-    while Agent.get(base_key .. "-" .. i) do
+    while Agent.find_by_agent_key(base_key .. "-" .. i) do
         i = i + 1
     end
     return base_key .. "-" .. i
@@ -76,12 +64,6 @@ end
 -- ============================================================================
 
 --- Resolve profile name from user input.
---
--- Three input cases:
---   non-empty string  → explicit profile name, use as-is
---   empty string ""   → user explicitly chose "Default" (shared-only)
---   nil               → not specified, auto-select or fall back to shared
---
 -- @param repo_root string Repository root path
 -- @param profile_name string|nil Input from user/browser
 -- @return string|nil Resolved profile name (nil = shared-only)
@@ -120,22 +102,50 @@ local function resolve_profile_name(repo_root, profile_name)
     end
 end
 
---- Build session configs for Agent.new() from resolved config.
--- Maps ConfigResolver output to the format Agent.new() expects.
+--- Pick the "agent" session config from resolved config.
+-- Returns a single session config for the primary agent PTY.
 -- @param resolved table ConfigResolver.resolve_all() output
--- @return array Session configs for Agent.new()
-local function build_sessions_from_resolved(resolved)
-    local sessions = {}
+-- @return table Single session config for Agent.new()
+local function pick_agent_session(resolved)
     for _, session in ipairs(resolved.sessions) do
-        sessions[#sessions + 1] = {
-            name = session.name,
-            command = "bash",
-            init_script = session.initialization,  -- absolute path
-            notifications = (session.name == "agent"),
-            forward_port = session.port_forward,
-        }
+        if session.name == "agent" then
+            return {
+                name = "agent",
+                command = "bash",
+                init_script = session.initialization,
+                notifications = true,
+                forward_port = session.port_forward,
+            }
+        end
     end
-    return sessions
+    -- Fallback: use first session
+    local session = resolved.sessions[1]
+    return {
+        name = session.name,
+        command = "bash",
+        init_script = session.initialization,
+        notifications = (session.name == "agent"),
+        forward_port = session.port_forward,
+    }
+end
+
+--- Pick a named session config from resolved config for an accessory.
+-- @param resolved table ConfigResolver.resolve_all() output
+-- @param session_name string Name of the session to pick
+-- @return table|nil Single session config, or nil if not found
+local function pick_named_session(resolved, session_name)
+    for _, session in ipairs(resolved.sessions) do
+        if session.name == session_name then
+            return {
+                name = session_name,
+                command = "bash",
+                init_script = session.initialization,
+                notifications = false,
+                forward_port = session.port_forward,
+            }
+        end
+    end
+    return nil
 end
 
 -- ============================================================================
@@ -143,15 +153,12 @@ end
 -- ============================================================================
 
 --- Notify lifecycle status change via hooks.
--- Used during creation/deletion for intermediate statuses (creating_worktree,
--- spawning_ptys, stopping, etc.). Observers in connections.lua broadcast to clients.
---
--- @param agent_key string The agent key
+-- @param agent_id string The agent key or session_uuid
 -- @param status string The lifecycle status
 -- @param extra table|nil Optional extra fields to include
-local function notify_lifecycle(agent_key, status, extra)
+local function notify_lifecycle(agent_id, status, extra)
     local payload = {
-        agent_id = agent_key,
+        agent_id = agent_id,
         status = status,
     }
     if extra then
@@ -174,7 +181,7 @@ end
 -- @param client table|nil       Requesting client (for dimensions)
 -- @param agent_key string       Pre-computed agent key for status broadcasts
 -- @param profile_name string    Profile to use for config resolution
--- @param metadata table|nil     Plugin metadata (e.g., issue_number, invocation_url)
+-- @param metadata table|nil     Plugin metadata
 -- @return Agent|nil             The created agent, or nil on error
 -- @return string|nil            Error message (nil on success)
 local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, profile_name, metadata)
@@ -199,13 +206,13 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
         return nil, msg
     end
 
-    local sessions = build_sessions_from_resolved(resolved)
+    -- Pick the single "agent" session from resolved config
+    local session_config = pick_agent_session(resolved)
 
-    -- Default dimensions for PTY creation. The actual client dimensions
-    -- are set when the client subscribes to the terminal channel via pty_clients.
+    -- Default dimensions
     local dims = { rows = 24, cols = 80 }
 
-    -- Extract workspace fields from metadata (set by plugins) before passing to Agent.new
+    -- Extract workspace fields from metadata
     local workspace_name = metadata and metadata.workspace or nil
     local workspace_id = metadata and metadata.workspace_id or nil
     local workspace_metadata = metadata and metadata.workspace_metadata or nil
@@ -219,7 +226,8 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
         workspace = workspace_name,
         workspace_id = workspace_id,
         workspace_metadata = workspace_metadata,
-        sessions = sessions,
+        session_type = "agent",
+        session = session_config,
         dims = dims,
         agent_key = agent_key,
         profile_name = profile_name,
@@ -229,7 +237,6 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
         local msg = string.format("Failed to spawn agent for %s: %s",
             branch_name, tostring(agent))
         log.error(msg)
-        -- Broadcast failure status
         notify_lifecycle(agent_key, "failed", { error = tostring(agent) })
         return nil, msg
     end
@@ -237,17 +244,68 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
     -- Notify via hooks (connections.lua observes and broadcasts to clients)
     hooks.notify("agent_created", agent:info())
 
-    -- Deliver initial prompt to the agent PTY via probe-based message delivery.
-    -- send_message lazily initialises the delivery task, so this is safe to call
-    -- immediately — the probe mechanism waits until the shell is ready before
-    -- injecting the text.
-    if prompt and prompt ~= "" then
-        local session = agent.sessions and agent.sessions["agent"]
-        if session then
-            session:send_message(prompt)
-        end
+    -- Deliver initial prompt to the agent PTY
+    if prompt and prompt ~= "" and agent.session then
+        agent.session:send_message(prompt)
     end
 
+    return agent
+end
+
+--- Spawn an accessory in an existing worktree.
+--
+-- @param branch_name string
+-- @param wt_path string        Worktree filesystem path
+-- @param session_name string    Session name from config (e.g., "server")
+-- @param agent_key string       Pre-computed agent key
+-- @param profile_name string    Profile to use
+-- @param metadata table|nil     Plugin metadata
+-- @return Agent|nil
+-- @return string|nil
+local function spawn_accessory(branch_name, wt_path, session_name, agent_key, profile_name, metadata)
+    local repo = config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
+    local repo_root = worktree.repo_root()
+
+    local device_root = config.data_dir and config.data_dir() or nil
+    local resolved, err = ConfigResolver.resolve_all({
+        device_root = device_root,
+        repo_root = repo_root,
+        profile = profile_name,
+    })
+    if not resolved then
+        log.error(string.format("Config resolution failed: %s", tostring(err)))
+        return nil, tostring(err)
+    end
+
+    local session_config = pick_named_session(resolved, session_name)
+    if not session_config then
+        -- Fall back to a raw shell with the given name
+        session_config = { name = session_name, command = "bash" }
+    end
+
+    local workspace_name = metadata and metadata.workspace or nil
+    local workspace_id = metadata and metadata.workspace_id or nil
+
+    local ok, agent = pcall(Agent.new, {
+        repo = repo,
+        branch_name = branch_name,
+        worktree_path = wt_path,
+        session_type = "accessory",
+        session = session_config,
+        metadata = metadata,
+        workspace = workspace_name,
+        workspace_id = workspace_id,
+        dims = { rows = 24, cols = 80 },
+        agent_key = agent_key,
+        profile_name = profile_name,
+    })
+
+    if not ok then
+        log.error(string.format("Failed to spawn accessory: %s", tostring(agent)))
+        return nil, tostring(agent)
+    end
+
+    hooks.notify("agent_created", agent:info())
     return agent
 end
 
@@ -256,27 +314,18 @@ end
 -- ============================================================================
 
 --- Handle a request to create a new agent.
--- Called by Client:on_message when it receives a "create_agent" subscription
--- message, or by command channel processing.
---
--- Supports two launch modes:
--- 1. Main repo mode: No issue_or_branch AND no from_worktree - agent runs in repo root
--- 2. Worktree mode: Find existing or create new worktree, then spawn agent
---
--- @param issue_or_branch string|nil  Issue number or branch name (nil for main repo mode)
+-- @param issue_or_branch string|nil  Issue number or branch name
 -- @param prompt string|nil           Optional task prompt
 -- @param from_worktree string|nil    Optional existing worktree path
--- @param client table|nil            Requesting client (for progress/dims)
--- @param profile_name string|nil     Profile name (auto-selected if only one)
--- @param metadata table|nil          Plugin metadata (e.g., issue_number, invocation_url)
--- @return Agent|nil                  The created agent, or nil on error/async
--- @return string|nil                 Error message (nil on success or async creation)
+-- @param client table|nil            Requesting client
+-- @param profile_name string|nil     Profile name
+-- @param metadata table|nil          Plugin metadata
+-- @return Agent|nil
+-- @return string|nil
 local function handle_create_agent(issue_or_branch, prompt, from_worktree, client, profile_name, metadata)
-    -- Early identifier for lifecycle events on error paths (matches what TUI
-    -- sets for creating_agent_id in actions.lua).
     local early_id = issue_or_branch or "main"
 
-    -- Interceptor: plugins can transform params or block creation (return nil)
+    -- Interceptor: plugins can transform params or block creation
     local params = hooks.call("before_agent_create", {
         issue_or_branch = issue_or_branch,
         prompt = prompt,
@@ -289,14 +338,13 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         notify_lifecycle(early_id, "failed", { error = "Blocked by interceptor" })
         return nil, "Blocked by interceptor"
     end
-    -- Allow interceptors to modify fields
     issue_or_branch = params.issue_or_branch
     prompt = params.prompt
     from_worktree = params.from_worktree
     profile_name = params.profile_name
     metadata = params.metadata
 
-    -- Resolve profile name (auto-select if only one, nil = shared-only)
+    -- Resolve profile name
     local repo_root = worktree.repo_root()
     if repo_root then
         local resolved_profile, profile_err = resolve_profile_name(repo_root, profile_name)
@@ -305,7 +353,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
             notify_lifecycle(early_id, "failed", { error = profile_err })
             return nil, "Profile resolution failed: " .. profile_err
         end
-        profile_name = resolved_profile  -- nil for shared-only, or a profile name
+        profile_name = resolved_profile
     else
         log.error("Cannot resolve profile: no repo root detected")
         notify_lifecycle(early_id, "failed", { error = "No repo root detected" })
@@ -323,21 +371,15 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
 
     local _, branch_name = parse_issue_or_branch(issue_or_branch)
 
-    -- Treat empty string as no prompt
     if prompt == "" then
         prompt = nil
     end
 
-    -- Detect repo
     local repo = config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
-
-    -- Build agent key for status broadcasts and duplicate checking
     local agent_key = build_agent_key(repo, branch_name)
-
-    -- Allow multiple agents on the same branch by suffixing the key
     agent_key = next_available_key(agent_key)
 
-    -- Non-git mode: no worktree isolation, spawn directly in cwd
+    -- Non-git mode
     if not worktree.is_git_repo() then
         log.info(string.format("No git repo — spawning %s directly in %s", branch_name, repo_root))
         return spawn_agent(branch_name, repo_root, prompt, client, agent_key, profile_name, metadata)
@@ -346,16 +388,12 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     -- Find or create worktree
     local wt_path = from_worktree or worktree.find(branch_name)
 
-    -- worktree.find() only checks linked worktrees, not the main checkout.
-    -- hub.get_worktrees() also excludes it (filters by .git file vs directory).
-    -- Read .git/HEAD directly to check if branch_name is the main repo branch.
     if not wt_path then
         local head_path = repo_root .. "/.git/HEAD"
         local f = io.open(head_path, "r")
         if f then
             local head = f:read("*l")
             f:close()
-            -- HEAD contains "ref: refs/heads/<branch>" when on a branch
             local main_branch = head and head:match("^ref: refs/heads/(.+)$")
             if main_branch == branch_name then
                 wt_path = repo_root
@@ -365,22 +403,17 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     end
 
     if not wt_path then
-        -- Broadcast: creating worktree (sent immediately to clients)
         notify_lifecycle(agent_key, "creating_worktree")
         log.info(string.format("No worktree found for %s, queueing async creation...", branch_name))
 
-        -- Queue async creation — returns immediately, Hub fires worktree_created
-        -- or worktree_create_failed event when git completes on blocking thread.
-        local client_rows = 24
-        local client_cols = 80
         worktree.create_async({
             agent_key = agent_key,
             branch = branch_name,
             prompt = prompt,
             metadata = metadata,
             profile_name = profile_name,
-            client_rows = client_rows,
-            client_cols = client_cols,
+            client_rows = 24,
+            client_cols = 80,
         })
         return nil  -- Agent spawning continues in worktree_created event handler
     else
@@ -390,30 +423,71 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     return spawn_agent(branch_name, wt_path, prompt, client, agent_key, profile_name, metadata)
 end
 
---- Handle a request to delete an agent.
---
--- @param agent_key string       Agent key (repo-issue or repo-branch)
--- @param delete_worktree boolean  Whether to also delete the worktree
--- @return boolean                 True if agent was found and deleted
-local function handle_delete_agent(agent_key, delete_worktree)
-    -- Interceptor: plugins can block deletion (return nil)
-    local config = hooks.call("before_agent_delete", {
-        agent_key = agent_key,
+--- Handle a request to create an accessory.
+-- @param workspace string|nil     Workspace name (used to find worktree path)
+-- @param session_name string      Session name from config (e.g., "server")
+-- @param profile_name string|nil  Profile name
+-- @param metadata table|nil       Plugin metadata
+-- @return Agent|nil
+-- @return string|nil
+local function handle_create_accessory(workspace, session_name, profile_name, metadata)
+    if not session_name then
+        return nil, "session_name is required for accessories"
+    end
+
+    -- Find worktree from workspace or use repo root
+    local wt_path = worktree.repo_root()
+    local branch_name = "main"
+
+    -- If workspace provided, try to find the worktree from existing agents
+    if workspace then
+        local existing = Agent.find_by_workspace(workspace)
+        if #existing > 0 then
+            wt_path = existing[1].worktree_path
+            branch_name = existing[1].branch_name
+        end
+    end
+
+    local repo = config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
+    local base_key = build_agent_key(repo, branch_name) .. "-" .. session_name
+    local agent_key = next_available_key(base_key)
+
+    metadata = metadata or {}
+    if workspace then
+        metadata.workspace = workspace
+    end
+
+    return spawn_accessory(branch_name, wt_path, session_name, agent_key, profile_name, metadata)
+end
+
+--- Handle a request to delete a session (agent or accessory).
+-- @param session_uuid string       Session UUID
+-- @param delete_worktree boolean   Whether to also delete the worktree
+-- @return boolean
+local function handle_delete_session(session_uuid, delete_worktree)
+    -- Interceptor: plugins can block deletion
+    local cfg = hooks.call("before_agent_delete", {
+        session_uuid = session_uuid,
         delete_worktree = delete_worktree,
     })
-    if config == nil then
-        log.info("before_agent_delete interceptor blocked agent deletion")
+    if cfg == nil then
+        log.info("before_agent_delete interceptor blocked deletion")
         return false
     end
-    -- Allow interceptors to modify fields
-    agent_key = config.agent_key
-    delete_worktree = config.delete_worktree
+    session_uuid = cfg.session_uuid
+    delete_worktree = cfg.delete_worktree
 
-    local agent = Agent.get(agent_key)
+    local agent = Agent.get(session_uuid)
     if not agent then
-        log.warn("Cannot delete unknown agent: " .. tostring(agent_key))
-        return false
+        -- Try lookup by agent_key for backward compat
+        agent = Agent.find_by_agent_key(session_uuid)
+        if not agent then
+            log.warn("Cannot delete unknown session: " .. tostring(session_uuid))
+            return false
+        end
     end
+
+    local agent_key = agent:agent_key()
 
     -- Broadcast: stopping
     notify_lifecycle(agent_key, "stopping")
@@ -423,40 +497,39 @@ local function handle_delete_agent(agent_key, delete_worktree)
         local wt_path = agent.worktree_path
         local still_running = {}
         for _, other in ipairs(Agent.list()) do
-            if other:agent_key() ~= agent_key and other.worktree_path == wt_path then
+            if other.session_uuid ~= agent.session_uuid and other.worktree_path == wt_path then
                 still_running[#still_running + 1] = other:agent_key()
             end
         end
         if #still_running > 0 then
             log.warn(string.format(
-                "Cannot delete worktree — agent(s) [%s] still running in it",
+                "Cannot delete worktree — session(s) [%s] still running in it",
                 table.concat(still_running, ", ")))
             delete_worktree = false
         end
     end
 
-    -- Close the agent (kills PTY sessions)
+    -- Close the agent (kills PTY session)
     agent:close(delete_worktree)
 
-    -- Broadcast: deleted (or removing_worktree if that was requested)
     if delete_worktree then
         notify_lifecycle(agent_key, "removing_worktree")
     end
 
-    -- Notify via hooks (connections.lua observes and broadcasts to clients)
+    -- Notify via hooks
     hooks.notify("agent_deleted", agent_key)
 
     return true
 end
+
+-- Keep backward-compat name
+local handle_delete_agent = handle_delete_session
 
 -- ============================================================================
 -- Event Listeners
 -- ============================================================================
 
 --- Format a notification string for an existing agent.
--- Matches the format used by the Rust try_notify_existing_agent().
--- @param message table The command_message with prompt/context fields
--- @return string The notification text
 local function format_notification(message)
     local prompt = message.prompt
     if prompt then
@@ -470,16 +543,12 @@ local function format_notification(message)
 end
 
 --- Notify an existing agent of a new mention via PTY input.
--- Writes the notification text to the agent's "agent" session PTY.
--- @param agent Agent The existing agent to notify
--- @param text string The notification text
 local function notify_existing_agent(agent, text)
-    local session = agent.sessions and agent.sessions["agent"]
-    if session then
-        session:send_message(text)
+    if agent.session then
+        agent.session:send_message(text)
         log.info("Sent notification to existing agent: " .. agent:agent_key())
     else
-        log.warn("Cannot notify agent (no 'agent' session): " .. agent:agent_key())
+        log.warn("Cannot notify agent (no session): " .. agent:agent_key())
     end
 end
 
@@ -499,11 +568,9 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
             local meta = message.metadata or {}
             local existing = {}
 
-            -- Match by workspace name from plugin metadata
             if meta.workspace then
                 existing = Agent.find_by_workspace(meta.workspace)
             else
-                -- Fallback: match by issue_number + repo
                 local repo = message.repo or config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
                 local issue_number, _ = parse_issue_or_branch(issue_or_branch)
                 if issue_number then
@@ -526,7 +593,6 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
         end
 
         if issue_or_branch then
-            -- Build metadata from message fields
             local meta = message.metadata or {}
             if message.invocation_url and not meta.invocation_url then
                 meta.invocation_url = message.invocation_url
@@ -539,12 +605,19 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
         else
             log.warn("command_message create_agent missing issue_or_branch")
         end
-    elseif msg_type == "delete_agent" then
-        local agent_id = message.id or message.agent_id or message.session_key
-        if agent_id then
-            handle_delete_agent(agent_id, message.delete_worktree or false)
+
+    elseif msg_type == "create_accessory" then
+        local session_name = message.session_name
+        local workspace = message.workspace
+        local profile = message.profile
+        handle_create_accessory(workspace, session_name, profile, message.metadata)
+
+    elseif msg_type == "delete_agent" or msg_type == "delete_session" then
+        local session_id = message.id or message.agent_id or message.session_uuid or message.session_key
+        if session_id then
+            handle_delete_session(session_id, message.delete_worktree or false)
         else
-            log.warn("command_message delete_agent missing agent_id")
+            log.warn("command_message delete missing session identifier")
         end
     end
 end)
@@ -553,16 +626,12 @@ end)
 -- Async Worktree Creation Callbacks
 -- ============================================================================
 
---- Resume agent spawning after async worktree creation completes.
--- Fired by Hub when spawn_blocking finishes the git worktree add.
--- Carries all context needed to continue where handle_create_agent left off.
 _event_subs[#_event_subs + 1] = events.on("worktree_created", function(info)
     log.info(string.format("Worktree created for %s at %s, resuming agent spawn",
         info.branch, info.path))
 
     local repo_root = worktree.repo_root()
 
-    -- Copy workspace files into new worktree (same logic as was in handle_create_agent)
     local device_root_copy = config.data_dir and config.data_dir() or nil
     local resolved_for_copy, _ = ConfigResolver.resolve_all({
         device_root = device_root_copy,
@@ -577,7 +646,6 @@ _event_subs[#_event_subs + 1] = events.on("worktree_created", function(info)
         end
     end
 
-    -- Reconstruct a minimal client table for dimensions
     local client = { rows = info.client_rows, cols = info.client_cols }
 
     spawn_agent(
@@ -591,8 +659,6 @@ _event_subs[#_event_subs + 1] = events.on("worktree_created", function(info)
     )
 end)
 
---- Handle async worktree creation failure.
--- Fired by Hub when the blocking git operation fails.
 _event_subs[#_event_subs + 1] = events.on("worktree_create_failed", function(info)
     log.error(string.format("Async worktree creation failed for %s: %s",
         info.branch, info.error))
@@ -606,11 +672,12 @@ end)
 local M = {
     handle_create_agent = handle_create_agent,
     handle_delete_agent = handle_delete_agent,
+    handle_create_accessory = handle_create_accessory,
+    handle_delete_session = handle_delete_session,
 }
 
 -- Lifecycle hooks for hot-reload
 function M._before_reload()
-    -- Unsubscribe event listeners to prevent duplicate firing
     for _, sub_id in ipairs(_event_subs) do
         events.off(sub_id)
     end

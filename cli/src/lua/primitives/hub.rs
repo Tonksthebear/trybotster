@@ -8,7 +8,7 @@
 //!
 //! - **State queries** (`get_worktrees`, `server_id`, `detect_repo`)
 //!   read directly from shared state or environment
-//! - **Registration** (`register_agent`, `unregister_agent`) manages PTY handles
+//! - **Registration** (`register_session`, `unregister_session`) manages PTY handles
 //! - **Operations** (`quit`, `handle_webrtc_offer`, `handle_ice_candidate`)
 //!   send events to the Hub event loop via `HubEventSender`
 //!
@@ -18,8 +18,8 @@
 //! -- Get available worktrees
 //! local worktrees = hub.get_worktrees()
 //!
-//! -- Register agent PTY handles
-//! local index = hub.register_agent("owner-repo-42", sessions)
+//! -- Register session PTY handle
+//! local index = hub.register_session("sess-abc123", handle, { agent_key = "owner-repo-42" })
 //!
 //! -- Get server-assigned hub ID
 //! local id = hub.server_id()
@@ -99,8 +99,8 @@ pub type SharedServerId = Arc<Mutex<Option<String>>>;
 ///
 /// Adds the following functions to the `hub` table:
 /// - `hub.get_worktrees()` - Get available worktrees
-/// - `hub.register_agent(key, sessions)` - Register agent PTY handles
-/// - `hub.unregister_agent(key)` - Unregister agent PTY handles
+/// - `hub.register_session(uuid, handle, metadata)` - Register session PTY handle
+/// - `hub.unregister_session(uuid)` - Unregister session PTY handle
 /// - `hub.hub_id()` - Get local hub identifier (stable hash, matches hub_discovery IDs)
 /// - `hub.server_id()` - Get server-assigned hub ID
 /// - `hub.detect_repo()` - Detect current repo name
@@ -162,99 +162,89 @@ pub(crate) fn register(
     hub.set("get_worktrees", get_worktrees_fn)
         .map_err(|e| anyhow!("Failed to set hub.get_worktrees: {e}"))?;
 
-    // hub.register_agent(agent_key, sessions) - Register agent PTY handles
+    // hub.register_session(session_uuid, pty_handle, metadata) - Register session PTY handle
     //
-    // Called by Lua Agent class to register PTY session handles with
+    // Called by Lua Agent class to register a single PTY session handle with
     // HandleCache, enabling Rust-side PTY operations (forwarders, write, resize).
     //
     // Arguments:
-    //   agent_key: string - Agent key (e.g., "owner-repo-42")
-    //   sessions: array - Ordered Lua array of PtySessionHandle userdata
-    //                     Index order determines PTY index (agent=0, then alphabetical)
+    //   session_uuid: string - Stable session UUID (e.g., "sess-1234567890-abcdef")
+    //   pty_handle:   PtySessionHandle userdata - Single PTY handle
+    //   metadata:     table - { session_type = "agent"|"accessory", agent_key = "owner-repo-42", workspace_id = nil }
     let cache2 = Arc::clone(&handle_cache);
-    let register_agent_fn = lua
-        .create_function(move |_, (agent_key, sessions): (String, LuaTable)| {
-            use crate::hub::agent_handle::{AgentPtys, PtyHandle};
+    let register_session_fn = lua
+        .create_function(move |_, (session_uuid, session_ud, metadata): (String, LuaAnyUserData, LuaTable)| {
+            use crate::hub::agent_handle::{SessionHandle, SessionType, PtyHandle};
             use crate::lua::primitives::pty::PtySessionHandle;
 
-            let mut pty_handles: Vec<PtyHandle> = Vec::new();
+            let pty_handle: PtyHandle = {
+                let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
+                    LuaError::runtime(format!(
+                        "register_session: not a PtySessionHandle: {e}"
+                    ))
+                })?;
+                handle.to_pty_handle()
+            };
 
-            // Iterate ordered Lua array (1-based indices)
-            for i in 1..=sessions.raw_len() {
-                if let Ok(ud) = sessions.get::<LuaAnyUserData>(i) {
-                    match ud.borrow::<PtySessionHandle>() {
-                        Ok(handle) => {
-                            pty_handles.push(handle.to_pty_handle());
-                            log::debug!(
-                                "[Lua] Extracted PTY handle at index {} for '{}'",
-                                i - 1, agent_key
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "[Lua] Failed to borrow PTY session at index {} for '{}': {}",
-                                i, agent_key, e
-                            );
-                        }
-                    }
-                }
-            }
+            let agent_key: String = metadata
+                .get("agent_key")
+                .unwrap_or_else(|_| session_uuid.clone());
 
-            if pty_handles.is_empty() {
-                log::error!(
-                    "[Lua] register_agent '{}' failed: no valid PTY sessions found in array",
-                    agent_key
-                );
-                return Err(LuaError::runtime(
-                    "register_agent requires at least one PTY session"
-                ));
-            }
+            let session_type_str: String = metadata
+                .get("session_type")
+                .unwrap_or_else(|_| "agent".to_string());
+            let session_type = match session_type_str.as_str() {
+                "accessory" => SessionType::Accessory,
+                _ => SessionType::Agent,
+            };
 
-            let pty_count = pty_handles.len();
-            // Use a placeholder index; add_agent returns the actual position
-            // (which may differ on replace when agent already exists).
-            let handle = AgentPtys::new(agent_key.clone(), pty_handles, 0);
+            let workspace_id: Option<String> = metadata
+                .get("workspace_id")
+                .ok();
 
-            match cache2.add_agent(handle) {
-                Some(idx) => {
-                    // Update the agent_index to match actual position
-                    cache2.update_agent_index(&agent_key, idx);
-                    log::info!("[Lua] Registered agent '{}' at index {} with {} PTY(s)",
-                        agent_key, idx, pty_count);
-                    Ok(idx)
-                }
-                None => Err(LuaError::runtime("Failed to register agent with HandleCache")),
-            }
+            let handle = SessionHandle::new(
+                session_uuid.clone(),
+                agent_key.clone(),
+                session_type,
+                workspace_id,
+                pty_handle,
+            );
+
+            cache2.add_session(handle);
+            let index = cache2.index_of(&session_uuid);
+            log::info!("[Lua] Registered session '{}' (key='{}', type={}) at index {:?}",
+                session_uuid, agent_key, session_type, index);
+            Ok(index.unwrap_or(0))
         })
-        .map_err(|e| anyhow!("Failed to create hub.register_agent function: {e}"))?;
+        .map_err(|e| anyhow!("Failed to create hub.register_session function: {e}"))?;
 
-    hub.set("register_agent", register_agent_fn)
-        .map_err(|e| anyhow!("Failed to set hub.register_agent: {e}"))?;
+    hub.set("register_session", register_session_fn)
+        .map_err(|e| anyhow!("Failed to set hub.register_session: {e}"))?;
 
-    // hub.unregister_agent(agent_key) - Unregister agent PTY handles
+    // hub.unregister_session(session_uuid) - Unregister session PTY handle
     //
-    // Called by Lua when an agent is closed to remove it from HandleCache.
-    // Also fires AgentUnregistered so the Hub can clean up broker_sessions entries.
+    // Called by Lua when a session is closed to remove it from HandleCache.
+    // Also fires SessionUnregistered so the Hub can clean up broker_sessions entries.
     let cache3 = Arc::clone(&handle_cache);
     let tx_unreg = hub_event_tx.clone();
-    let unregister_agent_fn = lua
-        .create_function(move |_, agent_key: String| {
-            let removed = cache3.remove_agent(&agent_key);
+    let unregister_session_fn = lua
+        .create_function(move |_, session_uuid: String| {
+            let removed = cache3.remove_session(&session_uuid);
             if removed {
-                log::info!("[Lua] Unregistered agent '{}'", agent_key);
+                log::info!("[Lua] Unregistered session '{}'", session_uuid);
                 let guard = tx_unreg.lock().expect("HubEventSender mutex poisoned");
                 if let Some(ref sender) = *guard {
-                    let _ = sender.send(HubEvent::AgentUnregistered {
-                        agent_key: agent_key.clone(),
+                    let _ = sender.send(HubEvent::SessionUnregistered {
+                        session_uuid: session_uuid.clone(),
                     });
                 }
             }
             Ok(removed)
         })
-        .map_err(|e| anyhow!("Failed to create hub.unregister_agent function: {e}"))?;
+        .map_err(|e| anyhow!("Failed to create hub.unregister_session function: {e}"))?;
 
-    hub.set("unregister_agent", unregister_agent_fn)
-        .map_err(|e| anyhow!("Failed to set hub.unregister_agent: {e}"))?;
+    hub.set("unregister_session", unregister_session_fn)
+        .map_err(|e| anyhow!("Failed to set hub.unregister_session: {e}"))?;
 
     // hub.hub_id() - Returns the local hub identifier (stable hash).
     // This is the same ID returned by hub_discovery.list(), suitable for
@@ -378,7 +368,7 @@ pub(crate) fn register(
     hub.set("request_ratchet_restart", request_ratchet_restart_fn)
         .map_err(|e| anyhow!("Failed to set hub.request_ratchet_restart: {e}"))?;
 
-    // hub.register_pty_with_broker(session_handle, agent_key, pty_index)
+    // hub.register_pty_with_broker(session_handle, session_uuid)
     //   → session_id: integer | nil
     //
     // Transfers the master PTY FD to the broker via SCM_RIGHTS so the broker
@@ -388,15 +378,14 @@ pub(crate) fn register(
     //
     // Arguments:
     //   session_handle: PtySessionHandle userdata
-    //   agent_key:  string  (e.g. "owner-repo-42")
-    //   pty_index:  integer (0 = cli, 1 = server)
+    //   session_uuid:   string (e.g. "sess-1234567890-abcdef")
     #[cfg(unix)]
     {
         let broker_conn = Arc::clone(&broker_connection);
         let tx_reg = hub_event_tx.clone();
         let register_pty_fn = lua
             .create_function(
-                move |_, (session_ud, agent_key, pty_index): (LuaAnyUserData, String, usize)| {
+                move |_, (session_ud, session_uuid): (LuaAnyUserData, String)| {
                     use crate::lua::primitives::pty::PtySessionHandle;
 
                     // Extract FD, PID, and current dimensions from the PtySessionHandle userdata.
@@ -415,10 +404,9 @@ pub(crate) fn register(
                         Some(f) => f,
                         None => {
                             ::log::warn!(
-                                "[Broker] register_pty_with_broker('{}' pty={}): \
+                                "[Broker] register_pty_with_broker('{}'): \
                                  master FD unavailable",
-                                agent_key,
-                                pty_index
+                                session_uuid
                             );
                             return Ok(LuaNil);
                         }
@@ -437,8 +425,7 @@ pub(crate) fn register(
                         match guard.as_mut() {
                             Some(conn) => {
                                 match conn.register_pty(
-                                    &agent_key,
-                                    pty_index,
+                                    &session_uuid,
                                     child_pid,
                                     rows,
                                     cols,
@@ -447,9 +434,8 @@ pub(crate) fn register(
                                     Ok(sid) => sid,
                                     Err(e) => {
                                         ::log::warn!(
-                                            "[Broker] register_pty('{}' pty={}) failed: {e}",
-                                            agent_key,
-                                            pty_index
+                                            "[Broker] register_pty('{}') failed: {e}",
+                                            session_uuid
                                         );
                                         return Ok(LuaNil);
                                     }
@@ -472,16 +458,14 @@ pub(crate) fn register(
                         if let Some(ref sender) = *guard {
                             let _ = sender.send(HubEvent::BrokerSessionRegistered {
                                 session_id,
-                                agent_key: agent_key.clone(),
-                                pty_index,
+                                session_uuid: session_uuid.clone(),
                             });
                         }
                     }
 
                     ::log::info!(
-                        "[Broker] Registered PTY '{}' pty={} → session {}",
-                        agent_key,
-                        pty_index,
+                        "[Broker] Registered PTY '{}' → session {}",
+                        session_uuid,
                         session_id
                     );
                     Ok(LuaValue::Integer(i64::from(session_id)))
@@ -645,7 +629,7 @@ pub(crate) fn register(
             .map_err(|e| anyhow!("Failed to set hub.get_pty_snapshot_from_broker: {e}"))?;
     }
 
-    // hub.create_ghost_pty(agent_key, pty_index, session_id, rows, cols)
+    // hub.create_ghost_session(session_uuid, session_id, rows, cols)
     //   → PtySessionHandle userdata
     //
     // Creates a shadow-screen-only PTY handle for Hub restart recovery.
@@ -653,24 +637,22 @@ pub(crate) fn register(
     // and broadcast channel are initialised with the given dimensions.
     //
     // Also fires HubEvent::BrokerSessionRegistered so the Hub's
-    // broker_sessions routing table maps session_id → (agent_key, pty_index).
+    // broker_sessions routing table maps session_id → session_uuid.
     // BrokerPtyOutput frames then route to the correct HandleCache entry once
-    // the caller registers the ghost handles via hub.register_agent().
+    // the caller registers the ghost handle via hub.register_session().
     //
     // Arguments:
-    //   agent_key:  string  — agent key (e.g. "owner-repo-42")
-    //   pty_index:  integer — 0-based PTY index (0 = CLI, 1 = server)
-    //   session_id: integer — broker session ID from context.json metadata
-    //   rows:       integer — terminal rows saved in context.json metadata
-    //   cols:       integer — terminal cols saved in context.json metadata
+    //   session_uuid: string  — session UUID (e.g. "sess-1234567890-abcdef")
+    //   session_id:   integer — broker session ID from context.json metadata
+    //   rows:         integer — terminal rows saved in context.json metadata
+    //   cols:         integer — terminal cols saved in context.json metadata
     {
         let tx_ghost = Arc::clone(&hub_event_tx);
         let create_ghost_fn = lua
             .create_function(
                 move |_,
-                      (agent_key, pty_index, session_id, rows, cols): (
+                      (session_uuid, session_id, rows, cols): (
                     String,
-                    usize,
                     u32,
                     u16,
                     u16,
@@ -681,9 +663,9 @@ pub(crate) fn register(
                     // and broadcast channel at the dimensions saved in context.json.
                     let handle = PtySessionHandle::new_ghost(rows, cols, Arc::clone(&tx_ghost));
 
-                    // Register the broker session_id → (agent_key, pty_index) mapping
+                    // Register the broker session_id → session_uuid mapping
                     // so BrokerPtyOutput frames route correctly once the caller calls
-                    // hub.register_agent() to populate HandleCache.
+                    // hub.register_session() to populate HandleCache.
                     {
                         let guard = tx_ghost
                             .lock()
@@ -691,26 +673,24 @@ pub(crate) fn register(
                         if let Some(ref sender) = *guard {
                             let _ = sender.send(HubEvent::BrokerSessionRegistered {
                                 session_id,
-                                agent_key: agent_key.clone(),
-                                pty_index,
+                                session_uuid: session_uuid.clone(),
                             });
                         }
                     }
 
                     ::log::info!(
-                        "[Broker] Created ghost PTY '{}' pty={} session={}",
-                        agent_key,
-                        pty_index,
+                        "[Broker] Created ghost session '{}' session={}",
+                        session_uuid,
                         session_id
                     );
 
                     Ok(handle)
                 },
             )
-            .map_err(|e| anyhow!("Failed to create hub.create_ghost_pty function: {e}"))?;
+            .map_err(|e| anyhow!("Failed to create hub.create_ghost_session function: {e}"))?;
 
-        hub.set("create_ghost_pty", create_ghost_fn)
-            .map_err(|e| anyhow!("Failed to set hub.create_ghost_pty: {e}"))?;
+        hub.set("create_ghost_session", create_ghost_fn)
+            .map_err(|e| anyhow!("Failed to set hub.create_ghost_session: {e}"))?;
     }
 
     // hub.quit() - Request Hub shutdown (broker kills PTYs immediately).
@@ -816,6 +796,35 @@ pub(crate) fn register(
         .set("hub", hub)
         .map_err(|e| anyhow!("Failed to register hub table globally: {e}"))?;
 
+    // Backward-compatible aliases for Lua handlers not yet updated (Phase 5-6 scope).
+    // These will be removed once the Lua side is updated to use the new names.
+    lua.load(
+        r#"
+        hub.register_agent = function(agent_key, sessions)
+            -- Legacy: register first session handle with agent_key as UUID placeholder
+            local handle = sessions[1]
+            if handle then
+                return hub.register_session(agent_key, handle, { agent_key = agent_key })
+            end
+            return nil
+        end
+        hub.unregister_agent = function(agent_key)
+            return hub.unregister_session(agent_key)
+        end
+        hub.create_ghost_pty = function(agent_key, _pty_index, session_id, rows, cols)
+            return hub.create_ghost_session(agent_key, session_id, rows, cols)
+        end
+        -- Legacy: 3-arg form (handle, key, pty_index) → 2-arg form (handle, key).
+        -- pty_index is silently dropped (single-PTY model).
+        local _new_register_pty = hub.register_pty_with_broker
+        hub.register_pty_with_broker = function(handle, key_or_uuid, _pty_index)
+            return _new_register_pty(handle, key_or_uuid)
+        end
+        "#,
+    )
+    .exec()
+    .map_err(|e| anyhow!("Failed to register backward-compat hub aliases: {e}"))?;
+
     Ok(())
 }
 
@@ -856,8 +865,8 @@ mod tests {
 
         let hub: LuaTable = lua.globals().get("hub").expect("hub table should exist");
         assert!(hub.contains_key("get_worktrees").unwrap());
-        assert!(hub.contains_key("register_agent").unwrap());
-        assert!(hub.contains_key("unregister_agent").unwrap());
+        assert!(hub.contains_key("register_session").unwrap());
+        assert!(hub.contains_key("unregister_session").unwrap());
         assert!(hub.contains_key("hub_id").unwrap());
         assert!(hub.contains_key("server_id").unwrap());
         assert!(hub.contains_key("detect_repo").unwrap());

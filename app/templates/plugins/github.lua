@@ -224,16 +224,15 @@ local function format_notification(payload)
     return "=== NEW MENTION (automated notification) ===\nNew mention\n=================="
 end
 
---- Notify an existing agent by writing to its "agent" PTY session.
+--- Notify an existing agent by writing to its single PTY session.
 -- @param agent Agent
 -- @param payload table
 local function notify_agent(agent, payload)
-    local session = agent.sessions and agent.sessions["agent"]
-    if session then
-        session:send_message(format_notification(payload))
+    if agent.session then
+        agent.session:send_message(format_notification(payload))
         log.info(string.format("GitHub: notified existing agent %s", agent:agent_key()))
     else
-        log.warn(string.format("GitHub: cannot notify agent %s (no 'agent' session)", agent:agent_key()))
+        log.warn(string.format("GitHub: cannot notify agent %s (no session)", agent:agent_key()))
     end
 end
 
@@ -251,7 +250,7 @@ hooks.on("pty_notification", "github_question_notify", function(data)
     local agent_key = data.agent_key
     if not agent_key then return end
 
-    local agent = Agent.get(agent_key)
+    local agent = Agent.find_by_agent_key(agent_key)
     if not agent then return end
 
     -- Only post if we have issue context

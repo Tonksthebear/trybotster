@@ -261,9 +261,8 @@ mod tests {
             .await.expect("Timed out").expect("Channel closed");
 
         match event {
-            HubEvent::SocketPtyInput { agent_index, pty_index, data, .. } => {
-                assert_eq!(agent_index, 2);
-                assert_eq!(pty_index, 1);
+            HubEvent::SocketPtyInput { session_uuid, data, .. } => {
+                assert_eq!(session_uuid, "index:2");
                 assert_eq!(data, b"ls -la\n");
             }
             other => panic!("Expected SocketPtyInput, got: {other:?}"),

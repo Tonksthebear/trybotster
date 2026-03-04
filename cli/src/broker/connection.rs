@@ -16,7 +16,7 @@
 //!                                     set_timeout(120)
 //!                                     install_forwarder(event_tx.into())
 //!
-//! PTY spawn ──register_pty(key, idx, pid, rows, cols, fd)──► BrokerMessage::Registered
+//! PTY spawn ──register_pty(uuid, pid, rows, cols, fd)──► BrokerMessage::Registered
 //!
 //! Hub restart (graceful) ──disconnect_graceful()──► broker starts timeout window
 //! Hub shutdown  (clean)  ──kill_all()──────────────► broker kills children + exits
@@ -150,11 +150,11 @@ impl BrokerConnection {
 
     /// Register a PTY master FD with the broker via `sendmsg` + SCM_RIGHTS.
     ///
-    /// Sends an `FdTransfer` frame whose payload carries the agent key,
-    /// PTY index, child PID, and terminal dimensions. The master FD itself
-    /// is attached as SCM_RIGHTS ancillary data in the same `sendmsg` call —
-    /// the broker receives an independent descriptor pointing to the same
-    /// open file description, so the Hub's own copy is unaffected.
+    /// Sends an `FdTransfer` frame whose payload carries the session UUID,
+    /// child PID, and terminal dimensions. The master FD itself is attached
+    /// as SCM_RIGHTS ancillary data in the same `sendmsg` call — the broker
+    /// receives an independent descriptor pointing to the same open file
+    /// description, so the Hub's own copy is unaffected.
     ///
     /// Returns the `session_id` the broker assigned. Store this alongside
     /// the agent's metadata so it can be passed to [`get_snapshot`] on
@@ -166,16 +166,14 @@ impl BrokerConnection {
     /// with an error frame.
     pub fn register_pty(
         &mut self,
-        agent_key: &str,
-        pty_index: usize,
+        session_uuid: &str,
         child_pid: u32,
         rows: u16,
         cols: u16,
         fd: RawFd,
     ) -> Result<u32> {
         let reg = FdTransferPayload {
-            agent_key: agent_key.to_owned(),
-            pty_index,
+            session_uuid: session_uuid.to_owned(),
             child_pid,
             rows,
             cols,
@@ -780,15 +778,13 @@ fn demux_reader(
                 }
                 BrokerFrame::BrokerControl(BrokerMessage::PtyExited {
                     session_id,
-                    agent_key,
-                    pty_index,
+                    session_uuid,
                     exit_code,
                 }) => {
                     let _ = event_tx.send(
                         crate::hub::events::HubEvent::BrokerPtyExited {
                             session_id,
-                            agent_key,
-                            pty_index,
+                            session_uuid,
                             exit_code,
                         },
                     );
@@ -912,8 +908,7 @@ mod integration_tests {
 
             // Send Registered response.
             let resp = encode_broker_control(&BrokerMessage::Registered {
-                agent_key: "test-agent".to_string(),
-                pty_index: 0,
+                session_uuid: "test-agent".to_string(),
                 session_id: 42,
             });
             use std::io::Write;
@@ -928,7 +923,7 @@ mod integration_tests {
         conn.install_forwarder(event_tx.into()).unwrap();
 
         // Register PTY — this must succeed (Registered routed to read_response via channel).
-        let session_id = conn.register_pty("test-agent", 0, 0, 24, 80, pipe_read).unwrap();
+        let session_id = conn.register_pty("test-agent", 0, 24, 80, pipe_read).unwrap();
         assert_eq!(session_id, 42, "register_pty should return broker-assigned session_id");
 
         // Registered must NOT have leaked to the event channel.

@@ -12,7 +12,7 @@
 // Rust guideline compliant 2026-02
 
 use botster::terminal::{AlacrittyParser, NoopListener};
-use botster::{Agent, PtyView, TerminalWidget};
+use botster::{Agent, TerminalWidget};
 use ratatui::{
     backend::TestBackend,
     layout::{Constraint, Direction, Layout},
@@ -360,7 +360,7 @@ fn test_spawn_real_pty_with_init_script() {
         // Spawn bash and source the init script
         use botster::agent::spawn::PtySpawnConfig;
         agent
-            .cli_pty.spawn(PtySpawnConfig {
+            .pty.spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),
                 command: "bash".to_string(),
                 env: env_vars,
@@ -375,7 +375,7 @@ fn test_spawn_real_pty_with_init_script() {
         thread::sleep(Duration::from_millis(500));
 
         // Verify we received some output via scrollback buffer
-        let buffer = agent.get_snapshot(PtyView::Cli);
+        let buffer = agent.get_snapshot();
         assert!(!buffer.is_empty(), "PTY should have produced output");
 
         tx.send(()).unwrap();
@@ -392,9 +392,9 @@ fn test_spawn_real_pty_with_init_script() {
     }
 }
 
-/// Test spawning the server PTY with our test server script
+/// Test spawning a PTY with our test server script
 #[test]
-fn test_spawn_server_pty() {
+fn test_spawn_pty_with_server_script() {
     use std::collections::HashMap;
     use std::sync::mpsc;
 
@@ -413,46 +413,32 @@ fn test_spawn_server_pty() {
             temp_dir.path().to_path_buf(),
         );
 
-        // First set up the CLI PTY (as would happen in normal operation)
-        use botster::agent::spawn::PtySpawnConfig;
-        use botster::agent::pty::PtySession;
-        agent
-            .cli_pty.spawn(PtySpawnConfig {
-                worktree_path: temp_dir.path().to_path_buf(),
-                command: "bash".to_string(),
-                env: HashMap::new(),
-                init_commands: vec!["echo 'CLI PTY started'".to_string()],
-                detect_notifications: true,
-                port: None,
-                context: String::new(),
-            })
-            .expect("Failed to spawn CLI PTY");
-
-        // Now spawn the server PTY
+        // Spawn the PTY with the server script
         let server_script = fixture_path("test_botster_server.sh");
         let mut server_env = HashMap::new();
         server_env.insert("PORT".to_string(), "3000".to_string());
 
-        let mut server_pty = PtySession::new(24, 80);
-        server_pty.spawn(PtySpawnConfig {
-            worktree_path: temp_dir.path().to_path_buf(),
-            command: server_script.display().to_string(),
-            env: server_env,
-            init_commands: vec![],
-            detect_notifications: false,
-            port: Some(3000),
-            context: String::new(),
-        }).expect("Failed to spawn server PTY");
-        agent.server_pty = Some(server_pty);
+        use botster::agent::spawn::PtySpawnConfig;
+        agent
+            .pty.spawn(PtySpawnConfig {
+                worktree_path: temp_dir.path().to_path_buf(),
+                command: server_script.display().to_string(),
+                env: server_env,
+                init_commands: vec![],
+                detect_notifications: false,
+                port: Some(3000),
+                context: String::new(),
+            })
+            .expect("Failed to spawn PTY");
 
-        assert!(agent.has_server_pty(), "Server PTY should be available");
+        assert!(agent.pty.is_spawned(), "PTY should be spawned");
 
         // Wait for server to produce output
         thread::sleep(Duration::from_secs(3));
 
-        // Check server PTY content
-        let server_buffer = agent.server_pty.as_ref().unwrap().get_snapshot();
-        assert!(!server_buffer.is_empty(), "Server PTY should have output");
+        // Check PTY content
+        let buffer = agent.get_snapshot();
+        assert!(!buffer.is_empty(), "PTY should have output");
 
         tx.send(()).unwrap();
     });
@@ -467,9 +453,9 @@ fn test_spawn_server_pty() {
     }
 }
 
-/// Test switching between CLI and Server PTY views with real PTYs
+/// Test that agent's single PTY can be spawned and produces output
 #[test]
-fn test_real_pty_view_switching() {
+fn test_real_pty_spawn_and_output() {
     use std::collections::HashMap;
     use std::sync::mpsc;
 
@@ -488,45 +474,25 @@ fn test_real_pty_view_switching() {
             temp_dir.path().to_path_buf(),
         );
 
-        // Spawn CLI PTY
+        // Spawn PTY
         use botster::agent::spawn::PtySpawnConfig;
-        use botster::agent::pty::PtySession;
         agent
-            .cli_pty.spawn(PtySpawnConfig {
+            .pty.spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),
                 command: "bash".to_string(),
                 env: HashMap::new(),
-                init_commands: vec!["for i in $(seq 1 50); do echo \"CLI Line $i\"; done".to_string()],
+                init_commands: vec!["for i in $(seq 1 50); do echo \"Line $i\"; done".to_string()],
                 detect_notifications: true,
                 port: None,
                 context: String::new(),
             })
-            .expect("Failed to spawn CLI PTY");
-
-        // Spawn server PTY
-        let server_script = fixture_path("test_botster_server.sh");
-        let mut server_pty = PtySession::new(24, 80);
-        server_pty.spawn(PtySpawnConfig {
-            worktree_path: temp_dir.path().to_path_buf(),
-            command: server_script.display().to_string(),
-            env: HashMap::new(),
-            init_commands: vec![],
-            detect_notifications: false,
-            port: None,
-            context: String::new(),
-        }).expect("Failed to spawn server PTY");
-        agent.server_pty = Some(server_pty);
+            .expect("Failed to spawn PTY");
 
         // Wait for output
         thread::sleep(Duration::from_secs(2));
 
-        // Phase 5: PTY view is now per-client state, not per-agent.
-        // Verify that the agent has both PTYs available.
-        assert!(agent.cli_pty.is_spawned());
-        assert!(agent.has_server_pty());
-
-        // Clients track their own active PTY index and use write_input_to_view().
-        // See client tests (tui.rs, browser.rs) for client-side toggle testing.
+        // Verify the agent's PTY is spawned
+        assert!(agent.pty.is_spawned());
 
         tx.send(()).unwrap();
     });
@@ -536,7 +502,7 @@ fn test_real_pty_view_switching() {
             handle.join().unwrap();
         }
         Err(_) => {
-            panic!("TIMEOUT: PTY view switching test did not complete within 15 seconds");
+            panic!("TIMEOUT: PTY spawn test did not complete within 15 seconds");
         }
     }
 }
@@ -619,11 +585,8 @@ fn test_agent_pty_handle_subscription() {
 
     let (agent, _temp_dir) = create_test_agent();
 
-    // Get PTY handle for CLI PTY (index 0)
-    let handle = agent.get_pty_handle(0);
-    assert!(handle.is_some(), "CLI PTY handle should exist");
-
-    let handle = handle.unwrap();
+    // Get PTY handle (single PTY per agent)
+    let handle = agent.get_pty_handle();
 
     // Subscribe to events
     let mut rx = handle.subscribe();
@@ -634,13 +597,6 @@ fn test_agent_pty_handle_subscription() {
     assert!(
         rx.try_recv().is_err(),
         "Should not have events before spawn"
-    );
-
-    // Server PTY (index 1) should not exist for un-spawned agent
-    let server_handle = agent.get_pty_handle(1);
-    assert!(
-        server_handle.is_none(),
-        "Server PTY should not exist without spawn"
     );
 }
 
@@ -725,7 +681,7 @@ fn test_agent_scrollback_snapshot_for_browser() {
 
     // Get snapshot for CLI view — always non-empty (contains ANSI reset/clear).
     // Verify it doesn't contain any real terminal output.
-    let snapshot = agent.get_snapshot(PtyView::Cli);
+    let snapshot = agent.get_snapshot();
     let snapshot_str = String::from_utf8_lossy(&snapshot);
     assert!(
         !snapshot_str.contains("$") && !snapshot_str.contains("~"),
