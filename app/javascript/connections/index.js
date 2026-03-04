@@ -9,16 +9,16 @@
  *   hub.onAgentList((agents) => render(agents));
  *
  *   // Terminal connection (data plane)
- *   const key = TerminalConnection.key(hubId, agentIndex, ptyIndex);
+ *   const key = TerminalConnection.key(hubId, sessionUuid);
  *   const term = await HubConnectionManager.acquire(TerminalConnection, key, {
- *     hubId, agentIndex, ptyIndex
+ *     hubId, sessionUuid
  *   });
  *   term.onOutput((data) => terminal.write(data));
  *
  *   // Preview connection (HTTP proxy)
- *   const previewKey = PreviewConnection.key(hubId, agentIndex, ptyIndex);
+ *   const previewKey = PreviewConnection.key(hubId, sessionUuid);
  *   const preview = await HubConnectionManager.acquire(PreviewConnection, previewKey, {
- *     hubId, agentIndex, ptyIndex
+ *     hubId, sessionUuid
  *   });
  *   const response = await preview.fetch({ method: "GET", path: "/" });
  *
