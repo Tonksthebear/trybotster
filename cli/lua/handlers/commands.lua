@@ -46,11 +46,44 @@ commands.register("create_agent", function(client, _sub_id, command)
     local prompt = command.prompt
     local from_worktree = command.from_worktree
     local profile = command.profile
+    local workspace = command.workspace
 
-    require("handlers.agents").handle_create_agent(issue_or_branch, prompt, from_worktree, client, profile)
-    log.info(string.format("Create agent request: %s (profile: %s)",
-        tostring(issue_or_branch or "main"), tostring(profile or "auto")))
-end, { description = "Create a new agent (with optional worktree and profile)" })
+    -- Build metadata with workspace if provided
+    local metadata = nil
+    if workspace then
+        metadata = { workspace = workspace }
+    end
+
+    require("handlers.agents").handle_create_agent(issue_or_branch, prompt, from_worktree, client, profile, metadata)
+    log.info(string.format("Create agent request: %s (profile: %s, workspace: %s)",
+        tostring(issue_or_branch or "main"), tostring(profile or "auto"), tostring(workspace or "none")))
+end, { description = "Create a new agent (with optional worktree, profile, and workspace)" })
+
+commands.register("rename_workspace", function(client, sub_id, command)
+    local workspace_id = command.workspace_id
+    local new_name = command.new_name or command.name
+    if not workspace_id or not new_name then
+        log.warn("rename_workspace missing workspace_id or new_name")
+        return
+    end
+
+    local data_dir = config.data_dir and config.data_dir() or nil
+    if not data_dir then
+        log.warn("rename_workspace: no data_dir configured")
+        return
+    end
+
+    local ws = require("lib.workspace_store")
+    local ok = ws.rename_workspace(data_dir, workspace_id, new_name)
+    if ok then
+        -- Broadcast updated agent list so all clients see the new name
+        local connections = require("handlers.connections")
+        connections.broadcast_hub_event("agent_list", {
+            agents = require("lib.agent").all_info(),
+        })
+        log.info(string.format("Workspace %s renamed to '%s'", workspace_id, new_name))
+    end
+end, { description = "Rename a workspace" })
 
 commands.register("reopen_worktree", function(client, _sub_id, command)
     local path = command.path

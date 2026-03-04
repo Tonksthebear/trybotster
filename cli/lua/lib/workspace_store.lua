@@ -257,13 +257,13 @@ function M.read_workspace(data_dir, workspace_id)
     return manifest
 end
 
---- Find an existing workspace manifest matching a dedup key.
+--- Find an existing workspace manifest matching a name.
 -- @param data_dir string
--- @param dedup_key string  Opaque identity string constructed by plugins
+-- @param name string  Workspace display name (e.g. "owner/repo#42")
 -- @return string|nil workspace_id
 -- @return table|nil manifest
-function M.find_workspace(data_dir, dedup_key)
-    if not dedup_key or dedup_key == "" then return nil, nil end
+function M.find_workspace(data_dir, name)
+    if not name or name == "" then return nil, nil end
 
     local ws_dir = M.workspaces_dir(data_dir)
     if not fs.exists(ws_dir) then return nil, nil end
@@ -277,7 +277,7 @@ function M.find_workspace(data_dir, dedup_key)
 
     for _, workspace_id in ipairs(entries) do
         local manifest = M.read_workspace(data_dir, workspace_id)
-        if manifest and manifest.dedup_key == dedup_key then
+        if manifest and manifest.name == name then
             return workspace_id, manifest
         end
     end
@@ -286,20 +286,20 @@ function M.find_workspace(data_dir, dedup_key)
 end
 
 --- Find or create a workspace manifest for a new session.
--- Callers provide the dedup_key and title; the store matches opaquely.
+-- Callers provide the name (display name); the store matches on it.
 -- @param data_dir string
--- @param opts table { dedup_key, title, metadata, created_at }
+-- @param opts table { name, branch, worktree_path, metadata, created_at }
 -- @return string|nil workspace_id
 -- @return table|nil manifest
 -- @return boolean created_new
 function M.ensure_workspace(data_dir, opts)
-    local dedup_key = opts and opts.dedup_key
-    if not dedup_key or dedup_key == "" then
-        log.warn("[workspace_store] ensure_workspace: missing dedup_key")
+    local name = opts and opts.name
+    if not name or name == "" then
+        log.warn("[workspace_store] ensure_workspace: missing name")
         return nil, nil, false
     end
 
-    local existing_id, existing_manifest = M.find_workspace(data_dir, dedup_key)
+    local existing_id, existing_manifest = M.find_workspace(data_dir, name)
     if existing_id then
         return existing_id, existing_manifest, false
     end
@@ -307,13 +307,14 @@ function M.ensure_workspace(data_dir, opts)
     local workspace_id = M.generate_workspace_id()
     local now = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
     local manifest = {
-        id         = workspace_id,
-        title      = opts.title or dedup_key,
-        dedup_key  = dedup_key,
-        status     = "active",
-        created_at = opts.created_at or now,
-        updated_at = now,
-        metadata   = opts.metadata or {},
+        id            = workspace_id,
+        name          = name,
+        worktree_path = opts.worktree_path,
+        branch        = opts.branch,
+        status        = "active",
+        created_at    = opts.created_at or now,
+        updated_at    = now,
+        metadata      = opts.metadata or {},
     }
 
     local ok = M.write_workspace(data_dir, workspace_id, manifest)
@@ -321,6 +322,42 @@ function M.ensure_workspace(data_dir, opts)
         return nil, nil, false
     end
     return workspace_id, manifest, true
+end
+
+--- Rename a workspace (update the display name).
+-- @param data_dir string
+-- @param workspace_id string
+-- @param new_name string
+-- @return boolean success
+function M.rename_workspace(data_dir, workspace_id, new_name)
+    if not new_name or new_name == "" then
+        log.warn("[workspace_store] rename_workspace: empty new_name")
+        return false
+    end
+    local manifest = M.read_workspace(data_dir, workspace_id)
+    if not manifest then
+        log.warn(string.format("[workspace_store] rename_workspace: workspace %s not found", workspace_id))
+        return false
+    end
+    manifest.name = new_name
+    manifest.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+    return M.write_workspace(data_dir, workspace_id, manifest)
+end
+
+--- Set the worktree_path on a workspace after async worktree creation completes.
+-- @param data_dir string
+-- @param workspace_id string
+-- @param worktree_path string
+-- @return boolean success
+function M.update_workspace_worktree(data_dir, workspace_id, worktree_path)
+    local manifest = M.read_workspace(data_dir, workspace_id)
+    if not manifest then
+        log.warn(string.format("[workspace_store] update_workspace_worktree: workspace %s not found", workspace_id))
+        return false
+    end
+    manifest.worktree_path = worktree_path
+    manifest.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+    return M.write_workspace(data_dir, workspace_id, manifest)
 end
 
 --- Read and decode all session manifests for a workspace.
@@ -431,8 +468,7 @@ function M.build_workspace_groups(data_dir, agents)
             if not by_id[workspace_id] then
                 local manifest = M.read_workspace(data_dir, workspace_id) or {
                     id = workspace_id,
-                    title = agent.dedup_key or (agent.repo or "unknown/repo") .. " — " .. (agent.branch_name or "main"),
-                    dedup_key = agent.dedup_key,
+                    name = agent.workspace_name or (agent.repo or "unknown/repo") .. " — " .. (agent.branch_name or "main"),
                     status = "active",
                     created_at = nil,
                     updated_at = nil,
@@ -447,8 +483,8 @@ function M.build_workspace_groups(data_dir, agents)
 
                 by_id[workspace_id] = {
                     id = workspace_id,
-                    title = manifest.title,
-                    dedup_key = manifest.dedup_key,
+                    name = manifest.name,
+                    title = manifest.name,  -- backward compat for TUI
                     status = manifest.status,
                     created_at = manifest.created_at,
                     updated_at = manifest.updated_at,
@@ -557,38 +593,25 @@ function M.migrate(data_dir)
         local issue_number = meta.issue_number
         local now          = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
 
-        -- Let plugins build dedup_key from legacy fields via interceptor hook.
-        -- If no plugin claims ownership, use a generic fallback format.
-        local migrate_ctx = {
-            repo = ctx.repo,
-            issue_number = issue_number,
-            branch_name = ctx.branch_name,
-        }
-        local result = hooks.call("build_dedup_key", migrate_ctx)
-        local dedup_key = result and result.dedup_key
-        local ws_title = result and result.title
-        local ws_metadata = result and result.metadata
-
-        if not dedup_key then
-            -- Generic fallback: no plugin claimed this data
-            if issue_number then
-                dedup_key = ctx.repo .. "#" .. tostring(issue_number)
-                ws_title = ctx.repo .. " — issue #" .. tostring(issue_number)
-            else
-                dedup_key = ctx.repo .. ":" .. ctx.branch_name
-                ws_title = ctx.repo .. " — " .. ctx.branch_name
-            end
-            ws_metadata = { repo = ctx.repo, issue_number = issue_number }
+        -- Build workspace name from repo + issue/branch
+        local ws_name
+        local ws_metadata
+        if issue_number then
+            ws_name = ctx.repo .. "#" .. tostring(issue_number)
+        else
+            ws_name = ctx.repo .. ":" .. ctx.branch_name
         end
+        ws_metadata = { repo = ctx.repo, issue_number = issue_number }
 
         local workspace_manifest = {
-            id         = workspace_id,
-            title      = ws_title,
-            dedup_key  = dedup_key,
-            status     = "active",
-            created_at = ctx.created_at or now,
-            updated_at = now,
-            metadata   = ws_metadata or { repo = ctx.repo, issue_number = issue_number },
+            id            = workspace_id,
+            name          = ws_name,
+            worktree_path = ctx.worktree_path or worktree_path,
+            branch        = ctx.branch_name,
+            status        = "active",
+            created_at    = ctx.created_at or now,
+            updated_at    = now,
+            metadata      = ws_metadata,
         }
 
         -- Lift flat broker_session_N / broker_pty_rows_N keys into structured tables
@@ -680,8 +703,8 @@ function M.migrate(data_dir)
     end
 end
 
---- Migrate v1 workspace manifests (repo/issue_number/ad_hoc_key) to dedup_key format.
--- Scans all workspace manifests. If a manifest has `repo` but no `dedup_key`,
+--- Migrate v1 workspace manifests (repo/issue_number/ad_hoc_key) to name format.
+-- Scans all workspace manifests. If a manifest has `repo` but no `name`,
 -- converts to the new schema. Idempotent: already-converted manifests are skipped.
 -- @param data_dir string
 function M.migrate_v2(data_dir)
@@ -694,36 +717,25 @@ function M.migrate_v2(data_dir)
     local count = 0
     for _, workspace_id in ipairs(entries) do
         local manifest = M.read_workspace(data_dir, workspace_id)
-        if manifest and not manifest.dedup_key and manifest.repo then
-            -- Let plugins build dedup_key via interceptor hook (same as migrate).
-            local migrate_ctx = {
-                repo = manifest.repo,
-                issue_number = manifest.issue_number,
-                branch_name = manifest.ad_hoc_key or manifest.branch,
-            }
-            local result = hooks.call("build_dedup_key", migrate_ctx)
-            local dedup_key = result and result.dedup_key
-            local ws_metadata = result and result.metadata
-
-            if not dedup_key then
-                -- Generic fallback
-                if manifest.issue_number then
-                    dedup_key = manifest.repo .. "#" .. tostring(manifest.issue_number)
-                else
-                    local branch = manifest.ad_hoc_key or manifest.branch or "main"
-                    dedup_key = manifest.repo .. ":" .. branch
-                end
-                ws_metadata = { repo = manifest.repo, issue_number = manifest.issue_number }
+        if manifest and not manifest.name and manifest.repo then
+            local ws_name
+            if manifest.issue_number then
+                ws_name = manifest.repo .. "#" .. tostring(manifest.issue_number)
+            else
+                local branch = manifest.ad_hoc_key or manifest.branch or "main"
+                ws_name = manifest.repo .. ":" .. branch
             end
+            local ws_metadata = { repo = manifest.repo, issue_number = manifest.issue_number }
 
             local migrated = {
-                id         = manifest.id,
-                title      = manifest.title,
-                dedup_key  = dedup_key,
-                status     = manifest.status,
-                created_at = manifest.created_at,
-                updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
-                metadata   = ws_metadata or { repo = manifest.repo, issue_number = manifest.issue_number },
+                id            = manifest.id,
+                name          = ws_name,
+                worktree_path = manifest.worktree_path,
+                branch        = manifest.branch,
+                status        = manifest.status,
+                created_at    = manifest.created_at,
+                updated_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+                metadata      = ws_metadata,
             }
 
             M.write_workspace(data_dir, workspace_id, migrated)
@@ -732,7 +744,85 @@ function M.migrate_v2(data_dir)
     end
 
     if count > 0 then
-        log.info(string.format("[workspace_store] migrate_v2: %d workspace(s) converted to dedup_key", count))
+        log.info(string.format("[workspace_store] migrate_v2: %d workspace(s) converted to name format", count))
+    end
+end
+
+--- Migrate v2 workspace manifests (dedup_key/title) to v3 (name).
+-- Converts dedup_key-based manifests to the new name-based schema.
+-- - dedup_key starting "github:" → strip prefix, set as name
+-- - dedup_key starting "local:" → delete workspace (per-agent artifacts)
+-- - Copy worktree_path from first agent's session that references this workspace
+-- - Remove dedup_key and title fields
+-- Idempotent: already-converted manifests (those with `name` set) are skipped.
+-- @param data_dir string
+function M.migrate_v3(data_dir)
+    local ws_dir = M.workspaces_dir(data_dir)
+    if not fs.exists(ws_dir) then return end
+
+    local entries, _ = fs.list_dir(ws_dir)
+    if not entries then return end
+
+    local count = 0
+    local deleted = 0
+    for _, workspace_id in ipairs(entries) do
+        local manifest = M.read_workspace(data_dir, workspace_id)
+        if not manifest then goto continue end
+        -- Already migrated (has name field)
+        if manifest.name then goto continue end
+        -- Only migrate manifests that have dedup_key
+        if not manifest.dedup_key then goto continue end
+
+        local dk = manifest.dedup_key
+        if dk:sub(1, 6) == "local:" then
+            -- Per-agent workspace artifacts — delete the workspace
+            local ws_path = M.workspace_dir(data_dir, workspace_id)
+            -- Remove manifest file
+            pcall(fs.delete, M.workspace_manifest_path(data_dir, workspace_id))
+            deleted = deleted + 1
+            log.info(string.format("[workspace_store] migrate_v3: deleted local workspace %s (%s)",
+                workspace_id, dk))
+            goto continue
+        end
+
+        -- Strip "github:" prefix if present
+        local ws_name = dk
+        if dk:sub(1, 7) == "github:" then
+            ws_name = dk:sub(8)
+        end
+
+        -- Find worktree_path from first session in this workspace
+        local wt_path = nil
+        local branch = nil
+        local sessions = M.read_workspace_sessions(data_dir, workspace_id)
+        for _, rec in ipairs(sessions) do
+            if rec.manifest and rec.manifest.worktree_path then
+                wt_path = rec.manifest.worktree_path
+                branch = rec.manifest.branch
+                break
+            end
+        end
+
+        local migrated = {
+            id            = manifest.id,
+            name          = ws_name,
+            worktree_path = wt_path or manifest.worktree_path,
+            branch        = branch or manifest.branch,
+            status        = manifest.status,
+            created_at    = manifest.created_at,
+            updated_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+            metadata      = manifest.metadata or {},
+        }
+
+        M.write_workspace(data_dir, workspace_id, migrated)
+        count = count + 1
+
+        ::continue::
+    end
+
+    if count > 0 or deleted > 0 then
+        log.info(string.format("[workspace_store] migrate_v3: %d workspace(s) converted, %d local workspace(s) deleted",
+            count, deleted))
     end
 end
 

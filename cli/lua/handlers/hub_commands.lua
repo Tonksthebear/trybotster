@@ -79,21 +79,10 @@ handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
                 local payload = message.payload or {}
                 local cmd_repo = config.env("BOTSTER_REPO") or hub.detect_repo()
                 local issue_num = payload.issue_number
-                -- Let plugins build dedup_key from raw fields via interceptor hook.
-                -- hub_commands is a core handler — it must not hardcode plugin key formats.
-                local dk = nil
-                local ws_title = nil
-                local ws_metadata = nil
-                if cmd_repo then
-                    local result = hooks.call("build_dedup_key", {
-                        repo = cmd_repo,
-                        issue_number = issue_num,
-                    })
-                    if result and result.dedup_key then
-                        dk = result.dedup_key
-                        ws_title = result.title
-                        ws_metadata = result.metadata
-                    end
+                -- Build workspace name inline
+                local ws_name = nil
+                if cmd_repo and issue_num then
+                    ws_name = cmd_repo .. "#" .. tostring(issue_num)
                 end
                 events.emit("command_message", {
                     type = "create_agent",
@@ -103,27 +92,19 @@ handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
                     metadata = {
                         issue_number = issue_num,
                         invocation_url = payload.issue_url,
-                        dedup_key = dk,
-                        workspace_title = ws_title,
-                        workspace_metadata = ws_metadata,
+                        workspace = ws_name,
+                        workspace_metadata = cmd_repo and { repo = cmd_repo, issue_number = issue_num } or nil,
                     },
                 })
             elseif event_type == "agent_cleanup" then
                 local payload = message.payload or {}
                 local cmd_repo = config.env("BOTSTER_REPO") or hub.detect_repo() or ""
                 if payload.issue_number then
-                    -- Let plugins build dedup_key via interceptor hook
-                    local matches = {}
-                    local result = hooks.call("build_dedup_key", {
-                        repo = cmd_repo,
-                        issue_number = payload.issue_number,
-                    })
-                    local dk = result and result.dedup_key
-                    if dk then
-                        matches = Agent.find_by_dedup_key(dk)
-                    end
+                    -- Find matching agents by workspace name
+                    local ws_name = cmd_repo .. "#" .. tostring(payload.issue_number)
+                    local matches = Agent.find_by_workspace(ws_name)
                     if #matches == 0 then
-                        -- Fallback for agents created before dedup_key migration
+                        -- Fallback for agents created before workspace migration
                         for _, agent in ipairs(Agent.find_by_meta("issue_number", payload.issue_number)) do
                             if agent.repo == cmd_repo then
                                 matches[#matches + 1] = agent
