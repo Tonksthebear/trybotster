@@ -263,14 +263,14 @@ mcp.count() -> number
 
 Tools track their source plugin automatically via `_G._loading_plugin_source` (set by `loader.lua`). On plugin hot-reload, `mcp.reset(source)` clears that plugin's tools before re-registering. The hub emits a `tools_list_changed` notification to connected MCP clients so they re-fetch the tool list.
 
-**MCP stdio bridge**: Run `botster mcp-serve --socket /path/to/hub.sock` to expose registered tools over JSON-RPC stdio. This is how Claude Code agents call hub tools — configure it as an MCP server in `.mcp.json`:
+**MCP stdio bridge**: Run `botster mcp-serve` to expose registered tools over JSON-RPC stdio. This is how Claude Code agents call hub tools — configure it as an MCP server in `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "botster": {
       "command": "botster",
-      "args": ["mcp-serve", "--socket", "/path/to/hub.sock"]
+      "args": ["mcp-serve"]
     }
   }
 }

@@ -510,11 +510,7 @@ enum Commands {
         hub: Option<String>,
     },
     /// Run as MCP server bridge (connects to hub, speaks MCP on stdio)
-    McpServe {
-        /// Path to hub Unix socket (auto-discovers from cwd if omitted)
-        #[arg(long)]
-        socket: Option<String>,
-    },
+    McpServe,
     /// Get agent context values (identity, worktree metadata, plugin data).
     /// Omit key to dump all context as JSON.
     Context {
@@ -608,16 +604,10 @@ fn resolve_hub_id_for_cwd() -> Option<String> {
 ///
 /// Strict resolution: requires `BOTSTER_HUB_MANIFEST_PATH`.
 /// No cwd discovery and no multi-source fallback.
-fn resolve_mcp_serve_socket(explicit_socket: Option<String>) -> Result<String> {
+fn resolve_mcp_serve_socket() -> Result<String> {
     use botster::hub::daemon::HubManifest;
 
     let socket_exists = |path: &str| std::path::Path::new(path).exists();
-
-    if explicit_socket.is_some() {
-        anyhow::bail!(
-            "mcp-serve no longer supports --socket. BOTSTER_HUB_MANIFEST_PATH is required."
-        );
-    }
 
     let manifest_path = std::env::var("BOTSTER_HUB_MANIFEST_PATH")
         .ok()
@@ -903,7 +893,7 @@ fn main() -> Result<()> {
     // All other commands write to a timestamped file so concurrent processes
     // (hub, attach, tui) never overwrite each other's logs.
     let cli = Cli::parse();
-    let is_mcp_serve = matches!(cli.command, Commands::McpServe { .. } | Commands::Context { .. });
+    let is_mcp_serve = matches!(cli.command, Commands::McpServe | Commands::Context { .. });
 
     if is_mcp_serve {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
@@ -1061,8 +1051,8 @@ fn main() -> Result<()> {
         Commands::Attach { hub: hub_arg } => {
             run_attach(hub_arg)?;
         }
-        Commands::McpServe { socket } => {
-            let socket_path = resolve_mcp_serve_socket(socket)?;
+        Commands::McpServe => {
+            let socket_path = resolve_mcp_serve_socket()?;
             botster::mcp_gateway::run(&socket_path)?;
         }
         Commands::Context { key } => {

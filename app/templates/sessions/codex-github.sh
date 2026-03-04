@@ -18,28 +18,23 @@
 cd "$BOTSTER_WORKTREE_PATH"
 
 # ---------------------------------------------------------------------------
-# MCP server configuration
+# MCP server registration
 # ---------------------------------------------------------------------------
-# Build a JSON array of MCP servers for the --mcp-server flag.
-# Codex accepts inline JSON: --mcp-server '{"type":"sse","url":"...","headers":{...}}'
-
-MCP_SERVERS=()
+# Codex MCP servers are registered via `codex mcp add`.
+# The old `--mcp-server` flag is no longer supported by Codex CLI.
 
 # Trybotster remote MCP (GitHub tools, memory, platform capabilities)
 if [ -n "$BOTSTER_MCP_TOKEN" ]; then
   MCP_URL="${BOTSTER_MCP_URL:-https://mcp.trybotster.com}"
   echo "Registering trybotster MCP server..."
-  MCP_SERVERS+=("$(printf '{"type":"sse","url":"%s","headers":{"Authorization":"Bearer %s"}}' "$MCP_URL" "$BOTSTER_MCP_TOKEN")")
+  codex mcp remove trybotster >/dev/null 2>&1 || true
+  codex mcp add trybotster --url "$MCP_URL" --bearer-token-env-var BOTSTER_MCP_TOKEN
 fi
 
 # Botster hub MCP bridge (orchestrator, plugin tools, hub commands)
 echo "Registering botster hub MCP tools..."
-HUB_SOCKET="$(botster context hub_socket)"
-if [ -n "$HUB_SOCKET" ]; then
-  MCP_SERVERS+=("$(printf '{"type":"stdio","command":"botster","args":["mcp-serve","--socket","%s"]}' "$HUB_SOCKET")")
-else
-  MCP_SERVERS+=('{"type":"stdio","command":"botster","args":["mcp-serve"]}')
-fi
+codex mcp remove botster-hub >/dev/null 2>&1 || true
+codex mcp add botster-hub -- botster mcp-serve
 
 # ---------------------------------------------------------------------------
 # Launch
@@ -53,10 +48,4 @@ else
 fi
 echo "Worktree: $BOTSTER_WORKTREE_PATH"
 
-# Build --mcp-server args
-MCP_ARGS=()
-for server in "${MCP_SERVERS[@]}"; do
-  MCP_ARGS+=(--mcp-server "$server")
-done
-
-codex --full-auto "${MCP_ARGS[@]}" "$(botster context prompt)"
+codex --full-auto "$(botster context prompt)"

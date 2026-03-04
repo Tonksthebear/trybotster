@@ -29,15 +29,9 @@ botster json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogA
 # ---------------------------------------------------------------------------
 # Registers the local hub MCP bridge so agents can use plugin-provided tools
 # (orchestrator, custom plugin tools, etc.) via the Botster hub.
-# Prefer injected hub socket context from the parent hub.
 
 echo "Registering botster hub MCP tools..."
-HUB_SOCKET="$(botster context hub_socket)"
-if [ -n "$HUB_SOCKET" ] && [ -S "$HUB_SOCKET" ]; then
-  claude mcp add botster-hub -- botster mcp-serve --socket "$HUB_SOCKET"
-else
-  claude mcp add botster-hub -- botster mcp-serve
-fi
+claude mcp add botster-hub -- botster mcp-serve
 
 # ---------------------------------------------------------------------------
 # Launch

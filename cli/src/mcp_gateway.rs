@@ -4,7 +4,7 @@
 //! dispatch, and id correlation. Routes tool/prompt requests through the
 //! hub socket `mcp` channel to Lua.
 //!
-//! Launched by Claude Code as: `botster mcp-serve --socket /path/to/hub.sock`
+//! Launched by Claude Code as: `botster mcp-serve`
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
