@@ -212,8 +212,9 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
     -- Default dimensions
     local dims = { rows = 24, cols = 80 }
 
-    -- Extract workspace fields from metadata
-    local workspace_name = metadata and metadata.workspace or nil
+    -- Extract workspace fields from metadata; default to branch name so agents
+    -- on the same branch share a workspace.
+    local workspace_name = metadata and metadata.workspace or branch_name
     local workspace_id = metadata and metadata.workspace_id or nil
     local workspace_metadata = metadata and metadata.workspace_metadata or nil
 
@@ -283,7 +284,7 @@ local function spawn_accessory(branch_name, wt_path, session_name, agent_key, pr
         session_config = { name = session_name, command = "bash" }
     end
 
-    local workspace_name = metadata and metadata.workspace or nil
+    local workspace_name = metadata and metadata.workspace or branch_name
     local workspace_id = metadata and metadata.workspace_id or nil
 
     local ok, agent = pcall(Agent.new, {
