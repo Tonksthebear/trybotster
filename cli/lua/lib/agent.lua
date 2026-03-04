@@ -30,10 +30,25 @@ local port_state = state.get("agent_port_state", { next_port = 8080 })
 -- UUID Generation
 -- =============================================================================
 
---- Generate a session UUID in the format "sess-{timestamp}-{hex}".
+-- Monotonic counter for collision-safe UUID generation (persistent across reloads)
+local uuid_state = state.get("agent_uuid_counter", { seq = 0 })
+
+--- Generate a collision-safe session UUID.
+-- Format: "sess-{epoch}-{seq}-{random128}"
+-- Combines second-level time + process-local monotonic counter + 128 bits of
+-- randomness (4 independent draws). The counter alone prevents collisions under
+-- burst creation; the random salt prevents collisions across process restarts
+-- that might reset the counter.
 -- @return string
 local function generate_session_uuid()
-    return string.format("sess-%d-%08x", os.time(), math.random(0, 0xFFFFFFFF))
+    uuid_state.seq = uuid_state.seq + 1
+    return string.format("sess-%d-%04x-%08x%08x%08x%08x",
+        os.time(),
+        uuid_state.seq,
+        math.random(0, 0xFFFFFFFF),
+        math.random(0, 0xFFFFFFFF),
+        math.random(0, 0xFFFFFFFF),
+        math.random(0, 0xFFFFFFFF))
 end
 
 -- =============================================================================
