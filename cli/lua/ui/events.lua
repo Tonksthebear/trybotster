@@ -12,7 +12,7 @@
 -- Supported operations:
 --   set_mode          { op, mode }                   - Update Rust's mode shadow
 --   send_msg          { op, data }
---   focus_terminal    { op, agent_id, pty_index, agent_index }
+--   focus_terminal    { op, agent_id, agent_index }   (pty_index always 0)
 --   set_connection_code { op, url, qr_ascii }
 --   clear_connection_code { op }
 --   osc_alert           { op, title, body }            - Write OSC 777/9 to outer terminal
@@ -217,7 +217,6 @@ function M.on_hub_event(event_type, event_data, context)
     if agent.id then
       local idx = agent_index_for(agent.id)
       _tui_state.selected_agent_index = idx
-      _tui_state.active_pty_index = 0
       _tui_state.list_cursor_pos = find_agent_cursor_pos(agent.id)
       return {
         { op = "focus_terminal", agent_id = agent.id, pty_index = 0, agent_index = idx },
@@ -244,7 +243,6 @@ function M.on_hub_event(event_type, event_data, context)
         local next = agents[#agents]
         local idx = agent_index_for(next.id)
         _tui_state.selected_agent_index = idx
-        _tui_state.active_pty_index = 0
         _tui_state.list_cursor_pos = find_agent_cursor_pos(next.id)
         return {
           { op = "focus_terminal", agent_id = next.id, pty_index = 0, agent_index = idx },
@@ -252,7 +250,6 @@ function M.on_hub_event(event_type, event_data, context)
         }
       else
         _tui_state.selected_agent_index = nil
-        _tui_state.active_pty_index = 0
         _tui_state.list_cursor_pos = nil
         return {
           { op = "focus_terminal" },  -- nil agent_id clears selection
@@ -352,13 +349,6 @@ function M.on_hub_event(event_type, event_data, context)
       }
     end
     -- Multiple profiles: populate list for user selection (mode already set)
-    return {}
-  end
-
-  if event_type == "session_types" then
-    local types = event_data.session_types
-    if not types then return nil end
-    _tui_state.available_session_types = types
     return {}
   end
 

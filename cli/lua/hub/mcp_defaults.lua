@@ -91,7 +91,7 @@ To replace the layout entirely, just redefine render:
           block = { title = " Terminal ", borders = "all" },
           props = {
             agent_index = _tui_state and _tui_state.selected_agent_index,
-            pty_index   = (_tui_state and _tui_state.active_pty_index) or 0,
+            pty_index   = 0,  -- always 0 in single-PTY model
           },
         },
       },
@@ -103,10 +103,9 @@ To replace the layout entirely, just redefine render:
 Read agent and UI state from the _tui_state global inside render():
 
   _tui_state.agents                  -- array of agent info tables:
-    agent.id, agent.display_name, agent.branch_name, agent.profile_name
-    agent.sessions, agent.notification, agent.in_worktree
+    agent.id, agent.session_uuid, agent.session_type, agent.display_name,
+    agent.branch_name, agent.profile_name, agent.notification, agent.in_worktree
   _tui_state.selected_agent_index    -- 0-based int, or nil
-  _tui_state.active_pty_index        -- 0-based int
   _tui_state.available_worktrees     -- array of { branch, path }
   _tui_state.mode                    -- current mode string (see modes below)
   _tui_state.input_buffer            -- current text input
@@ -128,7 +127,7 @@ Read agent and UI state from the _tui_state global inside render():
   { type = "list",      block = {...}, props = { items = {...}, selected = N } }
   { type = "paragraph", block = {...}, props = { lines = {...}, alignment = "center" } }
   { type = "input",     block = {...}, props = { lines = {...}, placeholder = "..." } }
-  { type = "terminal",  block = {...}, props = { agent_index = N, pty_index = N } }
+  { type = "terminal",  block = {...}, props = { agent_index = N, pty_index = 0 } }
   { type = "empty",     block = {...} }
 
   Constraints: "30%" | "30" (fixed cols) | "min:10" | "max:80"
@@ -151,7 +150,7 @@ Read agent and UI state from the _tui_state global inside render():
   menu                      command palette (Ctrl+P)
   new_agent_select_profile  new_agent_select_worktree  new_agent_create_worktree
   new_agent_prompt          close_agent_confirm         connection_code
-  add_session_select_type   remove_session_select       error
+  error
 
 ## Adding Keybindings
 
@@ -167,7 +166,7 @@ Put this in `~/.botster/lua/user/ui/keybindings.lua`:
 
 Built-in shared bindings (normal + insert):
   ctrl+p → open_menu     ctrl+j → select_next     ctrl+k → select_previous
-  ctrl+] → toggle_pty    shift+pageup/pagedown/home/end → scroll
+  shift+pageup/pagedown/home/end → scroll
   ctrl+r → refresh_agents
 
 ## Adding a Custom Overlay
@@ -238,13 +237,9 @@ first, restart once, then subsequent file changes hot-reload without restarting.
     log.info("Agent closed: " .. agent:agent_key())
   end)
 
-  hooks.on("agent_session_added", "my.session", function(payload)
-    -- payload.agent, payload.session_name, payload.pty_index
-  end)
-
 Available agent observer events:
   after_agent_create    after_agent_close    before_agent_close
-  agent_created         agent_deleted        agent_session_added   agent_session_removed
+  agent_created         agent_deleted
 
 ## Adding a Hub Command (Ctrl+P palette)
 
@@ -562,7 +557,7 @@ Use the state guard pattern:
   end)
 
 Other useful agent events:
-  before_agent_close    agent_session_added    agent_session_removed
+  before_agent_close
 
 ## Step 7: Expose Tools to Claude
 
