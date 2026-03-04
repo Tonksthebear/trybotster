@@ -176,6 +176,7 @@ end
 -- @param profile_name string    Profile to use for config resolution
 -- @param metadata table|nil     Plugin metadata (e.g., issue_number, invocation_url)
 -- @return Agent|nil             The created agent, or nil on error
+-- @return string|nil            Error message (nil on success)
 local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, profile_name, metadata)
     local repo = config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
     local repo_root = worktree.repo_root()
@@ -191,10 +192,11 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
         profile = profile_name,
     })
     if not resolved then
-        log.error(string.format("Config resolution failed for profile '%s': %s",
-            tostring(profile_name), tostring(err)))
+        local msg = string.format("Config resolution failed for profile '%s': %s",
+            tostring(profile_name), tostring(err))
+        log.error(msg)
         notify_lifecycle(agent_key, "failed", { error = tostring(err) })
-        return nil
+        return nil, msg
     end
 
     local sessions = build_sessions_from_resolved(resolved)
@@ -224,11 +226,12 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, prof
     })
 
     if not ok then
-        log.error(string.format("Failed to spawn agent for %s: %s",
-            branch_name, tostring(agent)))
+        local msg = string.format("Failed to spawn agent for %s: %s",
+            branch_name, tostring(agent))
+        log.error(msg)
         -- Broadcast failure status
         notify_lifecycle(agent_key, "failed", { error = tostring(agent) })
-        return nil
+        return nil, msg
     end
 
     -- Notify via hooks (connections.lua observes and broadcasts to clients)
@@ -266,7 +269,8 @@ end
 -- @param client table|nil            Requesting client (for progress/dims)
 -- @param profile_name string|nil     Profile name (auto-selected if only one)
 -- @param metadata table|nil          Plugin metadata (e.g., issue_number, invocation_url)
--- @return Agent|nil                  The created agent, or nil on error
+-- @return Agent|nil                  The created agent, or nil on error/async
+-- @return string|nil                 Error message (nil on success or async creation)
 local function handle_create_agent(issue_or_branch, prompt, from_worktree, client, profile_name, metadata)
     -- Early identifier for lifecycle events on error paths (matches what TUI
     -- sets for creating_agent_id in actions.lua).
@@ -283,7 +287,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     if params == nil then
         log.info("before_agent_create interceptor blocked agent creation")
         notify_lifecycle(early_id, "failed", { error = "Blocked by interceptor" })
-        return nil
+        return nil, "Blocked by interceptor"
     end
     -- Allow interceptors to modify fields
     issue_or_branch = params.issue_or_branch
@@ -299,13 +303,13 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         if profile_err then
             log.error(string.format("Profile resolution failed: %s", profile_err))
             notify_lifecycle(early_id, "failed", { error = profile_err })
-            return nil
+            return nil, "Profile resolution failed: " .. profile_err
         end
         profile_name = resolved_profile  -- nil for shared-only, or a profile name
     else
         log.error("Cannot resolve profile: no repo root detected")
         notify_lifecycle(early_id, "failed", { error = "No repo root detected" })
-        return nil
+        return nil, "No repo root detected"
     end
 
     -- Main repo mode: no issue_or_branch AND no from_worktree
