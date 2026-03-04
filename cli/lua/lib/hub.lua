@@ -367,11 +367,13 @@ function Hub:create_agent(issue_or_branch, prompt, profile, workspace)
         if workspace then
             metadata = { workspace = workspace }
         end
-        local agent = agents_handler.handle_create_agent(
+        local agent, err = agents_handler.handle_create_agent(
             issue_or_branch, prompt, nil, nil, profile, metadata
         )
         if agent then
             return "Agent created: " .. agent:agent_key()
+        elseif err then
+            error(err)
         else
             return "Agent creation initiated (worktree may be creating async)"
         end
