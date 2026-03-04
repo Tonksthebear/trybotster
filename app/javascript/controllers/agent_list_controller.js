@@ -389,7 +389,7 @@ export default class extends Controller {
     });
 
     // Interpolate hrefs — use session_uuid for routing
-    const sessionUuid = agent.session_uuid || agent.id;
+    const sessionUuid = agent.session_uuid;
     root.querySelectorAll("[data-href]").forEach((el) => {
       el.href = el.dataset.href
         .replace("{hubId}", hubId)
