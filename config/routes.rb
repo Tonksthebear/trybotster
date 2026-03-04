@@ -35,19 +35,13 @@ Rails.application.routes.draw do
       resource :settings, only: [ :show ], controller: :settings
       resource :device, only: [ :show ], controller: :device
       resource :pairing, only: [ :show ], controller: :pairing
-      # Agent terminal view by index
-      # /hubs/:hub_id/agents/:index - agent overview (redirects to PTY 0)
-      # /hubs/:hub_id/agents/:index/ptys/:pty_index - specific PTY terminal
-      resources :agents, only: [ :show ], param: :index do
-        resources :ptys, only: [ :show ], param: :index, controller: "agents/ptys"
-
-        # Preview - for PTYs with port forwarding
-        # Shell page at /preview/shell (under SW scope, so controlled)
-        # SW.js at /preview/sw.js
-        # Proxied content at /preview/* (except shell and sw.js)
-        get ":pty_index/preview/sw.js", to: "agents/previews#service_worker", as: :pty_service_worker
-        get ":pty_index/preview/shell", to: "agents/previews#shell", as: :pty_preview_shell
-        get ":pty_index/preview", to: "agents/previews#bootstrap", as: :pty_preview
+      # Session terminal view by session UUID
+      # /hubs/:hub_id/sessions/:session_uuid - terminal for a specific session
+      resources :sessions, only: [ :show ], param: :uuid do
+        # Preview - for sessions with port forwarding
+        get "preview/sw.js", to: "sessions/previews#service_worker", as: :preview_service_worker
+        get "preview/shell", to: "sessions/previews#shell", as: :preview_shell
+        get "preview", to: "sessions/previews#bootstrap", as: :preview
       end
     end
   end

@@ -3,7 +3,7 @@
 require "test_helper"
 
 module Hubs
-  class AgentsControllerTest < ActionDispatch::IntegrationTest
+  class SessionsControllerTest < ActionDispatch::IntegrationTest
     include Devise::Test::IntegrationHelpers
 
     setup do
@@ -14,31 +14,25 @@ module Hubs
     # === Authentication ===
 
     test "show requires authentication" do
-      get hub_agent_path(@active_hub, 0)
+      get hub_session_path(@active_hub, "test-session-uuid")
       assert_redirected_to root_path
     end
 
-    # === Redirect Behavior ===
+    # === Session View ===
 
-    test "show redirects to PTY 0 for agent" do
+    test "show renders session terminal view" do
       sign_in @user
-      get hub_agent_path(@active_hub, 0)
+      get hub_session_path(@active_hub, "test-session-uuid")
 
-      assert_redirected_to hub_agent_pty_path(@active_hub, 0, 0)
-    end
-
-    test "show preserves agent index in redirect" do
-      sign_in @user
-      get hub_agent_path(@active_hub, 2)
-
-      assert_redirected_to hub_agent_pty_path(@active_hub, 2, 0)
+      assert_response :success
+      assert_match "session-uuid", response.body
     end
 
     # === Hub Scoping ===
 
     test "show redirects to hubs for non-existent hub" do
       sign_in @user
-      get hub_agent_path("non-existent-hub-id", 0)
+      get hub_session_path("non-existent-hub-id", "test-session-uuid")
 
       assert_redirected_to hubs_path
       assert_equal "Hub not found", flash[:alert]
@@ -53,7 +47,7 @@ module Hubs
       )
 
       sign_in @user
-      get hub_agent_path(other_hub, 0)
+      get hub_session_path(other_hub, "test-session-uuid")
 
       assert_redirected_to hubs_path
       assert_equal "Hub not found", flash[:alert]

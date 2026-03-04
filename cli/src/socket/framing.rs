@@ -8,10 +8,10 @@
 //!
 //! Frame types:
 //! - `0x01`: JSON message (UTF-8 `serde_json::Value`)
-//! - `0x02`: PTY output binary (hub→client) — `[u16 agent][u16 pty][raw bytes]`
-//! - `0x03`: PTY input binary (client→hub) — `[u16 agent][u16 pty][raw bytes]`
-//! - `0x04`: PTY scrollback (hub→client) — `[u16 agent][u16 pty][u8 kitty][raw bytes]`
-//! - `0x05`: Process exited (hub→client) — `[u16 agent][u16 pty][i32 exit_code]`
+//! - `0x02`: PTY output binary (hub→client) — `[u16 uuid_len][uuid][raw bytes]`
+//! - `0x03`: PTY input binary (client→hub) — `[u16 uuid_len][uuid][raw bytes]`
+//! - `0x04`: PTY scrollback (hub→client) — `[u16 uuid_len][uuid][u8 kitty][raw bytes]`
+//! - `0x05`: Process exited (hub→client) — `[u16 uuid_len][uuid][i32 exit_code]`
 //! - `0x06`: Raw binary (bidirectional) — `[raw bytes]`
 
 use anyhow::{anyhow, bail, Result};
@@ -43,30 +43,24 @@ pub enum Frame {
 
     /// PTY output data (hub → client).
     PtyOutput {
-        /// Agent index.
-        agent_index: u16,
-        /// PTY index within the agent.
-        pty_index: u16,
+        /// Session UUID identifying the PTY.
+        session_uuid: String,
         /// Raw PTY output bytes.
         data: Vec<u8>,
     },
 
     /// PTY input data (client → hub).
     PtyInput {
-        /// Agent index.
-        agent_index: u16,
-        /// PTY index within the agent.
-        pty_index: u16,
+        /// Session UUID identifying the target PTY.
+        session_uuid: String,
         /// Raw keyboard input bytes.
         data: Vec<u8>,
     },
 
     /// PTY scrollback data (hub → client, sent once on subscribe).
     Scrollback {
-        /// Agent index.
-        agent_index: u16,
-        /// PTY index within the agent.
-        pty_index: u16,
+        /// Session UUID identifying the PTY.
+        session_uuid: String,
         /// Whether kitty keyboard protocol is active.
         kitty_enabled: bool,
         /// Raw scrollback bytes.
@@ -75,10 +69,8 @@ pub enum Frame {
 
     /// PTY process exited (hub → client).
     ProcessExited {
-        /// Agent index.
-        agent_index: u16,
-        /// PTY index within the agent.
-        pty_index: u16,
+        /// Session UUID identifying the PTY.
+        session_uuid: String,
         /// Exit code (None if killed by signal).
         exit_code: Option<i32>,
     },
@@ -88,6 +80,31 @@ pub enum Frame {
     /// Used by `socket.send_binary()` for plugin-level binary messaging.
     /// Not interpreted as PTY data.
     Binary(Vec<u8>),
+}
+
+/// Encode a session UUID as a length-prefixed byte sequence.
+fn encode_session_uuid(payload: &mut Vec<u8>, session_uuid: &str) {
+    let uuid_bytes = session_uuid.as_bytes();
+    payload.extend_from_slice(&(uuid_bytes.len() as u16).to_le_bytes());
+    payload.extend_from_slice(uuid_bytes);
+}
+
+/// Decode a length-prefixed session UUID from a payload at the start.
+///
+/// Returns `(session_uuid, bytes_consumed)`.
+fn decode_session_uuid(payload: &[u8]) -> Result<(String, usize)> {
+    if payload.len() < 2 {
+        bail!("Frame too short for session UUID length prefix");
+    }
+    let uuid_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let total = 2 + uuid_len;
+    if payload.len() < total {
+        bail!("Frame too short for session UUID: need {total}, have {}", payload.len());
+    }
+    let uuid = std::str::from_utf8(&payload[2..total])
+        .map_err(|e| anyhow!("Invalid UTF-8 in session UUID: {e}"))?
+        .to_string();
+    Ok((uuid, total))
 }
 
 impl Frame {
@@ -100,32 +117,28 @@ impl Frame {
                 let payload = serde_json::to_vec(value).expect("JSON serialization cannot fail");
                 encode_raw(frame_type::JSON, &payload)
             }
-            Frame::PtyOutput { agent_index, pty_index, data } => {
-                let mut payload = Vec::with_capacity(4 + data.len());
-                payload.extend_from_slice(&agent_index.to_le_bytes());
-                payload.extend_from_slice(&pty_index.to_le_bytes());
+            Frame::PtyOutput { session_uuid, data } => {
+                let mut payload = Vec::with_capacity(2 + session_uuid.len() + data.len());
+                encode_session_uuid(&mut payload, session_uuid);
                 payload.extend_from_slice(data);
                 encode_raw(frame_type::PTY_OUTPUT, &payload)
             }
-            Frame::PtyInput { agent_index, pty_index, data } => {
-                let mut payload = Vec::with_capacity(4 + data.len());
-                payload.extend_from_slice(&agent_index.to_le_bytes());
-                payload.extend_from_slice(&pty_index.to_le_bytes());
+            Frame::PtyInput { session_uuid, data } => {
+                let mut payload = Vec::with_capacity(2 + session_uuid.len() + data.len());
+                encode_session_uuid(&mut payload, session_uuid);
                 payload.extend_from_slice(data);
                 encode_raw(frame_type::PTY_INPUT, &payload)
             }
-            Frame::Scrollback { agent_index, pty_index, kitty_enabled, data } => {
-                let mut payload = Vec::with_capacity(5 + data.len());
-                payload.extend_from_slice(&agent_index.to_le_bytes());
-                payload.extend_from_slice(&pty_index.to_le_bytes());
+            Frame::Scrollback { session_uuid, kitty_enabled, data } => {
+                let mut payload = Vec::with_capacity(2 + session_uuid.len() + 1 + data.len());
+                encode_session_uuid(&mut payload, session_uuid);
                 payload.push(u8::from(*kitty_enabled));
                 payload.extend_from_slice(data);
                 encode_raw(frame_type::SCROLLBACK, &payload)
             }
-            Frame::ProcessExited { agent_index, pty_index, exit_code } => {
-                let mut payload = Vec::with_capacity(8);
-                payload.extend_from_slice(&agent_index.to_le_bytes());
-                payload.extend_from_slice(&pty_index.to_le_bytes());
+            Frame::ProcessExited { session_uuid, exit_code } => {
+                let mut payload = Vec::with_capacity(2 + session_uuid.len() + 4);
+                encode_session_uuid(&mut payload, session_uuid);
                 payload.extend_from_slice(&exit_code.unwrap_or(-1).to_le_bytes());
                 encode_raw(frame_type::PROCESS_EXITED, &payload)
             }
@@ -155,54 +168,45 @@ fn decode_frame(frame_type: u8, payload: &[u8]) -> Result<Frame> {
             Ok(Frame::Json(value))
         }
         frame_type::PTY_OUTPUT => {
-            if payload.len() < 4 {
-                bail!("PTY output frame too short: {} bytes", payload.len());
-            }
-            let agent_index = u16::from_le_bytes([payload[0], payload[1]]);
-            let pty_index = u16::from_le_bytes([payload[2], payload[3]]);
+            let (session_uuid, consumed) = decode_session_uuid(payload)?;
             Ok(Frame::PtyOutput {
-                agent_index,
-                pty_index,
-                data: payload[4..].to_vec(),
+                session_uuid,
+                data: payload[consumed..].to_vec(),
             })
         }
         frame_type::PTY_INPUT => {
-            if payload.len() < 4 {
-                bail!("PTY input frame too short: {} bytes", payload.len());
-            }
-            let agent_index = u16::from_le_bytes([payload[0], payload[1]]);
-            let pty_index = u16::from_le_bytes([payload[2], payload[3]]);
+            let (session_uuid, consumed) = decode_session_uuid(payload)?;
             Ok(Frame::PtyInput {
-                agent_index,
-                pty_index,
-                data: payload[4..].to_vec(),
+                session_uuid,
+                data: payload[consumed..].to_vec(),
             })
         }
         frame_type::SCROLLBACK => {
-            if payload.len() < 5 {
-                bail!("Scrollback frame too short: {} bytes", payload.len());
+            let (session_uuid, consumed) = decode_session_uuid(payload)?;
+            if payload.len() < consumed + 1 {
+                bail!("Scrollback frame too short for kitty flag");
             }
-            let agent_index = u16::from_le_bytes([payload[0], payload[1]]);
-            let pty_index = u16::from_le_bytes([payload[2], payload[3]]);
-            let kitty_enabled = payload[4] != 0;
+            let kitty_enabled = payload[consumed] != 0;
             Ok(Frame::Scrollback {
-                agent_index,
-                pty_index,
+                session_uuid,
                 kitty_enabled,
-                data: payload[5..].to_vec(),
+                data: payload[consumed + 1..].to_vec(),
             })
         }
         frame_type::PROCESS_EXITED => {
-            if payload.len() < 8 {
-                bail!("Process exited frame too short: {} bytes", payload.len());
+            let (session_uuid, consumed) = decode_session_uuid(payload)?;
+            if payload.len() < consumed + 4 {
+                bail!("Process exited frame too short for exit code");
             }
-            let agent_index = u16::from_le_bytes([payload[0], payload[1]]);
-            let pty_index = u16::from_le_bytes([payload[2], payload[3]]);
-            let raw_code = i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            let raw_code = i32::from_le_bytes([
+                payload[consumed],
+                payload[consumed + 1],
+                payload[consumed + 2],
+                payload[consumed + 3],
+            ]);
             let exit_code = if raw_code == -1 { None } else { Some(raw_code) };
             Ok(Frame::ProcessExited {
-                agent_index,
-                pty_index,
+                session_uuid,
                 exit_code,
             })
         }
@@ -302,8 +306,7 @@ mod tests {
     #[test]
     fn test_pty_output_round_trip() {
         let frame = Frame::PtyOutput {
-            agent_index: 0,
-            pty_index: 1,
+            session_uuid: "sess-abc-123".to_string(),
             data: b"hello world".to_vec(),
         };
         let encoded = frame.encode();
@@ -316,8 +319,7 @@ mod tests {
     #[test]
     fn test_pty_input_round_trip() {
         let frame = Frame::PtyInput {
-            agent_index: 2,
-            pty_index: 0,
+            session_uuid: "sess-def-456".to_string(),
             data: vec![0x1b, b'[', b'A'], // Up arrow
         };
         let encoded = frame.encode();
@@ -330,8 +332,7 @@ mod tests {
     #[test]
     fn test_scrollback_round_trip() {
         let frame = Frame::Scrollback {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "sess-ghi-789".to_string(),
             kitty_enabled: true,
             data: b"scrollback content".to_vec(),
         };
@@ -345,8 +346,7 @@ mod tests {
     #[test]
     fn test_process_exited_round_trip() {
         let frame = Frame::ProcessExited {
-            agent_index: 1,
-            pty_index: 0,
+            session_uuid: "sess-exit-1".to_string(),
             exit_code: Some(0),
         };
         let encoded = frame.encode();
@@ -359,8 +359,7 @@ mod tests {
     #[test]
     fn test_process_exited_none_round_trip() {
         let frame = Frame::ProcessExited {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "sess-exit-none".to_string(),
             exit_code: None,
         };
         let encoded = frame.encode();
@@ -373,7 +372,7 @@ mod tests {
     #[test]
     fn test_multiple_frames_in_single_feed() {
         let f1 = Frame::Json(serde_json::json!({"msg": 1}));
-        let f2 = Frame::PtyOutput { agent_index: 0, pty_index: 0, data: b"data".to_vec() };
+        let f2 = Frame::PtyOutput { session_uuid: "sess-0".to_string(), data: b"data".to_vec() };
         let f3 = Frame::Json(serde_json::json!({"msg": 2}));
 
         let mut buf = Vec::new();
@@ -412,8 +411,7 @@ mod tests {
     #[test]
     fn test_byte_at_a_time() {
         let frame = Frame::PtyInput {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "s".to_string(),
             data: b"x".to_vec(),
         };
         let encoded = frame.encode();
@@ -433,9 +431,21 @@ mod tests {
     #[test]
     fn test_empty_pty_data() {
         let frame = Frame::PtyOutput {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "sess-empty".to_string(),
             data: vec![],
+        };
+        let encoded = frame.encode();
+        let mut decoder = FrameDecoder::new();
+        let frames = decoder.feed(&encoded).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], frame);
+    }
+
+    #[test]
+    fn test_empty_session_uuid() {
+        let frame = Frame::PtyOutput {
+            session_uuid: String::new(),
+            data: b"data".to_vec(),
         };
         let encoded = frame.encode();
         let mut decoder = FrameDecoder::new();
@@ -476,8 +486,7 @@ mod tests {
     fn test_large_pty_data() {
         let data = vec![0x42u8; 256 * 1024]; // 256KB
         let frame = Frame::PtyOutput {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "sess-large".to_string(),
             data: data.clone(),
         };
         let encoded = frame.encode();

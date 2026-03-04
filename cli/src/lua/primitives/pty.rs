@@ -961,10 +961,8 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
 /// Context passed to PTY output hooks.
 #[derive(Debug, Clone)]
 pub struct PtyOutputContext {
-    /// Agent index in Hub's agent list.
-    pub agent_index: usize,
-    /// PTY index within the agent.
-    pub pty_index: usize,
+    /// Session UUID identifying the PTY producing output.
+    pub session_uuid: String,
     /// Browser peer receiving this output.
     pub peer_id: String,
 }

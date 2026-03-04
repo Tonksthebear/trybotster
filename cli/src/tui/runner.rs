@@ -204,8 +204,8 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TuiRunner")
             .field("mode", &self.mode)
-            .field("selected_agent", &self.panel_pool.selected_agent)
-            .field("current_agent_index", &self.panel_pool.current_agent_index)
+            .field("selected_agent", &self.panel_pool.selected_agent())
+            .field("current_session_uuid", &self.panel_pool.current_session_uuid())
             .field("terminal_dims", &self.panel_pool.terminal_dims())
             .field("quit", &self.quit)
             .finish_non_exhaustive()
@@ -355,9 +355,7 @@ where
 
             // 2b. Mirror terminal modes from PTY to outer terminal
             {
-                let focused = self.panel_pool.current_agent_index
-                    .zip(self.panel_pool.current_pty_index)
-                    .and_then(|key| self.panel_pool.panels.get(&key));
+                let focused = self.panel_pool.focused_panel();
                 self.terminal_modes.sync(focused, self.has_overlay);
             }
 
@@ -510,7 +508,7 @@ where
                     self.terminal_modes.on_focus_gained();
                     log::debug!("[FOCUS] terminal gained focus, mode={} overlay={}", self.mode, self.has_overlay);
                     if self.mode == "insert" && !self.has_overlay {
-                        log::debug!("[FOCUS] forwarding \\x1b[I to PTY agent={:?} pty={:?}", self.panel_pool.current_agent_index, self.panel_pool.current_pty_index);
+                        log::debug!("[FOCUS] forwarding \\x1b[I to PTY session={:?}", self.panel_pool.current_session_uuid());
                         self.handle_pty_input(b"\x1b[I");
                     }
                 }
@@ -518,7 +516,7 @@ where
                     self.terminal_modes.on_focus_lost();
                     log::debug!("[FOCUS] terminal lost focus, mode={} overlay={}", self.mode, self.has_overlay);
                     if self.mode == "insert" && !self.has_overlay {
-                        log::debug!("[FOCUS] forwarding \\x1b[O to PTY agent={:?} pty={:?}", self.panel_pool.current_agent_index, self.panel_pool.current_pty_index);
+                        log::debug!("[FOCUS] forwarding \\x1b[O to PTY session={:?}", self.panel_pool.current_session_uuid());
                         self.handle_pty_input(b"\x1b[O");
                     }
                 }
@@ -820,27 +818,24 @@ where
     /// Send raw PTY input bytes directly to the PTY writer.
     ///
     /// Bypasses Lua entirely — no JSON serialization, no `from_utf8_lossy`.
-    /// Uses `current_agent_index` and `current_pty_index` to route to the
-    /// correct PTY. No-op if no PTY is currently focused.
+    /// Uses `current_session_uuid` to route to the correct PTY.
+    /// No-op if no PTY is currently focused.
     fn handle_pty_input(&mut self, data: &[u8]) {
-        if let (Some(agent_index), Some(pty_index)) =
-            (self.panel_pool.current_agent_index, self.panel_pool.current_pty_index)
-        {
+        if let Some(uuid) = self.panel_pool.current_session_uuid.clone() {
             log::trace!(
-                "[PTY-FWD] Sending {} bytes to agent={} pty={} (overlay={})",
-                data.len(), agent_index, pty_index, self.has_overlay
+                "[PTY-FWD] Sending {} bytes to session={} (overlay={})",
+                data.len(), uuid, self.has_overlay
             );
             if let Err(e) = self.request_tx.send(TuiRequest::PtyInput {
-                agent_index,
-                pty_index,
+                session_uuid: uuid,
                 data: data.to_vec(),
             }) {
                 log::error!("Failed to send PTY input: {e}");
             }
         } else {
             log::warn!(
-                "[PTY-FWD] Dropped {} bytes: agent_index={:?} pty_index={:?}",
-                data.len(), self.panel_pool.current_agent_index, self.panel_pool.current_pty_index
+                "[PTY-FWD] Dropped {} bytes: no focused session",
+                data.len()
             );
         }
     }
@@ -867,16 +862,11 @@ where
         // Drain all pending events (no arbitrary cap).
         loop {
             match self.output_rx.try_recv() {
-                Ok(TuiOutput::Scrollback { agent_index, pty_index, data, kitty_enabled }) => {
+                Ok(TuiOutput::Scrollback { session_uuid, data, kitty_enabled }) => {
                     self.dirty = true;
-                    let panel = self.panel_pool.resolve_panel(agent_index, pty_index);
+                    let panel = self.panel_pool.resolve_panel(&session_uuid);
                     panel.on_scrollback(&data);
-                    // Set kitty state from the PTY session boolean.
-                    // generate_ansi_snapshot() appends \x1b[>1u to the snapshot when
-                    // kitty is active, but we also carry the boolean so terminal_modes
-                    // can sync the outer terminal's kitty state immediately on connect.
-                    let is_focused = agent_index == self.panel_pool.current_agent_index
-                        && pty_index == self.panel_pool.current_pty_index;
+                    let is_focused = self.panel_pool.is_focused(&session_uuid);
                     if is_focused {
                         self.terminal_modes.on_kitty_changed(kitty_enabled);
                     }
@@ -886,39 +876,36 @@ where
                         if is_focused { ", applied" } else { "" }
                     );
                 }
-                Ok(TuiOutput::Output { agent_index, pty_index, data }) => {
+                Ok(TuiOutput::Output { session_uuid, data }) => {
                     self.dirty = true;
-                    let panel = self.panel_pool.resolve_panel(agent_index, pty_index);
+                    let panel = self.panel_pool.resolve_panel(&session_uuid);
                     panel.on_output(&data);
                 }
-                Ok(TuiOutput::OutputBatch { agent_index, pty_index, chunks }) => {
+                Ok(TuiOutput::OutputBatch { session_uuid, chunks }) => {
                     self.dirty = true;
-                    let panel = self.panel_pool.resolve_panel(agent_index, pty_index);
+                    let panel = self.panel_pool.resolve_panel(&session_uuid);
                     for data in &chunks {
                         panel.on_output(data);
                     }
                 }
-                Ok(TuiOutput::ProcessExited { agent_index, pty_index, exit_code }) => {
+                Ok(TuiOutput::ProcessExited { session_uuid, exit_code }) => {
                     self.dirty = true;
                     log::info!("PTY process exited with code {:?}", exit_code);
-                    // Reset kitty if the exited PTY is the focused one.
-                    // Well-behaved programs pop kitty before exit, but crashes don't.
-                    if agent_index == self.panel_pool.current_agent_index
-                        && pty_index == self.panel_pool.current_pty_index
-                    {
+                    if self.panel_pool.is_focused(&session_uuid) {
                         self.terminal_modes.clear_inner_kitty();
                     }
-                    // View cleanup handled by agent_deleted hub event in Lua
                 }
                 Ok(TuiOutput::Message(value)) => {
                     self.dirty = true;
                     self.dispatch_hub_event(value, layout_lua);
                 }
+                Ok(TuiOutput::Binary(data)) => {
+                    log::debug!("[TUI] Received binary data ({} bytes)", data.len());
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     log::debug!("PTY output channel disconnected");
-                    // Unfocus current PTY so the focused flag doesn't stick.
-                    if self.terminal_modes.terminal_focused() && self.panel_pool.current_agent_index.is_some() {
+                    if self.terminal_modes.terminal_focused() && self.panel_pool.current_session_uuid.is_some() {
                         self.handle_pty_input(b"\x1b[O");
                     }
                     let msgs = self.panel_pool.disconnect_all();
@@ -946,9 +933,8 @@ where
         // Handle kitty_changed directly — sets outer terminal keyboard mode.
         // Only apply if the message is for the currently focused PTY.
         if event_type == "kitty_changed" {
-            let msg_agent = msg.get("agent_index").and_then(|v| v.as_u64()).map(|v| v as usize);
-            let msg_pty = msg.get("pty_index").and_then(|v| v.as_u64()).map(|v| v as usize);
-            if msg_agent == self.panel_pool.current_agent_index && msg_pty == self.panel_pool.current_pty_index {
+            let msg_uuid = msg.get("session_uuid").and_then(|v| v.as_str());
+            if msg_uuid == self.panel_pool.current_session_uuid() {
                 if let Some(enabled) = msg.get("enabled").and_then(|v| v.as_bool()) {
                     self.terminal_modes.on_kitty_changed(enabled);
                 }
@@ -959,9 +945,8 @@ where
         // Handle focus_requested — PTY enabled focus reporting (CSI ? 1004 h).
         // Respond with current terminal focus state so the app knows immediately.
         if event_type == "focus_requested" {
-            let msg_agent = msg.get("agent_index").and_then(|v| v.as_u64()).map(|v| v as usize);
-            let msg_pty = msg.get("pty_index").and_then(|v| v.as_u64()).map(|v| v as usize);
-            if msg_agent == self.panel_pool.current_agent_index && msg_pty == self.panel_pool.current_pty_index {
+            let msg_uuid = msg.get("session_uuid").and_then(|v| v.as_str());
+            if msg_uuid == self.panel_pool.current_session_uuid() {
                 let seq = if self.terminal_modes.terminal_focused() { b"\x1b[I" as &[u8] } else { b"\x1b[O" };
                 log::debug!("[FOCUS] PTY requested focus reporting, responding with {}", if self.terminal_modes.terminal_focused() { "focused" } else { "unfocused" });
                 self.handle_pty_input(seq);
@@ -1004,9 +989,7 @@ where
         use super::render::{render, RenderContext};
 
         // Read scroll state from the focused panel (no mutex needed)
-        let (scroll_offset, is_scrolled) = self.panel_pool.current_agent_index
-            .zip(self.panel_pool.current_pty_index)
-            .and_then(|(ai, pi)| self.panel_pool.panels.get(&(ai, pi)))
+        let (scroll_offset, is_scrolled) = self.panel_pool.focused_panel()
             .map(|panel| (panel.scroll_offset(), panel.is_scrolled()))
             .unwrap_or((0, false));
 
@@ -1021,7 +1004,6 @@ where
 
             // Terminal State — panels own parsers directly (no mutex)
             panels: &self.panel_pool.panels,
-            active_pty_index: self.panel_pool.active_pty_index,
             scroll_offset,
             is_scrolled,
 
@@ -1159,13 +1141,11 @@ where
                 }
                 LuaOp::FocusTerminal {
                     agent_id,
-                    agent_index,
-                    pty_index,
+                    session_uuid,
                 } => {
                     self.execute_focus_terminal_typed(
                         agent_id.as_deref(),
-                        agent_index,
-                        pty_index,
+                        session_uuid.as_deref(),
                     );
                 }
                 LuaOp::SetConnectionCode { url, qr_ascii } => {
@@ -1209,17 +1189,16 @@ where
     fn execute_focus_terminal_typed(
         &mut self,
         agent_id: Option<&str>,
-        agent_index: Option<usize>,
-        pty_index: usize,
+        session_uuid: Option<&str>,
     ) {
         log::info!(
-            "focus_terminal: agent_id={:?}, agent_index={:?}, pty_index={}",
-            agent_id, agent_index, pty_index
+            "focus_terminal: agent_id={:?}, session_uuid={:?}",
+            agent_id, session_uuid
         );
 
         let terminal_focused = self.terminal_modes.terminal_focused();
         let effects = self.panel_pool.focus_terminal(
-            agent_id, agent_index, pty_index, terminal_focused,
+            agent_id, session_uuid, terminal_focused,
         );
         self.apply_focus_effects(effects);
     }
@@ -1239,8 +1218,7 @@ where
         }
         for input in effects.pty_inputs {
             if let Err(e) = self.request_tx.send(TuiRequest::PtyInput {
-                agent_index: input.agent_index,
-                pty_index: input.pty_index,
+                session_uuid: input.session_uuid.clone(),
                 data: input.data.to_vec(),
             }) {
                 log::error!("Failed to send PTY input: {e}");
@@ -1255,15 +1233,8 @@ where
     #[cfg(test)]
     pub(super) fn execute_focus_terminal(&mut self, op: &serde_json::Value) {
         let agent_id = op.get("agent_id").and_then(|v| v.as_str());
-        let pty_index = op
-            .get("pty_index")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        let agent_index = op
-            .get("agent_index")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-        self.execute_focus_terminal_typed(agent_id, agent_index, pty_index);
+        let session_uuid = op.get("session_uuid").and_then(|v| v.as_str());
+        self.execute_focus_terminal_typed(agent_id, session_uuid);
     }
 }
 
@@ -2658,10 +2629,10 @@ mod tests {
 
         // Setup: create a panel with initial dims
         let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
-        runner.panel_pool.panels.insert((0, 0), panel);
+        panel.connect("sess-0");
+        runner.panel_pool.panels.insert("sess-0".to_string(), panel);
 
-        assert_eq!(runner.panel_pool.panels.get(&(0, 0)).unwrap().dims(), (24, 80));
+        assert_eq!(runner.panel_pool.panels.get("sess-0").unwrap().dims(), (24, 80));
 
         // Simulate resize event
         runner.handle_resize(40, 120);
@@ -2669,7 +2640,7 @@ mod tests {
         // Verify: terminal_dims updated, panel dims invalidated (0,0)
         assert_eq!(runner.panel_pool.terminal_dims, (40, 120));
         assert_eq!(
-            runner.panel_pool.panels.get(&(0, 0)).unwrap().dims(), (0, 0),
+            runner.panel_pool.panels.get("sess-0").unwrap().dims(), (0, 0),
             "Panel dims should be invalidated so sync_widget_dims detects change"
         );
     }
@@ -2694,12 +2665,11 @@ mod tests {
     fn test_focus_terminal_subscribes_and_updates_state() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Action: focus agent-1 (Lua provides agent_index)
+        // Action: focus agent-1 (Lua provides session_uuid)
         runner.execute_focus_terminal(&serde_json::json!({
             "op": "focus_terminal",
             "agent_id": "agent-1",
-            "agent_index": 1,
-            "pty_index": 0,
+            "session_uuid": "sess-1",
         }));
 
         // Verify: subscribe message sent immediately (no deferral)
@@ -2707,20 +2677,19 @@ mod tests {
             Ok(req) => {
                 let msg = unwrap_lua_msg(req);
                 assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
-                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:1:0"));
+                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:sess-1"));
             }
             Err(_) => panic!("Expected subscribe message"),
         }
 
         // Verify local state updated
         assert_eq!(runner.panel_pool.selected_agent.as_deref(), Some("agent-1"));
-        assert_eq!(runner.panel_pool.current_agent_index, Some(1));
-        assert_eq!(runner.panel_pool.current_pty_index, Some(0));
-        assert_eq!(runner.panel_pool.current_terminal_sub_id, Some("tui:1:0".to_string()));
+        assert_eq!(runner.panel_pool.current_session_uuid(), Some("sess-1"));
+        assert_eq!(runner.panel_pool.current_terminal_sub_id(), Some("tui:sess-1"));
 
         // Verify panel created and in Connecting state
         use crate::tui::terminal_panel::PanelState;
-        assert_eq!(runner.panel_pool.panels.get(&(1, 0)).unwrap().state(), PanelState::Connecting);
+        assert_eq!(runner.panel_pool.panels.get("sess-1").unwrap().state(), PanelState::Connecting);
     }
 
     /// Verifies `focus_terminal` with nil agent_id clears selection.
@@ -2735,13 +2704,12 @@ mod tests {
 
         // Setup: agent 0 selected with active panel
         runner.panel_pool.selected_agent = Some("agent-0".to_string());
-        runner.panel_pool.current_agent_index = Some(0);
-        runner.panel_pool.current_pty_index = Some(0);
-        runner.panel_pool.current_terminal_sub_id = Some("tui:0:0".to_string());
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.panel_pool.current_terminal_sub_id = Some("tui:sess-0".to_string());
         {
-            let panel = runner.panel_pool.panels.entry((0, 0))
+            let panel = runner.panel_pool.panels.entry("sess-0".to_string())
                 .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(24, 80));
-            panel.connect(0, 0); // put in Connecting state
+            panel.connect("sess-0"); // put in Connecting state
         }
 
         // Action: focus_terminal with no agent_id (clear selection)
@@ -2759,10 +2727,9 @@ mod tests {
         }
 
         // Verify selection cleared
-        assert_eq!(runner.panel_pool.selected_agent, None);
-        assert_eq!(runner.panel_pool.current_agent_index, None);
-        assert_eq!(runner.panel_pool.current_pty_index, None);
-        assert_eq!(runner.panel_pool.current_terminal_sub_id, None);
+        assert_eq!(runner.panel_pool.selected_agent(), None);
+        assert_eq!(runner.panel_pool.current_session_uuid(), None);
+        assert_eq!(runner.panel_pool.current_terminal_sub_id(), None);
     }
 
     /// Verifies `focus_terminal` sends unsubscribe for old and subscribe for new.
@@ -2777,21 +2744,19 @@ mod tests {
 
         // Setup: agent 0 selected with active panel
         runner.panel_pool.selected_agent = Some("agent-0".to_string());
-        runner.panel_pool.current_agent_index = Some(0);
-        runner.panel_pool.current_pty_index = Some(0);
-        runner.panel_pool.current_terminal_sub_id = Some("tui:0:0".to_string());
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.panel_pool.current_terminal_sub_id = Some("tui:sess-0".to_string());
         {
-            let panel = runner.panel_pool.panels.entry((0, 0))
+            let panel = runner.panel_pool.panels.entry("sess-0".to_string())
                 .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(24, 80));
-            panel.connect(0, 0);
+            panel.connect("sess-0");
         }
 
-        // Action: focus agent-1 (Lua provides agent_index)
+        // Action: focus agent-1 (Lua provides session_uuid)
         runner.execute_focus_terminal(&serde_json::json!({
             "op": "focus_terminal",
             "agent_id": "agent-1",
-            "agent_index": 1,
-            "pty_index": 0,
+            "session_uuid": "sess-1",
         }));
 
         // Verify: unsubscribe sent for old terminal
@@ -2799,7 +2764,7 @@ mod tests {
             Ok(req) => {
                 let msg = unwrap_lua_msg(req);
                 assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("unsubscribe"));
-                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:0:0"));
+                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:sess-0"));
             }
             Err(_) => panic!("Expected unsubscribe message to be sent"),
         }
@@ -2809,19 +2774,19 @@ mod tests {
             Ok(req) => {
                 let msg = unwrap_lua_msg(req);
                 assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
-                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:1:0"));
+                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:sess-1"));
             }
             Err(_) => panic!("Expected subscribe message to be sent"),
         }
 
         // Verify state
-        assert_eq!(runner.panel_pool.selected_agent.as_deref(), Some("agent-1"));
-        assert_eq!(runner.panel_pool.current_agent_index, Some(1));
-        assert_eq!(runner.panel_pool.current_terminal_sub_id, Some("tui:1:0".to_string()));
+        assert_eq!(runner.panel_pool.selected_agent(), Some("agent-1"));
+        assert_eq!(runner.panel_pool.current_session_uuid(), Some("sess-1"));
+        assert_eq!(runner.panel_pool.current_terminal_sub_id(), Some("tui:sess-1"));
 
         use crate::tui::terminal_panel::PanelState;
-        assert_eq!(runner.panel_pool.panels.get(&(0, 0)).unwrap().state(), PanelState::Idle);
-        assert_eq!(runner.panel_pool.panels.get(&(1, 0)).unwrap().state(), PanelState::Connecting);
+        assert_eq!(runner.panel_pool.panels.get("sess-0").unwrap().state(), PanelState::Idle);
+        assert_eq!(runner.panel_pool.panels.get("sess-1").unwrap().state(), PanelState::Connecting);
     }
 
     /// Verifies `focus_terminal` with unknown agent_id is a no-op.
@@ -2831,20 +2796,19 @@ mod tests {
     /// When the agent doesn't exist in the cache, focus_terminal should log
     /// a warning and not change any state.
     #[test]
-    fn test_focus_terminal_missing_agent_index_is_noop() {
+    fn test_focus_terminal_missing_session_uuid_is_noop() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Action: focus agent without agent_index (Lua bug or edge case)
+        // Action: focus agent without session_uuid (Lua bug or edge case)
         runner.execute_focus_terminal(&serde_json::json!({
             "op": "focus_terminal",
             "agent_id": "nonexistent",
-            "pty_index": 0,
         }));
 
         // Verify: no request sent
         assert!(
             request_rx.try_recv().is_err(),
-            "No JSON should be sent when agent not found"
+            "No JSON should be sent when session_uuid missing"
         );
     }
 
@@ -2860,16 +2824,14 @@ mod tests {
 
         // Setup: agent 0 already focused
         runner.panel_pool.selected_agent = Some("agent-0".to_string());
-        runner.panel_pool.current_agent_index = Some(0);
-        runner.panel_pool.current_pty_index = Some(0);
-        runner.panel_pool.current_terminal_sub_id = Some("tui:0:0".to_string());
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.panel_pool.current_terminal_sub_id = Some("tui:sess-0".to_string());
 
-        // Action: focus same agent+pty (Lua provides agent_index)
+        // Action: focus same agent+session (Lua provides session_uuid)
         runner.execute_focus_terminal(&serde_json::json!({
             "op": "focus_terminal",
             "agent_id": "agent-0",
-            "agent_index": 0,
-            "pty_index": 0,
+            "session_uuid": "sess-0",
         }));
 
         // Verify: no messages sent (already focused)
@@ -2894,10 +2856,10 @@ mod tests {
         // Panel must be Connected for on_output to be accepted, then
         // disconnect so it's Idle when focus_terminal runs.
         let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
-        panel.connect(1, 0);
+        panel.connect("sess-1");
         panel.on_scrollback(b"stale content from previous session");
-        panel.disconnect(1, 0);
-        runner.panel_pool.panels.insert((1, 0), panel);
+        panel.disconnect("sess-1");
+        runner.panel_pool.panels.insert("sess-1".to_string(), panel);
         // Simulate already viewing this agent (prevents stale-panel eviction)
         runner.panel_pool.selected_agent = Some("agent-1".to_string());
 
@@ -2905,12 +2867,11 @@ mod tests {
         runner.execute_focus_terminal(&serde_json::json!({
             "op": "focus_terminal",
             "agent_id": "agent-1",
-            "agent_index": 1,
-            "pty_index": 0,
+            "session_uuid": "sess-1",
         }));
 
         // Verify: stale content is preserved in the panel (not blanked)
-        let panel = runner.panel_pool.panels.get(&(1, 0)).unwrap();
+        let panel = runner.panel_pool.panels.get("sess-1").unwrap();
         let contents = panel.contents();
         assert!(
             contents.contains("stale"),
@@ -2931,7 +2892,7 @@ mod tests {
         // Setup: panel with known dims from a previous render
         let panel = crate::tui::terminal_panel::TerminalPanel::new(20, 60);
         // Panel was previously connected and disconnected (has dims)
-        runner.panel_pool.panels.insert((1, 0), panel);
+        runner.panel_pool.panels.insert("sess-1".to_string(), panel);
         // Simulate already viewing this agent (prevents stale-panel eviction)
         runner.panel_pool.selected_agent = Some("agent-1".to_string());
 
@@ -2939,8 +2900,7 @@ mod tests {
         runner.execute_focus_terminal(&serde_json::json!({
             "op": "focus_terminal",
             "agent_id": "agent-1",
-            "agent_index": 1,
-            "pty_index": 0,
+            "session_uuid": "sess-1",
         }));
 
         // Verify: subscribe uses the panel's dims (20x60), not terminal dims (24x80)
@@ -2968,23 +2928,21 @@ mod tests {
 
         // Setup: panel in Connecting state with existing content and scroll offset
         let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
-        panel.connect(0, 0); // Idle → Connecting (subscribe sent)
+        panel.connect("sess-0"); // Idle → Connecting (subscribe sent)
         for i in 0..30 {
             panel.on_output(format!("old line {i}\r\n").as_bytes());
         }
         panel.scroll_up(5);
         assert!(panel.is_scrolled(), "precondition: scrolled");
-        runner.panel_pool.panels.insert((0, 0), panel);
-        runner.panel_pool.current_agent_index = Some(0);
-        runner.panel_pool.current_pty_index = Some(0);
+        runner.panel_pool.panels.insert("sess-0".to_string(), panel);
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
 
         // Deliver scrollback event with fresh content
         runner.output_rx.close();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         runner.output_rx = rx;
         tx.send(TuiOutput::Scrollback {
-            agent_index: Some(0),
-            pty_index: Some(0),
+            session_uuid: "sess-0".into(),
             data: b"fresh snapshot\r\n".to_vec(),
             kitty_enabled: false,
         }).unwrap();
@@ -2993,7 +2951,7 @@ mod tests {
         runner.poll_pty_events(None);
 
         // Verify: old content gone, scroll reset, new content present
-        let panel = runner.panel_pool.panels.get(&(0, 0)).unwrap();
+        let panel = runner.panel_pool.panels.get("sess-0").unwrap();
         let contents = panel.contents();
         assert!(
             !contents.contains("old line"),
@@ -3020,12 +2978,11 @@ mod tests {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Set up connected state with a panel
-        runner.panel_pool.current_agent_index = Some(0);
-        runner.panel_pool.current_pty_index = Some(0);
-        runner.panel_pool.current_terminal_sub_id = Some("tui:0:0".to_string());
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.panel_pool.current_terminal_sub_id = Some("tui:sess-0".to_string());
         let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
-        runner.panel_pool.panels.insert((0, 0), panel);
+        panel.connect("sess-0");
+        runner.panel_pool.panels.insert("sess-0".to_string(), panel);
 
         // Drain the subscribe message
         let _ = request_rx.try_recv();
@@ -3040,7 +2997,7 @@ mod tests {
         assert_eq!(runner.panel_pool.terminal_dims, (40, 120));
 
         // Verify: panel dims invalidated (will trigger resize on next render)
-        assert_eq!(runner.panel_pool.panels.get(&(0, 0)).unwrap().dims(), (0, 0));
+        assert_eq!(runner.panel_pool.panels.get("sess-0").unwrap().dims(), (0, 0));
     }
 
     /// Verifies `handle_resize()` updates state without sending messages
@@ -3090,14 +3047,13 @@ mod tests {
 
     fn make_test_render_context() -> super::super::render::RenderContext<'static> {
         // 'static requires leaked reference for the empty panels map
-        let panels: &'static std::collections::HashMap<(usize, usize), crate::tui::terminal_panel::TerminalPanel> =
+        let panels: &'static std::collections::HashMap<String, crate::tui::terminal_panel::TerminalPanel> =
             Box::leak(Box::new(std::collections::HashMap::new()));
         super::super::render::RenderContext {
             error_message: None,
             connection_code: None,
             bundle_used: false,
             panels,
-            active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
             seconds_since_poll: 0,
@@ -3116,8 +3072,7 @@ mod tests {
     fn test_sync_subscriptions_subscribes_new() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        runner.panel_pool.current_agent_index = Some(0);
-        runner.panel_pool.current_pty_index = Some(0);
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
 
         // Tree with a single terminal widget with explicit binding
         let tree = crate::tui::render_tree::RenderNode::Widget {
@@ -3127,8 +3082,7 @@ mod tests {
             custom_lines: None,
             props: Some(crate::tui::render_tree::WidgetProps::Terminal(
                 crate::tui::render_tree::TerminalBinding {
-                    agent_index: Some(0),
-                    pty_index: Some(0),
+                    session_uuid: Some("sess-0".to_string()),
                 },
             )),
         };
@@ -3136,21 +3090,20 @@ mod tests {
         let msgs = runner.panel_pool.sync_subscriptions(&tree, &std::collections::HashMap::new());
         for msg in msgs { runner.send_msg(msg); }
 
-        // Should have sent a subscribe message for (0, 0)
+        // Should have sent a subscribe message for sess-0
         match request_rx.try_recv() {
             Ok(req) => {
                 let msg = unwrap_lua_msg(req);
                 assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
-                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:0:0"));
+                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:sess-0"));
                 let params = msg.get("params").expect("should have params");
-                assert_eq!(params.get("agent_index").and_then(|v| v.as_u64()), Some(0));
-                assert_eq!(params.get("pty_index").and_then(|v| v.as_u64()), Some(0));
+                assert_eq!(params.get("session_uuid").and_then(|v| v.as_str()), Some("sess-0"));
             }
             Err(_) => panic!("Expected subscribe message"),
         }
 
         use crate::tui::terminal_panel::PanelState;
-        assert_eq!(runner.panel_pool.panels.get(&(0, 0)).unwrap().state(), PanelState::Connecting);
+        assert_eq!(runner.panel_pool.panels.get("sess-0").unwrap().state(), PanelState::Connecting);
     }
 
     /// Verifies `sync_subscriptions` unsubscribes when a binding is removed.
@@ -3158,22 +3111,21 @@ mod tests {
     fn test_sync_subscriptions_unsubscribes_removed() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        runner.panel_pool.current_agent_index = Some(0);
-        runner.panel_pool.current_pty_index = Some(0);
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
 
-        // Pre-populate panels for two PTYs (both connected)
+        // Pre-populate panels for two sessions (both connected)
         {
             let mut p0 = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
-            p0.connect(0, 0);
-            runner.panel_pool.panels.insert((0, 0), p0);
+            p0.connect("sess-0");
+            runner.panel_pool.panels.insert("sess-0".to_string(), p0);
             let mut p1 = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
-            p1.connect(0, 1);
-            runner.panel_pool.panels.insert((0, 1), p1);
+            p1.connect("sess-1");
+            runner.panel_pool.panels.insert("sess-1".to_string(), p1);
         }
         // Drain subscribe messages
         while request_rx.try_recv().is_ok() {}
 
-        // Tree only has terminal for PTY 0 — PTY 1 should be unsubscribed
+        // Tree only has terminal for sess-0 — sess-1 should be unsubscribed
         let tree = crate::tui::render_tree::RenderNode::Widget {
             widget_type: crate::tui::render_tree::WidgetType::Terminal,
             id: None,
@@ -3181,8 +3133,7 @@ mod tests {
             custom_lines: None,
             props: Some(crate::tui::render_tree::WidgetProps::Terminal(
                 crate::tui::render_tree::TerminalBinding {
-                    agent_index: Some(0),
-                    pty_index: Some(0),
+                    session_uuid: Some("sess-0".to_string()),
                 },
             )),
         };
@@ -3190,20 +3141,20 @@ mod tests {
         let msgs = runner.panel_pool.sync_subscriptions(&tree, &std::collections::HashMap::new());
         for msg in msgs { runner.send_msg(msg); }
 
-        // Should have sent unsubscribe for (0, 1)
+        // Should have sent unsubscribe for sess-1
         let mut found_unsubscribe = false;
         while let Ok(req) = request_rx.try_recv() {
             let msg = unwrap_lua_msg(req);
             if msg.get("type").and_then(|v| v.as_str()) == Some("unsubscribe") {
-                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:0:1"));
+                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:sess-1"));
                 found_unsubscribe = true;
             }
         }
         assert!(found_unsubscribe, "Should send unsubscribe for removed binding");
 
-        // Panel (0, 0) still exists, (0, 1) removed
-        assert!(runner.panel_pool.panels.contains_key(&(0, 0)));
-        assert!(!runner.panel_pool.panels.contains_key(&(0, 1)));
+        // Panel sess-0 still exists, sess-1 removed
+        assert!(runner.panel_pool.panels.contains_key("sess-0"));
+        assert!(!runner.panel_pool.panels.contains_key("sess-1"));
     }
 
     /// Verifies `sync_subscriptions` is idempotent for already-connected panels.
@@ -3211,14 +3162,13 @@ mod tests {
     fn test_sync_subscriptions_no_change_idempotent() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        runner.panel_pool.current_agent_index = Some(0);
-        runner.panel_pool.current_pty_index = Some(0);
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
 
         // Pre-populate with a connected panel
         {
             let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
-            panel.connect(0, 0);
-            runner.panel_pool.panels.insert((0, 0), panel);
+            panel.connect("sess-0");
+            runner.panel_pool.panels.insert("sess-0".to_string(), panel);
         }
         // Drain subscribe message
         while request_rx.try_recv().is_ok() {}
@@ -3230,8 +3180,7 @@ mod tests {
             custom_lines: None,
             props: Some(crate::tui::render_tree::WidgetProps::Terminal(
                 crate::tui::render_tree::TerminalBinding {
-                    agent_index: Some(0),
-                    pty_index: Some(0),
+                    session_uuid: Some("sess-0".to_string()),
                 },
             )),
         };
