@@ -52,7 +52,7 @@ pub mod terminal;
 pub mod terminal_widget;
 
 // Re-export commonly used types
-pub use agent::{Agent, PtyView};
+pub use agent::Agent;
 pub use config::{Config, HubRegistry};
 pub use git::WorktreeManager;
 pub use relay::{AgentInfo, TerminalMessage, WorktreeInfo};

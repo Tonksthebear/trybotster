@@ -237,10 +237,8 @@ pub(crate) enum HubEvent {
     SocketPtyInput {
         /// Client identifier (for focus tracking).
         client_id: String,
-        /// Agent index.
-        agent_index: usize,
-        /// PTY index within the agent.
-        pty_index: usize,
+        /// Session UUID identifying the target PTY.
+        session_uuid: String,
         /// Raw input bytes.
         data: Vec<u8>,
     },
@@ -283,36 +281,32 @@ pub(crate) enum HubEvent {
     BrokerPtyExited {
         /// Broker-assigned session identifier.
         session_id: u32,
-        /// Agent key identifying the agent that owns this PTY.
-        agent_key: String,
-        /// PTY index within the agent (0 = cli, 1 = server).
-        pty_index: usize,
+        /// Session UUID identifying the session that exited.
+        session_uuid: String,
         /// Exit code, or `None` if killed by signal.
         exit_code: Option<i32>,
     },
 
-    /// Register a broker session → agent PTY mapping in the Hub.
+    /// Register a broker session → session UUID mapping in the Hub.
     ///
     /// Sent by the `hub.register_pty_with_broker()` Lua primitive after the
     /// broker returns a session ID for a newly transferred PTY FD. The Hub
     /// stores this mapping so `BrokerPtyOutput` frames can be routed to the
-    /// correct agent's shadow screen and event broadcast channel.
+    /// correct session's shadow screen and event broadcast channel.
     BrokerSessionRegistered {
         /// Broker-assigned session identifier (returned by `register_pty`).
         session_id: u32,
-        /// Agent key identifying the owning agent.
-        agent_key: String,
-        /// PTY index within the agent (0 = cli, 1 = server).
-        pty_index: usize,
+        /// Session UUID identifying the owning session.
+        session_uuid: String,
     },
 
-    /// An agent's PTY handles were removed from `HandleCache` by `hub.unregister_agent()`.
+    /// A session was removed from `HandleCache` by `hub.unregister_session()`.
     ///
-    /// The Hub removes all `broker_sessions` entries whose `agent_key` matches
-    /// so the routing table does not grow without bound when agents cycle.
-    AgentUnregistered {
-        /// The agent key that was removed.
-        agent_key: String,
+    /// The Hub removes all `broker_sessions` entries whose `session_uuid` matches
+    /// so the routing table does not grow without bound when sessions cycle.
+    SessionUnregistered {
+        /// The session UUID that was removed.
+        session_uuid: String,
     },
 
     /// Async worktree deletion completed.
@@ -384,7 +378,7 @@ impl HubEvent {
             Self::BrokerPtyOutput { .. } => "broker_pty_output",
             Self::BrokerPtyExited { .. } => "broker_pty_exited",
             Self::BrokerSessionRegistered { .. } => "broker_session_registered",
-            Self::AgentUnregistered { .. } => "agent_unregistered",
+            Self::SessionUnregistered { .. } => "session_unregistered",
             Self::WorktreeDeleteCompleted { .. } => "worktree_delete_completed",
             Self::WebRtcOfferCompleted { .. } => "webrtc_offer_completed",
         }
