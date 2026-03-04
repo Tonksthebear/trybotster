@@ -182,23 +182,21 @@ end
 
 --- Get a PTY snapshot from an agent session.
 -- Local: calls Agent directly. Remote: uses hub_client.request().
--- @param agent_id string Agent key
--- @param session string|nil Session name (default "agent")
+-- @param agent_id string Agent key or session_uuid
+-- @param session string|nil Session name (ignored in single-PTY model, kept for API compat)
 -- @return string Snapshot content
 function Hub:get_pty_snapshot(agent_id, session)
     session = session or "agent"
 
     if self._is_local then
-        local agent = Agent.get(agent_id)
+        local agent = Agent.get(agent_id) or Agent.find_by_agent_key(agent_id)
         if not agent then
             error(string.format("Hub:get_pty_snapshot: agent '%s' not found", agent_id))
         end
-        local handle = agent.sessions[session]
-        if not handle then
-            error(string.format("Hub:get_pty_snapshot: session '%s' not found on agent '%s'",
-                session, agent_id))
+        if not agent.session then
+            error(string.format("Hub:get_pty_snapshot: no PTY session on agent '%s'", agent_id))
         end
-        return handle:get_screen()
+        return agent.session:get_screen()
     end
 
     -- Remote: blocking request via hub_client.request()
@@ -217,23 +215,21 @@ end
 
 --- Send a message to an agent's PTY session.
 -- Local: calls send_message directly. Remote: uses hub_client.request().
--- @param agent_id string Agent key
+-- @param agent_id string Agent key or session_uuid
 -- @param text string Message text to deliver
--- @param session string|nil Session name (default "agent")
+-- @param session string|nil Session name (ignored in single-PTY model, kept for API compat)
 function Hub:send_message(agent_id, text, session)
     session = session or "agent"
 
     if self._is_local then
-        local agent = Agent.get(agent_id)
+        local agent = Agent.get(agent_id) or Agent.find_by_agent_key(agent_id)
         if not agent then
             error(string.format("Hub:send_message: agent '%s' not found", agent_id))
         end
-        local handle = agent.sessions[session]
-        if not handle then
-            error(string.format("Hub:send_message: session '%s' not found on agent '%s'",
-                session, agent_id))
+        if not agent.session then
+            error(string.format("Hub:send_message: no PTY session on agent '%s'", agent_id))
         end
-        handle:send_message(text)
+        agent.session:send_message(text)
         return "Message sent"
     end
 
@@ -256,28 +252,25 @@ end
 -- agent's inbox. Fires a PTY doorbell so the agent knows to call receive_messages().
 -- For type="notify", skips inbox and writes text directly to PTY instead.
 -- Local: writes inbox directly. Remote: RPC to target hub.
--- @param agent_id string Agent key
+-- @param agent_id string Agent key or session_uuid
 -- @param opts table { type, payload, reply_to, expires_in, session, from_agent_id }
 -- @return table { msg_id, status }
 function Hub:post(agent_id, opts)
     opts = opts or {}
     local msg_type = opts.type or "message"
-    local session = opts.session or "agent"
 
     if self._is_local then
-        local agent = Agent.get(agent_id)
+        local agent = Agent.get(agent_id) or Agent.find_by_agent_key(agent_id)
         if not agent then
             error(string.format("Hub:post: agent '%s' not found", agent_id))
         end
 
         if msg_type == "notify" then
             -- PTY-only: write text directly, no inbox, no doorbell
-            local handle = agent.sessions[session]
-            if not handle then
-                error(string.format("Hub:post: session '%s' not found on agent '%s'",
-                    session, agent_id))
+            if not agent.session then
+                error(string.format("Hub:post: no PTY session on agent '%s'", agent_id))
             end
-            handle:send_message(opts.payload or "")
+            agent.session:send_message(opts.payload or "")
             return { msg_id = nil, status = "delivered" }
         end
 
@@ -289,9 +282,8 @@ function Hub:post(agent_id, opts)
         table.insert(agent._inbox, envelope)
 
         -- PTY doorbell — minimal trigger line only, payload stays in inbox
-        local handle = agent.sessions[session]
-        if handle then
-            handle:send_message(string.format(
+        if agent.session then
+            agent.session:send_message(string.format(
                 "\n\xe2\xac\xa1 [botster-mcp] new message from %s \xe2\x80\x94 use receive_messages() via botster MCP\n",
                 envelope.from.agent_id
             ))
@@ -300,8 +292,8 @@ function Hub:post(agent_id, opts)
 
         -- Inbox written but session was missing — message is readable via receive_messages()
         -- but agent won't see a doorbell
-        log.warn(string.format("Hub:post: inbox written for %s but session '%s' not found, no doorbell",
-            agent_id, session))
+        log.warn(string.format("Hub:post: inbox written for %s but no PTY session, no doorbell",
+            agent_id))
         return { msg_id = envelope.msg_id, status = "inbox_only" }
     end
 
@@ -330,11 +322,18 @@ end
 -- Local: calls Agent.receive_messages() directly. Remote: uses hub_client.request().
 -- NOTE: No authorization checks — any caller can drain any agent's inbox.
 -- Acceptable for single-user deployments; multi-user would need caller verification.
--- @param agent_id string Agent key
+-- @param agent_id string Agent key or session_uuid
 -- @return array of envelope tables (may be empty)
 function Hub:receive_messages(agent_id)
     if self._is_local then
+        -- Agent.receive_messages expects session_uuid; resolve from agent_key if needed
         local messages = Agent.receive_messages(agent_id)
+        if messages == nil then
+            local agent = Agent.find_by_agent_key(agent_id)
+            if agent then
+                messages = Agent.receive_messages(agent.session_uuid)
+            end
+        end
         if messages == nil then
             error(string.format("Hub:receive_messages: agent '%s' not found", agent_id))
         end
