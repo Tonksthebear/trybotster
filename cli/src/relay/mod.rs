@@ -52,7 +52,7 @@ pub mod types;
 
 pub use state::BrowserState;
 
-pub use types::{AgentInfo, BrowserCommand, BrowserResize, SessionInfo, TerminalMessage, WorktreeInfo};
+pub use types::{AgentInfo, BrowserCommand, BrowserResize, TerminalMessage, WorktreeInfo};
 
 pub use olm_crypto::{
     binary_format, extract_olm_key, DeviceKeyBundle, OlmEnvelope, VodozemacCrypto,

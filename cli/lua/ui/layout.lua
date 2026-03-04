@@ -40,10 +40,12 @@ end
 
 --- Get selected agent info from client-side agent cache.
 local function get_selected_agent()
-  local agents = _tui_state and _tui_state.agents or {}
-  local idx = _tui_state and _tui_state.selected_agent_index
-  if idx == nil then return nil end
-  return agents[idx + 1]  -- Lua 1-based
+  local uuid = _tui_state and _tui_state.selected_session_uuid
+  if not uuid then return nil end
+  for _, a in ipairs(_tui_state and _tui_state.agents or {}) do
+    if a.session_uuid == uuid then return a end
+  end
+  return nil
 end
 
 -- =============================================================================
@@ -277,10 +279,18 @@ function render(state)
     list_cursor = _tui_state.list_cursor_pos
   else
     list_items = build_agent_items(state)
-    -- Legacy cursor: selected_agent_index offset by creating indicator
-    list_cursor = _tui_state and _tui_state.selected_agent_index
-    if list_cursor and creating then
-      list_cursor = list_cursor + 1
+    -- Legacy cursor: find selected agent's position in list, offset by creating indicator
+    local uuid = _tui_state and _tui_state.selected_session_uuid
+    if uuid then
+      for i, a in ipairs(_tui_state and _tui_state.agents or {}) do
+        if a.session_uuid == uuid then
+          list_cursor = i - 1  -- 0-based
+          break
+        end
+      end
+      if list_cursor and creating then
+        list_cursor = list_cursor + 1
+      end
     end
   end
 
@@ -302,9 +312,10 @@ function render(state)
   end
 
   -- Build terminal panel: always show selected agent only (single PTY per agent)
+  -- Rust TUI still reads agent_index/pty_index from props, so resolve from session_uuid.
   local terminal_props = {}
-  if _tui_state and _tui_state.selected_agent_index then
-    terminal_props.agent_index = _tui_state.selected_agent_index
+  if sa and sa.display_index ~= nil then
+    terminal_props.agent_index = sa.display_index
     terminal_props.pty_index = 0
   end
   local terminal_panel = {

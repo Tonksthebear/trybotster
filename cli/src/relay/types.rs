@@ -13,7 +13,7 @@
 //! Messages are sent as JSON over WebRTC DataChannel. E2E encryption is
 //! handled by Matrix Olm (1:1 sessions) and Megolm (group sessions).
 
-// Rust guideline compliant 2025-01
+// Rust guideline compliant 2026-03
 
 use serde::{Deserialize, Serialize};
 
@@ -110,26 +110,21 @@ pub enum TerminalMessage {
     },
 }
 
-/// Info about a single PTY session within an agent.
-///
-/// Part of the dynamic sessions model where agents can have N sessions
-/// (agent, server, watcher, etc.) instead of just cli + server.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionInfo {
-    /// Session name (e.g., "agent", "server", "watcher").
-    pub name: String,
-    /// Whether this session has port forwarding enabled.
-    pub port_forward: bool,
-    /// Allocated port number, if port forwarding is enabled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-}
-
 /// Agent info for list response.
+///
+/// Single-PTY model: each agent has exactly one PTY session identified by
+/// `session_uuid`. The legacy `sessions` Vec and `has_server_pty`/`server_running`
+/// fields have been removed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
     /// Unique agent identifier (session key).
     pub id: String,
+    /// Stable session UUID — the primary addressing key for this agent's PTY.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_uuid: Option<String>,
+    /// Session type name (e.g., "agent", "shell").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_type: Option<String>,
     /// Owning workspace identifier for grouped UI rendering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
@@ -143,18 +138,8 @@ pub struct AgentInfo {
     pub name: Option<String>,
     /// Current agent status (e.g., "Running", "Idle").
     pub status: Option<String>,
-    /// Ordered list of PTY sessions (agent first, then alphabetical).
-    ///
-    /// Browser checks this field first for dynamic tab rendering.
-    /// Falls back to `has_server_pty`/`port` for backward compatibility.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sessions: Option<Vec<SessionInfo>>,
     /// Port number for the agent's HTTP forwarding.
     pub port: Option<u16>,
-    /// Whether a dev server is running.
-    pub server_running: Option<bool>,
-    /// Whether a server PTY exists.
-    pub has_server_pty: Option<bool>,
     /// Scrollback offset in lines.
     pub scroll_offset: Option<u32>,
     /// Hub identifier where this agent runs.
@@ -307,19 +292,15 @@ mod tests {
         let msg = TerminalMessage::Agents {
             agents: vec![AgentInfo {
                 id: "test-id".to_string(),
+                session_uuid: Some("uuid-abc-123".to_string()),
+                session_type: Some("agent".to_string()),
                 workspace_id: Some("ws-123".to_string()),
                 repo: Some("owner/repo".to_string()),
                 issue_number: Some(42),
                 branch_name: Some("botster-issue-42".to_string()),
                 name: None,
                 status: Some("Running".to_string()),
-                sessions: Some(vec![
-                    SessionInfo { name: "agent".to_string(), port_forward: false, port: None },
-                    SessionInfo { name: "server".to_string(), port_forward: true, port: Some(3000) },
-                ]),
                 port: Some(3000),
-                server_running: Some(true),
-                has_server_pty: Some(true),
                 scroll_offset: Some(0),
                 hub_identifier: Some("hub-123".to_string()),
             }],
