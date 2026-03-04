@@ -13,7 +13,7 @@
 //! TuiRunner to the PTY writer via [`TuiRequest::PtyInput`].
 //!
 //! JSON message types:
-//! - Resize: `{subscriptionId: "tui:{agent}:{pty}", data: {type: "resize", rows, cols}}`
+//! - Resize: `{subscriptionId: "tui:{session_uuid}", data: {type: "resize", rows, cols}}`
 //! - Agent lifecycle: `{subscriptionId: "tui_hub", data: {type: "create_agent", ...}}`
 //! - Connection: `{subscriptionId: "tui_hub", data: {type: "get_connection_code"}}`
 //! - Quit: `{subscriptionId: "tui_hub", data: {type: "quit"}}`
@@ -39,10 +39,8 @@ pub enum TuiRequest {
     /// Keyboard input goes directly to the PTY writer. No JSON
     /// serialization, no `from_utf8_lossy`, no Lua round-trip.
     PtyInput {
-        /// Agent index in Hub's agent list.
-        agent_index: usize,
-        /// PTY index within the agent.
-        pty_index: usize,
+        /// Session UUID identifying the target PTY.
+        session_uuid: String,
         /// Raw input bytes to write to the PTY.
         data: Vec<u8>,
     },
@@ -53,19 +51,16 @@ pub enum TuiRequest {
 /// TuiRunner receives these through the output channel and processes them
 /// (feeding to AlacrittyParser, handling process exit, etc.).
 ///
-/// PTY-related variants carry optional `agent_index` and `pty_index` fields
-/// to identify which parser should receive the data. When `None`, data is
-/// routed to the currently active parser (backward compat).
+/// PTY-related variants carry a `session_uuid` field to identify which
+/// parser should receive the data.
 #[derive(Debug, Clone)]
 pub enum TuiOutput {
     /// Historical output from before connection.
     ///
     /// Sent once when connecting to a PTY, contains the scrollback buffer.
     Scrollback {
-        /// Agent index for parser routing (`None` = active parser).
-        agent_index: Option<usize>,
-        /// PTY index for parser routing (`None` = active PTY).
-        pty_index: Option<usize>,
+        /// Session UUID for parser routing.
+        session_uuid: String,
         /// Raw scrollback data.
         data: Vec<u8>,
         /// Whether the inner PTY has kitty keyboard protocol active.
@@ -80,10 +75,8 @@ pub enum TuiOutput {
     ///
     /// Sent whenever the PTY produces new output.
     Output {
-        /// Agent index for parser routing (`None` = active parser).
-        agent_index: Option<usize>,
-        /// PTY index for parser routing (`None` = active PTY).
-        pty_index: Option<usize>,
+        /// Session UUID for parser routing.
+        session_uuid: String,
         /// Raw PTY output data.
         data: Vec<u8>,
     },
@@ -92,10 +85,8 @@ pub enum TuiOutput {
     ///
     /// Reduces wake pipe writes from one-per-4KB-chunk to one-per-batch.
     OutputBatch {
-        /// Agent index for parser routing.
-        agent_index: Option<usize>,
-        /// PTY index for parser routing.
-        pty_index: Option<usize>,
+        /// Session UUID for parser routing.
+        session_uuid: String,
         /// Coalesced output chunks (processed sequentially to preserve CSI 3J detection).
         chunks: Vec<Vec<u8>>,
     },
@@ -105,10 +96,8 @@ pub enum TuiOutput {
     /// Sent when the PTY process terminates. TuiRunner should handle this
     /// appropriately (e.g., show exit status, disable input).
     ProcessExited {
-        /// Agent index for identifying which PTY exited.
-        agent_index: Option<usize>,
-        /// PTY index for identifying which PTY exited.
-        pty_index: Option<usize>,
+        /// Session UUID for identifying which PTY exited.
+        session_uuid: String,
         /// Exit code from the PTY process, if available.
         exit_code: Option<i32>,
     },
@@ -128,9 +117,9 @@ mod tests {
 
     #[test]
     fn test_tui_output_debug() {
-        let scrollback = TuiOutput::Scrollback { agent_index: Some(0), pty_index: Some(0), data: vec![1, 2, 3], kitty_enabled: false };
-        let output = TuiOutput::Output { agent_index: Some(0), pty_index: Some(1), data: vec![4, 5, 6] };
-        let exited = TuiOutput::ProcessExited { agent_index: Some(0), pty_index: Some(0), exit_code: Some(0) };
+        let scrollback = TuiOutput::Scrollback { session_uuid: "sess-0".into(), data: vec![1, 2, 3], kitty_enabled: false };
+        let output = TuiOutput::Output { session_uuid: "sess-0".into(), data: vec![4, 5, 6] };
+        let exited = TuiOutput::ProcessExited { session_uuid: "sess-0".into(), exit_code: Some(0) };
         let message = TuiOutput::Message(serde_json::json!({"type": "agent_created"}));
 
         assert!(format!("{:?}", scrollback).contains("Scrollback"));
@@ -143,8 +132,7 @@ mod tests {
     fn test_tui_request_debug() {
         let lua_msg = TuiRequest::LuaMessage(serde_json::json!({"type": "resize"}));
         let pty_input = TuiRequest::PtyInput {
-            agent_index: 0,
-            pty_index: 1,
+            session_uuid: "sess-0".into(),
             data: vec![b'h', b'i'],
         };
 

@@ -170,25 +170,9 @@ hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
     broadcast_hub_event("worktree_list", { worktrees = worktrees })
 end)
 
---- Resolve an agent from Rust callbacks that still use agent_index.
--- Rust calls _set_pty_focused(agent_index, pty_index, peer_id, focused)
--- and _on_pty_input(agent_index). In the new model, we look up the agent
--- by its display_index to find the session_uuid.
--- @param agent_index number 0-based display index from Rust
--- @return Agent|nil, string|nil (agent, session_uuid)
-local function resolve_agent_from_index(agent_index)
-    local agent = Agent.get_by_display_index(agent_index)
-    if agent then
-        return agent, agent.session_uuid
-    end
-    return nil, nil
-end
-
 -- Global callable by Rust to update per-client focus state.
--- Rust calls this with (agent_index, pty_index, peer_id, focused).
--- pty_index is ignored (always 0 in single-PTY model).
-function _set_pty_focused(agent_index, _pty_index, peer_id, focused)
-    local _, session_uuid = resolve_agent_from_index(agent_index)
+-- Rust calls this with (session_uuid, peer_id, focused).
+function _set_pty_focused(session_uuid, peer_id, focused)
     if session_uuid then
         pty_clients.set_focused(session_uuid, peer_id, focused)
     end
@@ -276,10 +260,10 @@ local function clear_session_notification(session_uuid)
 end
 
 -- Called directly from Rust on the PTY input hot path.
--- Rust still passes agent_index; we resolve to session_uuid.
-function _on_pty_input(agent_index)
-    local agent, session_uuid = resolve_agent_from_index(agent_index)
+-- Rust passes session_uuid; we look up the agent for hook dispatch.
+function _on_pty_input(session_uuid)
     if not session_uuid then return false end
+    local agent = Agent.get(session_uuid)
 
     local cleared, any_remaining = clear_session_notification(session_uuid)
     if cleared and agent then
@@ -294,9 +278,9 @@ function _clear_session_notification(session_uuid)
     return any_remaining
 end
 
--- Legacy alias — Rust callbacks may still use agent_index
-_clear_agent_notification = function(agent_index)
-    local _, session_uuid = resolve_agent_from_index(agent_index)
+-- Legacy alias kept for backward compatibility with older plugins.
+-- Accepts session_uuid directly (no more agent_index resolution).
+_clear_agent_notification = function(session_uuid)
     if session_uuid then
         return _clear_session_notification(session_uuid)
     end
@@ -451,6 +435,7 @@ function M._before_reload()
     hooks.off("pty_prompt", "update_agent_prompt")
     hooks.off("pty_cursor_visibility", "update_agent_cursor")
     _set_pty_focused = nil
+    _on_pty_input = nil
     _clear_session_notification = nil
     _clear_agent_notification = nil
     log.info(string.format("connections.lua reloading with %d client(s)", get_client_count()))

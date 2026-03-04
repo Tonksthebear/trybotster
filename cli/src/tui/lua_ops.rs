@@ -32,10 +32,8 @@ pub enum LuaOp {
     FocusTerminal {
         /// Agent session key. `None` clears the selection.
         agent_id: Option<String>,
-        /// Positional index of the agent in `_tui_state.agents`.
-        agent_index: Option<usize>,
-        /// PTY index within the agent (0 = CLI, 1 = server).
-        pty_index: usize,
+        /// Session UUID of the PTY to focus.
+        session_uuid: Option<String>,
     },
 
     /// Cache connection code data (QR + URL) for display.
@@ -82,18 +80,13 @@ impl LuaOp {
                     .get("agent_id")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let agent_index = value
-                    .get("agent_index")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize);
-                let pty_index = value
-                    .get("pty_index")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
+                let session_uuid = value
+                    .get("session_uuid")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 Some(Self::FocusTerminal {
                     agent_id,
-                    agent_index,
-                    pty_index,
+                    session_uuid,
                 })
             }
             "set_connection_code" => {
@@ -166,19 +159,16 @@ mod tests {
         let val = json!({
             "op": "focus_terminal",
             "agent_id": "abc-123",
-            "agent_index": 2,
-            "pty_index": 1
+            "session_uuid": "sess-456"
         });
         let op = LuaOp::parse(&val).expect("should parse");
         match op {
             LuaOp::FocusTerminal {
                 agent_id,
-                agent_index,
-                pty_index,
+                session_uuid,
             } => {
                 assert_eq!(agent_id.as_deref(), Some("abc-123"));
-                assert_eq!(agent_index, Some(2));
-                assert_eq!(pty_index, 1);
+                assert_eq!(session_uuid.as_deref(), Some("sess-456"));
             }
             _ => panic!("wrong variant"),
         }
@@ -191,12 +181,10 @@ mod tests {
         match op {
             LuaOp::FocusTerminal {
                 agent_id,
-                agent_index,
-                pty_index,
+                session_uuid,
             } => {
                 assert!(agent_id.is_none());
-                assert!(agent_index.is_none());
-                assert_eq!(pty_index, 0);
+                assert!(session_uuid.is_none());
             }
             _ => panic!("wrong variant"),
         }

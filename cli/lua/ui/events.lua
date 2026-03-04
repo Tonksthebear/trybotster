@@ -12,7 +12,7 @@
 -- Supported operations:
 --   set_mode          { op, mode }                   - Update Rust's mode shadow
 --   send_msg          { op, data }
---   focus_terminal    { op, agent_id, agent_index }   (agent_index = display_index for Rust TUI)
+--   focus_terminal    { op, agent_id, session_uuid }
 --   set_connection_code { op, url, qr_ascii }
 --   clear_connection_code { op }
 --   osc_alert           { op, title, body }            - Write OSC 777/9 to outer terminal
@@ -59,13 +59,6 @@ local function update_agent_status(agent_id, status)
       return
     end
   end
-end
-
-local function agent_index_for(agent_id)
-  for i, a in ipairs(_tui_state.agents) do
-    if a.id == agent_id then return i - 1 end -- 0-based for Rust
-  end
-  return nil
 end
 
 -- =============================================================================
@@ -215,11 +208,10 @@ function M.on_hub_event(event_type, event_data, context)
 
     -- Focus the new agent's terminal and enter insert mode
     if agent.id then
-      local idx = agent_index_for(agent.id)
       _tui_state.selected_session_uuid = agent.session_uuid
       _tui_state.list_cursor_pos = find_agent_cursor_pos(agent.id)
       return {
-        { op = "focus_terminal", agent_id = agent.id, agent_index = idx },
+        { op = "focus_terminal", agent_id = agent.id, session_uuid = agent.session_uuid },
         set_mode_ops("insert"),
       }
     end
@@ -241,11 +233,10 @@ function M.on_hub_event(event_type, event_data, context)
       if #agents > 0 then
         -- Pick the last agent (most recently added), or clamp to end of list
         local next = agents[#agents]
-        local idx = agent_index_for(next.id)
         _tui_state.selected_session_uuid = next.session_uuid
         _tui_state.list_cursor_pos = find_agent_cursor_pos(next.id)
         return {
-          { op = "focus_terminal", agent_id = next.id, agent_index = idx },
+          { op = "focus_terminal", agent_id = next.id, session_uuid = next.session_uuid },
           set_mode_ops("insert"),
         }
       else
