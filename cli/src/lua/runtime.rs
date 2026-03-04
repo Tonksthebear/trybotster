@@ -1248,7 +1248,7 @@ impl LuaRuntime {
     ///
     /// # Arguments
     ///
-    /// * `ctx` - Context containing agent_index, pty_index, peer_id
+    /// * `ctx` - Context containing session_uuid, peer_id
     /// * `data` - Raw PTY output bytes
     ///
     /// # Returns
@@ -1261,8 +1261,7 @@ impl LuaRuntime {
     ) -> usize {
         let result: mlua::Result<usize> = (|| {
             let ctx_table = self.lua.create_table()?;
-            ctx_table.set("agent_index", ctx.agent_index)?;
-            ctx_table.set("pty_index", ctx.pty_index)?;
+            ctx_table.set("session_uuid", ctx.session_uuid.as_str())?;
             ctx_table.set("peer_id", ctx.peer_id.clone())?;
 
             let data_str = self.lua.create_string(data)?;
@@ -1347,10 +1346,8 @@ impl LuaRuntime {
         let ctx_table: mlua::Table = self.lua.registry_value(self.pty_hook_ctx.as_ref().unwrap())
             .map_err(|e| anyhow!("Failed to retrieve cached PTY context table: {e}"))?;
 
-        ctx_table.set("agent_index", ctx.agent_index)
-            .map_err(|e| anyhow!("Failed to set agent_index: {e}"))?;
-        ctx_table.set("pty_index", ctx.pty_index)
-            .map_err(|e| anyhow!("Failed to set pty_index: {e}"))?;
+        ctx_table.set("session_uuid", ctx.session_uuid.as_str())
+            .map_err(|e| anyhow!("Failed to set session_uuid: {e}"))?;
         ctx_table.set("peer_id", ctx.peer_id.clone())
             .map_err(|e| anyhow!("Failed to set peer_id: {e}"))?;
 
@@ -2344,8 +2341,7 @@ mod tests {
         "#).exec().unwrap();
 
         let ctx = PtyOutputContext {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "test-session".to_string(),
             peer_id: "test-peer".to_string(),
         };
 
@@ -2367,8 +2363,7 @@ mod tests {
         "#).exec().unwrap();
 
         let ctx = PtyOutputContext {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "test-session".to_string(),
             peer_id: "test-peer".to_string(),
         };
 
@@ -2390,8 +2385,7 @@ mod tests {
         "#).exec().unwrap();
 
         let ctx = PtyOutputContext {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "test-session".to_string(),
             peer_id: "test-peer".to_string(),
         };
 
@@ -2415,19 +2409,16 @@ mod tests {
         "#).exec().unwrap();
 
         let ctx = PtyOutputContext {
-            agent_index: 3,
-            pty_index: 1,
+            session_uuid: "sess-abc-123".to_string(),
             peer_id: "context-test-peer".to_string(),
         };
 
         runtime.call_pty_output_interceptors(&ctx, b"test").unwrap();
 
-        let agent_idx: usize = runtime.lua().load("return received_ctx.agent_index").eval().unwrap();
-        let pty_idx: usize = runtime.lua().load("return received_ctx.pty_index").eval().unwrap();
+        let session_uuid: String = runtime.lua().load("return received_ctx.session_uuid").eval().unwrap();
         let peer_id: String = runtime.lua().load("return received_ctx.peer_id").eval().unwrap();
 
-        assert_eq!(agent_idx, 3);
-        assert_eq!(pty_idx, 1);
+        assert_eq!(session_uuid, "sess-abc-123");
         assert_eq!(peer_id, "context-test-peer");
     }
 
@@ -3411,9 +3402,9 @@ mod tests {
     /// Set up a minimal Lua environment for notification tests.
     ///
     /// Mirrors the production code structure in `handlers/connections.lua`:
-    /// - `clear_agent_notification()` — shared clear logic
+    /// - `clear_session_notification()` — shared clear logic
     /// - `_on_pty_input()` — called from Rust hot path, fires plugin hook
-    /// - `_clear_agent_notification()` — called from command handler, no hook
+    /// - `_clear_session_notification()` — called from command handler, no hook
     fn setup_notification_env(runtime: &LuaRuntime) {
         runtime.lua().load(r#"
             -- Minimal Agent mock with notification support
@@ -3501,7 +3492,7 @@ mod tests {
             end
 
             -- Called from clear_notification command (TUI agent switch)
-            function _clear_agent_notification(session_uuid)
+            function _clear_session_notification(session_uuid)
                 if not session_uuid then return false end
                 local _, any_remaining = clear_session_notification(session_uuid)
                 return any_remaining
@@ -3738,14 +3729,14 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_agent_notification_command_path_no_hook() {
+    fn test_clear_session_notification_command_path_no_hook() {
         let mut runtime = LuaRuntime::new().expect("Should create runtime");
         setup_notification_env(&runtime);
         add_test_agent(&runtime, "agent-0", true);
 
         // Simulate the clear_notification command path (TUI agent switch)
         let remaining: bool = runtime.lua().load(
-            "return _clear_agent_notification('sess-0')"
+            "return _clear_session_notification('sess-0')"
         ).eval().unwrap();
 
         // Notification should be cleared
@@ -3777,7 +3768,7 @@ mod tests {
         add_test_agent(&runtime, "agent-1", true);
 
         // Clear agent 0 via command path (TUI agent switch)
-        runtime.lua().load("_clear_agent_notification('sess-0')").exec().unwrap();
+        runtime.lua().load("_clear_session_notification('sess-0')").exec().unwrap();
 
         // Clear agent 1 via PTY input path (typing)
         runtime.pty_input_listening = true;
