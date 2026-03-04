@@ -158,12 +158,6 @@ impl HandleCache {
         self.len() == 0
     }
 
-    /// Get the session UUID at a given display index.
-    #[must_use]
-    pub fn uuid_at_index(&self, index: usize) -> Option<String> {
-        self.order.read().ok()?.get(index).cloned()
-    }
-
     /// Get the display index for a session UUID.
     #[must_use]
     pub fn index_of(&self, uuid: &str) -> Option<usize> {

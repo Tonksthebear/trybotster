@@ -44,10 +44,8 @@ use crate::relay::olm_crypto::{CONTENT_FILE, CONTENT_FILE_CHUNK, CONTENT_MSG, CO
 /// Bypasses JSON/Lua for zero-overhead keystroke delivery.
 #[derive(Debug)]
 pub struct PtyInputIncoming {
-    /// Agent index parsed from subscription ID.
-    pub agent_index: usize,
-    /// PTY index parsed from subscription ID.
-    pub pty_index: usize,
+    /// Session UUID identifying the target PTY.
+    pub session_uuid: String,
     /// Raw input bytes from browser.
     pub data: Vec<u8>,
     /// Browser identity key (for per-client focus tracking).
@@ -60,10 +58,8 @@ pub struct PtyInputIncoming {
 /// which the CLI writes to a temp file and injects the path into the PTY.
 #[derive(Debug)]
 pub struct FileInputIncoming {
-    /// Agent index parsed from subscription ID.
-    pub agent_index: usize,
-    /// PTY index parsed from subscription ID.
-    pub pty_index: usize,
+    /// Session UUID identifying the target PTY.
+    pub session_uuid: String,
     /// Original filename from the browser (e.g., "screenshot.png").
     pub filename: String,
     /// Raw file bytes.
@@ -85,9 +81,8 @@ pub struct StreamIncoming {
 
 /// In-progress chunked file transfer reassembly state.
 struct FileChunkAssembly {
-    /// Metadata from the first chunk (sub_id, filename parsing).
-    agent_index: usize,
-    pty_index: usize,
+    /// Session UUID identifying the target PTY.
+    session_uuid: String,
     filename: String,
     /// Accumulated file data across chunks.
     data: Vec<u8>,
@@ -1516,7 +1511,7 @@ async fn handle_dc_message(
                 .unwrap_or("");
             let payload = plaintext[3 + sub_id_len..].to_vec();
 
-            // Parse "terminal_{agent}_{pty}" and send directly to PTY
+            // Parse "terminal_{session_uuid}" and send directly to PTY
             if let Some(incoming) = parse_pty_input_sub_id(sub_id, payload, browser_identity.to_string()) {
                 if let Some(ref tx) = pty_input_tx {
                     match tx.try_send(incoming) {
@@ -1598,8 +1593,7 @@ async fn handle_dc_message(
             if let Some(pty_info) = parse_pty_input_sub_id(sub_id, Vec::new(), browser_identity.to_string()) {
                 if let Some(ref tx) = file_input_tx {
                     match tx.try_send(FileInputIncoming {
-                        agent_index: pty_info.agent_index,
-                        pty_index: pty_info.pty_index,
+                        session_uuid: pty_info.session_uuid,
                         filename,
                         data,
                     }) {
@@ -1661,10 +1655,10 @@ async fn handle_dc_message(
                 let file_data = &payload[fname_start + filename_len..];
 
                 // Parse routing info
-                let (agent_index, pty_index) = if let Some(pty_info) =
+                let session_uuid = if let Some(pty_info) =
                     parse_pty_input_sub_id(sub_id, Vec::new(), browser_identity.to_string())
                 {
-                    (pty_info.agent_index, pty_info.pty_index)
+                    pty_info.session_uuid
                 } else {
                     log::warn!("[WebRTC-DC] CONTENT_FILE_CHUNK: bad sub_id: {sub_id}");
                     return;
@@ -1676,8 +1670,7 @@ async fn handle_dc_message(
                 );
 
                 let mut assembly = FileChunkAssembly {
-                    agent_index,
-                    pty_index,
+                    session_uuid,
                     filename,
                     data: Vec::with_capacity(512 * 1024), // pre-allocate for typical file
                 };
@@ -1687,8 +1680,7 @@ async fn handle_dc_message(
                     // Single chunk with both START and END (small file sent as chunk)
                     if let Some(ref tx) = file_input_tx {
                         match tx.try_send(FileInputIncoming {
-                            agent_index: assembly.agent_index,
-                            pty_index: assembly.pty_index,
+                            session_uuid: assembly.session_uuid,
                             filename: assembly.filename,
                             data: assembly.data,
                         }) {
@@ -1732,8 +1724,7 @@ async fn handle_dc_message(
                     );
                     if let Some(ref tx) = file_input_tx {
                         match tx.try_send(FileInputIncoming {
-                            agent_index: assembly.agent_index,
-                            pty_index: assembly.pty_index,
+                            session_uuid: assembly.session_uuid,
                             filename: assembly.filename,
                             data: assembly.data,
                         }) {
@@ -1775,21 +1766,17 @@ async fn handle_dc_message(
     }
 }
 
-/// Parse a terminal subscription ID ("terminal_{agent}_{pty}") into a [`PtyInputIncoming`].
+/// Parse a terminal subscription ID ("terminal_{session_uuid}") into a [`PtyInputIncoming`].
 fn parse_pty_input_sub_id(sub_id: &str, data: Vec<u8>, browser_identity: String) -> Option<PtyInputIncoming> {
-    let parts: Vec<&str> = sub_id.split('_').collect();
-    if parts.len() == 3 && parts[0] == "terminal" {
-        let agent_index = parts[1].parse().ok()?;
-        let pty_index = parts[2].parse().ok()?;
-        Some(PtyInputIncoming {
-            agent_index,
-            pty_index,
-            data,
-            browser_identity,
-        })
-    } else {
-        None
+    let session_uuid = sub_id.strip_prefix("terminal_")?;
+    if session_uuid.is_empty() {
+        return None;
     }
+    Some(PtyInputIncoming {
+        session_uuid: session_uuid.to_string(),
+        data,
+        browser_identity,
+    })
 }
 
 fn notify_ingress_backpressure(

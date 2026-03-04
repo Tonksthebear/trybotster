@@ -251,8 +251,7 @@ mod tests {
             .await.unwrap().unwrap();
 
         let frame = Frame::PtyInput {
-            agent_index: 2,
-            pty_index: 1,
+            session_uuid: "sess-abc-123".to_string(),
             data: b"ls -la\n".to_vec(),
         };
         stream.write_all(&frame.encode()).await.unwrap();
@@ -262,7 +261,7 @@ mod tests {
 
         match event {
             HubEvent::SocketPtyInput { session_uuid, data, .. } => {
-                assert_eq!(session_uuid, "index:2");
+                assert_eq!(session_uuid, "sess-abc-123");
                 assert_eq!(data, b"ls -la\n");
             }
             other => panic!("Expected SocketPtyInput, got: {other:?}"),
@@ -381,8 +380,7 @@ mod tests {
 
         // Send PtyOutput (hub→client only, unexpected from client)
         let bad = Frame::PtyOutput {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "sess-bad".to_string(),
             data: b"bad".to_vec(),
         };
         stream.write_all(&bad.encode()).await.unwrap();

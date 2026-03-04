@@ -358,32 +358,14 @@ impl Hub {
                 }
             }
             HubEvent::SocketPtyInput { client_id, session_uuid, data } => {
-                // Socket protocol still sends agent_index in Frame (Phase 8 scope).
-                // Bridge "index:N" format to real session UUID via index-based lookup.
-                let (resolved_uuid, session_handle) = if let Some(idx_str) = session_uuid.strip_prefix("index:") {
-                    let idx = match idx_str.parse::<usize>() {
-                        Ok(i) => i,
-                        Err(_) => {
-                            log::warn!("[Socket] SocketPtyInput: invalid index format '{}'", session_uuid);
-                            return;
-                        }
-                    };
-                    (self.handle_cache.uuid_at_index(idx), self.handle_cache.get_session_by_index(idx))
-                } else {
-                    (Some(session_uuid.clone()), self.handle_cache.get_session(&session_uuid))
-                };
-
-                // Track per-client focus state via Lua (needs real session_uuid, not "index:N")
-                if let Some(ref uuid) = resolved_uuid {
-                    if data == b"\x1b[I" {
-                        self.lua.set_pty_focused(uuid, &client_id, true);
-                    } else if data == b"\x1b[O" {
-                        self.lua.set_pty_focused(uuid, &client_id, false);
-                    }
-                    self.lua.notify_pty_input(uuid);
+                if data == b"\x1b[I" {
+                    self.lua.set_pty_focused(&session_uuid, &client_id, true);
+                } else if data == b"\x1b[O" {
+                    self.lua.set_pty_focused(&session_uuid, &client_id, false);
                 }
+                self.lua.notify_pty_input(&session_uuid);
 
-                if let Some(session_handle) = session_handle {
+                if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
                     if let Err(e) = session_handle.pty().write_input_direct(&data) {
                         log::error!("[Socket] PTY write failed for {}: {e}", client_id);
                     }
@@ -894,19 +876,15 @@ impl Hub {
 
     /// Handle a single binary PTY input from a browser (WebRTC).
     pub fn handle_pty_input(&mut self, input: crate::channel::webrtc::PtyInputIncoming) {
-        // Resolve session_uuid from agent_index for Lua focus tracking.
-        // Browser protocol still uses agent_index; will migrate to session_uuid separately.
-        let session_uuid = self.handle_cache.uuid_at_index(input.agent_index);
-        if let Some(ref uuid) = session_uuid {
-            if input.data == b"\x1b[I" {
-                self.lua.set_pty_focused(uuid, &input.browser_identity, true);
-            } else if input.data == b"\x1b[O" {
-                self.lua.set_pty_focused(uuid, &input.browser_identity, false);
-            }
-            self.lua.notify_pty_input(uuid);
+        if input.data == b"\x1b[I" {
+            self.lua.set_pty_focused(&input.session_uuid, &input.browser_identity, true);
+        } else if input.data == b"\x1b[O" {
+            self.lua.set_pty_focused(&input.session_uuid, &input.browser_identity, false);
         }
-        if let Some(agent_handle) = self.handle_cache.get_agent(input.agent_index) {
-            if let Err(e) = agent_handle.pty().write_input_direct(&input.data) {
+        self.lua.notify_pty_input(&input.session_uuid);
+
+        if let Some(session_handle) = self.handle_cache.get_session(&input.session_uuid) {
+            if let Err(e) = session_handle.pty().write_input_direct(&input.data) {
                 log::error!("[PTY-INPUT] Write failed: {e}");
             }
         }
@@ -950,15 +928,15 @@ impl Hub {
         }
 
         log::info!(
-            "[FILE-INPUT] Wrote {} bytes to {} (agent={}, pty={})",
+            "[FILE-INPUT] Wrote {} bytes to {} (session={})",
             file.data.len(),
             path.display(),
-            file.agent_index,
-            file.pty_index,
+            file.session_uuid,
         );
 
         // Track for cleanup + inject path into PTY
-        if let Some(agent_handle) = self.handle_cache.get_agent(file.agent_index) {
+        if let Some(session_handle) = self.handle_cache.get_session(&file.session_uuid) {
+            let agent_handle = session_handle;
             self.paste_files
                 .entry(agent_handle.agent_key().to_string())
                 .or_default()
@@ -1543,7 +1521,7 @@ impl Hub {
         }
 
         // Abort any PTY forwarders for this browser.
-        // Forwarder keys are "{peer_id}:{agent_index}:{pty_index}" where peer_id = browser_identity
+        // Forwarder keys are "{peer_id}:{session_uuid}" where peer_id = browser_identity
         self.pty_forwarders.retain(|key, task| {
             if key.starts_with(browser_identity) {
                 task.abort();
@@ -2576,7 +2554,6 @@ impl Hub {
         // Clone the frame sender from the connection — we only need to send encoded frames.
         let frame_tx = conn.frame_sender();
         let session_uuid = req.session_uuid.clone();
-        let agent_index = self.handle_cache.index_of(&req.session_uuid).unwrap_or(0) as u16;
         let active_flag = req.active_flag;
         let client_id = req.client_id.clone();
         let hub_event_tx = self.hub_event_tx.clone();
@@ -2593,8 +2570,7 @@ impl Hub {
             // Send scrollback snapshot first
             if !snapshot.is_empty() {
                 let frame = Frame::Scrollback {
-                    agent_index,
-                    pty_index: 0,
+                    session_uuid: session_uuid.clone(),
                     kitty_enabled,
                     data: snapshot,
                 };
@@ -2630,8 +2606,7 @@ impl Hub {
                 match pty_rx.recv().await {
                     Ok(PtyEvent::Output(data)) => {
                         let frame = Frame::PtyOutput {
-                            agent_index,
-                            pty_index: 0,
+                            session_uuid: session_uuid.clone(),
                             data,
                         };
                         match frame_tx.try_send(frame.encode()) {
@@ -2658,8 +2633,7 @@ impl Hub {
                             exit_code, client_id, session_uuid
                         );
                         let frame = Frame::ProcessExited {
-                            agent_index,
-                            pty_index: 0,
+                            session_uuid: session_uuid.clone(),
                             exit_code,
                         };
                         let _ = frame_tx.try_send(frame.encode());
@@ -2727,10 +2701,8 @@ impl Hub {
         let Some(ref mut rx) = self.pty_input_rx else { return; };
         let inputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for input in inputs {
-            // PtyInputIncoming still uses agent_index (Phase 8 scope).
-            // Bridge via index-based lookup to get the session handle.
-            if let Some(agent_handle) = self.handle_cache.get_session_by_index(input.agent_index) {
-                if let Err(e) = agent_handle.pty().write_input_direct(&input.data) {
+            if let Some(session_handle) = self.handle_cache.get_session(&input.session_uuid) {
+                if let Err(e) = session_handle.pty().write_input_direct(&input.data) {
                     log::error!("[PTY-INPUT] Write failed: {e}");
                 }
             }
