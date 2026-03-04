@@ -17,7 +17,7 @@
 -- Supported operations:
 --   set_mode         { op, mode }                   - Update Rust's mode shadow
 --   send_msg         { op, data }                   - Send JSON message to Hub via Lua protocol
---   focus_terminal   { op, agent_id, agent_index }   (pty_index always 0)
+--   focus_terminal   { op, agent_id, agent_index }   (agent_index = display_index for Rust TUI)
 --   quit             { op }                         - Request application quit
 --
 -- Context fields (Rust-owned):
@@ -107,10 +107,10 @@ local function focus_agent_ops(agent_id, context)
   end
   if not agent then return {} end
 
-  _tui_state.selected_agent_index = idx
+  _tui_state.selected_session_uuid = agent.session_uuid
 
   local ops = {
-    { op = "focus_terminal", agent_id = agent_id, pty_index = 0, agent_index = idx },
+    { op = "focus_terminal", agent_id = agent_id, agent_index = idx },
     set_mode_ops("insert"),
   }
   if agent.notification then
@@ -381,7 +381,13 @@ function M.on_action(action, context)
     -- Fallback: legacy flat agent navigation (before workspace data arrives)
     local agents = _tui_state.agents
     if #agents == 0 then return nil end
-    local current_idx = _tui_state.selected_agent_index
+    local current_idx = nil
+    local uuid = _tui_state.selected_session_uuid
+    if uuid then
+      for i, a in ipairs(agents) do
+        if a.session_uuid == uuid then current_idx = i - 1; break end
+      end
+    end
     local next_idx
     if current_idx then
       next_idx = (current_idx + 1) % #agents
@@ -390,9 +396,9 @@ function M.on_action(action, context)
     end
     local next_agent = agents[next_idx + 1]
     if not next_agent then return nil end
-    _tui_state.selected_agent_index = next_idx
+    _tui_state.selected_session_uuid = next_agent.session_uuid
     local ops = {
-      { op = "focus_terminal", agent_id = next_agent.id, pty_index = 0, agent_index = next_idx },
+      { op = "focus_terminal", agent_id = next_agent.id, agent_index = next_idx },
       set_mode_ops("insert"),
     }
     if next_agent.notification then
@@ -433,7 +439,13 @@ function M.on_action(action, context)
     -- Fallback: legacy flat agent navigation
     local agents = _tui_state.agents
     if #agents == 0 then return nil end
-    local current_idx = _tui_state.selected_agent_index
+    local current_idx = nil
+    local uuid = _tui_state.selected_session_uuid
+    if uuid then
+      for i, a in ipairs(agents) do
+        if a.session_uuid == uuid then current_idx = i - 1; break end
+      end
+    end
     local prev_idx
     if current_idx then
       prev_idx = (current_idx - 1 + #agents) % #agents
@@ -442,9 +454,9 @@ function M.on_action(action, context)
     end
     local prev_agent = agents[prev_idx + 1]
     if not prev_agent then return nil end
-    _tui_state.selected_agent_index = prev_idx
+    _tui_state.selected_session_uuid = prev_agent.session_uuid
     local ops = {
-      { op = "focus_terminal", agent_id = prev_agent.id, pty_index = 0, agent_index = prev_idx },
+      { op = "focus_terminal", agent_id = prev_agent.id, agent_index = prev_idx },
       set_mode_ops("insert"),
     }
     if prev_agent.notification then

@@ -83,16 +83,23 @@ To replace the layout entirely, just redefine render:
               end
               return out
             end)(),
-            selected = _tui_state and _tui_state.selected_agent_index,
+            selected = _tui_state and _tui_state.list_cursor_pos,
           },
         },
         {
           type = "terminal",
           block = { title = " Terminal ", borders = "all" },
-          props = {
-            agent_index = _tui_state and _tui_state.selected_agent_index,
-            pty_index   = 0,  -- always 0 in single-PTY model
-          },
+          props = (function()
+            -- Resolve display_index from selected session_uuid
+            local uuid = _tui_state and _tui_state.selected_session_uuid
+            if not uuid then return { agent_index = 0, pty_index = 0 } end
+            for _, a in ipairs(_tui_state.agents or {}) do
+              if a.session_uuid == uuid then
+                return { agent_index = a.display_index or 0, pty_index = 0 }
+              end
+            end
+            return { agent_index = 0, pty_index = 0 }
+          end)(),
         },
       },
     }
@@ -102,14 +109,16 @@ To replace the layout entirely, just redefine render:
 
 Read agent and UI state from the _tui_state global inside render():
 
-  _tui_state.agents                  -- array of agent info tables:
+  _tui_state.agents                    -- array of agent info tables:
     agent.id, agent.session_uuid, agent.session_type, agent.display_name,
-    agent.branch_name, agent.profile_name, agent.notification, agent.in_worktree
-  _tui_state.selected_agent_index    -- 0-based int, or nil
-  _tui_state.available_worktrees     -- array of { branch, path }
-  _tui_state.mode                    -- current mode string (see modes below)
-  _tui_state.input_buffer            -- current text input
-  _tui_state.list_selected           -- 0-based selected list index
+    agent.display_index, agent.branch_name, agent.profile_name, agent.notification,
+    agent.in_worktree
+  _tui_state.selected_session_uuid     -- session UUID string, or nil
+  _tui_state.list_cursor_pos           -- 0-based cursor position in the agent list
+  _tui_state.available_worktrees       -- array of { branch, path }
+  _tui_state.mode                      -- current mode string (see modes below)
+  _tui_state.input_buffer              -- current text input
+  _tui_state.list_selected             -- 0-based selected list index
 
 ## Render State (the `state` argument)
 
@@ -127,7 +136,7 @@ Read agent and UI state from the _tui_state global inside render():
   { type = "list",      block = {...}, props = { items = {...}, selected = N } }
   { type = "paragraph", block = {...}, props = { lines = {...}, alignment = "center" } }
   { type = "input",     block = {...}, props = { lines = {...}, placeholder = "..." } }
-  { type = "terminal",  block = {...}, props = { agent_index = N, pty_index = 0 } }
+  { type = "terminal",  block = {...}, props = { agent_index = N, pty_index = 0 } }  -- agent_index = display_index from agent info
   { type = "empty",     block = {...} }
 
   Constraints: "30%" | "30" (fixed cols) | "min:10" | "max:80"

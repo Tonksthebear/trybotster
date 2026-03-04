@@ -294,7 +294,7 @@ function _clear_session_notification(session_uuid)
     return any_remaining
 end
 
--- Backward compat alias for the old global name
+-- Legacy alias — Rust callbacks may still use agent_index
 _clear_agent_notification = function(agent_index)
     local _, session_uuid = resolve_agent_from_index(agent_index)
     if session_uuid then

@@ -220,8 +220,6 @@ local function process_context_file(context_path, in_worktree, ghost_infos, seen
         status         = "ghost",
         orphaned       = any_orphaned,
         notification   = false,
-        has_server_pty = false,
-        server_running = false,
         port           = nil,
         created_at     = nil,
     }
@@ -373,8 +371,6 @@ local function process_session_manifest(record, ghost_infos, seen_keys)
         in_worktree    = sess.worktree_path ~= nil,
         status         = "ghost",
         notification   = false,
-        has_server_pty = false,
-        server_running = false,
         port           = nil,
         created_at     = nil,
     }

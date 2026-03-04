@@ -160,11 +160,15 @@ export class HubConnection extends HubRoute {
   }
 
   /**
-   * Clear the notification flag on an agent by index.
-   * @param {number} agentIndex - 0-based agent index
+   * Clear the notification flag on a session.
+   * Accepts session_uuid (preferred) or agent_index (legacy Rails views).
+   * @param {string|number} sessionUuidOrAgentIndex - Session UUID string or agent index number
    */
-  clearNotification(agentIndex) {
-    return this.send("clear_notification", { agent_index: agentIndex });
+  clearNotification(sessionUuidOrAgentIndex) {
+    if (typeof sessionUuidOrAgentIndex === "string") {
+      return this.send("clear_notification", { session_uuid: sessionUuidOrAgentIndex });
+    }
+    return this.send("clear_notification", { agent_index: sessionUuidOrAgentIndex });
   }
 
   /**

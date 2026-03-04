@@ -11,17 +11,13 @@
  *   - stateChange - { state, prevState, error }
  *   - error - { reason, message }
  *
- * Flow:
- *   1. Connection base class establishes WebRTC + Olm session
- *   2. StreamMultiplexer sends OPEN frame to CLI with target port
- *   3. CLI opens TCP connection to localhost:port, sends OPENED
- *   4. Browser serializes HTTP request as raw bytes, sends via DATA frames
- *   5. CLI forwards TCP bytes, browser parses HTTP response
+ * Single-PTY model: session UUID is the primary key. agentIndex accepted
+ * for backward compat with Rails views.
  *
  * Usage:
- *   const key = PreviewConnection.key(hubId, agentIndex, ptyIndex);
+ *   const key = PreviewConnection.key(hubId, sessionUuid);
  *   const preview = await HubConnectionManager.acquire(PreviewConnection, key, {
- *     hubId, agentIndex, ptyIndex, port: 3000
+ *     hubId, sessionUuid, port: 3000
  *   });
  *   const response = await preview.fetch({ method: "GET", path: "/" });
  */
@@ -37,6 +33,8 @@ export class PreviewConnection extends HubRoute {
 
   constructor(key, options, manager) {
     super(key, options, manager)
+    this.sessionUuid = options.sessionUuid
+    // Backward compat: agentIndex still accepted from Rails views
     this.agentIndex = options.agentIndex
     this.ptyIndex = options.ptyIndex ?? 1
     this.port = options.port ?? 3000
@@ -50,19 +48,25 @@ export class PreviewConnection extends HubRoute {
 
   /**
    * Compute semantic subscription ID.
-   * Format: preview_{agentIndex}_{ptyIndex}
+   * Prefers session_uuid; falls back to agentIndex for backward compat.
    */
   computeSubscriptionId() {
+    if (this.sessionUuid) return `preview_${this.sessionUuid}`
     return `preview_${this.agentIndex}_${this.ptyIndex}`
   }
 
   channelParams() {
-    return {
+    const params = {
       hub_id: this.getHubId(),
-      agent_index: this.agentIndex,
-      pty_index: this.ptyIndex,
       browser_identity: this.browserIdentity,
     }
+    if (this.sessionUuid) {
+      params.session_uuid = this.sessionUuid
+    } else {
+      params.agent_index = this.agentIndex
+      params.pty_index = this.ptyIndex
+    }
+    return params
   }
 
   handleMessage(message) {
@@ -171,6 +175,10 @@ export class PreviewConnection extends HubRoute {
 
   // ========== Getters ==========
 
+  getSessionUuid() {
+    return this.sessionUuid
+  }
+
   getAgentIndex() {
     return this.agentIndex
   }
@@ -225,8 +233,14 @@ export class PreviewConnection extends HubRoute {
 
   // ========== Static helper ==========
 
-  static key(hubId, agentIndex, ptyIndex = 1) {
-    return `preview:${hubId}:${agentIndex}:${ptyIndex}`
+  /**
+   * Build connection key. Prefers sessionUuid; falls back to agentIndex.
+   */
+  static key(hubId, sessionUuidOrAgentIndex, ptyIndex) {
+    if (typeof sessionUuidOrAgentIndex === "string") {
+      return `preview:${hubId}:${sessionUuidOrAgentIndex}`
+    }
+    return `preview:${hubId}:${sessionUuidOrAgentIndex}:${ptyIndex ?? 1}`
   }
 
   // ========== Private ==========

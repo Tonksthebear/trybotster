@@ -561,16 +561,7 @@ end
 function Agent:info()
     local key = self:agent_key()
 
-    -- Check if session's port is running
     local port = self._port
-    local has_server_pty = (self.session_name ~= "agent" and port ~= nil)
-    local server_running = false
-    if has_server_pty and self.session then
-        local ok2, alive = pcall(function() return self.session:is_alive() end)
-        if ok2 then
-            server_running = alive
-        end
-    end
 
     -- Build display name: prefer OSC title, fall back to branch_name + suffix
     local display_name
@@ -607,9 +598,6 @@ function Agent:info()
         in_worktree = self._is_worktree or false,
         status = self.status,
         notification = self.notification or false,
-        -- Backward compat for browser
-        has_server_pty = has_server_pty,
-        server_running = server_running,
         port = port,
         created_at = self.created_at,
     }
