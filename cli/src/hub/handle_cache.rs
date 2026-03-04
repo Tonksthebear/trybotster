@@ -206,34 +206,6 @@ impl HandleCache {
         removed
     }
 
-    // =========================================================================
-    // Legacy compatibility methods (delegate to new UUID-based methods)
-    // =========================================================================
-
-    /// Get agent handle by display index.
-    ///
-    /// Legacy compatibility — delegates to `get_session_by_index()`.
-    #[must_use]
-    pub fn get_agent(&self, index: usize) -> Option<SessionHandle> {
-        self.get_session_by_index(index)
-    }
-
-    /// Get an agent handle by its key string.
-    ///
-    /// Legacy compatibility — delegates to `get_session_by_key()`.
-    #[must_use]
-    pub fn get_agent_by_key(&self, key: &str) -> Option<SessionHandle> {
-        self.get_session_by_key(key)
-    }
-
-    /// Get all agent handles.
-    ///
-    /// Legacy compatibility — delegates to `get_all_sessions()`.
-    #[must_use]
-    pub fn get_all_agents(&self) -> Vec<SessionHandle> {
-        self.get_all_sessions()
-    }
-
     // ============================================================
     // Worktree Cache
     // ============================================================

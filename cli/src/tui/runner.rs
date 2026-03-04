@@ -3213,7 +3213,7 @@ mod tests {
 
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil, active_pty_index = 0 }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
         lua.preload_module(

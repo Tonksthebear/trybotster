@@ -67,10 +67,6 @@ struct ChannelIdentifier {
     channel: String,
     hub_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    agent_index: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pty_index: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     browser_identity: Option<String>,
     /// CLI subscription flag for per-browser HubChannel streams.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -489,10 +485,9 @@ impl ActionCableChannel {
             match Self::connect_websocket(&server_url, &api_key, &config).await {
                 Ok((mut write, mut read, identifier_json)) => {
                     log::info!(
-                        "Connected to {} for hub {} (agent: {:?})",
+                        "Connected to {} for hub {}",
                         config.channel_name,
                         config.hub_id,
-                        config.agent_index
                     );
 
                     state.set(ConnectionState::Connected).await;
@@ -605,8 +600,6 @@ impl ActionCableChannel {
         let identifier = ChannelIdentifier {
             channel: config.channel_name.clone(),
             hub_id: config.hub_id.clone(),
-            agent_index: config.agent_index,
-            pty_index: config.pty_index,
             browser_identity: config.browser_identity.clone(),
             cli_subscription: config.cli_subscription,
         };

@@ -515,13 +515,6 @@ enum Commands {
         #[arg(long)]
         socket: Option<String>,
     },
-    /// Run legacy MCP server bridge (hand-rolled JSON-RPC, rollback path)
-    #[command(hide = true)]
-    McpServeLegacy {
-        /// Path to hub Unix socket (auto-discovers from cwd if omitted)
-        #[arg(long)]
-        socket: Option<String>,
-    },
     /// Get agent context values (identity, worktree metadata, plugin data).
     /// Omit key to dump all context as JSON.
     Context {
@@ -613,54 +606,39 @@ fn resolve_hub_id_for_cwd() -> Option<String> {
 
 /// Resolve a socket path for `mcp-serve`.
 ///
-/// Resolution order:
-/// 1. Explicit `--socket` argument (must exist).
-/// 2. Injected `BOTSTER_HUB_SOCKET` / `botster context hub_socket`.
-/// 3. Injected manifest path (`BOTSTER_HUB_MANIFEST_PATH` / context) lookup.
-///
-/// Intentionally does not perform cwd-based hub discovery; spawned agent sessions
-/// must resolve from injected parent-hub context.
+/// Strict resolution: requires `BOTSTER_HUB_MANIFEST_PATH`.
+/// No cwd discovery and no multi-source fallback.
 fn resolve_mcp_serve_socket(explicit_socket: Option<String>) -> Result<String> {
     use botster::hub::daemon::HubManifest;
 
     let socket_exists = |path: &str| std::path::Path::new(path).exists();
 
-    if let Some(path) = explicit_socket {
-        if socket_exists(&path) {
-            return Ok(path);
-        }
-        anyhow::bail!("Provided --socket does not exist: {path}");
-    }
-
-    if let Ok(path) = std::env::var("BOTSTER_HUB_SOCKET") {
-        if !path.is_empty() && socket_exists(&path) {
-            return Ok(path);
-        }
-    }
-
-    let ctx = commands::context::build();
-    if let Some(path) = ctx.get("hub_socket") {
-        if !path.is_empty() && socket_exists(path) {
-            return Ok(path.clone());
-        }
+    if explicit_socket.is_some() {
+        anyhow::bail!(
+            "mcp-serve no longer supports --socket. BOTSTER_HUB_MANIFEST_PATH is required."
+        );
     }
 
     let manifest_path = std::env::var("BOTSTER_HUB_MANIFEST_PATH")
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| ctx.get("hub_manifest_path").cloned());
-    if let Some(path) = manifest_path {
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read hub manifest at {path}"))?;
-        let manifest: HubManifest = serde_json::from_str(&content)
-            .with_context(|| format!("Failed to parse hub manifest JSON at {path}"))?;
-        if socket_exists(&manifest.socket_path) {
-            return Ok(manifest.socket_path);
-        }
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "BOTSTER_HUB_MANIFEST_PATH is required for mcp-serve but was missing or empty."
+            )
+        })?;
+
+    let content = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("Failed to read hub manifest at {manifest_path}"))?;
+    let manifest: HubManifest = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse hub manifest JSON at {manifest_path}"))?;
+    if socket_exists(&manifest.socket_path) {
+        return Ok(manifest.socket_path);
     }
 
     anyhow::bail!(
-        "Unable to resolve hub socket for mcp-serve. Expected --socket, BOTSTER_HUB_SOCKET, or BOTSTER_HUB_MANIFEST_PATH from the parent hub."
+        "BOTSTER_HUB_MANIFEST_PATH resolved, but manifest socket does not exist: {}",
+        manifest.socket_path
     );
 }
 
@@ -925,7 +903,7 @@ fn main() -> Result<()> {
     // All other commands write to a timestamped file so concurrent processes
     // (hub, attach, tui) never overwrite each other's logs.
     let cli = Cli::parse();
-    let is_mcp_serve = matches!(cli.command, Commands::McpServe { .. } | Commands::McpServeLegacy { .. } | Commands::Context { .. });
+    let is_mcp_serve = matches!(cli.command, Commands::McpServe { .. } | Commands::Context { .. });
 
     if is_mcp_serve {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
@@ -1086,10 +1064,6 @@ fn main() -> Result<()> {
         Commands::McpServe { socket } => {
             let socket_path = resolve_mcp_serve_socket(socket)?;
             botster::mcp_gateway::run(&socket_path)?;
-        }
-        Commands::McpServeLegacy { socket } => {
-            let socket_path = resolve_mcp_serve_socket(socket)?;
-            botster::mcp_serve::run(&socket_path)?;
         }
         Commands::Context { key } => {
             commands::context::run(key.as_deref())?;

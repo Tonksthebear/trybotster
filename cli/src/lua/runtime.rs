@@ -3334,16 +3334,8 @@ mod tests {
                         end
                     }}
                 end
-                -- Backward compat alias for Lua handlers not yet updated (Phase 5-6 scope)
-                hub.create_ghost_pty = function(_agent_key, _pty_index, _session_id, _rows, _cols)
-                    return hub.create_ghost_session(_agent_key, _session_id, _rows, _cols)
-                end
 
                 hub.register_session = function(_session_uuid, _handle, _metadata)
-                    return 0
-                end
-                -- Backward compat alias for Lua handlers not yet updated (Phase 5-6 scope)
-                hub.register_agent = function(_agent_key, _handles)
                     return 0
                 end
             "#,

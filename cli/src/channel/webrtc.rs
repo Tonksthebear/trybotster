@@ -127,10 +127,6 @@ pub struct WebRtcConfig {
     pub hub_id: String,
     /// Browser identity we're connecting to.
     pub browser_identity: String,
-    /// Agent index (for terminal/preview channels).
-    pub agent_index: Option<usize>,
-    /// PTY index (0=CLI, 1=Server).
-    pub pty_index: Option<usize>,
 }
 
 /// Builder for `WebRtcChannel`.

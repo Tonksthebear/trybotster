@@ -52,8 +52,6 @@ pub mod state;
 
 pub use actions::HubAction;
 pub use agent_handle::{SessionHandle, SessionType};
-// Legacy alias for downstream code still referencing AgentPtys.
-pub use agent_handle::AgentPtys;
 pub use state::{HubState, SharedHubState};
 
 use std::sync::{Arc, Mutex};

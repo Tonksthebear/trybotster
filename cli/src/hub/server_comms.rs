@@ -3320,8 +3320,6 @@ impl Hub {
             let config = ChannelConfig {
                 channel_name: "WebRtcChannel".to_string(),
                 hub_id: hub_id.clone(),
-                agent_index: None,
-                pty_index: None,
                 browser_identity: Some(browser_identity.to_string()),
                 encrypt: true,
                 compression_threshold: Some(4096),
@@ -3932,26 +3930,13 @@ impl Hub {
             format!("{base_url}{icon_path}")
         };
 
-        let agent_index = lua
-            .and_then(|o| o.get("agentIndex"))
-            .and_then(|v| v.as_i64());
-        let pty_index = lua
-            .and_then(|o| o.get("ptyIndex"))
-            .and_then(|v| v.as_i64());
-
-        let mut data = serde_json::json!({
+        let data = serde_json::json!({
             "id": id,
             "kind": kind,
             "hubId": hub_id,
             "url": relative_url,
             "createdAt": chrono::Utc::now().to_rfc3339(),
         });
-        if let Some(ai) = agent_index {
-            data["agentIndex"] = serde_json::json!(ai);
-        }
-        if let Some(pi) = pty_index {
-            data["ptyIndex"] = serde_json::json!(pi);
-        }
 
         let mut notification = serde_json::json!({
             "title": title,
@@ -3975,7 +3960,6 @@ impl Hub {
         // This keeps Rust generic — Lua uses Declarative Web Push field names directly.
         const CONSUMED_KEYS: &[&str] = &[
             "kind", "title", "body", "url", "icon", "tag", "id",
-            "agentIndex", "ptyIndex",
             "web_push", "notification", // prevent overwriting structured fields
         ];
         if let Some(obj) = lua {

@@ -157,10 +157,6 @@ impl SessionHandle {
     }
 }
 
-// Keep the old name as a type alias during transition so downstream code
-// that references `AgentPtys` still compiles while we migrate call sites.
-pub type AgentPtys = SessionHandle;
-
 /// Handle for interacting with a PTY session.
 ///
 /// Provides both event subscription and direct PTY interaction:

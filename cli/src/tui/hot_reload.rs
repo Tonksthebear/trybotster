@@ -290,7 +290,6 @@ impl LuaBootstrap {
                     list_selected = 0,\
                     selected_agent = nil,\
                     selected_agent_index = nil,\
-                    active_pty_index = 0,\
                     connection_code = nil,\
                 }",
                 "_tui_state_init",

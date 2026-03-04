@@ -25,8 +25,6 @@
 //! channel.connect(ChannelConfig {
 //!     channel_name: "TerminalRelayChannel".into(), // Virtual channel for routing
 //!     hub_id: "hub-123".into(),
-//!     agent_index: None,
-//!     pty_index: Some(0), // 0=CLI, 1=Server
 //!     encrypt: true,
 //!     compression_threshold: Some(4096),
 //! }).await?;
@@ -63,10 +61,6 @@ pub struct ChannelConfig {
     pub channel_name: String,
     /// Hub identifier for routing.
     pub hub_id: String,
-    /// Agent index within the hub (for agent-scoped channels like Preview).
-    pub agent_index: Option<usize>,
-    /// PTY index within the agent (0=CLI, 1=Server).
-    pub pty_index: Option<usize>,
     /// Browser identity for browser-specific streams (HubChannel only).
     /// When set, subscribes to `hub:{hub_id}:browser:{identity}` instead of CLI stream.
     pub browser_identity: Option<String>,
