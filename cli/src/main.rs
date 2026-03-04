@@ -515,6 +515,13 @@ enum Commands {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Run legacy MCP server bridge (hand-rolled JSON-RPC, rollback path)
+    #[command(hide = true)]
+    McpServeLegacy {
+        /// Path to hub Unix socket (auto-discovers from cwd if omitted)
+        #[arg(long)]
+        socket: Option<String>,
+    },
     /// Get agent context values (identity, worktree metadata, plugin data).
     /// Omit key to dump all context as JSON.
     Context {
@@ -918,7 +925,7 @@ fn main() -> Result<()> {
     // All other commands write to a timestamped file so concurrent processes
     // (hub, attach, tui) never overwrite each other's logs.
     let cli = Cli::parse();
-    let is_mcp_serve = matches!(cli.command, Commands::McpServe { .. } | Commands::Context { .. });
+    let is_mcp_serve = matches!(cli.command, Commands::McpServe { .. } | Commands::McpServeLegacy { .. } | Commands::Context { .. });
 
     if is_mcp_serve {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
@@ -1077,6 +1084,10 @@ fn main() -> Result<()> {
             run_attach(hub_arg)?;
         }
         Commands::McpServe { socket } => {
+            let socket_path = resolve_mcp_serve_socket(socket)?;
+            botster::mcp_gateway::run(&socket_path)?;
+        }
+        Commands::McpServeLegacy { socket } => {
             let socket_path = resolve_mcp_serve_socket(socket)?;
             botster::mcp_serve::run(&socket_path)?;
         }
