@@ -36,8 +36,9 @@ const RECONNECT_RETRIES: u32 = 10;
 const RECONNECT_RETRY_MS: u64 = 1_000;
 
 /// Timeout for individual hub requests (tools/list, tools/call, etc.).
-/// Tool calls can take a very long time (agents running commands).
-const HUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Tool calls can run indefinitely (agents executing commands), so this is
+/// intentionally very generous. The legacy bridge had no timeout at all.
+const HUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(86_400);
 
 // ============================================================================
 // Hub Bridge
@@ -215,8 +216,8 @@ async fn run_hub_session(
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if let Ok(frames) = decoder.feed(&buf[..n]) {
+                Ok(n) => match decoder.feed(&buf[..n]) {
+                    Ok(frames) => {
                         for frame in frames {
                             if let Frame::Json(v) = frame {
                                 if hub_msg_tx.send(v).is_err() {
@@ -225,7 +226,11 @@ async fn run_hub_session(
                             }
                         }
                     }
-                }
+                    Err(e) => {
+                        log::error!("[mcp-gateway] Frame decode error: {e}");
+                        break;
+                    }
+                },
             }
         }
     });
@@ -356,9 +361,16 @@ pub struct McpGateway {
 
 impl McpGateway {
     /// Send a request to the hub and wait for the response.
-    async fn hub_request(&self, key: String, frame: Frame) -> Result<Value, ErrorData> {
+    async fn hub_request(
+        &self,
+        method: &str,
+        key: String,
+        frame: Frame,
+    ) -> Result<Value, ErrorData> {
         let start = Instant::now();
         let (tx, rx) = oneshot::channel();
+
+        log::info!("[mcp-gateway] method={method} call_id={key} sending");
 
         let req = BridgeRequest {
             key: key.clone(),
@@ -374,7 +386,7 @@ impl McpGateway {
             .await
             .map_err(|_| {
                 log::error!(
-                    "[mcp-gateway] call_id={key} timeout after {}ms",
+                    "[mcp-gateway] method={method} call_id={key} timeout after {}ms",
                     start.elapsed().as_millis()
                 );
                 ErrorData::internal_error(
@@ -388,7 +400,7 @@ impl McpGateway {
             .map_err(|e| ErrorData::internal_error(e, None))?;
 
         log::info!(
-            "[mcp-gateway] call_id={key} duration_ms={}",
+            "[mcp-gateway] method={method} call_id={key} duration_ms={}",
             start.elapsed().as_millis()
         );
 
@@ -452,42 +464,19 @@ fn hub_prompt_to_mcp(p: &Value) -> Option<Prompt> {
 
 /// Convert hub content array to rmcp `Content` items.
 ///
-/// Hub sends: `[{ type: "text", text: "..." }]`
+/// Hub content uses the same MCP wire shape (`{ type: "text", text: "..." }`,
+/// `{ type: "image", data: "...", mimeType: "..." }`, etc.), so we deserialize
+/// directly via serde to preserve all content types — not just text.
 fn hub_content_to_mcp(content: &Value) -> Vec<Content> {
-    content
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|c| {
-                    let text = c.get("text").and_then(|t| t.as_str())?;
-                    Some(Content::text(text.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    serde_json::from_value::<Vec<Content>>(content.clone()).unwrap_or_default()
 }
 
 /// Convert hub messages array to rmcp `PromptMessage` items.
 ///
-/// Hub sends: `[{ role: "user", content: { type: "text", text: "..." } }]`
+/// Hub messages use the same MCP wire shape, so we deserialize directly
+/// to preserve all content types (text, image, resource, etc.).
 fn hub_messages_to_mcp(messages: &Value) -> Vec<PromptMessage> {
-    messages
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| {
-                    let role_str = m.get("role").and_then(|r| r.as_str())?;
-                    let role = match role_str {
-                        "assistant" => PromptMessageRole::Assistant,
-                        _ => PromptMessageRole::User,
-                    };
-                    let content = m.get("content")?;
-                    let text = content.get("text").and_then(|t| t.as_str())?;
-                    Some(PromptMessage::new_text(role, text.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    serde_json::from_value::<Vec<PromptMessage>>(messages.clone()).unwrap_or_default()
 }
 
 impl ServerHandler for McpGateway {
@@ -545,6 +534,7 @@ impl ServerHandler for McpGateway {
         async move {
             let msg = self
                 .hub_request(
+                    "tools/list",
                     "tools_list".to_string(),
                     Frame::Json(json!({
                         "subscriptionId": SUB_ID,
@@ -576,10 +566,9 @@ impl ServerHandler for McpGateway {
                 .as_ref()
                 .map_or_else(|| json!({}), |m| Value::Object(m.clone()));
 
-            log::info!("[mcp-gateway] method=tools/call tool={tool_name} call_id={call_id}");
-
             let msg = self
                 .hub_request(
+                    &format!("tools/call[{tool_name}]"),
                     call_id.clone(),
                     Frame::Json(json!({
                         "subscriptionId": SUB_ID,
@@ -613,6 +602,7 @@ impl ServerHandler for McpGateway {
         async move {
             let msg = self
                 .hub_request(
+                    "prompts/list",
                     "prompts_list".to_string(),
                     Frame::Json(json!({
                         "subscriptionId": SUB_ID,
@@ -644,12 +634,9 @@ impl ServerHandler for McpGateway {
                 .as_ref()
                 .map_or_else(|| json!({}), |m| Value::Object(m.clone()));
 
-            log::info!(
-                "[mcp-gateway] method=prompts/get prompt={prompt_name} call_id={call_id}"
-            );
-
             let msg = self
                 .hub_request(
+                    &format!("prompts/get[{prompt_name}]"),
                     call_id.clone(),
                     Frame::Json(json!({
                         "subscriptionId": SUB_ID,
