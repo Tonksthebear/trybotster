@@ -17,7 +17,7 @@
 -- Supported operations:
 --   set_mode         { op, mode }                   - Update Rust's mode shadow
 --   send_msg         { op, data }                   - Send JSON message to Hub via Lua protocol
---   focus_terminal   { op, agent_id, agent_index }   (agent_index = display_index for Rust TUI)
+--   focus_terminal   { op, agent_id, session_uuid }
 --   quit             { op }                         - Request application quit
 --
 -- Context fields (Rust-owned):
@@ -72,14 +72,6 @@ local function selected_agent_not_in_worktree(context)
   return true
 end
 
---- Look up 0-based agent index from agent_id in client state.
-local function agent_index_for(agent_id)
-  for i, a in ipairs(_tui_state.agents) do
-    if a.id == agent_id then return i - 1 end
-  end
-  return nil
-end
-
 -- =============================================================================
 -- Workspace flat_list helpers (Phase 3)
 -- =============================================================================
@@ -98,9 +90,6 @@ end
 
 --- Focus an agent by id, returning ops for terminal focus + mode switch + notification clear.
 local function focus_agent_ops(agent_id, context)
-  local idx = agent_index_for(agent_id)
-  if idx == nil then return {} end
-
   local agent = nil
   for _, a in ipairs(_tui_state.agents) do
     if a.id == agent_id then agent = a; break end
@@ -110,7 +99,7 @@ local function focus_agent_ops(agent_id, context)
   _tui_state.selected_session_uuid = agent.session_uuid
 
   local ops = {
-    { op = "focus_terminal", agent_id = agent_id, agent_index = idx },
+    { op = "focus_terminal", agent_id = agent_id, session_uuid = agent.session_uuid },
     set_mode_ops("insert"),
   }
   if agent.notification then
@@ -398,7 +387,7 @@ function M.on_action(action, context)
     if not next_agent then return nil end
     _tui_state.selected_session_uuid = next_agent.session_uuid
     local ops = {
-      { op = "focus_terminal", agent_id = next_agent.id, agent_index = next_idx },
+      { op = "focus_terminal", agent_id = next_agent.id, session_uuid = next_agent.session_uuid },
       set_mode_ops("insert"),
     }
     if next_agent.notification then
@@ -456,7 +445,7 @@ function M.on_action(action, context)
     if not prev_agent then return nil end
     _tui_state.selected_session_uuid = prev_agent.session_uuid
     local ops = {
-      { op = "focus_terminal", agent_id = prev_agent.id, agent_index = prev_idx },
+      { op = "focus_terminal", agent_id = prev_agent.id, session_uuid = prev_agent.session_uuid },
       set_mode_ops("insert"),
     }
     if prev_agent.notification then

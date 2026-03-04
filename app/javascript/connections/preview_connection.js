@@ -11,8 +11,7 @@
  *   - stateChange - { state, prevState, error }
  *   - error - { reason, message }
  *
- * Single-PTY model: session UUID is the primary key. agentIndex accepted
- * for backward compat with Rails views.
+ * Single-PTY model: session UUID is the sole routing key.
  *
  * Usage:
  *   const key = PreviewConnection.key(hubId, sessionUuid);
@@ -34,9 +33,6 @@ export class PreviewConnection extends HubRoute {
   constructor(key, options, manager) {
     super(key, options, manager)
     this.sessionUuid = options.sessionUuid
-    // Backward compat: agentIndex still accepted from Rails views
-    this.agentIndex = options.agentIndex
-    this.ptyIndex = options.ptyIndex ?? 1
     this.port = options.port ?? 3000
   }
 
@@ -46,27 +42,16 @@ export class PreviewConnection extends HubRoute {
     return "preview"
   }
 
-  /**
-   * Compute semantic subscription ID.
-   * Prefers session_uuid; falls back to agentIndex for backward compat.
-   */
   computeSubscriptionId() {
-    if (this.sessionUuid) return `preview_${this.sessionUuid}`
-    return `preview_${this.agentIndex}_${this.ptyIndex}`
+    return `preview_${this.sessionUuid}`
   }
 
   channelParams() {
-    const params = {
+    return {
       hub_id: this.getHubId(),
+      session_uuid: this.sessionUuid,
       browser_identity: this.browserIdentity,
     }
-    if (this.sessionUuid) {
-      params.session_uuid = this.sessionUuid
-    } else {
-      params.agent_index = this.agentIndex
-      params.pty_index = this.ptyIndex
-    }
-    return params
   }
 
   handleMessage(message) {
@@ -179,14 +164,6 @@ export class PreviewConnection extends HubRoute {
     return this.sessionUuid
   }
 
-  getAgentIndex() {
-    return this.agentIndex
-  }
-
-  getPtyIndex() {
-    return this.ptyIndex
-  }
-
   getPort() {
     return this.port
   }
@@ -233,14 +210,8 @@ export class PreviewConnection extends HubRoute {
 
   // ========== Static helper ==========
 
-  /**
-   * Build connection key. Prefers sessionUuid; falls back to agentIndex.
-   */
-  static key(hubId, sessionUuidOrAgentIndex, ptyIndex) {
-    if (typeof sessionUuidOrAgentIndex === "string") {
-      return `preview:${hubId}:${sessionUuidOrAgentIndex}`
-    }
-    return `preview:${hubId}:${sessionUuidOrAgentIndex}:${ptyIndex ?? 1}`
+  static key(hubId, sessionUuid) {
+    return `preview:${hubId}:${sessionUuid}`
   }
 
   // ========== Private ==========

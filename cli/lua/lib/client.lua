@@ -107,13 +107,6 @@ function Client:handle_subscribe(msg)
     params = result.params or params
 
     local session_uuid = params.session_uuid
-    -- Fallback: resolve from agent_index for TUI and legacy browser clients
-    if not session_uuid and params.agent_index ~= nil then
-        local agent = Agent.get_by_display_index(params.agent_index)
-        if agent then
-            session_uuid = agent.session_uuid
-        end
-    end
     log.info(string.format("Subscribe: %s -> %s (peer=%s, session=%s, rows=%s, cols=%s)",
         sub_id:sub(1, 16), channel, self.peer_id:sub(1, 8),
         tostring(session_uuid and session_uuid:sub(1, 16) or "nil"),

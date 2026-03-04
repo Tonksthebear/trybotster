@@ -1,7 +1,7 @@
 //! Panel pool — owns terminal panels and focus state.
 //!
 //! Manages the collection of [`TerminalPanel`] instances keyed by
-//! `(agent_index, pty_index)` and tracks which panel is currently focused.
+//! `session_uuid` and tracks which panel is currently focused.
 //! Methods return [`OutMessages`] instead of sending directly, keeping
 //! channel I/O in the runner.
 
@@ -15,14 +15,12 @@ use super::terminal_panel::{PanelState, TerminalPanel};
 /// Messages to send to Hub, collected and forwarded by the runner.
 pub type OutMessages = Vec<serde_json::Value>;
 
-/// Explicitly-targeted PTY input — carries destination indices so
+/// Explicitly-targeted PTY input — carries destination session UUID so
 /// the runner can send it without relying on implicit focus state.
 #[derive(Debug)]
 pub struct PtyInput {
-    /// Agent index to route the input to.
-    pub agent_index: usize,
-    /// PTY index to route the input to.
-    pub pty_index: usize,
+    /// Session UUID to route the input to.
+    pub session_uuid: String,
     /// Raw bytes (typically synthetic focus escape sequences).
     pub data: &'static [u8],
 }
@@ -31,7 +29,7 @@ pub struct PtyInput {
 ///
 /// The runner applies these mechanically — no focus logic needed.
 /// PTY inputs carry explicit targets so ordering is safe regardless
-/// of when `PanelPool` mutated its internal indices.
+/// of when `PanelPool` mutated its internal state.
 #[derive(Debug, Default)]
 pub struct FocusEffects {
     /// PTY inputs in order: focus-out (old PTY), then focus-in (new PTY).
@@ -42,24 +40,20 @@ pub struct FocusEffects {
     pub clear_kitty: bool,
 }
 
-/// Owns terminal panels and tracks which agent/PTY is focused.
+/// Owns terminal panels and tracks which session is focused.
 ///
 /// Pure state machine — never touches channels or stdout. All external
 /// effects are returned as [`OutMessages`] for the runner to execute.
 #[derive(Debug)]
 pub struct PanelPool {
-    /// Terminal panels keyed by `(agent_index, pty_index)`.
-    pub(super) panels: HashMap<(usize, usize), TerminalPanel>,
+    /// Terminal panels keyed by `session_uuid`.
+    pub(super) panels: HashMap<String, TerminalPanel>,
     /// Terminal dimensions (rows, cols) — used as default for new panels.
     pub(super) terminal_dims: (u16, u16),
-    /// Currently selected agent session key.
+    /// Currently selected agent session key (agent_id).
     pub(super) selected_agent: Option<String>,
-    /// Active PTY index (cycles with Ctrl+]).
-    pub(super) active_pty_index: usize,
-    /// Index of agent being viewed.
-    pub(super) current_agent_index: Option<usize>,
-    /// Index of PTY being viewed (0 = CLI, 1 = server).
-    pub(super) current_pty_index: Option<usize>,
+    /// Session UUID of the currently focused PTY.
+    pub(super) current_session_uuid: Option<String>,
     /// Subscription ID of the focused PTY.
     pub(super) current_terminal_sub_id: Option<String>,
 }
@@ -71,60 +65,53 @@ impl PanelPool {
             panels: HashMap::new(),
             terminal_dims,
             selected_agent: None,
-            active_pty_index: 0,
-            current_agent_index: None,
-            current_pty_index: None,
+            current_session_uuid: None,
             current_terminal_sub_id: None,
         }
     }
 
     // === Panel Access ===
 
-    /// Get or create a panel for the given agent/PTY, falling back to current focus.
+    /// Get or create a panel for the given session UUID.
     pub fn resolve_panel(
         &mut self,
-        agent_index: Option<usize>,
-        pty_index: Option<usize>,
+        session_uuid: &str,
     ) -> &mut TerminalPanel {
-        let key = (
-            agent_index.or(self.current_agent_index).unwrap_or(0),
-            pty_index.or(self.current_pty_index).unwrap_or(0),
-        );
         let (rows, cols) = self.terminal_dims;
         self.panels
-            .entry(key)
+            .entry(session_uuid.to_string())
             .or_insert_with(|| TerminalPanel::new(rows, cols))
     }
 
     /// Immutable reference to the focused panel.
     pub fn focused_panel(&self) -> Option<&TerminalPanel> {
-        let key = (self.current_agent_index?, self.current_pty_index?);
-        self.panels.get(&key)
+        let uuid = self.current_session_uuid.as_ref()?;
+        self.panels.get(uuid)
     }
 
     /// Mutable reference to the focused panel.
     pub fn focused_panel_mut(&mut self) -> Option<&mut TerminalPanel> {
-        let key = (self.current_agent_index?, self.current_pty_index?);
-        self.panels.get_mut(&key)
+        let uuid = self.current_session_uuid.as_ref()?;
+        self.panels.get_mut(uuid)
     }
 
     /// The focused panel key, if any.
-    pub fn focused_key(&self) -> Option<(usize, usize)> {
-        Some((self.current_agent_index?, self.current_pty_index?))
+    pub fn focused_key(&self) -> Option<&str> {
+        self.current_session_uuid.as_deref()
     }
 
     /// Whether a message targets the currently focused panel.
-    pub fn is_focused(&self, agent_index: Option<usize>, pty_index: Option<usize>) -> bool {
-        agent_index == self.current_agent_index && pty_index == self.current_pty_index
+    pub fn is_focused(&self, session_uuid: &str) -> bool {
+        self.current_session_uuid.as_deref() == Some(session_uuid)
     }
 
     /// Direct access to panels map (for rendering).
-    pub fn panels(&self) -> &HashMap<(usize, usize), TerminalPanel> {
+    pub fn panels(&self) -> &HashMap<String, TerminalPanel> {
         &self.panels
     }
 
     /// Check if a panel exists for the given key.
-    pub fn contains_key(&self, key: &(usize, usize)) -> bool {
+    pub fn contains_key(&self, key: &str) -> bool {
         self.panels.contains_key(key)
     }
 
@@ -137,53 +124,49 @@ impl PanelPool {
     pub fn sync_subscriptions(
         &mut self,
         tree: &RenderNode,
-        areas: &HashMap<(usize, usize), (u16, u16)>,
+        areas: &HashMap<String, (u16, u16)>,
     ) -> OutMessages {
         let mut msgs = OutMessages::new();
 
-        let default_agent = self.current_agent_index.unwrap_or(0);
-        let default_pty = self.current_pty_index.unwrap_or(0);
+        let default_uuid = self.current_session_uuid.clone().unwrap_or_default();
 
         let desired =
-            super::render_tree::collect_terminal_bindings(tree, default_agent, default_pty);
+            super::render_tree::collect_terminal_bindings(tree, &default_uuid);
 
         // Connect panels for new bindings
-        for &(agent_idx, pty_idx) in &desired {
+        for uuid in &desired {
             let (rows, cols) = areas
-                .get(&(agent_idx, pty_idx))
+                .get(uuid)
                 .copied()
                 .unwrap_or(self.terminal_dims);
             let panel = self
                 .panels
-                .entry((agent_idx, pty_idx))
+                .entry(uuid.clone())
                 .or_insert_with(|| TerminalPanel::new(rows, cols));
 
             if panel.state() == PanelState::Idle {
-                if let Some(msg) = panel.connect(agent_idx, pty_idx) {
+                if let Some(msg) = panel.connect(uuid) {
                     msgs.push(msg);
                 }
             }
         }
 
         // Disconnect panels not in desired set (skip the focused panel)
-        let focused = (
-            self.current_agent_index.unwrap_or(usize::MAX),
-            self.current_pty_index.unwrap_or(usize::MAX),
-        );
-        let to_disconnect: Vec<(usize, usize)> = self
+        let focused = self.current_session_uuid.clone().unwrap_or_default();
+        let to_disconnect: Vec<String> = self
             .panels
             .keys()
-            .filter(|k| !desired.contains(k) && **k != focused)
-            .copied()
+            .filter(|k| !desired.contains(*k) && **k != focused)
+            .cloned()
             .collect();
 
-        for (ai, pi) in to_disconnect {
-            if let Some(panel) = self.panels.get_mut(&(ai, pi)) {
-                if let Some(msg) = panel.disconnect(ai, pi) {
+        for uuid in to_disconnect {
+            if let Some(panel) = self.panels.get_mut(&uuid) {
+                if let Some(msg) = panel.disconnect(&uuid) {
                     msgs.push(msg);
                 }
             }
-            self.panels.remove(&(ai, pi));
+            self.panels.remove(&uuid);
         }
 
         msgs
@@ -194,23 +177,20 @@ impl PanelPool {
     /// Returns resize messages for panels whose dimensions changed.
     pub fn sync_widget_dims(
         &mut self,
-        areas: &HashMap<(usize, usize), (u16, u16)>,
+        areas: &HashMap<String, (u16, u16)>,
     ) -> OutMessages {
         let mut msgs = OutMessages::new();
 
-        for (&(agent_idx, pty_idx), &(rows, cols)) in areas {
-            if let Some(panel) = self.panels.get_mut(&(agent_idx, pty_idx)) {
-                if let Some(msg) = panel.resize(rows, cols, agent_idx, pty_idx) {
+        for (uuid, &(rows, cols)) in areas {
+            if let Some(panel) = self.panels.get_mut(uuid) {
+                if let Some(msg) = panel.resize(rows, cols, uuid) {
                     msgs.push(msg);
                 }
             }
         }
 
         // Remove panels for bindings no longer rendered (except focused)
-        let focused = (
-            self.current_agent_index.unwrap_or(usize::MAX),
-            self.current_pty_index.unwrap_or(usize::MAX),
-        );
+        let focused = self.current_session_uuid.clone().unwrap_or_default();
         self.panels
             .retain(|k, _| areas.contains_key(k) || *k == focused);
 
@@ -230,19 +210,18 @@ impl PanelPool {
         let msgs: Vec<_> = self
             .panels
             .iter_mut()
-            .filter_map(|(&(ai, pi), panel)| panel.disconnect(ai, pi))
+            .filter_map(|(uuid, panel)| panel.disconnect(uuid))
             .collect();
         self.panels.clear();
         self.current_terminal_sub_id = None;
-        self.current_agent_index = None;
-        self.current_pty_index = None;
+        self.current_session_uuid = None;
         self.selected_agent = None;
         msgs
     }
 
     // === Focus ===
 
-    /// Switch focus to a specific agent and PTY.
+    /// Switch focus to a specific agent and session.
     ///
     /// Encapsulates the full focus lifecycle: synthetic focus-out on the
     /// old PTY, disconnect, state mutation, connect, and synthetic focus-in
@@ -253,97 +232,89 @@ impl PanelPool {
     pub fn focus_terminal(
         &mut self,
         agent_id: Option<&str>,
-        agent_index: Option<usize>,
-        pty_index: usize,
+        session_uuid: Option<&str>,
         terminal_focused: bool,
     ) -> FocusEffects {
         let mut effects = FocusEffects::default();
 
         // Clear selection if no agent_id
         let Some(agent_id) = agent_id else {
-            if terminal_focused && self.current_agent_index.is_some() {
-                if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
-                    log::debug!("[FOCUS] synthetic focus-out on clear, agent={ai}");
-                    effects.pty_inputs.push(PtyInput { agent_index: ai, pty_index: pi, data: b"\x1b[O" });
+            if terminal_focused && self.current_session_uuid.is_some() {
+                if let Some(uuid) = self.current_session_uuid.clone() {
+                    log::debug!("[FOCUS] synthetic focus-out on clear, session={uuid}");
+                    effects.pty_inputs.push(PtyInput { session_uuid: uuid, data: b"\x1b[O" });
                 }
             }
-            if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
-                if let Some(panel) = self.panels.get_mut(&(ai, pi)) {
-                    if let Some(msg) = panel.disconnect(ai, pi) {
+            if let Some(uuid) = self.current_session_uuid.clone() {
+                if let Some(panel) = self.panels.get_mut(&uuid) {
+                    if let Some(msg) = panel.disconnect(&uuid) {
                         effects.messages.push(msg);
                     }
                 }
             }
             self.selected_agent = None;
-            self.current_agent_index = None;
-            self.current_pty_index = None;
+            self.current_session_uuid = None;
             self.current_terminal_sub_id = None;
             effects.clear_kitty = true;
             return effects;
         };
 
-        let Some(index) = agent_index else {
-            log::warn!("focus_terminal: missing agent_index for agent {agent_id}");
+        let Some(uuid) = session_uuid else {
+            log::warn!("focus_terminal: missing session_uuid for agent {agent_id}");
             return effects;
         };
 
-        if self.current_agent_index == Some(index)
-            && self.current_pty_index == Some(pty_index)
+        if self.current_session_uuid.as_deref() == Some(uuid)
             && self.selected_agent.as_deref() == Some(agent_id)
         {
-            log::debug!("focus_terminal: already focused on agent {agent_id} pty {pty_index}");
+            log::debug!("focus_terminal: already focused on agent {agent_id} session {uuid}");
             return effects;
         }
 
-        // Synthetic focus-out BEFORE changing indices (targets old PTY)
-        if terminal_focused && self.current_agent_index.is_some() {
-            if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
-                log::debug!("[FOCUS] synthetic focus-out on switch, old_agent={ai}");
-                effects.pty_inputs.push(PtyInput { agent_index: ai, pty_index: pi, data: b"\x1b[O" });
+        // Synthetic focus-out BEFORE changing state (targets old PTY)
+        if terminal_focused && self.current_session_uuid.is_some() {
+            if let Some(old_uuid) = self.current_session_uuid.clone() {
+                log::debug!("[FOCUS] synthetic focus-out on switch, old_session={old_uuid}");
+                effects.pty_inputs.push(PtyInput { session_uuid: old_uuid, data: b"\x1b[O" });
             }
         }
 
         // Disconnect old panel
-        if let (Some(ai), Some(pi)) = (self.current_agent_index, self.current_pty_index) {
-            if let Some(panel) = self.panels.get_mut(&(ai, pi)) {
-                if let Some(msg) = panel.disconnect(ai, pi) {
+        if let Some(old_uuid) = self.current_session_uuid.clone() {
+            if let Some(panel) = self.panels.get_mut(&old_uuid) {
+                if let Some(msg) = panel.disconnect(&old_uuid) {
                     effects.messages.push(msg);
                 }
             }
         }
 
-        // Discard stale panel if agent shifted
+        // Discard stale panel if agent changed
         if self.selected_agent.as_deref() != Some(agent_id) {
-            self.panels.remove(&(index, pty_index));
+            self.panels.remove(uuid);
         }
 
         // Get or create panel, inheriting dims from outgoing panel
-        let old_key = (
-            self.current_agent_index.unwrap_or(usize::MAX),
-            self.current_pty_index.unwrap_or(usize::MAX),
-        );
-        let widget_dims = self.panels.get(&old_key)
+        let widget_dims = self.current_session_uuid.as_ref()
+            .and_then(|k| self.panels.get(k))
             .map(|p| p.dims())
             .unwrap_or(self.terminal_dims);
         let panel = self.panels
-            .entry((index, pty_index))
+            .entry(uuid.to_string())
             .or_insert_with(|| TerminalPanel::new(widget_dims.0, widget_dims.1));
 
-        if let Some(msg) = panel.connect(index, pty_index) {
+        if let Some(msg) = panel.connect(uuid) {
             effects.messages.push(msg);
         }
 
         // Update focus state
         self.selected_agent = Some(agent_id.to_string());
-        self.current_agent_index = Some(index);
-        self.current_pty_index = Some(pty_index);
-        self.active_pty_index = pty_index;
-        self.current_terminal_sub_id = Some(format!("tui:{}:{}", index, pty_index));
+        self.current_session_uuid = Some(uuid.to_string());
+        self.current_terminal_sub_id = Some(format!("tui:{uuid}"));
 
-        // Synthetic focus-in AFTER updating indices (targets new PTY)
+        // Synthetic focus-in AFTER updating state (targets new PTY)
         if terminal_focused {
-            log::debug!("[FOCUS] synthetic focus-in on switch, new_agent={index} pty={pty_index}");
-            effects.pty_inputs.push(PtyInput { agent_index: index, pty_index: pty_index, data: b"\x1b[I" });
+            log::debug!("[FOCUS] synthetic focus-in on switch, new_session={uuid}");
+            effects.pty_inputs.push(PtyInput { session_uuid: uuid.to_string(), data: b"\x1b[I" });
         } else {
             log::debug!("[FOCUS] skipping focus-in on switch (terminal not focused)");
         }
@@ -358,24 +329,14 @@ impl PanelPool {
         self.selected_agent.as_deref()
     }
 
-    /// Index of the agent being viewed.
-    pub fn current_agent_index(&self) -> Option<usize> {
-        self.current_agent_index
-    }
-
-    /// Index of the PTY being viewed.
-    pub fn current_pty_index(&self) -> Option<usize> {
-        self.current_pty_index
+    /// Session UUID of the currently focused PTY.
+    pub fn current_session_uuid(&self) -> Option<&str> {
+        self.current_session_uuid.as_deref()
     }
 
     /// Terminal dimensions (rows, cols).
     pub fn terminal_dims(&self) -> (u16, u16) {
         self.terminal_dims
-    }
-
-    /// Active PTY index (cycles with Ctrl+]).
-    pub fn active_pty_index(&self) -> usize {
-        self.active_pty_index
     }
 
     /// Subscription ID of the focused PTY.

@@ -17,10 +17,8 @@ import { HubConnectionManager, HubConnection } from "connections";
  *   data-field="name"     - Sets textContent to agent.display_name
  *   data-field="subtext"  - Sets textContent to "profile · branch"
  *   data-field="id"       - Sets textContent to agent.id
- *   data-field="index"    - Sets textContent to agent index
- *   data-href             - Interpolates {hubId} and {index} in href
+ *   data-href             - Interpolates {hubId} and {sessionUuid} in href
  *   data-agent-id         - Sets to agent.id (for actions)
- *   data-agent-index      - Sets to agent index (for actions)
  *
  * Workspace template placeholders:
  *   data-field="workspace-title"  - Sets textContent to workspace title
@@ -245,10 +243,10 @@ export default class extends Controller {
       this.emptyTarget.classList.add("hidden");
     }
 
-    // Build agent lookup by id -> flat array index (for URL routing)
+    // Build agent lookup by id
     const agentById = new Map();
-    agents.forEach((agent, index) => {
-      agentById.set(agent.id, { agent, index });
+    agents.forEach((agent) => {
+      agentById.set(agent.id, { agent });
     });
 
     // Build target DOM in a detached container
@@ -285,8 +283,8 @@ export default class extends Controller {
 
       // Agent items (hidden if workspace is collapsed)
       const collapsed = this.#collapsedWorkspaces.has(ws.id);
-      for (const { agent, index } of wsAgents) {
-        const el = this.#buildAgentItem(agent, index, hubId);
+      for (const { agent } of wsAgents) {
+        const el = this.#buildAgentItem(agent, hubId);
         if (collapsed) el.classList.add("hidden");
         el.dataset.workspaceId = ws.id;
         container.appendChild(el);
@@ -303,16 +301,16 @@ export default class extends Controller {
     }
 
     if (ungrouped.length > 0) {
-      for (const { agent, index } of ungrouped) {
-        container.appendChild(this.#buildAgentItem(agent, index, hubId));
+      for (const { agent } of ungrouped) {
+        container.appendChild(this.#buildAgentItem(agent, hubId));
       }
     }
   }
 
-  // Private: render agents in a flat list (backward compat)
+  // Private: render agents in a flat list
   #renderFlat(container, agents, hubId) {
-    agents.forEach((agent, index) => {
-      container.appendChild(this.#buildAgentItem(agent, index, hubId));
+    agents.forEach((agent) => {
+      container.appendChild(this.#buildAgentItem(agent, hubId));
     });
   }
 
@@ -363,7 +361,7 @@ export default class extends Controller {
   }
 
   // Private: build a single agent item element
-  #buildAgentItem(agent, index, hubId) {
+  #buildAgentItem(agent, hubId) {
     const clone = this.templateTarget.content.cloneNode(true);
     const root = clone.firstElementChild;
 
@@ -371,7 +369,7 @@ export default class extends Controller {
     root.id = `agent-${agent.id}`;
 
     // Set data attributes
-    this.#setDataAttributes(root, agent, index);
+    this.#setDataAttributes(root, agent);
 
     // Fill fields
     root.querySelectorAll("[data-field]").forEach((el) => {
@@ -385,18 +383,17 @@ export default class extends Controller {
         el.textContent = parts.join(" · ");
       } else if (field === "id") {
         el.textContent = agent.id;
-      } else if (field === "index") {
-        el.textContent = index + 1;
       } else if (agent[field] !== undefined) {
         el.textContent = agent[field];
       }
     });
 
-    // Interpolate hrefs
+    // Interpolate hrefs — use session_uuid for routing
+    const sessionUuid = agent.session_uuid;
     root.querySelectorAll("[data-href]").forEach((el) => {
       el.href = el.dataset.href
         .replace("{hubId}", hubId)
-        .replace("{index}", index);
+        .replace("{sessionUuid}", sessionUuid);
       delete el.dataset.href;
     });
 
@@ -415,19 +412,15 @@ export default class extends Controller {
   }
 
   // Private: set data attributes on the cloned element
-  #setDataAttributes(el, agent, index) {
+  #setDataAttributes(el, agent) {
     if (!el) return;
 
     // Set on root element
     el.dataset.agentId = agent.id;
-    el.dataset.agentIndex = index;
 
     // Also set on any children that need it
     el.querySelectorAll("[data-agent-id]").forEach((child) => {
       child.dataset.agentId = agent.id;
-    });
-    el.querySelectorAll("[data-agent-index]").forEach((child) => {
-      child.dataset.agentIndex = index;
     });
   }
 
@@ -450,16 +443,18 @@ export default class extends Controller {
   // Private: derive selected agent from current URL path
   #syncSelectionFromUrl() {
     const match = window.location.pathname.match(
-      /\/hubs\/[^/]+\/agents\/(\d+)/,
+      /\/hubs\/[^/]+\/sessions\/([^/]+)/,
     );
     if (!match) {
-      // Not on an agent page — clear selection
+      // Not on a session page — clear selection
       if (this.selectedIdValue) this.selectedIdValue = "";
       return;
     }
 
-    const index = parseInt(match[1], 10);
-    const agent = this.agentsValue[index];
+    const sessionUuid = match[1];
+    const agent = this.agentsValue.find(
+      (a) => a.session_uuid === sessionUuid,
+    );
     if (agent && agent.id !== this.selectedIdValue) {
       this.selectedIdValue = agent.id;
     }

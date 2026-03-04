@@ -193,28 +193,25 @@ impl TuiBridge {
 fn frame_to_tui_output(frame: Frame) -> Option<TuiOutput> {
     match frame {
         Frame::Json(value) => Some(TuiOutput::Message(value)),
-        Frame::PtyOutput { agent_index, pty_index, data } => Some(TuiOutput::Output {
-            agent_index: Some(agent_index as usize),
-            pty_index: Some(pty_index as usize),
+        Frame::PtyOutput { session_uuid, data } => Some(TuiOutput::Output {
+            session_uuid,
             data,
         }),
-        Frame::Scrollback { agent_index, pty_index, kitty_enabled, data } => {
+        Frame::Scrollback { session_uuid, kitty_enabled, data } => {
             Some(TuiOutput::Scrollback {
-                agent_index: Some(agent_index as usize),
-                pty_index: Some(pty_index as usize),
+                session_uuid,
                 data,
                 kitty_enabled,
             })
         }
-        Frame::ProcessExited { agent_index, pty_index, exit_code } => {
+        Frame::ProcessExited { session_uuid, exit_code } => {
             Some(TuiOutput::ProcessExited {
-                agent_index: Some(agent_index as usize),
-                pty_index: Some(pty_index as usize),
+                session_uuid,
                 exit_code,
             })
         }
         Frame::PtyInput { .. } => None, // Client-to-hub only
-        Frame::Binary(_) => None, // Raw binary not used by TUI
+        Frame::Binary(data) => Some(TuiOutput::Binary(data)),
     }
 }
 
@@ -222,9 +219,8 @@ fn frame_to_tui_output(frame: Frame) -> Option<TuiOutput> {
 fn tui_request_to_frame(request: &TuiRequest) -> Frame {
     match request {
         TuiRequest::LuaMessage(json) => Frame::Json(json.clone()),
-        TuiRequest::PtyInput { agent_index, pty_index, data } => Frame::PtyInput {
-            agent_index: *agent_index as u16,
-            pty_index: *pty_index as u16,
+        TuiRequest::PtyInput { session_uuid, data } => Frame::PtyInput {
+            session_uuid: session_uuid.clone(),
             data: data.clone(),
         },
     }
@@ -346,8 +342,7 @@ mod tests {
             setup_bridge(&tmp, "pty_out.sock").await;
 
         let frame = Frame::PtyOutput {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "test-session".to_string(),
             data: b"$ echo hello\r\nhello\r\n".to_vec(),
         };
         server_write.write_all(&frame.encode()).await.unwrap();
@@ -361,9 +356,8 @@ mod tests {
         .expect("Channel closed");
 
         match output {
-            TuiOutput::Output { agent_index, pty_index, data } => {
-                assert_eq!(agent_index, Some(0));
-                assert_eq!(pty_index, Some(0));
+            TuiOutput::Output { session_uuid, data } => {
+                assert_eq!(session_uuid, "test-session");
                 assert_eq!(data, b"$ echo hello\r\nhello\r\n");
             }
             other => panic!("Expected TuiOutput::Output, got: {other:?}"),
@@ -381,8 +375,7 @@ mod tests {
         channels
             .request_tx
             .send(TuiRequest::PtyInput {
-                agent_index: 1,
-                pty_index: 0,
+                session_uuid: "test-session".to_string(),
                 data: b"hello".to_vec(),
             })
             .unwrap();
@@ -402,9 +395,8 @@ mod tests {
 
         let pty_frame = all_frames.iter().find(|f| matches!(f, Frame::PtyInput { .. })).unwrap();
         match pty_frame {
-            Frame::PtyInput { agent_index, pty_index, data } => {
-                assert_eq!(*agent_index, 1);
-                assert_eq!(*pty_index, 0);
+            Frame::PtyInput { session_uuid, data } => {
+                assert_eq!(session_uuid, "test-session");
                 assert_eq!(data, b"hello");
             }
             _ => unreachable!(),
@@ -421,8 +413,7 @@ mod tests {
 
         // Scrollback
         let sb = Frame::Scrollback {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "test-session".to_string(),
             kitty_enabled: true,
             data: b"scrollback".to_vec(),
         };
@@ -437,9 +428,8 @@ mod tests {
         .unwrap();
 
         match output {
-            TuiOutput::Scrollback { agent_index, pty_index, kitty_enabled, data } => {
-                assert_eq!(agent_index, Some(0));
-                assert_eq!(pty_index, Some(0));
+            TuiOutput::Scrollback { session_uuid, kitty_enabled, data } => {
+                assert_eq!(session_uuid, "test-session");
                 assert!(kitty_enabled);
                 assert_eq!(data, b"scrollback");
             }
@@ -448,8 +438,7 @@ mod tests {
 
         // Process exited
         let ex = Frame::ProcessExited {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "test-session".to_string(),
             exit_code: Some(42),
         };
         server_write.write_all(&ex.encode()).await.unwrap();
@@ -463,9 +452,8 @@ mod tests {
         .unwrap();
 
         match output {
-            TuiOutput::ProcessExited { agent_index, pty_index, exit_code } => {
-                assert_eq!(agent_index, Some(0));
-                assert_eq!(pty_index, Some(0));
+            TuiOutput::ProcessExited { session_uuid, exit_code } => {
+                assert_eq!(session_uuid, "test-session");
                 assert_eq!(exit_code, Some(42));
             }
             other => panic!("Expected ProcessExited, got: {other:?}"),
