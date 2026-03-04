@@ -2379,6 +2379,7 @@ impl Hub {
 
         let sink = output_tx.clone();
         let session_uuid = req.session_uuid.clone();
+        let agent_index = self.handle_cache.index_of(&req.session_uuid);
         let active_flag = req.active_flag;
         let wake_fd = self.tui_wake_fd;
 
@@ -2398,8 +2399,8 @@ impl Hub {
                     snapshot.len(), session_uuid
                 );
                 if sink.send(TuiOutput::Scrollback {
-                    agent_index: None,
-                    pty_index: None,
+                    agent_index,
+                    pty_index: Some(0),
                     data: snapshot,
                     kitty_enabled,
                 }).is_err() {
@@ -2439,8 +2440,8 @@ impl Hub {
                             }
                         }
                         if sink.send(TuiOutput::OutputBatch {
-                            agent_index: None,
-                            pty_index: None,
+                            agent_index,
+                            pty_index: Some(0),
                             chunks,
                         }).is_err() {
                             log::trace!("[Lua-TUI] Output channel closed, stopping forwarder");
@@ -2459,8 +2460,8 @@ impl Hub {
                                         exit_code, session_uuid
                                     );
                                     let _ = sink.send(TuiOutput::ProcessExited {
-                                        agent_index: None,
-                                        pty_index: None,
+                                        agent_index,
+                                        pty_index: Some(0),
                                         exit_code,
                                     });
                                     if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
@@ -2492,8 +2493,8 @@ impl Hub {
                             exit_code, session_uuid
                         );
                         let _ = sink.send(TuiOutput::ProcessExited {
-                            agent_index: None,
-                            pty_index: None,
+                            agent_index,
+                            pty_index: Some(0),
                             exit_code,
                         });
                         if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
@@ -2580,6 +2581,7 @@ impl Hub {
         // Clone the frame sender from the connection — we only need to send encoded frames.
         let frame_tx = conn.frame_sender();
         let session_uuid = req.session_uuid.clone();
+        let agent_index = self.handle_cache.index_of(&req.session_uuid).unwrap_or(0) as u16;
         let active_flag = req.active_flag;
         let client_id = req.client_id.clone();
         let hub_event_tx = self.hub_event_tx.clone();
@@ -2596,7 +2598,7 @@ impl Hub {
             // Send scrollback snapshot first
             if !snapshot.is_empty() {
                 let frame = Frame::Scrollback {
-                    agent_index: 0,
+                    agent_index,
                     pty_index: 0,
                     kitty_enabled,
                     data: snapshot,
@@ -2633,7 +2635,7 @@ impl Hub {
                 match pty_rx.recv().await {
                     Ok(PtyEvent::Output(data)) => {
                         let frame = Frame::PtyOutput {
-                            agent_index: 0,
+                            agent_index,
                             pty_index: 0,
                             data,
                         };
@@ -2661,7 +2663,7 @@ impl Hub {
                             exit_code, client_id, session_uuid
                         );
                         let frame = Frame::ProcessExited {
-                            agent_index: 0,
+                            agent_index,
                             pty_index: 0,
                             exit_code,
                         };
