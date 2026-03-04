@@ -31,7 +31,7 @@ local shared_bindings = {
   ["ctrl+p"]         = "open_menu",
   ["ctrl+j"]         = "select_next",
   ["ctrl+k"]         = "select_previous",
-  ["ctrl+]"]         = "toggle_pty",
+  -- ctrl+] reserved for future use (was toggle_pty in multi-PTY model)
   ["shift+pageup"]   = "scroll_half_up",
   ["shift+pagedown"] = "scroll_half_down",
   ["shift+home"]     = "scroll_top",

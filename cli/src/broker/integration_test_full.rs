@@ -120,7 +120,7 @@ fn test_full_pipeline_pty_output_reaches_subscriber() {
     // `Session::kill_child()`, so `kill_all()` during cleanup does not send
     // signals to real processes.
     let session_id = conn
-        .register_pty("test-agent", 0, 99999, 24, 80, read_end)
+        .register_pty("test-agent", 99999, 24, 80, read_end)
         .expect("register_pty must return a session_id");
 
     // ── 5. Write raw bytes to the pipe write end ──────────────────────────────
@@ -338,7 +338,7 @@ fn test_hub_reconnect_snapshot_and_output() {
     // kill_all() during cleanup sends SIGHUP/SIGKILL to a non-existent PID
     // (ESRCH, silently ignored) and does not affect real processes.
     let session_id1 = conn_a
-        .register_pty("test-agent-reconnect-a", 0, 99999, 24, 80, read_end1)
+        .register_pty("test-agent-reconnect-a", 99999, 24, 80, read_end1)
         .expect("Hub A: register_pty must return a session_id");
 
     // Write the first payload through pipe1.  The broker's reader_loop reads
@@ -416,7 +416,7 @@ fn test_hub_reconnect_snapshot_and_output() {
     let (read_end2, write_end2) = make_pipe();
 
     let session_id2 = conn_b
-        .register_pty("test-agent-reconnect-b", 0, 99999, 24, 80, read_end2)
+        .register_pty("test-agent-reconnect-b", 99999, 24, 80, read_end2)
         .expect("Hub B: register pipe2 must return a new session_id");
 
     // ── 7. Write to pipe2, verify Hub B receives BrokerPtyOutput ─────────────
@@ -539,7 +539,7 @@ fn test_existing_session_routes_to_hub_b_after_reconnect() {
 
     let mut conn_a = BrokerConnection::connect(&socket_path).expect("Hub A: connect");
     let session_id1 = conn_a
-        .register_pty("test-agent-existing", 0, 99999, 24, 80, read_end1)
+        .register_pty("test-agent-existing", 99999, 24, 80, read_end1)
         .expect("Hub A: register_pty");
 
     // ── 3. Hub A disconnects (simulating exec-restart) ────────────────────────
@@ -673,7 +673,7 @@ fn test_ctrl_delivery_under_output_flood() {
     let (read_end, write_end) = make_pipe();
 
     let session_id = conn
-        .register_pty("test-agent-flood", 0, 99999, 24, 80, read_end)
+        .register_pty("test-agent-flood", 99999, 24, 80, read_end)
         .expect("register_pty");
 
     // Flood thread: write 256 × 4 096-byte chunks — enough to fill the old

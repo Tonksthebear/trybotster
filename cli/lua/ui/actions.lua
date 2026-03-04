@@ -17,7 +17,7 @@
 -- Supported operations:
 --   set_mode         { op, mode }                   - Update Rust's mode shadow
 --   send_msg         { op, data }                   - Send JSON message to Hub via Lua protocol
---   focus_terminal   { op, agent_id, pty_index, agent_index }
+--   focus_terminal   { op, agent_id, agent_index }   (agent_index = display_index for Rust TUI)
 --   quit             { op }                         - Request application quit
 --
 -- Context fields (Rust-owned):
@@ -26,6 +26,8 @@
 -- Client-side state (_tui_state):
 --   mode, input_buffer, list_selected, agents, pending_fields, available_worktrees,
 --   flat_list, list_cursor_pos, workspaces, _ws_collapsed
+--
+-- Single-PTY model: each agent has exactly one PTY session. No session cycling.
 --
 -- Note: _tui_state.list_selected is 0-based. Lua tables are 1-based,
 -- so add 1 when indexing into Lua arrays (e.g., overlay_actions[list_selected + 1]).
@@ -105,17 +107,16 @@ local function focus_agent_ops(agent_id, context)
   end
   if not agent then return {} end
 
-  _tui_state.selected_agent_index = idx
-  _tui_state.active_pty_index = 0
+  _tui_state.selected_session_uuid = agent.session_uuid
 
   local ops = {
-    { op = "focus_terminal", agent_id = agent_id, pty_index = 0, agent_index = idx },
+    { op = "focus_terminal", agent_id = agent_id, agent_index = idx },
     set_mode_ops("insert"),
   }
   if agent.notification then
     table.insert(ops, { op = "send_msg", data = {
       subscriptionId = "tui_hub",
-      data = { type = "clear_notification", agent_index = idx },
+      data = { type = "clear_notification", session_uuid = agent.session_uuid },
     }})
   end
   return ops
@@ -146,22 +147,6 @@ function M.on_action(action, context)
           data = { type = "list_profiles" },
         }},
       }
-    elseif selected == "add_session" then
-      if context.selected_agent then
-        return {
-          set_mode_ops("add_session_select_type"),
-          { op = "send_msg", data = {
-            subscriptionId = "tui_hub",
-            data = { type = "list_session_types", agent_id = context.selected_agent },
-          }},
-        }
-      end
-      return { set_mode_ops(base_mode(context)) }
-    elseif selected == "remove_session" then
-      if context.selected_agent then
-        return { set_mode_ops("remove_session_select") }
-      end
-      return { set_mode_ops(base_mode(context)) }
     elseif selected == "close_agent" then
       if context.selected_agent then
         return { set_mode_ops("close_agent_confirm") }
@@ -204,16 +189,6 @@ function M.on_action(action, context)
         }},
         set_mode_ops(base_mode(context)),
       }
-    else
-      -- switch_session:N — switch to a specific PTY by index
-      local session_idx = selected and string.match(selected, "^switch_session:(%d+)$")
-      if session_idx then
-        return {
-          { op = "focus_terminal", agent_id = context.selected_agent, pty_index = tonumber(session_idx),
-            agent_index = agent_index_for(context.selected_agent) },
-          set_mode_ops(base_mode(context)),
-        }
-      end
     end
     -- Unknown or nil action: close menu
     return { set_mode_ops(base_mode(context)) }
@@ -274,47 +249,6 @@ function M.on_action(action, context)
       _tui_state.pending_fields.profile = selected
     end
     return transition_to_worktree_selection()
-  end
-
-  -- === Session type selection ===
-  if action == "list_select" and _tui_state.mode == "add_session_select_type" then
-    local types = _tui_state.available_session_types or {}
-    local selected_type = types[_tui_state.list_selected + 1]  -- Lua 1-based
-    if selected_type and context.selected_agent then
-      return {
-        { op = "send_msg", data = {
-          subscriptionId = "tui_hub",
-          data = {
-            type = "add_session",
-            agent_id = context.selected_agent,
-            session_type = selected_type.name,
-          },
-        }},
-        set_mode_ops(base_mode(context)),
-      }
-    end
-    return { set_mode_ops(base_mode(context)) }
-  end
-
-  -- === Remove session selection ===
-  if action == "list_select" and _tui_state.mode == "remove_session_select" then
-    -- list index is 0-based, and we skipped index 0 (agent session) in the overlay,
-    -- so the actual pty_index is list_index + 1
-    local pty_index = (_tui_state.list_selected or 0) + 1
-    if context.selected_agent then
-      return {
-        { op = "send_msg", data = {
-          subscriptionId = "tui_hub",
-          data = {
-            type = "remove_session",
-            agent_id = context.selected_agent,
-            pty_index = pty_index,
-          },
-        }},
-        set_mode_ops(base_mode(context)),
-      }
-    end
-    return { set_mode_ops(base_mode(context)) }
   end
 
   -- === Text input submit ===
@@ -407,26 +341,6 @@ function M.on_action(action, context)
     }
   end
 
-  -- === PTY session cycling (Ctrl+] in normal/insert mode) ===
-  if action == "toggle_pty" then
-    if not context.selected_agent then return nil end
-    -- Read session count from client-side agent state
-    local agent_id = context.selected_agent
-    local session_count = 1
-    for _, a in ipairs(_tui_state.agents) do
-      if a.id == agent_id then
-        session_count = a.sessions and #a.sessions or 1
-        break
-      end
-    end
-    local next_pty = ((_tui_state.active_pty_index or 0) + 1) % session_count
-    _tui_state.active_pty_index = next_pty
-    return {
-      { op = "focus_terminal", agent_id = agent_id, pty_index = next_pty,
-        agent_index = agent_index_for(agent_id) },
-    }
-  end
-
   -- === Modal state ===
   if action == "open_menu" then
     return { set_mode_ops("menu") }
@@ -467,7 +381,13 @@ function M.on_action(action, context)
     -- Fallback: legacy flat agent navigation (before workspace data arrives)
     local agents = _tui_state.agents
     if #agents == 0 then return nil end
-    local current_idx = _tui_state.selected_agent_index
+    local current_idx = nil
+    local uuid = _tui_state.selected_session_uuid
+    if uuid then
+      for i, a in ipairs(agents) do
+        if a.session_uuid == uuid then current_idx = i - 1; break end
+      end
+    end
     local next_idx
     if current_idx then
       next_idx = (current_idx + 1) % #agents
@@ -476,16 +396,15 @@ function M.on_action(action, context)
     end
     local next_agent = agents[next_idx + 1]
     if not next_agent then return nil end
-    _tui_state.selected_agent_index = next_idx
-    _tui_state.active_pty_index = 0
+    _tui_state.selected_session_uuid = next_agent.session_uuid
     local ops = {
-      { op = "focus_terminal", agent_id = next_agent.id, pty_index = 0, agent_index = next_idx },
+      { op = "focus_terminal", agent_id = next_agent.id, agent_index = next_idx },
       set_mode_ops("insert"),
     }
     if next_agent.notification then
       table.insert(ops, { op = "send_msg", data = {
         subscriptionId = "tui_hub",
-        data = { type = "clear_notification", agent_index = next_idx },
+        data = { type = "clear_notification", session_uuid = next_agent.session_uuid },
       }})
     end
     return ops
@@ -520,7 +439,13 @@ function M.on_action(action, context)
     -- Fallback: legacy flat agent navigation
     local agents = _tui_state.agents
     if #agents == 0 then return nil end
-    local current_idx = _tui_state.selected_agent_index
+    local current_idx = nil
+    local uuid = _tui_state.selected_session_uuid
+    if uuid then
+      for i, a in ipairs(agents) do
+        if a.session_uuid == uuid then current_idx = i - 1; break end
+      end
+    end
     local prev_idx
     if current_idx then
       prev_idx = (current_idx - 1 + #agents) % #agents
@@ -529,16 +454,15 @@ function M.on_action(action, context)
     end
     local prev_agent = agents[prev_idx + 1]
     if not prev_agent then return nil end
-    _tui_state.selected_agent_index = prev_idx
-    _tui_state.active_pty_index = 0
+    _tui_state.selected_session_uuid = prev_agent.session_uuid
     local ops = {
-      { op = "focus_terminal", agent_id = prev_agent.id, pty_index = 0, agent_index = prev_idx },
+      { op = "focus_terminal", agent_id = prev_agent.id, agent_index = prev_idx },
       set_mode_ops("insert"),
     }
     if prev_agent.notification then
       table.insert(ops, { op = "send_msg", data = {
         subscriptionId = "tui_hub",
-        data = { type = "clear_notification", agent_index = prev_idx },
+        data = { type = "clear_notification", session_uuid = prev_agent.session_uuid },
       }})
     end
     return ops

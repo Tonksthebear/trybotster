@@ -80,7 +80,6 @@ function Client:on_message(msg)
 end
 
 --- Handle subscribe message - create virtual subscription.
--- Handles WebRTC subscribe requests for PTY output streaming.
 -- @param msg The subscribe message
 function Client:handle_subscribe(msg)
     local sub_id = msg.subscriptionId
@@ -107,18 +106,23 @@ function Client:handle_subscribe(msg)
     channel = result.channel or channel
     params = result.params or params
 
-    local agent_index = params.agent_index
-    local pty_index = params.pty_index
-    log.info(string.format("Subscribe: %s -> %s (peer=%s, agent=%s, pty=%s, rows=%s, cols=%s)",
+    local session_uuid = params.session_uuid
+    -- Fallback: resolve from agent_index for TUI and legacy browser clients
+    if not session_uuid and params.agent_index ~= nil then
+        local agent = Agent.get_by_display_index(params.agent_index)
+        if agent then
+            session_uuid = agent.session_uuid
+        end
+    end
+    log.info(string.format("Subscribe: %s -> %s (peer=%s, session=%s, rows=%s, cols=%s)",
         sub_id:sub(1, 16), channel, self.peer_id:sub(1, 8),
-        tostring(agent_index), tostring(pty_index),
+        tostring(session_uuid and session_uuid:sub(1, 16) or "nil"),
         tostring(params.rows), tostring(params.cols)))
 
     -- Store subscription info
     self.subscriptions[sub_id] = {
         channel = channel,
-        agent_index = agent_index,
-        pty_index = pty_index,
+        session_uuid = session_uuid,
     }
 
     -- Send subscription confirmation immediately
@@ -147,15 +151,14 @@ function Client:handle_subscribe(msg)
         local cols = params.cols or 80
         if rows < 2 or cols < 2 then
             log.warn(string.format(
-                "Suspicious terminal dimensions from %s: %dx%d (agent=%d, pty=%d)",
-                self.peer_id:sub(1, 8), cols, rows, agent_index, pty_index))
+                "Suspicious terminal dimensions from %s: %dx%d (session=%s)",
+                self.peer_id:sub(1, 8), cols, rows,
+                tostring(session_uuid and session_uuid:sub(1, 16) or "nil")))
         end
 
-        -- Rebuild forwarder on every terminal subscribe so tab teardown/recreate
-        -- always gets a fresh snapshot replay.
-        if agent_index ~= nil and pty_index ~= nil then
-            pty_clients.register(agent_index, pty_index, self.peer_id, rows, cols)
-            self:setup_terminal_subscription(sub_id, agent_index, pty_index)
+        if session_uuid then
+            pty_clients.register(session_uuid, self.peer_id, rows, cols)
+            self:setup_terminal_subscription(sub_id, session_uuid)
         end
     elseif channel == "hub" then
         -- Send initial agent and worktree lists
@@ -164,8 +167,6 @@ function Client:handle_subscribe(msg)
         self:send_worktree_list(sub_id)
     elseif channel == "mcp" then
         -- MCP is pull-based: the client sends tools/list when ready.
-        -- No auto-push on subscribe (unlike hub channel's agent_list).
-        -- Store caller's full context so tool handlers can identify the calling agent.
         self.subscriptions[sub_id].caller_context = params.context or {}
         local ctx = params.context or {}
         log.info(string.format("MCP subscription from %s... (agent=%s, hub=%s)",
@@ -177,39 +178,34 @@ end
 
 --- Set up terminal subscription with PTY forwarder.
 -- Creates a transport-agnostic forwarder that streams PTY output to the client.
--- Both TUI and WebRTC use the same code path: pty_clients handles resize,
--- transport.create_pty_forwarder handles output streaming.
 --
 -- @param sub_id The subscription ID
--- @param agent_index The agent index
--- @param pty_index The PTY index (0=CLI, 1=Server)
-function Client:setup_terminal_subscription(sub_id, agent_index, pty_index)
-    if agent_index == nil or pty_index == nil then
-        log.warn("Terminal subscription missing agent_index or pty_index")
+-- @param session_uuid The session UUID identifying the PTY
+function Client:setup_terminal_subscription(sub_id, session_uuid)
+    if not session_uuid then
+        log.warn("Terminal subscription missing session_uuid")
         return
     end
 
     -- PTY was already resized by pty_clients.register() in handle_subscribe().
     -- Now create the forwarder to stream output to this client.
-    local rows, cols = pty_clients.get_active_dims(agent_index, pty_index)
+    local rows, cols = pty_clients.get_active_dims(session_uuid)
     rows = rows or 24
     cols = cols or 80
 
     local forwarder = self.transport.create_pty_forwarder({
-        agent_index = agent_index,
-        pty_index = pty_index,
+        session_uuid = session_uuid,
         subscription_id = sub_id,
         prefix = "\x01",  -- Binary prefix for raw terminal data
     })
 
     self.forwarders[sub_id] = forwarder
 
-    log.info(string.format("Terminal subscription %s: agent=%d, pty=%d (%dx%d)",
-        sub_id:sub(1, 16), agent_index, pty_index, cols, rows))
+    log.info(string.format("Terminal subscription %s: session=%s (%dx%d)",
+        sub_id:sub(1, 16), session_uuid:sub(1, 16), cols, rows))
 end
 
 --- Send agent list to a HubChannel subscription.
--- Uses Agent registry for rich metadata (repo, issue, branch, status, etc.).
 -- @param sub_id The subscription ID to send to
 function Client:send_agent_list(sub_id)
     local payload = require("lib.agent_list_payload").build(Agent.all_info())
@@ -260,8 +256,8 @@ function Client:handle_unsubscribe(msg)
     end
 
     -- Unregister from pty_clients (auto-resizes to next client if any)
-    if sub.channel == "terminal" and sub.agent_index ~= nil and sub.pty_index ~= nil then
-        pty_clients.unregister(sub.agent_index, sub.pty_index, self.peer_id)
+    if sub.channel == "terminal" and sub.session_uuid then
+        pty_clients.unregister(sub.session_uuid, self.peer_id)
     end
 
     hooks.notify("client_unsubscribed", {
@@ -293,7 +289,6 @@ function Client:handle_data(msg)
     -- Determine command source (protocol difference between encrypted/plaintext flows):
     -- - Encrypted flow: command fields at top level (type, data, etc.)
     -- - Plaintext flow: command nested under "data" field
-    -- This dual extraction handles both protocol formats transparently.
     local command = msg
     if msg.data and type(msg.data) == "table" then
         command = msg.data
@@ -313,36 +308,33 @@ end
 -- @param sub The subscription info
 -- @param command The terminal command
 function Client:handle_terminal_data(sub, command)
-    local agent_index = sub.agent_index or 0
-    local pty_index = sub.pty_index or 0
+    local session_uuid = sub.session_uuid
     local cmd_type = command.type
 
-    log.debug(string.format("handle_terminal_data: cmd_type=%s, agent=%d, pty=%d",
-        tostring(cmd_type), agent_index, pty_index))
+    log.debug(string.format("handle_terminal_data: cmd_type=%s, session=%s",
+        tostring(cmd_type), tostring(session_uuid and session_uuid:sub(1, 16) or "nil")))
 
     if cmd_type == "resize" or command.command == "resize" then
         local rows = command.rows or 24
         local cols = command.cols or 80
-        log.info(string.format("Resize: peer=%s, agent=%d, pty=%d, %dx%d",
-            self.peer_id:sub(1, 8), agent_index, pty_index, cols, rows))
-        pty_clients.update(agent_index, pty_index, self.peer_id, rows, cols)
+        if session_uuid then
+            log.info(string.format("Resize: peer=%s, session=%s, %dx%d",
+                self.peer_id:sub(1, 8), session_uuid:sub(1, 16), cols, rows))
+            pty_clients.update(session_uuid, self.peer_id, rows, cols)
+        end
     else
         log.debug(string.format("Unknown terminal command: %s", tostring(cmd_type)))
     end
 end
 
 --- Handle hub control data (list_agents, create_agent, etc.).
--- Runs the before_hub_command interceptor chain, then dispatches
--- to the command registry. See lib/commands.lua and handlers/commands.lua.
 -- @param sub_id The subscription ID for responses
 -- @param command The hub command
 function Client:handle_hub_data(sub_id, command)
     local cmd_type = command.type or command.command
     log.debug(string.format("handle_hub_data: type=%s", tostring(cmd_type)))
 
-    -- Interceptor chain: transform, validate, or drop before dispatch.
-    -- Return nil from an interceptor to block the command entirely.
-    -- Only pass command through the chain (self/sub_id are context, not transformable).
+    -- Interceptor chain
     command = hooks.call("before_hub_command", command)
     if command == nil then return end
 
@@ -350,7 +342,6 @@ function Client:handle_hub_data(sub_id, command)
 end
 
 --- Handle MCP channel data messages.
--- Routes tools_list, tool_call, prompts_list, and prompt_get requests from MCP bridge clients.
 -- @param sub_id The subscription ID
 -- @param command The command message
 function Client:handle_mcp_data(sub_id, command)
@@ -370,12 +361,8 @@ function Client:handle_mcp_data(sub_id, command)
         local tool_name = command.name
         local params = command.arguments or {}
 
-        -- Pass the caller's full context to tool handlers
         local context = sub and sub.caller_context or {}
 
-        -- Use callback form so proxied tools can respond asynchronously.
-        -- For local tools the callback fires synchronously (same tick).
-        -- For proxied tools it fires after the HTTP round-trip completes.
         mcp.call_tool(tool_name, params, context, function(result, err)
             if err then
                 self:send({
@@ -460,10 +447,10 @@ function Client:disconnect()
     end
     self.forwarders = {}
 
-    -- Unregister from all terminal PTYs (auto-resizes to next client)
+    -- Unregister from all terminal sessions (auto-resizes to next client)
     for _, sub in pairs(self.subscriptions) do
-        if sub.channel == "terminal" and sub.agent_index ~= nil and sub.pty_index ~= nil then
-            pty_clients.unregister(sub.agent_index, sub.pty_index, self.peer_id)
+        if sub.channel == "terminal" and sub.session_uuid then
+            pty_clients.unregister(sub.session_uuid, self.peer_id)
         end
     end
     self.subscriptions = {}

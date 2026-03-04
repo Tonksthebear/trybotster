@@ -1,5 +1,12 @@
 //! PTY broker process — holds PTY file descriptors across Hub restarts.
 //!
+//! # Wire Format Compatibility
+//!
+//! The `FdTransferPayload` (0x15 frame) uses a binary format with no version
+//! byte. Changes to `FdTransferPayload::encode`/`decode` require both the
+//! Hub and Broker to be restarted together — a running old broker will
+//! silently misparse a new-format frame and vice versa.
+//!
 //! # Purpose
 //!
 //! The broker is a lightweight process that outlives the Hub daemon. By
@@ -201,8 +208,7 @@ type SharedTee = Arc<Mutex<Option<TeeState>>>;
 struct Session {
     #[allow(dead_code)] // stored for diagnostics / future use
     session_id: u32,
-    agent_key: String,
-    pty_index: usize,
+    session_uuid: String,
     /// The master PTY FD.  `OwnedFd` closes on drop.
     master_fd: OwnedFd,
     child_pid: u32,
@@ -277,8 +283,8 @@ type SharedWriter = Arc<Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>>;
 struct Broker {
     /// All active sessions, keyed by session_id.
     sessions: HashMap<u32, Session>,
-    /// Maps (agent_key, pty_index) → session_id for lookup by key.
-    key_map: HashMap<(String, usize), u32>,
+    /// Maps session_uuid → session_id for lookup by key.
+    key_map: HashMap<String, u32>,
     next_session_id: u32,
     reconnect_timeout: Duration,
     /// Shared channel sender — updated at the start of every `handle_connection`
@@ -299,8 +305,8 @@ impl Broker {
     }
 
     fn alloc_session_id(&mut self) -> u32 {
-        let id = self.next_session_id;
-        self.next_session_id = self.next_session_id.wrapping_add(1).max(1);
+        let id = self.next_session_id.max(1); // ensure 0 is never returned
+        self.next_session_id = id.wrapping_add(1).max(1);
         id
     }
 
@@ -335,11 +341,10 @@ impl Broker {
             reader_loop(raw, reader_sid, parser_clone, shared, tee_clone);
         });
 
-        self.key_map.insert((reg.agent_key.clone(), reg.pty_index), session_id);
+        self.key_map.insert(reg.session_uuid.clone(), session_id);
         self.sessions.insert(session_id, Session {
             session_id,
-            agent_key: reg.agent_key,
-            pty_index: reg.pty_index,
+            session_uuid: reg.session_uuid,
             master_fd: fd,
             child_pid: reg.child_pid,
             parser,
@@ -353,7 +358,7 @@ impl Broker {
     /// Unregister a session (process already exited, Hub is cleaning up).
     fn unregister(&mut self, session_id: u32) {
         if let Some(mut sess) = self.sessions.remove(&session_id) {
-            self.key_map.remove(&(sess.agent_key.clone(), sess.pty_index));
+            self.key_map.remove(&sess.session_uuid);
             // Join the reader — it will exit when the PTY FD is closed on drop.
             if let Some(handle) = sess.reader.take() {
                 drop(sess.master_fd); // close FD first so reader unblocks
@@ -611,14 +616,12 @@ fn handle_connection(
                             continue;
                         }
                     };
-                    let agent_key = reg.agent_key.clone();
-                    let pty_index = reg.pty_index;
+                    let session_uuid = reg.session_uuid.clone();
                     // register() spawns the reader thread using Arc::clone of
                     // broker.shared_writer (already wired to this connection above).
                     let session_id = broker.register(fd, reg);
                     let resp = encode_broker_control(&BrokerMessage::Registered {
-                        agent_key,
-                        pty_index,
+                        session_uuid,
                         session_id,
                     });
                     let _ = writer_tx.send(resp);

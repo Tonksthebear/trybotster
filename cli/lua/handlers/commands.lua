@@ -1,7 +1,6 @@
 -- Built-in hub command registrations (hot-reloadable)
 --
 -- Registers all built-in hub channel commands with the command registry.
--- Extracted from lib/client.lua's handle_hub_data() if/elseif chain.
 --
 -- Users can override built-in commands or add new ones:
 --   local commands = require("lib.commands")
@@ -48,7 +47,6 @@ commands.register("create_agent", function(client, _sub_id, command)
     local profile = command.profile
     local workspace = command.workspace
 
-    -- Build metadata with workspace if provided
     local metadata = nil
     if workspace then
         metadata = { workspace = workspace }
@@ -58,6 +56,22 @@ commands.register("create_agent", function(client, _sub_id, command)
     log.info(string.format("Create agent request: %s (profile: %s, workspace: %s)",
         tostring(issue_or_branch or "main"), tostring(profile or "auto"), tostring(workspace or "none")))
 end, { description = "Create a new agent (with optional worktree, profile, and workspace)" })
+
+commands.register("create_accessory", function(client, _sub_id, command)
+    local session_name = command.session_name or command.name
+    local workspace = command.workspace
+    local profile = command.profile
+    local metadata = command.metadata
+
+    if not session_name then
+        log.warn("create_accessory missing session_name")
+        return
+    end
+
+    require("handlers.agents").handle_create_accessory(workspace, session_name, profile, metadata)
+    log.info(string.format("Create accessory request: %s (workspace: %s)",
+        session_name, tostring(workspace or "none")))
+end, { description = "Create an accessory session (no AI autonomy)" })
 
 commands.register("rename_workspace", function(client, sub_id, command)
     local workspace_id = command.workspace_id
@@ -76,7 +90,6 @@ commands.register("rename_workspace", function(client, sub_id, command)
     local ws = require("lib.workspace_store")
     local ok = ws.rename_workspace(data_dir, workspace_id, new_name)
     if ok then
-        -- Broadcast updated agent list so all clients see the new name
         local connections = require("handlers.connections")
         connections.broadcast_hub_event("agent_list", {
             agents = require("lib.agent").all_info(),
@@ -99,154 +112,55 @@ commands.register("reopen_worktree", function(client, _sub_id, command)
 end, { description = "Reopen an existing worktree as an agent" })
 
 commands.register("delete_agent", function(_client, _sub_id, command)
-    -- Field name inconsistency: agent ID may be in "id", "agent_id", or "session_key".
-    local agent_id = command.id or command.agent_id or command.session_key
+    local session_id = command.id or command.agent_id or command.session_uuid or command.session_key
     local delete_worktree = command.delete_worktree or false
 
-    if agent_id then
-        require("handlers.agents").handle_delete_agent(agent_id, delete_worktree)
-        log.info(string.format("Delete agent request: %s", agent_id))
+    if session_id then
+        require("handlers.agents").handle_delete_session(session_id, delete_worktree)
+        log.info(string.format("Delete session request: %s", session_id))
     else
-        log.warn("delete_agent missing agent_id")
+        log.warn("delete_agent missing session identifier")
     end
-end, { description = "Delete an agent (optionally with worktree)" })
+end, { description = "Delete a session (agent or accessory, optionally with worktree)" })
 
-commands.register("add_session", function(client, sub_id, command)
-    local Agent = require("lib.agent")
-    local agent_id = command.agent_id or command.id
-    if not agent_id then
-        log.warn("add_session missing agent_id")
-        return
-    end
+-- Alias: delete_session → delete_agent
+commands.register("delete_session", function(_client, _sub_id, command)
+    local session_id = command.id or command.session_uuid or command.agent_id or command.session_key
+    local delete_worktree = command.delete_worktree or false
 
-    local agent = Agent.get(agent_id)
-    if not agent then
-        log.warn("add_session: agent not found: " .. tostring(agent_id))
-        return
-    end
-
-    local session_type = command.session_type or "shell"
-    local session_config
-
-    if session_type == "shell" then
-        -- Raw shell: just bash, no init script
-        session_config = { name = "shell" }
+    if session_id then
+        require("handlers.agents").handle_delete_session(session_id, delete_worktree)
+        log.info(string.format("Delete session request: %s", session_id))
     else
-        -- Configured session type: resolve from profile
-        local types = agent:available_session_types()
-        local found = nil
-        for _, t in ipairs(types) do
-            if t.name == session_type then
-                found = t
-                break
-            end
-        end
-        if found and not found.raw then
-            session_config = {
-                name = found.name,
-                init_script = found.initialization,
-                forward_port = found.port_forward,
-            }
-        else
-            -- Fall back to raw shell with the given name
-            session_config = { name = session_type }
-        end
+        log.warn("delete_session missing session identifier")
     end
-
-    local pty_index = agent:add_session(session_config)
-    if pty_index then
-        -- Broadcast updated agent list so all clients see the new session.
-        -- Use agent_list (not agent_created) to avoid TUI auto-focus reset.
-        local connections = require("handlers.connections")
-        connections.broadcast_hub_event("agent_list", {
-            agents = require("lib.agent").all_info(),
-        })
-        log.info(string.format("Added session '%s' to agent %s at pty_index %d",
-            session_config.name, agent_id, pty_index))
-    end
-end, { description = "Add a PTY session to a running agent" })
-
-commands.register("remove_session", function(client, sub_id, command)
-    local Agent = require("lib.agent")
-    local agent_id = command.agent_id or command.id
-    if not agent_id then
-        log.warn("remove_session missing agent_id")
-        return
-    end
-
-    local pty_index = command.pty_index
-    if pty_index == nil then
-        log.warn("remove_session missing pty_index")
-        return
-    end
-
-    local agent = Agent.get(agent_id)
-    if not agent then
-        log.warn("remove_session: agent not found: " .. tostring(agent_id))
-        return
-    end
-
-    local ok = agent:remove_session(pty_index)
-    if ok then
-        -- Broadcast updated agent list so all clients see the removal
-        local connections = require("handlers.connections")
-        connections.broadcast_hub_event("agent_list", {
-            agents = require("lib.agent").all_info(),
-        })
-        log.info(string.format("Removed session at pty_index %d from agent %s", pty_index, agent_id))
-    end
-end, { description = "Remove a PTY session from a running agent" })
-
-commands.register("list_session_types", function(client, sub_id, command)
-    local Agent = require("lib.agent")
-    local agent_id = command.agent_id or command.id
-    if not agent_id then
-        log.warn("list_session_types missing agent_id")
-        return
-    end
-
-    local agent = Agent.get(agent_id)
-    if not agent then
-        log.warn("list_session_types: agent not found: " .. tostring(agent_id))
-        return
-    end
-
-    local types = agent:available_session_types()
-    client:send({
-        subscriptionId = sub_id,
-        type = "session_types",
-        agent_id = agent_id,
-        session_types = types,
-    })
-end, { description = "List available session types for an agent" })
+end, { description = "Delete a session (alias for delete_agent)" })
 
 commands.register("select_agent", function(_client, _sub_id, command)
-    -- No backend action needed; agent selection is client-side UI state
-    log.debug(string.format("Select agent: %s", tostring(command.id or command.agent_index)))
+    log.debug(string.format("Select agent: %s", tostring(command.id or command.session_uuid)))
 end, { description = "Select agent (client-side only, no-op)" })
 
 commands.register("clear_notification", function(_client, _sub_id, command)
-    local agent_index = command.agent_index
-    if agent_index == nil then
-        log.warn("clear_notification missing agent_index")
-        return
+    local session_uuid = command.session_uuid
+    if session_uuid then
+        _clear_session_notification(session_uuid)
+    elseif command.agent_index then
+        -- Legacy: Rails views still pass agent_index (no session_uuid available at page load)
+        _clear_agent_notification(command.agent_index)
+    else
+        log.warn("clear_notification missing session_uuid or agent_index")
     end
-    -- Shared clear logic (no pty_input hook — this is agent switching, not typing)
-    _clear_agent_notification(agent_index)
-end, { description = "Clear notification flag on an agent" })
+end, { description = "Clear notification flag on a session" })
 
 -- ============================================================================
 -- Connection Commands
 -- ============================================================================
 
 commands.register("get_connection_code", function(_client, _sub_id, _command)
-    -- generate_connection_url() is idempotent (returns cached bundle
-    -- unless consumed by a browser, in which case it auto-regenerates).
     connection.generate()
 end, { description = "Get or generate connection code with QR" })
 
 commands.register("regenerate_connection_code", function(_client, _sub_id, _command)
-    -- Force-regenerate: creates a fresh PreKeyBundle unconditionally
     connection.regenerate()
     log.info("Connection code regeneration requested")
 end, { description = "Force-regenerate connection code" })
@@ -264,10 +178,6 @@ commands.register("quit", function(_client, _sub_id, _command)
 end, { description = "Shut down the hub" })
 
 commands.register("restart_hub", function(_client, _sub_id, _command)
-    -- exec_restart: Hub exec()-replaces itself with a fresh binary instance.
-    -- The broker keeps PTY FDs alive during the reconnect window so agents
-    -- survive. hub.graceful_restart() only quits cleanly — it does NOT
-    -- relaunch the Hub, so nothing would come back automatically.
     hub.exec_restart()
 end, { description = "Graceful restart — agents survive the Hub restarting" })
 
@@ -313,7 +223,6 @@ commands.register("install_update", function(client, sub_id, _command)
             error = result.error,
         })
     end
-    -- On success, process exec-restarts — connection drops, browser reconnects
 end, { description = "Install update and restart (kills active agents)" })
 
 -- ============================================================================

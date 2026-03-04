@@ -13,14 +13,17 @@
  *
  * Flow:
  *   1. Browser establishes WebRTC peer connection with CLI
- *   2. Browser subscribes with channel="TerminalRelayChannel" (virtual routing)
+ *   2. Browser subscribes with channel="terminal" (virtual routing)
  *   3. CLI sets up PTY output forwarder for this subscription
  *   4. Browser receives raw PTY output via DataChannel
  *
+ * Single-PTY model: each session has exactly one PTY. Session UUID is the
+ * primary key. agentIndex is supported for backward compat with Rails views.
+ *
  * Usage:
- *   const key = TerminalConnection.key(hubId, agentIndex, ptyIndex);
+ *   const key = TerminalConnection.key(hubId, sessionUuid);
  *   const term = await HubConnectionManager.acquire(TerminalConnection, key, {
- *     hubId, agentIndex, ptyIndex
+ *     hubId, sessionUuid
  *   });
  *   term.onOutput((data) => terminal.write(data));
  *   term.sendInput("ls -la\n");
@@ -40,6 +43,8 @@ export class TerminalConnection extends HubRoute {
 
   constructor(key, options, manager) {
     super(key, options, manager);
+    this.sessionUuid = options.sessionUuid;
+    // Backward compat: agentIndex still accepted from Rails views
     this.agentIndex = options.agentIndex;
     this.ptyIndex = options.ptyIndex ?? 0;
   }
@@ -52,25 +57,31 @@ export class TerminalConnection extends HubRoute {
 
   /**
    * Compute semantic subscription ID.
-   * Format: terminal_{agentIndex}_{ptyIndex}
+   * Prefers session_uuid; falls back to agentIndex for backward compat.
    */
   computeSubscriptionId() {
+    if (this.sessionUuid) return `terminal_${this.sessionUuid}`;
     return `terminal_${this.agentIndex}_${this.ptyIndex}`;
   }
 
   channelParams() {
-    // WebRTC subscription params - used by CLI to route PTY I/O
-    // CLI keys forwarders by (browser_identity, agent_index, pty_index)
+    // WebRTC subscription params - used by CLI to route PTY I/O.
+    // session_uuid is the primary key; agent_index kept for backward compat.
     // rows/cols included so CLI can resize PTY immediately at subscription
     // time, eliminating the race between subscribe and resize messages.
-    return {
+    const params = {
       hub_id: this.getHubId(),
-      agent_index: this.agentIndex,
-      pty_index: this.ptyIndex,
       browser_identity: this.browserIdentity,
       rows: this.options.rows,
       cols: this.options.cols,
     };
+    if (this.sessionUuid) {
+      params.session_uuid = this.sessionUuid;
+    } else {
+      params.agent_index = this.agentIndex;
+      params.pty_index = this.ptyIndex;
+    }
+    return params;
   }
 
   handleMessage(message) {
@@ -147,6 +158,10 @@ export class TerminalConnection extends HubRoute {
   }
 
   // ========== Getters ==========
+
+  getSessionUuid() {
+    return this.sessionUuid;
+  }
 
   getAgentIndex() {
     return this.agentIndex;
@@ -316,8 +331,17 @@ export class TerminalConnection extends HubRoute {
 
   // ========== Static helper ==========
 
-  static key(hubId, agentIndex, ptyIndex = 0) {
-    return `terminal:${hubId}:${agentIndex}:${ptyIndex}`;
+  /**
+   * Build connection key. Prefers sessionUuid; falls back to agentIndex.
+   * Overloads:
+   *   key(hubId, sessionUuid)           — new session_uuid path
+   *   key(hubId, agentIndex, ptyIndex)  — legacy agent_index path
+   */
+  static key(hubId, sessionUuidOrAgentIndex, ptyIndex) {
+    if (typeof sessionUuidOrAgentIndex === "string") {
+      return `terminal:${hubId}:${sessionUuidOrAgentIndex}`;
+    }
+    return `terminal:${hubId}:${sessionUuidOrAgentIndex}:${ptyIndex ?? 0}`;
   }
 
   #emitOutput(data) {

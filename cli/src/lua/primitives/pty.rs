@@ -49,14 +49,14 @@
 //! -- Create a PTY forwarder (Rust handles the streaming)
 //! local forwarder = webrtc.create_pty_forwarder({
 //!     peer_id = "browser-123",
-//!     agent_index = 0,
-//!     pty_index = 0,
+//!     session_uuid = "sess-1234567890-abcdef",
 //!     prefix = "\x01",  -- Optional: prefix for raw terminal data
 //! })
 //!
 //! -- Check forwarder status
-//! print(forwarder:id())         -- "browser-123:0:0"
-//! print(forwarder:is_active())  -- true
+//! print(forwarder:id())             -- "browser-123:sess-1234567890-abcdef"
+//! print(forwarder:session_uuid())   -- "sess-1234567890-abcdef"
+//! print(forwarder:is_active())      -- true
 //!
 //! -- Stop forwarder (forwarder is also stopped automatically on cleanup)
 //! forwarder:stop()
@@ -185,9 +185,9 @@ impl PtySessionHandle {
     /// # Example
     ///
     /// ```ignore
-    /// // In the broker_reconnected Lua handler via hub.create_ghost_pty():
+    /// // In the broker_reconnected Lua handler via hub.create_ghost_session():
     /// let ghost = PtySessionHandle::new_ghost(24, 80, hub_event_tx.clone());
-    /// // Feed broker scrollback, then register via hub.register_agent()
+    /// // Feed broker scrollback, then register via hub.register_session()
     /// ```
     #[must_use]
     pub(crate) fn new_ghost(rows: u16, cols: u16, hub_event_tx: HubEventSender) -> Self {
@@ -467,14 +467,12 @@ impl LuaUserData for PtySessionHandle {
 /// and stop the forwarder. The actual streaming is handled by Rust.
 #[derive(Debug)]
 pub struct PtyForwarder {
-    /// Unique forwarder identifier: "{peer_id}:{agent_index}:{pty_index}".
+    /// Unique forwarder identifier: "{peer_id}:{session_uuid}".
     pub id: String,
     /// Browser peer that receives the PTY output.
     pub peer_id: String,
-    /// Agent index in Hub's agent list.
-    pub agent_index: usize,
-    /// PTY index within the agent (0=CLI, 1=Server).
-    pub pty_index: usize,
+    /// Session UUID identifying the PTY.
+    pub session_uuid: String,
     /// Whether this forwarder is still active.
     /// Set to false when stop() is called or Hub cleans up.
     pub active: Arc<Mutex<bool>>,
@@ -503,11 +501,8 @@ impl LuaUserData for PtyForwarder {
         // forwarder:peer_id() - Get the target peer ID
         methods.add_method("peer_id", |_, this, ()| Ok(this.peer_id.clone()));
 
-        // forwarder:agent_index() - Get the agent index
-        methods.add_method("agent_index", |_, this, ()| Ok(this.agent_index));
-
-        // forwarder:pty_index() - Get the PTY index
-        methods.add_method("pty_index", |_, this, ()| Ok(this.pty_index));
+        // forwarder:session_uuid() - Get the session UUID
+        methods.add_method("session_uuid", |_, this, ()| Ok(this.session_uuid.clone()));
     }
 }
 
@@ -516,10 +511,8 @@ impl LuaUserData for PtyForwarder {
 pub struct CreateForwarderRequest {
     /// Browser peer that will receive the PTY output.
     pub peer_id: String,
-    /// Agent index in Hub's agent list.
-    pub agent_index: usize,
-    /// PTY index within the agent (0=CLI, 1=Server).
-    pub pty_index: usize,
+    /// Session UUID identifying the target PTY.
+    pub session_uuid: String,
     /// Optional prefix byte for raw terminal data (typically 0x01).
     pub prefix: Option<Vec<u8>>,
     /// Browser-generated subscription ID for message routing.
@@ -538,10 +531,8 @@ pub struct CreateForwarderRequest {
 /// and routes output through `tui_output_tx` instead of WebRTC.
 #[derive(Debug, Clone)]
 pub struct CreateTuiForwarderRequest {
-    /// Agent index in Hub's agent list (legacy, for forwarder ID).
-    pub agent_index: usize,
-    /// PTY index within the agent (0=CLI, 1=Server).
-    pub pty_index: usize,
+    /// Session UUID identifying the target PTY.
+    pub session_uuid: String,
     /// Subscription ID for tracking (Lua-generated).
     pub subscription_id: String,
     /// Shared active flag for the forwarder handle.
@@ -555,10 +546,8 @@ pub struct CreateTuiForwarderRequest {
 pub struct CreateSocketForwarderRequest {
     /// Socket client identifier (e.g., "socket:0137b").
     pub client_id: String,
-    /// Agent index in Hub's agent list.
-    pub agent_index: usize,
-    /// PTY index within the agent (0=CLI, 1=Server).
-    pub pty_index: usize,
+    /// Session UUID identifying the target PTY.
+    pub session_uuid: String,
     /// Subscription ID for tracking (Lua-generated).
     pub subscription_id: String,
     /// Shared active flag for the forwarder handle.
@@ -581,26 +570,22 @@ pub enum PtyRequest {
 
     /// Stop an existing PTY forwarder.
     StopForwarder {
-        /// Forwarder identifier: "{peer_id}:{agent_index}:{pty_index}".
+        /// Forwarder identifier: "{peer_id}:{session_uuid}".
         forwarder_id: String,
     },
 
     /// Write input data to a PTY.
     WritePty {
-        /// Agent index in Hub's agent list.
-        agent_index: usize,
-        /// PTY index within the agent.
-        pty_index: usize,
+        /// Session UUID identifying the target PTY.
+        session_uuid: String,
         /// Input data to write.
         data: Vec<u8>,
     },
 
     /// Resize a PTY.
     ResizePty {
-        /// Agent index in Hub's agent list.
-        agent_index: usize,
-        /// PTY index within the agent.
-        pty_index: usize,
+        /// Session UUID identifying the target PTY.
+        session_uuid: String,
         /// New number of rows.
         rows: u16,
         /// New number of columns.
@@ -631,22 +616,18 @@ impl Clone for PtyRequest {
                 forwarder_id: forwarder_id.clone(),
             },
             Self::WritePty {
-                agent_index,
-                pty_index,
+                session_uuid,
                 data,
             } => Self::WritePty {
-                agent_index: *agent_index,
-                pty_index: *pty_index,
+                session_uuid: session_uuid.clone(),
                 data: data.clone(),
             },
             Self::ResizePty {
-                agent_index,
-                pty_index,
+                session_uuid,
                 rows,
                 cols,
             } => Self::ResizePty {
-                agent_index: *agent_index,
-                pty_index: *pty_index,
+                session_uuid: session_uuid.clone(),
                 rows: *rows,
                 cols: *cols,
             },
@@ -684,8 +665,8 @@ fn send_pty_event(tx: &HubEventSender, request: PtyRequest) {
 /// - `pty.spawn(config)` - Spawn a PTY session, returns `PtySessionHandle` userdata
 /// - `webrtc.create_pty_forwarder(opts)` - Create a PTY-to-WebRTC forwarder
 /// - `tui.create_pty_forwarder(opts)` - Create a PTY-to-TUI forwarder
-/// - `hub.write_pty(agent_index, pty_index, data)` - Write input to PTY
-/// - `hub.resize_pty(agent_index, pty_index, rows, cols)` - Resize PTY
+/// - `hub.write_pty(session_uuid, data)` - Write input to PTY
+/// - `hub.resize_pty(session_uuid, rows, cols)` - Resize PTY
 ///
 /// # Arguments
 ///
@@ -702,32 +683,28 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
         .get("webrtc")
         .unwrap_or_else(|_| lua.create_table().unwrap());
 
-    // webrtc.create_pty_forwarder({ peer_id, agent_index, pty_index, subscription_id, prefix? })
+    // webrtc.create_pty_forwarder({ peer_id, session_uuid, subscription_id, prefix? })
     let tx = hub_event_tx.clone();
     let create_forwarder_fn = lua
         .create_function(move |_lua, opts: LuaTable| {
             let peer_id: String = opts
                 .get("peer_id")
                 .map_err(|_| LuaError::runtime("peer_id is required"))?;
-            let agent_index: usize = opts
-                .get("agent_index")
-                .map_err(|_| LuaError::runtime("agent_index is required"))?;
-            let pty_index: usize = opts
-                .get("pty_index")
-                .map_err(|_| LuaError::runtime("pty_index is required"))?;
+            let session_uuid: String = opts
+                .get("session_uuid")
+                .map_err(|_| LuaError::runtime("session_uuid is required"))?;
             let subscription_id: String = opts
                 .get("subscription_id")
                 .map_err(|_| LuaError::runtime("subscription_id is required"))?;
             let prefix: Option<LuaString> = opts.get("prefix").ok();
 
-            let forwarder_id = format!("{}:{}:{}", peer_id, agent_index, pty_index);
+            let forwarder_id = format!("{}:{}", peer_id, session_uuid);
             let active_flag = Arc::new(Mutex::new(true));
 
             // Send the request to Hub via event channel
             send_pty_event(&tx, PtyRequest::CreateForwarder(CreateForwarderRequest {
                 peer_id: peer_id.clone(),
-                agent_index,
-                pty_index,
+                session_uuid: session_uuid.clone(),
                 prefix: prefix.map(|p| p.as_bytes().to_vec()),
                 subscription_id,
                 active_flag: Arc::clone(&active_flag),
@@ -738,8 +715,7 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
             let forwarder = PtyForwarder {
                 id: forwarder_id,
                 peer_id,
-                agent_index,
-                pty_index,
+                session_uuid,
                 active: active_flag,
             };
 
@@ -762,30 +738,26 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
         .get("tui")
         .unwrap_or_else(|_| lua.create_table().unwrap());
 
-    // tui.create_pty_forwarder({ agent_index, pty_index, subscription_id })
+    // tui.create_pty_forwarder({ session_uuid, subscription_id })
     //
     // Like webrtc.create_pty_forwarder but routes output through TUI send queue.
     // No peer_id needed — there's only one TUI client.
     let tx_tui = hub_event_tx.clone();
     let create_tui_forwarder_fn = lua
         .create_function(move |_lua, opts: LuaTable| {
-            let agent_index: usize = opts
-                .get("agent_index")
-                .map_err(|_| LuaError::runtime("agent_index is required"))?;
-            let pty_index: usize = opts
-                .get("pty_index")
-                .map_err(|_| LuaError::runtime("pty_index is required"))?;
+            let session_uuid: String = opts
+                .get("session_uuid")
+                .map_err(|_| LuaError::runtime("session_uuid is required"))?;
             let subscription_id: String = opts
                 .get("subscription_id")
                 .map_err(|_| LuaError::runtime("subscription_id is required"))?;
 
-            let forwarder_id = format!("tui:{}:{}", agent_index, pty_index);
+            let forwarder_id = format!("tui:{}", session_uuid);
             let active_flag = Arc::new(Mutex::new(true));
 
             // Send the request to Hub via event channel
             send_pty_event(&tx_tui, PtyRequest::CreateTuiForwarder(CreateTuiForwarderRequest {
-                agent_index,
-                pty_index,
+                session_uuid: session_uuid.clone(),
                 subscription_id,
                 active_flag: Arc::clone(&active_flag),
             }));
@@ -794,8 +766,7 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
             let forwarder = PtyForwarder {
                 id: forwarder_id,
                 peer_id: "tui".to_string(),
-                agent_index,
-                pty_index,
+                session_uuid,
                 active: active_flag,
             };
 
@@ -817,14 +788,13 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
         .get("hub")
         .unwrap_or_else(|_| lua.create_table().unwrap());
 
-    // hub.write_pty(agent_index, pty_index, data)
+    // hub.write_pty(session_uuid, data)
     let tx2 = hub_event_tx.clone();
     let write_pty_fn = lua
         .create_function(
-            move |_, (agent_index, pty_index, data): (usize, usize, LuaString)| {
+            move |_, (session_uuid, data): (String, LuaString)| {
                 send_pty_event(&tx2, PtyRequest::WritePty {
-                    agent_index,
-                    pty_index,
+                    session_uuid,
                     data: data.as_bytes().to_vec(),
                 });
                 Ok(())
@@ -835,14 +805,13 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
     hub.set("write_pty", write_pty_fn)
         .map_err(|e| anyhow!("Failed to set hub.write_pty: {e}"))?;
 
-    // hub.resize_pty(agent_index, pty_index, rows, cols)
+    // hub.resize_pty(session_uuid, rows, cols)
     let tx3 = hub_event_tx.clone();
     let resize_pty_fn = lua
         .create_function(
-            move |_, (agent_index, pty_index, rows, cols): (usize, usize, u16, u16)| {
+            move |_, (session_uuid, rows, cols): (String, u16, u16)| {
                 send_pty_event(&tx3, PtyRequest::ResizePty {
-                    agent_index,
-                    pty_index,
+                    session_uuid,
                     rows,
                     cols,
                 });
@@ -1018,10 +987,9 @@ mod tests {
         let lua = Lua::new();
 
         let forwarder = PtyForwarder {
-            id: "test-peer:0:0".to_string(),
+            id: "test-peer:sess-test-uuid".to_string(),
             peer_id: "test-peer".to_string(),
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "sess-test-uuid".to_string(),
             active: Arc::new(Mutex::new(true)),
         };
 
@@ -1029,7 +997,7 @@ mod tests {
 
         // Test id() method
         let id: String = lua.load("return forwarder:id()").eval().expect("Failed to get id");
-        assert_eq!(id, "test-peer:0:0");
+        assert_eq!(id, "test-peer:sess-test-uuid");
 
         // Test is_active() method
         let active: bool = lua.load("return forwarder:is_active()").eval().expect("Failed to check is_active");
@@ -1044,11 +1012,8 @@ mod tests {
         let peer_id: String = lua.load("return forwarder:peer_id()").eval().unwrap();
         assert_eq!(peer_id, "test-peer");
 
-        let agent_idx: usize = lua.load("return forwarder:agent_index()").eval().unwrap();
-        assert_eq!(agent_idx, 0);
-
-        let pty_idx: usize = lua.load("return forwarder:pty_index()").eval().unwrap();
-        assert_eq!(pty_idx, 0);
+        let uuid: String = lua.load("return forwarder:session_uuid()").eval().unwrap();
+        assert_eq!(uuid, "sess-test-uuid");
     }
 
     #[test]
@@ -1062,8 +1027,7 @@ mod tests {
             r#"
             forwarder = webrtc.create_pty_forwarder({
                 peer_id = "browser-123",
-                agent_index = 0,
-                pty_index = 1,
+                session_uuid = "sess-fwd-test",
                 subscription_id = "sub_1_1234567890",
             })
         "#,
@@ -1075,8 +1039,7 @@ mod tests {
         match event {
             HubEvent::LuaPtyRequest(PtyRequest::CreateForwarder(req)) => {
                 assert_eq!(req.peer_id, "browser-123");
-                assert_eq!(req.agent_index, 0);
-                assert_eq!(req.pty_index, 1);
+                assert_eq!(req.session_uuid, "sess-fwd-test");
                 assert_eq!(req.subscription_id, "sub_1_1234567890");
                 assert!(req.prefix.is_none());
             }
@@ -1084,7 +1047,7 @@ mod tests {
         }
 
         let id: String = lua.load("return forwarder:id()").eval().unwrap();
-        assert_eq!(id, "browser-123:0:1");
+        assert_eq!(id, "browser-123:sess-fwd-test");
     }
 
     #[test]
@@ -1098,8 +1061,7 @@ mod tests {
             r#"
             webrtc.create_pty_forwarder({
                 peer_id = "browser-456",
-                agent_index = 1,
-                pty_index = 0,
+                session_uuid = "sess-prefix-test",
                 subscription_id = "sub_2_9876543210",
                 prefix = "\x01",
             })
@@ -1124,19 +1086,17 @@ mod tests {
 
         super::register(&lua, tx).expect("Should register PTY primitives");
 
-        lua.load(r#"hub.write_pty(0, 1, "ls -la\n")"#)
+        lua.load(r#"hub.write_pty("sess-write-test", "ls -la\n")"#)
             .exec()
             .expect("Should write PTY");
 
         let event = rx.try_recv().expect("Should have received event");
         match event {
             HubEvent::LuaPtyRequest(PtyRequest::WritePty {
-                agent_index,
-                pty_index,
+                session_uuid,
                 data,
             }) => {
-                assert_eq!(agent_index, 0);
-                assert_eq!(pty_index, 1);
+                assert_eq!(session_uuid, "sess-write-test");
                 assert_eq!(data, b"ls -la\n");
             }
             _ => panic!("Expected LuaPtyRequest WritePty event"),
@@ -1150,20 +1110,18 @@ mod tests {
 
         super::register(&lua, tx).expect("Should register PTY primitives");
 
-        lua.load(r#"hub.resize_pty(0, 0, 40, 120)"#)
+        lua.load(r#"hub.resize_pty("sess-resize-test", 40, 120)"#)
             .exec()
             .expect("Should resize PTY");
 
         let event = rx.try_recv().expect("Should have received event");
         match event {
             HubEvent::LuaPtyRequest(PtyRequest::ResizePty {
-                agent_index,
-                pty_index,
+                session_uuid,
                 rows,
                 cols,
             }) => {
-                assert_eq!(agent_index, 0);
-                assert_eq!(pty_index, 0);
+                assert_eq!(session_uuid, "sess-resize-test");
                 assert_eq!(rows, 40);
                 assert_eq!(cols, 120);
             }
@@ -1180,9 +1138,9 @@ mod tests {
 
         lua.load(
             r#"
-            webrtc.create_pty_forwarder({ peer_id = "p1", agent_index = 0, pty_index = 0, subscription_id = "sub_1" })
-            hub.write_pty(0, 0, "test")
-            hub.resize_pty(0, 0, 24, 80)
+            webrtc.create_pty_forwarder({ peer_id = "p1", session_uuid = "sess-multi", subscription_id = "sub_1" })
+            hub.write_pty("sess-multi", "test")
+            hub.resize_pty("sess-multi", 24, 80)
         "#,
         )
         .exec()
@@ -1207,7 +1165,7 @@ mod tests {
         let result: mlua::Result<()> = lua
             .load(
                 r#"
-            webrtc.create_pty_forwarder({ agent_index = 0, pty_index = 0 })
+            webrtc.create_pty_forwarder({ session_uuid = "sess-x", subscription_id = "sub_1" })
         "#,
             )
             .exec();
@@ -1218,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_forwarder_requires_agent_index() {
+    fn test_create_forwarder_requires_session_uuid() {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
 
@@ -1227,7 +1185,7 @@ mod tests {
         let result: mlua::Result<()> = lua
             .load(
                 r#"
-            webrtc.create_pty_forwarder({ peer_id = "test", pty_index = 0, subscription_id = "sub_1" })
+            webrtc.create_pty_forwarder({ peer_id = "test", subscription_id = "sub_1" })
         "#,
             )
             .exec();
@@ -1235,8 +1193,8 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("agent_index"),
-            "Error should mention agent_index: {}",
+            err_msg.contains("session_uuid"),
+            "Error should mention session_uuid: {}",
             err_msg
         );
     }
@@ -1251,7 +1209,7 @@ mod tests {
         let result: mlua::Result<()> = lua
             .load(
                 r#"
-            webrtc.create_pty_forwarder({ peer_id = "test", agent_index = 0, pty_index = 0 })
+            webrtc.create_pty_forwarder({ peer_id = "test", session_uuid = "sess-x" })
         "#,
             )
             .exec();
@@ -1301,8 +1259,7 @@ mod tests {
         lua.load(
             r#"
             forwarder = tui.create_pty_forwarder({
-                agent_index = 0,
-                pty_index = 1,
+                session_uuid = "sess-tui-test",
                 subscription_id = "tui_term_1",
             })
         "#,
@@ -1313,8 +1270,7 @@ mod tests {
         let event = rx.try_recv().expect("Should have received event");
         match event {
             HubEvent::LuaPtyRequest(PtyRequest::CreateTuiForwarder(req)) => {
-                assert_eq!(req.agent_index, 0);
-                assert_eq!(req.pty_index, 1);
+                assert_eq!(req.session_uuid, "sess-tui-test");
                 assert_eq!(req.subscription_id, "tui_term_1");
             }
             _ => panic!("Expected LuaPtyRequest CreateTuiForwarder event"),
@@ -1322,7 +1278,7 @@ mod tests {
 
         // Verify forwarder handle
         let id: String = lua.load("return forwarder:id()").eval().unwrap();
-        assert_eq!(id, "tui:0:1");
+        assert_eq!(id, "tui:sess-tui-test");
 
         let peer: String = lua.load("return forwarder:peer_id()").eval().unwrap();
         assert_eq!(peer, "tui");
@@ -1332,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tui_create_pty_forwarder_requires_agent_index() {
+    fn test_tui_create_pty_forwarder_requires_session_uuid() {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
 
@@ -1345,7 +1301,7 @@ mod tests {
         let result: mlua::Result<()> = lua
             .load(
                 r#"
-            tui.create_pty_forwarder({ pty_index = 0, subscription_id = "sub_1" })
+            tui.create_pty_forwarder({ subscription_id = "sub_1" })
         "#,
             )
             .exec();
@@ -1353,8 +1309,8 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("agent_index"),
-            "Error should mention agent_index: {}",
+            err_msg.contains("session_uuid"),
+            "Error should mention session_uuid: {}",
             err_msg
         );
     }
@@ -1373,8 +1329,7 @@ mod tests {
         lua.load(
             r#"
             fwd = tui.create_pty_forwarder({
-                agent_index = 0,
-                pty_index = 0,
+                session_uuid = "sess-tui-stop",
                 subscription_id = "sub_tui",
             })
         "#,

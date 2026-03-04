@@ -40,10 +40,12 @@ end
 
 --- Get selected agent info from client-side agent cache.
 local function get_selected_agent()
-  local agents = _tui_state and _tui_state.agents or {}
-  local idx = _tui_state and _tui_state.selected_agent_index
-  if idx == nil then return nil end
-  return agents[idx + 1]  -- Lua 1-based
+  local uuid = _tui_state and _tui_state.selected_session_uuid
+  if not uuid then return nil end
+  for _, a in ipairs(_tui_state and _tui_state.agents or {}) do
+    if a.session_uuid == uuid then return a end
+  end
+  return nil
 end
 
 -- =============================================================================
@@ -226,22 +228,6 @@ local function build_menu_items(state)
   -- Agent section (only if agent selected)
   if sa then
     table.insert(items, { text = "── Agent ──", header = true })
-    local sessions = sa.sessions or {}
-    if #sessions > 1 then
-      for idx, session in ipairs(sessions) do
-        local name = type(session) == "table" and session.name or session
-        local label = string.upper(name)
-        if (idx - 1) == _tui_state.active_pty_index then
-          label = label .. " *"
-        end
-        table.insert(items, { text = label, action = "switch_session:" .. (idx - 1) })
-      end
-    end
-    table.insert(items, { text = "Add Session", action = "add_session" })
-    -- Only show Remove Session when there are sessions beyond the primary (index 0)
-    if #sessions > 1 then
-      table.insert(items, { text = "Remove Session", action = "remove_session" })
-    end
     table.insert(items, { text = "Close Agent", action = "close_agent" })
   end
 
@@ -293,48 +279,44 @@ function render(state)
     list_cursor = _tui_state.list_cursor_pos
   else
     list_items = build_agent_items(state)
-    -- Legacy cursor: selected_agent_index offset by creating indicator
-    list_cursor = _tui_state and _tui_state.selected_agent_index
-    if list_cursor and creating then
-      list_cursor = list_cursor + 1
+    -- Legacy cursor: find selected agent's position in list, offset by creating indicator
+    local uuid = _tui_state and _tui_state.selected_session_uuid
+    if uuid then
+      for i, a in ipairs(_tui_state and _tui_state.agents or {}) do
+        if a.session_uuid == uuid then
+          list_cursor = i - 1  -- 0-based
+          break
+        end
+      end
+      if list_cursor and creating then
+        list_cursor = list_cursor + 1
+      end
     end
   end
 
-  -- Terminal title: branch name, session view, scroll indicator, mode
+  -- Terminal title: branch name, session type, scroll indicator
   local term_title = " Terminal [No agent selected] "
   if sa then
-    local session_names = sa.sessions or {}
-    local pty_idx = _tui_state.active_pty_index or 0
-    local session_name = session_names[pty_idx + 1]
-    if type(session_name) == "table" then session_name = session_name.name end
-    session_name = session_name or "agent"
-    local session_label = string.upper(session_name)
-    -- Show forwarded port if this session has one
-    local session_info = sa.sessions and sa.sessions[pty_idx + 1]
-    if type(session_info) == "table" and session_info.port then
-      session_label = session_label .. " :" .. session_info.port
-    end
-    local view
-    local session_count = #session_names
-    if session_count > 1 then
-      view = "[" .. session_label .. " | Ctrl+]: next]"
-    else
-      view = "[" .. session_label .. "]"
+    local session_label = string.upper(sa.session_type or sa.session_name or "agent")
+    -- Show forwarded port if applicable
+    if sa.port then
+      session_label = session_label .. " :" .. sa.port
     end
     local scroll = ""
     if state.is_scrolled then
       scroll = string.format(" [SCROLLBACK +%d | Shift+End: live]", state.scroll_offset)
     end
     term_title = {
-      { text = string.format(" %s %s%s ", sa.branch_name or "main", view, scroll) },
+      { text = string.format(" %s [%s]%s ", sa.branch_name or "main", session_label, scroll) },
     }
   end
 
-  -- Build terminal panel: always show selected agent only
+  -- Build terminal panel: always show selected agent only (single PTY per agent)
+  -- Rust TUI still reads agent_index/pty_index from props, so resolve from session_uuid.
   local terminal_props = {}
-  if _tui_state and _tui_state.selected_agent_index then
-    terminal_props.agent_index = _tui_state.selected_agent_index
-    terminal_props.pty_index = _tui_state.active_pty_index or 0
+  if sa and sa.display_index ~= nil then
+    terminal_props.agent_index = sa.display_index
+    terminal_props.pty_index = 0
   end
   local terminal_panel = {
     type = "terminal",
@@ -482,53 +464,6 @@ function render_overlay(state)
           "Scan QR to connect securely",
           "Link used - [r] to pair new device",
           "[r] new link  [c] copy  [Esc] close",
-        },
-      },
-    }
-  elseif _tui_state.mode == "add_session_select_type" then
-    local type_items = {}
-    for _, t in ipairs(_tui_state.available_session_types or {}) do
-      local label = t.label or t.name
-      table.insert(type_items, { text = label, secondary = { { text = t.description or "", style = "dim" } } })
-    end
-    if #type_items == 0 then
-      type_items = { { text = "Loading...", style = "dim" } }
-    end
-    return {
-      type = "centered", width = 50, height = 30,
-      child = {
-        type = "list",
-        id = "session_type_list",
-        block = { title = " Add Session [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
-        props = {
-          items = type_items,
-        },
-      },
-    }
-  elseif _tui_state.mode == "remove_session_select" then
-    local sa = get_selected_agent()
-    local session_items = {}
-    if sa and sa.sessions then
-      for idx, session in ipairs(sa.sessions) do
-        -- Skip index 0 (primary agent session)
-        if idx > 1 then
-          local name = type(session) == "table" and session.name or session
-          local label = string.upper(name)
-          table.insert(session_items, { text = label })
-        end
-      end
-    end
-    if #session_items == 0 then
-      session_items = { { text = "No removable sessions", style = "dim" } }
-    end
-    return {
-      type = "centered", width = 50, height = 30,
-      child = {
-        type = "list",
-        id = "remove_session_list",
-        block = { title = " Remove Session [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
-        props = {
-          items = session_items,
         },
       },
     }

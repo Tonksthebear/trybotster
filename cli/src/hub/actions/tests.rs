@@ -120,23 +120,9 @@ fn test_agent_get_pty_handle_returns_valid_handle() {
         temp_dir.path().to_path_buf(),
     );
 
-    // CLI PTY (index 0) should always exist
-    let cli_handle = agent.get_pty_handle(0);
-    assert!(cli_handle.is_some(), "CLI PTY handle should exist");
-
-    // Server PTY (index 1) doesn't exist for un-spawned agent
-    let server_handle = agent.get_pty_handle(1);
-    assert!(server_handle.is_none(), "Server PTY handle should not exist");
-
-    // Invalid index
-    let invalid_handle = agent.get_pty_handle(99);
-    assert!(
-        invalid_handle.is_none(),
-        "Invalid PTY index should return None"
-    );
-
+    // Single PTY handle should be accessible
+    let handle = agent.get_pty_handle();
     // Verify we can subscribe to events through the handle
-    let handle = cli_handle.unwrap();
     let _rx = handle.subscribe();
 }
 

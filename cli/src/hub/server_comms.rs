@@ -358,19 +358,36 @@ impl Hub {
                     log::error!("[Socket] Lua message handling error for {}: {e}", client_id);
                 }
             }
-            HubEvent::SocketPtyInput { client_id, agent_index, pty_index, data } => {
-                // Track per-client focus state
-                if data == b"\x1b[I" {
-                    self.lua.set_pty_focused(agent_index, pty_index, &client_id, true);
-                } else if data == b"\x1b[O" {
-                    self.lua.set_pty_focused(agent_index, pty_index, &client_id, false);
-                }
-                self.lua.notify_pty_input(agent_index);
-                if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
-                    if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
-                        if let Err(e) = pty_handle.write_input_direct(&data) {
-                            log::error!("[Socket] PTY write failed for {}: {e}", client_id);
+            HubEvent::SocketPtyInput { client_id, session_uuid, data } => {
+                // Socket protocol still sends agent_index in Frame (Phase 8 scope).
+                // Bridge "index:N" format to real session handle via index-based lookup.
+                let (agent_index, session_handle) = if let Some(idx_str) = session_uuid.strip_prefix("index:") {
+                    let idx = match idx_str.parse::<usize>() {
+                        Ok(i) => i,
+                        Err(_) => {
+                            log::warn!("[Socket] SocketPtyInput: invalid index format '{}'", session_uuid);
+                            return;
                         }
+                    };
+                    (Some(idx), self.handle_cache.get_session_by_index(idx))
+                } else {
+                    let idx = self.handle_cache.index_of(&session_uuid);
+                    (idx, self.handle_cache.get_session(&session_uuid))
+                };
+
+                // Track per-client focus state via Lua (still uses agent_index)
+                if let Some(agent_index) = agent_index {
+                    if data == b"\x1b[I" {
+                        self.lua.set_pty_focused(agent_index, 0, &client_id, true);
+                    } else if data == b"\x1b[O" {
+                        self.lua.set_pty_focused(agent_index, 0, &client_id, false);
+                    }
+                    self.lua.notify_pty_input(agent_index);
+                }
+
+                if let Some(session_handle) = session_handle {
+                    if let Err(e) = session_handle.pty().write_input_direct(&data) {
+                        log::error!("[Socket] PTY write failed for {}: {e}", client_id);
                     }
                 }
             }
@@ -411,28 +428,20 @@ impl Hub {
                     PtyRequest::StopForwarder { forwarder_id } => {
                         self.stop_lua_pty_forwarder(&forwarder_id);
                     }
-                    PtyRequest::WritePty { agent_index, pty_index, data } => {
-                        if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
-                            if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
-                                if let Err(e) = pty_handle.write_input_direct(&data) {
-                                    log::error!("[PTY-WRITE] Write failed: {e}");
-                                }
-                            } else {
-                                log::warn!("[PTY-WRITE] No PTY at index {} for agent {}", pty_index, agent_index);
+                    PtyRequest::WritePty { session_uuid, data } => {
+                        if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
+                            if let Err(e) = session_handle.pty().write_input_direct(&data) {
+                                log::error!("[PTY-WRITE] Write failed: {e}");
                             }
                         } else {
-                            log::warn!("[PTY-WRITE] No agent at index {}", agent_index);
+                            log::warn!("[PTY-WRITE] No session '{}'", session_uuid);
                         }
                     }
-                    PtyRequest::ResizePty { agent_index, pty_index, rows, cols } => {
-                        if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
-                            if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
-                                pty_handle.resize_direct(rows, cols);
-                            } else {
-                                log::debug!("[Lua] No PTY at index {} for agent {}", pty_index, agent_index);
-                            }
+                    PtyRequest::ResizePty { session_uuid, rows, cols } => {
+                        if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
+                            session_handle.pty().resize_direct(rows, cols);
                         } else {
-                            log::debug!("[Lua] No agent at index {}", agent_index);
+                            log::debug!("[Lua] No session '{}'", session_uuid);
                         }
                     }
                     PtyRequest::SpawnNotificationWatcher { watcher_key, agent_key, session_name, event_tx } => {
@@ -703,32 +712,24 @@ impl Hub {
 
             // Store the session → agent mapping so BrokerPtyOutput can
             // be routed to the correct PtyHandle.
-            HubEvent::BrokerSessionRegistered { session_id, agent_key, pty_index } => {
+            HubEvent::BrokerSessionRegistered { session_id, session_uuid } => {
                 log::debug!(
-                    "[Broker] Session {} → '{}' pty={}",
-                    session_id, agent_key, pty_index
+                    "[Broker] Session {} → '{}'",
+                    session_id, session_uuid
                 );
-                self.broker_sessions.insert(session_id, (agent_key, pty_index));
+                self.broker_sessions.insert(session_id, session_uuid);
             }
 
-            // Route broker PTY output to the agent's shadow screen and
+            // Route broker PTY output to the session's shadow screen and
             // all subscribed forwarders (TUI, WebRTC, socket clients).
             HubEvent::BrokerPtyOutput { session_id, data } => {
-                if let Some((agent_key, pty_index)) = self.broker_sessions.get(&session_id) {
-                    if let Some(agent_handle) = self.handle_cache.get_agent_by_key(agent_key) {
-                        if let Some(pty_handle) = agent_handle.get_pty(*pty_index) {
-                            pty_handle.feed_broker_output(&data);
-                        } else {
-                            log::warn!(
-                                "[Broker] BrokerPtyOutput session={}: no PTY at index {} \
-                                 for agent '{}'",
-                                session_id, pty_index, agent_key
-                            );
-                        }
+                if let Some(session_uuid) = self.broker_sessions.get(&session_id) {
+                    if let Some(session_handle) = self.handle_cache.get_session(session_uuid) {
+                        session_handle.pty().feed_broker_output(&data);
                     } else {
                         log::debug!(
-                            "[Broker] BrokerPtyOutput session={}: agent '{}' not in cache",
-                            session_id, agent_key
+                            "[Broker] BrokerPtyOutput session={}: session '{}' not in cache",
+                            session_id, session_uuid
                         );
                     }
                 } else {
@@ -741,23 +742,23 @@ impl Hub {
 
             // NOT sent in broker v1 (reader thread exits silently on child
             // death). Retained for future use; logged but not acted upon.
-            HubEvent::BrokerPtyExited { session_id, agent_key, pty_index, exit_code } => {
+            HubEvent::BrokerPtyExited { session_id, session_uuid, exit_code } => {
                 log::info!(
-                    "[Broker] PtyExited session={} agent='{}' pty={} exit={:?}",
-                    session_id, agent_key, pty_index, exit_code
+                    "[Broker] PtyExited session={} uuid='{}' exit={:?}",
+                    session_id, session_uuid, exit_code
                 );
                 self.broker_sessions.remove(&session_id);
             }
 
-            HubEvent::AgentUnregistered { agent_key } => {
+            HubEvent::SessionUnregistered { session_uuid } => {
                 let before = self.broker_sessions.len();
-                self.broker_sessions.retain(|_, (key, _)| key != &agent_key);
+                self.broker_sessions.retain(|_, uuid| uuid != &session_uuid);
                 let removed = before - self.broker_sessions.len();
                 if removed > 0 {
                     log::debug!(
-                        "[Broker] Removed {} session(s) for unregistered agent '{}'",
+                        "[Broker] Removed {} session(s) for unregistered session '{}'",
                         removed,
-                        agent_key
+                        session_uuid
                     );
                 }
             }
@@ -881,15 +882,8 @@ impl Hub {
                 }
                 self.lua.notify_pty_input(agent_index);
                 if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
-                    if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
-                        if let Err(e) = pty_handle.write_input_direct(&data) {
-                            log::error!("[PTY-INPUT] Write failed: {e}");
-                        }
-                    } else {
-                        log::warn!(
-                            "[PTY-INPUT] No PTY at index {} for agent {} (key={})",
-                            pty_index, agent_index, agent_handle.agent_key()
-                        );
+                    if let Err(e) = agent_handle.pty().write_input_direct(&data) {
+                        log::error!("[PTY-INPUT] Write failed: {e}");
                     }
                 } else {
                     log::warn!(
@@ -912,10 +906,8 @@ impl Hub {
         }
         self.lua.notify_pty_input(input.agent_index);
         if let Some(agent_handle) = self.handle_cache.get_agent(input.agent_index) {
-            if let Some(pty_handle) = agent_handle.get_pty(input.pty_index) {
-                if let Err(e) = pty_handle.write_input_direct(&input.data) {
-                    log::error!("[PTY-INPUT] Write failed: {e}");
-                }
+            if let Err(e) = agent_handle.pty().write_input_direct(&input.data) {
+                log::error!("[PTY-INPUT] Write failed: {e}");
             }
         }
     }
@@ -972,11 +964,9 @@ impl Hub {
                 .or_default()
                 .push(path.clone());
 
-            if let Some(pty_handle) = agent_handle.get_pty(file.pty_index) {
-                let path_with_space = format!("{} ", path.display());
-                if let Err(e) = pty_handle.write_input_direct(path_with_space.as_bytes()) {
-                    log::error!("[FILE-INPUT] Failed to inject path into PTY: {e}");
-                }
+            let path_with_space = format!("{} ", path.display());
+            if let Err(e) = agent_handle.pty().write_input_direct(path_with_space.as_bytes()) {
+                log::error!("[FILE-INPUT] Failed to inject path into PTY: {e}");
             }
         }
     }
@@ -2168,25 +2158,17 @@ impl Hub {
     ///
     /// Spawns a new forwarder task that streams PTY output to WebRTC.
     fn create_lua_pty_forwarder(&mut self, req: crate::lua::CreateForwarderRequest) {
-        let forwarder_key = format!("{}:{}:{}", req.peer_id, req.agent_index, req.pty_index);
+        let forwarder_key = format!("{}:{}", req.peer_id, req.session_uuid);
 
-        // Check if agent and PTY exist
-        let Some(agent_handle) = self.handle_cache.get_agent(req.agent_index) else {
-            log::warn!("[Lua] Cannot create forwarder: no agent at index {}", req.agent_index);
+        // Check if session exists
+        let Some(session_handle) = self.handle_cache.get_session(&req.session_uuid) else {
+            log::warn!("[Lua] Cannot create forwarder: no session '{}'", req.session_uuid);
             // Mark forwarder as inactive
             *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
             return;
         };
 
-        let Some(pty_handle) = agent_handle.get_pty(req.pty_index) else {
-            log::warn!(
-                "[Lua] Cannot create forwarder: no PTY at index {} for agent {}",
-                req.pty_index,
-                req.agent_index
-            );
-            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
-            return;
-        };
+        let pty_handle = session_handle.pty();
 
         // Abort any existing forwarder for this key
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
@@ -2204,8 +2186,7 @@ impl Hub {
         let output_tx = self.webrtc_pty_output_tx.clone();
         let hub_event_tx = self.hub_event_tx.clone();
         let peer_id = req.peer_id.clone();
-        let agent_index = req.agent_index;
-        let pty_index = req.pty_index;
+        let session_uuid = req.session_uuid.clone();
         let prefix = req.prefix.unwrap_or_else(|| vec![0x01]);
         let active_flag = req.active_flag;
 
@@ -2217,10 +2198,9 @@ impl Hub {
             use crate::agent::pty::PtyEvent;
 
             log::info!(
-                "[Lua] Started PTY forwarder for peer {} agent {} pty {}",
+                "[Lua] Started PTY forwarder for peer {} session {}",
                 &peer_id[..peer_id.len().min(8)],
-                agent_index,
-                pty_index
+                session_uuid
             );
 
             // Send terminal snapshot first (if any), chunked to fit within
@@ -2237,12 +2217,11 @@ impl Hub {
                 let num_chunks = (snapshot.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
                 let snapshot_id: u32 = rand::random();
                 log::debug!(
-                    "[Lua] Sending {} bytes of snapshot in {} chunks (id={:#010x}) for agent {} pty {}",
+                    "[Lua] Sending {} bytes of snapshot in {} chunks (id={:#010x}) for session {}",
                     snapshot.len(),
                     num_chunks,
                     snapshot_id,
-                    agent_index,
-                    pty_index
+                    session_uuid
                 );
 
                 for (i, chunk) in snapshot.chunks(CHUNK_SIZE).enumerate() {
@@ -2258,8 +2237,7 @@ impl Hub {
                         subscription_id: subscription_id.clone(),
                         browser_identity: peer_id.clone(),
                         data: raw_message,
-                        agent_index,
-                        pty_index,
+                        session_uuid: session_uuid.clone(),
                     }) {
                         Ok(()) => {}
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -2303,8 +2281,7 @@ impl Hub {
                             subscription_id: subscription_id.clone(),
                             browser_identity: peer_id.clone(),
                             data: raw_message,
-                            agent_index,
-                            pty_index,
+                            session_uuid: session_uuid.clone(),
                         }) {
                             Ok(()) => {}
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -2326,12 +2303,10 @@ impl Hub {
                     }
                     Ok(PtyEvent::ProcessExited { exit_code }) => {
                         log::info!(
-                            "[Lua] PTY process exited (code={:?}) for agent {} pty {}",
+                            "[Lua] PTY process exited (code={:?}) for session {}",
                             exit_code,
-                            agent_index,
-                            pty_index
+                            session_uuid
                         );
-                        // Could send exit notification here
                         break;
                     }
                     Ok(_other_event) => {
@@ -2339,17 +2314,15 @@ impl Hub {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!(
-                            "[Lua] PTY forwarder lagged by {} events for agent {} pty {}",
+                            "[Lua] PTY forwarder lagged by {} events for session {}",
                             n,
-                            agent_index,
-                            pty_index
+                            session_uuid
                         );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         log::info!(
-                            "[Lua] PTY channel closed for agent {} pty {}",
-                            agent_index,
-                            pty_index
+                            "[Lua] PTY channel closed for session {}",
+                            session_uuid
                         );
                         break;
                     }
@@ -2360,10 +2333,9 @@ impl Hub {
             *active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
 
             log::info!(
-                "[Lua] Stopped PTY forwarder for peer {} agent {} pty {}",
+                "[Lua] Stopped PTY forwarder for peer {} session {}",
                 &peer_id[..peer_id.len().min(8)],
-                agent_index,
-                pty_index
+                session_uuid
             );
         });
 
@@ -2377,23 +2349,16 @@ impl Hub {
     fn create_lua_tui_pty_forwarder(&mut self, req: crate::lua::primitives::CreateTuiForwarderRequest) {
         use crate::client::TuiOutput;
 
-        let forwarder_key = format!("tui:{}:{}", req.agent_index, req.pty_index);
+        let forwarder_key = format!("tui:{}", req.session_uuid);
 
-        // Check if agent and PTY exist
-        let Some(agent_handle) = self.handle_cache.get_agent(req.agent_index) else {
-            log::warn!("[Lua-TUI] Cannot create forwarder: no agent at index {}", req.agent_index);
+        // Check if session exists
+        let Some(session_handle) = self.handle_cache.get_session(&req.session_uuid) else {
+            log::warn!("[Lua-TUI] Cannot create forwarder: no session '{}'", req.session_uuid);
             *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
             return;
         };
 
-        let Some(pty_handle) = agent_handle.get_pty(req.pty_index) else {
-            log::warn!(
-                "[Lua-TUI] Cannot create forwarder: no PTY at index {} for agent {}",
-                req.pty_index, req.agent_index
-            );
-            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
-            return;
-        };
+        let pty_handle = session_handle.pty();
 
         let Some(ref output_tx) = self.tui_output_tx else {
             log::warn!("[Lua-TUI] Cannot create forwarder: no TUI output channel");
@@ -2413,8 +2378,8 @@ impl Hub {
         let pty_rx = pty_handle.subscribe();
 
         let sink = output_tx.clone();
-        let agent_index = req.agent_index;
-        let pty_index = req.pty_index;
+        let session_uuid = req.session_uuid.clone();
+        let agent_index = self.handle_cache.index_of(&req.session_uuid);
         let active_flag = req.active_flag;
         let wake_fd = self.tui_wake_fd;
 
@@ -2423,19 +2388,19 @@ impl Hub {
             use crate::agent::pty::PtyEvent;
 
             log::info!(
-                "[Lua-TUI] Started PTY forwarder for agent {} pty {}",
-                agent_index, pty_index
+                "[Lua-TUI] Started PTY forwarder for session {}",
+                session_uuid
             );
 
             // Send terminal snapshot first (if any)
             if !snapshot.is_empty() {
                 log::debug!(
-                    "[Lua-TUI] Sending {} bytes of snapshot for agent {} pty {}",
-                    snapshot.len(), agent_index, pty_index
+                    "[Lua-TUI] Sending {} bytes of snapshot for session {}",
+                    snapshot.len(), session_uuid
                 );
                 if sink.send(TuiOutput::Scrollback {
-                    agent_index: Some(agent_index),
-                    pty_index: Some(pty_index),
+                    agent_index,
+                    pty_index: Some(0),
                     data: snapshot,
                     kitty_enabled,
                 }).is_err() {
@@ -2475,8 +2440,8 @@ impl Hub {
                             }
                         }
                         if sink.send(TuiOutput::OutputBatch {
-                            agent_index: Some(agent_index),
-                            pty_index: Some(pty_index),
+                            agent_index,
+                            pty_index: Some(0),
                             chunks,
                         }).is_err() {
                             log::trace!("[Lua-TUI] Output channel closed, stopping forwarder");
@@ -2491,12 +2456,12 @@ impl Hub {
                             match event {
                                 PtyEvent::ProcessExited { exit_code } => {
                                     log::info!(
-                                        "[Lua-TUI] PTY process exited (code={:?}) for agent {} pty {} (stashed)",
-                                        exit_code, agent_index, pty_index
+                                        "[Lua-TUI] PTY process exited (code={:?}) for session {} (stashed)",
+                                        exit_code, session_uuid
                                     );
                                     let _ = sink.send(TuiOutput::ProcessExited {
-                                        agent_index: Some(agent_index),
-                                        pty_index: Some(pty_index),
+                                        agent_index,
+                                        pty_index: Some(0),
                                         exit_code,
                                     });
                                     if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
@@ -2506,16 +2471,14 @@ impl Hub {
                                     let _ = sink.send(TuiOutput::Message(serde_json::json!({
                                         "type": "kitty_changed",
                                         "enabled": enabled,
-                                        "agent_index": agent_index,
-                                        "pty_index": pty_index,
+                                        "session_uuid": session_uuid,
                                     })));
                                     if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
                                 }
                                 PtyEvent::FocusRequested => {
                                     let _ = sink.send(TuiOutput::Message(serde_json::json!({
                                         "type": "focus_requested",
-                                        "agent_index": agent_index,
-                                        "pty_index": pty_index,
+                                        "session_uuid": session_uuid,
                                     })));
                                     if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
                                 }
@@ -2526,12 +2489,12 @@ impl Hub {
                     }
                     Ok(PtyEvent::ProcessExited { exit_code }) => {
                         log::info!(
-                            "[Lua-TUI] PTY process exited (code={:?}) for agent {} pty {}",
-                            exit_code, agent_index, pty_index
+                            "[Lua-TUI] PTY process exited (code={:?}) for session {}",
+                            exit_code, session_uuid
                         );
                         let _ = sink.send(TuiOutput::ProcessExited {
-                            agent_index: Some(agent_index),
-                            pty_index: Some(pty_index),
+                            agent_index,
+                            pty_index: Some(0),
                             exit_code,
                         });
                         if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
@@ -2541,30 +2504,28 @@ impl Hub {
                         let _ = sink.send(TuiOutput::Message(serde_json::json!({
                             "type": "kitty_changed",
                             "enabled": enabled,
-                            "agent_index": agent_index,
-                            "pty_index": pty_index,
+                            "session_uuid": session_uuid,
                         })));
                         if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
                     }
                     Ok(PtyEvent::FocusRequested) => {
                         let _ = sink.send(TuiOutput::Message(serde_json::json!({
                             "type": "focus_requested",
-                            "agent_index": agent_index,
-                            "pty_index": pty_index,
+                            "session_uuid": session_uuid,
                         })));
                         if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!(
-                            "[Lua-TUI] PTY forwarder lagged by {} events for agent {} pty {}",
-                            n, agent_index, pty_index
+                            "[Lua-TUI] PTY forwarder lagged by {} events for session {}",
+                            n, session_uuid
                         );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         log::info!(
-                            "[Lua-TUI] PTY channel closed for agent {} pty {}",
-                            agent_index, pty_index
+                            "[Lua-TUI] PTY channel closed for session {}",
+                            session_uuid
                         );
                         break;
                     }
@@ -2575,8 +2536,8 @@ impl Hub {
             *active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
 
             log::info!(
-                "[Lua-TUI] Stopped PTY forwarder for agent {} pty {}",
-                agent_index, pty_index
+                "[Lua-TUI] Stopped PTY forwarder for session {}",
+                session_uuid
             );
         });
 
@@ -2590,22 +2551,15 @@ impl Hub {
     fn create_lua_socket_pty_forwarder(&mut self, req: crate::lua::primitives::CreateSocketForwarderRequest) {
         use crate::socket::framing::Frame;
 
-        let forwarder_key = format!("{}:{}:{}", req.client_id, req.agent_index, req.pty_index);
+        let forwarder_key = format!("{}:{}", req.client_id, req.session_uuid);
 
-        let Some(agent_handle) = self.handle_cache.get_agent(req.agent_index) else {
-            log::warn!("[Lua-Socket] Cannot create forwarder: no agent at index {}", req.agent_index);
+        let Some(session_handle) = self.handle_cache.get_session(&req.session_uuid) else {
+            log::warn!("[Lua-Socket] Cannot create forwarder: no session '{}'", req.session_uuid);
             *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
             return;
         };
 
-        let Some(pty_handle) = agent_handle.get_pty(req.pty_index) else {
-            log::warn!(
-                "[Lua-Socket] Cannot create forwarder: no PTY at index {} for agent {}",
-                req.pty_index, req.agent_index
-            );
-            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
-            return;
-        };
+        let pty_handle = session_handle.pty();
 
         let Some(conn) = self.socket_clients.get(&req.client_id) else {
             log::warn!("[Lua-Socket] Cannot create forwarder: no socket client {}", req.client_id);
@@ -2626,8 +2580,8 @@ impl Hub {
 
         // Clone the frame sender from the connection — we only need to send encoded frames.
         let frame_tx = conn.frame_sender();
-        let agent_index = req.agent_index;
-        let pty_index = req.pty_index;
+        let session_uuid = req.session_uuid.clone();
+        let agent_index = self.handle_cache.index_of(&req.session_uuid).unwrap_or(0) as u16;
         let active_flag = req.active_flag;
         let client_id = req.client_id.clone();
         let hub_event_tx = self.hub_event_tx.clone();
@@ -2637,15 +2591,15 @@ impl Hub {
             use crate::agent::pty::PtyEvent;
 
             log::info!(
-                "[Lua-Socket] Started PTY forwarder for {} agent {} pty {}",
-                client_id, agent_index, pty_index
+                "[Lua-Socket] Started PTY forwarder for {} session {}",
+                client_id, session_uuid
             );
 
             // Send scrollback snapshot first
             if !snapshot.is_empty() {
                 let frame = Frame::Scrollback {
-                    agent_index: agent_index as u16,
-                    pty_index: pty_index as u16,
+                    agent_index,
+                    pty_index: 0,
                     kitty_enabled,
                     data: snapshot,
                 };
@@ -2681,8 +2635,8 @@ impl Hub {
                 match pty_rx.recv().await {
                     Ok(PtyEvent::Output(data)) => {
                         let frame = Frame::PtyOutput {
-                            agent_index: agent_index as u16,
-                            pty_index: pty_index as u16,
+                            agent_index,
+                            pty_index: 0,
                             data,
                         };
                         match frame_tx.try_send(frame.encode()) {
@@ -2705,46 +2659,43 @@ impl Hub {
                     }
                     Ok(PtyEvent::ProcessExited { exit_code }) => {
                         log::info!(
-                            "[Lua-Socket] PTY process exited (code={:?}) for {} agent {} pty {}",
-                            exit_code, client_id, agent_index, pty_index
+                            "[Lua-Socket] PTY process exited (code={:?}) for {} session {}",
+                            exit_code, client_id, session_uuid
                         );
                         let frame = Frame::ProcessExited {
-                            agent_index: agent_index as u16,
-                            pty_index: pty_index as u16,
+                            agent_index,
+                            pty_index: 0,
                             exit_code,
                         };
                         let _ = frame_tx.try_send(frame.encode());
                         break;
                     }
                     Ok(PtyEvent::KittyChanged(enabled)) => {
-                        // Send as JSON event (same as TUI forwarder)
                         let frame = Frame::Json(serde_json::json!({
                             "type": "kitty_changed",
                             "enabled": enabled,
-                            "agent_index": agent_index,
-                            "pty_index": pty_index,
+                            "session_uuid": session_uuid,
                         }));
                         let _ = frame_tx.try_send(frame.encode());
                     }
                     Ok(PtyEvent::FocusRequested) => {
                         let frame = Frame::Json(serde_json::json!({
                             "type": "focus_requested",
-                            "agent_index": agent_index,
-                            "pty_index": pty_index,
+                            "session_uuid": session_uuid,
                         }));
                         let _ = frame_tx.try_send(frame.encode());
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!(
-                            "[Lua-Socket] PTY forwarder lagged by {} events for {} agent {} pty {}",
-                            n, client_id, agent_index, pty_index
+                            "[Lua-Socket] PTY forwarder lagged by {} events for {} session {}",
+                            n, client_id, session_uuid
                         );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         log::info!(
-                            "[Lua-Socket] PTY channel closed for {} agent {} pty {}",
-                            client_id, agent_index, pty_index
+                            "[Lua-Socket] PTY channel closed for {} session {}",
+                            client_id, session_uuid
                         );
                         break;
                     }
@@ -2754,8 +2705,8 @@ impl Hub {
             *active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
 
             log::info!(
-                "[Lua-Socket] Stopped PTY forwarder for {} agent {} pty {}",
-                client_id, agent_index, pty_index
+                "[Lua-Socket] Stopped PTY forwarder for {} session {}",
+                client_id, session_uuid
             );
         });
 
@@ -2781,11 +2732,11 @@ impl Hub {
         let Some(ref mut rx) = self.pty_input_rx else { return; };
         let inputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for input in inputs {
-            if let Some(agent_handle) = self.handle_cache.get_agent(input.agent_index) {
-                if let Some(pty_handle) = agent_handle.get_pty(input.pty_index) {
-                    if let Err(e) = pty_handle.write_input_direct(&input.data) {
-                        log::error!("[PTY-INPUT] Write failed: {e}");
-                    }
+            // PtyInputIncoming still uses agent_index (Phase 8 scope).
+            // Bridge via index-based lookup to get the session handle.
+            if let Some(agent_handle) = self.handle_cache.get_session_by_index(input.agent_index) {
+                if let Err(e) = agent_handle.pty().write_input_direct(&input.data) {
+                    log::error!("[PTY-INPUT] Write failed: {e}");
                 }
             }
         }
@@ -3101,9 +3052,16 @@ impl Hub {
             self.pty_output_messages_drained += 1;
         }
 
+        let agent_index = match self.handle_cache.index_of(&msg.session_uuid) {
+            Some(idx) => idx,
+            None => {
+                log::warn!("PTY output for unknown session {}, skipping", msg.session_uuid);
+                return;
+            }
+        };
         let ctx = PtyOutputContext {
-            agent_index: msg.agent_index,
-            pty_index: msg.pty_index,
+            agent_index,
+            pty_index: 0,
             peer_id: msg.browser_identity.clone(),
         };
 
@@ -3178,9 +3136,16 @@ impl Hub {
                 continue;
             }
 
+            let agent_index = match self.handle_cache.index_of(&msg.session_uuid) {
+                Some(idx) => idx,
+                None => {
+                    log::warn!("PTY output for unknown session {}, skipping", msg.session_uuid);
+                    continue;
+                }
+            };
             let ctx = PtyOutputContext {
-                agent_index: msg.agent_index,
-                pty_index: msg.pty_index,
+                agent_index,
+                pty_index: 0,
                 peer_id: msg.browser_identity.clone(),
             };
 
@@ -3279,23 +3244,17 @@ impl Hub {
                 }
                 TuiRequest::PtyInput {
                     agent_index,
-                    pty_index,
+                    pty_index: _,
                     data,
                 } => {
-                    if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
-                        if let Some(pty_handle) = agent_handle.get_pty(pty_index) {
-                            if let Err(e) = pty_handle.write_input_direct(&data) {
-                                log::error!("[PTY-INPUT] Write failed: {e}");
-                            }
-                        } else {
-                            log::warn!(
-                                "[PTY-INPUT] No PTY at index {} for agent {}",
-                                pty_index,
-                                agent_index
-                            );
+                    // TuiRequest still uses agent_index/pty_index (Phase 7 scope).
+                    // Bridge via index-based lookup.
+                    if let Some(session_handle) = self.handle_cache.get_session_by_index(agent_index) {
+                        if let Err(e) = session_handle.pty().write_input_direct(&data) {
+                            log::error!("[PTY-INPUT] Write failed: {e}");
                         }
                     } else {
-                        log::warn!("[PTY-INPUT] No agent at index {}", agent_index);
+                        log::warn!("[PTY-INPUT] No session at index {}", agent_index);
                     }
                 }
             }
@@ -4598,8 +4557,7 @@ mod tests {
             subscription_id: "sub_test".to_string(),
             browser_identity: "test-browser-identity".to_string(),
             data: vec![0x01, 0x41, 0x42, 0x43], // "ABC"
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "sess-test".to_string(),
         };
 
         // Step 1: PTY forwarder sends output
@@ -4650,8 +4608,7 @@ mod tests {
                     subscription_id: "sub_test".to_string(),
                     browser_identity: "test-browser-identity".to_string(),
                     data: vec![0x01, 0x41 + i],
-                    agent_index: 0,
-                    pty_index: 0,
+                    session_uuid: "sess-test".to_string(),
                 })
                 .unwrap();
         }
