@@ -202,11 +202,7 @@ impl SocketClientConn {
                 client_id: client_id.to_string(),
                 msg,
             },
-            Frame::PtyInput { agent_index, pty_index: _, data } => {
-                // Socket protocol still sends agent_index/pty_index in Frame (Phase 8 scope).
-                // Convert to session_uuid via index-based lookup in HandleCache.
-                // For now, use index-based placeholder that server_comms resolves.
-                let session_uuid = format!("index:{}", agent_index);
+            Frame::PtyInput { session_uuid, data } => {
                 HubEvent::SocketPtyInput {
                     client_id: client_id.to_string(),
                     session_uuid,

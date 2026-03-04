@@ -134,20 +134,19 @@ impl TerminalPanel {
     ///
     /// Returns a subscribe JSON message for the caller to send.
     /// No-op if already `Connecting` or `Connected`.
-    pub fn connect(&mut self, agent_idx: usize, pty_idx: usize) -> Option<serde_json::Value> {
+    pub fn connect(&mut self, session_uuid: &str) -> Option<serde_json::Value> {
         if self.state != PanelState::Idle {
             return None;
         }
         self.state = PanelState::Connecting;
         let (rows, cols) = self.dims;
-        let sub_id = sub_id(agent_idx, pty_idx);
+        let sub_id = sub_id(session_uuid);
         Some(serde_json::json!({
             "type": "subscribe",
             "channel": "terminal",
             "subscriptionId": sub_id,
             "params": {
-                "agent_index": agent_idx,
-                "pty_index": pty_idx,
+                "session_uuid": session_uuid,
                 "rows": rows,
                 "cols": cols,
             }
@@ -157,12 +156,12 @@ impl TerminalPanel {
     /// Unsubscribe from the PTY, transitioning to `Idle`.
     ///
     /// Returns an unsubscribe JSON message. No-op if already `Idle`.
-    pub fn disconnect(&mut self, agent_idx: usize, pty_idx: usize) -> Option<serde_json::Value> {
+    pub fn disconnect(&mut self, session_uuid: &str) -> Option<serde_json::Value> {
         if self.state == PanelState::Idle {
             return None;
         }
         self.state = PanelState::Idle;
-        let sub_id = sub_id(agent_idx, pty_idx);
+        let sub_id = sub_id(session_uuid);
         Some(serde_json::json!({
             "type": "unsubscribe",
             "subscriptionId": sub_id,
@@ -211,8 +210,7 @@ impl TerminalPanel {
         &mut self,
         rows: u16,
         cols: u16,
-        agent_idx: usize,
-        pty_idx: usize,
+        session_uuid: &str,
     ) -> Option<serde_json::Value> {
         if (rows, cols) == self.dims || rows < 2 || cols == 0 {
             return None;
@@ -223,7 +221,7 @@ impl TerminalPanel {
         if self.state == PanelState::Idle {
             return None;
         }
-        let sub_id = sub_id(agent_idx, pty_idx);
+        let sub_id = sub_id(session_uuid);
         Some(serde_json::json!({
             "subscriptionId": sub_id,
             "data": { "type": "resize", "rows": rows, "cols": cols }
@@ -290,9 +288,9 @@ impl TerminalPanel {
     }
 }
 
-/// Build the subscription ID string for a `(agent, pty)` pair.
-fn sub_id(agent_idx: usize, pty_idx: usize) -> String {
-    format!("tui:{agent_idx}:{pty_idx}")
+/// Build the subscription ID string for a session UUID.
+fn sub_id(session_uuid: &str) -> String {
+    format!("tui:{session_uuid}")
 }
 
 #[cfg(test)]
@@ -310,13 +308,13 @@ mod tests {
     #[test]
     fn connect_transitions_idle_to_connecting() {
         let mut panel = TerminalPanel::new(24, 80);
-        let msg = panel.connect(0, 0);
+        let msg = panel.connect("sess-0");
         assert!(msg.is_some());
         assert_eq!(panel.state(), PanelState::Connecting);
 
         let msg = msg.unwrap();
         assert_eq!(msg["type"], "subscribe");
-        assert_eq!(msg["params"]["agent_index"], 0);
+        assert_eq!(msg["params"]["session_uuid"], "sess-0");
         assert_eq!(msg["params"]["rows"], 24);
         assert_eq!(msg["params"]["cols"], 80);
     }
@@ -324,11 +322,11 @@ mod tests {
     #[test]
     fn connect_is_noop_when_not_idle() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
         assert_eq!(panel.state(), PanelState::Connecting);
 
         // Second connect is a no-op
-        let msg = panel.connect(0, 0);
+        let msg = panel.connect("sess-0");
         assert!(msg.is_none());
         assert_eq!(panel.state(), PanelState::Connecting);
     }
@@ -336,7 +334,7 @@ mod tests {
     #[test]
     fn on_scrollback_transitions_to_connected() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
         panel.on_scrollback(b"Hello, World!");
         assert_eq!(panel.state(), PanelState::Connected);
 
@@ -356,7 +354,7 @@ mod tests {
     #[test]
     fn on_output_accepted_when_connecting() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
         panel.on_output(b"data");
 
         let cell = &panel.term().grid()[Point::new(Line(0), Column(0))];
@@ -366,11 +364,11 @@ mod tests {
     #[test]
     fn disconnect_transitions_to_idle() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
         panel.on_scrollback(b"data");
         assert_eq!(panel.state(), PanelState::Connected);
 
-        let msg = panel.disconnect(0, 0);
+        let msg = panel.disconnect("sess-0");
         assert!(msg.is_some());
         assert_eq!(panel.state(), PanelState::Idle);
         assert_eq!(msg.unwrap()["type"], "unsubscribe");
@@ -379,16 +377,16 @@ mod tests {
     #[test]
     fn disconnect_is_noop_when_idle() {
         let mut panel = TerminalPanel::new(24, 80);
-        let msg = panel.disconnect(0, 0);
+        let msg = panel.disconnect("sess-0");
         assert!(msg.is_none());
     }
 
     #[test]
     fn resize_sends_message_when_subscribed_and_dims_changed() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
 
-        let msg = panel.resize(30, 100, 0, 0);
+        let msg = panel.resize(30, 100, "sess-0");
         assert!(msg.is_some());
         assert_eq!(panel.dims(), (30, 100));
 
@@ -401,7 +399,7 @@ mod tests {
     #[test]
     fn resize_no_message_when_idle() {
         let mut panel = TerminalPanel::new(24, 80);
-        let msg = panel.resize(30, 100, 0, 0);
+        let msg = panel.resize(30, 100, "sess-0");
         assert!(msg.is_none());
         // Dims still update even when idle
         assert_eq!(panel.dims(), (30, 100));
@@ -410,40 +408,40 @@ mod tests {
     #[test]
     fn resize_no_message_when_dims_unchanged() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
-        let msg = panel.resize(24, 80, 0, 0);
+        panel.connect("sess-0");
+        let msg = panel.resize(24, 80, "sess-0");
         assert!(msg.is_none());
     }
 
     #[test]
     fn resize_rejects_too_small() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
 
         // rows < 2
-        assert!(panel.resize(1, 80, 0, 0).is_none());
+        assert!(panel.resize(1, 80, "sess-0").is_none());
         assert_eq!(panel.dims(), (24, 80));
 
         // cols == 0
-        assert!(panel.resize(24, 0, 0, 0).is_none());
+        assert!(panel.resize(24, 0, "sess-0").is_none());
         assert_eq!(panel.dims(), (24, 80));
     }
 
     #[test]
     fn invalidate_dims_forces_next_resize() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
         panel.invalidate_dims();
 
         // Same original dims now detected as changed
-        let msg = panel.resize(24, 80, 0, 0);
+        let msg = panel.resize(24, 80, "sess-0");
         assert!(msg.is_some());
     }
 
     #[test]
     fn scrollback_clears_parser_before_writing() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
         panel.on_output(b"old content");
         panel.on_scrollback(b"new snapshot");
 
@@ -464,7 +462,7 @@ mod tests {
     #[test]
     fn on_output_clears_scrollback_on_csi_3j() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
 
         // Write enough lines to create scrollback.
         for i in 0..30 {
@@ -494,7 +492,7 @@ mod tests {
     #[test]
     fn scroll_up_and_down() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
 
         // Write enough lines to create scrollback.
         for i in 0..50 {
@@ -517,7 +515,7 @@ mod tests {
     #[test]
     fn scroll_to_top_clamps_to_depth() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
 
         for i in 0..50 {
             panel.on_output(format!("line {i}\r\n").as_bytes());
@@ -531,7 +529,7 @@ mod tests {
     #[test]
     fn scroll_up_clamped_to_scrollback_depth() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
 
         for i in 0..30 {
             panel.on_output(format!("line {i}\r\n").as_bytes());
@@ -546,7 +544,7 @@ mod tests {
     #[test]
     fn scroll_down_does_not_go_negative() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
         panel.scroll_down(100);
         assert_eq!(panel.scroll_offset(), 0);
     }
@@ -554,7 +552,7 @@ mod tests {
     #[test]
     fn scrollback_resets_scroll_on_reconnect() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.connect(0, 0);
+        panel.connect("sess-0");
 
         for i in 0..30 {
             panel.on_output(format!("line {i}\r\n").as_bytes());

@@ -90,15 +90,8 @@ To replace the layout entirely, just redefine render:
           type = "terminal",
           block = { title = " Terminal ", borders = "all" },
           props = (function()
-            -- Resolve display_index from selected session_uuid
             local uuid = _tui_state and _tui_state.selected_session_uuid
-            if not uuid then return { agent_index = 0, pty_index = 0 } end
-            for _, a in ipairs(_tui_state.agents or {}) do
-              if a.session_uuid == uuid then
-                return { agent_index = a.display_index or 0, pty_index = 0 }
-              end
-            end
-            return { agent_index = 0, pty_index = 0 }
+            return { session_uuid = uuid }
           end)(),
         },
       },
@@ -136,7 +129,7 @@ Read agent and UI state from the _tui_state global inside render():
   { type = "list",      block = {...}, props = { items = {...}, selected = N } }
   { type = "paragraph", block = {...}, props = { lines = {...}, alignment = "center" } }
   { type = "input",     block = {...}, props = { lines = {...}, placeholder = "..." } }
-  { type = "terminal",  block = {...}, props = { agent_index = N, pty_index = 0 } }  -- agent_index = display_index from agent info
+  { type = "terminal",  block = {...}, props = { session_uuid = "uuid-string" } }  -- session_uuid from agent info
   { type = "empty",     block = {...} }
 
   Constraints: "30%" | "30" (fixed cols) | "min:10" | "max:80"

@@ -63,15 +63,14 @@
   <div id="preview-connection"
        data-controller="preview"
        data-preview-hub-id-value="<%= Current.hub.id %>"
-       data-preview-agent-index-value="<%= Current.agent_index %>"
-       data-preview-pty-index-value="<%= Current.pty_index %>"
+       data-preview-session-uuid-value="<%= Current.session_uuid %>"
        data-preview-scope-value="<%= @scope %>"
        data-preview-initial-url-value="/">
 
     <%# Status bar %>
     <div class="status-bar">
       <span data-preview-target="status" class="status-text">Connecting...</span>
-      <a href="<%= hub_agent_path(Current.hub, Current.agent_index) %>"
+      <a href="<%= hub_session_path(Current.hub, Current.session_uuid) %>"
          class="text-zinc-500 hover:text-zinc-300 text-xs">
         Back to Terminal
       </a>

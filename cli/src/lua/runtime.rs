@@ -1248,7 +1248,7 @@ impl LuaRuntime {
     ///
     /// # Arguments
     ///
-    /// * `ctx` - Context containing agent_index, pty_index, peer_id
+    /// * `ctx` - Context containing session_uuid, peer_id
     /// * `data` - Raw PTY output bytes
     ///
     /// # Returns
@@ -1261,8 +1261,7 @@ impl LuaRuntime {
     ) -> usize {
         let result: mlua::Result<usize> = (|| {
             let ctx_table = self.lua.create_table()?;
-            ctx_table.set("agent_index", ctx.agent_index)?;
-            ctx_table.set("pty_index", ctx.pty_index)?;
+            ctx_table.set("session_uuid", ctx.session_uuid.as_str())?;
             ctx_table.set("peer_id", ctx.peer_id.clone())?;
 
             let data_str = self.lua.create_string(data)?;
@@ -1347,10 +1346,8 @@ impl LuaRuntime {
         let ctx_table: mlua::Table = self.lua.registry_value(self.pty_hook_ctx.as_ref().unwrap())
             .map_err(|e| anyhow!("Failed to retrieve cached PTY context table: {e}"))?;
 
-        ctx_table.set("agent_index", ctx.agent_index)
-            .map_err(|e| anyhow!("Failed to set agent_index: {e}"))?;
-        ctx_table.set("pty_index", ctx.pty_index)
-            .map_err(|e| anyhow!("Failed to set pty_index: {e}"))?;
+        ctx_table.set("session_uuid", ctx.session_uuid.as_str())
+            .map_err(|e| anyhow!("Failed to set session_uuid: {e}"))?;
         ctx_table.set("peer_id", ctx.peer_id.clone())
             .map_err(|e| anyhow!("Failed to set peer_id: {e}"))?;
 
@@ -1778,14 +1775,13 @@ impl LuaRuntime {
     /// ("tui" for TUI, browser identity key for WebRTC).
     pub fn set_pty_focused(
         &self,
-        agent_index: usize,
-        pty_index: usize,
+        session_uuid: &str,
         peer_id: &str,
         focused: bool,
     ) {
         let result: mlua::Result<()> = (|| {
             let func: mlua::Function = self.lua.globals().get("_set_pty_focused")?;
-            func.call::<()>((agent_index, pty_index, peer_id, focused))?;
+            func.call::<()>((session_uuid, peer_id, focused))?;
             Ok(())
         })();
 
@@ -1798,20 +1794,20 @@ impl LuaRuntime {
     ///
     /// Gated by `pty_input_listening` — when no notifications are pending
     /// (99.9% of keystrokes), this is a single bool check with no Lua call.
-    /// When armed, calls `_on_pty_input(agent_index)` in Lua which clears
+    /// When armed, calls `_on_pty_input(session_uuid)` in Lua which clears
     /// the notification and returns whether any agents still have pending
     /// notifications. Disarms when none remain.
     ///
     /// Called from both browser (WebRTC) and TUI PTY input paths —
     /// the single convergence point for all input sources.
-    pub fn notify_pty_input(&mut self, agent_index: usize) {
+    pub fn notify_pty_input(&mut self, session_uuid: &str) {
         if !self.pty_input_listening {
             return;
         }
 
         let result: mlua::Result<bool> = (|| {
             let func: mlua::Function = self.lua.globals().get("_on_pty_input")?;
-            func.call::<bool>(agent_index)
+            func.call::<bool>(session_uuid)
         })();
 
         match result {
@@ -2345,8 +2341,7 @@ mod tests {
         "#).exec().unwrap();
 
         let ctx = PtyOutputContext {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "test-session".to_string(),
             peer_id: "test-peer".to_string(),
         };
 
@@ -2368,8 +2363,7 @@ mod tests {
         "#).exec().unwrap();
 
         let ctx = PtyOutputContext {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "test-session".to_string(),
             peer_id: "test-peer".to_string(),
         };
 
@@ -2391,8 +2385,7 @@ mod tests {
         "#).exec().unwrap();
 
         let ctx = PtyOutputContext {
-            agent_index: 0,
-            pty_index: 0,
+            session_uuid: "test-session".to_string(),
             peer_id: "test-peer".to_string(),
         };
 
@@ -2416,19 +2409,16 @@ mod tests {
         "#).exec().unwrap();
 
         let ctx = PtyOutputContext {
-            agent_index: 3,
-            pty_index: 1,
+            session_uuid: "sess-abc-123".to_string(),
             peer_id: "context-test-peer".to_string(),
         };
 
         runtime.call_pty_output_interceptors(&ctx, b"test").unwrap();
 
-        let agent_idx: usize = runtime.lua().load("return received_ctx.agent_index").eval().unwrap();
-        let pty_idx: usize = runtime.lua().load("return received_ctx.pty_index").eval().unwrap();
+        let session_uuid: String = runtime.lua().load("return received_ctx.session_uuid").eval().unwrap();
         let peer_id: String = runtime.lua().load("return received_ctx.peer_id").eval().unwrap();
 
-        assert_eq!(agent_idx, 3);
-        assert_eq!(pty_idx, 1);
+        assert_eq!(session_uuid, "sess-abc-123");
         assert_eq!(peer_id, "context-test-peer");
     }
 
@@ -3412,9 +3402,9 @@ mod tests {
     /// Set up a minimal Lua environment for notification tests.
     ///
     /// Mirrors the production code structure in `handlers/connections.lua`:
-    /// - `clear_agent_notification()` — shared clear logic
+    /// - `clear_session_notification()` — shared clear logic
     /// - `_on_pty_input()` — called from Rust hot path, fires plugin hook
-    /// - `_clear_agent_notification()` — called from command handler, no hook
+    /// - `_clear_session_notification()` — called from command handler, no hook
     fn setup_notification_env(runtime: &LuaRuntime) {
         runtime.lua().load(r#"
             -- Minimal Agent mock with notification support
@@ -3436,8 +3426,16 @@ mod tests {
                 end,
             }
 
-            -- Agent.get by key (mirrors lib/agent.lua)
-            Agent.get = function(key)
+            -- Agent.get by session_uuid (mirrors lib/agent.lua)
+            Agent.get = function(session_uuid)
+                for _, a in ipairs(_test_agents) do
+                    if a._session_uuid == session_uuid then return a end
+                end
+                return nil
+            end
+
+            -- Agent.find_by_agent_key (mirrors lib/agent.lua)
+            Agent.find_by_agent_key = function(key)
                 for _, a in ipairs(_test_agents) do
                     if a._agent_key == key then return a end
                 end
@@ -3463,10 +3461,9 @@ mod tests {
                 table.insert(_broadcasts, { type = event_type, data = data })
             end
 
-            -- Shared clear logic (mirrors connections.lua)
-            local function clear_agent_notification(agent_index)
-                local agents = Agent.list()
-                local agent = agents[agent_index + 1]
+            -- Shared clear logic (mirrors connections.lua, uses session_uuid)
+            local function clear_session_notification(session_uuid)
+                local agent = Agent.get(session_uuid)
                 local cleared = false
                 if agent and agent.notification then
                     agent.notification = false
@@ -3474,18 +3471,20 @@ mod tests {
                     cleared = true
                 end
                 local any_remaining = false
-                for _, a in ipairs(agents) do
+                for _, a in ipairs(Agent.list()) do
                     if a.notification then any_remaining = true; break end
                 end
                 return cleared, any_remaining, agent
             end
 
-            -- Called from Rust PTY input hot path
-            function _on_pty_input(agent_index)
-                local cleared, any_remaining, agent = clear_agent_notification(agent_index)
+            -- Called from Rust PTY input hot path (now receives session_uuid)
+            function _on_pty_input(session_uuid)
+                if not session_uuid then return false end
+                local agent = Agent.get(session_uuid)
+                local cleared, any_remaining = clear_session_notification(session_uuid)
                 if cleared and agent then
                     hooks.notify("pty_input", {
-                        agent_index = agent_index,
+                        session_uuid = session_uuid,
                         agent_key = agent._agent_key,
                     })
                 end
@@ -3493,8 +3492,9 @@ mod tests {
             end
 
             -- Called from clear_notification command (TUI agent switch)
-            function _clear_agent_notification(agent_index)
-                local _, any_remaining = clear_agent_notification(agent_index)
+            function _clear_session_notification(session_uuid)
+                if not session_uuid then return false end
+                local _, any_remaining = clear_session_notification(session_uuid)
                 return any_remaining
             end
         "#).exec().unwrap();
@@ -3502,9 +3502,11 @@ mod tests {
 
     /// Add a test agent to the Lua mock.
     fn add_test_agent(runtime: &LuaRuntime, key: &str, notification: bool) {
+        let idx = runtime.lua().load("return #_test_agents").eval::<i64>().unwrap();
         runtime.lua().load(&format!(
-            r#"table.insert(_test_agents, {{ _agent_key = "{key}", notification = {notif} }})"#,
+            r#"table.insert(_test_agents, {{ _agent_key = "{key}", _session_uuid = "sess-{idx}", notification = {notif} }})"#,
             key = key,
+            idx = idx,
             notif = notification,
         )).exec().unwrap();
     }
@@ -3546,7 +3548,7 @@ mod tests {
         assert!(!runtime.pty_input_listening);
 
         // This should be a pure bool check, no Lua call
-        runtime.notify_pty_input(0);
+        runtime.notify_pty_input("sess-0");
 
         // Verify _on_pty_input was never called (no broadcasts)
         let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
@@ -3564,7 +3566,7 @@ mod tests {
         runtime.pty_input_listening = true;
 
         // First keystroke should clear the notification
-        runtime.notify_pty_input(0);
+        runtime.notify_pty_input("sess-0");
 
         // Notification should be cleared
         let notif: bool = runtime.lua().load(
@@ -3594,7 +3596,7 @@ mod tests {
         runtime.pty_input_listening = true;
 
         // Keystroke on agent 0 — clears its notification
-        runtime.notify_pty_input(0);
+        runtime.notify_pty_input("sess-0");
 
         // Agent 0 cleared, agent 1 still has notification
         let notif0: bool = runtime.lua().load(
@@ -3613,7 +3615,7 @@ mod tests {
         );
 
         // Keystroke on agent 1 — clears its notification
-        runtime.notify_pty_input(1);
+        runtime.notify_pty_input("sess-1");
 
         let notif1_after: bool = runtime.lua().load(
             "return _test_agents[2].notification"
@@ -3637,7 +3639,7 @@ mod tests {
         runtime.pty_input_listening = true;
 
         // Keystroke on agent 0 (no notification) — should not broadcast
-        runtime.notify_pty_input(0);
+        runtime.notify_pty_input("sess-0");
 
         let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
             .eval().unwrap();
@@ -3654,7 +3656,7 @@ mod tests {
         add_test_agent(&runtime, "my-agent", true);
 
         runtime.pty_input_listening = true;
-        runtime.notify_pty_input(0);
+        runtime.notify_pty_input("sess-0");
 
         // Should have fired hooks.notify("pty_input", ...) for plugins
         let hook_call_count: i64 = runtime.lua().load(
@@ -3678,7 +3680,7 @@ mod tests {
         runtime.pty_input_listening = true;
 
         // Keystroke on agent 0 (no notification to clear)
-        runtime.notify_pty_input(0);
+        runtime.notify_pty_input("sess-0");
 
         let hook_call_count: i64 = runtime.lua().load(
             "return #_pty_input_hook_calls"
@@ -3694,20 +3696,20 @@ mod tests {
 
         // Initially disarmed
         assert!(!runtime.pty_input_listening);
-        runtime.notify_pty_input(0);  // no-op
+        runtime.notify_pty_input("sess-0");  // no-op
 
         // Simulate notification arriving (set flag + agent state)
         runtime.lua().load("_test_agents[1].notification = true").exec().unwrap();
         runtime.pty_input_listening = true;
 
         // Keystroke clears it
-        runtime.notify_pty_input(0);
+        runtime.notify_pty_input("sess-0");
         assert!(!runtime.pty_input_listening, "Disarmed after clear");
 
         // Another keystroke — should be pure bool check, no Lua
         let broadcasts_before: i64 = runtime.lua().load("return #_broadcasts")
             .eval().unwrap();
-        runtime.notify_pty_input(0);
+        runtime.notify_pty_input("sess-0");
         let broadcasts_after: i64 = runtime.lua().load("return #_broadcasts")
             .eval().unwrap();
         assert_eq!(broadcasts_before, broadcasts_after, "No Lua call when disarmed");
@@ -3717,7 +3719,7 @@ mod tests {
         runtime.pty_input_listening = true;
 
         // Keystroke clears again
-        runtime.notify_pty_input(0);
+        runtime.notify_pty_input("sess-0");
         assert!(!runtime.pty_input_listening, "Disarmed after second clear");
 
         // Total: 2 broadcasts (one per notification clear)
@@ -3727,14 +3729,14 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_agent_notification_command_path_no_hook() {
+    fn test_clear_session_notification_command_path_no_hook() {
         let mut runtime = LuaRuntime::new().expect("Should create runtime");
         setup_notification_env(&runtime);
         add_test_agent(&runtime, "agent-0", true);
 
         // Simulate the clear_notification command path (TUI agent switch)
         let remaining: bool = runtime.lua().load(
-            "return _clear_agent_notification(0)"
+            "return _clear_session_notification('sess-0')"
         ).eval().unwrap();
 
         // Notification should be cleared
@@ -3766,11 +3768,11 @@ mod tests {
         add_test_agent(&runtime, "agent-1", true);
 
         // Clear agent 0 via command path (TUI agent switch)
-        runtime.lua().load("_clear_agent_notification(0)").exec().unwrap();
+        runtime.lua().load("_clear_session_notification('sess-0')").exec().unwrap();
 
         // Clear agent 1 via PTY input path (typing)
         runtime.pty_input_listening = true;
-        runtime.notify_pty_input(1);
+        runtime.notify_pty_input("sess-1");
 
         // Both should have broadcast
         let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
@@ -3815,7 +3817,7 @@ mod tests {
 
             -- Register the bridge
             hooks.on("_pty_notification_raw", "enrich_and_dispatch", function(info)
-                local agent = info.agent_key and Agent.get(info.agent_key)
+                local agent = info.agent_key and Agent.find_by_agent_key(info.agent_key)
                 info.already_notified = agent and agent.notification or false
                 hooks.notify("pty_notification", info)
             end)
