@@ -165,10 +165,26 @@ function Agent.new(config)
         self:_sync_session_manifest()
         ws.append_event(data_dir, self._workspace_id, self._session_uuid, "created")
     elseif data_dir and not workspace_name then
-        -- Standalone agent (no workspace) — still needs session tracking for broker
+        -- Standalone agent (no workspace name) — still needs session tracking
+        -- for broker restart recovery. Create an anonymous workspace so session
+        -- manifests have a parent directory and _sync_session_manifest() works.
         local ws = require("lib.workspace_store")
-        self._workspace_id = nil
+        ws.init_dir(data_dir)
+        self._workspace_id = ws.generate_workspace_id()
         self._session_uuid = ws.generate_session_uuid()
+        -- Write a minimal workspace manifest (no name = standalone, won't group in TUI)
+        local anon_manifest = {
+            id            = self._workspace_id,
+            worktree_path = config.worktree_path,
+            branch        = config.branch_name,
+            status        = "active",
+            created_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
+            updated_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+            metadata      = {},
+        }
+        pcall(ws.write_workspace, data_dir, self._workspace_id, anon_manifest)
+        self:_sync_session_manifest()
+        ws.append_event(data_dir, self._workspace_id, self._session_uuid, "created")
     end
 
 
