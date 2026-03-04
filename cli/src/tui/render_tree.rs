@@ -85,14 +85,11 @@ pub enum RenderNode {
 
 /// PTY binding for a terminal widget.
 ///
-/// Specifies which agent and PTY session to render. `None` fields
-/// default to the currently selected agent/PTY at render time.
+/// Specifies which session to render. `None` means no agent is selected.
 #[derive(Debug, Clone, Default)]
 pub struct TerminalBinding {
-    /// Agent index (defaults to selected agent if `None`).
-    pub agent_index: Option<usize>,
-    /// PTY index (defaults to active PTY if `None`).
-    pub pty_index: Option<usize>,
+    /// Session UUID identifying the PTY to render.
+    pub session_uuid: Option<String>,
 }
 
 /// Widget-specific props parsed from Lua.
@@ -536,21 +533,18 @@ impl RenderNode {
 
 /// Parse optional terminal props from a widget table.
 ///
-/// Reads `props.agent_index` and `props.pty_index` if present.
+/// Reads `props.session_uuid` if present.
 fn parse_terminal_props(table: &LuaTable) -> Option<WidgetProps> {
     let props_value: LuaValue = table.get("props").ok()?;
     let LuaValue::Table(props_table) = props_value else {
         return None;
     };
 
-    let agent_index: Option<usize> = props_table.get("agent_index").ok();
-    let pty_index: Option<usize> = props_table.get("pty_index").ok();
+    let session_uuid: Option<String> = props_table.get("session_uuid").ok();
 
-    // Only create props if at least one field is specified
-    if agent_index.is_some() || pty_index.is_some() {
+    if session_uuid.is_some() {
         Some(WidgetProps::Terminal(TerminalBinding {
-            agent_index,
-            pty_index,
+            session_uuid,
         }))
     } else {
         None
@@ -1007,35 +1001,31 @@ fn render_widget(
 
 /// Collect all terminal bindings from a render tree.
 ///
-/// Walks the tree recursively, collecting `(agent_index, pty_index)` pairs
-/// from every `Terminal` widget. Unspecified fields in bindings are resolved
-/// using the provided defaults (typically the selected agent/active PTY).
+/// Walks the tree recursively, collecting session UUIDs from every
+/// `Terminal` widget that has an explicit binding.
 ///
 /// Used by `sync_subscriptions` to determine which PTYs the layout needs.
 pub fn collect_terminal_bindings(
     node: &RenderNode,
-    default_agent: usize,
-    default_pty: usize,
-) -> std::collections::HashSet<(usize, usize)> {
+    _default_uuid: &str,
+) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
-    collect_bindings_recursive(node, default_agent, default_pty, &mut set);
+    collect_bindings_recursive(node, &mut set);
     set
 }
 
 fn collect_bindings_recursive(
     node: &RenderNode,
-    default_agent: usize,
-    default_pty: usize,
-    set: &mut std::collections::HashSet<(usize, usize)>,
+    set: &mut std::collections::HashSet<String>,
 ) {
     match node {
         RenderNode::HSplit { children, .. } | RenderNode::VSplit { children, .. } => {
             for child in children {
-                collect_bindings_recursive(child, default_agent, default_pty, set);
+                collect_bindings_recursive(child, set);
             }
         }
         RenderNode::Centered { child, .. } => {
-            collect_bindings_recursive(child, default_agent, default_pty, set);
+            collect_bindings_recursive(child, set);
         }
         RenderNode::Widget {
             widget_type,
@@ -1047,9 +1037,9 @@ fn collect_bindings_recursive(
                 // props (agent selected). An unbound terminal (no agent selected)
                 // should not subscribe to any PTY or keep parsers alive.
                 if let Some(WidgetProps::Terminal(b)) = props {
-                    let agent_idx = b.agent_index.unwrap_or(default_agent);
-                    let pty_idx = b.pty_index.unwrap_or(default_pty);
-                    set.insert((agent_idx, pty_idx));
+                    if let Some(ref uuid) = b.session_uuid {
+                        set.insert(uuid.clone());
+                    }
                 }
             }
         }
@@ -1675,7 +1665,7 @@ mod tests {
             custom_lines: None,
             props: None,
         };
-        let bindings = collect_terminal_bindings(&tree, 2, 1);
+        let bindings = collect_terminal_bindings(&tree, "");
         assert_eq!(bindings.len(), 0, "Unbound terminal should not produce a binding");
     }
 
@@ -1687,30 +1677,27 @@ mod tests {
             block: None,
             custom_lines: None,
             props: Some(WidgetProps::Terminal(TerminalBinding {
-                agent_index: Some(0),
-                pty_index: Some(1),
+                session_uuid: Some("sess-a".into()),
             })),
         };
-        let bindings = collect_terminal_bindings(&tree, 2, 0);
+        let bindings = collect_terminal_bindings(&tree, "");
         assert_eq!(bindings.len(), 1);
-        assert!(bindings.contains(&(0, 1)));
+        assert!(bindings.contains("sess-a"));
     }
 
     #[test]
-    fn test_collect_bindings_partial_props() {
+    fn test_collect_bindings_none_uuid() {
         let tree = RenderNode::Widget {
             widget_type: WidgetType::Terminal,
             id: None,
             block: None,
             custom_lines: None,
             props: Some(WidgetProps::Terminal(TerminalBinding {
-                agent_index: None,
-                pty_index: Some(1),
+                session_uuid: None,
             })),
         };
-        let bindings = collect_terminal_bindings(&tree, 3, 0);
-        assert_eq!(bindings.len(), 1);
-        assert!(bindings.contains(&(3, 1)), "agent_index should default to 3");
+        let bindings = collect_terminal_bindings(&tree, "default-uuid");
+        assert_eq!(bindings.len(), 0, "None session_uuid should not produce a binding");
     }
 
     #[test]
@@ -1727,8 +1714,7 @@ mod tests {
                     block: None,
                     custom_lines: None,
                     props: Some(WidgetProps::Terminal(TerminalBinding {
-                        agent_index: Some(0),
-                        pty_index: Some(0),
+                        session_uuid: Some("sess-a".into()),
                     })),
                 },
                 RenderNode::Widget {
@@ -1737,16 +1723,15 @@ mod tests {
                     block: None,
                     custom_lines: None,
                     props: Some(WidgetProps::Terminal(TerminalBinding {
-                        agent_index: Some(0),
-                        pty_index: Some(1),
+                        session_uuid: Some("sess-b".into()),
                     })),
                 },
             ],
         };
-        let bindings = collect_terminal_bindings(&tree, 0, 0);
+        let bindings = collect_terminal_bindings(&tree, "");
         assert_eq!(bindings.len(), 2);
-        assert!(bindings.contains(&(0, 0)));
-        assert!(bindings.contains(&(0, 1)));
+        assert!(bindings.contains("sess-a"));
+        assert!(bindings.contains("sess-b"));
     }
 
     #[test]
@@ -1773,7 +1758,7 @@ mod tests {
                 },
             ],
         };
-        let bindings = collect_terminal_bindings(&tree, 0, 0);
+        let bindings = collect_terminal_bindings(&tree, "");
         assert_eq!(bindings.len(), 0, "Unbound terminals should not produce bindings");
     }
 
@@ -1788,14 +1773,13 @@ mod tests {
                 block: None,
                 custom_lines: None,
                 props: Some(WidgetProps::Terminal(TerminalBinding {
-                    agent_index: Some(1),
-                    pty_index: Some(0),
+                    session_uuid: Some("sess-c".into()),
                 })),
             }),
         };
-        let bindings = collect_terminal_bindings(&tree, 0, 0);
+        let bindings = collect_terminal_bindings(&tree, "");
         assert_eq!(bindings.len(), 1);
-        assert!(bindings.contains(&(1, 0)));
+        assert!(bindings.contains("sess-c"));
     }
 
     #[test]
@@ -1813,8 +1797,7 @@ mod tests {
                     block: None,
                     custom_lines: None,
                     props: Some(WidgetProps::Terminal(TerminalBinding {
-                        agent_index: Some(0),
-                        pty_index: Some(0),
+                        session_uuid: Some("sess-d".into()),
                     })),
                 },
                 RenderNode::Widget {
@@ -1823,13 +1806,12 @@ mod tests {
                     block: None,
                     custom_lines: None,
                     props: Some(WidgetProps::Terminal(TerminalBinding {
-                        agent_index: Some(0),
-                        pty_index: Some(0),
+                        session_uuid: Some("sess-d".into()),
                     })),
                 },
             ],
         };
-        let bindings = collect_terminal_bindings(&tree, 0, 0);
+        let bindings = collect_terminal_bindings(&tree, "");
         assert_eq!(bindings.len(), 1, "Duplicate bindings should be deduplicated");
     }
 }

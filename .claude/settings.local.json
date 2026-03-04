@@ -135,7 +135,10 @@
       "mcp__trybotster__github_get_pull_request_reviews",
       "Bash(rails runner:*)",
       "mcp__github__pull_request_read",
-      "mcp__botster-hub__delete_agent"
+      "mcp__botster-hub__delete_agent",
+      "mcp__botster-hub__github_get_issue_comments",
+      "mcp__botster-hub__github_get_pull_request_reviews",
+      "mcp__botster-hub__github_create_issue"
     ],
     "deny": [],
     "ask": []

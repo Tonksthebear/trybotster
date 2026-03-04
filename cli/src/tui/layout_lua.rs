@@ -697,14 +697,13 @@ mod tests {
     use super::*;
 
     fn make_test_ctx(_mode: &str) -> RenderContext<'static> {
-        let panels: &'static std::collections::HashMap<(usize, usize), crate::tui::terminal_panel::TerminalPanel> =
+        let panels: &'static std::collections::HashMap<String, crate::tui::terminal_panel::TerminalPanel> =
             Box::leak(Box::new(std::collections::HashMap::new()));
         RenderContext {
             error_message: None,
             connection_code: None,
             bundle_used: false,
             panels,
-            active_pty_index: 0,
             scroll_offset: 0,
             is_scrolled: false,
             seconds_since_poll: 0,

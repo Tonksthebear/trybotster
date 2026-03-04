@@ -146,7 +146,10 @@ commands.register("clear_notification", function(_client, _sub_id, command)
         _clear_session_notification(session_uuid)
     elseif command.agent_index then
         -- Legacy: Rails views still pass agent_index (no session_uuid available at page load)
-        _clear_agent_notification(command.agent_index)
+        local agent = require("lib.agent").get_by_display_index(command.agent_index)
+        if agent and agent.session_uuid then
+            _clear_session_notification(agent.session_uuid)
+        end
     else
         log.warn("clear_notification missing session_uuid or agent_index")
     end

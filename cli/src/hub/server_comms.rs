@@ -329,8 +329,7 @@ impl Hub {
                     }
                     TuiSendRequest::Binary { data } => {
                         let _ = tx.send(TuiOutput::Output {
-                            agent_index: None,
-                            pty_index: None,
+                            session_uuid: String::new(),
                             data,
                         });
                     }
@@ -360,8 +359,8 @@ impl Hub {
             }
             HubEvent::SocketPtyInput { client_id, session_uuid, data } => {
                 // Socket protocol still sends agent_index in Frame (Phase 8 scope).
-                // Bridge "index:N" format to real session handle via index-based lookup.
-                let (agent_index, session_handle) = if let Some(idx_str) = session_uuid.strip_prefix("index:") {
+                // Bridge "index:N" format to real session UUID via index-based lookup.
+                let (resolved_uuid, session_handle) = if let Some(idx_str) = session_uuid.strip_prefix("index:") {
                     let idx = match idx_str.parse::<usize>() {
                         Ok(i) => i,
                         Err(_) => {
@@ -369,20 +368,19 @@ impl Hub {
                             return;
                         }
                     };
-                    (Some(idx), self.handle_cache.get_session_by_index(idx))
+                    (self.handle_cache.uuid_at_index(idx), self.handle_cache.get_session_by_index(idx))
                 } else {
-                    let idx = self.handle_cache.index_of(&session_uuid);
-                    (idx, self.handle_cache.get_session(&session_uuid))
+                    (Some(session_uuid.clone()), self.handle_cache.get_session(&session_uuid))
                 };
 
-                // Track per-client focus state via Lua (still uses agent_index)
-                if let Some(agent_index) = agent_index {
+                // Track per-client focus state via Lua (needs real session_uuid, not "index:N")
+                if let Some(ref uuid) = resolved_uuid {
                     if data == b"\x1b[I" {
-                        self.lua.set_pty_focused(agent_index, 0, &client_id, true);
+                        self.lua.set_pty_focused(uuid, &client_id, true);
                     } else if data == b"\x1b[O" {
-                        self.lua.set_pty_focused(agent_index, 0, &client_id, false);
+                        self.lua.set_pty_focused(uuid, &client_id, false);
                     }
-                    self.lua.notify_pty_input(agent_index);
+                    self.lua.notify_pty_input(uuid);
                 }
 
                 if let Some(session_handle) = session_handle {
@@ -869,26 +867,25 @@ impl Hub {
                 }
             }
             TuiRequest::PtyInput {
-                agent_index,
-                pty_index,
+                session_uuid,
                 data,
             } => {
                 // Track per-client focus state in Lua pty_clients
                 // (before notify_pty_input so focus is current).
                 if data == b"\x1b[I" {
-                    self.lua.set_pty_focused(agent_index, pty_index, "tui", true);
+                    self.lua.set_pty_focused(&session_uuid, "tui", true);
                 } else if data == b"\x1b[O" {
-                    self.lua.set_pty_focused(agent_index, pty_index, "tui", false);
+                    self.lua.set_pty_focused(&session_uuid, "tui", false);
                 }
-                self.lua.notify_pty_input(agent_index);
-                if let Some(agent_handle) = self.handle_cache.get_agent(agent_index) {
-                    if let Err(e) = agent_handle.pty().write_input_direct(&data) {
+                self.lua.notify_pty_input(&session_uuid);
+                if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
+                    if let Err(e) = session_handle.pty().write_input_direct(&data) {
                         log::error!("[PTY-INPUT] Write failed: {e}");
                     }
                 } else {
                     log::warn!(
-                        "[PTY-INPUT] No agent at index {} (cache has {} agents)",
-                        agent_index, self.handle_cache.len()
+                        "[PTY-INPUT] No session for UUID {} (cache has {} agents)",
+                        session_uuid, self.handle_cache.len()
                     );
                 }
             }
@@ -897,14 +894,17 @@ impl Hub {
 
     /// Handle a single binary PTY input from a browser (WebRTC).
     pub fn handle_pty_input(&mut self, input: crate::channel::webrtc::PtyInputIncoming) {
-        // Track per-client focus state in Lua pty_clients
-        // (before notify_pty_input so focus is current).
-        if input.data == b"\x1b[I" {
-            self.lua.set_pty_focused(input.agent_index, input.pty_index, &input.browser_identity, true);
-        } else if input.data == b"\x1b[O" {
-            self.lua.set_pty_focused(input.agent_index, input.pty_index, &input.browser_identity, false);
+        // Resolve session_uuid from agent_index for Lua focus tracking.
+        // Browser protocol still uses agent_index; will migrate to session_uuid separately.
+        let session_uuid = self.handle_cache.uuid_at_index(input.agent_index);
+        if let Some(ref uuid) = session_uuid {
+            if input.data == b"\x1b[I" {
+                self.lua.set_pty_focused(uuid, &input.browser_identity, true);
+            } else if input.data == b"\x1b[O" {
+                self.lua.set_pty_focused(uuid, &input.browser_identity, false);
+            }
+            self.lua.notify_pty_input(uuid);
         }
-        self.lua.notify_pty_input(input.agent_index);
         if let Some(agent_handle) = self.handle_cache.get_agent(input.agent_index) {
             if let Err(e) = agent_handle.pty().write_input_direct(&input.data) {
                 log::error!("[PTY-INPUT] Write failed: {e}");
@@ -2379,7 +2379,6 @@ impl Hub {
 
         let sink = output_tx.clone();
         let session_uuid = req.session_uuid.clone();
-        let agent_index = self.handle_cache.index_of(&req.session_uuid);
         let active_flag = req.active_flag;
         let wake_fd = self.tui_wake_fd;
 
@@ -2399,8 +2398,7 @@ impl Hub {
                     snapshot.len(), session_uuid
                 );
                 if sink.send(TuiOutput::Scrollback {
-                    agent_index,
-                    pty_index: Some(0),
+                    session_uuid: session_uuid.clone(),
                     data: snapshot,
                     kitty_enabled,
                 }).is_err() {
@@ -2440,8 +2438,7 @@ impl Hub {
                             }
                         }
                         if sink.send(TuiOutput::OutputBatch {
-                            agent_index,
-                            pty_index: Some(0),
+                            session_uuid: session_uuid.clone(),
                             chunks,
                         }).is_err() {
                             log::trace!("[Lua-TUI] Output channel closed, stopping forwarder");
@@ -2460,8 +2457,7 @@ impl Hub {
                                         exit_code, session_uuid
                                     );
                                     let _ = sink.send(TuiOutput::ProcessExited {
-                                        agent_index,
-                                        pty_index: Some(0),
+                                        session_uuid: session_uuid.clone(),
                                         exit_code,
                                     });
                                     if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
@@ -2493,8 +2489,7 @@ impl Hub {
                             exit_code, session_uuid
                         );
                         let _ = sink.send(TuiOutput::ProcessExited {
-                            agent_index,
-                            pty_index: Some(0),
+                            session_uuid: session_uuid.clone(),
                             exit_code,
                         });
                         if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
@@ -3243,18 +3238,15 @@ impl Hub {
                     }
                 }
                 TuiRequest::PtyInput {
-                    agent_index,
-                    pty_index: _,
+                    session_uuid,
                     data,
                 } => {
-                    // TuiRequest still uses agent_index/pty_index (Phase 7 scope).
-                    // Bridge via index-based lookup.
-                    if let Some(session_handle) = self.handle_cache.get_session_by_index(agent_index) {
+                    if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
                         if let Err(e) = session_handle.pty().write_input_direct(&data) {
                             log::error!("[PTY-INPUT] Write failed: {e}");
                         }
                     } else {
-                        log::warn!("[PTY-INPUT] No session at index {}", agent_index);
+                        log::warn!("[PTY-INPUT] No session for UUID {}", session_uuid);
                     }
                 }
             }

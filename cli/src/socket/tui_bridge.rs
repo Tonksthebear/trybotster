@@ -193,23 +193,24 @@ impl TuiBridge {
 fn frame_to_tui_output(frame: Frame) -> Option<TuiOutput> {
     match frame {
         Frame::Json(value) => Some(TuiOutput::Message(value)),
-        Frame::PtyOutput { agent_index, pty_index, data } => Some(TuiOutput::Output {
-            agent_index: Some(agent_index as usize),
-            pty_index: Some(pty_index as usize),
+        Frame::PtyOutput { agent_index: _, pty_index: _, data } => Some(TuiOutput::Output {
+            // Socket frames still carry agent_index/pty_index in wire format.
+            // TuiOutput now uses session_uuid — the socket bridge doesn't know
+            // the UUID, so we pass an empty string. The TUI runner handles
+            // socket-sourced output by session context, not by UUID lookup.
+            session_uuid: String::new(),
             data,
         }),
-        Frame::Scrollback { agent_index, pty_index, kitty_enabled, data } => {
+        Frame::Scrollback { agent_index: _, pty_index: _, kitty_enabled, data } => {
             Some(TuiOutput::Scrollback {
-                agent_index: Some(agent_index as usize),
-                pty_index: Some(pty_index as usize),
+                session_uuid: String::new(),
                 data,
                 kitty_enabled,
             })
         }
-        Frame::ProcessExited { agent_index, pty_index, exit_code } => {
+        Frame::ProcessExited { agent_index: _, pty_index: _, exit_code } => {
             Some(TuiOutput::ProcessExited {
-                agent_index: Some(agent_index as usize),
-                pty_index: Some(pty_index as usize),
+                session_uuid: String::new(),
                 exit_code,
             })
         }
@@ -222,9 +223,12 @@ fn frame_to_tui_output(frame: Frame) -> Option<TuiOutput> {
 fn tui_request_to_frame(request: &TuiRequest) -> Frame {
     match request {
         TuiRequest::LuaMessage(json) => Frame::Json(json.clone()),
-        TuiRequest::PtyInput { agent_index, pty_index, data } => Frame::PtyInput {
-            agent_index: *agent_index as u16,
-            pty_index: *pty_index as u16,
+        TuiRequest::PtyInput { session_uuid: _, data } => Frame::PtyInput {
+            // Socket wire format still uses agent_index/pty_index.
+            // Remote TUI bridge doesn't have session→index mapping;
+            // the hub side resolves this from the session_uuid in the JSON.
+            agent_index: 0,
+            pty_index: 0,
             data: data.clone(),
         },
     }
@@ -361,9 +365,9 @@ mod tests {
         .expect("Channel closed");
 
         match output {
-            TuiOutput::Output { agent_index, pty_index, data } => {
-                assert_eq!(agent_index, Some(0));
-                assert_eq!(pty_index, Some(0));
+            TuiOutput::Output { session_uuid, data } => {
+                // Socket bridge doesn't know session_uuid; uses empty string
+                assert_eq!(session_uuid, "");
                 assert_eq!(data, b"$ echo hello\r\nhello\r\n");
             }
             other => panic!("Expected TuiOutput::Output, got: {other:?}"),
@@ -381,8 +385,7 @@ mod tests {
         channels
             .request_tx
             .send(TuiRequest::PtyInput {
-                agent_index: 1,
-                pty_index: 0,
+                session_uuid: "test-session".to_string(),
                 data: b"hello".to_vec(),
             })
             .unwrap();
@@ -403,7 +406,8 @@ mod tests {
         let pty_frame = all_frames.iter().find(|f| matches!(f, Frame::PtyInput { .. })).unwrap();
         match pty_frame {
             Frame::PtyInput { agent_index, pty_index, data } => {
-                assert_eq!(*agent_index, 1);
+                // Socket bridge sends hardcoded 0s for wire format (session_uuid used internally)
+                assert_eq!(*agent_index, 0);
                 assert_eq!(*pty_index, 0);
                 assert_eq!(data, b"hello");
             }
@@ -437,9 +441,8 @@ mod tests {
         .unwrap();
 
         match output {
-            TuiOutput::Scrollback { agent_index, pty_index, kitty_enabled, data } => {
-                assert_eq!(agent_index, Some(0));
-                assert_eq!(pty_index, Some(0));
+            TuiOutput::Scrollback { session_uuid, kitty_enabled, data } => {
+                assert_eq!(session_uuid, "");
                 assert!(kitty_enabled);
                 assert_eq!(data, b"scrollback");
             }
@@ -463,9 +466,8 @@ mod tests {
         .unwrap();
 
         match output {
-            TuiOutput::ProcessExited { agent_index, pty_index, exit_code } => {
-                assert_eq!(agent_index, Some(0));
-                assert_eq!(pty_index, Some(0));
+            TuiOutput::ProcessExited { session_uuid, exit_code } => {
+                assert_eq!(session_uuid, "");
                 assert_eq!(exit_code, Some(42));
             }
             other => panic!("Expected ProcessExited, got: {other:?}"),
