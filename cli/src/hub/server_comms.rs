@@ -328,10 +328,7 @@ impl Hub {
                         let _ = tx.send(TuiOutput::Message(data));
                     }
                     TuiSendRequest::Binary { data } => {
-                        let _ = tx.send(TuiOutput::Output {
-                            session_uuid: String::new(),
-                            data,
-                        });
+                        let _ = tx.send(TuiOutput::Binary(data));
                     }
                 }
                 self.wake_tui();
