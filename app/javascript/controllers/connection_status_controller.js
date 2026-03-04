@@ -29,8 +29,6 @@ export default class extends Controller {
   static values = {
     hubId: String,
     type: { type: String, default: "hub" },
-    agentIndex: { type: Number, default: 0 },
-    ptyIndex: { type: Number, default: 0 },
   };
 
   static targets = ["browserSection", "connectionSection", "hubSection"];

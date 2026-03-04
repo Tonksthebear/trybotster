@@ -144,11 +144,8 @@ commands.register("clear_notification", function(_client, _sub_id, command)
     local session_uuid = command.session_uuid
     if session_uuid then
         _clear_session_notification(session_uuid)
-    elseif command.agent_index then
-        -- Legacy: Rails views still pass agent_index (no session_uuid available at page load)
-        _clear_agent_notification(command.agent_index)
     else
-        log.warn("clear_notification missing session_uuid or agent_index")
+        log.warn("clear_notification missing session_uuid")
     end
 end, { description = "Clear notification flag on a session" })
 

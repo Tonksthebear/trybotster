@@ -1,13 +1,9 @@
 <%# Connection Status Partial - shows [Browser] | [Connection] | [Hub] %>
 <% connection_type ||= "hub" %>
-<% agent_index ||= 0 %>
-<% pty_index ||= 0 %>
 
 <div data-controller="connection-status"
      data-connection-status-hub-id-value="<%= hub.id %>"
      data-connection-status-type-value="<%= connection_type %>"
-     data-connection-status-agent-index-value="<%= agent_index %>"
-     data-connection-status-pty-index-value="<%= pty_index %>"
      class="flex items-center gap-1 text-xs font-medium">
 
   <%# Browser - Signaling/ActionCable status %>

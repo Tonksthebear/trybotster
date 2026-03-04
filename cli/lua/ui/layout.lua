@@ -312,11 +312,9 @@ function render(state)
   end
 
   -- Build terminal panel: always show selected agent only (single PTY per agent)
-  -- Rust TUI still reads agent_index/pty_index from props, so resolve from session_uuid.
   local terminal_props = {}
-  if sa and sa.display_index ~= nil then
-    terminal_props.agent_index = sa.display_index
-    terminal_props.pty_index = 0
+  if sa and sa.session_uuid then
+    terminal_props.session_uuid = sa.session_uuid
   end
   local terminal_panel = {
     type = "terminal",

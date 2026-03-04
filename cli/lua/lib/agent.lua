@@ -598,7 +598,7 @@ function Agent:info()
         session_uuid = self.session_uuid,
         session_type = self.session_type,
         session_name = self.session_name,
-        -- display_index retained for Rust→Lua callbacks that still use agent_index
+        -- display_index retained for legacy browser protocol (clear_notification command)
         display_index = self.display_index,
         display_name = display_name,
         title = self.title,
@@ -642,7 +642,7 @@ function Agent.find_by_agent_key(key)
 end
 
 --- Get an agent by its display index.
--- Used by Rust callbacks that still pass agent_index.
+-- Used by legacy browser clear_notification command.
 -- @param index number Display index (0-based)
 -- @return Agent or nil
 function Agent.get_by_display_index(index)

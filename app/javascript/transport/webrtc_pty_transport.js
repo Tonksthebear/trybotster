@@ -6,7 +6,7 @@
  * layer for SSH-like terminal integration.
  *
  * Lifecycle:
- *   constructor({ hubId, agentIndex, ptyIndex }) — stores params, no connection
+ *   constructor({ hubId, sessionUuid }) — stores params, no connection
  *   connect(options)  — called by Restty via connectPty(), acquires TerminalConnection
  *   disconnect()      — unsubscribes events
  *   destroy()         — releases TerminalConnection
@@ -20,8 +20,7 @@ import { HubConnectionManager, TerminalConnection } from "connections";
 export class WebRtcPtyTransport {
   static #RESIZE_DEBOUNCE_MS = 30;
   #hubId;
-  #agentIndex;
-  #ptyIndex;
+  #sessionUuid;
   #terminalConn = null;
   #callbacks = null;
   #unsubscribers = [];
@@ -33,10 +32,9 @@ export class WebRtcPtyTransport {
   #pendingResize = null; // { cols, rows }
   #pendingResizeTimer = null;
 
-  constructor({ hubId, agentIndex, ptyIndex }) {
+  constructor({ hubId, sessionUuid }) {
     this.#hubId = hubId;
-    this.#agentIndex = agentIndex;
-    this.#ptyIndex = ptyIndex;
+    this.#sessionUuid = sessionUuid;
   }
 
   /**
@@ -46,22 +44,17 @@ export class WebRtcPtyTransport {
   async connect(options) {
     this.#callbacks = options.callbacks;
     console.debug(
-      `[WebRtcPtyTransport] connect start hub=${this.#hubId} agent=${this.#agentIndex} pty=${this.#ptyIndex} size=${options.cols}x${options.rows}`,
+      `[WebRtcPtyTransport] connect start hub=${this.#hubId} session=${this.#sessionUuid} size=${options.cols}x${options.rows}`,
     );
 
-    const termKey = TerminalConnection.key(
-      this.#hubId,
-      this.#agentIndex,
-      this.#ptyIndex,
-    );
+    const termKey = TerminalConnection.key(this.#hubId, this.#sessionUuid);
 
     this.#terminalConn = await HubConnectionManager.acquire(
       TerminalConnection,
       termKey,
       {
         hubId: this.#hubId,
-        agentIndex: this.#agentIndex,
-        ptyIndex: this.#ptyIndex,
+        sessionUuid: this.#sessionUuid,
         rows: options.rows,
         cols: options.cols,
       },
@@ -73,7 +66,7 @@ export class WebRtcPtyTransport {
 
     this.#wireEvents();
     console.debug(
-      `[WebRtcPtyTransport] connect ready hub=${this.#hubId} agent=${this.#agentIndex} pty=${this.#ptyIndex}`,
+      `[WebRtcPtyTransport] connect ready hub=${this.#hubId} session=${this.#sessionUuid}`,
     );
   }
 

@@ -36,7 +36,7 @@ class HubConnectionManagerSingleton {
    * Acquire a typed connection wrapper.
    *
    * @param {Function} ConnectionClass - HubConnection or TerminalConnection class
-   * @param {string} key - Unique identifier (e.g., hubId or "hubId:agentIndex:ptyIndex")
+   * @param {string} key - Unique identifier (e.g., hubId or "terminal:hubId:sessionUuid")
    * @param {Object} options - Options passed to ConnectionClass constructor
    * @returns {Promise<Connection>} - The typed connection wrapper
    */

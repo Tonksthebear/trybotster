@@ -62,11 +62,9 @@ pub struct RenderContext<'a> {
     pub bundle_used: bool,
 
     // === Terminal State ===
-    /// Terminal panels keyed by `(agent_index, pty_index)`.
+    /// Terminal panels keyed by `session_uuid`.
     /// Used by terminal widgets with explicit PTY bindings.
-    pub panels: &'a std::collections::HashMap<(usize, usize), super::terminal_panel::TerminalPanel>,
-    /// Index of the currently active PTY session (0 = first session).
-    pub active_pty_index: usize,
+    pub panels: &'a std::collections::HashMap<String, super::terminal_panel::TerminalPanel>,
     /// Current scroll offset for the active PTY.
     pub scroll_offset: usize,
     /// Whether the active PTY is scrolled (not at bottom).
@@ -87,15 +85,14 @@ pub struct RenderContext<'a> {
     pub terminal_rows: u16,
 
     // === Widget Area Tracking ===
-    /// Actual rendered area (rows, cols) of each terminal widget, keyed by (agent_index, pty_index).
+    /// Actual rendered area (rows, cols) of each terminal widget, keyed by session_uuid.
     /// Populated during rendering so the runner can resize parsers and PTYs to match.
-    pub terminal_areas: std::cell::RefCell<std::collections::HashMap<(usize, usize), (u16, u16)>>,
+    pub terminal_areas: std::cell::RefCell<std::collections::HashMap<String, (u16, u16)>>,
 }
 
 impl<'a> std::fmt::Debug for RenderContext<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RenderContext")
-            .field("active_pty_index", &self.active_pty_index)
             .field("scroll_offset", &self.scroll_offset)
             .field("is_scrolled", &self.is_scrolled)
             .finish_non_exhaustive()
@@ -211,26 +208,20 @@ pub(super) fn render_terminal_panel(
     block: Block,
     binding: Option<&super::render_tree::TerminalBinding>,
 ) {
-    // Resolve which panel to use: explicit binding → pool lookup, else focused PTY
-    let (agent_idx, pty_idx) = if let Some(b) = binding {
-        (
-            b.agent_index.unwrap_or(0),
-            b.pty_index.unwrap_or(ctx.active_pty_index),
-        )
-    } else {
-        // Fallback: no binding — only used by Rust fallback renderer (Lua is broken)
-        (0, ctx.active_pty_index)
-    };
+    // Resolve which panel to use: explicit binding → pool lookup
+    let session_uuid = binding.and_then(|b| b.session_uuid.as_deref());
 
     // Record the inner area (minus borders) so the runner can resize parsers/PTYs
     let inner = block.inner(area);
-    if inner.width > 0 && inner.height > 0 {
-        ctx.terminal_areas
-            .borrow_mut()
-            .insert((agent_idx, pty_idx), (inner.height, inner.width));
+    if let Some(uuid) = session_uuid {
+        if inner.width > 0 && inner.height > 0 {
+            ctx.terminal_areas
+                .borrow_mut()
+                .insert(uuid.to_string(), (inner.height, inner.width));
+        }
     }
 
-    let panel = ctx.panels.get(&(agent_idx, pty_idx));
+    let panel = session_uuid.and_then(|uuid| ctx.panels.get(uuid));
 
     if let Some(panel) = panel {
         let scroll_offset = panel.scroll_offset();
