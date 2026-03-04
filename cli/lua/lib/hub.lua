@@ -305,7 +305,7 @@ function Hub:post(agent_id, opts)
         payload       = opts.payload,
         reply_to      = opts.reply_to,
         expires_in    = opts.expires_in,
-        session       = session,
+        session       = opts.session or "agent",
         from_hub_id   = self_id,
         from_agent_id = opts.from_agent_id or "unknown",
     }, 10000)
