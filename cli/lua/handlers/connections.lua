@@ -278,15 +278,6 @@ function _clear_session_notification(session_uuid)
     return any_remaining
 end
 
--- Legacy alias kept for backward compatibility with older plugins.
--- Accepts session_uuid directly (no more agent_index resolution).
-_clear_agent_notification = function(session_uuid)
-    if session_uuid then
-        return _clear_session_notification(session_uuid)
-    end
-    return false
-end
-
 -- Update agent title when the running program sets the terminal title (OSC 0/2).
 hooks.on("pty_title_changed", "update_agent_title", function(info)
     local agent = info.agent_key and Agent.find_by_agent_key(info.agent_key)
@@ -437,7 +428,6 @@ function M._before_reload()
     _set_pty_focused = nil
     _on_pty_input = nil
     _clear_session_notification = nil
-    _clear_agent_notification = nil
     log.info(string.format("connections.lua reloading with %d client(s)", get_client_count()))
 end
 

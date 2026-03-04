@@ -3016,16 +3016,8 @@ impl Hub {
             self.pty_output_messages_drained += 1;
         }
 
-        let agent_index = match self.handle_cache.index_of(&msg.session_uuid) {
-            Some(idx) => idx,
-            None => {
-                log::warn!("PTY output for unknown session {}, skipping", msg.session_uuid);
-                return;
-            }
-        };
         let ctx = PtyOutputContext {
-            agent_index,
-            pty_index: 0,
+            session_uuid: msg.session_uuid.clone(),
             peer_id: msg.browser_identity.clone(),
         };
 
@@ -3100,16 +3092,8 @@ impl Hub {
                 continue;
             }
 
-            let agent_index = match self.handle_cache.index_of(&msg.session_uuid) {
-                Some(idx) => idx,
-                None => {
-                    log::warn!("PTY output for unknown session {}, skipping", msg.session_uuid);
-                    continue;
-                }
-            };
             let ctx = PtyOutputContext {
-                agent_index,
-                pty_index: 0,
+                session_uuid: msg.session_uuid.clone(),
                 peer_id: msg.browser_identity.clone(),
             };
 
