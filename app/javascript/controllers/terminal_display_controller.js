@@ -50,6 +50,8 @@ export default class extends Controller {
   #connectPtyRequested = false;
   #connectPtyTimer = null;
   #pendingSize = null;
+  #listenerTeardowns = [];
+  #restoreImeFocus = null;
 
   connect() {
     this.#disconnected = false;
@@ -64,10 +66,15 @@ export default class extends Controller {
     this.#teardownPresence = null;
     this.#disconnected = true;
     this.#unbindViewport();
+    this.#teardownListeners();
 
     if (this.#momentumRafId) {
       cancelAnimationFrame(this.#momentumRafId);
       this.#momentumRafId = null;
+    }
+    if (this.#toastTimeout) {
+      clearTimeout(this.#toastTimeout);
+      this.#toastTimeout = null;
     }
     this.#hubConn?.release();
     this.#hubConn = null;
@@ -123,6 +130,7 @@ export default class extends Controller {
 
   async #initTerminal() {
     if (!this.hubIdValue) return;
+    this.#teardownListeners();
     this.#backendReady = false;
     this.#connectPtyRequested = false;
     if (this.#connectPtyTimer) {
@@ -267,6 +275,22 @@ export default class extends Controller {
   static MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
   #toastTimeout = null;
 
+  #listen(target, event, handler, options) {
+    target.addEventListener(event, handler, options);
+    this.#listenerTeardowns.push(() =>
+      target.removeEventListener(event, handler, options),
+    );
+  }
+
+  #teardownListeners() {
+    for (const teardown of this.#listenerTeardowns) {
+      teardown();
+    }
+    this.#listenerTeardowns = [];
+    this.#restoreImeFocus?.();
+    this.#restoreImeFocus = null;
+  }
+
   /**
    * Intercept paste and drop events for file transfers.
    * Sends file bytes over WebRTC to the CLI which writes a temp file
@@ -275,7 +299,7 @@ export default class extends Controller {
   #bindFileDrop(container) {
     // Paste: intercept files before Restty's imeInput handler.
     // Text-only paste (no files) falls through to Restty normally.
-    container.addEventListener("paste", async (e) => {
+    const onPaste = async (e) => {
       const items = [...(e.clipboardData?.items || [])];
       const fileItem = items.find(i => i.kind === "file");
       if (!fileItem) return;
@@ -287,24 +311,27 @@ export default class extends Controller {
       if (!blob) return;
 
       await this.#sendFile(blob);
-    }, { capture: true });
+    };
+    this.#listen(container, "paste", onPaste, { capture: true });
 
     // Dragover: must preventDefault for browser to allow drop.
     // Capture phase to intercept before Restty's canvas.
-    container.addEventListener("dragover", (e) => {
+    const onDragOver = (e) => {
       if (!e.dataTransfer?.types?.includes("Files")) return;
       e.preventDefault();
       if (this.hasDropZoneTarget) this.dropZoneTarget.toggleAttribute("data-visible", true);
-    }, { capture: true });
+    };
+    this.#listen(container, "dragover", onDragOver, { capture: true });
 
-    container.addEventListener("dragleave", (e) => {
+    const onDragLeave = (e) => {
       if (!container.contains(e.relatedTarget)) {
         if (this.hasDropZoneTarget) this.dropZoneTarget.removeAttribute("data-visible");
       }
-    }, { capture: true });
+    };
+    this.#listen(container, "dragleave", onDragLeave, { capture: true });
 
     // Drop: extract files (capture phase to beat canvas)
-    container.addEventListener("drop", async (e) => {
+    const onDrop = async (e) => {
       if (this.hasDropZoneTarget) this.dropZoneTarget.removeAttribute("data-visible");
       const files = [...(e.dataTransfer?.files || [])];
       if (!files.length) return;
@@ -315,7 +342,8 @@ export default class extends Controller {
       for (const file of files) {
         await this.#sendFile(file);
       }
-    }, { capture: true });
+    };
+    this.#listen(container, "drop", onDrop, { capture: true });
   }
 
   async #sendFile(blob) {
@@ -373,6 +401,9 @@ export default class extends Controller {
     ime.focus = (opts) => {
       if (!focusGated) nativeFocus(opts);
     };
+    this.#restoreImeFocus = () => {
+      ime.focus = nativeFocus;
+    };
 
     // Restty handles live drag scrolling natively in long-press mode — its
     // onPointerMove calls scrollViewportByLines() on pan gestures.
@@ -386,7 +417,7 @@ export default class extends Controller {
     const VELOCITY_MAX_SAMPLES = 8;
     let velocitySamples = []; // { y, t } ring buffer
 
-    canvas.addEventListener("pointerdown", (e) => {
+    const onPointerDown = (e) => {
       if (e.pointerType !== "touch") return;
       this.#touchStart = { x: e.clientX, y: e.clientY };
       focusGated = true;
@@ -395,17 +426,19 @@ export default class extends Controller {
         cancelAnimationFrame(this.#momentumRafId);
         this.#momentumRafId = null;
       }
-    }, true);
+    };
+    this.#listen(canvas, "pointerdown", onPointerDown, true);
 
     // Track velocity during drag for momentum on release.
     // Restty's onPointerMove handles the actual live scrolling.
-    canvas.addEventListener("pointermove", (e) => {
+    const onPointerMove = (e) => {
       if (e.pointerType !== "touch" || !this.#touchStart) return;
       velocitySamples.push({ y: e.clientY, t: e.timeStamp });
       if (velocitySamples.length > VELOCITY_MAX_SAMPLES) velocitySamples.shift();
-    });
+    };
+    this.#listen(canvas, "pointermove", onPointerMove);
 
-    canvas.addEventListener("pointerup", (e) => {
+    const onPointerUp = (e) => {
       if (e.pointerType !== "touch" || !this.#touchStart) {
         focusGated = false;
         return;
@@ -440,13 +473,15 @@ export default class extends Controller {
         }
       }
       velocitySamples = [];
-    });
+    };
+    this.#listen(canvas, "pointerup", onPointerUp);
 
-    canvas.addEventListener("pointercancel", () => {
+    const onPointerCancel = () => {
       this.#touchStart = null;
       focusGated = false;
       velocitySamples = [];
-    });
+    };
+    this.#listen(canvas, "pointercancel", onPointerCancel);
   }
 
   /**
