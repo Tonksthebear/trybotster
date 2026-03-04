@@ -163,6 +163,9 @@ end
 -- Agent Spawning (internal)
 -- ============================================================================
 
+-- Forward declaration so spawn_agent can call spawn_accessory
+local spawn_accessory
+
 --- Spawn an agent in an existing worktree.
 --
 -- @param branch_name string
@@ -272,7 +275,7 @@ end
 -- @param pre_resolved table|nil Already-resolved config (avoids re-resolving)
 -- @return Agent|nil
 -- @return string|nil
-function spawn_accessory(branch_name, wt_path, accessory_name, agent_key, agent_name, metadata, pre_resolved)
+spawn_accessory = function(branch_name, wt_path, accessory_name, agent_key, agent_name, metadata, pre_resolved)
     local repo = config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
     local repo_root = worktree.repo_root()
 
@@ -344,6 +347,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         prompt = prompt,
         from_worktree = from_worktree,
         agent_name = agent_name,
+        profile_name = agent_name,  -- backward compat for hook consumers
         metadata = metadata,
     })
     if params == nil then
@@ -354,7 +358,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     issue_or_branch = params.issue_or_branch
     prompt = params.prompt
     from_worktree = params.from_worktree
-    agent_name = params.agent_name
+    agent_name = params.agent_name or params.profile_name  -- accept either from hooks
     metadata = params.metadata
 
     -- Resolve agent name
@@ -426,13 +430,18 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         notify_lifecycle(agent_key, "creating_worktree")
         log.info(string.format("No worktree found for %s, queueing async creation...", branch_name))
 
+        -- Stash workspace_manifest and agent_name in metadata so they survive
+        -- the Rust round-trip (WorktreeCreateResult only carries metadata, not these fields)
+        local async_metadata = metadata and vim.tbl_deep_extend("force", {}, metadata) or {}
+        async_metadata._workspace_manifest = workspace_manifest
+        async_metadata._agent_name = agent_name
+
         worktree.create_async({
             agent_key = agent_key,
             branch = branch_name,
             prompt = prompt,
-            metadata = metadata,
-            agent_name = agent_name,
-            workspace_manifest = workspace_manifest,
+            metadata = async_metadata,
+            profile_name = agent_name,  -- Rust reads profile_name from this table
             client_rows = 24,
             client_cols = 80,
         })
@@ -670,15 +679,22 @@ _event_subs[#_event_subs + 1] = events.on("worktree_created", function(info)
 
     local client = { rows = info.client_rows, cols = info.client_cols }
 
+    -- Extract stashed fields from metadata (Rust doesn't carry these directly)
+    local metadata = info.metadata or {}
+    local workspace_manifest = metadata._workspace_manifest
+    local agent_name = metadata._agent_name or info.profile_name
+    metadata._workspace_manifest = nil
+    metadata._agent_name = nil
+
     spawn_agent(
         info.branch,
         info.path,
         info.prompt,
         client,
         info.agent_key,
-        info.agent_name,
-        info.metadata,
-        info.workspace_manifest
+        agent_name,
+        metadata,
+        workspace_manifest
     )
 end)
 
