@@ -39,11 +39,10 @@ Subscribe to a channel for receiving events.
 ```json
 {
   "type": "subscribe",
-  "subscriptionId": "sub_1_1234567890",
+  "subscriptionId": "terminal_sess-abc123",
   "channel": "HubChannel",
   "params": {
-    "agent_index": 0,
-    "pty_index": 0
+    "session_uuid": "sess-abc123"
   }
 }
 ```
@@ -53,8 +52,7 @@ Subscribe to a channel for receiving events.
 | `subscriptionId` | string | Yes | Unique subscription identifier |
 | `channel` | string | Yes | Channel name: `HubChannel`, `TerminalRelayChannel`, `PreviewChannel` |
 | `params` | object | No | Channel-specific parameters |
-| `params.agent_index` | integer | For terminal | Agent index (0-based) |
-| `params.pty_index` | integer | For terminal | PTY index: 0=CLI, 1=Server |
+| `params.session_uuid` | string | For terminal/preview | Session UUID identifying the PTY session |
 
 ### unsubscribe
 
@@ -202,8 +200,8 @@ List of all agents. Sent on HubChannel subscription and on request.
   ],
   "agents": [
     {
-      "index": 0,
       "id": "session-key-here",
+      "session_uuid": "sess-abc123",
       "workspace_id": "ws-1730000000000-abcdef",
       "repo": "owner/repo",
       "issue_number": 42,
@@ -227,8 +225,8 @@ List of all agents. Sent on HubChannel subscription and on request.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `index` | integer | Yes | Agent index (0-based) |
 | `id` | string | Yes | Session key |
+| `session_uuid` | string | Yes | Session UUID for addressing |
 | `workspace_id` | string | No | Owning workspace ID for grouping |
 | `repo` | string | No | Repository in `owner/repo` format |
 | `issue_number` | integer | No | GitHub issue number |
@@ -350,12 +348,12 @@ The raw bytes are the terminal output including ANSI escape sequences. No JSON e
 - **Arrays** are always JSON arrays `[]`, never objects `{}`
 - **Optional fields** are omitted (not `null`)
 - **Timestamps** are Unix milliseconds (integer)
-- **Indices** are 0-based integers
+- **Session UUIDs** are string identifiers for PTY sessions
 
 ## Channels
 
 | Channel | Purpose |
 |---------|---------|
 | `HubChannel` | Agent lifecycle, worktrees, control plane |
-| `TerminalRelayChannel` | PTY input/output for a specific agent+pty |
+| `TerminalRelayChannel` | PTY input/output for a specific session |
 | `PreviewChannel` | Development server preview (future) |

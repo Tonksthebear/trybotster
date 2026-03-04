@@ -63,8 +63,8 @@
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
 │  │                        BrowserClient                                    │ │
 │  │  • Handles HttpConnectionRequested                                      │ │
-│  │  • Creates HttpChannel for (agent_index, pty_index)                     │ │
-│  │  • Owns http_channels: HashMap<(agent_index, pty_index), HttpChannel>   │ │
+│  │  • Creates HttpChannel for session_uuid                                 │ │
+│  │  • Owns http_channels: HashMap<String, HttpChannel>                     │ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                    │                                        │
 │                                    ▼                                        │
@@ -86,7 +86,7 @@
 │                                    │                                        │
 │                                    ▼                                        │
 │  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                    PtySession (server PTY, index=1)                     │ │
+│  │                    PtySession (server PTY)                              │ │
 │  │  • Owns port: Option<u16>                                               │ │
 │  │  • Sets BOTSTER_TUNNEL_PORT env var                                     │ │
 │  │  • Exposes port via PtyHandle                                           │ │
@@ -108,9 +108,7 @@
 ### 1. Browser Initiates Preview
 
 ```
-Browser navigates to: /hubs/:hub_id/agents/:agent_index/1/preview
-                                                       ↑
-                                              pty_index=1 (server PTY)
+Browser navigates to: /hubs/:hub_id/sessions/:session_uuid/preview
 ```
 
 ### 2. Channel Subscription
@@ -119,12 +117,12 @@ Browser navigates to: /hubs/:hub_id/agents/:agent_index/1/preview
 Browser                          Rails                           CLI
    │                               │                               │
    │──subscribe(PreviewChannel)───▶│                               │
-   │   {hub_id, agent_index,       │                               │
+   │   {hub_id, session_uuid,      │                               │
    │    browser_identity}          │                               │
    │                               │                               │
    │                               │──HubCommand──────────────────▶│
    │                               │  browser_wants_preview        │
-   │                               │  {agent_index,                │
+   │                               │  {session_uuid,               │
    │                               │   browser_identity}           │
    │                               │                               │
    │                               │         HubEvent::HttpConnectionRequested
@@ -135,7 +133,7 @@ Browser                          Rails                           CLI
    │                               │              HttpChannel      │
    │                               │                               │
    │                               │◀──subscribe(PreviewChannel)───│
-   │                               │   {hub_id, agent_index}       │
+   │                               │   {hub_id, session_uuid}      │
    │                               │   (no browser_identity =      │
    │                               │    agent side)                │
 ```
@@ -200,11 +198,10 @@ struct HttpChannel {
 }
 
 impl HttpChannel {
-    /// Create new HttpChannel for a specific agent/pty combo.
+    /// Create new HttpChannel for a specific session.
     /// Queries PtyHandle for port, creates HttpProxy, subscribes to channel.
     async fn new(
-        agent_index: usize,
-        pty_index: usize,
+        session_uuid: String,
         pty_handle: &PtyHandle,
         config: &BrowserClientConfig,
     ) -> Result<Self, String>;
@@ -220,8 +217,7 @@ pub enum HubEvent {
     /// Browser requested HTTP preview connection
     HttpConnectionRequested {
         client_id: ClientId,
-        agent_index: usize,
-        pty_index: usize,
+        session_uuid: String,
         browser_identity: String,
     },
 }
@@ -249,8 +245,8 @@ impl PtySession {
 pub struct BrowserClient {
     // ... existing fields ...
 
-    /// HTTP channels for preview proxying, keyed by (agent_index, pty_index)
-    http_channels: HashMap<(usize, usize), HttpChannel>,
+    /// HTTP channels for preview proxying, keyed by session_uuid
+    http_channels: HashMap<String, HttpChannel>,
 }
 ```
 
@@ -260,11 +256,9 @@ pub struct BrowserClient {
 
 | Route | Purpose |
 |-------|---------|
-| `/hubs/:hub_id/agents/:agent_index/:pty_index/preview` | Preview page (uses preview_controller.js) |
-| `/hubs/:hub_id/agents/:agent_index/:pty_index/preview/sw.js` | Service worker |
-| `/hubs/:hub_id/agents/:agent_index/:pty_index/preview/*path` | Catch-all for proxied paths |
-
-For now, pty_index is hardcoded to `1` (server PTY) in the GUI button.
+| `/hubs/:hub_id/sessions/:session_uuid/preview` | Preview page (uses preview_controller.js) |
+| `/hubs/:hub_id/sessions/:session_uuid/preview/sw.js` | Service worker |
+| `/hubs/:hub_id/sessions/:session_uuid/preview/*path` | Catch-all for proxied paths |
 
 ---
 

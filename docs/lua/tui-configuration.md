@@ -59,8 +59,7 @@ Called each frame via `render(state)` and `render_overlay(state)`. Returns a tre
 | Field | Description |
 |-------|-------------|
 | `agents` | Cached agent list |
-| `selected_agent_index` | 0-based index |
-| `active_pty_index` | Which session is focused |
+| `selected_session_uuid` | UUID of selected session |
 | `mode` | Current UI mode string |
 | `input_buffer` | Current text input |
 | `list_selected` | 0-based list cursor |
@@ -78,7 +77,7 @@ Called each frame via `render(state)` and `render_overlay(state)`. Returns a tre
 | `list` | `items` (each: `{text, secondary?, style?, action?, header?}`) | Selectable list |
 | `paragraph` | `lines`, `alignment?`, `wrap?` | Static text |
 | `input` | `lines` (prompt), `placeholder` | Text input |
-| `terminal` | `props: {agent_index, pty_index}` | PTY panel |
+| `terminal` | `props: {session_uuid}` | PTY panel |
 | `connection_code` | (special) | QR code display |
 | `empty` | (border/title only) | Spacer/placeholder |
 
@@ -94,7 +93,7 @@ Called via `on_action(action, context)`. Returns a table of ops for Rust to exec
 |----|--------|--------|
 | `set_mode` | `mode` | Update Rust's mode shadow |
 | `send_msg` | `data: {subscriptionId, data: {type, ...}}` | Send JSON to hub |
-| `focus_terminal` | `agent_id, pty_index, agent_index` | Focus a PTY panel |
+| `focus_terminal` | `agent_id, session_uuid` | Focus a PTY panel |
 | `quit` | — | Application exit |
 
 ### Context Fields
