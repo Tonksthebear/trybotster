@@ -211,7 +211,7 @@ fn frame_to_tui_output(frame: Frame) -> Option<TuiOutput> {
             })
         }
         Frame::PtyInput { .. } => None, // Client-to-hub only
-        Frame::Binary(_) => None, // Raw binary not used by TUI
+        Frame::Binary(data) => Some(TuiOutput::Binary(data)),
     }
 }
 

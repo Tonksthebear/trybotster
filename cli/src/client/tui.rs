@@ -109,6 +109,12 @@ pub enum TuiOutput {
     /// These are broadcast by `broadcast_hub_event()` in Lua and delivered
     /// via `HubEvent::TuiSend` to the Hub event loop.
     Message(serde_json::Value),
+
+    /// Raw binary data from Lua `tui.send_binary()`.
+    ///
+    /// Plugin-level binary messaging — not PTY output. Carries no session UUID
+    /// because it isn't routed to a terminal panel.
+    Binary(Vec<u8>),
 }
 
 #[cfg(test)]
@@ -121,11 +127,13 @@ mod tests {
         let output = TuiOutput::Output { session_uuid: "sess-0".into(), data: vec![4, 5, 6] };
         let exited = TuiOutput::ProcessExited { session_uuid: "sess-0".into(), exit_code: Some(0) };
         let message = TuiOutput::Message(serde_json::json!({"type": "agent_created"}));
+        let binary = TuiOutput::Binary(vec![0xFF, 0xFE]);
 
         assert!(format!("{:?}", scrollback).contains("Scrollback"));
         assert!(format!("{:?}", output).contains("Output"));
         assert!(format!("{:?}", exited).contains("ProcessExited"));
         assert!(format!("{:?}", message).contains("Message"));
+        assert!(format!("{:?}", binary).contains("Binary"));
     }
 
     #[test]

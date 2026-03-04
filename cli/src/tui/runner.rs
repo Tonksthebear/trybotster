@@ -899,6 +899,9 @@ where
                     self.dirty = true;
                     self.dispatch_hub_event(value, layout_lua);
                 }
+                Ok(TuiOutput::Binary(data)) => {
+                    log::debug!("[TUI] Received binary data ({} bytes)", data.len());
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     log::debug!("PTY output channel disconnected");
