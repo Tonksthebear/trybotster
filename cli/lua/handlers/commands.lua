@@ -22,7 +22,7 @@ commands.register("list_worktrees", function(client, sub_id, _command)
     client:send_worktree_list(sub_id)
 end, { description = "Send worktree list to client" })
 
-commands.register("list_configs", function(client, sub_id, _command)
+local function send_agent_config(client, sub_id)
     local ConfigResolver = require("lib.config_resolver")
     local device_root = config.data_dir and config.data_dir() or nil
     local repo_root = worktree.repo_root()
@@ -31,12 +31,20 @@ commands.register("list_configs", function(client, sub_id, _command)
     local workspaces = ConfigResolver.list_workspaces(device_root, repo_root)
     client:send({
         subscriptionId = sub_id,
-        type = "configs",
+        type = "agent_config",
         agents = agents,
         accessories = accessories,
         workspaces = workspaces,
     })
+end
+
+commands.register("list_configs", function(client, sub_id, _command)
+    send_agent_config(client, sub_id)
 end, { description = "List available agents, accessories, and workspaces" })
+
+commands.register("list_agent_config", function(client, sub_id, _command)
+    send_agent_config(client, sub_id)
+end, { description = "List available agent config (alias for list_configs)" })
 
 -- Backward compat: list_profiles → list_configs
 commands.register("list_profiles", function(client, sub_id, _command)
@@ -70,7 +78,9 @@ commands.register("create_agent", function(client, _sub_id, command)
     end
 
     -- If a workspace config name is provided, load the manifest
-    if command.workspace_config then
+    -- Browser sends "workspace", CLI may also use "workspace_config"
+    local workspace_config_name = command.workspace_config or workspace
+    if workspace_config_name then
         metadata = metadata or {}
         local ConfigResolver = require("lib.config_resolver")
         local device_root = config.data_dir and config.data_dir() or nil
@@ -80,8 +90,8 @@ commands.register("create_agent", function(client, _sub_id, command)
             repo_root = repo_root,
             require_agent = false,
         })
-        if resolved and resolved.workspaces[command.workspace_config] then
-            metadata.workspace_config = resolved.workspaces[command.workspace_config]
+        if resolved and resolved.workspaces[workspace_config_name] then
+            metadata.workspace_config = resolved.workspaces[workspace_config_name]
         end
     end
 
