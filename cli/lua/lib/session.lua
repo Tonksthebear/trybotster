@@ -358,6 +358,21 @@ function Session:_sync_session_manifest()
         end
     end
 
+    -- Build plugin metadata for the manifest, excluding internal broker keys
+    -- that are already represented as structured fields above.
+    local plugin_metadata = {}
+    local internal_keys = {
+        broker_session_id = true,
+        broker_pty_rows = true,
+        broker_pty_cols = true,
+        tee_log_path = true,
+    }
+    for k, v in pairs(self.metadata) do
+        if not internal_keys[k] then
+            plugin_metadata[k] = v
+        end
+    end
+
     local manifest = {
         uuid          = self.session_uuid,
         workspace_id  = self._workspace_id,
@@ -370,6 +385,7 @@ function Session:_sync_session_manifest()
         agent_name    = self.agent_name,
         profile_name  = self.profile_name,  -- backward compat
         prompt        = self.prompt,  -- task description (read by `botster context prompt`)
+        metadata      = plugin_metadata,   -- flattened by `botster context` for template access
         hub_id             = hub.hub_id() or hub.server_id(),
         hub_manifest_path  = self.hub_manifest_path,
         status        = (self.status == "running") and "active" or self.status,
