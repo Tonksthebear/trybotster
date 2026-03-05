@@ -1,13 +1,13 @@
--- MCP (Model Context Protocol) tool and prompt registry
+-- MCP (Model Context Protocol) tool, prompt, and resource template registry
 --
--- Allows any Lua plugin to register tools and prompts that agents can invoke
--- via MCP. Both are registered with a name, descriptor, and handler function.
--- The registry notifies connected MCP clients when the tool or prompt list
--- changes so they can re-fetch.
+-- Allows any Lua plugin to register tools, prompts, and resource templates
+-- that agents can invoke via MCP. Each is registered with a name, descriptor,
+-- and handler function. The registry notifies connected MCP clients when any
+-- list changes so they can re-fetch.
 --
--- Tools and prompts track their source (plugin path) automatically. On plugin
--- reload, call mcp.reset(source) to clear that plugin's registrations before
--- re-registering.
+-- Tools, prompts, and resource templates track their source (plugin path)
+-- automatically. On plugin reload, call mcp.reset(source) to clear that
+-- plugin's registrations before re-registering.
 --
 -- Usage from a plugin:
 --   mcp.tool("list_hubs", {
@@ -28,6 +28,18 @@
 --           },
 --       }
 --   end)
+--
+--   mcp.resource("botster://hubs/{hub_id}/agents", {
+--       name = "Hub Agents",
+--       description = "List agents on a specific hub",
+--       mimeType = "application/json",
+--   }, function(params)
+--       return {
+--           { uri = "botster://hubs/" .. params.hub_id .. "/agents",
+--             mimeType = "application/json",
+--             text = json.encode(get_agents(params.hub_id)) },
+--       }
+--   end)
 
 local M = {}
 
@@ -38,6 +50,11 @@ local tools = {}
 -- Internal prompt registry: name -> { name, description, arguments, handler, source }
 local prompts = {}
 
+-- Internal resource template registry: uri_template -> { uri_template, name, description,
+-- mimeType, handler, source, proxy_id?, _pattern, _param_names }
+-- proxy_id is set for resources forwarded from a remote MCP server; handler is nil for these.
+local resource_templates = {}
+
 -- Proxy registry: proxy_id (url) -> { url, token, source, tool_names = {}, on_auth_error = fn|nil }
 -- Tracks which remote MCP servers have been registered so we can clean up on reset/reload.
 local proxies = {}
@@ -47,10 +64,11 @@ local proxies = {}
 -- for registries that actually changed during the batch.
 local _batch = false
 
--- Dirty flags set during a batch when tools or prompts are modified.
+-- Dirty flags set during a batch when tools, prompts, or resources are modified.
 -- Cleared by end_batch() after scheduling the relevant notification.
 local _batch_tools_dirty = false
 local _batch_prompts_dirty = false
+local _batch_resources_dirty = false
 
 -- Debounce state for mcp_tools_changed notifications.
 -- Multiple rapid reloads (e.g. several agents editing plugin files simultaneously)
@@ -63,6 +81,10 @@ local _debounce_timer = nil
 -- debounce exactly; kept separate because MCP uses distinct list_changed
 -- notifications for tools and prompts.
 local _debounce_timer_prompts = nil
+
+-- Debounce state for mcp_resources_changed notifications. Same pattern as
+-- tools and prompts — MCP uses a distinct resources/list_changed notification.
+local _debounce_timer_resources = nil
 
 -- Seconds to wait after the last change before notifying clients.
 -- 500 ms covers a burst of simultaneous plugin reloads while keeping
@@ -90,6 +112,18 @@ local function schedule_notify_prompts()
     _debounce_timer_prompts = timer.after(NOTIFY_DEBOUNCE_SECS, function()
         _debounce_timer_prompts = nil
         events.emit("mcp_prompts_changed")
+    end)
+end
+
+-- Schedule (or reschedule) the mcp_resources_changed notification.
+-- Identical debounce pattern to schedule_notify() for tools.
+local function schedule_notify_resources()
+    if _debounce_timer_resources then
+        timer.cancel(_debounce_timer_resources)
+    end
+    _debounce_timer_resources = timer.after(NOTIFY_DEBOUNCE_SECS, function()
+        _debounce_timer_resources = nil
+        events.emit("mcp_resources_changed")
     end)
 end
 
@@ -646,15 +680,250 @@ function M.count_prompts()
 end
 
 -- =============================================================================
--- Batch Updates (shared across tools and prompts)
+-- Resource Templates
 -- =============================================================================
 
---- Clear tools, prompts, and proxies registered by a specific source.
+--- Convert a URI template to a Lua pattern and extract parameter names.
+-- e.g. "botster://hubs/{hub_id}/agents" -> pattern "^botster://hubs/([^/]+)/agents$", params {"hub_id"}
+-- @param template string URI template with {param} placeholders
+-- @return string Lua pattern for matching
+-- @return table Array of parameter names in order
+local function compile_uri_template(template)
+    local param_names = {}
+    -- Escape Lua pattern magic characters, then replace escaped {param} placeholders
+    local escaped = template:gsub("([%.%+%-%*%?%[%]%^%$%(%)%%])", "%%%1")
+    local pattern = escaped:gsub("{([^}]+)}", function(name)
+        param_names[#param_names + 1] = name
+        return "([^/]+)"
+    end)
+    return "^" .. pattern .. "$", param_names
+end
+
+--- Match a URI against a URI template, returning extracted parameters or nil.
+-- @param uri string The URI to match
+-- @param template string The URI template
+-- @return table|nil Parameter table (e.g. { hub_id = "123" }) or nil if no match
+local function match_uri_template(uri, template)
+    local entry = resource_templates[template]
+    if not entry then return nil end
+    local captures = { uri:match(entry._pattern) }
+    if #captures == 0 then return nil end
+    local params = {}
+    for i, name in ipairs(entry._param_names) do
+        params[name] = captures[i]
+    end
+    return params
+end
+
+--- Register an MCP resource template.
+-- @param uri_template string URI template (e.g. "botster://hubs/{hub_id}/agents")
+-- @param schema table { name = "...", description = "...", mimeType = "..." }
+-- @param handler function(params) -> array of { uri, mimeType, text }
+function M.resource(uri_template, schema, handler)
+    if type(uri_template) ~= "string" or uri_template == "" then
+        error("mcp.resource: uri_template must be a non-empty string")
+    end
+    if type(schema) ~= "table" then
+        error("mcp.resource: schema must be a table")
+    end
+    if type(handler) ~= "function" then
+        error("mcp.resource: handler must be a function")
+    end
+
+    local pattern, param_names = compile_uri_template(uri_template)
+
+    resource_templates[uri_template] = {
+        uri_template = uri_template,
+        name = schema.name or uri_template,
+        description = schema.description or "",
+        mimeType = schema.mimeType or "application/json",
+        handler = handler,
+        source = caller_source(),
+        _pattern = pattern,
+        _param_names = param_names,
+    }
+
+    if not _batch then
+        schedule_notify_resources()
+    else
+        _batch_resources_dirty = true
+    end
+    log.info(string.format("MCP resource template registered: %s", uri_template))
+end
+
+--- Remove an MCP resource template by URI template.
+-- @param uri_template string URI template
+function M.remove_resource(uri_template)
+    if resource_templates[uri_template] then
+        resource_templates[uri_template] = nil
+        if not _batch then
+            schedule_notify_resources()
+        else
+            _batch_resources_dirty = true
+        end
+        log.info(string.format("MCP resource template removed: %s", uri_template))
+    end
+end
+
+--- List all registered resource templates (metadata only, no handlers).
+-- @return array of { uriTemplate, name, description, mimeType }
+function M.list_resource_templates()
+    local result = {}
+    for _, rt in pairs(resource_templates) do
+        result[#result + 1] = {
+            uriTemplate = rt.uri_template,
+            name = rt.name,
+            description = rt.description,
+            mimeType = rt.mimeType,
+        }
+    end
+    return result
+end
+
+--- Read a resource by URI, matching against registered templates.
+--
+-- Supports both synchronous (local resources) and asynchronous (proxied resources) dispatch.
+-- When `callback` is provided, it is always called — synchronously for local resources,
+-- asynchronously for proxied resources (after the HTTP response arrives).
+--
+-- @param uri string The resource URI to read
+-- @param context table|nil Caller context
+-- @param callback function|nil function(contents, err) — contents is array of { uri, mimeType, text }
+-- @return contents, error_string (only meaningful for local resources without a callback)
+function M.read_resource(uri, context, callback)
+    -- Find a matching template
+    local matched_template = nil
+    local params = nil
+    for tmpl, entry in pairs(resource_templates) do
+        local p = { uri:match(entry._pattern) }
+        if #p > 0 then
+            matched_template = entry
+            params = {}
+            for i, name in ipairs(entry._param_names) do
+                params[name] = p[i]
+            end
+            break
+        end
+    end
+
+    if not matched_template then
+        local err = "No resource template matches URI: " .. uri
+        if callback then callback(nil, err) return end
+        return nil, err
+    end
+
+    -- Proxied resource: forward to remote MCP server via HTTP.
+    if matched_template.proxy_id then
+        if not callback then
+            log.warn(string.format(
+                "mcp.read_resource: '%s' is a proxied resource — a callback is required, result will be lost",
+                uri
+            ))
+        end
+
+        local proxy = proxies[matched_template.proxy_id]
+        if not proxy then
+            local err = "Proxy not found for resource: " .. uri
+            if callback then callback(nil, err) return end
+            return nil, err
+        end
+
+        local body = json.encode({
+            jsonrpc = "2.0",
+            id      = 1,
+            method  = "resources/read",
+            params  = { uri = uri },
+        })
+
+        http.request({
+            method  = "POST",
+            url     = proxy.url,
+            headers = build_headers(proxy.token, proxy.session_id),
+            body    = body,
+        }, function(resp, http_err)
+            if http_err then
+                if callback then callback(nil, "HTTP error: " .. tostring(http_err)) end
+                return
+            end
+
+            if resp.status == 401 then
+                if proxy.on_auth_error then proxy.on_auth_error() end
+                if callback then
+                    callback(nil, string.format("MCP token expired for %s (401)", proxy.url))
+                end
+                return
+            end
+
+            if resp.status ~= 200 then
+                if callback then
+                    callback(nil, string.format("Remote MCP error %d from %s", resp.status, proxy.url))
+                end
+                return
+            end
+
+            local data, decode_err = decode_mcp_response(resp, proxy.url)
+            if not data then
+                if callback then callback(nil, decode_err) end
+                return
+            end
+
+            if data.error then
+                local msg = (type(data.error) == "table" and data.error.message) or tostring(data.error)
+                if callback then callback(nil, msg) end
+                return
+            end
+
+            local result = data.result or {}
+            local contents = result.contents or {}
+            if callback then callback(contents, nil) end
+        end)
+
+        return  -- async; result arrives via callback
+    end
+
+    -- Local resource: invoke handler synchronously.
+    local ok, result = pcall(matched_template.handler, params or {}, context or {})
+    if not ok then
+        local err = tostring(result)
+        if callback then callback(nil, err) return end
+        return nil, err
+    end
+
+    -- Normalize: handler should return array of { uri, mimeType, text }
+    local contents
+    if type(result) == "table" and result[1] and result[1].uri then
+        contents = result
+    elseif type(result) == "string" then
+        contents = { { uri = uri, mimeType = matched_template.mimeType, text = result } }
+    elseif type(result) == "table" then
+        contents = { { uri = uri, mimeType = matched_template.mimeType, text = json.encode(result) } }
+    else
+        contents = { { uri = uri, mimeType = matched_template.mimeType, text = tostring(result) } }
+    end
+
+    if callback then callback(contents, nil) return end
+    return contents, nil
+end
+
+--- Get count of registered resource templates.
+-- @return number
+function M.count_resources()
+    local n = 0
+    for _ in pairs(resource_templates) do n = n + 1 end
+    return n
+end
+
+-- =============================================================================
+-- Batch Updates (shared across tools, prompts, and resource templates)
+-- =============================================================================
+
+--- Clear tools, prompts, resource templates, and proxies registered by a specific source.
 -- Called automatically before plugin reload. If source is nil, clears all.
 -- @param source string|nil Source identifier to clear (nil = clear all)
 function M.reset(source)
     local removed_tools = 0
     local removed_prompts = 0
+    local removed_resources = 0
     local removed_proxies = 0
 
     if source then
@@ -668,6 +937,12 @@ function M.reset(source)
             if prompt.source == source then
                 prompts[name] = nil
                 removed_prompts = removed_prompts + 1
+            end
+        end
+        for tmpl, rt in pairs(resource_templates) do
+            if rt.source == source then
+                resource_templates[tmpl] = nil
+                removed_resources = removed_resources + 1
             end
         end
         -- Also remove any proxy entries registered by this source.
@@ -686,6 +961,10 @@ function M.reset(source)
             prompts[name] = nil
             removed_prompts = removed_prompts + 1
         end
+        for tmpl in pairs(resource_templates) do
+            resource_templates[tmpl] = nil
+            removed_resources = removed_resources + 1
+        end
         for proxy_id in pairs(proxies) do
             proxies[proxy_id] = nil
             removed_proxies = removed_proxies + 1
@@ -699,6 +978,9 @@ function M.reset(source)
         if removed_prompts > 0 then
             schedule_notify_prompts()
         end
+        if removed_resources > 0 then
+            schedule_notify_resources()
+        end
     else
         if removed_tools > 0 then
             _batch_tools_dirty = true
@@ -706,11 +988,14 @@ function M.reset(source)
         if removed_prompts > 0 then
             _batch_prompts_dirty = true
         end
+        if removed_resources > 0 then
+            _batch_resources_dirty = true
+        end
     end
 
     log.info(string.format(
-        "MCP reset: %d tools, %d prompts, %d proxies removed (source=%s)",
-        removed_tools, removed_prompts, removed_proxies, tostring(source)
+        "MCP reset: %d tools, %d prompts, %d resources, %d proxies removed (source=%s)",
+        removed_tools, removed_prompts, removed_resources, removed_proxies, tostring(source)
     ))
 end
 
@@ -724,29 +1009,34 @@ end
 
 --- End a batch update — emit changed notifications (debounced) for only the
 -- registries that were actually modified during the batch. A tool-only plugin
--- reload will not fire mcp_prompts_changed; a prompt-only change will not
--- fire mcp_tools_changed. Correct even on load failure: if reset() cleared
--- registrations, the dirty flag was set and clients will be notified.
+-- reload will not fire mcp_prompts_changed or mcp_resources_changed. Correct
+-- even on load failure: if reset() cleared registrations, the dirty flag was
+-- set and clients will be notified.
 function M.end_batch()
     _batch = false
     local tools_dirty = _batch_tools_dirty
     local prompts_dirty = _batch_prompts_dirty
+    local resources_dirty = _batch_resources_dirty
     _batch_tools_dirty = false
     _batch_prompts_dirty = false
+    _batch_resources_dirty = false
     if tools_dirty then
         schedule_notify()
     end
     if prompts_dirty then
         schedule_notify_prompts()
     end
+    if resources_dirty then
+        schedule_notify_resources()
+    end
 end
 
 -- =============================================================================
 -- Lifecycle Hooks for Hot-Reload
 -- =============================================================================
--- mcp.lua holds plugin-registered tool and prompt handlers. On reload:
---   _before_reload: save both registries (handlers are plugin closures)
---   _after_reload:  restore both, update _G.mcp so existing call sites see new module
+-- mcp.lua holds plugin-registered tool, prompt, and resource handlers. On reload:
+--   _before_reload: save all registries (handlers are plugin closures)
+--   _after_reload:  restore all, update _G.mcp so existing call sites see new module
 -- Without these hooks, reloading mcp.lua silently orphans all registrations.
 
 function M._before_reload()
@@ -759,38 +1049,46 @@ function M._before_reload()
         timer.cancel(_debounce_timer_prompts)
         _debounce_timer_prompts = nil
     end
-    -- Stash all three registries via hub.state (in-memory, handles survive reload)
+    if _debounce_timer_resources then
+        timer.cancel(_debounce_timer_resources)
+        _debounce_timer_resources = nil
+    end
+    -- Stash all four registries via hub.state (in-memory, handles survive reload)
     if _G.state then
         _G.state.set("mcp_tools_saved", tools)
         _G.state.set("mcp_prompts_saved", prompts)
+        _G.state.set("mcp_resources_saved", resource_templates)
         _G.state.set("mcp_proxies_saved", proxies)
     end
     log.info(string.format(
-        "mcp.lua reloading — saving %d tools, %d prompts, %d proxies",
-        M.count(), M.count_prompts(), (function()
+        "mcp.lua reloading — saving %d tools, %d prompts, %d resources, %d proxies",
+        M.count(), M.count_prompts(), M.count_resources(), (function()
             local n = 0; for _ in pairs(proxies) do n = n + 1 end; return n
         end)()
     ))
 end
 
 function M._after_reload()
-    -- Restore all three registries from before reload
+    -- Restore all four registries from before reload
     if _G.state then
-        local saved_tools   = _G.state.get("mcp_tools_saved", {})
-        local saved_prompts = _G.state.get("mcp_prompts_saved", {})
-        local saved_proxies = _G.state.get("mcp_proxies_saved", {})
-        tools   = saved_tools
-        prompts = saved_prompts
-        proxies = saved_proxies
+        local saved_tools      = _G.state.get("mcp_tools_saved", {})
+        local saved_prompts    = _G.state.get("mcp_prompts_saved", {})
+        local saved_resources  = _G.state.get("mcp_resources_saved", {})
+        local saved_proxies    = _G.state.get("mcp_proxies_saved", {})
+        tools              = saved_tools
+        prompts            = saved_prompts
+        resource_templates = saved_resources
+        proxies            = saved_proxies
         _G.state.set("mcp_tools_saved", nil)
         _G.state.set("mcp_prompts_saved", nil)
+        _G.state.set("mcp_resources_saved", nil)
         _G.state.set("mcp_proxies_saved", nil)
     end
     -- Update global so callers using _G.mcp get new module methods
     _G.mcp = M
     log.info(string.format(
-        "mcp.lua reloaded — %d tools, %d prompts preserved",
-        M.count(), M.count_prompts()
+        "mcp.lua reloaded — %d tools, %d prompts, %d resources preserved",
+        M.count(), M.count_prompts(), M.count_resources()
     ))
 end
 
