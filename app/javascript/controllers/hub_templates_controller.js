@@ -237,7 +237,7 @@ export default class extends Controller {
    * Get the currently selected install scope for a template.
    * Reads from the active scope button, or falls back to template @scope metadata.
    */
-  /** Extract plugin name from a dest path (e.g., "shared/plugins/github/init.lua" → "github"). */
+  /** Extract plugin name from a dest path (e.g., "plugins/github/init.lua" → "github"). */
   #pluginName(dest) {
     const match = dest?.match(/plugins\/([^/]+)\//);
     return match ? match[1] : dest;

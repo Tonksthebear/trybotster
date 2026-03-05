@@ -148,9 +148,10 @@ local function build_list_items()
         end
 
         local item = { text = text }
-        -- Secondary: profile · branch (when branch differs from display name)
+        -- Secondary: agent name · branch (when branch differs from display name)
         local parts = {}
-        if agent.profile_name then parts[#parts+1] = agent.profile_name end
+        if agent.agent_name then parts[#parts+1] = agent.agent_name
+        elseif agent.profile_name then parts[#parts+1] = agent.profile_name end
         if agent.branch_name and agent.branch_name ~= name then
           parts[#parts+1] = agent.branch_name
         end
@@ -197,7 +198,8 @@ local function build_agent_items(state)
   for _, agent in ipairs(_tui_state and _tui_state.agents or {}) do
     local name = agent.display_name or agent.branch_name
     local parts = {}
-    if agent.profile_name then table.insert(parts, agent.profile_name) end
+    if agent.agent_name then table.insert(parts, agent.agent_name)
+    elseif agent.profile_name then table.insert(parts, agent.profile_name) end
     if agent.branch_name then table.insert(parts, agent.branch_name) end
     local secondary = #parts > 0 and table.concat(parts, " · ") or nil
     local item
