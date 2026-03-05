@@ -264,6 +264,10 @@ function Hub:post(agent_id, opts)
         if not agent then
             error(string.format("Hub:post: agent '%s' not found", agent_id))
         end
+        -- Only agents accept inbox messages; accessories have no AI to read them
+        if agent.session_type ~= "agent" and msg_type ~= "notify" then
+            error(string.format("Hub:post: session '%s' is an accessory, not an agent", agent_id))
+        end
 
         if msg_type == "notify" then
             -- PTY-only: write text directly, no inbox, no doorbell
