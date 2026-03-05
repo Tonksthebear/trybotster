@@ -6,16 +6,16 @@
 -- - Parse issue-or-branch input into branch_name
 -- - Find or create worktrees
 -- - Resolve config via ConfigResolver (agents/accessories/workspaces)
--- - Spawn agents (single PTY) via Agent.new()
--- - Spawn accessories (single PTY, no AI autonomy) via Agent.new()
+-- - Spawn agents (single PTY, AI-driven) via Agent.new()
+-- - Spawn accessories (single PTY, no AI autonomy) via Accessory.new()
 -- - Auto-spawn workspace accessories when agent is created with a workspace
 -- - Broadcast agent lifecycle events to connected clients
 --
--- Single-PTY model: each Agent instance has exactly one PTY.
--- Agents have AI autonomy. Accessories are plain PTY sessions.
+-- Both Agent and Accessory inherit from Session (lib/session.lua).
 -- Session UUID is the primary key for everything.
 
 local Agent = require("lib.agent")
+local Accessory = require("lib.accessory")
 local ConfigResolver = require("lib.config_resolver")
 
 -- ============================================================================
@@ -273,7 +273,7 @@ end
 -- @param agent_name string      Agent name for config resolution
 -- @param metadata table|nil     Plugin metadata
 -- @param pre_resolved table|nil Already-resolved config (avoids re-resolving)
--- @return Agent|nil
+-- @return Accessory|nil
 -- @return string|nil
 spawn_accessory = function(branch_name, wt_path, accessory_name, agent_key, agent_name, metadata, pre_resolved)
     local repo = config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
@@ -302,11 +302,10 @@ spawn_accessory = function(branch_name, wt_path, accessory_name, agent_key, agen
     local workspace_name = metadata and metadata.workspace or branch_name
     local workspace_id = metadata and metadata.workspace_id or nil
 
-    local ok, agent = pcall(Agent.new, {
+    local ok, agent = pcall(Accessory.new, {
         repo = repo,
         branch_name = branch_name,
         worktree_path = wt_path,
-        session_type = "accessory",
         session = session_config,
         metadata = metadata,
         workspace = workspace_name,
@@ -464,7 +463,7 @@ end
 -- @param accessory_name string        Accessory name from config (e.g., "rails-server")
 -- @param agent_name string|nil        Agent name for config resolution
 -- @param metadata table|nil           Plugin metadata
--- @return Agent|nil
+-- @return Accessory|nil
 -- @return string|nil
 local function handle_create_accessory(workspace, accessory_name, agent_name, metadata)
     if not accessory_name then
