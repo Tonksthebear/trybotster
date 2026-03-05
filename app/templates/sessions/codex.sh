@@ -14,9 +14,6 @@
 # Uncomment if using mise
 mise trust 2>/dev/null
 
-# Change to the worktree directory
-cd "$BOTSTER_WORKTREE_PATH"
-
 # ---------------------------------------------------------------------------
 # Launch
 # ---------------------------------------------------------------------------
@@ -24,4 +21,4 @@ cd "$BOTSTER_WORKTREE_PATH"
 echo "Botster agent initialized for branch: $(botster context branch_name)"
 echo "Worktree: $BOTSTER_WORKTREE_PATH"
 
-codex --full-auto "$(botster context prompt)"
+codex --full-auto --no-alt-screen "$(botster context prompt)"
