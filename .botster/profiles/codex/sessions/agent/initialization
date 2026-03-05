@@ -14,9 +14,6 @@
 # Uncomment if using mise
 # mise trust 2>/dev/null
 
-# Change to the worktree directory
-cd "$BOTSTER_WORKTREE_PATH"
-
 # ---------------------------------------------------------------------------
 # Launch
 # ---------------------------------------------------------------------------
