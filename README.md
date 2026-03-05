@@ -284,6 +284,10 @@ Additional env vars may be injected by plugins (e.g., the GitHub plugin adds `BO
 ### Codex MCP (strict manifest mode)
 
 `botster mcp-serve` resolves hub context from `BOTSTER_HUB_MANIFEST_PATH` only.
+Use a single Codex MCP server entry named `botster` (do not register additional Botster MCP aliases in session scripts).
+
+For Botster agent sessions, launch Codex with `--no-alt-screen` so PTY scrollback is preserved.
+Accessory sessions can keep Codex default/auto alternate-screen behavior.
 
 Configure Codex to pass that env var to the MCP subprocess:
 
