@@ -602,35 +602,57 @@ fn resolve_hub_id_for_cwd() -> Option<String> {
 
 /// Resolve a socket path for `mcp-serve`.
 ///
-/// Strict resolution: requires `BOTSTER_HUB_MANIFEST_PATH`.
-/// No cwd discovery and no multi-source fallback.
+/// Requires `BOTSTER_SESSION_UUID` — looks up the session manifest in the
+/// workspace store, reads `hub_manifest_path` from it, then reads the hub
+/// manifest for the socket path.
 fn resolve_mcp_serve_socket() -> Result<String> {
     use botster::hub::daemon::HubManifest;
 
-    let socket_exists = |path: &str| std::path::Path::new(path).exists();
-
-    let manifest_path = std::env::var("BOTSTER_HUB_MANIFEST_PATH")
+    let session_uuid = std::env::var("BOTSTER_SESSION_UUID")
         .ok()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
+            anyhow::anyhow!("BOTSTER_SESSION_UUID is required for mcp-serve")
+        })?;
+
+    let session_manifest = botster::env::session_manifest_path(&session_uuid)
+        .ok_or_else(|| {
             anyhow::anyhow!(
-                "BOTSTER_HUB_MANIFEST_PATH is required for mcp-serve but was missing or empty."
+                "Session manifest not found for BOTSTER_SESSION_UUID={session_uuid}"
             )
         })?;
 
-    let content = std::fs::read_to_string(&manifest_path)
-        .with_context(|| format!("Failed to read hub manifest at {manifest_path}"))?;
-    let manifest: HubManifest = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse hub manifest JSON at {manifest_path}"))?;
-    if socket_exists(&manifest.socket_path) {
-        return Ok(manifest.socket_path);
+    let content = std::fs::read_to_string(&session_manifest)
+        .with_context(|| format!("Failed to read session manifest at {}", session_manifest.display()))?;
+    let session: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse session manifest at {}", session_manifest.display()))?;
+
+    let hub_manifest_path = session
+        .get("hub_manifest_path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Session manifest missing hub_manifest_path for session {session_uuid}"
+            )
+        })?;
+
+    let hub_content = std::fs::read_to_string(hub_manifest_path)
+        .with_context(|| format!("Failed to read hub manifest at {hub_manifest_path}"))?;
+    let hub_manifest: HubManifest = serde_json::from_str(&hub_content)
+        .with_context(|| format!("Failed to parse hub manifest at {hub_manifest_path}"))?;
+
+    if !std::path::Path::new(&hub_manifest.socket_path).exists() {
+        anyhow::bail!(
+            "Session {} hub socket does not exist: {}",
+            session_uuid,
+            hub_manifest.socket_path
+        );
     }
 
-    anyhow::bail!(
-        "BOTSTER_HUB_MANIFEST_PATH resolved, but manifest socket does not exist: {}",
-        manifest.socket_path
-    );
+    Ok(hub_manifest.socket_path)
 }
+
 
 ///
 /// Discovers a running hub (by directory or explicit `--hub` arg),

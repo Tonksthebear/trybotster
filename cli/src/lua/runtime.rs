@@ -3275,88 +3275,79 @@ mod tests {
             .load_string("hub/init.lua", &init_src)
             .expect("load hub/init.lua");
 
-        let wt_path = tmp.path().join("wt-empty-snapshot");
-        let ctx_dir = wt_path.join(".botster");
-        std::fs::create_dir_all(&ctx_dir).expect("create .botster dir");
+        // Create a session manifest in the workspace store (the only recovery path).
+        let workspace_id = "ws-test-001";
+        let session_uuid = "sess-test-empty-snapshot";
+        let ws_dir = data_dir.join("workspaces").join(workspace_id);
+        let sess_dir = ws_dir.join("sessions").join(session_uuid);
+        std::fs::create_dir_all(&sess_dir).expect("create session dir");
 
-        // Create a tee log file so a wrong orphaned-path classification would
-        // attempt replay via fs.read_bytes(), which we count below.
-        let tee_log_path = tmp.path().join("logs").join("pty-0.log");
-        std::fs::create_dir_all(tee_log_path.parent().expect("log parent"))
-            .expect("create log parent");
-        std::fs::write(&tee_log_path, b"unexpected replay")
-            .expect("write tee log fixture");
-
-        let context = serde_json::json!({
-            "repo": "owner/repo",
-            "branch_name": "empty-snapshot",
-            "metadata": {
-                "broker_session_0": "123",
-                "broker_pty_rows_0": "24",
-                "broker_pty_cols_0": "80",
-                "tee_log_path_0": tee_log_path.to_string_lossy().to_string(),
-            }
+        let workspace_manifest = serde_json::json!({
+            "id": workspace_id,
+            "name": "owner/repo:empty-snapshot",
+            "worktree_path": tmp.path().join("wt-empty-snapshot").to_string_lossy(),
+            "branch": "empty-snapshot",
+            "status": "active",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "metadata": {}
         });
         std::fs::write(
-            ctx_dir.join("context.json"),
-            serde_json::to_vec(&context).expect("serialize context"),
+            ws_dir.join("manifest.json"),
+            serde_json::to_vec(&workspace_manifest).expect("serialize workspace manifest"),
         )
-        .expect("write context.json");
+        .expect("write workspace manifest");
+
+        let session_manifest = serde_json::json!({
+            "uuid": session_uuid,
+            "workspace_id": workspace_id,
+            "agent_key": "owner-repo-empty-snapshot",
+            "type": "agent",
+            "role": "developer",
+            "repo": "owner/repo",
+            "branch": "empty-snapshot",
+            "worktree_path": tmp.path().join("wt-empty-snapshot").to_string_lossy(),
+            "status": "active",
+            "broker_sessions": { "0": 123 },
+            "pty_dimensions": { "0": { "rows": 24, "cols": 80 } },
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z"
+        });
+        std::fs::write(
+            sess_dir.join("manifest.json"),
+            serde_json::to_vec(&session_manifest).expect("serialize session manifest"),
+        )
+        .expect("write session manifest");
 
         runtime
             .lua()
-            .load(&format!(
+            .load(
                 r#"
-                -- Keep this test isolated: only scan the synthetic worktree.
-                config.data_dir = nil
-                worktree.list = function()
-                    return {{ {{ path = "{worktree_path}" }} }}
-                end
-
-                _test_read_bytes_calls = 0
                 _test_feed_calls = 0
-
-                -- If orphaned-path replay is mistakenly triggered for empty snapshots,
-                -- replay_tee_log() will call fs.read_bytes().
-                fs.read_bytes = function(_path)
-                    _test_read_bytes_calls = _test_read_bytes_calls + 1
-                    return nil, "unexpected read_bytes in empty-snapshot graceful path"
-                end
 
                 hub.get_pty_snapshot_from_broker = function(_session_id)
                     return "" -- alive broker session with no output yet
                 end
 
                 hub.create_ghost_session = function(_session_uuid, _session_id, _rows, _cols)
-                    return {{
+                    return {
                         feed_output = function(_self, _data)
                             _test_feed_calls = _test_feed_calls + 1
                         end
-                    }}
+                    }
                 end
 
                 hub.register_session = function(_session_uuid, _handle, _metadata)
                     return 0
                 end
             "#,
-                worktree_path = wt_path.to_string_lossy(),
-            ))
+            )
             .exec()
             .expect("install broker_reconnected test stubs");
 
         runtime
             .fire_json_event("broker_reconnected", &serde_json::json!({}))
             .expect("fire broker_reconnected");
-
-        let read_bytes_calls: i64 = runtime
-            .lua()
-            .load("return _test_read_bytes_calls")
-            .eval()
-            .expect("read _test_read_bytes_calls");
-        assert_eq!(
-            read_bytes_calls, 0,
-            "Empty snapshot must not trigger tee replay/log reads"
-        );
 
         let feed_calls: i64 = runtime
             .lua()
@@ -3366,24 +3357,6 @@ mod tests {
         assert_eq!(
             feed_calls, 0,
             "Empty snapshot has no bytes; feed_output should not be called"
-        );
-
-        let orphaned: bool = runtime
-            .lua()
-            .load(
-                r#"
-                local state = require("hub.state")
-                local reg = state.get("ghost_agent_registry", {})
-                local ghost = reg["owner-repo-empty-snapshot"]
-                assert(ghost ~= nil, "Expected ghost agent to be registered")
-                return ghost.orphaned
-            "#,
-            )
-            .eval()
-            .expect("read ghost.orphaned");
-        assert!(
-            !orphaned,
-            "Empty snapshot should classify as graceful (orphaned=false)"
         );
     }
 

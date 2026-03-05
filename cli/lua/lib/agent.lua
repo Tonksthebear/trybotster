@@ -136,35 +136,20 @@ function Agent.new(config)
 
     local key = self:agent_key()
 
-    -- Compute context.json path for broker restart recovery.
-    -- Worktree agents (.git is a file): <worktree>/.botster/context.json
-    -- Main-branch agents (.git is a directory): <data_dir>/.botster/agents/<key>/context.json
     local git_path = config.worktree_path .. "/.git"
     local is_worktree = fs.exists(git_path) and not fs.is_dir(git_path)
     self._is_worktree = is_worktree
 
-    -- Resolve device data_dir for workspace store and main-branch context path.
+    -- Resolve device data_dir for workspace store.
     -- Agent.new() receives a `config` parameter that shadows the global `config`,
     -- so access the global via _G to get the actual device data directory.
     local data_dir = _G.config and _G.config.data_dir and _G.config.data_dir() or nil
     self._data_dir = data_dir
 
-    if is_worktree then
-        self._context_path = config.worktree_path .. "/.botster/context.json"
-    else
-        if data_dir then
-            self._context_path = data_dir .. "/.botster/agents/" .. key .. "/context.json"
-        end
-    end
-
     -- Build environment variables
     local env = self:build_env(config.env)
     self.hub_socket = env.BOTSTER_HUB_SOCKET
     self.hub_manifest_path = env.BOTSTER_HUB_MANIFEST_PATH
-
-    if self._context_path then
-        self:_sync_context_json()
-    end
 
     -- Initialize Central Session Store.
     if data_dir and workspace_name then
@@ -340,12 +325,12 @@ function Agent:agent_key()
     return repo_safe .. "-" .. branch_safe
 end
 
---- Set a metadata value and sync context.json if applicable.
+--- Set a metadata value and sync session manifest.
 -- @param key string Metadata key
 -- @param value any Metadata value
 function Agent:set_meta(key, value)
     self.metadata[key] = value
-    self:_sync_context_json()
+    self:_sync_session_manifest()
 end
 
 --- Get a metadata value.
@@ -353,39 +338,6 @@ end
 -- @return any Metadata value or nil
 function Agent:get_meta(key)
     return self.metadata[key]
-end
-
---- Sync context.json with current agent state.
-function Agent:_sync_context_json()
-    -- Legacy context.json (worktree or data_dir/agents/key/context.json)
-    if self._context_path then
-        local context = {
-            repo = self.repo,
-            branch_name = self.branch_name,
-            worktree_path = self.worktree_path,
-            hub_socket = self.hub_socket,
-            hub_manifest_path = self.hub_manifest_path,
-            prompt = self.prompt,
-            metadata = self.metadata,
-            agent_name = self.agent_name,
-            profile_name = self.profile_name,  -- backward compat
-            session_uuid = self.session_uuid,
-            session_type = self.session_type,
-            created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
-        }
-        local context_dir = self._context_path:match("^(.+)/[^/]+$")
-        if context_dir and not fs.exists(context_dir) then
-            fs.mkdir(context_dir)
-        end
-        local ok, err = pcall(fs.write, self._context_path, json.encode(context))
-        if not ok then
-            log.warn(string.format("Failed to sync context.json: %s", tostring(err)))
-        end
-    end
-
-    -- Central Session Store manifest
-    self:_sync_workspace_manifest()
-    self:_sync_session_manifest()
 end
 
 --- Sync the Central Session Store session manifest.
@@ -417,6 +369,8 @@ function Agent:_sync_session_manifest()
         worktree_path = self.worktree_path,
         agent_name    = self.agent_name,
         profile_name  = self.profile_name,  -- backward compat
+        hub_id             = hub.hub_id() or hub.server_id(),
+        hub_manifest_path  = self.hub_manifest_path,
         status        = (self.status == "running") and "active" or self.status,
         broker_sessions = broker_sessions,
         pty_dimensions  = pty_dimensions,
@@ -484,11 +438,6 @@ function Agent:close(delete_worktree)
 
     -- Remove from registry
     agents[self.session_uuid] = nil
-
-    -- Remove context file so this agent is not resurrected as a ghost on restart.
-    if self._context_path and fs.exists(self._context_path) then
-        pcall(fs.delete, self._context_path)
-    end
 
     -- Mark the Central Session Store session as closed
     if self._data_dir and self._workspace_id then

@@ -145,6 +145,38 @@ pub fn should_skip_keyring() -> bool {
     is_any_test()
 }
 
+/// Resolve the data directory (`~/.botster` or `~/.botster-dev`).
+///
+/// Checks `BOTSTER_CONFIG_DIR` env var first, then falls back to
+/// `~/.{APP_NAME}` based on debug/release build.
+#[must_use]
+pub fn data_dir() -> Option<std::path::PathBuf> {
+    if let Ok(custom) = std::env::var("BOTSTER_CONFIG_DIR") {
+        return Some(std::path::PathBuf::from(custom));
+    }
+    let app_name = format!(".{APP_NAME}");
+    dirs::home_dir().map(|d| d.join(app_name))
+}
+
+/// Find a session manifest path by UUID in the workspace store.
+///
+/// Scans `{data_dir}/workspaces/*/sessions/{uuid}/manifest.json`.
+#[must_use]
+pub fn session_manifest_path(session_uuid: &str) -> Option<std::path::PathBuf> {
+    let workspaces_dir = data_dir()?.join("workspaces");
+    for entry in std::fs::read_dir(&workspaces_dir).ok()?.flatten() {
+        let path = entry
+            .path()
+            .join("sessions")
+            .join(session_uuid)
+            .join("manifest.json");
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
