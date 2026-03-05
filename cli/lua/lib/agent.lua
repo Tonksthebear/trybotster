@@ -72,7 +72,8 @@ end
 --   env             table    (optional)  base environment variables
 --   dims            table    (optional)  { rows = 24, cols = 80 }
 --   agent_key       string   (optional)  display key (derived from repo+branch if not set)
---   profile_name    string   (optional)  config profile name
+--   agent_name      string   (optional)  config agent name (e.g., "claude")
+--   profile_name    string   (optional)  DEPRECATED alias for agent_name
 --
 -- @param config Table of agent configuration
 -- @return Agent instance
@@ -121,7 +122,8 @@ function Agent.new(config)
         metadata = metadata,
         _workspace_name = workspace_name,
         _workspace_metadata = config.workspace_metadata or {},
-        profile_name = config.profile_name,
+        agent_name = config.agent_name or config.profile_name,
+        profile_name = config.agent_name or config.profile_name,  -- backward compat alias
         created_at = os.time(),
         status = "running",
         title = nil,          -- window title from OSC 0/2 (set by pty_title_changed hook)
@@ -365,7 +367,8 @@ function Agent:_sync_context_json()
             hub_manifest_path = self.hub_manifest_path,
             prompt = self.prompt,
             metadata = self.metadata,
-            profile_name = self.profile_name,
+            agent_name = self.agent_name,
+            profile_name = self.profile_name,  -- backward compat
             session_uuid = self.session_uuid,
             session_type = self.session_type,
             created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
@@ -412,7 +415,8 @@ function Agent:_sync_session_manifest()
         repo          = self.repo,
         branch        = self.branch_name,
         worktree_path = self.worktree_path,
-        profile_name  = self.profile_name,
+        agent_name    = self.agent_name,
+        profile_name  = self.profile_name,  -- backward compat
         status        = (self.status == "running") and "active" or self.status,
         broker_sessions = broker_sessions,
         pty_dimensions  = pty_dimensions,
@@ -603,7 +607,8 @@ function Agent:info()
         display_name = display_name,
         title = self.title,
         cwd = self.cwd,
-        profile_name = self.profile_name,
+        agent_name = self.agent_name,
+        profile_name = self.profile_name,  -- backward compat
         repo = self.repo,
         metadata = self.metadata,
         workspace_name = self._workspace_name,

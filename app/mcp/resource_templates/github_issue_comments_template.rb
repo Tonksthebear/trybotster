@@ -18,43 +18,27 @@ class GithubIssueCommentsTemplate < ApplicationMCPResTemplate
 
   def resolve
     full_repo = "#{owner}/#{repo}"
-    issue_number = number.to_i
-
     installation_id = ::Github::App.installation_id_for_repo(full_repo)
-    unless installation_id
-      return { error: "GitHub App is not installed on #{full_repo}" }.to_json
-    end
+    raise "GitHub App is not installed on #{full_repo}" unless installation_id
 
     client = ::Github::App.installation_client(installation_id)
-    comments = client.issue_comments(full_repo, issue_number)
+    comments = client.issue_comments(full_repo, number.to_i)
 
-    comments.map do |comment|
-      {
-        id: comment[:id],
-        author: comment[:user][:login],
-        created_at: comment[:created_at],
-        updated_at: comment[:updated_at],
-        html_url: comment[:html_url],
-        body: comment[:body]
-      }
-    end.to_json
+    ActionMCP::Content::Resource.new(
+      "github://repos/#{owner}/#{repo}/issues/#{number}/comments",
+      "application/json",
+      text: comments.map { |comment|
+        {
+          id: comment[:id],
+          author: comment[:user][:login],
+          created_at: comment[:created_at],
+          updated_at: comment[:updated_at],
+          html_url: comment[:html_url],
+          body: comment[:body]
+        }
+      }.to_json
+    )
   rescue Octokit::Error => e
-    { error: "Failed to fetch comments: #{e.message}" }.to_json
-  rescue => e
-    { error: "Error fetching comments: #{e.message}" }.to_json
-  end
-
-  private
-
-  def owner
-    arguments["owner"]
-  end
-
-  def repo
-    arguments["repo"]
-  end
-
-  def number
-    arguments["number"]
+    raise "Failed to fetch issue comments: #{e.message}"
   end
 end

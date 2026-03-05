@@ -2,7 +2,7 @@
 # @template Claude
 # @description Minimal agent session that launches Claude Code in a worktree
 # @category sessions
-# @dest shared/sessions/agent/initialization
+# @dest agents/claude/initialization
 # @scope device
 # @version 1.1.0
 

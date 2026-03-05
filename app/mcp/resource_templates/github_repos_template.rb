@@ -9,25 +9,24 @@ class GithubReposTemplate < ApplicationMCPResTemplate
   def resolve
     repos = ::Github::App.list_installation_repos
 
-    if repos.empty?
-      return [].to_json
-    end
-
-    # Sort by updated_at descending by default
     repos.sort_by! { |r| r[:updated_at] || "" }
     repos.reverse!
 
-    repos.first(30).map do |repo|
-      {
-        full_name: repo[:full_name],
-        description: repo[:description],
-        html_url: repo[:html_url],
-        language: repo[:language],
-        stargazers_count: repo[:stargazers_count],
-        updated_at: repo[:updated_at]
-      }
-    end.to_json
+    ActionMCP::Content::Resource.new(
+      "github://repos",
+      "application/json",
+      text: repos.first(30).map { |repo|
+        {
+          full_name: repo[:full_name],
+          description: repo[:description],
+          html_url: repo[:html_url],
+          language: repo[:language],
+          stargazers_count: repo[:stargazers_count],
+          updated_at: repo[:updated_at]
+        }
+      }.to_json
+    )
   rescue => e
-    { error: "Error fetching repositories: #{e.message}" }.to_json
+    raise "Error fetching repositories: #{e.message}"
   end
 end
