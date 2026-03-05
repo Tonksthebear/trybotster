@@ -1,41 +1,33 @@
 //! Agent context resolution command.
 //!
-//! Merges agent-level identity (env vars) with worktree-level metadata
-//! (`.botster/context.json`) into a flat namespace. Used by session init
-//! scripts to access task context without manual JSON parsing.
-//!
-//! # Sources (higher priority wins)
-//!
-//! 1. Worktree `.botster/context.json` — repo, branch_name, prompt, metadata.*
-//! 2. Agent env vars — agent_key, hub_id, hub_socket, hub_manifest_path, worktree_path
+//! Derives all agent identity from `BOTSTER_SESSION_UUID`. The session manifest
+//! in the workspace store (`~/.botster{-dev}/workspaces/*/sessions/{uuid}/manifest.json`)
+//! is the single source of truth.
 //!
 //! # Examples
 //!
 //! ```bash
 //! botster context agent_key       # prints agent key
-//! botster context issue_number    # reads from metadata in context.json
-//! botster context prompt          # reads prompt from context.json
+//! botster context hub_id          # prints hub ID
 //! botster context                 # dumps all context as JSON
 //! ```
 
 use anyhow::Result;
 use std::collections::BTreeMap;
 
-/// Well-known agent-level keys sourced from environment variables.
-const AGENT_ENV_KEYS: &[(&str, &str)] = &[
-    ("agent_key", "BOTSTER_AGENT_KEY"),
-    ("hub_id", "BOTSTER_HUB_ID"),
-    ("hub_socket", "BOTSTER_HUB_SOCKET"),
-    ("hub_manifest_path", "BOTSTER_HUB_MANIFEST_PATH"),
-    ("worktree_path", "BOTSTER_WORKTREE_PATH"),
-    ("prompt", "BOTSTER_PROMPT"),
-];
-
 /// Run the context command.
 ///
 /// If `key` is `Some`, prints the value for that key (or empty line if not found).
 /// If `key` is `None`, dumps all available context as JSON.
 pub fn run(key: Option<&str>) -> Result<()> {
+    if std::env::var("BOTSTER_SESSION_UUID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        anyhow::bail!("BOTSTER_SESSION_UUID is required for botster context");
+    }
+
     let context = build();
 
     match key {
@@ -51,53 +43,56 @@ pub fn run(key: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Build the merged context map.
+/// Build the context map from the session manifest.
 ///
-/// Priority: agent-level (env vars) > worktree-level (context.json).
-/// Metadata keys from context.json are flattened into the top-level namespace.
+/// Requires `BOTSTER_SESSION_UUID` to be set. Loads the session manifest from
+/// the workspace store and extracts agent identity fields.
 ///
 /// Public so `mcp_gateway` can pass the full context at subscribe time.
 pub fn build() -> BTreeMap<String, String> {
-    build_from_json(load_context_json())
-}
+    let Some(session_uuid) = std::env::var("BOTSTER_SESSION_UUID")
+        .ok()
+        .filter(|s| !s.is_empty())
+    else {
+        log::warn!("[context] BOTSTER_SESSION_UUID not set");
+        return BTreeMap::new();
+    };
 
-/// Core merge logic, separated from file I/O so tests can inject JSON directly.
-fn build_from_json(worktree_ctx: Option<serde_json::Value>) -> BTreeMap<String, String> {
+    let Some(manifest_path) = crate::env::session_manifest_path(&session_uuid) else {
+        log::warn!("[context] Session manifest not found for {session_uuid}");
+        return BTreeMap::new();
+    };
+
+    let Ok(content) = std::fs::read_to_string(&manifest_path) else {
+        log::warn!("[context] Failed to read session manifest at {}", manifest_path.display());
+        return BTreeMap::new();
+    };
+
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) else {
+        log::warn!("[context] Failed to parse session manifest at {}", manifest_path.display());
+        return BTreeMap::new();
+    };
+
     let mut ctx = BTreeMap::new();
 
-    // 1. Load worktree-level context (lower priority, loaded first)
-    if let Some(ref json) = worktree_ctx {
-        // Top-level string fields
-        for field in &["repo", "branch_name", "prompt", "hub_socket", "hub_manifest_path"] {
-            if let Some(val) = json.get(*field).and_then(|v| v.as_str()) {
-                if !val.is_empty() {
-                    ctx.insert((*field).to_string(), val.to_string());
-                }
-            }
-        }
+    // Extract well-known fields from the session manifest
+    let fields = [
+        ("session_uuid", "uuid"),
+        ("agent_key", "agent_key"),
+        ("hub_id", "hub_id"),
+        ("hub_manifest_path", "hub_manifest_path"),
+        ("repo", "repo"),
+        ("branch_name", "branch"),
+        ("worktree_path", "worktree_path"),
+        ("agent_name", "agent_name"),
+        ("workspace_id", "workspace_id"),
+        ("prompt", "prompt"),
+    ];
 
-        // Flatten metadata into top-level namespace
-        if let Some(metadata) = json.get("metadata").and_then(|v| v.as_object()) {
-            for (k, v) in metadata {
-                let str_val = match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::Bool(b) => b.to_string(),
-                    serde_json::Value::Null => continue,
-                    other => other.to_string(),
-                };
-                if !str_val.is_empty() {
-                    ctx.insert(k.clone(), str_val);
-                }
-            }
-        }
-    }
-
-    // 2. Overlay agent-level env vars (higher priority)
-    for (key, env_var) in AGENT_ENV_KEYS {
-        if let Ok(val) = std::env::var(env_var) {
+    for (ctx_key, manifest_key) in &fields {
+        if let Some(val) = manifest.get(*manifest_key).and_then(|v| v.as_str()) {
             if !val.is_empty() {
-                ctx.insert((*key).to_string(), val);
+                ctx.insert((*ctx_key).to_string(), val.to_string());
             }
         }
     }
@@ -108,75 +103,12 @@ fn build_from_json(worktree_ctx: Option<serde_json::Value>) -> BTreeMap<String, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serialize env-var-touching tests to prevent cross-test races.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn json(s: &str) -> Option<serde_json::Value> {
-        serde_json::from_str(s).ok()
-    }
 
     #[test]
-    fn hub_socket_from_context_json_when_env_absent() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("BOTSTER_HUB_SOCKET");
-
-        let ctx = build_from_json(json(
-            r#"{"hub_socket": "/tmp/botster-1000/abc123.sock"}"#,
-        ));
-
-        assert_eq!(
-            ctx.get("hub_socket").map(String::as_str),
-            Some("/tmp/botster-1000/abc123.sock")
-        );
+    fn build_returns_empty_when_session_uuid_not_set() {
+        // BOTSTER_SESSION_UUID should not be set in test env
+        std::env::remove_var("BOTSTER_SESSION_UUID");
+        let ctx = build();
+        assert!(ctx.is_empty());
     }
-
-    #[test]
-    fn env_var_wins_over_context_json_hub_socket() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("BOTSTER_HUB_SOCKET", "/tmp/botster-1000/from-env.sock");
-
-        let ctx = build_from_json(json(
-            r#"{"hub_socket": "/tmp/botster-1000/from-file.sock"}"#,
-        ));
-
-        std::env::remove_var("BOTSTER_HUB_SOCKET");
-
-        assert_eq!(
-            ctx.get("hub_socket").map(String::as_str),
-            Some("/tmp/botster-1000/from-env.sock")
-        );
-    }
-
-    #[test]
-    fn empty_hub_socket_values_are_skipped() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("BOTSTER_HUB_SOCKET");
-
-        // Empty string in context.json must not insert the key
-        let ctx_file_empty = build_from_json(json(r#"{"hub_socket": ""}"#));
-        assert!(!ctx_file_empty.contains_key("hub_socket"));
-
-        // Empty env var must not insert the key
-        std::env::set_var("BOTSTER_HUB_SOCKET", "");
-        let ctx_env_empty =
-            build_from_json(json(r#"{"hub_socket": "/tmp/botster-1000/abc123.sock"}"#));
-        std::env::remove_var("BOTSTER_HUB_SOCKET");
-
-        // Empty env must not overwrite a valid context.json value
-        assert_eq!(
-            ctx_env_empty.get("hub_socket").map(String::as_str),
-            Some("/tmp/botster-1000/abc123.sock")
-        );
-    }
-}
-
-/// Load `.botster/context.json` from the current directory.
-///
-/// Returns `None` if the file doesn't exist or can't be parsed.
-fn load_context_json() -> Option<serde_json::Value> {
-    let path = std::env::current_dir().ok()?.join(".botster/context.json");
-    let content = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
 }

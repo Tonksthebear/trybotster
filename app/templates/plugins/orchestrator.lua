@@ -3,277 +3,290 @@
 -- @category plugins
 -- @dest plugins/orchestrator/init.lua
 -- @scope device
--- @version 1.0.0
+-- @version 2.0.0
 
 -- Orchestrator plugin
 --
--- Discovers running hubs on the local machine, connects to them via
--- Unix socket, and maintains a live registry of their agents. Exposes
--- hook-based APIs that an orchestrator agent (or other plugins) can
--- call to list hubs, create agents on remote hubs, and delete them.
+-- Pure agent CRUD: list, create, and delete agents across hubs.
+-- Hub connections are transparent — Hub.get(hub_id) auto-connects on demand
+-- via hub_discovery. No manual connection management is needed here.
 --
--- Uses two Lua primitives:
---   hub_discovery — list(), is_running(hub_id), socket_path(hub_id)
---   hub_client    — connect(path), on_message(conn, cb), send(conn, data), close(conn)
+-- Runs a periodic cleanup timer to remove connections to hubs that have
+-- stopped running (Hub.cleanup_dead()).
+--
+-- Tools:
+--   whoami         — returns the calling agent's identity and hub info
+--   list_hubs      — list all running hubs and their agents
+--   create_agent   — create an agent on any hub
+--   delete_agent   — delete an agent on any hub
+--   get_pty_snapshot — get terminal content from an agent session
+--
+-- Handles incoming hub-to-hub RPCs via hub_rpc_request hook.
 
+local state = require("hub.state")
 local hooks = require("hub.hooks")
+local Agent = require("lib.agent")
+local Hub = require("lib.hub")
 
-local self_id = hub.server_id()
+local self_id = hub.hub_id()
 
--- ============================================================================
--- Hub Registry
--- ============================================================================
-
--- hub_id -> { conn_id, agents, status }
-local connected_hubs = {}
-
--- conn_id -> hub_id (reverse lookup for disconnect cleanup)
-local conn_to_hub = {}
+-- Timer handle — stored so _before_reload can cancel it.
+local _timer_state = state.get("orchestrator.timer_state", { id = nil })
 
 -- ============================================================================
--- Message Handling
+-- MCP Tools
 -- ============================================================================
 
---- Process a JSON message received from a remote hub.
--- Updates the local registry so hook consumers always see fresh state.
---
--- @param hub_id string The remote hub's ID
--- @param message table Decoded JSON message from the remote hub
-local function handle_hub_message(hub_id, message)
-    local hub_entry = connected_hubs[hub_id]
-    if not hub_entry then return end
-
-    local msg_type = message.type
-
-    if msg_type == "subscribed" then
-        hub_entry.status = "connected"
-        log.info("Orchestrator: connected to hub " .. hub_id)
-
-    elseif msg_type == "agent_list" then
-        hub_entry.agents = message.agents or {}
-        events.emit("remote_agents_updated", {
-            hub_id = hub_id,
-            agents = hub_entry.agents,
-        })
-
-    elseif msg_type == "agent_created" then
-        -- The hub will broadcast a fresh agent_list after creation,
-        -- but we can emit an event immediately for fast UI feedback.
-        events.emit("remote_agent_created", {
-            hub_id = hub_id,
-            agent = message.agent,
-        })
-
-    elseif msg_type == "agent_deleted" then
-        events.emit("remote_agent_deleted", {
-            hub_id = hub_id,
-            agent_id = message.agent_id,
-        })
-
-    elseif msg_type == "agent_status_changed" then
-        -- Update the cached agent status if we have it
-        if hub_entry.agents and message.agent_id then
-            for _, agent in ipairs(hub_entry.agents) do
-                if agent.key == message.agent_id then
-                    agent.status = message.status
-                    break
-                end
-            end
-        end
-        events.emit("remote_agent_status_changed", {
-            hub_id = hub_id,
-            agent_id = message.agent_id,
-            status = message.status,
-        })
-
-    elseif msg_type == "error" then
-        log.warn(string.format("Orchestrator: error from hub %s: %s",
-            hub_id, tostring(message.message or message.error)))
-    end
-end
-
--- ============================================================================
--- Connection Management
--- ============================================================================
-
---- Connect to a discovered hub and wire up message handling.
---
--- @param hub_id string The remote hub's server ID
--- @param socket_path string Path to the remote hub's Unix socket
-local function connect_to_hub(hub_id, socket_path)
-    if connected_hubs[hub_id] then return end
-
-    log.info(string.format("Orchestrator: connecting to hub %s at %s", hub_id, socket_path))
-
-    local conn_id = hub_client.connect(socket_path)
-
-    connected_hubs[hub_id] = {
-        conn_id = conn_id,
-        agents = {},
-        status = "connecting",
+mcp.tool("whoami", {
+    description = "Returns the calling agent's identity: agent key, session UUID, hub ID, repo, branch, and worktree path. Use this to discover your own identity when coordinating with other agents or tools.",
+    input_schema = {
+        type = "object",
+        properties = {},
+    },
+}, function(params, context)
+    local result = {
+        agent_key = context.agent_key,
+        hub_id = context.hub_id,
+        self_hub_id = self_id,
     }
-    conn_to_hub[conn_id] = hub_id
 
-    hub_client.on_message(conn_id, function(message, connection_id)
-        handle_hub_message(hub_id, message)
-    end)
-end
-
---- Disconnect from a remote hub and clean up registry state.
---
--- @param hub_id string The remote hub's server ID
-local function disconnect_hub(hub_id)
-    local hub_entry = connected_hubs[hub_id]
-    if not hub_entry then return end
-
-    log.info("Orchestrator: disconnecting from hub " .. hub_id)
-
-    hub_client.close(hub_entry.conn_id)
-    conn_to_hub[hub_entry.conn_id] = nil
-    connected_hubs[hub_id] = nil
-
-    events.emit("remote_hub_disconnected", { hub_id = hub_id })
-end
-
---- Mark a hub as disconnected without sending a close (the socket is already gone).
---
--- @param hub_id string The remote hub's server ID
-local function mark_disconnected(hub_id)
-    local hub_entry = connected_hubs[hub_id]
-    if not hub_entry then return end
-
-    log.info("Orchestrator: hub " .. hub_id .. " is no longer reachable")
-
-    conn_to_hub[hub_entry.conn_id] = nil
-    connected_hubs[hub_id] = nil
-
-    events.emit("remote_hub_disconnected", { hub_id = hub_id })
-end
-
--- ============================================================================
--- Discovery
--- ============================================================================
-
---- Scan for running hubs and connect to any we haven't seen yet.
--- Also prunes hubs that are no longer running.
-local function discover_and_connect()
-    -- Prune hubs that stopped running
-    for hub_id, _ in pairs(connected_hubs) do
-        if not hub_discovery.is_running(hub_id) then
-            mark_disconnected(hub_id)
+    if context.agent_key and context.agent_key ~= "" then
+        local agent = Agent.find_by_agent_key(context.agent_key)
+        if agent then
+            local info = agent:info()
+            result.session_uuid = agent.session_uuid
+            result.repo = info.repo
+            result.branch_name = info.branch_name
+            result.worktree_path = info.worktree_path
+            result.agent_name = info.agent_name
+            result.workspace_name = info.workspace_name
+            result.status = info.status
         end
     end
 
-    -- Connect to newly discovered hubs
-    local running = hub_discovery.list()
-    for _, info in ipairs(running) do
-        if info.id ~= self_id and not connected_hubs[info.id] then
-            connect_to_hub(info.id, info.socket)
-        end
-    end
-end
-
--- ============================================================================
--- Hook-based API
--- ============================================================================
-
---- List all known remote hubs and their agents.
--- Returns an array of { id, status, agent_count, agents }.
-hooks.on("orchestrator_list_hubs", "orchestrator_list_hubs_impl", function()
-    local result = {}
-    for hub_id, hub_entry in pairs(connected_hubs) do
-        table.insert(result, {
-            id = hub_id,
-            status = hub_entry.status,
-            agent_count = #(hub_entry.agents or {}),
-            agents = hub_entry.agents,
-        })
-    end
     return result
 end)
 
---- Create an agent on a remote hub.
--- data: { hub_id, issue_or_branch, prompt, profile }
-hooks.on("orchestrator_create_agent", "orchestrator_create_agent_impl", function(data)
-    if not data or not data.hub_id then
-        log.warn("Orchestrator: create_agent called without hub_id")
-        return
+mcp.tool("list_hubs", {
+    description = "List all running hubs and their agents. Returns an array of hubs, each with an id, status ('local' or 'connected'), and agents array. Your own agent is excluded from the results. Use this to discover other agents before sending messages or reading snapshots.",
+    input_schema = {
+        type = "object",
+        properties = {},
+    },
+}, function(params, context)
+    local caller_key = context.agent_key
+    local caller_hub = context.hub_id
+    local result = {}
+
+    local function is_caller(agent_id, hub_id)
+        return caller_key and caller_key ~= ""
+            and caller_hub and caller_hub ~= ""
+            and agent_id == caller_key
+            and hub_id == caller_hub
     end
 
-    local hub_entry = connected_hubs[data.hub_id]
-    if not hub_entry then
-        log.warn("Orchestrator: hub not connected: " .. tostring(data.hub_id))
-        return
+    local all_hubs = hub_discovery.list()
+
+    for _, info in ipairs(all_hubs) do
+        local h = Hub.get(info.id)
+        local ok, agents_raw = pcall(function() return h:agent_list() end)
+        local agents = {}
+        if ok and agents_raw then
+            for _, agent in ipairs(agents_raw) do
+                if not is_caller(agent.id, info.id) then
+                    table.insert(agents, agent)
+                end
+            end
+        else
+            log.warn(string.format("Orchestrator: list_hubs failed to get agents from hub %s: %s",
+                info.id, ok and "nil result" or tostring(agents_raw)))
+        end
+
+        table.insert(result, {
+            id     = info.id,
+            status = (info.id == self_id) and "local" or "connected",
+            agents = agents,
+        })
     end
 
-    hub_client.send(hub_entry.conn_id, {
-        subscriptionId = "orchestrator",
-        type = "create_agent",
-        issue_or_branch = data.issue_or_branch,
-        prompt = data.prompt,
-        profile = data.profile,
-    })
-    log.info(string.format("Orchestrator: requested agent creation on hub %s", data.hub_id))
+    return result
 end)
 
---- Delete an agent on a remote hub.
--- data: { hub_id, agent_id, delete_worktree }
-hooks.on("orchestrator_delete_agent", "orchestrator_delete_agent_impl", function(data)
-    if not data or not data.hub_id or not data.agent_id then
-        log.warn("Orchestrator: delete_agent called without hub_id or agent_id")
-        return
-    end
-
-    local hub_entry = connected_hubs[data.hub_id]
-    if not hub_entry then
-        log.warn("Orchestrator: hub not connected: " .. tostring(data.hub_id))
-        return
-    end
-
-    hub_client.send(hub_entry.conn_id, {
-        subscriptionId = "orchestrator",
-        type = "delete_agent",
-        id = data.agent_id,
-        delete_worktree = data.delete_worktree or false,
-    })
-    log.info(string.format("Orchestrator: requested agent deletion %s on hub %s",
-        data.agent_id, data.hub_id))
+mcp.tool("create_agent", {
+    description = "Create a new agent on a hub. For the local hub, omit hub_id or pass the local hub's ID. For remote hubs, pass their hub_id (from list_hubs). Returns the created agent's info.",
+    input_schema = {
+        type = "object",
+        properties = {
+            hub_id = {
+                type = "string",
+                description = "Hub ID to create the agent on. Omit or pass local hub ID for local creation.",
+            },
+            issue_or_branch = {
+                type = "string",
+                description = "Issue number or branch name for the agent.",
+            },
+            prompt = {
+                type = "string",
+                description = "Task prompt for the agent.",
+            },
+            profile = {
+                type = "string",
+                description = "Config profile name. Omit to auto-select.",
+            },
+        },
+        required = { "issue_or_branch" },
+    },
+}, function(params)
+    return Hub.call_safely(params.hub_id, function()
+        return Hub.get(params.hub_id):create_agent(
+            params.issue_or_branch,
+            params.prompt,
+            params.profile
+        )
+    end)
 end)
 
---- Request a fresh agent list from a specific remote hub.
--- data: { hub_id }
-hooks.on("orchestrator_refresh_agents", "orchestrator_refresh_agents_impl", function(data)
-    if not data or not data.hub_id then return end
-
-    local hub_entry = connected_hubs[data.hub_id]
-    if not hub_entry then return end
-
-    hub_client.send(hub_entry.conn_id, {
-        subscriptionId = "orchestrator",
-        type = "list_agents",
-    })
+mcp.tool("delete_agent", {
+    description = "Delete an agent on a hub. Pass the agent_id (agent key) from list_hubs results. Optionally delete the git worktree too.",
+    input_schema = {
+        type = "object",
+        properties = {
+            hub_id = {
+                type = "string",
+                description = "Hub ID where the agent lives. Omit for local.",
+            },
+            agent_id = {
+                type = "string",
+                description = "Agent key/ID to delete.",
+            },
+            delete_worktree = {
+                type = "boolean",
+                description = "Also delete the git worktree. Default false.",
+            },
+        },
+        required = { "agent_id" },
+    },
+}, function(params)
+    return Hub.call_safely(params.hub_id, function()
+        return Hub.get(params.hub_id):delete_agent(
+            params.agent_id,
+            params.delete_worktree
+        )
+    end)
 end)
 
---- Disconnect from a specific remote hub.
--- data: { hub_id }
-hooks.on("orchestrator_disconnect_hub", "orchestrator_disconnect_hub_impl", function(data)
-    if not data or not data.hub_id then return end
-    disconnect_hub(data.hub_id)
+mcp.tool("get_pty_snapshot", {
+    description = "Get a PTY snapshot from an agent session on any hub. Returns the current terminal content as text. Use the agent_id (agent key) from list_hubs results. Omit hub_id for the local hub.",
+    input_schema = {
+        type = "object",
+        properties = {
+            hub_id = {
+                type = "string",
+                description = "Hub ID where the agent lives. Omit for local hub.",
+            },
+            agent_id = {
+                type = "string",
+                description = "Agent key/ID.",
+            },
+            session = {
+                type = "string",
+                description = "Session name (default: 'agent').",
+            },
+        },
+        required = { "agent_id" },
+    },
+}, function(params)
+    return Hub.call_safely(params.hub_id, function()
+        return Hub.get(params.hub_id):get_pty_snapshot(params.agent_id, params.session)
+    end)
+end)
+
+-- ============================================================================
+-- Hub-to-Hub RPC (incoming requests from remote hubs)
+-- ============================================================================
+
+-- Handle RPC requests from remote hubs via the socket server.
+-- Dispatches by message.type and sends the response back with _mcp_rid.
+hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
+    local rid = message._mcp_rid
+    local local_hub = Hub.get()
+
+    local function respond(fn)
+        local ok, result = pcall(fn)
+        if ok then
+            socket.send(client_id, { _mcp_rid = rid, result = result })
+        else
+            socket.send(client_id, { _mcp_rid = rid, error = tostring(result) })
+        end
+    end
+
+    if message.type == "send_message" then
+        respond(function()
+            return local_hub:send_message(message.agent_id, message.text, message.session)
+        end)
+    elseif message.type == "get_pty_snapshot" then
+        respond(function()
+            return local_hub:get_pty_snapshot(message.agent_id, message.session)
+        end)
+    elseif message.type == "create_agent" then
+        respond(function()
+            return local_hub:create_agent(message.issue_or_branch, message.prompt, message.profile)
+        end)
+    elseif message.type == "delete_agent" then
+        respond(function()
+            return local_hub:delete_agent(message.agent_id, message.delete_worktree)
+        end)
+    elseif message.type == "post_message" then
+        respond(function()
+            return local_hub:post(message.agent_id, {
+                type          = message.msg_type,
+                payload       = message.payload,
+                reply_to      = message.reply_to,
+                expires_in    = message.expires_in,
+                session       = message.session,
+                from_agent_id = message.from_agent_id,
+            })
+        end)
+    elseif message.type == "receive_messages" then
+        respond(function()
+            return local_hub:receive_messages(message.agent_id)
+        end)
+    elseif message.type == "get_agent_list" then
+        respond(function()
+            return Agent.all_info()
+        end)
+    else
+        socket.send(client_id, {
+            _mcp_rid = rid,
+            error = string.format("unknown RPC method: %s", tostring(message.type)),
+        })
+    end
 end)
 
 -- ============================================================================
 -- Lifecycle
 -- ============================================================================
 
--- Initial discovery on load
-discover_and_connect()
+_timer_state.id = timer.every(60, function()
+    Hub.cleanup_dead()
+end)
 
--- Periodic scan: discover new hubs, prune dead ones (every 30 seconds)
-timer.every(30, discover_and_connect)
+log.info(string.format("Orchestrator plugin loaded (self=%s)", tostring(self_id)))
 
-local hub_count = 0
-for _ in pairs(connected_hubs) do hub_count = hub_count + 1 end
-log.info(string.format("Orchestrator plugin loaded (self=%s, connected to %d hubs)",
-    tostring(self_id), hub_count))
+return {
+    _before_reload = function()
+        if _timer_state.id then
+            timer.cancel(_timer_state.id)
+            _timer_state.id = nil
+        end
+        hooks.off("hub_rpc_request", "orchestrator_rpc")
+        log.info("Orchestrator: reloading")
+    end,
 
-return {}
+    _after_reload = function()
+        _timer_state.id = timer.every(60, function()
+            Hub.cleanup_dead()
+        end)
+        log.info("Orchestrator: reloaded")
+    end,
+}
