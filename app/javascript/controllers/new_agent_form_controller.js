@@ -6,10 +6,10 @@ import { HubConnection } from "connections/hub_connection";
  * NewAgentFormController - Handles the two-step new agent form.
  *
  * Step 1: Select existing worktree or enter new branch/issue
- * Step 2: Select profile, optional initial prompt, submit
+ * Step 2: Select agent, optional workspace, optional initial prompt, submit
  *
  * Uses HubConnectionManager to acquire connection for sending commands
- * and receiving worktree list and profile list updates.
+ * and receiving worktree list and agent config updates.
  */
 export default class extends Controller {
   static targets = [
@@ -19,8 +19,10 @@ export default class extends Controller {
     "step2",
     "selectedWorktreeLabel",
     "promptInput",
-    "profileSelect",
-    "profileSection",
+    "agentSelect",
+    "agentSection",
+    "workspaceSelect",
+    "workspaceSection",
     "noConfigWarning",
   ];
 
@@ -35,7 +37,8 @@ export default class extends Controller {
     }
 
     this.worktrees = [];
-    this.profiles = [];
+    this.agents = [];
+    this.workspaces = [];
     this.pendingSelection = null;
     this.unsubscribers = [];
 
@@ -53,10 +56,11 @@ export default class extends Controller {
       );
 
       this.unsubscribers.push(
-        this.hub.on("profileList", ({ profiles, sharedAgent }) => {
-          this.profiles = profiles;
-          this.sharedAgent = sharedAgent;
-          this.#renderProfileSelect();
+        this.hub.on("agentConfig", ({ agents, workspaces }) => {
+          this.agents = agents;
+          this.workspaces = workspaces;
+          this.#renderAgentSelect();
+          this.#renderWorkspaceSelect();
         }),
       );
 
@@ -65,7 +69,7 @@ export default class extends Controller {
       this.unsubscribers.push(
         this.hub.onConnected(() => {
           this.hub.requestWorktrees();
-          this.hub.requestProfiles();
+          this.hub.requestAgentConfig();
         }),
       );
 
@@ -139,25 +143,29 @@ export default class extends Controller {
       ? this.promptInputTarget.value?.trim()
       : "";
 
-    const profile = this.#selectedProfile();
+    const agentName = this.#selectedAgent();
+    const workspace = this.#selectedWorkspace();
 
     if (this.pendingSelection.type === "existing") {
       this.hub.send("reopen_worktree", {
         path: this.pendingSelection.path,
         branch: this.pendingSelection.branch,
         prompt: prompt || null,
-        profile,
+        agent_name: agentName,
+        workspace_config: workspace || null,
       });
     } else if (this.pendingSelection.type === "main") {
       this.hub.send("create_agent", {
         prompt: prompt || null,
-        profile,
+        agent_name: agentName,
+        workspace_config: workspace || null,
       });
     } else {
       this.hub.send("create_agent", {
         issue_or_branch: this.pendingSelection.issueOrBranch,
         prompt: prompt || null,
-        profile,
+        agent_name: agentName,
+        workspace_config: workspace || null,
       });
     }
 
@@ -169,10 +177,14 @@ export default class extends Controller {
     this.hub?.requestWorktrees();
   }
 
-  #selectedProfile() {
-    if (!this.hasProfileSelectTarget) return null;
-    // Empty string = "Default" (shared-only), preserve it for the CLI
-    return this.profileSelectTarget.value;
+  #selectedAgent() {
+    if (!this.hasAgentSelectTarget) return null;
+    return this.agentSelectTarget.value || null;
+  }
+
+  #selectedWorkspace() {
+    if (!this.hasWorkspaceSelectTarget) return null;
+    return this.workspaceSelectTarget.value || null;
   }
 
   #goToStep2(label) {
@@ -207,43 +219,62 @@ export default class extends Controller {
     }
   }
 
-  #renderProfileSelect() {
-    if (!this.hasProfileSelectTarget) return;
+  #renderAgentSelect() {
+    if (!this.hasAgentSelectTarget) return;
 
-    const select = this.profileSelectTarget;
+    const select = this.agentSelectTarget;
     select.innerHTML = "";
 
-    if (this.profiles.length === 0 && !this.sharedAgent) {
-      // No profiles and no shared agent — hide the section entirely
-      if (this.hasProfileSectionTarget) {
-        this.profileSectionTarget.classList.add("hidden");
+    if (this.agents.length === 0) {
+      // No agents configured — hide the section
+      if (this.hasAgentSectionTarget) {
+        this.agentSectionTarget.classList.add("hidden");
       }
-      // Show warning that no session config exists
+      // Show warning that no agent config exists
       if (this.hasNoConfigWarningTarget) {
         this.noConfigWarningTarget.classList.remove("hidden");
       }
       return;
     }
 
-    // Has config — hide warning if it was showing
+    // Has agents — hide warning
     if (this.hasNoConfigWarningTarget) {
       this.noConfigWarningTarget.classList.add("hidden");
     }
 
     // Show the section
-    if (this.hasProfileSectionTarget) {
-      this.profileSectionTarget.classList.remove("hidden");
+    if (this.hasAgentSectionTarget) {
+      this.agentSectionTarget.classList.remove("hidden");
     }
 
-    // "Default" uses shared config only, available when shared has an agent session
-    if (this.sharedAgent) {
+    this.agents.forEach((name) => {
       const option = document.createElement("option");
-      option.value = "";
-      option.textContent = "Default";
+      option.value = name;
+      option.textContent = name.charAt(0).toUpperCase() + name.slice(1);
       select.appendChild(option);
+    });
+  }
+
+  #renderWorkspaceSelect() {
+    if (!this.hasWorkspaceSelectTarget || !this.hasWorkspaceSectionTarget) return;
+
+    const select = this.workspaceSelectTarget;
+    select.innerHTML = "";
+
+    if (this.workspaces.length === 0) {
+      this.workspaceSectionTarget.classList.add("hidden");
+      return;
     }
 
-    this.profiles.forEach((name) => {
+    this.workspaceSectionTarget.classList.remove("hidden");
+
+    // Add empty option for "no workspace"
+    const emptyOption = document.createElement("option");
+    emptyOption.value = "";
+    emptyOption.textContent = "None";
+    select.appendChild(emptyOption);
+
+    this.workspaces.forEach((name) => {
       const option = document.createElement("option");
       option.value = name;
       option.textContent = name.charAt(0).toUpperCase() + name.slice(1);

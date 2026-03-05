@@ -413,18 +413,20 @@ function Client:handle_mcp_data(sub_id, command)
         self:send({
             subscriptionId = sub_id,
             type = "resource_templates_list",
-            resource_templates = mcp.list_resource_templates(),
+            resourceTemplates = mcp.list_resource_templates(),
         })
 
     elseif cmd_type == "resource_read" then
         local call_id = command.call_id
         local uri = command.uri
+
         local context = sub and sub.caller_context or {}
-        mcp.read_resource(uri, context, function(result, err)
+
+        mcp.read_resource(uri, context, function(contents, err)
             if err then
                 self:send({
                     subscriptionId = sub_id,
-                    type = "resource_read_result",
+                    type = "resource_result",
                     call_id = call_id,
                     is_error = true,
                     content = { { type = "text", text = err } },
@@ -432,10 +434,10 @@ function Client:handle_mcp_data(sub_id, command)
             else
                 self:send({
                     subscriptionId = sub_id,
-                    type = "resource_read_result",
+                    type = "resource_result",
                     call_id = call_id,
                     is_error = false,
-                    contents = result,
+                    contents = contents,
                 })
             end
         end)

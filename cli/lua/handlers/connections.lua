@@ -396,6 +396,20 @@ _event_subs[#_event_subs + 1] = events.on("mcp_prompts_changed", function()
     end
 end)
 
+-- Notify MCP clients when resource template list changes
+_event_subs[#_event_subs + 1] = events.on("mcp_resources_changed", function()
+    for _, client in pairs(clients) do
+        for sub_id, sub in pairs(client.subscriptions) do
+            if sub.channel == "mcp" then
+                client:send({
+                    subscriptionId = sub_id,
+                    type = "resources_list_changed",
+                })
+            end
+        end
+    end
+end)
+
 -- ============================================================================
 -- Module Interface
 -- ============================================================================

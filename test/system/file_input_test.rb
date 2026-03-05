@@ -12,8 +12,8 @@ class FileInputTest < ApplicationSystemTestCase
     @user = users(:one)
     @hub = create_test_hub(user: @user)
     @cli = start_cli(@hub)
-    # Create minimal agent session config so CLI can spawn agents
-    init_path = File.join(@cli.temp_dir, ".botster/shared/sessions/agent/initialization")
+    # Create minimal agent config so CLI can spawn agents
+    init_path = File.join(@cli.temp_dir, ".botster/agents/default/initialization")
     FileUtils.mkdir_p(File.dirname(init_path))
     File.write(init_path, "#!/bin/bash\n")
     # Clean up any leftover paste files from previous test runs

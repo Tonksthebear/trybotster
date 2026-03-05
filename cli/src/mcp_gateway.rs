@@ -165,7 +165,7 @@ fn handle_hub_message(
             }
         }
 
-        "resource_read_result" => {
+        "resource_result" => {
             let call_id = msg
                 .get("call_id")
                 .and_then(|c| c.as_str())
@@ -503,29 +503,18 @@ fn hub_messages_to_mcp(messages: &Value) -> Vec<PromptMessage> {
 
 /// Convert a hub resource template JSON object to an rmcp `ResourceTemplate`.
 ///
-/// Hub sends: `{ uri_template, name, description?, mime_type? }`
-fn hub_resource_template_to_mcp(rt: &Value) -> ResourceTemplate {
-    let uri_template = rt
-        .get("uri_template")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-    let name = rt
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
-
+/// Hub sends: `{ uriTemplate, name, description?, mimeType? }`
+fn hub_resource_template_to_mcp(t: &Value) -> Option<ResourceTemplate> {
+    let uri_template = t.get("uriTemplate")?.as_str()?;
+    let name = t.get("name")?.as_str()?;
     let mut raw = RawResourceTemplate::new(uri_template, name);
-
-    if let Some(desc) = rt.get("description").and_then(|v| v.as_str()) {
+    if let Some(desc) = t.get("description").and_then(|d| d.as_str()) {
         raw = raw.with_description(desc);
     }
-    if let Some(mime) = rt.get("mime_type").and_then(|v| v.as_str()) {
+    if let Some(mime) = t.get("mimeType").and_then(|m| m.as_str()) {
         raw = raw.with_mime_type(mime);
     }
-
-    Annotated::new(raw, None)
+    Some(raw.no_annotation())
 }
 
 impl ServerHandler for McpGateway {
@@ -751,9 +740,9 @@ impl ServerHandler for McpGateway {
                 .await?;
 
             let templates = msg
-                .get("resource_templates")
+                .get("resourceTemplates")
                 .and_then(|t| t.as_array())
-                .map(|arr| arr.iter().map(hub_resource_template_to_mcp).collect())
+                .map(|arr| arr.iter().filter_map(hub_resource_template_to_mcp).collect())
                 .unwrap_or_default();
 
             Ok(ListResourceTemplatesResult::with_all_items(templates))
@@ -777,34 +766,63 @@ impl ServerHandler for McpGateway {
                         "subscriptionId": SUB_ID,
                         "type": "resource_read",
                         "call_id": call_id,
-                        "uri": uri,
+                        "uri": uri
                     })),
                 )
                 .await?;
 
-            // Check for error response
             let is_error = msg
                 .get("is_error")
-                .and_then(|v| v.as_bool())
+                .and_then(|e| e.as_bool())
                 .unwrap_or(false);
 
             if is_error {
-                let err_text = msg
-                    .get("content")
-                    .and_then(|c| c.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|item| item.get("text"))
+                let empty = json!([]);
+                let content = msg.get("content").unwrap_or(&empty);
+                let err_text = content
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|c| c.get("text"))
                     .and_then(|t| t.as_str())
-                    .unwrap_or("Unknown error")
-                    .to_owned();
-                return Err(ErrorData::resource_not_found(err_text, None));
+                    .unwrap_or("resource read error");
+                return Err(ErrorData::resource_not_found(err_text.to_string(), None));
             }
 
-            // Parse contents array from hub response
             let contents: Vec<ResourceContents> = msg
                 .get("contents")
-                .cloned()
-                .and_then(|c| serde_json::from_value(c).ok())
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| {
+                            let item_uri = item
+                                .get("uri")
+                                .and_then(|u| u.as_str())
+                                .unwrap_or(uri);
+
+                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                let mut rc = ResourceContents::text(text, item_uri);
+                                if let Some(mime) =
+                                    item.get("mimeType").and_then(|m| m.as_str())
+                                {
+                                    rc = rc.with_mime_type(mime);
+                                }
+                                Some(rc)
+                            } else if let Some(blob) =
+                                item.get("blob").and_then(|b| b.as_str())
+                            {
+                                let mut rc = ResourceContents::blob(blob, item_uri);
+                                if let Some(mime) =
+                                    item.get("mimeType").and_then(|m| m.as_str())
+                                {
+                                    rc = rc.with_mime_type(mime);
+                                }
+                                Some(rc)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
 
             Ok(ReadResourceResult::new(contents))
