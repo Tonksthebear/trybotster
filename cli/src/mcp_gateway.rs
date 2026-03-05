@@ -165,7 +165,7 @@ fn handle_hub_message(
             }
         }
 
-        "resource_read_result" => {
+        "resource_result" => {
             let call_id = msg
                 .get("call_id")
                 .and_then(|c| c.as_str())
@@ -503,15 +503,15 @@ fn hub_messages_to_mcp(messages: &Value) -> Vec<PromptMessage> {
 
 /// Convert a hub resource template JSON object to an rmcp `ResourceTemplate`.
 ///
-/// Hub sends: `{ uri_template, name, description?, mime_type? }`
+/// Hub sends: `{ uriTemplate, name, description?, mimeType? }`
 fn hub_resource_template_to_mcp(t: &Value) -> Option<ResourceTemplate> {
-    let uri_template = t.get("uri_template")?.as_str()?;
+    let uri_template = t.get("uriTemplate")?.as_str()?;
     let name = t.get("name")?.as_str()?;
     let mut raw = RawResourceTemplate::new(uri_template, name);
     if let Some(desc) = t.get("description").and_then(|d| d.as_str()) {
         raw = raw.with_description(desc);
     }
-    if let Some(mime) = t.get("mime_type").and_then(|m| m.as_str()) {
+    if let Some(mime) = t.get("mimeType").and_then(|m| m.as_str()) {
         raw = raw.with_mime_type(mime);
     }
     Some(raw.no_annotation())
@@ -740,7 +740,7 @@ impl ServerHandler for McpGateway {
                 .await?;
 
             let templates = msg
-                .get("resource_templates")
+                .get("resourceTemplates")
                 .and_then(|t| t.as_array())
                 .map(|arr| arr.iter().filter_map(hub_resource_template_to_mcp).collect())
                 .unwrap_or_default();
