@@ -55,6 +55,8 @@ end
 function Agent.receive_messages(session_uuid)
     local agent = Agent.get(session_uuid)
     if not agent then return nil end
+    -- Only agents have inboxes; accessories don't receive messages
+    if agent.session_type ~= "agent" then return nil end
 
     local now = os.time()
     local valid = {}
