@@ -44,7 +44,9 @@ end
 
 -- Load library modules
 safe_require("lib.config_resolver")
+safe_require("lib.session")
 safe_require("lib.agent")
+safe_require("lib.accessory")
 safe_require("lib.commands")
 _G.mcp = safe_require("lib.mcp")
 
