@@ -432,7 +432,13 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
 
         -- Stash workspace_manifest and agent_name in metadata so they survive
         -- the Rust round-trip (WorktreeCreateResult only carries metadata, not these fields)
-        local async_metadata = metadata and vim.tbl_deep_extend("force", {}, metadata) or {}
+        -- Use plain Lua table copy here so this works in headless runtimes (no global `vim`).
+        local async_metadata = {}
+        if metadata then
+            for k, v in pairs(metadata) do
+                async_metadata[k] = v
+            end
+        end
         async_metadata._workspace_manifest = workspace_manifest
         async_metadata._agent_name = agent_name
 
