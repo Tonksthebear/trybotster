@@ -643,7 +643,8 @@ function M.migrate(data_dir)
             repo          = ctx.repo,
             branch        = ctx.branch_name,
             worktree_path = ctx.worktree_path or worktree_path,
-            profile_name  = ctx.profile_name,
+            agent_name    = ctx.agent_name or ctx.profile_name,
+            profile_name  = ctx.agent_name or ctx.profile_name,  -- backward compat
             status        = "active",
             broker_sessions = broker_sessions,
             pty_dimensions  = pty_dimensions,

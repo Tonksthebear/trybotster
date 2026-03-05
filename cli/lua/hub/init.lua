@@ -108,13 +108,11 @@ end)
 safe_require("user.init")
 
 -- ============================================================================
--- Plugin Loading (Unified: device + repo layers)
+-- Plugin Loading (2-layer: device + repo)
 -- ============================================================================
 -- Uses config_resolver.resolve_all() to discover plugins across:
---   1. ~/.botster/shared/plugins/
---   2. ~/.botster/profiles/{profile}/plugins/
---   3. {repo}/.botster/shared/plugins/
---   4. {repo}/.botster/profiles/{profile}/plugins/
+--   1. ~/.botster/plugins/
+--   2. {repo}/.botster/plugins/
 
 local ConfigResolver = require("lib.config_resolver")
 local state = require("hub.state")
@@ -123,20 +121,26 @@ local loaded_plugin_names = {}
 
 local device_root = config.data_dir and config.data_dir() or nil
 local repo_root = (worktree and worktree.repo_root) and worktree.repo_root() or nil
-local active_profile = (config.get and config.get("active_profile")) or nil
 
 -- Store resolver opts so plugin watcher/reload can re-discover plugins
 state.set("plugin_resolver_opts", {
     device_root = device_root,
     repo_root = repo_root,
-    profile = active_profile,
 })
+
+-- Run migration if old structure detected
+if ConfigResolver.needs_migration(device_root, repo_root) then
+    log.info("Legacy config structure detected, running migration...")
+    local mig_ok, mig_err = pcall(ConfigResolver.migrate, device_root, repo_root)
+    if not mig_ok then
+        log.warn(string.format("Config migration error: %s", tostring(mig_err)))
+    end
+end
 
 if device_root or repo_root then
     local unified = ConfigResolver.resolve_all({
         device_root = device_root,
         repo_root = repo_root,
-        profile = active_profile,
         require_agent = false,  -- plugin discovery doesn't need agent session
     })
 

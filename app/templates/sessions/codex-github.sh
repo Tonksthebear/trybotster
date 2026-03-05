@@ -2,7 +2,7 @@
 # @template Codex GitHub
 # @description Agent session with GitHub MCP tools, issue tracking, and worktree context
 # @category sessions
-# @dest shared/sessions/agent/initialization
+# @dest agents/codex/initialization
 # @scope device
 # @version 1.0.0
 
