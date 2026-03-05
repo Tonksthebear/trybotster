@@ -180,7 +180,7 @@ export class HubConnection extends HubRoute {
    * Request agent/accessory/workspace config from CLI.
    */
   requestAgentConfig() {
-    return this.send("list_agent_config");
+    return this.send("list_configs");
   }
 
   /**

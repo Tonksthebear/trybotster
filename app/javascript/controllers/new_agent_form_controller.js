@@ -152,20 +152,20 @@ export default class extends Controller {
         branch: this.pendingSelection.branch,
         prompt: prompt || null,
         agent_name: agentName,
-        workspace: workspace || null,
+        workspace_config: workspace || null,
       });
     } else if (this.pendingSelection.type === "main") {
       this.hub.send("create_agent", {
         prompt: prompt || null,
         agent_name: agentName,
-        workspace: workspace || null,
+        workspace_config: workspace || null,
       });
     } else {
       this.hub.send("create_agent", {
         issue_or_branch: this.pendingSelection.issueOrBranch,
         prompt: prompt || null,
         agent_name: agentName,
-        workspace: workspace || null,
+        workspace_config: workspace || null,
       });
     }
 
