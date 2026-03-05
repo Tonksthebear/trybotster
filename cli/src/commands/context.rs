@@ -97,6 +97,25 @@ pub fn build() -> BTreeMap<String, String> {
         }
     }
 
+    // Flatten metadata keys into context so plugins can store arbitrary
+    // values (e.g. issue_number, invocation_url) accessible via
+    // `botster context <key>`. Metadata values don't override well-known fields.
+    if let Some(metadata) = manifest.get("metadata").and_then(|v| v.as_object()) {
+        for (key, value) in metadata {
+            if !ctx.contains_key(key) {
+                if let Some(s) = value.as_str() {
+                    if !s.is_empty() {
+                        ctx.insert(key.clone(), s.to_string());
+                    }
+                } else if let Some(n) = value.as_i64() {
+                    ctx.insert(key.clone(), n.to_string());
+                } else if let Some(n) = value.as_u64() {
+                    ctx.insert(key.clone(), n.to_string());
+                }
+            }
+        }
+    }
+
     ctx
 }
 
