@@ -12,7 +12,7 @@
 # No MCP server or GitHub integration — just Codex and the codebase.
 
 # Uncomment if using mise
-# mise trust 2>/dev/null
+mise trust 2>/dev/null
 
 # Change to the worktree directory
 cd "$BOTSTER_WORKTREE_PATH"

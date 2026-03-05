@@ -281,6 +281,28 @@ BOTSTER_TUNNEL_PORT=4001
 
 Additional env vars may be injected by plugins (e.g., the GitHub plugin adds `BOTSTER_MCP_TOKEN` and `BOTSTER_MCP_URL`).
 
+### Codex MCP (strict manifest mode)
+
+`botster mcp-serve` resolves hub context from `BOTSTER_HUB_MANIFEST_PATH` only.
+
+Configure Codex to pass that env var to the MCP subprocess:
+
+```bash
+export BOTSTER_HUB_MANIFEST_PATH="$(botster context hub_manifest_path)"
+codex mcp remove botster
+codex mcp add botster \
+  --env BOTSTER_HUB_MANIFEST_PATH="$BOTSTER_HUB_MANIFEST_PATH" \
+  -- botster mcp-serve
+```
+
+Verify:
+
+```bash
+codex mcp get botster
+```
+
+The output should show `env: BOTSTER_HUB_MANIFEST_PATH=*****`.
+
 ## Templates
 
 The Settings > Templates tab in the browser provides a catalog of installable templates:

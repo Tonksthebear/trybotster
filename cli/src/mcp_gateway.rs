@@ -47,6 +47,7 @@ const HUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(86_400);
 enum HubNotification {
     ToolsListChanged,
     PromptsListChanged,
+    ResourcesListChanged,
 }
 
 /// A request sent from the gateway to the connection manager.
@@ -156,6 +157,28 @@ fn handle_hub_message(
 
         "prompts_list_changed" => {
             let _ = notification_tx.send(HubNotification::PromptsListChanged);
+        }
+
+        "resource_templates_list" => {
+            if let Some(tx) = pending.remove("resource_templates_list") {
+                let _ = tx.send(Ok(msg));
+            }
+        }
+
+        "resource_read_result" => {
+            let call_id = msg
+                .get("call_id")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            if !call_id.is_empty() {
+                if let Some(tx) = pending.remove(call_id) {
+                    let _ = tx.send(Ok(msg));
+                }
+            }
+        }
+
+        "resources_list_changed" => {
+            let _ = notification_tx.send(HubNotification::ResourcesListChanged);
         }
 
         _ => {} // Ignore other hub messages
@@ -478,6 +501,33 @@ fn hub_messages_to_mcp(messages: &Value) -> Vec<PromptMessage> {
     serde_json::from_value::<Vec<PromptMessage>>(messages.clone()).unwrap_or_default()
 }
 
+/// Convert a hub resource template JSON object to an rmcp `ResourceTemplate`.
+///
+/// Hub sends: `{ uri_template, name, description?, mime_type? }`
+fn hub_resource_template_to_mcp(rt: &Value) -> ResourceTemplate {
+    let uri_template = rt
+        .get("uri_template")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let name = rt
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+
+    let mut raw = RawResourceTemplate::new(uri_template, name);
+
+    if let Some(desc) = rt.get("description").and_then(|v| v.as_str()) {
+        raw = raw.with_description(desc);
+    }
+    if let Some(mime) = rt.get("mime_type").and_then(|v| v.as_str()) {
+        raw = raw.with_mime_type(mime);
+    }
+
+    Annotated::new(raw, None)
+}
+
 impl ServerHandler for McpGateway {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
@@ -486,6 +536,8 @@ impl ServerHandler for McpGateway {
                 .enable_tool_list_changed()
                 .enable_prompts()
                 .enable_prompts_list_changed()
+                .enable_resources()
+                .enable_resources_list_changed()
                 .build(),
         )
         .with_server_info(Implementation::new(
@@ -514,6 +566,12 @@ impl ServerHandler for McpGateway {
                             HubNotification::PromptsListChanged => {
                                 log::info!("[mcp-gateway] Forwarding prompts/list_changed");
                                 peer.notify_prompt_list_changed().await
+                            }
+                            HubNotification::ResourcesListChanged => {
+                                log::info!(
+                                    "[mcp-gateway] Forwarding resources/list_changed"
+                                );
+                                peer.notify_resource_list_changed().await
                             }
                         };
                         if let Err(e) = result {
@@ -671,6 +729,85 @@ impl ServerHandler for McpGateway {
             }
 
             Ok(result)
+        }
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, ErrorData>> + Send + '_
+    {
+        async move {
+            let msg = self
+                .hub_request(
+                    "resources/templates/list",
+                    "resource_templates_list".to_string(),
+                    Frame::Json(json!({
+                        "subscriptionId": SUB_ID,
+                        "type": "resource_templates_list"
+                    })),
+                )
+                .await?;
+
+            let templates = msg
+                .get("resource_templates")
+                .and_then(|t| t.as_array())
+                .map(|arr| arr.iter().map(hub_resource_template_to_mcp).collect())
+                .unwrap_or_default();
+
+            Ok(ListResourceTemplatesResult::with_all_items(templates))
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ReadResourceResult, ErrorData>> + Send + '_ {
+        async move {
+            let call_id = self.next_call_id("resource_read").await;
+            let uri = request.uri.as_str();
+
+            let msg = self
+                .hub_request(
+                    &format!("resources/read[{uri}]"),
+                    call_id.clone(),
+                    Frame::Json(json!({
+                        "subscriptionId": SUB_ID,
+                        "type": "resource_read",
+                        "call_id": call_id,
+                        "uri": uri,
+                    })),
+                )
+                .await?;
+
+            // Check for error response
+            let is_error = msg
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if is_error {
+                let err_text = msg
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|item| item.get("text"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("Unknown error")
+                    .to_owned();
+                return Err(ErrorData::resource_not_found(err_text, None));
+            }
+
+            // Parse contents array from hub response
+            let contents: Vec<ResourceContents> = msg
+                .get("contents")
+                .cloned()
+                .and_then(|c| serde_json::from_value(c).ok())
+                .unwrap_or_default();
+
+            Ok(ReadResourceResult::new(contents))
         }
     }
 }

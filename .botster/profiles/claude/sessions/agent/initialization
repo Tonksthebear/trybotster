@@ -30,8 +30,8 @@ botster json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogA
 # Registers the local hub MCP bridge so agents can use plugin-provided tools
 # (orchestrator, custom plugin tools, etc.) via the Botster hub.
 
-echo "Registering botster hub MCP tools..."
-claude mcp add botster-hub -- botster mcp-serve
+# echo "Registering botster hub MCP tools..."
+# claude mcp add botster-hub -- botster mcp-serve
 
 # ---------------------------------------------------------------------------
 # Launch
