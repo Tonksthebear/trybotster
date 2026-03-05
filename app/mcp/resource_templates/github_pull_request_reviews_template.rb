@@ -25,76 +25,57 @@ class GithubPullRequestReviewsTemplate < ApplicationMCPResTemplate
 
   def resolve
     full_repo = "#{owner}/#{repo}"
-    pr_number = number.to_i
-
     installation_id = ::Github::App.installation_id_for_repo(full_repo)
-    unless installation_id
-      return { error: "GitHub App is not installed on #{full_repo}" }.to_json
-    end
+    raise "GitHub App is not installed on #{full_repo}" unless installation_id
 
     client = ::Github::App.installation_client(installation_id)
-    reviews = client.pull_request_reviews(full_repo, pr_number)
-    comments = client.pull_request_comments(full_repo, pr_number)
+    reviews = client.pull_request_reviews(full_repo, number.to_i)
+    comments = client.pull_request_comments(full_repo, number.to_i)
 
-    # Index inline comments by review_id for grouping
     comments_by_review = comments.group_by { |c| c[:pull_request_review_id] }
 
-    result = {
-      reviews: reviews.map do |review|
-        inline = comments_by_review[review[:id]]
-        {
-          id: review[:id],
-          state: review[:state],
-          author: review[:user][:login],
-          submitted_at: review[:submitted_at],
-          html_url: review[:html_url],
-          body: review[:body],
-          inline_comments: inline&.map do |c|
-            {
-              path: c[:path],
-              line: c[:line] || c[:original_line],
-              author: c[:user][:login],
-              created_at: c[:created_at],
-              html_url: c[:html_url],
-              body: c[:body]
+    ActionMCP::Content::Resource.new(
+      "github://repos/#{owner}/#{repo}/pulls/#{number}/reviews",
+      "application/json",
+      text: {
+        reviews: reviews.map { |review|
+          inline = comments_by_review[review[:id]]
+          {
+            id: review[:id],
+            state: review[:state],
+            author: review[:user][:login],
+            submitted_at: review[:submitted_at],
+            html_url: review[:html_url],
+            body: review[:body],
+            inline_comments: inline&.map { |c|
+              {
+                path: c[:path],
+                line: c[:line] || c[:original_line],
+                author: c[:user][:login],
+                created_at: c[:created_at],
+                html_url: c[:html_url],
+                body: c[:body]
+              }
             }
-          end
-        }.compact
-      end,
-      standalone_inline_comments: (comments_by_review[nil] || []).map do |c|
-        {
-          path: c[:path],
-          line: c[:line] || c[:original_line],
-          author: c[:user][:login],
-          created_at: c[:created_at],
-          html_url: c[:html_url],
-          body: c[:body]
+          }.compact
+        },
+        standalone_inline_comments: (comments_by_review[nil] || []).map { |c|
+          {
+            path: c[:path],
+            line: c[:line] || c[:original_line],
+            author: c[:user][:login],
+            created_at: c[:created_at],
+            html_url: c[:html_url],
+            body: c[:body]
+          }
+        },
+        summary: {
+          total_reviews: reviews.count,
+          total_inline_comments: comments.count
         }
-      end,
-      summary: {
-        total_reviews: reviews.count,
-        total_inline_comments: comments.count
-      }
-    }
-
-    result.to_json
+      }.to_json
+    )
   rescue Octokit::Error => e
-    { error: "Failed to fetch pull request reviews: #{e.message}" }.to_json
-  rescue => e
-    { error: "Error fetching pull request reviews: #{e.message}" }.to_json
-  end
-
-  private
-
-  def owner
-    arguments["owner"]
-  end
-
-  def repo
-    arguments["repo"]
-  end
-
-  def number
-    arguments["number"]
+    raise "Failed to fetch pull request reviews: #{e.message}"
   end
 end

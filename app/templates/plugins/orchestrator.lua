@@ -1,7 +1,7 @@
 -- @template Orchestrator
 -- @description Connect to other hubs and manage agents remotely
 -- @category plugins
--- @dest shared/plugins/orchestrator/init.lua
+-- @dest plugins/orchestrator/init.lua
 -- @scope device
 -- @version 1.0.0
 

@@ -104,7 +104,7 @@ Read agent and UI state from the _tui_state global inside render():
 
   _tui_state.agents                    -- array of agent info tables:
     agent.id, agent.session_uuid, agent.session_type, agent.display_name,
-    agent.display_index, agent.branch_name, agent.profile_name, agent.notification,
+    agent.display_index, agent.branch_name, agent.agent_name, agent.notification,
     agent.in_worktree
   _tui_state.selected_session_uuid     -- session UUID string, or nil
   _tui_state.list_cursor_pos           -- 0-based cursor position in the agent list

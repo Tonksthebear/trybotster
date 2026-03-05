@@ -130,13 +130,11 @@ commands.register("template:list", function(client, sub_id, command)
     local ConfigResolver = require("lib.config_resolver")
     local installed = {}
 
-    -- Scan all 4 layers independently so we report every scope a plugin exists in.
-    -- (resolve_all merges by name and only keeps the winning layer.)
+    -- Scan device and repo roots for installed plugins and agents
     local device_root = config.data_dir and config.data_dir() or nil
     local repo_root = worktree.repo_root()
-    local active_profile = (config.get and config.get("active_profile")) or nil
 
-    local function scan_layer(base_path, scope_label, path_prefix)
+    local function scan_plugins(base_path, scope_label, path_prefix)
         local plugins = ConfigResolver.read_plugins(base_path)
         for name, plugin in pairs(plugins) do
             local dest = path_prefix .. "plugins/" .. name .. "/init.lua"
@@ -144,36 +142,14 @@ commands.register("template:list", function(client, sub_id, command)
         end
     end
 
-    -- Device shared
-    if device_root and fs.exists(device_root .. "/shared") then
-        scan_layer(device_root .. "/shared", "device", "shared/")
+    -- Device root
+    if device_root and fs.exists(device_root) then
+        scan_plugins(device_root, "device", "")
     end
 
-    -- Device profiles
-    if device_root then
-        local profiles = ConfigResolver.list_profiles_all(device_root, nil)
-        for _, profile_name in ipairs(profiles) do
-            local profile_path = device_root .. "/profiles/" .. profile_name
-            if fs.exists(profile_path) then
-                scan_layer(profile_path, "device", "profiles/" .. profile_name .. "/")
-            end
-        end
-    end
-
-    -- Repo shared
-    if repo_root and fs.exists(repo_root .. "/.botster/shared") then
-        scan_layer(repo_root .. "/.botster/shared", "repo", "shared/")
-    end
-
-    -- Repo profiles
-    if repo_root then
-        local profiles = ConfigResolver.list_profiles_all(nil, repo_root)
-        for _, profile_name in ipairs(profiles) do
-            local profile_path = repo_root .. "/.botster/profiles/" .. profile_name
-            if fs.exists(profile_path) then
-                scan_layer(profile_path, "repo", "profiles/" .. profile_name .. "/")
-            end
-        end
+    -- Repo root
+    if repo_root and fs.exists(repo_root .. "/.botster") then
+        scan_plugins(repo_root .. "/.botster", "repo", "")
     end
 
     respond(client, sub_id, command.request_id, { ok = true, installed = installed })
@@ -220,7 +196,6 @@ commands.register("plugin:load", function(client, sub_id, command)
     local unified = ConfigResolver.resolve_all({
         device_root = opts.device_root,
         repo_root = opts.repo_root,
-        profile = opts.profile,
         require_agent = false,
     })
 

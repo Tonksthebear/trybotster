@@ -22,46 +22,32 @@ class GithubPullRequestFilesTemplate < ApplicationMCPResTemplate
 
   def resolve
     full_repo = "#{owner}/#{repo}"
-    pr_number = number.to_i
-
     installation_id = ::Github::App.installation_id_for_repo(full_repo)
-    unless installation_id
-      return { error: "GitHub App is not installed on #{full_repo}" }.to_json
-    end
+    raise "GitHub App is not installed on #{full_repo}" unless installation_id
 
     client = ::Github::App.installation_client(installation_id)
-    files = client.pull_request_files(full_repo, pr_number)
+    files = client.pull_request_files(full_repo, number.to_i)
 
-    files.map do |file|
-      {
-        filename: file[:filename],
-        status: file[:status],
-        additions: file[:additions],
-        deletions: file[:deletions],
-        changes: file[:changes],
-        previous_filename: file[:previous_filename],
-        patch: file[:patch].present? ? annotate_patch(file[:patch]) : nil
-      }.compact
-    end.to_json
+    ActionMCP::Content::Resource.new(
+      "github://repos/#{owner}/#{repo}/pulls/#{number}/files",
+      "application/json",
+      text: files.map { |file|
+        {
+          filename: file[:filename],
+          status: file[:status],
+          additions: file[:additions],
+          deletions: file[:deletions],
+          changes: file[:changes],
+          previous_filename: file[:previous_filename],
+          patch: file[:patch].present? ? annotate_patch(file[:patch]) : nil
+        }.compact
+      }.to_json
+    )
   rescue Octokit::Error => e
-    { error: "Failed to fetch pull request files: #{e.message}" }.to_json
-  rescue => e
-    { error: "Error fetching pull request files: #{e.message}" }.to_json
+    raise "Failed to fetch pull request files: #{e.message}"
   end
 
   private
-
-  def owner
-    arguments["owner"]
-  end
-
-  def repo
-    arguments["repo"]
-  end
-
-  def number
-    arguments["number"]
-  end
 
   # Annotates a unified diff patch with right-side (new file) line numbers.
   # Numbered lines are valid targets for inline review comments (`line` parameter).

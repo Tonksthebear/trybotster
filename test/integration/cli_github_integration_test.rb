@@ -6,7 +6,7 @@ require_relative "cli_integration_test_case"
 # Tests the GitHub plugin integration: message → ActionCable → Lua plugin → agent spawn.
 #
 # GitHub is a PLUGIN integration, not core. These tests verify the full flow
-# through the github.lua plugin loaded from .botster/shared/plugins/github/.
+# through the github.lua plugin loaded from .botster/plugins/github/.
 #
 # The test sets up:
 # 1. A git repo with .botster/ directory structure (sessions + github plugin)
@@ -317,9 +317,9 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
 
   # Install the github.lua plugin into the repo's .botster/ directory.
   # The Lua runtime discovers plugins via ConfigResolver scanning
-  # {repo}/.botster/shared/plugins/{name}/init.lua
+  # {repo}/.botster/plugins/{name}/init.lua
   def install_github_plugin(repo_path)
-    plugin_dir = File.join(repo_path, ".botster", "shared", "plugins", "github")
+    plugin_dir = File.join(repo_path, ".botster", "plugins", "github")
     FileUtils.mkdir_p(plugin_dir)
 
     source = Rails.root.join("app/templates/plugins/github.lua")
@@ -339,11 +339,11 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     Rails.logger.info "[CliGithubTest] Installed github plugin at #{dest}"
   end
 
-  # Install a minimal agent session config so ConfigResolver.resolve_all()
-  # finds the required 'agent' session. The initialization script is a
+  # Install a minimal agent config so ConfigResolver.resolve_all()
+  # finds the required default agent. The initialization script is a
   # simple test script that verifies environment and exits.
   def install_agent_session(repo_path)
-    session_dir = File.join(repo_path, ".botster", "shared", "sessions", "agent")
+    session_dir = File.join(repo_path, ".botster", "agents", "default")
     FileUtils.mkdir_p(session_dir)
 
     File.write(File.join(session_dir, "initialization"), <<~BASH)
@@ -361,13 +361,13 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     BASH
     FileUtils.chmod(0o755, File.join(session_dir, "initialization"))
 
-    # Commit so worktrees inherit the session config
+    # Commit so worktrees inherit the agent config
     Dir.chdir(repo_path) do
       system("git add .botster/", out: File::NULL, err: File::NULL)
       system("git commit -m 'Add agent session config'", out: File::NULL, err: File::NULL)
     end
 
-    Rails.logger.info "[CliGithubTest] Installed agent session config"
+    Rails.logger.info "[CliGithubTest] Installed agent config"
   end
 
   # Install a long-lived agent session that stays alive reading stdin.
@@ -379,7 +379,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
   end
 
   def write_long_lived_session(repo_path)
-    session_dir = File.join(repo_path, ".botster", "shared", "sessions", "agent")
+    session_dir = File.join(repo_path, ".botster", "agents", "default")
     FileUtils.mkdir_p(session_dir)
 
     File.write(File.join(session_dir, "initialization"), <<~BASH)
@@ -401,7 +401,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
       system("git commit --amend --no-edit", out: File::NULL, err: File::NULL)
     end
 
-    Rails.logger.info "[CliGithubTest] Installed long-lived agent session"
+    Rails.logger.info "[CliGithubTest] Installed long-lived agent config"
   end
 
   def assert_message_acknowledged(message, timeout: 15)

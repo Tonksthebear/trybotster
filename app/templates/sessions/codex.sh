@@ -2,7 +2,7 @@
 # @template Codex
 # @description Minimal agent session that launches OpenAI Codex in a worktree
 # @category sessions
-# @dest profiles/codex/sessions/agent/initialization
+# @dest agents/codex/initialization
 # @scope device
 # @version 1.0.0
 

@@ -12,48 +12,32 @@ class GithubIssuesTemplate < ApplicationMCPResTemplate
 
   def resolve
     full_repo = "#{owner}/#{repo}"
-
     installation_id = ::Github::App.installation_id_for_repo(full_repo)
-    unless installation_id
-      return { error: "GitHub App is not installed on #{full_repo}" }.to_json
-    end
+    raise "GitHub App is not installed on #{full_repo}" unless installation_id
 
     client = ::Github::App.installation_client(installation_id)
-    state_param = state || "open"
-
+    state_param = state.presence || "open"
     issues = client.list_issues(full_repo, state: state_param)
 
-    issues.map do |issue|
-      {
-        number: issue[:number],
-        title: issue[:title],
-        state: issue[:state],
-        html_url: issue[:html_url],
-        author: issue[:user][:login],
-        comments: issue[:comments],
-        created_at: issue[:created_at],
-        updated_at: issue[:updated_at],
-        labels: issue[:labels]&.map { |l| l[:name] },
-        is_pull_request: issue[:pull_request].present?
-      }
-    end.to_json
+    ActionMCP::Content::Resource.new(
+      "github://repos/#{owner}/#{repo}/issues",
+      "application/json",
+      text: issues.map { |issue|
+        {
+          number: issue[:number],
+          title: issue[:title],
+          state: issue[:state],
+          html_url: issue[:html_url],
+          author: issue[:user][:login],
+          comments: issue[:comments],
+          created_at: issue[:created_at],
+          updated_at: issue[:updated_at],
+          labels: issue[:labels]&.map { |l| l[:name] },
+          is_pull_request: issue[:pull_request].present?
+        }
+      }.to_json
+    )
   rescue Octokit::Error => e
-    { error: "Failed to fetch issues: #{e.message}" }.to_json
-  rescue => e
-    { error: "Error fetching issues: #{e.message}" }.to_json
-  end
-
-  private
-
-  def owner
-    arguments["owner"]
-  end
-
-  def repo
-    arguments["repo"]
-  end
-
-  def state
-    arguments["state"]
+    raise "Failed to fetch issues: #{e.message}"
   end
 end

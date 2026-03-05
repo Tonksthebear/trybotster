@@ -223,6 +223,35 @@ pub fn cleanup_stale_files(hub_id: &str) {
 ///
 /// Called from `Hub::shutdown()` to clean up daemon files.
 pub fn cleanup_on_shutdown(hub_id: &str) {
+    let current_pid = std::process::id();
+
+    // Only the owning hub process may remove runtime artifacts.
+    // This prevents a stale/duplicate shutdown path from unlinking a live hub
+    // socket that belongs to a different PID.
+    if let Some(owner_pid) = read_pid_file(hub_id) {
+        if owner_pid != current_pid {
+            log::warn!(
+                "Skipping daemon cleanup for hub {}: pid file owned by {} (current pid={})",
+                &hub_id[..hub_id.len().min(8)],
+                owner_pid,
+                current_pid
+            );
+            return;
+        }
+    }
+
+    if let Some(manifest) = read_manifest(hub_id) {
+        if manifest.pid != current_pid {
+            log::warn!(
+                "Skipping daemon cleanup for hub {}: manifest owned by {} (current pid={})",
+                &hub_id[..hub_id.len().min(8)],
+                manifest.pid,
+                current_pid
+            );
+            return;
+        }
+    }
+
     if let Ok(path) = pid_file_path(hub_id) {
         let _ = fs::remove_file(&path);
     }
@@ -366,6 +395,56 @@ mod tests {
         cleanup_on_shutdown(&test_id);
         assert!(read_pid_file(&test_id).is_none());
         assert!(!is_hub_running(&test_id));
+    }
+
+    #[test]
+    fn test_cleanup_on_shutdown_skips_foreign_pid_file_owner() {
+        let test_id = format!("_test_foreign_pid_{}", std::process::id());
+        let pid_path = pid_file_path(&test_id).unwrap();
+        let socket_path = socket_path(&test_id).unwrap();
+
+        fs::write(&pid_path, "999999").unwrap();
+        fs::write(&socket_path, b"").unwrap();
+
+        cleanup_on_shutdown(&test_id);
+
+        assert!(pid_path.exists(), "foreign pid file should remain");
+        assert!(socket_path.exists(), "foreign socket should remain");
+
+        let _ = fs::remove_file(&pid_path);
+        let _ = fs::remove_file(&socket_path);
+        if let Ok(path) = manifest_path(&test_id) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn test_cleanup_on_shutdown_skips_foreign_manifest_owner() {
+        let test_id = format!("_test_foreign_manifest_{}", std::process::id());
+        let manifest = HubManifest {
+            hub_id: test_id.clone(),
+            server_id: Some("server-xyz".to_string()),
+            socket_path: socket_path(&test_id).unwrap().to_string_lossy().into_owned(),
+            pid: 999999,
+            updated_at: 1,
+        };
+        let manifest_content = serde_json::to_string_pretty(&manifest).unwrap();
+        fs::write(manifest_path(&test_id).unwrap(), manifest_content).unwrap();
+
+        let pid_path = pid_file_path(&test_id).unwrap();
+        let socket_path = socket_path(&test_id).unwrap();
+        fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        fs::write(&socket_path, b"").unwrap();
+
+        cleanup_on_shutdown(&test_id);
+
+        assert!(manifest_path(&test_id).unwrap().exists(), "foreign manifest should remain");
+        assert!(pid_path.exists(), "pid file should remain when cleanup is skipped");
+        assert!(socket_path.exists(), "socket should remain when cleanup is skipped");
+
+        let _ = fs::remove_file(pid_path);
+        let _ = fs::remove_file(socket_path);
+        let _ = fs::remove_file(manifest_path(&test_id).unwrap());
     }
 
     #[test]
