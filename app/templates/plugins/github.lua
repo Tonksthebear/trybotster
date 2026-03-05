@@ -1,7 +1,7 @@
 -- @template GitHub Integration
 -- @description Subscribe to GitHub events and trigger agent workflows from issues/PRs
 -- @category plugins
--- @dest shared/plugins/github/init.lua
+-- @dest plugins/github/init.lua
 -- @scope device
 -- @version 3.0.0
 
