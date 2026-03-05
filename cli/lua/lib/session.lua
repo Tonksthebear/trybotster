@@ -369,6 +369,7 @@ function Session:_sync_session_manifest()
         worktree_path = self.worktree_path,
         agent_name    = self.agent_name,
         profile_name  = self.profile_name,  -- backward compat
+        prompt        = self.prompt,  -- task description (read by `botster context prompt`)
         hub_id             = hub.hub_id() or hub.server_id(),
         hub_manifest_path  = self.hub_manifest_path,
         status        = (self.status == "running") and "active" or self.status,
