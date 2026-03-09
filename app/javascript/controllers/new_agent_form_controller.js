@@ -56,10 +56,15 @@ export default class extends Controller {
       );
 
       this.unsubscribers.push(
-        this.hub.on("agentConfig", ({ agents, workspaces }) => {
+        this.hub.on("agentConfig", ({ agents }) => {
           this.agents = agents;
-          this.workspaces = workspaces;
           this.#renderAgentSelect();
+        }),
+      );
+
+      this.unsubscribers.push(
+        this.hub.on("workspaceList", (workspaces) => {
+          this.workspaces = Array.isArray(workspaces) ? workspaces : [];
           this.#renderWorkspaceSelect();
         }),
       );
@@ -68,7 +73,9 @@ export default class extends Controller {
       // Use onConnected which fires immediately if already connected
       this.unsubscribers.push(
         this.hub.onConnected(() => {
+          this.hub.requestAgents();
           this.hub.requestWorktrees();
+          this.hub.requestWorkspaces();
           this.hub.requestAgentConfig();
         }),
       );
@@ -152,20 +159,23 @@ export default class extends Controller {
         branch: this.pendingSelection.branch,
         prompt: prompt || null,
         agent_name: agentName,
-        workspace_config: workspace || null,
+        workspace_id: workspace?.id || null,
+        workspace_name: workspace?.name || null,
       });
     } else if (this.pendingSelection.type === "main") {
       this.hub.send("create_agent", {
         prompt: prompt || null,
         agent_name: agentName,
-        workspace_config: workspace || null,
+        workspace_id: workspace?.id || null,
+        workspace_name: workspace?.name || null,
       });
     } else {
       this.hub.send("create_agent", {
         issue_or_branch: this.pendingSelection.issueOrBranch,
         prompt: prompt || null,
         agent_name: agentName,
-        workspace_config: workspace || null,
+        workspace_id: workspace?.id || null,
+        workspace_name: workspace?.name || null,
       });
     }
 
@@ -184,7 +194,14 @@ export default class extends Controller {
 
   #selectedWorkspace() {
     if (!this.hasWorkspaceSelectTarget) return null;
-    return this.workspaceSelectTarget.value || null;
+    const workspaceId = this.workspaceSelectTarget.value || null;
+    if (!workspaceId) return null;
+    return (
+      this.workspaces.find((workspace) => workspace?.id === workspaceId) || {
+        id: workspaceId,
+        name: null,
+      }
+    );
   }
 
   #goToStep2(label) {
@@ -261,7 +278,11 @@ export default class extends Controller {
     const select = this.workspaceSelectTarget;
     select.innerHTML = "";
 
-    if (this.workspaces.length === 0) {
+    const workspaces = this.workspaces.filter(
+      (workspace) => workspace && typeof workspace === "object" && workspace.id,
+    );
+
+    if (workspaces.length === 0) {
       this.workspaceSectionTarget.classList.add("hidden");
       return;
     }
@@ -274,10 +295,10 @@ export default class extends Controller {
     emptyOption.textContent = "None";
     select.appendChild(emptyOption);
 
-    this.workspaces.forEach((name) => {
+    workspaces.forEach((workspace) => {
       const option = document.createElement("option");
-      option.value = name;
-      option.textContent = name.charAt(0).toUpperCase() + name.slice(1);
+      option.value = workspace.id;
+      option.textContent = workspace.name || workspace.id;
       select.appendChild(option);
     });
   }

@@ -82,6 +82,10 @@ export class HubConnection extends HubRoute {
         this.emit("worktreeList", Array.isArray(message.worktrees) ? message.worktrees : []);
         break;
 
+      case "workspace_list":
+        this.emit("workspaceList", Array.isArray(message.workspaces) ? message.workspaces : []);
+        break;
+
       case "agent_created":
         this.emit("agentCreated", message);
         break;
@@ -152,6 +156,13 @@ export class HubConnection extends HubRoute {
   }
 
   /**
+   * Request workspace list from CLI.
+   */
+  requestWorkspaces() {
+    return this.send("list_workspaces");
+  }
+
+  /**
    * Select an agent (focus in CLI).
    * @param {string} agentId
    */
@@ -185,6 +196,32 @@ export class HubConnection extends HubRoute {
    */
   createAgent(options = {}) {
     return this.send("create_agent", options);
+  }
+
+  /**
+   * Rename a workspace.
+   * @param {string} workspaceId
+   * @param {string} newName
+   */
+  renameWorkspace(workspaceId, newName) {
+    return this.send("rename_workspace", {
+      workspace_id: workspaceId,
+      new_name: newName,
+    });
+  }
+
+  /**
+   * Move a live session to another workspace.
+   * @param {string} agentId
+   * @param {string|null} workspaceId
+   * @param {string|null} workspaceName
+   */
+  moveAgentWorkspace(agentId, workspaceId = null, workspaceName = null) {
+    return this.send("move_agent_workspace", {
+      agent_id: agentId,
+      workspace_id: workspaceId,
+      workspace_name: workspaceName,
+    });
   }
 
   /**

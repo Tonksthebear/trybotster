@@ -31,6 +31,8 @@ local shared_bindings = {
   ["ctrl+p"]         = "open_menu",
   ["ctrl+j"]         = "select_next",
   ["ctrl+k"]         = "select_previous",
+  ["ctrl+shift+r"]   = "start_rename_workspace",
+  ["ctrl+shift+m"]   = "start_move_workspace",
   -- ctrl+] reserved for future use (was toggle_pty in multi-PTY model)
   ["shift+pageup"]   = "scroll_half_up",
   ["shift+pagedown"] = "scroll_half_down",
@@ -91,6 +93,8 @@ M.new_agent_select_worktree = list_nav
 M.new_agent_select_profile = list_nav
 M.new_agent_create_worktree = text_input
 M.new_agent_prompt = text_input
+M.rename_workspace_input = text_input
+M.move_workspace_input = text_input
 
 M.close_agent_confirm = {
   ["escape"] = "close_modal",

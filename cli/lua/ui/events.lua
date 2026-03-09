@@ -100,7 +100,7 @@ end
 --- Rebuild workspace groups from the flat agents list.
 -- Groups agents by workspace_id; falls back to per-agent pseudo-workspace
 -- for agents without workspace_id (older hub versions).
--- Uses server-provided workspace metadata when available (title, status).
+-- Uses server-provided workspace metadata when available (name, status).
 local function rebuild_workspaces()
   local workspace_meta = _tui_state._workspace_meta or {}
 
@@ -117,7 +117,7 @@ local function rebuild_workspaces()
   local workspaces = {}
 
   if has_server_groups then
-    -- Server-provided workspace metadata: use titles, status, and agent ordering
+    -- Server-provided workspace metadata: use names, status, and agent ordering
     local ws_list = {}
     for _, meta in pairs(workspace_meta) do
       ws_list[#ws_list+1] = meta
@@ -142,7 +142,7 @@ local function rebuild_workspaces()
       if #ws_agents > 0 then
         workspaces[#workspaces+1] = {
           id = meta.id,
-          title = meta.title or meta.id,
+          name = meta.name or meta.id,
           status = meta.status,
           agents = meta.agents or {},       -- ID array for ws_helpers
           agent_objects = ws_agents,         -- full objects for rendering
@@ -155,7 +155,7 @@ local function rebuild_workspaces()
       if not seen_agent[agent.id] then
         workspaces[#workspaces+1] = {
           id = "implicit-" .. agent.id,
-          title = agent.branch_name or agent.id,
+          name = agent.branch_name or agent.id,
           agents = { agent.id },
           agent_objects = { agent },
         }
@@ -178,21 +178,21 @@ local function rebuild_workspaces()
     for _, ws_id in ipairs(order) do
       local group = groups[ws_id]
       local first = group.agent_objects[1]
-      local title
+      local name
       if first then
         local repo_short = first.repo and first.repo:match("/(.+)$") or first.repo
         local issue = first.metadata and first.metadata.issue_number
         if issue then
-          title = string.format("%s #%s", repo_short or "?", issue)
+          name = string.format("%s #%s", repo_short or "?", issue)
         else
-          title = first.branch_name or ws_id
+          name = first.branch_name or ws_id
         end
       else
-        title = ws_id
+        name = ws_id
       end
       workspaces[#workspaces+1] = {
         id = ws_id,
-        title = title,
+        name = name,
         agents = group.agents,
         agent_objects = group.agent_objects,
       }

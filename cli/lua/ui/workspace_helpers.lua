@@ -126,7 +126,7 @@ function M.rebuild_nav_flat_list(tui_state)
     flat[#flat+1] = {
       type = "workspace_header",
       workspace_id = ws.id,
-      title = ws.title,
+      name = ws.name,
       collapsed = collapsed or false,
       agent_count = #(ws.agent_objects or {}),
       status = ws_status,

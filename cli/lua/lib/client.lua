@@ -68,6 +68,9 @@ function Client:on_message(msg)
     elseif msg_type == "unsubscribe" then
         self:handle_unsubscribe(msg)
         return
+    elseif msg_type == "hello" then
+        self:handle_hello(msg)
+        return
     end
 
     -- Data messages have subscriptionId but no subscribe/unsubscribe type
@@ -77,6 +80,30 @@ function Client:on_message(msg)
         log.debug(string.format("Unknown message from %s...: type=%s",
             self.peer_id:sub(1, 8), tostring(msg_type)))
     end
+end
+
+--- Handle socket protocol hello message.
+-- This is advisory negotiation: we ack our protocol version so newer clients
+-- can detect capabilities, but we do not gate message handling on this.
+-- @param msg The hello message
+function Client:handle_hello(msg)
+    local peer_version = tonumber(msg.protocol_version) or 1
+    self.socket_protocol_version = peer_version
+
+    self:send({
+        type = "hello_ack",
+        protocol_version = 2,
+        min_supported_version = 1,
+        features = {
+            scrollback_dims = true,
+            process_exited = true,
+        },
+    })
+
+    log.debug(string.format(
+        "Socket protocol hello from %s... (peer_version=%d)",
+        self.peer_id:sub(1, 8),
+        peer_version))
 end
 
 --- Handle subscribe message - create virtual subscription.
@@ -215,6 +242,7 @@ function Client:handle_subscribe(msg)
         -- Send initial agent and worktree lists
         log.info(string.format("Hub subscription from %s...", self.peer_id:sub(1, 8)))
         self:send_agent_list(sub_id)
+        self:send_workspace_list(sub_id)
         self:send_worktree_list(sub_id)
         self:send_hub_recovery_state(sub_id)
     elseif channel == "mcp" then
@@ -266,6 +294,24 @@ function Client:send_agent_list(sub_id)
         type = "agent_list",
         agents = payload.agents,
         workspaces = payload.workspaces,
+    })
+end
+
+--- Send workspace list to a HubChannel subscription.
+-- @param sub_id The subscription ID to send to
+function Client:send_workspace_list(sub_id)
+    local Hub = require("lib.hub")
+    local ok, workspaces = pcall(function()
+        return Hub.get():list_workspaces()
+    end)
+    if not ok then
+        log.warn(string.format("Failed to build workspace list: %s", tostring(workspaces)))
+        workspaces = {}
+    end
+    self:send({
+        subscriptionId = sub_id,
+        type = "workspace_list",
+        workspaces = workspaces,
     })
 end
 

@@ -171,6 +171,13 @@
             <span data-workspace-badge class="size-2 rounded-full shrink-0"></span>
             <span data-field="workspace-title" class="text-xs font-medium text-zinc-400 group-hover/ws:text-zinc-300 truncate"></span>
             <span data-field="workspace-count" class="text-[10px] text-zinc-600 shrink-0"></span>
+            <button type="button"
+                    data-workspace-id
+                    data-action="agent-list#renameWorkspace"
+                    class="ml-auto shrink-0 p-1 text-zinc-600 hover:text-zinc-300 opacity-0 group-hover/ws:opacity-100 transition-opacity"
+                    title="Rename workspace">
+              <%= icon "pencil", class: "size-3.5" %>
+            </button>
           </div>
         </template>
 
@@ -190,6 +197,13 @@
               </div>
               <%= icon "chevron-right", class: "size-5 text-zinc-600 shrink-0" %>
             </a>
+            <button type="button"
+                    data-agent-id
+                    data-action="agent-list#moveAgentWorkspace"
+                    class="shrink-0 p-3 text-zinc-600 hover:text-zinc-300 transition-colors"
+                    title="Move to workspace">
+              <%= icon "arrows-right-left", class: "size-4" %>
+            </button>
             <button type="button"
                     data-agent-id
                     data-action="agent-list#delete"

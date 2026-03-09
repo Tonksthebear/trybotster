@@ -3,11 +3,12 @@
 -- @category plugins
 -- @dest plugins/orchestrator/init.lua
 -- @scope device
--- @version 2.0.0
+-- @version 2.1.0
 
 -- Orchestrator plugin
 --
--- Pure agent CRUD: list, create, and delete agents across hubs.
+-- Workspace-aware orchestration across hubs: list/create/delete agents,
+-- move sessions between workspaces, and rename/list workspaces.
 -- Hub connections are transparent — Hub.get(hub_id) auto-connects on demand
 -- via hub_discovery. No manual connection management is needed here.
 --
@@ -18,6 +19,9 @@
 --   whoami         — returns the calling agent's identity and hub info
 --   list_hubs      — list all running hubs and their agents
 --   create_agent   — create an agent on any hub
+--   list_workspaces — list workspace manifests on a hub
+--   rename_workspace — rename a workspace by ID
+--   move_agent_workspace — move a live session between workspaces
 --   delete_agent   — delete an agent on any hub
 --   get_pty_snapshot — get terminal content from an agent session
 --
@@ -133,6 +137,14 @@ mcp.tool("create_agent", {
                 type = "string",
                 description = "Config profile name. Omit to auto-select.",
             },
+            workspace_id = {
+                type = "string",
+                description = "Target workspace ID for the new agent.",
+            },
+            workspace_name = {
+                type = "string",
+                description = "Target workspace name for the new agent (used if workspace_id is omitted).",
+            },
         },
         required = { "issue_or_branch" },
     },
@@ -141,7 +153,86 @@ mcp.tool("create_agent", {
         return Hub.get(params.hub_id):create_agent(
             params.issue_or_branch,
             params.prompt,
-            params.profile
+            params.profile,
+            params.workspace_id,
+            params.workspace_name
+        )
+    end)
+end)
+
+mcp.tool("list_workspaces", {
+    description = "List workspaces on a hub. Returns persisted workspace metadata with current running-session membership counts.",
+    input_schema = {
+        type = "object",
+        properties = {
+            hub_id = {
+                type = "string",
+                description = "Hub ID to query. Omit for local hub.",
+            },
+        },
+    },
+}, function(params)
+    return Hub.call_safely(params.hub_id, function()
+        return Hub.get(params.hub_id):list_workspaces()
+    end)
+end)
+
+mcp.tool("rename_workspace", {
+    description = "Rename a workspace by ID on a hub.",
+    input_schema = {
+        type = "object",
+        properties = {
+            hub_id = {
+                type = "string",
+                description = "Hub ID where the workspace exists. Omit for local hub.",
+            },
+            workspace_id = {
+                type = "string",
+                description = "Workspace ID to rename.",
+            },
+            new_name = {
+                type = "string",
+                description = "New workspace display name.",
+            },
+        },
+        required = { "workspace_id", "new_name" },
+    },
+}, function(params)
+    return Hub.call_safely(params.hub_id, function()
+        return Hub.get(params.hub_id):rename_workspace(params.workspace_id, params.new_name)
+    end)
+end)
+
+mcp.tool("move_agent_workspace", {
+    description = "Move a live session to another workspace by ID or name.",
+    input_schema = {
+        type = "object",
+        properties = {
+            hub_id = {
+                type = "string",
+                description = "Hub ID where the session lives. Omit for local hub.",
+            },
+            agent_id = {
+                type = "string",
+                description = "Session UUID or agent key to move.",
+            },
+            workspace_id = {
+                type = "string",
+                description = "Target workspace ID.",
+            },
+            workspace_name = {
+                type = "string",
+                description = "Target workspace name (used when workspace_id is omitted).",
+            },
+        },
+        required = { "agent_id" },
+    },
+}, function(params)
+    return Hub.call_safely(params.hub_id, function()
+        return Hub.get(params.hub_id):move_agent_workspace(
+            params.agent_id,
+            params.workspace_id,
+            params.workspace_name
         )
     end)
 end)
@@ -230,7 +321,29 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
         end)
     elseif message.type == "create_agent" then
         respond(function()
-            return local_hub:create_agent(message.issue_or_branch, message.prompt, message.profile)
+            return local_hub:create_agent(
+                message.issue_or_branch,
+                message.prompt,
+                message.profile,
+                message.workspace_id,
+                message.workspace_name
+            )
+        end)
+    elseif message.type == "list_workspaces" then
+        respond(function()
+            return local_hub:list_workspaces()
+        end)
+    elseif message.type == "rename_workspace" then
+        respond(function()
+            return local_hub:rename_workspace(message.workspace_id, message.new_name)
+        end)
+    elseif message.type == "move_agent_workspace" then
+        respond(function()
+            return local_hub:move_agent_workspace(
+                message.agent_id,
+                message.workspace_id,
+                message.workspace_name
+            )
         end)
     elseif message.type == "delete_agent" then
         respond(function()

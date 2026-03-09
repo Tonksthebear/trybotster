@@ -21,7 +21,7 @@ import { HubConnectionManager, HubConnection } from "connections";
  *   data-agent-id         - Sets to agent.id (for actions)
  *
  * Workspace template placeholders:
- *   data-field="workspace-title"  - Sets textContent to workspace title
+ *   data-field="workspace-title"  - Sets textContent to workspace name
  *   data-field="workspace-status" - Sets textContent to workspace status
  *   data-workspace-badge          - Status badge dot (gets status-specific color class)
  *
@@ -114,6 +114,7 @@ export default class extends Controller {
       this.unsubscribers.push(
         this.hub.onConnected(() => {
           this.hub.requestAgents();
+          this.hub.requestWorkspaces();
         }),
       );
 
@@ -176,6 +177,61 @@ export default class extends Controller {
     }
 
     this.#render();
+  }
+
+  // Action: rename workspace
+  renameWorkspace(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!this.hub) return;
+
+    const wsId = event.currentTarget.dataset.workspaceId;
+    if (!wsId) return;
+
+    const workspace = this.workspacesValue.find((ws) => ws?.id === wsId);
+    const currentName = workspace?.name || wsId;
+    const input = window.prompt("Rename workspace:", currentName);
+    if (input === null) return;
+
+    const newName = input.trim();
+    if (!newName || newName === currentName) return;
+
+    this.hub.renameWorkspace(wsId, newName);
+  }
+
+  // Action: move session to another workspace
+  moveAgentWorkspace(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!this.hub) return;
+
+    const agentId = event.currentTarget.dataset.agentId;
+    if (!agentId) return;
+
+    const currentWorkspace = this.#workspaceForAgent(agentId);
+    const workspaceNames = this.workspacesValue
+      .map((ws) => ws?.name || ws?.id)
+      .filter(Boolean)
+      .join(", ");
+    const promptLabel = workspaceNames
+      ? `Move session to workspace (name or id).\nExisting: ${workspaceNames}`
+      : "Move session to workspace (name or id)";
+
+    const input = window.prompt(promptLabel, currentWorkspace?.name || "");
+    if (input === null) return;
+
+    const target = input.trim();
+    if (!target) return;
+
+    const existing = this.workspacesValue.find(
+      (ws) => ws?.id === target || ws?.name === target,
+    );
+
+    this.hub.moveAgentWorkspace(
+      agentId,
+      existing?.id || null,
+      existing?.name || target,
+    );
   }
 
   // Action: delete an agent - opens confirmation modal
@@ -322,6 +378,9 @@ export default class extends Controller {
     // Stable ID for Idiomorph keying
     root.id = `workspace-${ws.id}`;
     root.dataset.workspaceId = ws.id;
+    root
+      .querySelectorAll("[data-workspace-id]")
+      .forEach((el) => (el.dataset.workspaceId = ws.id));
 
     // Wire up toggle action
     root.dataset.action = "click->agent-list#toggleWorkspace";
@@ -330,7 +389,7 @@ export default class extends Controller {
     root.querySelectorAll("[data-field]").forEach((el) => {
       const field = el.dataset.field;
       if (field === "workspace-title") {
-        el.textContent = ws.title || ws.id;
+        el.textContent = ws.name || ws.id;
       } else if (field === "workspace-status") {
         el.textContent = ws.status || "inactive";
       } else if (field === "workspace-count") {
@@ -422,6 +481,13 @@ export default class extends Controller {
     el.querySelectorAll("[data-agent-id]").forEach((child) => {
       child.dataset.agentId = agent.id;
     });
+  }
+
+  // Private: find workspace containing an agent ID
+  #workspaceForAgent(agentId) {
+    return this.workspacesValue.find((ws) =>
+      Array.isArray(ws?.agents) ? ws.agents.includes(agentId) : false,
+    );
   }
 
   // Private: map workspace status to Tailwind badge color class
