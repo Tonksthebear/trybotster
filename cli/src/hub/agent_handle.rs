@@ -394,12 +394,18 @@ impl PtyHandle {
     /// This prevents reconnect races where output emitted during snapshot capture
     /// is replayed twice (once in snapshot, once via buffered stream), or missed
     /// between separate snapshot/subscribe calls.
+    ///
+    /// For broker-backed sessions this intentionally uses the local shadow-cache
+    /// snapshot (`get_snapshot_cached`) instead of issuing a fresh broker control
+    /// RPC in the attach path. Reconnect recovery already rehydrates shadow state
+    /// from the broker; avoiding a second synchronous control request here keeps
+    /// attach deterministic even when broker control response latency spikes.
     #[must_use]
     pub fn snapshot_and_subscribe_cached(
         &self,
     ) -> (Vec<u8>, bool, u16, u16, broadcast::Receiver<PtyEvent>) {
-        // Broker-backed sessions are broker-authoritative for snapshot bytes.
-        if let Some(relay) = &self.broker_relay {
+        // Broker-backed sessions use local shadow-cache snapshot bytes.
+        if self.broker_relay.is_some() {
             let (kitty_enabled, rows, cols) = {
                 let parser = self
                     .shadow_screen
@@ -410,34 +416,7 @@ impl PtyHandle {
                 let cols = parser.term().grid().columns() as u16;
                 (kitty_enabled, rows, cols)
             };
-
-            let snapshot = match relay.connection.lock() {
-                Ok(mut guard) => {
-                    if let Some(conn) = guard.as_mut() {
-                        match conn.get_snapshot(relay.session_id) {
-                            Ok(snapshot) => snapshot,
-                            Err(e) => {
-                                log::error!(
-                                    "Broker-authoritative snapshot failed in snapshot_and_subscribe_cached: {e}"
-                                );
-                                Vec::new()
-                            }
-                        }
-                    } else {
-                        log::error!(
-                            "Broker-authoritative snapshot failed in snapshot_and_subscribe_cached: broker connection not available"
-                        );
-                        Vec::new()
-                    }
-                }
-                Err(_) => {
-                    log::error!(
-                        "Broker-authoritative snapshot failed in snapshot_and_subscribe_cached: broker connection lock poisoned"
-                    );
-                    Vec::new()
-                }
-            };
-
+            let snapshot = self.get_snapshot_cached();
             let rx = self.event_tx.subscribe();
             return (snapshot, kitty_enabled, rows, cols, rx);
         }
@@ -1012,34 +991,29 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_and_subscribe_cached_prefers_broker_snapshot_for_broker_backed_sessions() {
+    fn test_snapshot_and_subscribe_cached_uses_local_shadow_for_broker_backed_sessions() {
         let (pty, mut server_stream) = create_broker_backed_test_pty();
         pty.feed_broker_output(b"local-shadow-output\n");
 
-        let broker = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-
-            let mut buf = [0u8; 128];
-            let n = server_stream.read(&mut buf).expect("read broker frame");
-            let frames = BrokerFrameDecoder::new()
-                .feed(&buf[..n])
-                .expect("decode broker frame");
-            assert_eq!(frames.len(), 1);
-            assert!(matches!(
-                &frames[0],
-                BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id: 42 })
-            ));
-
-            let response = encode_data(frame_type::SNAPSHOT, 42, b"broker-authoritative-snapshot");
-            server_stream
-                .write_all(&response)
-                .expect("write broker snapshot");
-        });
-
         let (snapshot, _kitty, _rows, _cols, _rx) = pty.snapshot_and_subscribe_cached();
-        assert_eq!(snapshot, b"broker-authoritative-snapshot");
+        assert!(
+            String::from_utf8_lossy(&snapshot).contains("local-shadow-output"),
+            "attach snapshot should come from local shadow cache for broker-backed sessions"
+        );
 
-        broker.join().expect("broker thread should finish");
+        server_stream
+            .set_nonblocking(true)
+            .expect("set_nonblocking on fake broker");
+        let mut buf = [0u8; 16];
+        let read_err = std::io::Read::read(&mut server_stream, &mut buf)
+            .expect_err("snapshot_and_subscribe_cached should not issue broker request");
+        assert!(
+            matches!(
+                read_err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected fake broker read error: {read_err}"
+        );
     }
 
     #[test]

@@ -657,9 +657,11 @@ fn resolve_mcp_serve_socket() -> Result<String> {
     let hub_manifest: HubManifest = serde_json::from_str(&hub_content)
         .with_context(|| format!("Failed to parse hub manifest at {hub_manifest_path}"))?;
 
+    // Do not hard-fail when the path is temporarily missing. The MCP gateway
+    // has retry/backoff logic for startup and reconnect windows.
     if !std::path::Path::new(&hub_manifest.socket_path).exists() {
-        anyhow::bail!(
-            "Session {} hub socket does not exist: {}",
+        log::warn!(
+            "Session {} hub socket path missing at startup: {} (continuing; mcp-gateway will retry)",
             session_uuid,
             hub_manifest.socket_path
         );

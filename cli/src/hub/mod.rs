@@ -872,8 +872,10 @@ impl Hub {
     /// 2. If found, attempt to connect and ping — reuse if alive.
     /// 3. If no socket or connection fails, spawn a new broker subprocess and
     ///    connect to it.
-    /// 4. On success, configure the reconnect timeout and start the async
-    ///    output forwarder thread.
+    /// 4. On success, configure the reconnect timeout and store the connection.
+    ///
+    /// The broker demux forwarder is installed after recovery completes so
+    /// recovery snapshot/list RPCs run on the direct request/response path.
     pub fn try_connect_broker(&mut self) -> Option<bool> {
         let path = match crate::broker::broker_socket_path(&self.hub_identifier) {
             Ok(p) => p,
@@ -942,42 +944,50 @@ impl Hub {
             log::warn!("[broker] failed to set timeout: {e}");
         }
 
-        // Install the demux reader thread before storing conn.
-        //
-        // The demux thread is the sole reader of the broker socket. It routes:
-        //   PtyOutput / PtyExited   → hub_event_tx (HubEvent channel)
-        //   Control frames          → BrokerConnection::response_rx (channel)
-        //
-        // After install_forwarder(), read_response() no longer reads the socket
-        // directly, eliminating the race where the forwarder and read_response()
-        // both competed to consume the same Registered frame off the shared
-        // kernel receive buffer (which caused silent registration failure and
-        // zero TUI output).
-        //
-        // install_forwarder() is called BEFORE recovery inventory is queried so
-        // any follow-up broker primitive calls run on the channel path, not
-        // the socket direct-read path.
-        if let Err(e) = conn.install_forwarder(self.hub_event_tx.clone()) {
-            log::warn!("[broker] failed to install demux reader: {e}; broker connect aborted");
-            return None;
-        }
-
-        // If the demux thread exits immediately, do not store this connection.
-        // A dead demux leaves read_response() waiting on a broken channel path.
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        if !conn.is_demux_alive() {
-            log::warn!(
-                "[broker] demux reader died immediately after install; broker connect aborted"
-            );
-            return None;
-        }
-
         // Store the connection before Rust-driven recovery so Lua broker
         // primitives (snapshot fetch, ghost registration) can use it.
         *self.broker_connection.lock().unwrap() = Some(conn);
         log::info!("[broker] connected");
 
         Some(is_reconnect)
+    }
+
+    /// Install broker demux forwarding after recovery control RPCs complete.
+    ///
+    /// Recovery uses synchronous broker control requests (`list_sessions`,
+    /// `get_snapshot`) and is simpler/safer on the direct response path before
+    /// demux takeover. Once recovery is done, install demux so broker PTY output
+    /// is streamed into Hub events.
+    fn install_broker_forwarder(&mut self) {
+        let mut guard = match self.broker_connection.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                log::warn!("[broker] failed to install demux reader: broker_connection mutex poisoned");
+                return;
+            }
+        };
+
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+
+        if conn.has_forwarder() {
+            return;
+        }
+
+        if let Err(e) = conn.install_forwarder(self.hub_event_tx.clone()) {
+            log::warn!("[broker] failed to install demux reader: {e}");
+            *guard = None;
+            return;
+        }
+
+        // If demux exits immediately, drop the connection so health checks can
+        // trigger a reconnect instead of waiting on a dead channel path.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if !conn.is_demux_alive() {
+            log::warn!("[broker] demux reader died immediately after install; dropping broker connection");
+            *guard = None;
+        }
     }
 
     /// Spawn the broker subprocess detached from the current process.
@@ -1068,6 +1078,9 @@ impl Hub {
         );
 
         let recovered_sessions = self.recover_broker_sessions();
+        if broker_connected {
+            self.install_broker_forwarder();
+        }
         self.fire_hub_recovery_state(
             "sessions_recovered",
             serde_json::json!({
