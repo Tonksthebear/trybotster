@@ -5,7 +5,7 @@
 -- with poll mode for reliable detection on macOS (FSEvents misses in-place writes).
 --
 -- Core modules: paths under _G._lua_base_path → loader.reload(module_name)
--- Plugins (file changes): paths under .botster/*/plugins/ → loader.reload_plugin(name)
+-- Plugins (file changes): paths under {device,repo}/plugins/ → loader.reload_plugin(name)
 -- Plugins (dir create/delete): plugin root dirs → loader.load_plugin / loader.unload_plugin
 
 local loader = require("hub.loader")
@@ -236,24 +236,18 @@ local function setup_watches()
         end
     end
 
-    -- Plugin directory watching (4 layers from ConfigResolver)
+    -- Plugin directory watching (2 layers from ConfigResolver)
     local opts = state.get("plugin_resolver_opts", {})
     local plugin_dirs = {}
 
-    -- Device layers
+    -- Device layer
     if opts.device_root then
-        table.insert(plugin_dirs, opts.device_root .. "/shared/plugins")
-        if opts.profile then
-            table.insert(plugin_dirs, opts.device_root .. "/profiles/" .. opts.profile .. "/plugins")
-        end
+        table.insert(plugin_dirs, opts.device_root .. "/plugins")
     end
 
-    -- Repo layers
+    -- Repo layer
     if opts.repo_root then
-        table.insert(plugin_dirs, opts.repo_root .. "/.botster/shared/plugins")
-        if opts.profile then
-            table.insert(plugin_dirs, opts.repo_root .. "/.botster/profiles/" .. opts.profile .. "/plugins")
-        end
+        table.insert(plugin_dirs, opts.repo_root .. "/.botster/plugins")
     end
 
     for _, dir in ipairs(plugin_dirs) do
