@@ -89,6 +89,7 @@ end
 --   metadata        table    (optional)  plugin key-value store (e.g., issue_number, invocation_url)
 --   workspace       string   (optional)  workspace name (e.g. "owner/repo#42")
 --   workspace_id    string   (optional)  pre-resolved workspace ID
+--   workspace_expect_new boolean (optional) reject reusing an active workspace with same name
 --   workspace_metadata table (optional)  plugin data stored on workspace manifest
 --   env             table    (optional)  base environment variables
 --   dims            table    (optional)  { rows = 24, cols = 80 }
@@ -127,6 +128,7 @@ function Session._init(self, config)
     -- Workspace name can be explicitly provided, or inferred from a supplied workspace_id.
     local workspace_name = config.workspace
     local pre_resolved_workspace_id = config.workspace_id
+    local workspace_expect_new = config.workspace_expect_new or false
 
     -- Set all shared fields on self
     self.session_uuid = session_uuid
@@ -184,18 +186,20 @@ function Session._init(self, config)
         end
 
         if not workspace_id and workspace_name then
-            local ok_ws, ws_id = pcall(function()
-                local id = ws.ensure_workspace(data_dir, {
+            local ok_ws, ws_id, ws_err = pcall(function()
+                local id, _, _, err = ws.ensure_workspace(data_dir, {
                     name = workspace_name,
                     metadata = self._workspace_metadata,
                     created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
+                    expect_new = workspace_expect_new,
                 })
-                return id
+                return id, err
             end)
-            if ok_ws then
+            if ok_ws and ws_id then
                 workspace_id = ws_id
             else
-                log.warn(string.format("Failed to ensure workspace manifest: %s", tostring(ws_id)))
+                log.warn(string.format("Failed to ensure workspace manifest: %s",
+                    tostring(ws_err or ws_id)))
             end
         end
 
@@ -214,6 +218,14 @@ function Session._init(self, config)
                 metadata   = {},
             }
             pcall(ws.write_workspace, data_dir, workspace_id, anon_manifest)
+            pcall(function()
+                local hooks_mod = require("hub.hooks")
+                hooks_mod.notify("workspace_created", {
+                    workspace_id = workspace_id,
+                    name = workspace_name,
+                    manifest = anon_manifest,
+                })
+            end)
         end
 
         self._workspace_id = workspace_id
@@ -265,6 +277,24 @@ function Session._init(self, config)
         port_state.next_port = port + 1
         spawn_config.port = port
         session_env.PORT = tostring(port)
+    end
+
+    -- Interceptor: plugins can inspect context or block spawn (return nil)
+    local spawn_ctx = {
+        worktree_path = config.worktree_path,
+        branch = config.branch_name,
+        agent_key = key,
+        session_uuid = session_uuid,
+        session_type = session_type,
+        session_name = session_name,
+        repo = config.repo,
+        workspace_id = self._workspace_id,
+        workspace_name = self._workspace_name,
+        metadata = metadata,
+    }
+    local spawn_result = hooks.call("before_pty_spawn", spawn_ctx)
+    if spawn_result == nil then
+        error(string.format("PTY spawn blocked by interceptor for %s", key))
     end
 
     local ok, handle, broker_session_id = pcall(hub.spawn_pty_with_broker, spawn_config, session_uuid)
@@ -444,7 +474,7 @@ end
 
 --- Move this live session into a different workspace.
 -- Creates the target workspace when only workspace_name is provided.
--- @param opts table { workspace_id, workspace_name, workspace_metadata }
+-- @param opts table { workspace_id, workspace_name, workspace_metadata, expect_new }
 -- @return table|nil result
 -- @return string|nil error
 function Session:move_to_workspace(opts)
@@ -457,6 +487,7 @@ function Session:move_to_workspace(opts)
     local target_workspace_id = opts.workspace_id
     local target_workspace_name = opts.workspace_name
     local target_workspace_metadata = opts.workspace_metadata or {}
+    local expect_new = opts.expect_new or false
 
     if target_workspace_id == "" then target_workspace_id = nil end
     if target_workspace_name == "" then target_workspace_name = nil end
@@ -487,13 +518,14 @@ function Session:move_to_workspace(opts)
         end
         workspace_name = workspace_name or target_manifest.name or default_workspace_name(self.branch_name)
     else
-        local created_id, created_manifest = ws.ensure_workspace(self._data_dir, {
+        local created_id, created_manifest, _, ensure_err = ws.ensure_workspace(self._data_dir, {
             name = workspace_name,
             metadata = target_workspace_metadata,
             created_at = now,
+            expect_new = expect_new,
         })
         if not created_id then
-            return nil, string.format("Failed to create workspace '%s'", tostring(workspace_name))
+            return nil, ensure_err or string.format("Failed to create workspace '%s'", tostring(workspace_name))
         end
         workspace_id = created_id
         workspace_name = created_manifest and created_manifest.name or workspace_name
@@ -604,6 +636,14 @@ function Session:close(delete_worktree)
             pcall(ws.write_session,
                 self._data_dir, self._workspace_id, self.session_uuid, manifest)
             pcall(ws.refresh_workspace_status, self._data_dir, self._workspace_id)
+            -- Check if workspace transitioned to closed
+            local updated_ws = ws.read_workspace(self._data_dir, self._workspace_id)
+            if updated_ws and updated_ws.status == "closed" then
+                hooks.notify("workspace_closed", {
+                    workspace_id = self._workspace_id,
+                    name = updated_ws.name or self._workspace_name,
+                })
+            end
         end
     end
 
@@ -614,6 +654,12 @@ function Session:close(delete_worktree)
             log.warn(string.format("Session %s: failed to delete worktree: %s",
                 key, tostring(err3)))
         end
+        hooks.notify("worktree_deleted", {
+            path = self.worktree_path,
+            branch = self.branch_name,
+            agent_key = key,
+            session_uuid = self.session_uuid,
+        })
     end
 
     -- Notify observers
