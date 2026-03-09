@@ -14,11 +14,11 @@ use crate::hub::handle_cache::HandleCache;
 
 use super::primitives;
 use super::primitives::events::SharedEventCallbacks;
+use super::primitives::http::HttpAsyncRegistry;
 use super::primitives::pty::PtyOutputContext;
 use super::primitives::socket::registry_keys as socket_registry_keys;
-use super::primitives::tui::registry_keys as tui_registry_keys;
-use super::primitives::http::HttpAsyncRegistry;
 use super::primitives::timer::TimerRegistry;
+use super::primitives::tui::registry_keys as tui_registry_keys;
 use super::primitives::watch::WatcherRegistry;
 use super::primitives::webrtc::registry_keys;
 use super::primitives::websocket::WebSocketRegistry;
@@ -85,7 +85,11 @@ pub struct LuaRuntime {
 
 impl std::fmt::Debug for LuaRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let event_cb_count = self.event_callbacks.lock().map(|c| c.callback_count()).unwrap_or(0);
+        let event_cb_count = self
+            .event_callbacks
+            .lock()
+            .map(|c| c.callback_count())
+            .unwrap_or(0);
         let watch_count = self.watcher_registry.lock().map(|w| w.len()).unwrap_or(0);
         let timer_count = self.timer_registry.lock().map(|t| t.len()).unwrap_or(0);
         let (http_pending, http_in_flight) = self
@@ -93,7 +97,9 @@ impl std::fmt::Debug for LuaRuntime {
             .lock()
             .map(|h| (h.pending_count(), h.in_flight_count()))
             .unwrap_or((0, 0));
-        let hub_event_tx_active = self.hub_event_sender.lock()
+        let hub_event_tx_active = self
+            .hub_event_sender
+            .lock()
             .map(|g| g.is_some())
             .unwrap_or(false);
         f.debug_struct("LuaRuntime")
@@ -105,8 +111,14 @@ impl std::fmt::Debug for LuaRuntime {
             .field("active_timers", &timer_count)
             .field("http_pending", &http_pending)
             .field("http_in_flight", &http_in_flight)
-            .field("websocket_connections",
-                &self.websocket_registry.lock().map(|r| r.connection_count()).unwrap_or(0))
+            .field(
+                "websocket_connections",
+                &self
+                    .websocket_registry
+                    .lock()
+                    .map(|r| r.connection_count())
+                    .unwrap_or(0),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -221,7 +233,8 @@ impl LuaRuntime {
             &lua,
             Arc::clone(&hub_event_sender),
             Arc::clone(&ac_callback_registry),
-        ).context("Failed to register ActionCable primitives")?;
+        )
+        .context("Failed to register ActionCable primitives")?;
 
         // Register hub client primitives with the shared event sender and registries
         primitives::register_hub_client(
@@ -230,7 +243,8 @@ impl LuaRuntime {
             Arc::clone(&hub_client_callback_registry),
             Arc::clone(&hub_client_pending_requests),
             Arc::clone(&hub_client_frame_senders),
-        ).context("Failed to register hub client primitives")?;
+        )
+        .context("Failed to register hub client primitives")?;
 
         // Note: Hub, connection, and worktree primitives are registered later via
         // register_hub_primitives() because they need a HandleCache reference from Hub
@@ -540,7 +554,8 @@ impl LuaRuntime {
         let lua = &self.lua;
 
         // Build a Lua table mapping module names to their source
-        let embedded_modules: mlua::Table = lua.create_table()
+        let embedded_modules: mlua::Table = lua
+            .create_table()
             .map_err(|e| anyhow!("Failed to create embedded modules table: {e}"))?;
 
         for (path, content) in embedded::all() {
@@ -651,10 +666,7 @@ impl LuaRuntime {
     /// `true` if a function with the given name exists in globals.
     #[must_use]
     pub fn has_function(&self, name: &str) -> bool {
-        self.lua
-            .globals()
-            .get::<mlua::Function>(name)
-            .is_ok()
+        self.lua.globals().get::<mlua::Function>(name).is_ok()
     }
 
     /// Get a reference to the underlying Lua state.
@@ -874,14 +886,18 @@ impl LuaRuntime {
     }
 
     fn call_peer_connected_internal(&self, peer_id: &str) -> Result<()> {
-        let key_result: mlua::Result<mlua::RegistryKey> =
-            self.lua.named_registry_value(registry_keys::ON_PEER_CONNECTED);
+        let key_result: mlua::Result<mlua::RegistryKey> = self
+            .lua
+            .named_registry_value(registry_keys::ON_PEER_CONNECTED);
 
         if let Ok(key) = key_result {
-            let callback: mlua::Function = self.lua.registry_value(&key)
+            let callback: mlua::Function = self
+                .lua
+                .registry_value(&key)
                 .map_err(|e| anyhow!("Failed to get peer_connected callback: {e}"))?;
 
-            callback.call::<()>(peer_id)
+            callback
+                .call::<()>(peer_id)
                 .map_err(|e| anyhow!("peer_connected callback failed: {e}"))?;
         }
 
@@ -915,14 +931,18 @@ impl LuaRuntime {
     }
 
     fn call_peer_disconnected_internal(&self, peer_id: &str) -> Result<()> {
-        let key_result: mlua::Result<mlua::RegistryKey> =
-            self.lua.named_registry_value(registry_keys::ON_PEER_DISCONNECTED);
+        let key_result: mlua::Result<mlua::RegistryKey> = self
+            .lua
+            .named_registry_value(registry_keys::ON_PEER_DISCONNECTED);
 
         if let Ok(key) = key_result {
-            let callback: mlua::Function = self.lua.registry_value(&key)
+            let callback: mlua::Function = self
+                .lua
+                .registry_value(&key)
                 .map_err(|e| anyhow!("Failed to get peer_disconnected callback: {e}"))?;
 
-            callback.call::<()>(peer_id)
+            callback
+                .call::<()>(peer_id)
                 .map_err(|e| anyhow!("peer_disconnected callback failed: {e}"))?;
         }
 
@@ -957,19 +977,26 @@ impl LuaRuntime {
         }
     }
 
-    fn call_webrtc_message_internal(&self, peer_id: &str, message: serde_json::Value) -> Result<()> {
+    fn call_webrtc_message_internal(
+        &self,
+        peer_id: &str,
+        message: serde_json::Value,
+    ) -> Result<()> {
         let key_result: mlua::Result<mlua::RegistryKey> =
             self.lua.named_registry_value(registry_keys::ON_MESSAGE);
 
         if let Ok(key) = key_result {
-            let callback: mlua::Function = self.lua.registry_value(&key)
+            let callback: mlua::Function = self
+                .lua
+                .registry_value(&key)
                 .map_err(|e| anyhow!("Failed to get webrtc_message callback: {e}"))?;
 
             // Convert JSON to Lua value, mapping null → nil (not userdata)
             let lua_value = crate::lua::primitives::json::json_to_lua(&self.lua, &message)
                 .map_err(|e| anyhow!("Failed to convert JSON to Lua value: {e}"))?;
 
-            callback.call::<()>((peer_id, lua_value))
+            callback
+                .call::<()>((peer_id, lua_value))
                 .map_err(|e| anyhow!("webrtc_message callback failed: {e}"))?;
         }
 
@@ -1122,9 +1149,8 @@ impl LuaRuntime {
     }
 
     fn call_tui_message_internal(&self, message: serde_json::Value) -> Result<()> {
-        let key_result: mlua::Result<mlua::RegistryKey> = self
-            .lua
-            .named_registry_value(tui_registry_keys::ON_MESSAGE);
+        let key_result: mlua::Result<mlua::RegistryKey> =
+            self.lua.named_registry_value(tui_registry_keys::ON_MESSAGE);
 
         if let Ok(key) = key_result {
             let callback: mlua::Function = self
@@ -1165,7 +1191,9 @@ impl LuaRuntime {
         match self.call_socket_client_connected_internal(client_id) {
             Ok(()) => Ok(()),
             Err(e) => {
-                if self.strict { Err(e) } else {
+                if self.strict {
+                    Err(e)
+                } else {
                     log::warn!("Lua socket_client_connected callback error: {}", e);
                     Ok(())
                 }
@@ -1174,12 +1202,16 @@ impl LuaRuntime {
     }
 
     fn call_socket_client_connected_internal(&self, client_id: &str) -> Result<()> {
-        let key_result: mlua::Result<mlua::RegistryKey> =
-            self.lua.named_registry_value(socket_registry_keys::ON_CLIENT_CONNECTED);
+        let key_result: mlua::Result<mlua::RegistryKey> = self
+            .lua
+            .named_registry_value(socket_registry_keys::ON_CLIENT_CONNECTED);
         if let Ok(key) = key_result {
-            let callback: mlua::Function = self.lua.registry_value(&key)
+            let callback: mlua::Function = self
+                .lua
+                .registry_value(&key)
                 .map_err(|e| anyhow!("Failed to get socket_client_connected callback: {e}"))?;
-            callback.call::<()>(client_id)
+            callback
+                .call::<()>(client_id)
                 .map_err(|e| anyhow!("socket_client_connected callback failed: {e}"))?;
         }
         Ok(())
@@ -1190,7 +1222,9 @@ impl LuaRuntime {
         match self.call_socket_client_disconnected_internal(client_id) {
             Ok(()) => Ok(()),
             Err(e) => {
-                if self.strict { Err(e) } else {
+                if self.strict {
+                    Err(e)
+                } else {
                     log::warn!("Lua socket_client_disconnected callback error: {}", e);
                     Ok(())
                 }
@@ -1199,12 +1233,16 @@ impl LuaRuntime {
     }
 
     fn call_socket_client_disconnected_internal(&self, client_id: &str) -> Result<()> {
-        let key_result: mlua::Result<mlua::RegistryKey> =
-            self.lua.named_registry_value(socket_registry_keys::ON_CLIENT_DISCONNECTED);
+        let key_result: mlua::Result<mlua::RegistryKey> = self
+            .lua
+            .named_registry_value(socket_registry_keys::ON_CLIENT_DISCONNECTED);
         if let Ok(key) = key_result {
-            let callback: mlua::Function = self.lua.registry_value(&key)
+            let callback: mlua::Function = self
+                .lua
+                .registry_value(&key)
                 .map_err(|e| anyhow!("Failed to get socket_client_disconnected callback: {e}"))?;
-            callback.call::<()>(client_id)
+            callback
+                .call::<()>(client_id)
                 .map_err(|e| anyhow!("socket_client_disconnected callback failed: {e}"))?;
         }
         Ok(())
@@ -1215,7 +1253,9 @@ impl LuaRuntime {
         match self.call_socket_message_internal(client_id, message) {
             Ok(()) => Ok(()),
             Err(e) => {
-                if self.strict { Err(e) } else {
+                if self.strict {
+                    Err(e)
+                } else {
                     log::warn!("Lua socket_message callback error: {}", e);
                     Ok(())
                 }
@@ -1223,15 +1263,23 @@ impl LuaRuntime {
         }
     }
 
-    fn call_socket_message_internal(&self, client_id: &str, message: serde_json::Value) -> Result<()> {
-        let key_result: mlua::Result<mlua::RegistryKey> =
-            self.lua.named_registry_value(socket_registry_keys::ON_MESSAGE);
+    fn call_socket_message_internal(
+        &self,
+        client_id: &str,
+        message: serde_json::Value,
+    ) -> Result<()> {
+        let key_result: mlua::Result<mlua::RegistryKey> = self
+            .lua
+            .named_registry_value(socket_registry_keys::ON_MESSAGE);
         if let Ok(key) = key_result {
-            let callback: mlua::Function = self.lua.registry_value(&key)
+            let callback: mlua::Function = self
+                .lua
+                .registry_value(&key)
                 .map_err(|e| anyhow!("Failed to get socket_message callback: {e}"))?;
             let lua_value = crate::lua::primitives::json::json_to_lua(&self.lua, &message)
                 .map_err(|e| anyhow!("Failed to convert JSON to Lua value: {e}"))?;
-            callback.call::<()>((client_id, lua_value))
+            callback
+                .call::<()>((client_id, lua_value))
                 .map_err(|e| anyhow!("socket_message callback failed: {e}"))?;
         }
         Ok(())
@@ -1254,11 +1302,7 @@ impl LuaRuntime {
     /// # Returns
     ///
     /// Number of observers notified.
-    pub fn notify_pty_output_observers(
-        &self,
-        ctx: &PtyOutputContext,
-        data: &[u8],
-    ) -> usize {
+    pub fn notify_pty_output_observers(&self, ctx: &PtyOutputContext, data: &[u8]) -> usize {
         let result: mlua::Result<usize> = (|| {
             let ctx_table = self.lua.create_table()?;
             ctx_table.set("session_uuid", ctx.session_uuid.as_str())?;
@@ -1323,47 +1367,62 @@ impl LuaRuntime {
     ) -> Result<Option<Vec<u8>>> {
         // Lazily initialize cached function and reusable context table
         if self.pty_hook_fn.is_none() {
-            let f: mlua::Function = self.lua.load(
-                r#"
+            let f: mlua::Function = self
+                .lua
+                .load(
+                    r#"
                 return function(ctx, data)
                     return hooks.call("pty_output", ctx, data)
                 end
-                "#
-            ).eval()
+                "#,
+                )
+                .eval()
                 .map_err(|e| anyhow!("Failed to create PTY hook wrapper: {e}"))?;
-            let fn_key = self.lua.create_registry_value(f)
+            let fn_key = self
+                .lua
+                .create_registry_value(f)
                 .map_err(|e| anyhow!("Failed to cache PTY hook function: {e}"))?;
             self.pty_hook_fn = Some(fn_key);
 
-            let ctx_table = self.lua.create_table()
+            let ctx_table = self
+                .lua
+                .create_table()
                 .map_err(|e| anyhow!("Failed to create context table: {e}"))?;
-            let ctx_key = self.lua.create_registry_value(ctx_table)
+            let ctx_key = self
+                .lua
+                .create_registry_value(ctx_table)
                 .map_err(|e| anyhow!("Failed to cache PTY context table: {e}"))?;
             self.pty_hook_ctx = Some(ctx_key);
         }
 
         // Reuse cached context table — update fields in place
-        let ctx_table: mlua::Table = self.lua.registry_value(self.pty_hook_ctx.as_ref().unwrap())
+        let ctx_table: mlua::Table = self
+            .lua
+            .registry_value(self.pty_hook_ctx.as_ref().unwrap())
             .map_err(|e| anyhow!("Failed to retrieve cached PTY context table: {e}"))?;
 
-        ctx_table.set("session_uuid", ctx.session_uuid.as_str())
+        ctx_table
+            .set("session_uuid", ctx.session_uuid.as_str())
             .map_err(|e| anyhow!("Failed to set session_uuid: {e}"))?;
-        ctx_table.set("peer_id", ctx.peer_id.clone())
+        ctx_table
+            .set("peer_id", ctx.peer_id.clone())
             .map_err(|e| anyhow!("Failed to set peer_id: {e}"))?;
 
         // Convert data to Lua string (binary-safe)
-        let data_str = self.lua.create_string(data)
+        let data_str = self
+            .lua
+            .create_string(data)
             .map_err(|e| anyhow!("Failed to create data string: {e}"))?;
 
-        let func: mlua::Function = self.lua.registry_value(self.pty_hook_fn.as_ref().unwrap())
+        let func: mlua::Function = self
+            .lua
+            .registry_value(self.pty_hook_fn.as_ref().unwrap())
             .map_err(|e| anyhow!("Failed to retrieve cached PTY hook function: {e}"))?;
 
         let result: mlua::Result<Option<mlua::String>> = func.call((ctx_table, data_str));
 
         match result {
-            Ok(Some(transformed)) => {
-                Ok(Some(transformed.as_bytes().to_vec()))
-            }
+            Ok(Some(transformed)) => Ok(Some(transformed.as_bytes().to_vec())),
             Ok(None) => Ok(None),
             Err(e) => Err(anyhow!("PTY output hook error: {e}")),
         }
@@ -1427,16 +1486,12 @@ impl LuaRuntime {
         Ok(())
     }
 
-
     /// Poll WebSocket events via shared vec (test-only fallback).
     ///
     /// Production uses `HubEvent::WebSocketEvent` from background threads.
     #[cfg(test)]
     pub fn poll_websocket_events(&self) -> usize {
-        primitives::websocket::poll_websocket_events(
-            &self.lua,
-            &self.websocket_registry,
-        )
+        primitives::websocket::poll_websocket_events(&self.lua, &self.websocket_registry)
     }
 
     /// Set up a test event channel for the `HubEventSender`.
@@ -1444,9 +1499,14 @@ impl LuaRuntime {
     /// Creates an unbounded channel, fills the shared `HubEventSender` so that
     /// Lua closures can send events, and returns the receiver for assertions.
     #[cfg(test)]
-    pub(crate) fn setup_test_event_channel(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::hub::events::HubEvent> {
+    pub(crate) fn setup_test_event_channel(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::hub::events::HubEvent> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        *self.hub_event_sender.lock().expect("HubEventSender mutex poisoned") =
+        *self
+            .hub_event_sender
+            .lock()
+            .expect("HubEventSender mutex poisoned") =
             Some(crate::hub::events::HubEventTx::from(tx));
         rx
     }
@@ -1466,7 +1526,10 @@ impl LuaRuntime {
         tokio_handle: tokio::runtime::Handle,
     ) {
         // Fill the shared HubEventSender for all 6 event-driven Lua primitives
-        *self.hub_event_sender.lock().expect("HubEventSender mutex poisoned") = Some(tx.clone());
+        *self
+            .hub_event_sender
+            .lock()
+            .expect("HubEventSender mutex poisoned") = Some(tx.clone());
 
         self.http_registry
             .lock()
@@ -1489,24 +1552,14 @@ impl LuaRuntime {
     /// Fire the Lua callback for a single completed HTTP response.
     ///
     /// Called from `handle_hub_event()` for `HubEvent::HttpResponse` events.
-    pub(crate) fn fire_http_callback(
-        &self,
-        response: primitives::http::CompletedHttpResponse,
-    ) {
-        primitives::http::fire_single_http_callback(
-            &self.lua,
-            &self.http_registry,
-            response,
-        );
+    pub(crate) fn fire_http_callback(&self, response: primitives::http::CompletedHttpResponse) {
+        primitives::http::fire_single_http_callback(&self.lua, &self.http_registry, response);
     }
 
     /// Fire the Lua callback for a single WebSocket event.
     ///
     /// Called from `handle_hub_event()` for `HubEvent::WebSocketEvent` events.
-    pub(crate) fn fire_websocket_event(
-        &self,
-        event: primitives::websocket::WsEvent,
-    ) {
+    pub(crate) fn fire_websocket_event(&self, event: primitives::websocket::WsEvent) {
         primitives::websocket::fire_single_websocket_event(
             &self.lua,
             &self.websocket_registry,
@@ -1520,11 +1573,7 @@ impl LuaRuntime {
     /// Looks up the callback in the timer registry, fires it, and cleans up
     /// one-shot entries.
     pub(crate) fn fire_timer_callback(&self, timer_id: &str) {
-        primitives::timer::fire_single_timer(
-            &self.lua,
-            &self.timer_registry,
-            timer_id,
-        );
+        primitives::timer::fire_single_timer(&self.lua, &self.timer_registry, timer_id);
     }
 
     /// Get a reference to the inner Lua state.
@@ -1616,7 +1665,9 @@ impl LuaRuntime {
     {
         // Collect callbacks and their functions in one lock acquisition
         let callbacks_to_call: Vec<mlua::Function> = {
-            let callbacks = self.event_callbacks.lock()
+            let callbacks = self
+                .event_callbacks
+                .lock()
                 .expect("Event callbacks mutex poisoned");
             callbacks
                 .get_callbacks(event)
@@ -1662,15 +1713,23 @@ impl LuaRuntime {
         let url = url.to_string();
 
         self.fire_event("connection_code_ready", |lua| {
-            let t = lua.create_table().map_err(|e| anyhow!("create_table: {e}"))?;
-            t.set("url", url.clone()).map_err(|e| anyhow!("set url: {e}"))?;
+            let t = lua
+                .create_table()
+                .map_err(|e| anyhow!("create_table: {e}"))?;
+            t.set("url", url.clone())
+                .map_err(|e| anyhow!("set url: {e}"))?;
 
             // Convert Vec<String> to Lua array
-            let qr_array = lua.create_table().map_err(|e| anyhow!("create qr_array: {e}"))?;
+            let qr_array = lua
+                .create_table()
+                .map_err(|e| anyhow!("create qr_array: {e}"))?;
             for (i, line) in qr_lines.iter().enumerate() {
-                qr_array.set(i + 1, line.clone()).map_err(|e| anyhow!("set qr line: {e}"))?;
+                qr_array
+                    .set(i + 1, line.clone())
+                    .map_err(|e| anyhow!("set qr line: {e}"))?;
             }
-            t.set("qr_ascii", qr_array).map_err(|e| anyhow!("set qr_ascii: {e}"))?;
+            t.set("qr_ascii", qr_array)
+                .map_err(|e| anyhow!("set qr_ascii: {e}"))?;
 
             Ok(mlua::Value::Table(t))
         })
@@ -1686,7 +1745,9 @@ impl LuaRuntime {
 
         let error = error.to_string();
         self.fire_event("connection_code_error", |lua| {
-            let s = lua.create_string(&error).map_err(|e| anyhow!("create_string: {e}"))?;
+            let s = lua
+                .create_string(&error)
+                .map_err(|e| anyhow!("create_string: {e}"))?;
             Ok(mlua::Value::String(s))
         })
     }
@@ -1773,12 +1834,7 @@ impl LuaRuntime {
     /// Called when focus-in (`\x1b[I`) or focus-out (`\x1b[O`) sequences
     /// are detected in PTY input. The `peer_id` identifies the client
     /// ("tui" for TUI, browser identity key for WebRTC).
-    pub fn set_pty_focused(
-        &self,
-        session_uuid: &str,
-        peer_id: &str,
-        focused: bool,
-    ) {
+    pub fn set_pty_focused(&self, session_uuid: &str, peer_id: &str, focused: bool) {
         let result: mlua::Result<()> = (|| {
             let func: mlua::Function = self.lua.globals().get("_set_pty_focused")?;
             func.call::<()>((session_uuid, peer_id, focused))?;
@@ -1906,9 +1962,9 @@ impl LuaRuntime {
 mod tests {
     use super::*;
     use crate::hub::events::HubEvent;
-    use crate::lua::primitives::webrtc::WebRtcSendRequest;
-    use crate::lua::primitives::tui::TuiSendRequest;
     use crate::lua::primitives::pty::PtyRequest;
+    use crate::lua::primitives::tui::TuiSendRequest;
+    use crate::lua::primitives::webrtc::WebRtcSendRequest;
 
     #[test]
     fn test_runtime_creation() {
@@ -1966,7 +2022,9 @@ mod tests {
 
         // Update with a new directory
         let additional_path = PathBuf::from("/additional/lua/path");
-        runtime.update_package_path(&additional_path).expect("Should update package.path");
+        runtime
+            .update_package_path(&additional_path)
+            .expect("Should update package.path");
 
         // Get updated package.path
         let updated_path: String = package.get("path").unwrap();
@@ -1987,7 +2045,10 @@ mod tests {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Load hooks module inline for testing
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             hooks = {
                 has_observers = function(event_name)
                     return false
@@ -1996,7 +2057,10 @@ mod tests {
                     return false
                 end
             }
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         assert!(!runtime.has_hooks("nonexistent_event"));
     }
@@ -2006,7 +2070,10 @@ mod tests {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Load hooks module with observer/interceptor API
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             hooks = {
                 has_observers = function(event_name)
                     return event_name == "test_event"
@@ -2015,7 +2082,10 @@ mod tests {
                     return false
                 end
             }
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         assert!(runtime.has_hooks("test_event"));
         assert!(!runtime.has_hooks("other_event"));
@@ -2026,13 +2096,19 @@ mod tests {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Load hooks module that transforms data
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             hooks = {
                 call = function(event_name, data)
                     return data .. "_transformed"
                 end
             }
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let result = runtime.call_interceptors("test_event", "hello");
         assert_eq!(result, Some("hello_transformed".to_string()));
@@ -2043,13 +2119,19 @@ mod tests {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Load hooks module that drops data
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             hooks = {
                 call = function(event_name, data)
                     return nil
                 end
             }
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let result = runtime.call_interceptors("test_event", "hello");
         assert_eq!(result, None);
@@ -2077,9 +2159,15 @@ mod tests {
     fn test_has_webrtc_callbacks_true_after_registration() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             webrtc.on_message(function(peer_id, msg) end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         assert!(runtime.has_webrtc_callbacks());
     }
@@ -2088,14 +2176,22 @@ mod tests {
     fn test_call_peer_connected_invokes_callback() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             connected_peer = nil
             webrtc.on_peer_connected(function(peer_id)
                 connected_peer = peer_id
             end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
-        runtime.call_peer_connected("test-peer-123").expect("Should call callback");
+        runtime
+            .call_peer_connected("test-peer-123")
+            .expect("Should call callback");
 
         let result: String = runtime.lua().globals().get("connected_peer").unwrap();
         assert_eq!(result, "test-peer-123");
@@ -2105,14 +2201,22 @@ mod tests {
     fn test_call_peer_disconnected_invokes_callback() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             disconnected_peer = nil
             webrtc.on_peer_disconnected(function(peer_id)
                 disconnected_peer = peer_id
             end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
-        runtime.call_peer_disconnected("test-peer-456").expect("Should call callback");
+        runtime
+            .call_peer_disconnected("test-peer-456")
+            .expect("Should call callback");
 
         let result: String = runtime.lua().globals().get("disconnected_peer").unwrap();
         assert_eq!(result, "test-peer-456");
@@ -2122,7 +2226,10 @@ mod tests {
     fn test_call_webrtc_message_invokes_callback_with_json() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             received_peer = nil
             received_type = nil
             received_value = nil
@@ -2131,14 +2238,19 @@ mod tests {
                 received_type = msg.type
                 received_value = msg.value
             end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let msg = serde_json::json!({
             "type": "test_message",
             "value": 42
         });
 
-        runtime.call_webrtc_message("peer-789", msg).expect("Should call callback");
+        runtime
+            .call_webrtc_message("peer-789", msg)
+            .expect("Should call callback");
 
         let peer: String = runtime.lua().globals().get("received_peer").unwrap();
         let msg_type: String = runtime.lua().globals().get("received_type").unwrap();
@@ -2154,10 +2266,16 @@ mod tests {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         let mut rx = runtime.setup_test_event_channel();
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             webrtc.send("peer-1", { type = "hello" })
             webrtc.send("peer-2", { type = "world" })
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let event1 = rx.try_recv().expect("Should receive first event");
         let event2 = rx.try_recv().expect("Should receive second event");
@@ -2183,16 +2301,24 @@ mod tests {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         let mut rx = runtime.setup_test_event_channel();
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             webrtc.on_message(function(peer_id, msg)
                 if msg.type == "ping" then
                     webrtc.send(peer_id, { type = "pong" })
                 end
             end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let ping = serde_json::json!({ "type": "ping" });
-        runtime.call_webrtc_message("peer-echo", ping).expect("Should call callback");
+        runtime
+            .call_webrtc_message("peer-echo", ping)
+            .expect("Should call callback");
 
         let event = rx.try_recv().expect("Should receive event");
         assert!(rx.try_recv().is_err(), "No more events expected");
@@ -2219,6 +2345,32 @@ mod tests {
     }
 
     #[test]
+    fn test_spawn_pty_with_broker_function_exists() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree_base = tmp.path().join("worktree-base");
+        std::fs::create_dir_all(&worktree_base).expect("create worktree base");
+        runtime
+            .register_hub_primitives(
+                std::sync::Arc::new(crate::hub::handle_cache::HandleCache::new()),
+                worktree_base.clone(),
+                "test-hub".to_string(),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                std::sync::Arc::new(std::sync::RwLock::new(crate::hub::state::HubState::new(
+                    worktree_base,
+                ))),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+            )
+            .expect("register hub/worktree primitives");
+
+        let globals = runtime.lua().globals();
+        let hub: mlua::Table = globals.get("hub").expect("hub should exist");
+        let spawn_fn: mlua::Result<mlua::Function> = hub.get("spawn_pty_with_broker");
+        assert!(spawn_fn.is_ok(), "spawn_pty_with_broker should exist");
+    }
+
+    #[test]
     fn test_create_pty_forwarder_function_exists() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         let globals = runtime.lua().globals();
@@ -2239,9 +2391,15 @@ mod tests {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         let mut rx = runtime.setup_test_event_channel();
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             hub.write_pty("test-session-uuid", "hello")
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let event = rx.try_recv().expect("Should receive event");
         assert!(rx.try_recv().is_err(), "No more events expected");
@@ -2260,15 +2418,25 @@ mod tests {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         let mut rx = runtime.setup_test_event_channel();
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             hub.resize_pty("resize-session-uuid", 50, 100)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let event = rx.try_recv().expect("Should receive event");
         assert!(rx.try_recv().is_err(), "No more events expected");
 
         match event {
-            HubEvent::LuaPtyRequest(PtyRequest::ResizePty { session_uuid, rows, cols }) => {
+            HubEvent::LuaPtyRequest(PtyRequest::ResizePty {
+                session_uuid,
+                rows,
+                cols,
+            }) => {
                 assert_eq!(session_uuid, "resize-session-uuid");
                 assert_eq!(rows, 50);
                 assert_eq!(cols, 100);
@@ -2282,13 +2450,19 @@ mod tests {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         let mut rx = runtime.setup_test_event_channel();
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             forwarder = webrtc.create_pty_forwarder({
                 peer_id = "test-browser",
                 session_uuid = "fwd-session-uuid",
                 subscription_id = "sub_1_test",
             })
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let event = rx.try_recv().expect("Should receive event");
         assert!(rx.try_recv().is_err(), "No more events expected");
@@ -2307,23 +2481,37 @@ mod tests {
     fn test_forwarder_handle_methods() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             forwarder = webrtc.create_pty_forwarder({
                 peer_id = "browser-xyz",
                 session_uuid = "handle-session-uuid",
                 subscription_id = "sub_2_test",
             })
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let id: String = runtime.lua().load("return forwarder:id()").eval().unwrap();
         assert_eq!(id, "browser-xyz:handle-session-uuid");
 
-        let active: bool = runtime.lua().load("return forwarder:is_active()").eval().unwrap();
+        let active: bool = runtime
+            .lua()
+            .load("return forwarder:is_active()")
+            .eval()
+            .unwrap();
         assert!(active);
 
         runtime.lua().load("forwarder:stop()").exec().unwrap();
 
-        let active_after: bool = runtime.lua().load("return forwarder:is_active()").eval().unwrap();
+        let active_after: bool = runtime
+            .lua()
+            .load("return forwarder:is_active()")
+            .eval()
+            .unwrap();
         assert!(!active_after);
     }
 
@@ -2332,20 +2520,28 @@ mod tests {
         let mut runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Set up hooks that pass through unchanged
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             hooks = {
                 call = function(event_name, ctx, data)
                     return data
                 end
             }
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let ctx = PtyOutputContext {
             session_uuid: "test-session".to_string(),
             peer_id: "test-peer".to_string(),
         };
 
-        let result = runtime.call_pty_output_interceptors(&ctx, b"hello world").unwrap();
+        let result = runtime
+            .call_pty_output_interceptors(&ctx, b"hello world")
+            .unwrap();
         assert_eq!(result, Some(b"hello world".to_vec()));
     }
 
@@ -2354,20 +2550,28 @@ mod tests {
         let mut runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Set up hooks that transform data
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             hooks = {
                 call = function(event_name, ctx, data)
                     return data .. " transformed"
                 end
             }
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let ctx = PtyOutputContext {
             session_uuid: "test-session".to_string(),
             peer_id: "test-peer".to_string(),
         };
 
-        let result = runtime.call_pty_output_interceptors(&ctx, b"hello").unwrap();
+        let result = runtime
+            .call_pty_output_interceptors(&ctx, b"hello")
+            .unwrap();
         assert_eq!(result, Some(b"hello transformed".to_vec()));
     }
 
@@ -2376,20 +2580,28 @@ mod tests {
         let mut runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Set up hooks that drop data
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             hooks = {
                 call = function(event_name, ctx, data)
                     return nil
                 end
             }
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let ctx = PtyOutputContext {
             session_uuid: "test-session".to_string(),
             peer_id: "test-peer".to_string(),
         };
 
-        let result = runtime.call_pty_output_interceptors(&ctx, b"hello").unwrap();
+        let result = runtime
+            .call_pty_output_interceptors(&ctx, b"hello")
+            .unwrap();
         assert_eq!(result, None);
     }
 
@@ -2398,7 +2610,10 @@ mod tests {
         let mut runtime = LuaRuntime::new().expect("Should create runtime");
 
         // Set up hooks that use context
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             received_ctx = nil
             hooks = {
                 call = function(event_name, ctx, data)
@@ -2406,7 +2621,10 @@ mod tests {
                     return data
                 end
             }
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let ctx = PtyOutputContext {
             session_uuid: "sess-abc-123".to_string(),
@@ -2415,8 +2633,16 @@ mod tests {
 
         runtime.call_pty_output_interceptors(&ctx, b"test").unwrap();
 
-        let session_uuid: String = runtime.lua().load("return received_ctx.session_uuid").eval().unwrap();
-        let peer_id: String = runtime.lua().load("return received_ctx.peer_id").eval().unwrap();
+        let session_uuid: String = runtime
+            .lua()
+            .load("return received_ctx.session_uuid")
+            .eval()
+            .unwrap();
+        let peer_id: String = runtime
+            .lua()
+            .load("return received_ctx.peer_id")
+            .eval()
+            .unwrap();
 
         assert_eq!(session_uuid, "sess-abc-123");
         assert_eq!(peer_id, "context-test-peer");
@@ -2446,9 +2672,15 @@ mod tests {
     fn test_has_event_callbacks_true_after_registration() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             events.on("agent_created", function(info) end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         assert!(runtime.has_event_callbacks("agent_created"));
         assert!(!runtime.has_event_callbacks("agent_deleted"));
@@ -2458,16 +2690,24 @@ mod tests {
     fn test_fire_event_invokes_callback() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             received_value = nil
             events.on("test_event", function(value)
                 received_value = value
             end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
-        runtime.fire_event("test_event", |lua| {
-            Ok(mlua::Value::String(lua.create_string("hello").unwrap()))
-        }).expect("Should fire event");
+        runtime
+            .fire_event("test_event", |lua| {
+                Ok(mlua::Value::String(lua.create_string("hello").unwrap()))
+            })
+            .expect("Should fire event");
 
         let received: String = runtime.lua().globals().get("received_value").unwrap();
         assert_eq!(received, "hello");
@@ -2477,14 +2717,22 @@ mod tests {
     fn test_fire_event_invokes_multiple_callbacks() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             call_count = 0
             events.on("test_event", function() call_count = call_count + 1 end)
             events.on("test_event", function() call_count = call_count + 1 end)
             events.on("test_event", function() call_count = call_count + 1 end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
-        runtime.fire_event("test_event", |_lua| Ok(mlua::Value::Nil)).unwrap();
+        runtime
+            .fire_event("test_event", |_lua| Ok(mlua::Value::Nil))
+            .unwrap();
 
         let count: i32 = runtime.lua().globals().get("call_count").unwrap();
         assert_eq!(count, 3);
@@ -2494,12 +2742,18 @@ mod tests {
     fn test_fire_shutdown_invokes_callback() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             shutdown_called = false
             events.on("shutdown", function()
                 shutdown_called = true
             end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         runtime.fire_shutdown().expect("Should fire event");
 
@@ -2536,9 +2790,15 @@ mod tests {
     fn test_has_tui_callbacks_true_after_registration() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             tui.on_message(function(msg) end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         assert!(runtime.has_tui_callbacks());
     }
@@ -2547,12 +2807,18 @@ mod tests {
     fn test_call_tui_connected_invokes_callback() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             tui_connected = false
             tui.on_connected(function()
                 tui_connected = true
             end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         runtime.call_tui_connected().expect("Should call callback");
 
@@ -2564,14 +2830,22 @@ mod tests {
     fn test_call_tui_disconnected_invokes_callback() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             tui_disconnected = false
             tui.on_disconnected(function()
                 tui_disconnected = true
             end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
-        runtime.call_tui_disconnected().expect("Should call callback");
+        runtime
+            .call_tui_disconnected()
+            .expect("Should call callback");
 
         let result: bool = runtime.lua().globals().get("tui_disconnected").unwrap();
         assert!(result);
@@ -2581,14 +2855,20 @@ mod tests {
     fn test_call_tui_message_invokes_callback_with_json() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             received_tui_type = nil
             received_tui_value = nil
             tui.on_message(function(msg)
                 received_tui_type = msg.type
                 received_tui_value = msg.value
             end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let msg = serde_json::json!({
             "type": "resize",
@@ -2609,10 +2889,16 @@ mod tests {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         let mut rx = runtime.setup_test_event_channel();
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             tui.send({ type = "agent_list" })
             tui.send({ type = "status" })
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let event1 = rx.try_recv().expect("Should receive first event");
         let event2 = rx.try_recv().expect("Should receive second event");
@@ -2638,13 +2924,19 @@ mod tests {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         let mut rx = runtime.setup_test_event_channel();
 
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             tui.on_message(function(msg)
                 if msg.type == "list_agents" then
                     tui.send({ type = "agent_list", count = 0 })
                 end
             end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         let msg = serde_json::json!({ "type": "list_agents" });
         runtime.call_tui_message(msg).expect("Should call callback");
@@ -2670,12 +2962,14 @@ mod tests {
 
         // Simulate what load_embedded does: eval a module and put it in package.loaded
         let module: mlua::Value = lua
-            .load(r#"
+            .load(
+                r#"
                 local M = {}
                 M.value = 42
                 function M.get_name() return "test_module" end
                 return M
-            "#)
+            "#,
+            )
             .eval()
             .expect("module should eval");
 
@@ -2717,33 +3011,39 @@ mod tests {
 
         // Seed "hub.state" first
         let state: mlua::Value = lua
-            .load(r#"
+            .load(
+                r#"
                 local M = {}
                 M.agents = {}
                 return M
-            "#)
+            "#,
+            )
             .eval()
             .unwrap();
         package_loaded.set("hub.state", state).unwrap();
 
         // Seed "hub.hooks" that depends on nothing
         let hooks: mlua::Value = lua
-            .load(r#"
+            .load(
+                r#"
                 local M = {}
                 function M.notify(event) end
                 return M
-            "#)
+            "#,
+            )
             .eval()
             .unwrap();
         package_loaded.set("hub.hooks", hooks).unwrap();
 
         // Now a script that requires both should work
         let result: bool = lua
-            .load(r#"
+            .load(
+                r#"
                 local state = require("hub.state")
                 local hooks = require("hub.hooks")
                 return type(state.agents) == "table" and type(hooks.notify) == "function"
-            "#)
+            "#,
+            )
             .eval()
             .expect("cross-module require should work");
         assert!(result, "Both modules should resolve from package.loaded");
@@ -2998,26 +3298,15 @@ mod tests {
             .expect("Should fire event");
 
         // JSON null should become Lua nil (type "nil"), not userdata
-        let field_type: String = runtime
-            .lua()
-            .globals()
-            .get("null_field_type")
-            .unwrap();
-        let is_nil: bool = runtime
-            .lua()
-            .globals()
-            .get("null_field_is_nil")
-            .unwrap();
+        let field_type: String = runtime.lua().globals().get("null_field_type").unwrap();
+        let is_nil: bool = runtime.lua().globals().get("null_field_is_nil").unwrap();
 
         assert_eq!(
             field_type, "nil",
             "JSON null should map to Lua nil, got '{}' (userdata = mlua NULL sentinel)",
             field_type
         );
-        assert!(
-            is_nil,
-            "JSON null field should be == nil in Lua"
-        );
+        assert!(is_nil, "JSON null field should be == nil in Lua");
     }
 
     /// Verifies `call_tui_message` converts JSON null to Lua nil, not userdata.
@@ -3049,20 +3338,10 @@ mod tests {
             "optional_field": null
         });
 
-        runtime
-            .call_tui_message(msg)
-            .expect("Should call callback");
+        runtime.call_tui_message(msg).expect("Should call callback");
 
-        let field_type: String = runtime
-            .lua()
-            .globals()
-            .get("tui_null_type")
-            .unwrap();
-        let is_nil: bool = runtime
-            .lua()
-            .globals()
-            .get("tui_null_is_nil")
-            .unwrap();
+        let field_type: String = runtime.lua().globals().get("tui_null_type").unwrap();
+        let is_nil: bool = runtime.lua().globals().get("tui_null_is_nil").unwrap();
 
         assert_eq!(
             field_type, "nil",
@@ -3109,11 +3388,7 @@ mod tests {
             .fire_json_event("test_nested_null", &payload)
             .expect("Should fire event");
 
-        let has_key: bool = runtime
-            .lua()
-            .globals()
-            .get("nested_has_key")
-            .unwrap();
+        let has_key: bool = runtime.lua().globals().get("nested_has_key").unwrap();
 
         assert!(
             !has_key,
@@ -3158,20 +3433,10 @@ mod tests {
             "data": { "type": "quit" }
         });
 
-        runtime
-            .call_tui_message(msg)
-            .expect("Should call callback");
+        runtime.call_tui_message(msg).expect("Should call callback");
 
-        let sub_id: String = runtime
-            .lua()
-            .globals()
-            .get("received_sub_id")
-            .unwrap();
-        let data_type: String = runtime
-            .lua()
-            .globals()
-            .get("received_data_type")
-            .unwrap();
+        let sub_id: String = runtime.lua().globals().get("received_sub_id").unwrap();
+        let data_type: String = runtime.lua().globals().get("received_data_type").unwrap();
 
         assert_eq!(sub_id, "tui_hub");
         assert_eq!(data_type, "quit");
@@ -3213,7 +3478,9 @@ mod tests {
             .fire_json_event("agent_created", &payload)
             .expect("Should fire event");
 
-        let event = rx.try_recv().expect("Hub event should produce TUI send event");
+        let event = rx
+            .try_recv()
+            .expect("Hub event should produce TUI send event");
         assert!(rx.try_recv().is_err(), "No more events expected");
 
         match event {
@@ -3226,11 +3493,9 @@ mod tests {
     }
 
     /// Regression test for broker restart resurrection classification:
-    /// `hub.get_pty_snapshot_from_broker(session_id) == ""` means the broker
-    /// session is alive with no buffered output yet. This must remain graceful
-    /// (not orphaned), and must not trigger tee log replay.
+    /// missing/empty broker snapshots are graceful and must not mutate manifest status.
     #[test]
-    fn test_broker_reconnected_empty_snapshot_is_graceful_not_orphaned() {
+    fn test_broker_sessions_recovered_missing_snapshot_is_graceful_not_orphaned() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3307,7 +3572,7 @@ mod tests {
             "repo": "owner/repo",
             "branch": "empty-snapshot",
             "worktree_path": tmp.path().join("wt-empty-snapshot").to_string_lossy(),
-            "status": "active",
+            "status": "orphaned",
             "broker_sessions": { "0": 123 },
             "pty_dimensions": { "0": { "rows": 24, "cols": 80 } },
             "created_at": "2025-01-01T00:00:00Z",
@@ -3324,9 +3589,8 @@ mod tests {
             .load(
                 r#"
                 _test_feed_calls = 0
-
                 hub.get_pty_snapshot_from_broker = function(_session_id)
-                    return "" -- alive broker session with no output yet
+                    return nil
                 end
 
                 hub.create_ghost_session = function(_session_uuid, _session_id, _rows, _cols)
@@ -3343,11 +3607,21 @@ mod tests {
             "#,
             )
             .exec()
-            .expect("install broker_reconnected test stubs");
+            .expect("install broker_sessions_recovered test stubs");
 
         runtime
-            .fire_json_event("broker_reconnected", &serde_json::json!({}))
-            .expect("fire broker_reconnected");
+            .fire_json_event(
+                "broker_sessions_recovered",
+                &serde_json::json!({
+                    "sessions": [
+                        {
+                            "session_id": 123,
+                            "session_uuid": session_uuid,
+                        }
+                    ]
+                }),
+            )
+            .expect("fire broker_sessions_recovered");
 
         let feed_calls: i64 = runtime
             .lua()
@@ -3356,8 +3630,410 @@ mod tests {
             .expect("read _test_feed_calls");
         assert_eq!(
             feed_calls, 0,
-            "Empty snapshot has no bytes; feed_output should not be called"
+            "Missing broker snapshot has no bytes; feed_output should not be called"
         );
+
+        // Recovery path must treat manifests as metadata-only and avoid
+        // mutating lifecycle status fields.
+        let persisted =
+            std::fs::read_to_string(sess_dir.join("manifest.json")).expect("read session manifest");
+        let persisted_json: serde_json::Value =
+            serde_json::from_str(&persisted).expect("parse session manifest");
+        assert_eq!(
+            persisted_json["status"],
+            serde_json::Value::String("orphaned".to_string()),
+            "restart recovery should not rewrite session status"
+        );
+    }
+
+    /// Regression test for restart recovery scrollback source of truth:
+    /// replay comes from broker snapshot RPC and feeds ghost shadow screen.
+    #[test]
+    fn test_broker_sessions_recovered_replays_broker_snapshot() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree_base = tmp.path().join("worktree-base");
+        std::fs::create_dir_all(&worktree_base).expect("create worktree base");
+
+        runtime
+            .register_hub_primitives(
+                std::sync::Arc::new(crate::hub::handle_cache::HandleCache::new()),
+                worktree_base.clone(),
+                "test-hub".to_string(),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                std::sync::Arc::new(std::sync::RwLock::new(crate::hub::state::HubState::new(
+                    worktree_base,
+                ))),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+            )
+            .expect("register hub/worktree primitives");
+
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("create temp data dir");
+        runtime
+            .lua()
+            .globals()
+            .set("__test_data_dir", data_dir.to_string_lossy().to_string())
+            .expect("set __test_data_dir");
+        runtime
+            .lua()
+            .load("config.data_dir = function() return __test_data_dir end")
+            .exec()
+            .expect("override config.data_dir for test");
+        let repo_lua_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lua");
+        runtime
+            .update_package_path(&repo_lua_dir)
+            .expect("prepend repo lua dir to package.path");
+        let init_src = std::fs::read_to_string(repo_lua_dir.join("hub/init.lua"))
+            .expect("read repo hub/init.lua");
+        runtime
+            .load_string("hub/init.lua", &init_src)
+            .expect("load hub/init.lua");
+
+        let workspace_id = "ws-test-tee";
+        let session_uuid = "sess-test-tee";
+        let ws_dir = data_dir.join("workspaces").join(workspace_id);
+        let sess_dir = ws_dir.join("sessions").join(session_uuid);
+        std::fs::create_dir_all(&sess_dir).expect("create session dir");
+
+        let workspace_manifest = serde_json::json!({
+            "id": workspace_id,
+            "name": "owner/repo:tee",
+            "worktree_path": tmp.path().join("wt-tee").to_string_lossy(),
+            "branch": "tee",
+            "status": "active",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "metadata": {}
+        });
+        std::fs::write(
+            ws_dir.join("manifest.json"),
+            serde_json::to_vec(&workspace_manifest).expect("serialize workspace manifest"),
+        )
+        .expect("write workspace manifest");
+
+        let session_manifest = serde_json::json!({
+            "uuid": session_uuid,
+            "workspace_id": workspace_id,
+            "agent_key": "owner-repo-tee",
+            "type": "agent",
+            "role": "developer",
+            "repo": "owner/repo",
+            "branch": "tee",
+            "worktree_path": tmp.path().join("wt-tee").to_string_lossy(),
+            "status": "active",
+            "broker_sessions": { "0": 777 },
+            "pty_dimensions": { "0": { "rows": 24, "cols": 80 } },
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z"
+        });
+        std::fs::write(
+            sess_dir.join("manifest.json"),
+            serde_json::to_vec(&session_manifest).expect("serialize session manifest"),
+        )
+        .expect("write session manifest");
+
+        runtime
+            .lua()
+            .load(
+                r#"
+                _test_feed_calls = 0
+                _test_feed_payload = nil
+                _test_snapshot_calls = 0
+
+                hub.get_pty_snapshot_from_broker = function(session_id)
+                    _test_snapshot_calls = _test_snapshot_calls + 1
+                    assert(session_id == 777, "unexpected session_id for broker snapshot")
+                    return "broker-snapshot-line\n"
+                end
+
+                hub.create_ghost_session = function(_session_uuid, _session_id, _rows, _cols)
+                    return {
+                        feed_output = function(_self, data)
+                            _test_feed_calls = _test_feed_calls + 1
+                            _test_feed_payload = data
+                        end
+                    }
+                end
+
+                hub.register_session = function(_session_uuid, _handle, _metadata)
+                    return 0
+                end
+            "#,
+            )
+            .exec()
+            .expect("install broker_sessions_recovered test stubs");
+
+        runtime
+            .fire_json_event(
+                "broker_sessions_recovered",
+                &serde_json::json!({
+                    "sessions": [
+                        {
+                            "session_id": 777,
+                            "session_uuid": session_uuid,
+                        }
+                    ]
+                }),
+            )
+            .expect("fire broker_sessions_recovered");
+
+        let feed_calls: i64 = runtime
+            .lua()
+            .load("return _test_feed_calls")
+            .eval()
+            .expect("read _test_feed_calls");
+        assert_eq!(
+            feed_calls, 1,
+            "broker snapshot should be replayed exactly once"
+        );
+
+        let payload: String = runtime
+            .lua()
+            .load("return _test_feed_payload")
+            .eval()
+            .expect("read _test_feed_payload");
+        assert_eq!(payload, "broker-snapshot-line\n");
+
+        let snapshot_calls: i64 = runtime
+            .lua()
+            .load("return _test_snapshot_calls")
+            .eval()
+            .expect("read _test_snapshot_calls");
+        assert_eq!(
+            snapshot_calls, 1,
+            "broker snapshot RPC should be called once"
+        );
+    }
+
+    /// Regression test for unified session registry behavior:
+    /// ghost entries are stored in agent_registry and replaced in-place by real sessions.
+    #[test]
+    fn test_broker_recovery_ghost_entry_is_replaced_in_unified_registry() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree_base = tmp.path().join("worktree-base");
+        std::fs::create_dir_all(&worktree_base).expect("create worktree base");
+
+        runtime
+            .register_hub_primitives(
+                std::sync::Arc::new(crate::hub::handle_cache::HandleCache::new()),
+                worktree_base.clone(),
+                "test-hub".to_string(),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+                std::sync::Arc::new(std::sync::RwLock::new(crate::hub::state::HubState::new(
+                    worktree_base,
+                ))),
+                std::sync::Arc::new(std::sync::Mutex::new(None)),
+            )
+            .expect("register hub/worktree primitives");
+
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("create temp data dir");
+        runtime
+            .lua()
+            .globals()
+            .set("__test_data_dir", data_dir.to_string_lossy().to_string())
+            .expect("set __test_data_dir");
+        runtime
+            .lua()
+            .load("config.data_dir = function() return __test_data_dir end")
+            .exec()
+            .expect("override config.data_dir for test");
+        let repo_lua_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lua");
+        runtime
+            .update_package_path(&repo_lua_dir)
+            .expect("prepend repo lua dir to package.path");
+        let init_src = std::fs::read_to_string(repo_lua_dir.join("hub/init.lua"))
+            .expect("read repo hub/init.lua");
+        runtime
+            .load_string("hub/init.lua", &init_src)
+            .expect("load hub/init.lua");
+
+        let workspace_id = "ws-test-unified-registry";
+        let session_uuid = "sess-test-unified-registry";
+        let ws_dir = data_dir.join("workspaces").join(workspace_id);
+        let sess_dir = ws_dir.join("sessions").join(session_uuid);
+        std::fs::create_dir_all(&sess_dir).expect("create session dir");
+
+        let workspace_manifest = serde_json::json!({
+            "id": workspace_id,
+            "name": "owner/repo:unified-registry",
+            "worktree_path": tmp.path().join("wt-unified-registry").to_string_lossy(),
+            "branch": "unified-registry",
+            "status": "active",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "metadata": {}
+        });
+        std::fs::write(
+            ws_dir.join("manifest.json"),
+            serde_json::to_vec(&workspace_manifest).expect("serialize workspace manifest"),
+        )
+        .expect("write workspace manifest");
+
+        let session_manifest = serde_json::json!({
+            "uuid": session_uuid,
+            "workspace_id": workspace_id,
+            "agent_key": "owner-repo-unified-registry",
+            "type": "agent",
+            "role": "developer",
+            "repo": "owner/repo",
+            "branch": "unified-registry",
+            "worktree_path": tmp.path().join("wt-unified-registry").to_string_lossy(),
+            "status": "active",
+            "broker_sessions": { "0": 4242 },
+            "pty_dimensions": { "0": { "rows": 24, "cols": 80 } },
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z"
+        });
+        std::fs::write(
+            sess_dir.join("manifest.json"),
+            serde_json::to_vec(&session_manifest).expect("serialize session manifest"),
+        )
+        .expect("write session manifest");
+
+        runtime
+            .lua()
+            .load(
+                r#"
+                hub.get_pty_snapshot_from_broker = function(_session_id)
+                    return nil
+                end
+
+                hub.create_ghost_session = function(_session_uuid, _session_id, _rows, _cols)
+                    return {
+                        feed_output = function(_self, _data) end
+                    }
+                end
+
+                hub.register_session = function(_session_uuid, _handle, _metadata)
+                    return 0
+                end
+            "#,
+            )
+            .exec()
+            .expect("install broker recovery test stubs");
+
+        runtime
+            .fire_json_event(
+                "broker_sessions_recovered",
+                &serde_json::json!({
+                    "sessions": [
+                        {
+                            "session_id": 4242,
+                            "session_uuid": session_uuid,
+                        }
+                    ]
+                }),
+            )
+            .expect("fire broker_sessions_recovered");
+
+        runtime
+            .lua()
+            .globals()
+            .set("__test_session_uuid", session_uuid)
+            .expect("set __test_session_uuid");
+
+        let ghost_count: i64 = runtime
+            .lua()
+            .load(
+                r#"
+                local Agent = require("lib.agent")
+                local count = 0
+                for _, info in ipairs(Agent.all_info()) do
+                    if info.session_uuid == __test_session_uuid and info.status == "ghost" then
+                        count = count + 1
+                    end
+                end
+                return count
+            "#,
+            )
+            .eval()
+            .expect("count ghost entries after recovery");
+        assert_eq!(ghost_count, 1, "recovery should register one ghost entry");
+
+        let ghost_get_is_nil: bool = runtime
+            .lua()
+            .load(
+                r#"
+                local Session = require("lib.session")
+                return Session.get(__test_session_uuid) == nil
+            "#,
+            )
+            .eval()
+            .expect("Session.get should hide ghost entries");
+        assert!(
+            ghost_get_is_nil,
+            "Session.get(session_uuid) must return nil while entry is ghost-only"
+        );
+
+        runtime
+            .lua()
+            .load(
+                r#"
+                local state = require("hub.state")
+                local reg = state.get("agent_registry", {})
+                reg[__test_session_uuid] = {
+                    created_at = os.time(),
+                    info = function(self)
+                        return {
+                            id = "owner-repo-unified-registry",
+                            session_uuid = __test_session_uuid,
+                            session_type = "agent",
+                            session_name = "agent",
+                            display_name = "unified-registry",
+                            status = "running",
+                            created_at = self.created_at,
+                        }
+                    end
+                }
+            "#,
+            )
+            .exec()
+            .expect("replace ghost entry with real session entry");
+
+        let (ghost_count_after, running_count_after): (i64, i64) = runtime
+            .lua()
+            .load(
+                r#"
+                local Agent = require("lib.agent")
+                local ghost = 0
+                local running = 0
+                for _, info in ipairs(Agent.all_info()) do
+                    if info.session_uuid == __test_session_uuid then
+                        if info.status == "ghost" then ghost = ghost + 1 end
+                        if info.status == "running" then running = running + 1 end
+                    end
+                end
+                return ghost, running
+            "#,
+            )
+            .eval()
+            .expect("count entries after replacement");
+
+        assert_eq!(
+            ghost_count_after, 0,
+            "ghost entry must be replaced in-place, not duplicated"
+        );
+        assert_eq!(
+            running_count_after, 1,
+            "exactly one real session entry should remain after replacement"
+        );
+
+        let real_get_exists: bool = runtime
+            .lua()
+            .load(
+                r#"
+                local Session = require("lib.session")
+                return Session.get(__test_session_uuid) ~= nil
+            "#,
+            )
+            .eval()
+            .expect("Session.get should return real session after replacement");
+        assert!(real_get_exists, "Session.get should resolve replaced real entry");
     }
 
     // =========================================================================
@@ -3371,7 +4047,10 @@ mod tests {
     /// - `_on_pty_input()` — called from Rust hot path, fires plugin hook
     /// - `_clear_session_notification()` — called from command handler, no hook
     fn setup_notification_env(runtime: &LuaRuntime) {
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             -- Minimal Agent mock with notification support
             _test_agents = {}
             Agent = {
@@ -3462,12 +4141,19 @@ mod tests {
                 local _, any_remaining = clear_session_notification(session_uuid)
                 return any_remaining
             end
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
     }
 
     /// Add a test agent to the Lua mock.
     fn add_test_agent(runtime: &LuaRuntime, key: &str, notification: bool) {
-        let idx = runtime.lua().load("return #_test_agents").eval::<i64>().unwrap();
+        let idx = runtime
+            .lua()
+            .load("return #_test_agents")
+            .eval::<i64>()
+            .unwrap();
         runtime.lua().load(&format!(
             r#"table.insert(_test_agents, {{ _agent_key = "{key}", _session_uuid = "sess-{idx}", notification = {notif} }})"#,
             key = key,
@@ -3488,10 +4174,16 @@ mod tests {
         setup_notification_env(&runtime);
 
         // Set up minimal hooks for notify_pty_notification
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             hooks.on = function() end
             hooks.off = function() end
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
 
         assert!(!runtime.pty_input_listening);
 
@@ -3501,7 +4193,10 @@ mod tests {
             &crate::agent::AgentNotification::Osc9(Some("bell".to_string())),
         );
 
-        assert!(runtime.pty_input_listening, "Should be armed after notification");
+        assert!(
+            runtime.pty_input_listening,
+            "Should be armed after notification"
+        );
     }
 
     #[test]
@@ -3516,8 +4211,7 @@ mod tests {
         runtime.notify_pty_input("sess-0");
 
         // Verify _on_pty_input was never called (no broadcasts)
-        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
-            .eval().unwrap();
+        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts").eval().unwrap();
         assert_eq!(broadcast_count, 0, "Should not call Lua when disarmed");
     }
 
@@ -3525,7 +4219,7 @@ mod tests {
     fn test_notify_pty_input_clears_notification_and_disarms() {
         let mut runtime = LuaRuntime::new().expect("Should create runtime");
         setup_notification_env(&runtime);
-        add_test_agent(&runtime, "agent-0", true);  // has notification
+        add_test_agent(&runtime, "agent-0", true); // has notification
 
         // Arm the listener
         runtime.pty_input_listening = true;
@@ -3534,14 +4228,15 @@ mod tests {
         runtime.notify_pty_input("sess-0");
 
         // Notification should be cleared
-        let notif: bool = runtime.lua().load(
-            "return _test_agents[1].notification"
-        ).eval().unwrap();
+        let notif: bool = runtime
+            .lua()
+            .load("return _test_agents[1].notification")
+            .eval()
+            .unwrap();
         assert!(!notif, "Notification should be cleared after input");
 
         // Should have broadcast the updated agent list
-        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
-            .eval().unwrap();
+        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts").eval().unwrap();
         assert_eq!(broadcast_count, 1, "Should broadcast agent_list update");
 
         // Listener should be disarmed (no more notifications pending)
@@ -3555,8 +4250,8 @@ mod tests {
     fn test_notify_pty_input_stays_armed_with_multiple_notifications() {
         let mut runtime = LuaRuntime::new().expect("Should create runtime");
         setup_notification_env(&runtime);
-        add_test_agent(&runtime, "agent-0", true);  // has notification
-        add_test_agent(&runtime, "agent-1", true);  // also has notification
+        add_test_agent(&runtime, "agent-0", true); // has notification
+        add_test_agent(&runtime, "agent-1", true); // also has notification
 
         runtime.pty_input_listening = true;
 
@@ -3564,12 +4259,16 @@ mod tests {
         runtime.notify_pty_input("sess-0");
 
         // Agent 0 cleared, agent 1 still has notification
-        let notif0: bool = runtime.lua().load(
-            "return _test_agents[1].notification"
-        ).eval().unwrap();
-        let notif1: bool = runtime.lua().load(
-            "return _test_agents[2].notification"
-        ).eval().unwrap();
+        let notif0: bool = runtime
+            .lua()
+            .load("return _test_agents[1].notification")
+            .eval()
+            .unwrap();
+        let notif1: bool = runtime
+            .lua()
+            .load("return _test_agents[2].notification")
+            .eval()
+            .unwrap();
         assert!(!notif0, "Agent 0 notification should be cleared");
         assert!(notif1, "Agent 1 notification should remain");
 
@@ -3582,9 +4281,11 @@ mod tests {
         // Keystroke on agent 1 — clears its notification
         runtime.notify_pty_input("sess-1");
 
-        let notif1_after: bool = runtime.lua().load(
-            "return _test_agents[2].notification"
-        ).eval().unwrap();
+        let notif1_after: bool = runtime
+            .lua()
+            .load("return _test_agents[2].notification")
+            .eval()
+            .unwrap();
         assert!(!notif1_after, "Agent 1 notification should be cleared");
 
         // Now disarmed — no notifications remain
@@ -3598,17 +4299,19 @@ mod tests {
     fn test_notify_pty_input_noop_for_agent_without_notification() {
         let mut runtime = LuaRuntime::new().expect("Should create runtime");
         setup_notification_env(&runtime);
-        add_test_agent(&runtime, "agent-0", false);  // no notification
-        add_test_agent(&runtime, "agent-1", true);   // has notification
+        add_test_agent(&runtime, "agent-0", false); // no notification
+        add_test_agent(&runtime, "agent-1", true); // has notification
 
         runtime.pty_input_listening = true;
 
         // Keystroke on agent 0 (no notification) — should not broadcast
         runtime.notify_pty_input("sess-0");
 
-        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
-            .eval().unwrap();
-        assert_eq!(broadcast_count, 0, "Should not broadcast when agent has no notification");
+        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts").eval().unwrap();
+        assert_eq!(
+            broadcast_count, 0,
+            "Should not broadcast when agent has no notification"
+        );
 
         // But should stay armed because agent 1 still has one
         assert!(runtime.pty_input_listening, "Should stay armed");
@@ -3624,14 +4327,18 @@ mod tests {
         runtime.notify_pty_input("sess-0");
 
         // Should have fired hooks.notify("pty_input", ...) for plugins
-        let hook_call_count: i64 = runtime.lua().load(
-            "return #_pty_input_hook_calls"
-        ).eval().unwrap();
+        let hook_call_count: i64 = runtime
+            .lua()
+            .load("return #_pty_input_hook_calls")
+            .eval()
+            .unwrap();
         assert_eq!(hook_call_count, 1, "Should fire pty_input hook for plugins");
 
-        let hook_agent_key: String = runtime.lua().load(
-            "return _pty_input_hook_calls[1].agent_key"
-        ).eval().unwrap();
+        let hook_agent_key: String = runtime
+            .lua()
+            .load("return _pty_input_hook_calls[1].agent_key")
+            .eval()
+            .unwrap();
         assert_eq!(hook_agent_key, "my-agent");
     }
 
@@ -3639,18 +4346,23 @@ mod tests {
     fn test_notify_pty_input_no_hook_when_no_notification_cleared() {
         let mut runtime = LuaRuntime::new().expect("Should create runtime");
         setup_notification_env(&runtime);
-        add_test_agent(&runtime, "agent-0", false);  // no notification
-        add_test_agent(&runtime, "agent-1", true);   // keeps us armed
+        add_test_agent(&runtime, "agent-0", false); // no notification
+        add_test_agent(&runtime, "agent-1", true); // keeps us armed
 
         runtime.pty_input_listening = true;
 
         // Keystroke on agent 0 (no notification to clear)
         runtime.notify_pty_input("sess-0");
 
-        let hook_call_count: i64 = runtime.lua().load(
-            "return #_pty_input_hook_calls"
-        ).eval().unwrap();
-        assert_eq!(hook_call_count, 0, "Should not fire hook when no notification cleared");
+        let hook_call_count: i64 = runtime
+            .lua()
+            .load("return #_pty_input_hook_calls")
+            .eval()
+            .unwrap();
+        assert_eq!(
+            hook_call_count, 0,
+            "Should not fire hook when no notification cleared"
+        );
     }
 
     #[test]
@@ -3661,10 +4373,14 @@ mod tests {
 
         // Initially disarmed
         assert!(!runtime.pty_input_listening);
-        runtime.notify_pty_input("sess-0");  // no-op
+        runtime.notify_pty_input("sess-0"); // no-op
 
         // Simulate notification arriving (set flag + agent state)
-        runtime.lua().load("_test_agents[1].notification = true").exec().unwrap();
+        runtime
+            .lua()
+            .load("_test_agents[1].notification = true")
+            .exec()
+            .unwrap();
         runtime.pty_input_listening = true;
 
         // Keystroke clears it
@@ -3672,15 +4388,20 @@ mod tests {
         assert!(!runtime.pty_input_listening, "Disarmed after clear");
 
         // Another keystroke — should be pure bool check, no Lua
-        let broadcasts_before: i64 = runtime.lua().load("return #_broadcasts")
-            .eval().unwrap();
+        let broadcasts_before: i64 = runtime.lua().load("return #_broadcasts").eval().unwrap();
         runtime.notify_pty_input("sess-0");
-        let broadcasts_after: i64 = runtime.lua().load("return #_broadcasts")
-            .eval().unwrap();
-        assert_eq!(broadcasts_before, broadcasts_after, "No Lua call when disarmed");
+        let broadcasts_after: i64 = runtime.lua().load("return #_broadcasts").eval().unwrap();
+        assert_eq!(
+            broadcasts_before, broadcasts_after,
+            "No Lua call when disarmed"
+        );
 
         // Second notification arrives
-        runtime.lua().load("_test_agents[1].notification = true").exec().unwrap();
+        runtime
+            .lua()
+            .load("_test_agents[1].notification = true")
+            .exec()
+            .unwrap();
         runtime.pty_input_listening = true;
 
         // Keystroke clears again
@@ -3688,38 +4409,45 @@ mod tests {
         assert!(!runtime.pty_input_listening, "Disarmed after second clear");
 
         // Total: 2 broadcasts (one per notification clear)
-        let total_broadcasts: i64 = runtime.lua().load("return #_broadcasts")
-            .eval().unwrap();
+        let total_broadcasts: i64 = runtime.lua().load("return #_broadcasts").eval().unwrap();
         assert_eq!(total_broadcasts, 2);
     }
 
     #[test]
     fn test_clear_session_notification_command_path_no_hook() {
-        let mut runtime = LuaRuntime::new().expect("Should create runtime");
+        let runtime = LuaRuntime::new().expect("Should create runtime");
         setup_notification_env(&runtime);
         add_test_agent(&runtime, "agent-0", true);
 
         // Simulate the clear_notification command path (TUI agent switch)
-        let remaining: bool = runtime.lua().load(
-            "return _clear_session_notification('sess-0')"
-        ).eval().unwrap();
+        let remaining: bool = runtime
+            .lua()
+            .load("return _clear_session_notification('sess-0')")
+            .eval()
+            .unwrap();
 
         // Notification should be cleared
-        let notif: bool = runtime.lua().load(
-            "return _test_agents[1].notification"
-        ).eval().unwrap();
+        let notif: bool = runtime
+            .lua()
+            .load("return _test_agents[1].notification")
+            .eval()
+            .unwrap();
         assert!(!notif, "Notification should be cleared");
 
         // Should have broadcast the update
-        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
-            .eval().unwrap();
+        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts").eval().unwrap();
         assert_eq!(broadcast_count, 1, "Should broadcast agent_list update");
 
         // But should NOT fire the pty_input hook (this wasn't typing)
-        let hook_call_count: i64 = runtime.lua().load(
-            "return #_pty_input_hook_calls"
-        ).eval().unwrap();
-        assert_eq!(hook_call_count, 0, "Command path should not fire pty_input hook");
+        let hook_call_count: i64 = runtime
+            .lua()
+            .load("return #_pty_input_hook_calls")
+            .eval()
+            .unwrap();
+        assert_eq!(
+            hook_call_count, 0,
+            "Command path should not fire pty_input hook"
+        );
 
         // No more notifications remaining
         assert!(!remaining);
@@ -3733,21 +4461,26 @@ mod tests {
         add_test_agent(&runtime, "agent-1", true);
 
         // Clear agent 0 via command path (TUI agent switch)
-        runtime.lua().load("_clear_session_notification('sess-0')").exec().unwrap();
+        runtime
+            .lua()
+            .load("_clear_session_notification('sess-0')")
+            .exec()
+            .unwrap();
 
         // Clear agent 1 via PTY input path (typing)
         runtime.pty_input_listening = true;
         runtime.notify_pty_input("sess-1");
 
         // Both should have broadcast
-        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts")
-            .eval().unwrap();
+        let broadcast_count: i64 = runtime.lua().load("return #_broadcasts").eval().unwrap();
         assert_eq!(broadcast_count, 2, "Both paths should broadcast");
 
         // Only the PTY input path should fire the hook
-        let hook_call_count: i64 = runtime.lua().load(
-            "return #_pty_input_hook_calls"
-        ).eval().unwrap();
+        let hook_call_count: i64 = runtime
+            .lua()
+            .load("return #_pty_input_hook_calls")
+            .eval()
+            .unwrap();
         assert_eq!(hook_call_count, 1, "Only PTY input should fire hook");
 
         // Listener should be disarmed (all cleared)
@@ -3763,7 +4496,10 @@ mod tests {
     /// Registers the `_pty_notification_raw` → `pty_notification` observer
     /// so tests can verify `already_notified` enrichment end-to-end.
     fn setup_enrichment_bridge(runtime: &LuaRuntime) {
-        runtime.lua().load(r#"
+        runtime
+            .lua()
+            .load(
+                r#"
             -- Register the enrichment bridge (mirrors connections.lua)
             hooks.on = function(event, name, callback)
                 if event == "_pty_notification_raw" and name == "enrich_and_dispatch" then
@@ -3786,7 +4522,10 @@ mod tests {
                 info.already_notified = agent and agent.notification or false
                 hooks.notify("pty_notification", info)
             end)
-        "#).exec().unwrap();
+        "#,
+            )
+            .exec()
+            .unwrap();
     }
 
     #[test]
@@ -3802,10 +4541,15 @@ mod tests {
             &crate::agent::AgentNotification::Osc9(Some("bell".to_string())),
         );
 
-        let already: bool = runtime.lua().load(
-            "return _pty_notification_calls[1].already_notified"
-        ).eval().unwrap();
-        assert!(!already, "Should be false when agent has no prior notification");
+        let already: bool = runtime
+            .lua()
+            .load("return _pty_notification_calls[1].already_notified")
+            .eval()
+            .unwrap();
+        assert!(
+            !already,
+            "Should be false when agent has no prior notification"
+        );
     }
 
     #[test]
@@ -3821,10 +4565,15 @@ mod tests {
             &crate::agent::AgentNotification::Osc9(Some("bell".to_string())),
         );
 
-        let already: bool = runtime.lua().load(
-            "return _pty_notification_calls[1].already_notified"
-        ).eval().unwrap();
-        assert!(already, "Should be true when agent already has a pending notification");
+        let already: bool = runtime
+            .lua()
+            .load("return _pty_notification_calls[1].already_notified")
+            .eval()
+            .unwrap();
+        assert!(
+            already,
+            "Should be true when agent already has a pending notification"
+        );
     }
 
     #[test]
@@ -3843,21 +4592,31 @@ mod tests {
             },
         );
 
-        let agent_key: String = runtime.lua().load(
-            "return _pty_notification_calls[1].agent_key"
-        ).eval().unwrap();
-        let session: String = runtime.lua().load(
-            "return _pty_notification_calls[1].session_name"
-        ).eval().unwrap();
-        let ntype: String = runtime.lua().load(
-            "return _pty_notification_calls[1].type"
-        ).eval().unwrap();
-        let title: String = runtime.lua().load(
-            "return _pty_notification_calls[1].title"
-        ).eval().unwrap();
-        let body: String = runtime.lua().load(
-            "return _pty_notification_calls[1].body"
-        ).eval().unwrap();
+        let agent_key: String = runtime
+            .lua()
+            .load("return _pty_notification_calls[1].agent_key")
+            .eval()
+            .unwrap();
+        let session: String = runtime
+            .lua()
+            .load("return _pty_notification_calls[1].session_name")
+            .eval()
+            .unwrap();
+        let ntype: String = runtime
+            .lua()
+            .load("return _pty_notification_calls[1].type")
+            .eval()
+            .unwrap();
+        let title: String = runtime
+            .lua()
+            .load("return _pty_notification_calls[1].title")
+            .eval()
+            .unwrap();
+        let body: String = runtime
+            .lua()
+            .load("return _pty_notification_calls[1].body")
+            .eval()
+            .unwrap();
 
         assert_eq!(agent_key, "agent-0");
         assert_eq!(session, "cli");

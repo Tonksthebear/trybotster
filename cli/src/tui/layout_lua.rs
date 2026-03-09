@@ -351,7 +351,8 @@ impl LayoutLua {
                 // Convert Lua table array to Vec<serde_json::Value>
                 let mut ops = Vec::new();
                 for pair in table.sequence_values::<LuaTable>() {
-                    let op_table = pair.map_err(|e| anyhow!("Invalid op in actions result: {e}"))?;
+                    let op_table =
+                        pair.map_err(|e| anyhow!("Invalid op in actions result: {e}"))?;
                     let json_val = lua_table_to_json(&self.lua, &op_table)?;
                     ops.push(json_val);
                 }
@@ -663,13 +664,13 @@ fn lua_value_to_json(lua: &Lua, value: &LuaValue) -> Result<serde_json::Value> {
         LuaValue::Nil => Ok(Value::Null),
         LuaValue::Boolean(b) => Ok(Value::Bool(*b)),
         LuaValue::Integer(n) => Ok(Value::Number((*n).into())),
-        LuaValue::Number(n) => {
-            serde_json::Number::from_f64(*n)
-                .map(Value::Number)
-                .ok_or_else(|| anyhow!("Cannot convert NaN/Inf to JSON"))
-        }
+        LuaValue::Number(n) => serde_json::Number::from_f64(*n)
+            .map(Value::Number)
+            .ok_or_else(|| anyhow!("Cannot convert NaN/Inf to JSON")),
         LuaValue::String(s) => {
-            let s = s.to_str().map_err(|e| anyhow!("Non-UTF8 Lua string: {e}"))?;
+            let s = s
+                .to_str()
+                .map_err(|e| anyhow!("Non-UTF8 Lua string: {e}"))?;
             Ok(Value::String(s.to_string()))
         }
         LuaValue::Table(t) => {
@@ -697,8 +698,10 @@ mod tests {
     use super::*;
 
     fn make_test_ctx(_mode: &str) -> RenderContext<'static> {
-        let panels: &'static std::collections::HashMap<String, crate::tui::terminal_panel::TerminalPanel> =
-            Box::leak(Box::new(std::collections::HashMap::new()));
+        let panels: &'static std::collections::HashMap<
+            String,
+            crate::tui::terminal_panel::TerminalPanel,
+        > = Box::leak(Box::new(std::collections::HashMap::new()));
         RenderContext {
             error_message: None,
             connection_code: None,
@@ -762,15 +765,16 @@ mod tests {
         let ctx = make_test_ctx("normal");
         let tree = layout.call_render(&ctx).unwrap();
         match tree {
-            RenderNode::HSplit { children, .. } => {
-                match &children[0] {
-                    RenderNode::Widget { block, .. } => {
-                        let block = block.as_ref().unwrap();
-                        assert_eq!(block.title.as_ref().and_then(|t| t.as_plain_str()), Some(" Agents (1) "));
-                    }
-                    _ => panic!("Expected Widget"),
+            RenderNode::HSplit { children, .. } => match &children[0] {
+                RenderNode::Widget { block, .. } => {
+                    let block = block.as_ref().unwrap();
+                    assert_eq!(
+                        block.title.as_ref().and_then(|t| t.as_plain_str()),
+                        Some(" Agents (1) ")
+                    );
                 }
-            }
+                _ => panic!("Expected Widget"),
+            },
             _ => panic!("Expected HSplit"),
         }
     }
@@ -847,20 +851,31 @@ mod tests {
             ("close_agent_confirm", true),
             ("connection_code", true),
             ("error", true),
+            ("restarting", true),
         ];
 
         for (label, expect_overlay) in &mode_expectations {
-            layout.exec(&format!("_tui_state.mode = '{label}'")).unwrap();
+            layout
+                .exec(&format!("_tui_state.mode = '{label}'"))
+                .unwrap();
             let mut ctx = make_test_ctx(label);
             ctx.error_message = Some("test error");
 
             // Main render should always succeed
             let tree = layout.call_render(&ctx);
-            assert!(tree.is_ok(), "render() failed for mode '{label}': {:?}", tree.err());
+            assert!(
+                tree.is_ok(),
+                "render() failed for mode '{label}': {:?}",
+                tree.err()
+            );
 
             // Overlay should match expectation
             let overlay = layout.call_render_overlay(&ctx);
-            assert!(overlay.is_ok(), "render_overlay() failed for mode '{label}': {:?}", overlay.err());
+            assert!(
+                overlay.is_ok(),
+                "render_overlay() failed for mode '{label}': {:?}",
+                overlay.err()
+            );
 
             let has_overlay = overlay.unwrap().is_some();
             assert_eq!(
@@ -892,6 +907,7 @@ mod tests {
             ("close_agent_confirm", "Paragraph"),
             ("connection_code", "ConnectionCode"),
             ("error", "Paragraph"),
+            ("restarting", "Paragraph"),
         ];
 
         for (mode, expected_widget) in &mode_widgets {
@@ -909,7 +925,10 @@ mod tests {
                         mode
                     );
                 }
-                _ => panic!("Mode {:?}: expected Centered overlay, got {:?}", mode, overlay),
+                _ => panic!(
+                    "Mode {:?}: expected Centered overlay, got {:?}",
+                    mode, overlay
+                ),
             }
         }
     }
@@ -1134,11 +1153,16 @@ mod tests {
         lua.preload_module(
             "ui.workspace_helpers",
             include_str!("../../lua/ui/workspace_helpers.lua"),
-        ).expect("workspace_helpers.lua should preload");
-        lua.load_keybindings(kb_source).expect("keybindings.lua should load");
-        lua.load_actions(actions_source).expect("actions.lua should load");
-        lua.load_events(events_source).expect("events.lua should load");
-        lua.load_extension(botster_source, "botster").expect("botster.lua should load");
+        )
+        .expect("workspace_helpers.lua should preload");
+        lua.load_keybindings(kb_source)
+            .expect("keybindings.lua should load");
+        lua.load_actions(actions_source)
+            .expect("actions.lua should load");
+        lua.load_events(events_source)
+            .expect("events.lua should load");
+        lua.load_extension(botster_source, "botster")
+            .expect("botster.lua should load");
         lua
     }
 
@@ -1147,21 +1171,26 @@ mod tests {
         let lua = make_full_lua();
 
         // Register a new keybinding via botster API
-        lua.load_extension(r#"
+        lua.load_extension(
+            r#"
             botster.keymap.set("normal", "ctrl+n", "open_menu", {
                 desc = "Quick new agent",
                 namespace = "test",
             })
-        "#, "test_keymap").unwrap();
+        "#,
+            "test_keymap",
+        )
+        .unwrap();
 
         // Wire dispatch
-        lua.load_extension(
-            "botster._wire_keybindings()",
-            "_wire",
-        ).unwrap();
+        lua.load_extension("botster._wire_keybindings()", "_wire")
+            .unwrap();
 
         // Verify the keybinding works
-        let ctx = KeyContext { list_count: 0, terminal_rows: 24 };
+        let ctx = KeyContext {
+            list_count: 0,
+            terminal_rows: 24,
+        };
         let result = lua.call_handle_key("ctrl+n", "normal", &ctx).unwrap();
         assert!(result.is_some(), "ctrl+n should be bound");
         assert_eq!(result.unwrap().action, "open_menu");
@@ -1172,17 +1201,25 @@ mod tests {
         let lua = make_full_lua();
 
         // Register a function-based keybinding
-        lua.load_extension(r#"
+        lua.load_extension(
+            r#"
             botster.keymap.set("normal", "ctrl+n", function(context)
                 return { action = "toggle_pty" }
             end, { desc = "Smart toggle" })
-        "#, "test_fn_keymap").unwrap();
+        "#,
+            "test_fn_keymap",
+        )
+        .unwrap();
 
         // Wire dispatch
-        lua.load_extension("botster._wire_keybindings()", "_wire").unwrap();
+        lua.load_extension("botster._wire_keybindings()", "_wire")
+            .unwrap();
 
         // Verify function-based keybinding resolves
-        let ctx = KeyContext { list_count: 0, terminal_rows: 24 };
+        let ctx = KeyContext {
+            list_count: 0,
+            terminal_rows: 24,
+        };
         let result = lua.call_handle_key("ctrl+n", "normal", &ctx).unwrap();
         assert!(result.is_some(), "ctrl+n function binding should resolve");
         assert_eq!(result.unwrap().action, "toggle_pty");
@@ -1193,16 +1230,24 @@ mod tests {
         let lua = make_full_lua();
 
         // ctrl+p is bound to open_menu in built-in keybindings
-        let ctx = KeyContext { list_count: 0, terminal_rows: 24 };
+        let ctx = KeyContext {
+            list_count: 0,
+            terminal_rows: 24,
+        };
         let result = lua.call_handle_key("ctrl+p", "normal", &ctx).unwrap();
         assert!(result.is_some(), "ctrl+p should be bound initially");
 
         // Delete the binding
-        lua.load_extension(r#"
+        lua.load_extension(
+            r#"
             botster.keymap.del("normal", "ctrl+p")
-        "#, "test_del").unwrap();
+        "#,
+            "test_del",
+        )
+        .unwrap();
 
-        lua.load_extension("botster._wire_keybindings()", "_wire").unwrap();
+        lua.load_extension("botster._wire_keybindings()", "_wire")
+            .unwrap();
 
         let result = lua.call_handle_key("ctrl+p", "normal", &ctx).unwrap();
         assert!(result.is_none(), "ctrl+p should be unbound after del");
@@ -1213,29 +1258,54 @@ mod tests {
         let lua = make_full_lua();
 
         // Register two bindings under same namespace
-        lua.load_extension(r#"
+        lua.load_extension(
+            r#"
             botster.keymap.set("normal", "ctrl+n", "action_a", { namespace = "myplugin" })
             botster.keymap.set("normal", "ctrl+m", "action_b", { namespace = "myplugin" })
-        "#, "test_ns").unwrap();
+        "#,
+            "test_ns",
+        )
+        .unwrap();
 
-        lua.load_extension("botster._wire_keybindings()", "_wire").unwrap();
+        lua.load_extension("botster._wire_keybindings()", "_wire")
+            .unwrap();
 
-        let ctx = KeyContext { list_count: 0, terminal_rows: 24 };
+        let ctx = KeyContext {
+            list_count: 0,
+            terminal_rows: 24,
+        };
 
         // Both should be bound
-        assert!(lua.call_handle_key("ctrl+n", "normal", &ctx).unwrap().is_some());
-        assert!(lua.call_handle_key("ctrl+m", "normal", &ctx).unwrap().is_some());
+        assert!(lua
+            .call_handle_key("ctrl+n", "normal", &ctx)
+            .unwrap()
+            .is_some());
+        assert!(lua
+            .call_handle_key("ctrl+m", "normal", &ctx)
+            .unwrap()
+            .is_some());
 
         // Clear the namespace
-        lua.load_extension(r#"
+        lua.load_extension(
+            r#"
             botster.keymap.clear_namespace("myplugin")
-        "#, "test_clear").unwrap();
+        "#,
+            "test_clear",
+        )
+        .unwrap();
 
-        lua.load_extension("botster._wire_keybindings()", "_wire").unwrap();
+        lua.load_extension("botster._wire_keybindings()", "_wire")
+            .unwrap();
 
         // Both should be unbound
-        assert!(lua.call_handle_key("ctrl+n", "normal", &ctx).unwrap().is_none());
-        assert!(lua.call_handle_key("ctrl+m", "normal", &ctx).unwrap().is_none());
+        assert!(lua
+            .call_handle_key("ctrl+n", "normal", &ctx)
+            .unwrap()
+            .is_none());
+        assert!(lua
+            .call_handle_key("ctrl+m", "normal", &ctx)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1243,16 +1313,21 @@ mod tests {
         let lua = make_full_lua();
 
         // Register a custom action
-        lua.load_extension(r#"
+        lua.load_extension(
+            r#"
             botster.action.register("my_custom_action", function(context)
                 return {
                     { op = "set_mode", mode = "menu" },
                 }
             end, { desc = "Test action" })
-        "#, "test_action").unwrap();
+        "#,
+            "test_action",
+        )
+        .unwrap();
 
         // Wire dispatch
-        lua.load_extension("botster._wire_actions()", "_wire").unwrap();
+        lua.load_extension("botster._wire_actions()", "_wire")
+            .unwrap();
 
         // Dispatch the custom action
         let ctx = ActionContext::default();
@@ -1269,7 +1344,8 @@ mod tests {
         let lua = make_full_lua();
 
         // Wire dispatch (no custom actions registered)
-        lua.load_extension("botster._wire_actions()", "_wire").unwrap();
+        lua.load_extension("botster._wire_actions()", "_wire")
+            .unwrap();
 
         // Built-in "open_menu" should still work
         let ctx = ActionContext::default();
@@ -1284,7 +1360,8 @@ mod tests {
     fn test_botster_keymap_list() {
         let lua = make_full_lua();
 
-        lua.load_extension(r#"
+        lua.load_extension(
+            r#"
             botster.keymap.set("normal", "ctrl+n", "my_action", {
                 desc = "My description",
                 namespace = "test_ns",
@@ -1294,7 +1371,10 @@ mod tests {
             assert(bindings[1].key == "ctrl+n", "Key should be ctrl+n")
             assert(bindings[1].desc == "My description", "Desc should match")
             assert(bindings[1].namespace == "test_ns", "Namespace should match")
-        "#, "test_list").unwrap();
+        "#,
+            "test_list",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1302,13 +1382,18 @@ mod tests {
         let lua = make_full_lua();
 
         // Set state in botster.g
-        lua.load_extension(r#"
+        lua.load_extension(
+            r#"
             botster.g.counter = 42
-        "#, "set_state").unwrap();
+        "#,
+            "set_state",
+        )
+        .unwrap();
 
         // Reload botster.lua (simulates hot-reload)
         let botster_source = include_str!("../../lua/ui/botster.lua");
-        lua.load_extension(botster_source, "botster_reload").unwrap();
+        lua.load_extension(botster_source, "botster_reload")
+            .unwrap();
 
         // Verify state persisted
         lua.load_extension(r#"
@@ -1321,24 +1406,42 @@ mod tests {
         let lua = make_full_lua();
 
         // Register a custom action
-        lua.load_extension(r#"
+        lua.load_extension(
+            r#"
             botster.action.register("test_action", function(context)
                 return { { op = "set_mode", mode = "menu" } }
             end)
-        "#, "register").unwrap();
+        "#,
+            "register",
+        )
+        .unwrap();
 
         // Wire TWICE (simulates hot-reload calling wire again)
-        lua.load_extension("botster._wire_actions() botster._wire_keybindings()", "_wire1").unwrap();
-        lua.load_extension("botster._wire_actions() botster._wire_keybindings()", "_wire2").unwrap();
+        lua.load_extension(
+            "botster._wire_actions() botster._wire_keybindings()",
+            "_wire1",
+        )
+        .unwrap();
+        lua.load_extension(
+            "botster._wire_actions() botster._wire_keybindings()",
+            "_wire2",
+        )
+        .unwrap();
 
         // Custom action should still work (not infinite recursion)
         let ctx = ActionContext::default();
         let result = lua.call_on_action("test_action", &ctx).unwrap();
-        assert!(result.is_some(), "Custom action should work after double-wire");
+        assert!(
+            result.is_some(),
+            "Custom action should work after double-wire"
+        );
 
         // Built-in action should also still work (fallthrough intact)
         let result2 = lua.call_on_action("open_menu", &ctx).unwrap();
-        assert!(result2.is_some(), "Built-in action should work after double-wire");
+        assert!(
+            result2.is_some(),
+            "Built-in action should work after double-wire"
+        );
     }
 
     #[test]
@@ -1395,29 +1498,43 @@ mod tests {
 
         // Mirror the exact init order from runner.rs run()
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
-        lua.load_keybindings(kb_source).expect("keybindings.lua should load");
+        lua.load_keybindings(kb_source)
+            .expect("keybindings.lua should load");
         lua.preload_module("ui.workspace_helpers", ws_helpers_source)
             .expect("workspace_helpers preload should succeed");
-        lua.load_actions(actions_source).expect("actions.lua should load");
-        lua.load_events(events_source).expect("events.lua should load");
+        lua.load_actions(actions_source)
+            .expect("actions.lua should load");
+        lua.load_events(events_source)
+            .expect("events.lua should load");
         lua.load_extension(
             "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).expect("bootstrap should succeed");
-        lua.load_extension(botster_source, "botster").expect("botster.lua should load");
+        lua.load_extension(botster_source, "botster")
+            .expect("botster.lua should load");
 
         // Render should succeed in normal mode
         let ctx = make_test_ctx("normal");
         let tree = lua.call_render(&ctx);
-        assert!(tree.is_ok(), "render() should succeed after full boot: {:?}", tree.err());
+        assert!(
+            tree.is_ok(),
+            "render() should succeed after full boot: {:?}",
+            tree.err()
+        );
 
         // Overlay should return None in normal mode
         let overlay = lua.call_render_overlay(&ctx);
         assert!(overlay.is_ok(), "render_overlay() should succeed");
-        assert!(overlay.unwrap().is_none(), "normal mode should have no overlay");
+        assert!(
+            overlay.unwrap().is_none(),
+            "normal mode should have no overlay"
+        );
 
         // Key handling should work
-        let key_ctx = KeyContext { list_count: 0, terminal_rows: 24 };
+        let key_ctx = KeyContext {
+            list_count: 0,
+            terminal_rows: 24,
+        };
         let result = lua.call_handle_key("ctrl+p", "normal", &key_ctx);
         assert!(result.is_ok(), "handle_key should work: {:?}", result.err());
     }
@@ -1451,16 +1568,23 @@ mod tests {
             end
             "#,
             "user_layout_override",
-        ).expect("user override should load");
+        )
+        .expect("user override should load");
 
         // Built-in render() still works (wasn't replaced)
         let tree = lua.call_render(&ctx);
-        assert!(tree.is_ok(), "render() should still work after overlay override");
+        assert!(
+            tree.is_ok(),
+            "render() should still work after overlay override"
+        );
 
         // Custom overlay activates for custom mode
         lua.exec("_tui_state.mode = 'custom_mode'").unwrap();
         let overlay = lua.call_render_overlay(&ctx).unwrap();
-        assert!(overlay.is_some(), "custom overlay should appear for custom_mode");
+        assert!(
+            overlay.is_some(),
+            "custom overlay should appear for custom_mode"
+        );
 
         // Built-in overlays still work (menu mode)
         lua.exec("_tui_state.mode = 'menu'").unwrap();
@@ -1477,7 +1601,10 @@ mod tests {
         let lua = make_full_lua();
 
         // Built-in: ctrl+p should map to "menu" action in normal mode
-        let key_ctx = KeyContext { list_count: 0, terminal_rows: 24 };
+        let key_ctx = KeyContext {
+            list_count: 0,
+            terminal_rows: 24,
+        };
         let result = lua.call_handle_key("ctrl+p", "normal", &key_ctx).unwrap();
         assert!(result.is_some(), "built-in ctrl+p should be bound");
 
@@ -1485,7 +1612,8 @@ mod tests {
         lua.load_extension(
             r#"botster.keymap.set("normal", "ctrl+t", "my_custom_action", { desc = "Test" })"#,
             "user_keys",
-        ).expect("user keybinding extension should load");
+        )
+        .expect("user keybinding extension should load");
 
         // New binding works
         let result = lua.call_handle_key("ctrl+t", "normal", &key_ctx).unwrap();
@@ -1509,10 +1637,12 @@ mod tests {
             end)
             "#,
             "user_actions",
-        ).expect("user action extension should load");
+        )
+        .expect("user action extension should load");
 
         // Wire botster actions into _actions dispatch (runner.rs does this after extensions)
-        lua.exec("botster._wire_actions() botster._wire_keybindings()").unwrap();
+        lua.exec("botster._wire_actions() botster._wire_keybindings()")
+            .unwrap();
 
         // Dispatch the custom action
         let action_ctx = ActionContext::default();
@@ -1544,11 +1674,16 @@ mod tests {
         lua.preload_module(
             "ui.workspace_helpers",
             include_str!("../../lua/ui/workspace_helpers.lua"),
-        ).expect("workspace_helpers.lua should preload");
-        lua.load_keybindings(kb_source).expect("keybindings.lua should load");
-        lua.load_actions(actions_source).expect("actions.lua should load");
-        lua.load_events(events_source).expect("events.lua should load");
-        lua.load_extension(botster_source, "botster").expect("botster.lua should load");
+        )
+        .expect("workspace_helpers.lua should preload");
+        lua.load_keybindings(kb_source)
+            .expect("keybindings.lua should load");
+        lua.load_actions(actions_source)
+            .expect("actions.lua should load");
+        lua.load_events(events_source)
+            .expect("events.lua should load");
+        lua.load_extension(botster_source, "botster")
+            .expect("botster.lua should load");
         lua
     }
 
@@ -1565,21 +1700,27 @@ mod tests {
             "agent_id": "my-repo-feature-auth",
             "status": "creating_worktree",
         });
-        let ops = lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+        let ops = lua
+            .call_on_hub_event("agent_status_changed", &event, &ctx)
+            .unwrap();
         assert!(ops.is_some(), "agent_status_changed should return ops");
 
         // Verify _tui_state was updated for the creating indicator
-        let creating_id = lua.eval_string(
-            "return _tui_state.pending_fields.creating_agent_id or 'NIL'"
-        ).unwrap();
-        assert_eq!(creating_id, "my-repo-feature-auth",
-            "creating_agent_id should be set after creating_worktree event");
+        let creating_id = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_id or 'NIL'")
+            .unwrap();
+        assert_eq!(
+            creating_id, "my-repo-feature-auth",
+            "creating_agent_id should be set after creating_worktree event"
+        );
 
-        let stage = lua.eval_string(
-            "return _tui_state.pending_fields.creating_agent_stage or 'NIL'"
-        ).unwrap();
-        assert_eq!(stage, "creating_worktree",
-            "creating_agent_stage should be 'creating_worktree'");
+        let stage = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_stage or 'NIL'")
+            .unwrap();
+        assert_eq!(
+            stage, "creating_worktree",
+            "creating_agent_stage should be 'creating_worktree'"
+        );
     }
 
     /// spawning_ptys lifecycle event should update stage to spawning_agent.
@@ -1594,7 +1735,8 @@ mod tests {
             "agent_id": "my-repo-42",
             "status": "creating_worktree",
         });
-        lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+        lua.call_on_hub_event("agent_status_changed", &event, &ctx)
+            .unwrap();
 
         // Then: spawning_ptys
         let event = serde_json::json!({
@@ -1602,13 +1744,16 @@ mod tests {
             "agent_id": "my-repo-42",
             "status": "spawning_ptys",
         });
-        lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+        lua.call_on_hub_event("agent_status_changed", &event, &ctx)
+            .unwrap();
 
-        let stage = lua.eval_string(
-            "return _tui_state.pending_fields.creating_agent_stage or 'NIL'"
-        ).unwrap();
-        assert_eq!(stage, "spawning_agent",
-            "spawning_ptys should map to 'spawning_agent' stage for display");
+        let stage = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_stage or 'NIL'")
+            .unwrap();
+        assert_eq!(
+            stage, "spawning_agent",
+            "spawning_ptys should map to 'spawning_agent' stage for display"
+        );
     }
 
     /// agent_created event should add agent to _tui_state.agents and clear
@@ -1619,10 +1764,13 @@ mod tests {
         let ctx = ActionContext::default();
 
         // Pre-condition: pending creation in progress
-        lua.exec(r#"
+        lua.exec(
+            r#"
             _tui_state.pending_fields.creating_agent_id = "my-repo-feature-auth"
             _tui_state.pending_fields.creating_agent_stage = "spawning_agent"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         // Simulate agent_created event from hub
         let event = serde_json::json!({
@@ -1640,37 +1788,50 @@ mod tests {
                 "created_at": 1707833400,
             }
         });
-        let ops = lua.call_on_hub_event("agent_created", &event, &ctx).unwrap();
+        let ops = lua
+            .call_on_hub_event("agent_created", &event, &ctx)
+            .unwrap();
         assert!(ops.is_some(), "agent_created should return ops");
 
         // Verify agent was added to _tui_state.agents
         let agent_count = lua.eval_usize("return #_tui_state.agents").unwrap();
-        assert_eq!(agent_count, 1, "Should have 1 agent after agent_created event");
+        assert_eq!(
+            agent_count, 1,
+            "Should have 1 agent after agent_created event"
+        );
 
         let agent_id = lua.eval_string("return _tui_state.agents[1].id").unwrap();
         assert_eq!(agent_id, "my-repo-feature-auth");
 
-        let branch = lua.eval_string("return _tui_state.agents[1].branch_name").unwrap();
+        let branch = lua
+            .eval_string("return _tui_state.agents[1].branch_name")
+            .unwrap();
         assert_eq!(branch, "feature-auth");
 
         // Verify pending_fields were cleared
-        let creating_id = lua.eval_string(
-            "return _tui_state.pending_fields.creating_agent_id and 'SET' or 'NIL'"
-        ).unwrap();
-        assert_eq!(creating_id, "NIL",
-            "creating_agent_id should be cleared after agent_created");
+        let creating_id = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_id and 'SET' or 'NIL'")
+            .unwrap();
+        assert_eq!(
+            creating_id, "NIL",
+            "creating_agent_id should be cleared after agent_created"
+        );
 
-        let stage = lua.eval_string(
-            "return _tui_state.pending_fields.creating_agent_stage and 'SET' or 'NIL'"
-        ).unwrap();
-        assert_eq!(stage, "NIL",
-            "creating_agent_stage should be cleared after agent_created");
+        let stage = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_stage and 'SET' or 'NIL'")
+            .unwrap();
+        assert_eq!(
+            stage, "NIL",
+            "creating_agent_stage should be cleared after agent_created"
+        );
 
         // Verify ops include focus_terminal (auto-select new agent)
         let ops = ops.unwrap();
         let focus_op = ops.iter().find(|op| op["op"] == "focus_terminal");
-        assert!(focus_op.is_some(),
-            "agent_created should return focus_terminal op to show the agent");
+        assert!(
+            focus_op.is_some(),
+            "agent_created should return focus_terminal op to show the agent"
+        );
         assert_eq!(focus_op.unwrap()["agent_id"], "my-repo-feature-auth");
 
         // Verify mode switches to insert
@@ -1681,27 +1842,26 @@ mod tests {
 
     /// Extract list item plain-text strings from the sidebar (first child of HSplit).
     fn extract_sidebar_items(tree: &RenderNode) -> Vec<String> {
-        use crate::tui::render_tree::{WidgetProps, ListProps, StyledContent};
+        use crate::tui::render_tree::{ListProps, StyledContent, WidgetProps};
         match tree {
-            RenderNode::HSplit { children, .. } => {
-                match &children[0] {
-                    RenderNode::Widget { props, .. } => {
-                        if let Some(WidgetProps::List(ListProps { items, .. })) = props {
-                            items.iter().map(|item| {
-                                match &item.content {
-                                    StyledContent::Plain(s) => s.clone(),
-                                    StyledContent::Styled(spans) => {
-                                        spans.iter().map(|s| s.text.clone()).collect::<String>()
-                                    }
+            RenderNode::HSplit { children, .. } => match &children[0] {
+                RenderNode::Widget { props, .. } => {
+                    if let Some(WidgetProps::List(ListProps { items, .. })) = props {
+                        items
+                            .iter()
+                            .map(|item| match &item.content {
+                                StyledContent::Plain(s) => s.clone(),
+                                StyledContent::Styled(spans) => {
+                                    spans.iter().map(|s| s.text.clone()).collect::<String>()
                                 }
-                            }).collect()
-                        } else {
-                            panic!("Expected List props on sidebar widget");
-                        }
+                            })
+                            .collect()
+                    } else {
+                        panic!("Expected List props on sidebar widget");
                     }
-                    _ => panic!("Expected Widget (list) as first child"),
                 }
-            }
+                _ => panic!("Expected Widget (list) as first child"),
+            },
             _ => panic!("Expected HSplit root layout"),
         }
     }
@@ -1711,20 +1871,32 @@ mod tests {
     fn test_layout_renders_creating_indicator() {
         let lua = make_full_lua_with_events();
 
-        lua.exec(r#"
+        lua.exec(
+            r#"
             _tui_state.pending_fields.creating_agent_id = "feature-auth"
             _tui_state.pending_fields.creating_agent_stage = "creating_worktree"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         let ctx = make_test_ctx("normal");
         let tree = lua.call_render(&ctx).unwrap();
         let items = extract_sidebar_items(&tree);
 
-        assert!(!items.is_empty(), "Should have at least the creating indicator");
-        assert!(items[0].contains("feature-auth"),
-            "Creating indicator should show agent identifier, got: {}", items[0]);
-        assert!(items[0].contains("Creating worktree"),
-            "Creating indicator should show stage, got: {}", items[0]);
+        assert!(
+            !items.is_empty(),
+            "Should have at least the creating indicator"
+        );
+        assert!(
+            items[0].contains("feature-auth"),
+            "Creating indicator should show agent identifier, got: {}",
+            items[0]
+        );
+        assert!(
+            items[0].contains("Creating worktree"),
+            "Creating indicator should show stage, got: {}",
+            items[0]
+        );
     }
 
     /// Layout should render the agent in the sidebar after creation completes.
@@ -1732,7 +1904,8 @@ mod tests {
     fn test_layout_renders_created_agent_in_sidebar() {
         let lua = make_full_lua_with_events();
 
-        lua.exec(r#"
+        lua.exec(
+            r#"
             _tui_state.agents = {
                 {
                     id = "my-repo-feature-auth",
@@ -1743,14 +1916,19 @@ mod tests {
                 }
             }
             _tui_state.selected_agent_index = 0
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         let ctx = make_test_ctx("insert");
         let tree = lua.call_render(&ctx).unwrap();
         let items = extract_sidebar_items(&tree);
 
         assert_eq!(items.len(), 1, "Should have exactly 1 agent item");
-        assert_eq!(items[0], "feature-auth", "Agent item should show display name");
+        assert_eq!(
+            items[0], "feature-auth",
+            "Agent item should show display name"
+        );
     }
 
     /// Full end-to-end: user creates agent → lifecycle events → agent appears.
@@ -1767,17 +1945,18 @@ mod tests {
             ..Default::default()
         };
         lua.call_on_action("list_select", &menu_ctx).unwrap(); // → profile select
-        // Simulate single-profile response (auto-skips to worktree)
+                                                               // Simulate single-profile response (auto-skips to worktree)
         let profiles_event = serde_json::json!({ "profiles": ["claude"] });
-        lua.call_on_hub_event("profiles", &profiles_event, &ctx).unwrap();
+        lua.call_on_hub_event("profiles", &profiles_event, &ctx)
+            .unwrap();
         lua.call_on_action("list_select", &ctx).unwrap(); // → Use Main Branch
         lua.exec("_tui_state.input_buffer = 'Fix bug'").unwrap();
         lua.call_on_action("input_submit", &ctx).unwrap(); // → sends create_agent
 
         // Verify creating indicator is set
-        let creating_id = lua.eval_string(
-            "return _tui_state.pending_fields.creating_agent_id or 'NIL'"
-        ).unwrap();
+        let creating_id = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_id or 'NIL'")
+            .unwrap();
         assert_eq!(creating_id, "main");
 
         // Step 2: Hub sends spawning_ptys lifecycle event
@@ -1786,10 +1965,11 @@ mod tests {
             "agent_id": "main",
             "status": "spawning_ptys",
         });
-        lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
-        let stage = lua.eval_string(
-            "return _tui_state.pending_fields.creating_agent_stage or 'NIL'"
-        ).unwrap();
+        lua.call_on_hub_event("agent_status_changed", &event, &ctx)
+            .unwrap();
+        let stage = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_stage or 'NIL'")
+            .unwrap();
         assert_eq!(stage, "spawning_agent");
 
         // Step 3: Hub sends agent_created event
@@ -1806,32 +1986,45 @@ mod tests {
                 "created_at": 1707833400,
             }
         });
-        let ops = lua.call_on_hub_event("agent_created", &event, &ctx).unwrap();
+        let ops = lua
+            .call_on_hub_event("agent_created", &event, &ctx)
+            .unwrap();
 
         // Verify: agent is in state
         let count = lua.eval_usize("return #_tui_state.agents").unwrap();
         assert_eq!(count, 1, "Agent should be in _tui_state.agents");
 
         // Verify: creating indicator cleared
-        let creating = lua.eval_string(
-            "return _tui_state.pending_fields.creating_agent_id and 'SET' or 'NIL'"
-        ).unwrap();
+        let creating = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_id and 'SET' or 'NIL'")
+            .unwrap();
         assert_eq!(creating, "NIL", "Creating indicator should be cleared");
 
         // Verify: ops auto-focus the agent
         let ops = ops.unwrap();
-        assert!(ops.iter().any(|op| op["op"] == "focus_terminal"),
-            "Should auto-focus the new agent");
-        assert!(ops.iter().any(|op| op["op"] == "set_mode" && op["mode"] == "insert"),
-            "Should enter insert mode");
+        assert!(
+            ops.iter().any(|op| op["op"] == "focus_terminal"),
+            "Should auto-focus the new agent"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| op["op"] == "set_mode" && op["mode"] == "insert"),
+            "Should enter insert mode"
+        );
 
         // Verify: layout renders the agent (workspace header + agent row)
         let render_ctx = make_test_ctx("insert");
         let tree = lua.call_render(&render_ctx).unwrap();
         let items = extract_sidebar_items(&tree);
         assert_eq!(items.len(), 2, "Should have workspace header + agent row");
-        assert!(items[0].contains("main"), "First item should be workspace header containing 'main'");
-        assert!(items[1].contains("main"), "Second item should be agent row containing 'main'");
+        assert!(
+            items[0].contains("main"),
+            "First item should be workspace header containing 'main'"
+        );
+        assert!(
+            items[1].contains("main"),
+            "Second item should be agent row containing 'main'"
+        );
     }
 
     /// Full end-to-end: new worktree flow with all lifecycle stages visible.
@@ -1847,9 +2040,10 @@ mod tests {
             ..Default::default()
         };
         lua.call_on_action("list_select", &menu_ctx).unwrap(); // → profile select
-        // Simulate single-profile response (auto-skips to worktree)
+                                                               // Simulate single-profile response (auto-skips to worktree)
         let profiles_event = serde_json::json!({ "profiles": ["claude"] });
-        lua.call_on_hub_event("profiles", &profiles_event, &ctx).unwrap();
+        lua.call_on_hub_event("profiles", &profiles_event, &ctx)
+            .unwrap();
         lua.exec("_tui_state.list_selected = 1").unwrap(); // Create New Worktree
         lua.call_on_action("list_select", &ctx).unwrap();
         lua.exec("_tui_state.input_buffer = '42'").unwrap();
@@ -1863,15 +2057,24 @@ mod tests {
             "agent_id": "42",
             "status": "creating_worktree",
         });
-        lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+        lua.call_on_hub_event("agent_status_changed", &event, &ctx)
+            .unwrap();
 
         // Verify creating indicator renders
         let render_ctx = make_test_ctx("normal");
         let tree = lua.call_render(&render_ctx).unwrap();
         let items = extract_sidebar_items(&tree);
         assert!(!items.is_empty(), "Should show creating indicator");
-        assert!(items[0].contains("42"), "Should show agent identifier: {}", items[0]);
-        assert!(items[0].contains("Creating worktree"), "Should show stage: {}", items[0]);
+        assert!(
+            items[0].contains("42"),
+            "Should show agent identifier: {}",
+            items[0]
+        );
+        assert!(
+            items[0].contains("Creating worktree"),
+            "Should show stage: {}",
+            items[0]
+        );
 
         // Lifecycle: spawning_ptys
         let event = serde_json::json!({
@@ -1879,12 +2082,16 @@ mod tests {
             "agent_id": "42",
             "status": "spawning_ptys",
         });
-        lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+        lua.call_on_hub_event("agent_status_changed", &event, &ctx)
+            .unwrap();
 
         let tree = lua.call_render(&render_ctx).unwrap();
         let items = extract_sidebar_items(&tree);
-        assert!(items[0].contains("Starting agent"),
-            "Should show 'Starting agent' stage: {}", items[0]);
+        assert!(
+            items[0].contains("Starting agent"),
+            "Should show 'Starting agent' stage: {}",
+            items[0]
+        );
 
         // agent_created
         let event = serde_json::json!({
@@ -1901,14 +2108,86 @@ mod tests {
                 "created_at": 1707833400,
             }
         });
-        lua.call_on_hub_event("agent_created", &event, &ctx).unwrap();
+        lua.call_on_hub_event("agent_created", &event, &ctx)
+            .unwrap();
 
         // Creating indicator gone, agent in list (workspace header + agent row)
         let tree = lua.call_render(&render_ctx).unwrap();
         let items = extract_sidebar_items(&tree);
-        assert_eq!(items.len(), 2, "Should have workspace header + agent row, no creating indicator");
-        assert!(items[1].contains("botster-issue-42"),
-            "Agent row should show agent display name, not creating indicator");
+        assert_eq!(
+            items.len(),
+            2,
+            "Should have workspace header + agent row, no creating indicator"
+        );
+        assert!(
+            items[1].contains("botster-issue-42"),
+            "Agent row should show agent display name, not creating indicator"
+        );
+    }
+
+    #[test]
+    fn test_hub_recovery_state_ready_exits_restarting_mode() {
+        let lua = make_full_lua_with_events();
+        lua.exec(
+            r#"
+            _tui_state.mode = "restarting"
+            _tui_state.selected_session_uuid = "sess-restart-ready"
+        "#,
+        )
+        .expect("seed restarting tui state");
+
+        let ctx = ActionContext {
+            selected_agent: Some("agent-restart-ready".to_string()),
+            ..Default::default()
+        };
+        let event = serde_json::json!({
+            "type": "hub_recovery_state",
+            "state": "ready",
+        });
+
+        let ops = lua
+            .call_on_hub_event("hub_recovery_state", &event, &ctx)
+            .expect("hub_recovery_state event should succeed")
+            .expect("ready recovery event should return ops");
+
+        assert!(
+            ops.iter().any(|op| {
+                op["op"] == "focus_terminal"
+                    && op["agent_id"] == "agent-restart-ready"
+                    && op["session_uuid"] == "sess-restart-ready"
+            }),
+            "ready recovery should refocus selected terminal"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| op["op"] == "set_mode" && op["mode"] == "insert"),
+            "ready recovery should leave restarting mode"
+        );
+    }
+
+    #[test]
+    fn test_hub_recovery_state_non_ready_keeps_restarting_mode() {
+        let lua = make_full_lua_with_events();
+        lua.exec("_tui_state.mode = 'restarting'")
+            .expect("seed restarting mode");
+
+        let ctx = ActionContext::default();
+        let event = serde_json::json!({
+            "type": "hub_recovery_state",
+            "state": "sessions_recovered",
+        });
+
+        let ops = lua
+            .call_on_hub_event("hub_recovery_state", &event, &ctx)
+            .expect("hub_recovery_state event should succeed")
+            .expect("hub_recovery_state should return ops table");
+        assert!(ops.is_empty(), "non-ready recovery state should be no-op");
+
+        let mode = lua.eval_string("return _tui_state.mode").unwrap();
+        assert_eq!(
+            mode, "restarting",
+            "non-ready recovery state should keep restarting mode"
+        );
     }
 
     /// Failed creation should clear the creating indicator.
@@ -1918,10 +2197,13 @@ mod tests {
         let ctx = ActionContext::default();
 
         // Set creating state
-        lua.exec(r#"
+        lua.exec(
+            r#"
             _tui_state.pending_fields.creating_agent_id = "my-repo-feature"
             _tui_state.pending_fields.creating_agent_stage = "creating_worktree"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         // Hub sends failed
         let event = serde_json::json!({
@@ -1929,12 +2211,16 @@ mod tests {
             "agent_id": "my-repo-feature",
             "status": "failed",
         });
-        lua.call_on_hub_event("agent_status_changed", &event, &ctx).unwrap();
+        lua.call_on_hub_event("agent_status_changed", &event, &ctx)
+            .unwrap();
 
-        let creating = lua.eval_string(
-            "return _tui_state.pending_fields.creating_agent_id and 'SET' or 'NIL'"
-        ).unwrap();
-        assert_eq!(creating, "NIL", "Failed status should clear creating indicator");
+        let creating = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_id and 'SET' or 'NIL'")
+            .unwrap();
+        assert_eq!(
+            creating, "NIL",
+            "Failed status should clear creating indicator"
+        );
     }
 
     // ========================================================================
@@ -1974,7 +2260,10 @@ mod tests {
 
         // Step 3: Simulate profiles event with single profile (auto-skips to worktree)
         let event_data = serde_json::json!({ "profiles": ["claude"] });
-        let event_ops = lua.call_on_hub_event("profiles", &event_data, &ctx).unwrap().unwrap();
+        let event_ops = lua
+            .call_on_hub_event("profiles", &event_data, &ctx)
+            .unwrap()
+            .unwrap();
         assert_eq!(event_ops[0]["op"], "set_mode");
         assert_eq!(event_ops[0]["mode"], "new_agent_select_worktree");
         assert_eq!(event_ops[1]["op"], "send_msg");
@@ -1998,10 +2287,15 @@ mod tests {
 
         // Step 3: Multi-profile response — stays in profile selection
         let event_data = serde_json::json!({ "profiles": ["claude", "web"] });
-        let event_ops = lua.call_on_hub_event("profiles", &event_data, &ctx).unwrap().unwrap();
+        let event_ops = lua
+            .call_on_hub_event("profiles", &event_data, &ctx)
+            .unwrap()
+            .unwrap();
         // Multi-profile: no mode change, just populates list
-        assert!(event_ops.is_empty(),
-            "Multi-profile should return empty ops (mode stays new_agent_select_profile)");
+        assert!(
+            event_ops.is_empty(),
+            "Multi-profile should return empty ops (mode stays new_agent_select_profile)"
+        );
 
         let mode = lua.eval_string("return _tui_state.mode").unwrap();
         assert_eq!(mode, "new_agent_select_profile");
@@ -2025,7 +2319,9 @@ mod tests {
         assert_eq!(ops[0]["mode"], "new_agent_select_worktree");
 
         // Profile should be stored in pending_fields
-        let profile = lua.eval_string("return _tui_state.pending_fields.profile").unwrap();
+        let profile = lua
+            .eval_string("return _tui_state.pending_fields.profile")
+            .unwrap();
         assert_eq!(profile, "web");
 
         // Select "Use Main Branch"
@@ -2040,8 +2336,10 @@ mod tests {
         let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
         let data = &send_op["data"]["data"];
         assert_eq!(data["type"], "create_agent");
-        assert_eq!(data["profile"], "web",
-            "Selected profile should be included in create_agent message");
+        assert_eq!(
+            data["profile"], "web",
+            "Selected profile should be included in create_agent message"
+        );
         assert_eq!(data["prompt"], "test prompt");
     }
 
@@ -2060,29 +2358,38 @@ mod tests {
         let ctx = ActionContext::default();
         let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
         assert_eq!(ops[0]["op"], "set_mode");
-        assert_eq!(ops[0]["mode"], "new_agent_prompt",
-            "Selecting 'Use Main Branch' should transition to prompt mode");
+        assert_eq!(
+            ops[0]["mode"], "new_agent_prompt",
+            "Selecting 'Use Main Branch' should transition to prompt mode"
+        );
 
         // Verify pending state: use_main_branch should be set
-        let use_main = lua.eval_string("return _tui_state.pending_fields.use_main_branch").unwrap();
+        let use_main = lua
+            .eval_string("return _tui_state.pending_fields.use_main_branch")
+            .unwrap();
         assert_eq!(use_main, "true");
 
         // pending_issue_or_branch should be nil (main branch has no issue)
-        let has_issue = lua.eval_string(
-            "return _tui_state.pending_fields.pending_issue_or_branch and 'set' or 'nil'"
-        ).unwrap();
+        let has_issue = lua
+            .eval_string(
+                "return _tui_state.pending_fields.pending_issue_or_branch and 'set' or 'nil'",
+            )
+            .unwrap();
         assert_eq!(has_issue, "nil");
 
         // Step 4: Type a prompt and submit
-        lua.exec("_tui_state.input_buffer = 'Fix the login bug'").unwrap();
+        lua.exec("_tui_state.input_buffer = 'Fix the login bug'")
+            .unwrap();
         let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
 
         // Should send create_agent message
         let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
         let data = &send_op["data"]["data"];
         assert_eq!(data["type"], "create_agent");
-        assert!(data["issue_or_branch"].is_null(),
-            "Main branch mode should have null issue_or_branch");
+        assert!(
+            data["issue_or_branch"].is_null(),
+            "Main branch mode should have null issue_or_branch"
+        );
         assert_eq!(data["prompt"], "Fix the login bug");
 
         // Should transition back to base mode (normal, since no agent selected)
@@ -2090,11 +2397,15 @@ mod tests {
         assert_eq!(mode_op["mode"], "normal");
 
         // Verify creating_agent_id was set for progress tracking
-        let creating_id = lua.eval_string("return _tui_state.pending_fields.creating_agent_id").unwrap();
+        let creating_id = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_id")
+            .unwrap();
         assert_eq!(creating_id, "main");
 
         // Verify creating_agent_stage is "spawning" (main skips worktree creation)
-        let stage = lua.eval_string("return _tui_state.pending_fields.creating_agent_stage").unwrap();
+        let stage = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_stage")
+            .unwrap();
         assert_eq!(stage, "spawning");
     }
 
@@ -2115,8 +2426,10 @@ mod tests {
         let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
         let data = &send_op["data"]["data"];
         assert_eq!(data["type"], "create_agent");
-        assert!(data["prompt"].is_null(),
-            "Empty prompt should be sent as null (handler applies default)");
+        assert!(
+            data["prompt"].is_null(),
+            "Empty prompt should be sent as null (handler applies default)"
+        );
     }
 
     /// Scenario 2: Open agent in new worktree (branch name).
@@ -2133,30 +2446,36 @@ mod tests {
         let ctx = ActionContext::default();
         let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
         assert_eq!(ops[0]["op"], "set_mode");
-        assert_eq!(ops[0]["mode"], "new_agent_create_worktree",
-            "Selecting 'Create New Worktree' should enter branch name input");
+        assert_eq!(
+            ops[0]["mode"], "new_agent_create_worktree",
+            "Selecting 'Create New Worktree' should enter branch name input"
+        );
 
         // Verify use_main_branch is cleared
-        let use_main = lua.eval_string(
-            "return _tui_state.pending_fields.use_main_branch and 'set' or 'nil'"
-        ).unwrap();
+        let use_main = lua
+            .eval_string("return _tui_state.pending_fields.use_main_branch and 'set' or 'nil'")
+            .unwrap();
         assert_eq!(use_main, "nil");
 
         // Step 4: Type branch name and submit
-        lua.exec("_tui_state.input_buffer = 'feature-auth'").unwrap();
+        lua.exec("_tui_state.input_buffer = 'feature-auth'")
+            .unwrap();
         let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
         assert_eq!(ops[0]["op"], "set_mode");
-        assert_eq!(ops[0]["mode"], "new_agent_prompt",
-            "Submitting branch name should transition to prompt mode");
+        assert_eq!(
+            ops[0]["mode"], "new_agent_prompt",
+            "Submitting branch name should transition to prompt mode"
+        );
 
         // Verify branch was stored
-        let branch = lua.eval_string(
-            "return _tui_state.pending_fields.pending_issue_or_branch"
-        ).unwrap();
+        let branch = lua
+            .eval_string("return _tui_state.pending_fields.pending_issue_or_branch")
+            .unwrap();
         assert_eq!(branch, "feature-auth");
 
         // Step 5: Type prompt and submit
-        lua.exec("_tui_state.input_buffer = 'Implement OAuth login'").unwrap();
+        lua.exec("_tui_state.input_buffer = 'Implement OAuth login'")
+            .unwrap();
         let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
 
         let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
@@ -2166,9 +2485,13 @@ mod tests {
         assert_eq!(data["prompt"], "Implement OAuth login");
 
         // Should set creating_agent_stage to "creating_worktree" (not "spawning")
-        let stage = lua.eval_string("return _tui_state.pending_fields.creating_agent_stage").unwrap();
-        assert_eq!(stage, "creating_worktree",
-            "New worktree flow should set stage to creating_worktree");
+        let stage = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_stage")
+            .unwrap();
+        assert_eq!(
+            stage, "creating_worktree",
+            "New worktree flow should set stage to creating_worktree"
+        );
     }
 
     /// Scenario 2b: Open agent in new worktree (issue number).
@@ -2187,14 +2510,17 @@ mod tests {
         lua.call_on_action("input_submit", &ctx).unwrap();
 
         // Type prompt and submit
-        lua.exec("_tui_state.input_buffer = 'Fix reported crash'").unwrap();
+        lua.exec("_tui_state.input_buffer = 'Fix reported crash'")
+            .unwrap();
         let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
 
         let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
         let data = &send_op["data"]["data"];
         assert_eq!(data["type"], "create_agent");
-        assert_eq!(data["issue_or_branch"], "42",
-            "Issue number should be passed as-is (handler parses it)");
+        assert_eq!(
+            data["issue_or_branch"], "42",
+            "Issue number should be passed as-is (handler parses it)"
+        );
         assert_eq!(data["prompt"], "Fix reported crash");
     }
 
@@ -2211,8 +2537,10 @@ mod tests {
         // Submit with empty branch name — should return nil (no-op)
         lua.exec("_tui_state.input_buffer = ''").unwrap();
         let result = lua.call_on_action("input_submit", &ctx).unwrap();
-        assert!(result.is_none(),
-            "Empty branch name should not advance the flow");
+        assert!(
+            result.is_none(),
+            "Empty branch name should not advance the flow"
+        );
 
         // Mode should still be new_agent_create_worktree
         let mode = lua.eval_string("return _tui_state.mode").unwrap();
@@ -2229,12 +2557,15 @@ mod tests {
         enter_new_agent_flow(&lua);
 
         // Set up available_worktrees (populated by list_worktrees response)
-        lua.exec(r#"
+        lua.exec(
+            r#"
             _tui_state.available_worktrees = {
                 { branch = "feature-auth", path = "/tmp/worktrees/feature-auth" },
                 { branch = "bugfix-login", path = "/tmp/worktrees/bugfix-login" },
             }
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         // Select first existing worktree (index 2 in the list:
         //   0 = "Use Main Branch", 1 = "Create New Worktree", 2 = first worktree)
@@ -2250,17 +2581,23 @@ mod tests {
         assert_eq!(data["branch"], "feature-auth");
 
         // Should set creating_agent_id for progress tracking
-        let creating_id = lua.eval_string("return _tui_state.pending_fields.creating_agent_id").unwrap();
+        let creating_id = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_id")
+            .unwrap();
         assert_eq!(creating_id, "feature-auth");
 
         // Should set stage to creating_worktree
-        let stage = lua.eval_string("return _tui_state.pending_fields.creating_agent_stage").unwrap();
+        let stage = lua
+            .eval_string("return _tui_state.pending_fields.creating_agent_stage")
+            .unwrap();
         assert_eq!(stage, "creating_worktree");
 
         // Should transition back to base mode (skips prompt entirely)
         let mode_op = ops.iter().find(|op| op["op"] == "set_mode").unwrap();
-        assert_eq!(mode_op["mode"], "normal",
-            "Existing worktree should return to normal mode (no prompt step)");
+        assert_eq!(
+            mode_op["mode"], "normal",
+            "Existing worktree should return to normal mode (no prompt step)"
+        );
     }
 
     /// Scenario 3b: Select second existing worktree.
@@ -2269,12 +2606,15 @@ mod tests {
         let lua = make_full_lua();
         enter_new_agent_flow(&lua);
 
-        lua.exec(r#"
+        lua.exec(
+            r#"
             _tui_state.available_worktrees = {
                 { branch = "feature-auth", path = "/tmp/worktrees/feature-auth" },
                 { branch = "bugfix-login", path = "/tmp/worktrees/bugfix-login" },
             }
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         // Select second existing worktree (index 3)
         lua.exec("_tui_state.list_selected = 3").unwrap();
@@ -2298,8 +2638,10 @@ mod tests {
         let ctx = ActionContext::default();
         let ops = lua.call_on_action("close_modal", &ctx).unwrap().unwrap();
         assert_eq!(ops[0]["op"], "set_mode");
-        assert_eq!(ops[0]["mode"], "normal",
-            "Escape should return to normal mode (no agent selected)");
+        assert_eq!(
+            ops[0]["mode"], "normal",
+            "Escape should return to normal mode (no agent selected)"
+        );
 
         // Start over and escape from branch name input
         enter_new_agent_flow(&lua);
@@ -2326,8 +2668,10 @@ mod tests {
             ..Default::default()
         };
         let ops = lua.call_on_action("close_modal", &ctx).unwrap().unwrap();
-        assert_eq!(ops[0]["mode"], "insert",
-            "Escape with selected agent should return to insert mode");
+        assert_eq!(
+            ops[0]["mode"], "insert",
+            "Escape with selected agent should return to insert mode"
+        );
     }
 
     /// Full keypress-level test: ctrl+p → enter → enter → type → enter.
@@ -2335,10 +2679,16 @@ mod tests {
     #[test]
     fn test_create_agent_flow_main_branch_via_keypresses() {
         let lua = make_full_lua();
-        let key_ctx = KeyContext { list_count: 3, terminal_rows: 24 };
+        let key_ctx = KeyContext {
+            list_count: 3,
+            terminal_rows: 24,
+        };
 
         // ctrl+p in normal mode → open_menu
-        let action = lua.call_handle_key("ctrl+p", "normal", &key_ctx).unwrap().unwrap();
+        let action = lua
+            .call_handle_key("ctrl+p", "normal", &key_ctx)
+            .unwrap()
+            .unwrap();
         assert_eq!(action.action, "open_menu");
 
         // Dispatch open_menu → mode becomes "menu"
@@ -2346,7 +2696,10 @@ mod tests {
         lua.call_on_action("open_menu", &ctx).unwrap();
 
         // enter in menu mode → list_select
-        let action = lua.call_handle_key("enter", "menu", &key_ctx).unwrap().unwrap();
+        let action = lua
+            .call_handle_key("enter", "menu", &key_ctx)
+            .unwrap()
+            .unwrap();
         assert_eq!(action.action, "list_select");
 
         // Dispatch list_select with new_agent → mode becomes "new_agent_select_profile"
@@ -2358,27 +2711,40 @@ mod tests {
 
         // Simulate single-profile response (auto-skips to worktree selection)
         let profiles_event = serde_json::json!({ "profiles": ["claude"] });
-        lua.call_on_hub_event("profiles", &profiles_event, &ctx).unwrap();
+        lua.call_on_hub_event("profiles", &profiles_event, &ctx)
+            .unwrap();
 
         // enter in worktree selection → list_select (selects "Use Main Branch")
-        let action = lua.call_handle_key("enter", "new_agent_select_worktree", &key_ctx).unwrap().unwrap();
+        let action = lua
+            .call_handle_key("enter", "new_agent_select_worktree", &key_ctx)
+            .unwrap()
+            .unwrap();
         assert_eq!(action.action, "list_select");
         let ctx = ActionContext::default();
         lua.call_on_action("list_select", &ctx).unwrap();
 
         // Type prompt characters
-        let action = lua.call_handle_key("H", "new_agent_prompt", &key_ctx).unwrap().unwrap();
+        let action = lua
+            .call_handle_key("H", "new_agent_prompt", &key_ctx)
+            .unwrap()
+            .unwrap();
         assert_eq!(action.action, "input_char");
         assert_eq!(action.char, Some('H'));
 
-        let action = lua.call_handle_key("i", "new_agent_prompt", &key_ctx).unwrap().unwrap();
+        let action = lua
+            .call_handle_key("i", "new_agent_prompt", &key_ctx)
+            .unwrap()
+            .unwrap();
         assert_eq!(action.action, "input_char");
 
         // Simulate typed text
         lua.exec("_tui_state.input_buffer = 'Hi'").unwrap();
 
         // enter in prompt mode → input_submit
-        let action = lua.call_handle_key("enter", "new_agent_prompt", &key_ctx).unwrap().unwrap();
+        let action = lua
+            .call_handle_key("enter", "new_agent_prompt", &key_ctx)
+            .unwrap()
+            .unwrap();
         assert_eq!(action.action, "input_submit");
 
         let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();

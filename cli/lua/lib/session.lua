@@ -27,6 +27,10 @@ local Session = state.class("Session")
 -- Session registry keyed by session_uuid (persistent across reloads)
 local sessions = state.get("agent_registry", {})
 
+local function is_ghost_entry(entry)
+    return type(entry) == "table" and entry._is_ghost == true
+end
+
 -- Sequential port counter for forward_port sessions (persistent across reloads)
 local port_state = state.get("agent_port_state", { next_port = 8080 })
 
@@ -241,9 +245,13 @@ function Session._init(self, config)
         session_env.PORT = tostring(port)
     end
 
-    local ok, handle = pcall(pty.spawn, spawn_config)
-    if not ok then
-        error(string.format("Failed to spawn PTY for %s: %s", key, tostring(handle)))
+    local ok, handle, broker_session_id = pcall(hub.spawn_pty_with_broker, spawn_config, session_uuid)
+    if not ok or not handle or not broker_session_id then
+        error(string.format(
+            "Failed to spawn broker-backed PTY for %s: %s",
+            key,
+            tostring(handle)
+        ))
     end
 
     self.session = handle
@@ -252,55 +260,33 @@ function Session._init(self, config)
     log.info(string.format("Session %s: spawned '%s' (uuid=%s, type=%s)", key, session_name, session_uuid, session_type))
 
     -- Register with HandleCache via hub.register_session()
-    local reg_ok, display_index = pcall(hub.register_session, session_uuid, handle, {
+    local reg_ok, reg_index = pcall(hub.register_session, session_uuid, handle, {
         session_type = session_type,
         agent_key = key,
         workspace_id = self._workspace_id,
+        broker_session_id = broker_session_id,
     })
     if reg_ok then
-        self.display_index = display_index
-        log.info(string.format("Session %s: registered at display index %d",
-            key, display_index))
+        log.info(string.format("Session %s: registered with HandleCache index %s",
+            key, tostring(reg_index)))
     else
-        log.error(string.format("Session %s: failed to register: %s", key, tostring(display_index)))
+        log.error(string.format("Session %s: failed to register: %s", key, tostring(reg_index)))
     end
 
-    -- Register PTY with broker for zero-downtime Hub restart.
-    local ok2, session_id = pcall(hub.register_pty_with_broker, handle, session_uuid)
-    if ok2 and session_id then
-        self:set_meta("broker_session_id", tostring(session_id))
-        -- Store PTY dimensions so ghost PTYs use real terminal size
-        local dims_ok, dim_rows, dim_cols = pcall(function() return handle:dimensions() end)
-        if dims_ok and dim_rows then
-            self:set_meta("broker_pty_rows", tostring(dim_rows))
-            self:set_meta("broker_pty_cols", tostring(dim_cols))
-        end
-        log.info(string.format("Session %s: registered with broker → session %d",
-            key, session_id))
-
-        -- Arm the file tee for hard-restart resurrection.
-        if data_dir then
-            local log_path = data_dir
-                .. "/workspaces/" .. key
-                .. "/sessions/" .. session_uuid
-                .. "/pty-0.log"
-            local pcall_ok, tee_result = pcall(hub.pty_tee, session_id, log_path, 10 * 1024 * 1024)
-            if pcall_ok and tee_result then
-                self:set_meta("tee_log_path", log_path)
-                log.info(string.format("Session %s: tee armed → %s", key, log_path))
-            else
-                log.warn(string.format("Session %s: tee arm failed", key))
-            end
-        end
-    elseif not ok2 then
-        log.warn(string.format("Session %s: broker registration failed: %s",
-            key, tostring(session_id)))
+    self:set_meta("broker_session_id", tostring(broker_session_id))
+    -- Store PTY dimensions so ghost PTYs use real terminal size
+    local dims_ok, dim_rows, dim_cols = pcall(function() return handle:dimensions() end)
+    if dims_ok and dim_rows then
+        self:set_meta("broker_pty_rows", tostring(dim_rows))
+        self:set_meta("broker_pty_cols", tostring(dim_cols))
     end
+    log.info(string.format("Session %s: registered with broker → session %d",
+        key, broker_session_id))
+
+    -- PTY recovery source-of-truth is broker snapshot state. No file tee arming.
 
     -- Register in session registry (keyed by session_uuid)
     sessions[session_uuid] = self
-    -- Clear ghost registry entry — real session supersedes the ghost.
-    state.get("ghost_agent_registry", {})[key] = nil
 
     -- Notify observers
     hooks.notify("after_agent_create", self)
@@ -568,8 +554,6 @@ function Session:info()
         session_uuid = self.session_uuid,
         session_type = self.session_type,
         session_name = self.session_name,
-        -- display_index retained for legacy browser protocol (clear_notification command)
-        display_index = self.display_index,
         display_name = display_name,
         title = self.title,
         cwd = self.cwd,
@@ -597,28 +581,19 @@ end
 -- @param session_uuid string Session UUID
 -- @return Session subclass instance or nil
 function Session.get(session_uuid)
-    return sessions[session_uuid]
+    local entry = sessions[session_uuid]
+    if is_ghost_entry(entry) then
+        return nil
+    end
+    return entry
 end
 
 --- Find a session by its agent_key (display label).
 -- @param key string Agent key
 -- @return Session subclass instance or nil
 function Session.find_by_agent_key(key)
-    for _, sess in pairs(sessions) do
+    for _, sess in ipairs(Session.list()) do
         if sess:agent_key() == key then
-            return sess
-        end
-    end
-    return nil
-end
-
---- Get a session by its display index.
--- Used by legacy browser clear_notification command.
--- @param index number Display index (0-based)
--- @return Session subclass instance or nil
-function Session.get_by_display_index(index)
-    for _, sess in pairs(sessions) do
-        if sess.display_index == index then
             return sess
         end
     end
@@ -630,7 +605,9 @@ end
 function Session.list()
     local result = {}
     for _, sess in pairs(sessions) do
-        table.insert(result, sess)
+        if not is_ghost_entry(sess) then
+            table.insert(result, sess)
+        end
     end
     -- Sort by creation time for stable ordering
     table.sort(result, function(a, b)
@@ -644,7 +621,7 @@ end
 -- @return array of Session subclass instances
 function Session.find_by_base_key(base_key)
     local result = {}
-    for _, sess in pairs(sessions) do
+    for _, sess in ipairs(Session.list()) do
         local key = sess:agent_key()
         if key == base_key then
             result[#result + 1] = sess
@@ -710,37 +687,55 @@ end
 -- @return number
 function Session.count()
     local count = 0
-    for _ in pairs(sessions) do
-        count = count + 1
+    for _, sess in pairs(sessions) do
+        if not is_ghost_entry(sess) then
+            count = count + 1
+        end
     end
     return count
 end
 
+--- Register a recovered ghost session info entry.
+-- Ghost entries share the same `sessions` registry and are replaced
+-- automatically when the real session with the same UUID is created.
+-- @param ghost_info table Session-info style table
+-- @return boolean
+function Session.register_ghost(ghost_info)
+    if type(ghost_info) ~= "table" then return false end
+    if not ghost_info.session_uuid or ghost_info.session_uuid == "" then return false end
+    if not ghost_info.id or ghost_info.id == "" then return false end
+    ghost_info._is_ghost = true
+    ghost_info.created_at = ghost_info.created_at or os.time()
+    sessions[ghost_info.session_uuid] = ghost_info
+    return true
+end
+
 --- Get info tables for all sessions (for client broadcast).
--- @return array of info tables sorted by display_index
+-- @return array of info tables sorted by creation time
 function Session.all_info()
     local result = {}
-    local seen = {}
-    for _, sess in ipairs(Session.list()) do
-        local info = sess:info()
-        result[#result + 1] = info
-        seen[info.id] = true
-    end
-    -- Include ghost agents not yet replaced by real sessions.
-    local ghost_registry = state.get("ghost_agent_registry", {})
-    for id, ghost_info in pairs(ghost_registry) do
-        if not seen[id] then
-            result[#result + 1] = ghost_info
+    for _, entry in pairs(sessions) do
+        if is_ghost_entry(entry) then
+            local info = {}
+            for k, v in pairs(entry) do
+                if k ~= "_is_ghost" then
+                    info[k] = v
+                end
+            end
+            result[#result + 1] = info
+        else
+            local info = entry:info()
+            result[#result + 1] = info
         end
     end
-    -- Sort by display_index for stable client-facing order.
+    -- Stable client-facing ordering.
     table.sort(result, function(a, b)
-        local ai = a.display_index
-        local bi = b.display_index
-        if ai == nil and bi == nil then return false end
-        if ai == nil then return false end
-        if bi == nil then return true end
-        return ai < bi
+        local ac = tonumber(a.created_at) or 0
+        local bc = tonumber(b.created_at) or 0
+        if ac == bc then
+            return tostring(a.id or "") < tostring(b.id or "")
+        end
+        return ac < bc
     end)
     return result
 end

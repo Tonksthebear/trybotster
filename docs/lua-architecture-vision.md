@@ -124,12 +124,17 @@ This is self-contained, not performance-critical, and exercises the Rust↔Lua i
 
 ```lua
 -- PTY
-pty.spawn(cmd, { args = {}, env = {}, cwd = "" })
-pty:write(data)
-pty:resize(cols, rows)
-pty:kill()
-pty:on_output(callback)
-pty:on_exit(callback)
+local handle, broker_session_id = hub.spawn_pty_with_broker({
+  command = "...",
+  worktree_path = "...",
+  rows = 24,
+  cols = 80,
+  env = {},
+  init_commands = {}
+}, session_uuid)
+handle:write(data)
+handle:resize(rows, cols)
+handle:kill()
 
 -- Terminal (for TUI)
 term.size()

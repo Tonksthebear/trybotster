@@ -19,7 +19,10 @@
 //! local worktrees = hub.get_worktrees()
 //!
 //! -- Register session PTY handle
-//! local index = hub.register_session("sess-abc123", handle, { agent_key = "owner-repo-42" })
+//! local index = hub.register_session("sess-abc123", handle, {
+//!   agent_key = "owner-repo-42",
+//!   broker_session_id = 123,
+//! })
 //!
 //! -- Get server-assigned hub ID
 //! local id = hub.server_id()
@@ -101,6 +104,7 @@ pub type SharedServerId = Arc<Mutex<Option<String>>>;
 /// - `hub.get_worktrees()` - Get available worktrees
 /// - `hub.register_session(uuid, handle, metadata)` - Register session PTY handle
 /// - `hub.unregister_session(uuid)` - Unregister session PTY handle
+/// - `hub.spawn_pty_with_broker(spawn_opts, session_uuid)` - Spawn and broker-register PTY
 /// - `hub.hub_id()` - Get local hub identifier (stable hash, matches hub_discovery IDs)
 /// - `hub.server_id()` - Get server-assigned hub ID
 /// - `hub.detect_repo()` - Detect current repo name
@@ -170,52 +174,83 @@ pub(crate) fn register(
     // Arguments:
     //   session_uuid: string - Stable session UUID (e.g., "sess-1234567890-abcdef")
     //   pty_handle:   PtySessionHandle userdata - Single PTY handle
-    //   metadata:     table - { session_type = "agent"|"accessory", agent_key = "owner-repo-42", workspace_id = nil }
+    //   metadata:     table - {
+    //     session_type = "agent"|"accessory",
+    //     agent_key = "owner-repo-42",
+    //     workspace_id = nil,
+    //     broker_session_id = 123, -- required for all runtime sessions
+    //   }
     let cache2 = Arc::clone(&handle_cache);
+    let register_broker_conn = Arc::clone(&broker_connection);
     let register_session_fn = lua
-        .create_function(move |_, (session_uuid, session_ud, metadata): (String, LuaAnyUserData, LuaTable)| {
-            use crate::hub::agent_handle::{SessionHandle, SessionType, PtyHandle};
-            use crate::lua::primitives::pty::PtySessionHandle;
+        .create_function(
+            move |_, (session_uuid, session_ud, metadata): (String, LuaAnyUserData, LuaTable)| {
+                use crate::hub::agent_handle::{PtyHandle, SessionHandle, SessionType};
+                use crate::lua::primitives::pty::PtySessionHandle;
 
-            let pty_handle: PtyHandle = {
-                let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
-                    LuaError::runtime(format!(
-                        "register_session: not a PtySessionHandle: {e}"
-                    ))
-                })?;
-                handle.to_pty_handle()
-            };
+                let broker_session_id: Option<u32> = match metadata.get::<LuaValue>("broker_session_id")
+                {
+                    Ok(LuaValue::Integer(v)) => u32::try_from(v).ok(),
+                    Ok(LuaValue::Number(v)) if v.is_finite() && v >= 0.0 => {
+                        // Lua numbers are f64; only accept whole, in-range values.
+                        let iv = v as u64;
+                        if (iv as f64 - v).abs() < f64::EPSILON {
+                            u32::try_from(iv).ok()
+                        } else {
+                            None
+                        }
+                    }
+                    Ok(LuaValue::String(s)) => s.to_str().ok().and_then(|x| x.parse::<u32>().ok()),
+                    _ => None,
+                };
 
-            let agent_key: String = metadata
-                .get("agent_key")
-                .unwrap_or_else(|_| session_uuid.clone());
+                let pty_handle: PtyHandle = {
+                    let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
+                        LuaError::runtime(format!("register_session: not a PtySessionHandle: {e}"))
+                    })?;
+                    let sid = broker_session_id.ok_or_else(|| {
+                        LuaError::runtime(
+                            "register_session: broker_session_id required for all sessions",
+                        )
+                    })?;
+                    handle.to_pty_handle_with_broker_relay((sid, Arc::clone(&register_broker_conn)))
+                };
 
-            let session_type_str: String = metadata
-                .get("session_type")
-                .unwrap_or_else(|_| "agent".to_string());
-            let session_type = match session_type_str.as_str() {
-                "accessory" => SessionType::Accessory,
-                _ => SessionType::Agent,
-            };
+                let agent_key: String = metadata
+                    .get("agent_key")
+                    .unwrap_or_else(|_| session_uuid.clone());
 
-            let workspace_id: Option<String> = metadata
-                .get("workspace_id")
-                .ok();
+                let session_type_str: String = metadata
+                    .get("session_type")
+                    .unwrap_or_else(|_| "agent".to_string());
+                let session_type = match session_type_str.as_str() {
+                    "accessory" => SessionType::Accessory,
+                    _ => SessionType::Agent,
+                };
 
-            let handle = SessionHandle::new(
-                session_uuid.clone(),
-                agent_key.clone(),
-                session_type,
-                workspace_id,
-                pty_handle,
-            );
+                let workspace_id: Option<String> = metadata.get("workspace_id").ok();
 
-            cache2.add_session(handle);
-            let index = cache2.index_of(&session_uuid);
-            log::info!("[Lua] Registered session '{}' (key='{}', type={}) at index {:?}",
-                session_uuid, agent_key, session_type, index);
-            Ok(index.unwrap_or(0))
-        })
+                let handle = SessionHandle::new(
+                    session_uuid.clone(),
+                    agent_key.clone(),
+                    session_type,
+                    workspace_id,
+                    pty_handle,
+                );
+
+                cache2.add_session(handle);
+                let index = cache2.index_of(&session_uuid);
+                log::info!(
+                    "[Lua] Registered session '{}' (key='{}', type={}, broker_session_id={:?}) at index {:?}",
+                    session_uuid,
+                    agent_key,
+                    session_type,
+                    broker_session_id,
+                    index
+                );
+                Ok(index.unwrap_or(0))
+            },
+        )
         .map_err(|e| anyhow!("Failed to create hub.register_session function: {e}"))?;
 
     hub.set("register_session", register_session_fn)
@@ -316,7 +351,9 @@ pub(crate) fn register(
                     sdp,
                 }));
             } else {
-                ::log::warn!("[Hub] handle_webrtc_offer called before hub_event_tx set — event dropped");
+                ::log::warn!(
+                    "[Hub] handle_webrtc_offer called before hub_event_tx set — event dropped"
+                );
             }
             Ok(())
         })
@@ -331,19 +368,23 @@ pub(crate) fn register(
     // matching the JSON structure from browser WebRTC signaling.
     let tx = hub_event_tx.clone();
     let handle_ice_candidate_fn = lua
-        .create_function(move |lua, (browser_identity, candidate_data): (String, LuaValue)| {
-            let candidate: serde_json::Value = lua.from_value(candidate_data)?;
-            let guard = tx.lock().expect("HubEventSender mutex poisoned");
-            if let Some(ref sender) = *guard {
-                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::HandleIceCandidate {
-                    browser_identity,
-                    candidate,
-                }));
-            } else {
-                ::log::warn!("[Hub] handle_ice_candidate called before hub_event_tx set — event dropped");
-            }
-            Ok(())
-        })
+        .create_function(
+            move |lua, (browser_identity, candidate_data): (String, LuaValue)| {
+                let candidate: serde_json::Value = lua.from_value(candidate_data)?;
+                let guard = tx.lock().expect("HubEventSender mutex poisoned");
+                if let Some(ref sender) = *guard {
+                    let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::HandleIceCandidate {
+                        browser_identity,
+                        candidate,
+                    }));
+                } else {
+                    ::log::warn!(
+                        "[Hub] handle_ice_candidate called before hub_event_tx set — event dropped"
+                    );
+                }
+                Ok(())
+            },
+        )
         .map_err(|e| anyhow!("Failed to create hub.handle_ice_candidate function: {e}"))?;
 
     hub.set("handle_ice_candidate", handle_ice_candidate_fn)
@@ -359,7 +400,9 @@ pub(crate) fn register(
                     browser_identity,
                 }));
             } else {
-                ::log::warn!("[Hub] request_ratchet_restart called before hub_event_tx set — event dropped");
+                ::log::warn!(
+                    "[Hub] request_ratchet_restart called before hub_event_tx set — event dropped"
+                );
             }
             Ok(())
         })
@@ -368,126 +411,124 @@ pub(crate) fn register(
     hub.set("request_ratchet_restart", request_ratchet_restart_fn)
         .map_err(|e| anyhow!("Failed to set hub.request_ratchet_restart: {e}"))?;
 
-    // hub.register_pty_with_broker(session_handle, session_uuid)
-    //   → session_id: integer | nil
+    // hub.spawn_pty_with_broker(spawn_opts, session_uuid)
+    //   → (session_handle, session_id)
     //
-    // Transfers the master PTY FD to the broker via SCM_RIGHTS so the broker
-    // can relay PTY I/O across Hub restarts. Returns the broker-assigned
-    // session ID on success, or nil if the broker is unavailable or the FD
-    // cannot be read (non-Unix, or PTY not yet spawned).
+    // Authoritative broker-born spawn path:
+    //   1) spawn PTY session handle (Rust internal helper)
+    //   2) transfer PTY FD to broker
+    //   3) register session_id -> session_uuid routing entry
     //
-    // Arguments:
-    //   session_handle: PtySessionHandle userdata
-    //   session_uuid:   string (e.g. "sess-1234567890-abcdef")
+    // Any broker registration failure is a hard error (no fallback).
     #[cfg(unix)]
     {
         let broker_conn = Arc::clone(&broker_connection);
         let tx_reg = hub_event_tx.clone();
-        let register_pty_fn = lua
-            .create_function(
-                move |_, (session_ud, session_uuid): (LuaAnyUserData, String)| {
-                    use crate::lua::primitives::pty::PtySessionHandle;
+        let spawn_with_broker_fn = lua
+            .create_function(move |lua_ctx, (opts, session_uuid): (LuaTable, String)| {
+                use crate::lua::primitives::pty::{
+                    spawn_session_handle_from_opts, PtySessionHandle,
+                };
 
-                    // Extract FD, PID, and current dimensions from the PtySessionHandle userdata.
-                    // Drop the borrow before locking the broker so there is no
-                    // risk of a lock-ordering deadlock.
-                    let (fd, child_pid, dims) = {
-                        let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
-                            LuaError::runtime(format!(
-                                "register_pty_with_broker: not a PtySessionHandle: {e}"
-                            ))
-                        })?;
-                        (handle.get_master_fd(), handle.get_child_pid(), handle.get_dims())
-                    }; // PtySessionHandle borrow released here
+                let handle = spawn_session_handle_from_opts(opts, tx_reg.clone())
+                    .map_err(|e| LuaError::runtime(format!(
+                        "spawn_pty_with_broker: spawn failed: {e}"
+                    )))?;
+                let session_ud: LuaAnyUserData = lua_ctx
+                    .create_userdata(handle)
+                    .map_err(|e| LuaError::runtime(format!(
+                        "spawn_pty_with_broker: failed to create session userdata: {e}"
+                    )))?;
 
-                    let fd = match fd {
-                        Some(f) => f,
+                // Extract FD, PID, and current dimensions from the PtySessionHandle userdata.
+                // Drop the borrow before locking the broker so there is no
+                // risk of a lock-ordering deadlock.
+                let (fd, child_pid, dims) = {
+                    let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
+                        LuaError::runtime(format!(
+                            "spawn_pty_with_broker: not a PtySessionHandle: {e}"
+                        ))
+                    })?;
+                    (
+                        handle.get_master_fd(),
+                        handle.get_child_pid(),
+                        handle.get_dims(),
+                    )
+                }; // PtySessionHandle borrow released here
+
+                let fd = match fd {
+                    Some(f) => f,
+                    None => {
+                        let _ = session_ud.call_method::<()>("kill", ());
+                        return Err(LuaError::runtime(format!(
+                            "spawn_pty_with_broker('{session_uuid}'): master FD unavailable"
+                        )));
+                    }
+                };
+
+                // Use the actual terminal dimensions from the session handle.
+                let (rows, cols) = dims;
+                let child_pid = child_pid.unwrap_or(0);
+
+                let session_id = {
+                    let mut guard = broker_conn.lock().map_err(|_| {
+                        LuaError::runtime("spawn_pty_with_broker: broker_connection mutex poisoned")
+                    })?;
+                    match guard.as_mut() {
+                        Some(conn) => match conn.register_pty(&session_uuid, child_pid, rows, cols, fd) {
+                            Ok(sid) => sid,
+                            Err(e) => {
+                                let _ = session_ud.call_method::<()>("kill", ());
+                                return Err(LuaError::runtime(format!(
+                                    "spawn_pty_with_broker('{session_uuid}'): broker register failed: {e}"
+                                )));
+                            }
+                        },
                         None => {
-                            ::log::warn!(
-                                "[Broker] register_pty_with_broker('{}'): \
-                                 master FD unavailable",
-                                session_uuid
-                            );
-                            return Ok(LuaNil);
-                        }
-                    };
-
-                    // Use the actual terminal dimensions from the session handle.
-                    let (rows, cols) = dims;
-                    let child_pid = child_pid.unwrap_or(0);
-
-                    let session_id = {
-                        let mut guard = broker_conn.lock().map_err(|_| {
-                            LuaError::runtime(
-                                "register_pty_with_broker: broker_connection mutex poisoned",
-                            )
-                        })?;
-                        match guard.as_mut() {
-                            Some(conn) => {
-                                match conn.register_pty(
-                                    &session_uuid,
-                                    child_pid,
-                                    rows,
-                                    cols,
-                                    fd,
-                                ) {
-                                    Ok(sid) => sid,
-                                    Err(e) => {
-                                        ::log::warn!(
-                                            "[Broker] register_pty('{}') failed: {e}",
-                                            session_uuid
-                                        );
-                                        return Ok(LuaNil);
-                                    }
-                                }
-                            }
-                            None => {
-                                ::log::debug!(
-                                    "[Broker] register_pty_with_broker: broker not connected, \
-                                     skipping"
-                                );
-                                return Ok(LuaNil);
-                            }
-                        }
-                    };
-
-                    // Notify the Hub event loop so it can populate its
-                    // session-to-agent routing table.
-                    {
-                        let guard = tx_reg.lock().expect("HubEventSender mutex poisoned");
-                        if let Some(ref sender) = *guard {
-                            let _ = sender.send(HubEvent::BrokerSessionRegistered {
-                                session_id,
-                                session_uuid: session_uuid.clone(),
-                            });
+                            let _ = session_ud.call_method::<()>("kill", ());
+                            return Err(LuaError::runtime(
+                                "spawn_pty_with_broker: broker not connected",
+                            ));
                         }
                     }
+                };
 
-                    ::log::info!(
-                        "[Broker] Registered PTY '{}' → session {}",
-                        session_uuid,
-                        session_id
-                    );
-                    Ok(LuaValue::Integer(i64::from(session_id)))
-                },
-            )
-            .map_err(|e| {
-                anyhow!("Failed to create hub.register_pty_with_broker function: {e}")
-            })?;
+                // Notify the Hub event loop so it can populate its
+                // session-to-agent routing table.
+                {
+                    let guard = tx_reg.lock().expect("HubEventSender mutex poisoned");
+                    if let Some(ref sender) = *guard {
+                        let _ = sender.send(HubEvent::BrokerSessionRegistered {
+                            session_id,
+                            session_uuid: session_uuid.clone(),
+                        });
+                    }
+                }
 
-        hub.set("register_pty_with_broker", register_pty_fn)
-            .map_err(|e| anyhow!("Failed to set hub.register_pty_with_broker: {e}"))?;
+                ::log::info!(
+                    "[Broker] Spawned and registered PTY '{}' → session {}",
+                    session_uuid,
+                    session_id
+                );
+                Ok((session_ud, i64::from(session_id)))
+            })
+            .map_err(|e| anyhow!("Failed to create hub.spawn_pty_with_broker function: {e}"))?;
+
+        hub.set("spawn_pty_with_broker", spawn_with_broker_fn)
+            .map_err(|e| anyhow!("Failed to set hub.spawn_pty_with_broker: {e}"))?;
     }
-    // On non-Unix targets, expose a no-op stub so plugins load without errors.
+    // On non-Unix targets, expose a stub with a clear runtime error.
     #[cfg(not(unix))]
     {
-        let noop_fn = lua
-            .create_function(|_, _: LuaMultiValue| Ok(LuaNil))
-            .map_err(|e| {
-                anyhow!("Failed to create hub.register_pty_with_broker stub: {e}")
-            })?;
-        hub.set("register_pty_with_broker", noop_fn)
-            .map_err(|e| anyhow!("Failed to set hub.register_pty_with_broker stub: {e}"))?;
+        let unsupported_fn = lua
+            .create_function(|_, _: LuaMultiValue| {
+                Err::<LuaMultiValue, _>(LuaError::runtime(
+                    "spawn_pty_with_broker is unavailable on this platform",
+                ))
+            })
+            .map_err(|e| anyhow!("Failed to create hub.spawn_pty_with_broker stub: {e}"))?;
+        hub.set("spawn_pty_with_broker", unsupported_fn)
+            .map_err(|e| anyhow!("Failed to set hub.spawn_pty_with_broker stub: {e}"))?;
     }
 
     // hub.pty_tee(session_id, log_path, cap_bytes) → true | nil
@@ -503,7 +544,7 @@ pub(crate) fn register(
     //   sessions directory and is not an arbitrary filesystem location.
     //
     // Arguments:
-    //   session_id: integer  — value returned by register_pty_with_broker
+    //   session_id: integer  — broker session ID returned by spawn_pty_with_broker
     //   log_path:   string   — absolute path ending in pty-0.log
     //   cap_bytes:  integer  — rotation threshold (0 → broker default 10 MiB)
     //
@@ -586,7 +627,7 @@ pub(crate) fn register(
     // connected or the fetch fails.
     //
     // Arguments:
-    //   session_id: integer — value returned by register_pty_with_broker
+    //   session_id: integer — broker session ID returned by spawn_pty_with_broker
     {
         let broker_conn2 = Arc::clone(&broker_connection);
         let snapshot_fn = lua
@@ -607,9 +648,7 @@ pub(crate) fn register(
                             Ok(LuaValue::String(s))
                         }
                         Err(e) => {
-                            ::log::warn!(
-                                "[Broker] get_snapshot(session={session_id}) failed: {e}"
-                            );
+                            ::log::warn!("[Broker] get_snapshot(session={session_id}) failed: {e}");
                             Ok(LuaNil)
                         }
                     },
@@ -650,13 +689,7 @@ pub(crate) fn register(
         let tx_ghost = Arc::clone(&hub_event_tx);
         let create_ghost_fn = lua
             .create_function(
-                move |_,
-                      (session_uuid, session_id, rows, cols): (
-                    String,
-                    u32,
-                    u16,
-                    u16,
-                )| {
+                move |_, (session_uuid, session_id, rows, cols): (String, u32, u16, u16)| {
                     use crate::lua::primitives::pty::PtySessionHandle;
 
                     // Create a ghost handle — no real PTY, just shadow screen
@@ -667,9 +700,7 @@ pub(crate) fn register(
                     // so BrokerPtyOutput frames route correctly once the caller calls
                     // hub.register_session() to populate HandleCache.
                     {
-                        let guard = tx_ghost
-                            .lock()
-                            .expect("HubEventSender mutex poisoned");
+                        let guard = tx_ghost.lock().expect("HubEventSender mutex poisoned");
                         if let Some(ref sender) = *guard {
                             let _ = sender.send(HubEvent::BrokerSessionRegistered {
                                 session_id,
@@ -753,9 +784,7 @@ pub(crate) fn register(
             if let Some(ref sender) = *guard {
                 let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::ExecRestart));
             } else {
-                ::log::warn!(
-                    "[Hub] exec_restart() called before hub_event_tx set — event dropped"
-                );
+                ::log::warn!("[Hub] exec_restart() called before hub_event_tx set — event dropped");
             }
             Ok(())
         })
@@ -780,9 +809,7 @@ pub(crate) fn register(
             if let Some(ref sender) = *guard {
                 let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::DevRebuild));
             } else {
-                ::log::warn!(
-                    "[Hub] dev_rebuild() called before hub_event_tx set — event dropped"
-                );
+                ::log::warn!("[Hub] dev_rebuild() called before hub_event_tx set — event dropped");
             }
             Ok(())
         })
@@ -801,8 +828,8 @@ pub(crate) fn register(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::new_hub_event_sender;
+    use super::*;
 
     fn test_broker() -> crate::broker::SharedBrokerConnection {
         Arc::new(Mutex::new(None))
@@ -815,9 +842,9 @@ mod tests {
         SharedServerId,
         Arc<RwLock<HubState>>,
     ) {
-        let state = Arc::new(RwLock::new(HubState::new(
-            std::path::PathBuf::from("/tmp/test-worktrees"),
-        )));
+        let state = Arc::new(RwLock::new(HubState::new(std::path::PathBuf::from(
+            "/tmp/test-worktrees",
+        ))));
         (
             new_hub_event_sender(),
             Arc::new(HandleCache::new()),
@@ -832,7 +859,8 @@ mod tests {
         let lua = Lua::new();
         let (tx, cache, hid, sid, state) = create_test_deps();
 
-        register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register hub primitives");
+        register(&lua, tx, cache, hid, sid, state, test_broker())
+            .expect("Should register hub primitives");
 
         let hub: LuaTable = lua.globals().get("hub").expect("hub table should exist");
         assert!(hub.contains_key("get_worktrees").unwrap());
@@ -848,6 +876,69 @@ mod tests {
         assert!(hub.contains_key("exec_restart").unwrap());
         assert!(hub.contains_key("dev_rebuild").unwrap());
         assert!(hub.contains_key("pty_tee").unwrap());
+    }
+
+    #[test]
+    fn test_register_session_with_broker_session_id_attaches_relay() {
+        let lua = Lua::new();
+        let (tx, cache, hid, sid, state) = create_test_deps();
+        register(&lua, tx, Arc::clone(&cache), hid, sid, state, test_broker())
+            .expect("Should register hub primitives");
+
+        lua.load(
+            r#"
+            local h = hub.create_ghost_session("sess-relay", 77, 24, 80)
+            hub.register_session("sess-relay", h, {
+                session_type = "agent",
+                agent_key = "relay-agent",
+                broker_session_id = 77,
+            })
+        "#,
+        )
+        .exec()
+        .expect("register broker-backed ghost session");
+
+        let handle = cache
+            .get_session("sess-relay")
+            .expect("session should be present in cache");
+        let err = handle
+            .pty()
+            .write_input_direct(b"x")
+            .expect_err("ghost writes should fail when broker connection is absent");
+        assert!(
+            err.contains("Broker connection not available"),
+            "expected broker relay path error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_register_session_without_broker_session_id_rejects_registration() {
+        let lua = Lua::new();
+        let (tx, cache, hid, sid, state) = create_test_deps();
+        register(&lua, tx, Arc::clone(&cache), hid, sid, state, test_broker())
+            .expect("Should register hub primitives");
+
+        let err = lua
+            .load(
+                r#"
+            local h = hub.create_ghost_session("sess-no-relay", 88, 24, 80)
+            hub.register_session("sess-no-relay", h, {
+                session_type = "agent",
+                agent_key = "plain-ghost",
+            })
+        "#,
+            )
+            .exec()
+            .expect_err("broker-owned registration without broker_session_id must fail");
+        assert!(
+            err.to_string()
+                .contains("broker_session_id required for all sessions"),
+            "expected explicit broker_session_id error, got: {err}"
+        );
+        assert!(
+            cache.get_session("sess-no-relay").is_none(),
+            "failed registration must not populate HandleCache"
+        );
     }
 
     /// `hub.pty_tee` with a path missing the "workspaces" component must return nil.
@@ -879,7 +970,10 @@ mod tests {
             .load(r#"return hub.pty_tee(1, "/data/workspaces/my-agent/pty-0.log", 0)"#)
             .eval()
             .unwrap();
-        assert!(result.is_nil(), "path without sessions component must return nil");
+        assert!(
+            result.is_nil(),
+            "path without sessions component must return nil"
+        );
     }
 
     /// A crafted path that contains "workspaces" as a substring of a directory name
@@ -897,7 +991,10 @@ mod tests {
             .load(r#"return hub.pty_tee(1, "/tmp/evil-workspaces/x/sessions/0/pty-0.log", 0)"#)
             .eval()
             .unwrap();
-        assert!(result.is_nil(), "substring match on component name must be rejected");
+        assert!(
+            result.is_nil(),
+            "substring match on component name must be rejected"
+        );
     }
 
     /// A path with ".." traversal components must be rejected.
@@ -966,7 +1063,11 @@ mod tests {
         register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
 
         let worktrees: LuaTable = lua.load("return hub.get_worktrees()").eval().unwrap();
-        assert_eq!(worktrees.len().unwrap(), 0, "Empty worktrees should have length 0");
+        assert_eq!(
+            worktrees.len().unwrap(),
+            0,
+            "Empty worktrees should have length 0"
+        );
     }
 
     #[test]
@@ -979,7 +1080,9 @@ mod tests {
 
         register(&lua, tx, cache, hid, sid, state, test_broker()).expect("Should register");
 
-        lua.load("hub.quit()").exec().expect("Should send quit event");
+        lua.load("hub.quit()")
+            .exec()
+            .expect("Should send quit event");
 
         match rx.try_recv() {
             Ok(HubEvent::LuaHubRequest(HubRequest::Quit)) => {}
@@ -1125,10 +1228,7 @@ mod tests {
                     candidate.get("candidate").and_then(|v| v.as_str()),
                     Some("candidate:...")
                 );
-                assert_eq!(
-                    candidate.get("sdpMid").and_then(|v| v.as_str()),
-                    Some("0")
-                );
+                assert_eq!(candidate.get("sdpMid").and_then(|v| v.as_str()), Some("0"));
             }
             other => panic!("Expected LuaHubRequest(HandleIceCandidate), got: {other:?}"),
         }

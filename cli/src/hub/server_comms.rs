@@ -15,15 +15,58 @@
 
 // Rust guideline compliant 2026-02
 
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use crate::channel::Channel;
 use crate::hub::actions::{self, HubAction};
-use crate::hub::{registration, Hub, WebRtcPtyOutput};
+use crate::hub::{
+    registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest, WebRtcPtyOutput,
+};
 use crate::notifications::push::send_push_direct;
+use base64::Engine;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoBuildProfile {
+    Debug,
+    Release,
+    Named(String),
+}
+
+fn detect_running_cargo_profile(current_exe: &Path) -> Option<CargoBuildProfile> {
+    let components: Vec<_> = current_exe.components().collect();
+
+    for window in components.windows(2) {
+        let target = window[0].as_os_str();
+        let profile = window[1].as_os_str();
+        if target == "target" {
+            let profile = profile.to_string_lossy();
+            return match profile.as_ref() {
+                "debug" => Some(CargoBuildProfile::Debug),
+                "release" => Some(CargoBuildProfile::Release),
+                "" => None,
+                other => Some(CargoBuildProfile::Named(other.to_string())),
+            };
+        }
+    }
+
+    None
+}
+
+/// Infer Cargo target dir from the running executable path.
+///
+/// For paths like `<...>/target/<profile>/<bin>`, returns `<...>/target`.
+fn detect_running_target_dir(current_exe: &Path) -> Option<std::path::PathBuf> {
+    let profile_dir = current_exe.parent()?;
+    let target_dir = profile_dir.parent()?;
+    (target_dir.file_name()? == "target").then(|| target_dir.to_path_buf())
+}
 
 impl Hub {
+    /// How long a terminal attach intent can stay pending before `not_found`.
+    const TERMINAL_ATTACH_NOT_FOUND_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// Build a single-line preview for ICE candidate logging.
     fn ice_candidate_preview(candidate: &str) -> String {
         const MAX: usize = 220;
@@ -59,6 +102,7 @@ impl Hub {
         self.poll_lua_action_cable_channels();
         self.poll_webrtc_channels();
         self.poll_user_file_watches();
+        self.process_pending_terminal_attaches();
     }
 
     /// Legacy periodic maintenance (test-only fallback).
@@ -69,6 +113,7 @@ impl Hub {
         self.cleanup_disconnected_webrtc_channels();
         self.poll_stream_frames_outgoing();
         self.poll_pty_observers();
+        self.process_pending_terminal_attaches();
     }
 
     // === Per-Event Handlers for select! Loop ===
@@ -95,13 +140,24 @@ impl Hub {
                     &notif.notification,
                 );
             }
-            HubEvent::PtyOscEvent { agent_key, session_name, event } => {
-                self.lua.notify_pty_osc_event(&agent_key, &session_name, &event);
+            HubEvent::PtyOscEvent {
+                agent_key,
+                session_name,
+                event,
+            } => {
+                self.lua
+                    .notify_pty_osc_event(&agent_key, &session_name, &event);
             }
-            HubEvent::PtyProcessExited { agent_key, session_name, exit_code } => {
+            HubEvent::PtyProcessExited {
+                agent_key,
+                session_name,
+                exit_code,
+            } => {
                 log::info!(
                     "[Hub] PTY process exited for {}:{} (code={:?})",
-                    agent_key, session_name, exit_code
+                    agent_key,
+                    session_name,
+                    exit_code
                 );
                 let data = serde_json::json!({
                     "agent_key": agent_key,
@@ -115,7 +171,10 @@ impl Hub {
             HubEvent::TimerFired { timer_id } => {
                 self.lua.fire_timer_callback(&timer_id);
             }
-            HubEvent::AcChannelMessage { channel_id, message } => {
+            HubEvent::AcChannelMessage {
+                channel_id,
+                message,
+            } => {
                 use crate::lua::primitives::action_cable;
                 let crypto = self.browser.crypto_service.as_ref();
                 action_cable::fire_single_ac_message(
@@ -134,7 +193,10 @@ impl Hub {
             HubEvent::LuaHubClientRequest(request) => {
                 self.process_hub_client_request(request);
             }
-            HubEvent::HubClientMessage { connection_id, message } => {
+            HubEvent::HubClientMessage {
+                connection_id,
+                message,
+            } => {
                 use crate::lua::primitives::hub_client;
                 hub_client::fire_hub_client_message(
                     self.lua.lua_ref(),
@@ -145,7 +207,11 @@ impl Hub {
                 );
             }
             HubEvent::HubClientDisconnected { connection_id } => {
-                if self.lua_hub_client_connections.remove(&connection_id).is_some() {
+                if self
+                    .lua_hub_client_connections
+                    .remove(&connection_id)
+                    .is_some()
+                {
                     // Clean up the callback registry entry and release the RegistryKey.
                     if let Ok(mut reg) = self.lua.hub_client_callback_registry().lock() {
                         if let Some(key) = reg.remove(&connection_id) {
@@ -174,14 +240,19 @@ impl Hub {
                     );
                 }
                 if !identities.is_empty() {
-                    if let Err(e) = crate::relay::persistence::save_push_subscriptions(
-                        &self.push_subscriptions,
-                    ) {
-                        log::error!("[WebPush] Failed to save push subscriptions after cleanup: {e}");
+                    if let Err(e) =
+                        crate::relay::persistence::save_push_subscriptions(&self.push_subscriptions)
+                    {
+                        log::error!(
+                            "[WebPush] Failed to save push subscriptions after cleanup: {e}"
+                        );
                     }
                 }
             }
-            HubEvent::WebRtcMessage { browser_identity, payload } => {
+            HubEvent::WebRtcMessage {
+                browser_identity,
+                payload,
+            } => {
                 self.handle_webrtc_message(&browser_identity, &payload);
                 // Check for decrypt failure threshold (ratchet restart).
                 if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
@@ -261,10 +332,13 @@ impl Hub {
                             }
                         };
                         while let Some(raw) = rx.recv().await {
-                            if tx.send(HubEvent::WebRtcMessage {
-                                browser_identity: bi.clone(),
-                                payload: raw.payload,
-                            }).is_err() {
+                            if tx
+                                .send(HubEvent::WebRtcMessage {
+                                    browser_identity: bi.clone(),
+                                    payload: raw.payload,
+                                })
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -308,7 +382,10 @@ impl Hub {
                                 return;
                             }
                         };
-                        self.try_send_to_peer(&peer_id, super::WebRtcSendItem::Json { data: payload });
+                        self.try_send_to_peer(
+                            &peer_id,
+                            super::WebRtcSendItem::Json { data: payload },
+                        );
                     }
                     WebRtcSendRequest::Binary { peer_id, data } => {
                         self.try_send_to_peer(&peer_id, super::WebRtcSendItem::Binary { data });
@@ -345,6 +422,25 @@ impl Hub {
                 if let Some(conn) = self.socket_clients.remove(&client_id) {
                     conn.disconnect();
                 }
+                let client_prefix = format!("{client_id}:");
+                self.pty_forwarders.retain(|key, task| {
+                    if key.starts_with(&client_prefix) {
+                        task.abort();
+                        log::debug!("[Socket] Aborted PTY forwarder: {}", key);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                self.pending_terminal_attaches.retain(|key, intent| {
+                    if key.starts_with(&client_prefix) {
+                        intent.request.deactivate();
+                        log::debug!("[Socket] Dropped pending terminal attach intent: {}", key);
+                        false
+                    } else {
+                        true
+                    }
+                });
                 if let Err(e) = self.lua.call_socket_client_disconnected(&client_id) {
                     log::warn!("[Socket] Lua client_disconnected callback error: {e}");
                 }
@@ -354,7 +450,11 @@ impl Hub {
                     log::error!("[Socket] Lua message handling error for {}: {e}", client_id);
                 }
             }
-            HubEvent::SocketPtyInput { client_id, session_uuid, data } => {
+            HubEvent::SocketPtyInput {
+                client_id,
+                session_uuid,
+                data,
+            } => {
                 if data == b"\x1b[I" {
                     self.lua.set_pty_focused(&session_uuid, &client_id, true);
                 } else if data == b"\x1b[O" {
@@ -414,15 +514,29 @@ impl Hub {
                             log::warn!("[PTY-WRITE] No session '{}'", session_uuid);
                         }
                     }
-                    PtyRequest::ResizePty { session_uuid, rows, cols } => {
+                    PtyRequest::ResizePty {
+                        session_uuid,
+                        rows,
+                        cols,
+                    } => {
                         if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
                             session_handle.pty().resize_direct(rows, cols);
                         } else {
                             log::debug!("[Lua] No session '{}'", session_uuid);
                         }
                     }
-                    PtyRequest::SpawnNotificationWatcher { watcher_key, agent_key, session_name, event_tx } => {
-                        self.spawn_notification_watcher(watcher_key, agent_key, session_name, event_tx);
+                    PtyRequest::SpawnNotificationWatcher {
+                        watcher_key,
+                        agent_key,
+                        session_name,
+                        event_tx,
+                    } => {
+                        self.spawn_notification_watcher(
+                            watcher_key,
+                            agent_key,
+                            session_name,
+                            event_tx,
+                        );
                     }
                 }
             }
@@ -440,40 +554,95 @@ impl Hub {
                         self.quit = true;
                     }
                     HubRequest::GracefulRestart => {
-                        log::info!("[Lua] Processing graceful-restart request — agents will survive");
+                        log::info!(
+                            "[Lua] Processing graceful-restart request — agents will survive"
+                        );
                         self.graceful_shutdown = true;
                         self.quit = true;
                     }
                     HubRequest::DevRebuild => {
-                        // Run `cargo build` in the background. On success, fire ExecRestart so
-                        // the Hub exec-replaces itself with the freshly built binary. The broker
-                        // keeps PTY FDs alive across the exec so agents survive.
+                        // Run `cargo build` in the background using the same Cargo profile as
+                        // the currently running executable when we can infer it from `current_exe()`.
+                        // On success, fire ExecRestart so the Hub exec-replaces itself with the
+                        // freshly built binary. The broker keeps PTY FDs alive across the exec so
+                        // agents survive.
                         //
                         // On failure the Hub logs the error and keeps running — no agents
                         // are disrupted.
-                        log::info!("[Dev] Starting cargo build — Hub will exec-restart on success");
+                        let current_exe = std::env::current_exe().ok();
+                        let profile = current_exe
+                            .as_deref()
+                            .and_then(detect_running_cargo_profile);
+                        let target_dir = current_exe.as_deref().and_then(detect_running_target_dir);
+                        match &profile {
+                            Some(CargoBuildProfile::Debug) => {
+                                log::info!(
+                                    "[Dev] Starting cargo build (debug profile) — Hub will exec-restart on success"
+                                );
+                            }
+                            Some(CargoBuildProfile::Release) => {
+                                log::info!(
+                                    "[Dev] Starting cargo build (--release) — Hub will exec-restart on success"
+                                );
+                            }
+                            Some(CargoBuildProfile::Named(name)) => {
+                                log::info!(
+                                    "[Dev] Starting cargo build (--profile {}) — Hub will exec-restart on success",
+                                    name
+                                );
+                            }
+                            None => {
+                                log::info!(
+                                    "[Dev] Starting cargo build (default profile: debug) — Hub will exec-restart on success"
+                                );
+                            }
+                        }
                         let tx = self.hub_event_tx.clone();
                         // manifest_dir is the `cli/` directory, embedded at compile time.
                         let manifest_dir = env!("CARGO_MANIFEST_DIR");
+                        let profile_for_build = profile.clone();
+                        let target_dir_for_build = target_dir.clone();
+                        if let Some(exe) = current_exe.as_ref() {
+                            log::info!("[Dev] Running executable: {}", exe.display());
+                        }
+                        if let Some(td) = target_dir.as_ref() {
+                            log::info!("[Dev] Using Cargo target-dir: {}", td.display());
+                        }
                         self.tokio_runtime.spawn(async move {
                             let result = tokio::task::spawn_blocking(move || {
-                                std::process::Command::new("cargo")
-                                    .arg("build")
+                                let mut cmd = std::process::Command::new("cargo");
+                                cmd.arg("build")
                                     .arg("--manifest-path")
                                     .arg(format!("{manifest_dir}/Cargo.toml"))
-                                    .status()
+                                    .current_dir(manifest_dir);
+                                if let Some(target_dir) = target_dir_for_build {
+                                    cmd.arg("--target-dir").arg(target_dir);
+                                }
+                                match profile_for_build {
+                                    Some(CargoBuildProfile::Debug) | None => {}
+                                    Some(CargoBuildProfile::Release) => {
+                                        cmd.arg("--release");
+                                    }
+                                    Some(CargoBuildProfile::Named(name)) => {
+                                        cmd.arg("--profile").arg(name);
+                                    }
+                                }
+                                cmd.status()
                             })
                             .await;
 
                             match result {
                                 Ok(Ok(status)) if status.success() => {
-                                    log::info!("[Dev] cargo build succeeded — triggering exec-restart");
-                                    let _ = tx.send(
-                                        HubEvent::LuaHubRequest(HubRequest::ExecRestart),
+                                    log::info!(
+                                        "[Dev] cargo build succeeded — triggering exec-restart"
                                     );
+                                    let _ =
+                                        tx.send(HubEvent::LuaHubRequest(HubRequest::ExecRestart));
                                 }
                                 Ok(Ok(status)) => {
-                                    log::error!("[Dev] cargo build failed with exit status: {status}");
+                                    log::error!(
+                                        "[Dev] cargo build failed with exit status: {status}"
+                                    );
                                 }
                                 Ok(Err(e)) => {
                                     log::error!("[Dev] cargo build failed to launch: {e}");
@@ -484,14 +653,20 @@ impl Hub {
                             }
                         });
                     }
-                    HubRequest::HandleWebrtcOffer { browser_identity, sdp } => {
+                    HubRequest::HandleWebrtcOffer {
+                        browser_identity,
+                        sdp,
+                    } => {
                         log::info!(
                             "[Lua] Processing WebRTC offer from {}",
                             &browser_identity[..browser_identity.len().min(8)]
                         );
                         self.handle_webrtc_offer(&sdp, &browser_identity);
                     }
-                    HubRequest::HandleIceCandidate { browser_identity, candidate } => {
+                    HubRequest::HandleIceCandidate {
+                        browser_identity,
+                        candidate,
+                    } => {
                         const MAX_QUEUED_ICE_PER_BROWSER: usize = 128;
                         let candidate_str = candidate
                             .get("candidate")
@@ -513,9 +688,11 @@ impl Hub {
 
                         if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
                             if let Err(e) = tokio::task::block_in_place(|| {
-                                self.tokio_runtime.block_on(
-                                    channel.handle_ice_candidate(candidate_str, sdp_mid, sdp_mline_index),
-                                )
+                                self.tokio_runtime.block_on(channel.handle_ice_candidate(
+                                    candidate_str,
+                                    sdp_mid,
+                                    sdp_mline_index,
+                                ))
                             }) {
                                 log::warn!(
                                     "[Lua] Failed to add ICE candidate for {}: {} (mid={:?}, mline={:?}, candidate='{}')",
@@ -594,12 +771,18 @@ impl Hub {
 
                 match request {
                     WorktreeRequest::Create {
-                        agent_key, branch, metadata, prompt, profile_name,
-                        client_rows, client_cols,
+                        agent_key,
+                        branch,
+                        metadata,
+                        prompt,
+                        profile_name,
+                        client_rows,
+                        client_cols,
                     } => {
                         log::info!(
                             "[Lua] Dispatching async worktree.create({}) for agent {}",
-                            branch, agent_key
+                            branch,
+                            agent_key
                         );
                         let worktree_base = self.config.worktree_base.clone();
                         let result_tx = self.worktree_result_tx.clone();
@@ -610,7 +793,8 @@ impl Hub {
                             let result = tokio::task::spawn_blocking(move || {
                                 let manager = WorktreeManager::new(worktree_base);
                                 manager.create_worktree_with_branch(&branch_clone)
-                            }).await;
+                            })
+                            .await;
 
                             let outcome = match result {
                                 Ok(Ok(path)) => Ok(path),
@@ -631,14 +815,17 @@ impl Hub {
                                 })
                                 .is_err()
                             {
-                                log::warn!("[Worktree] Result queue full/closed; dropping async result");
+                                log::warn!(
+                                    "[Worktree] Result queue full/closed; dropping async result"
+                                );
                             }
                         });
                     }
                     WorktreeRequest::Delete { path, branch } => {
                         log::info!(
                             "[Lua] Dispatching async worktree.delete({}, {})",
-                            path, branch
+                            path,
+                            branch
                         );
                         let worktree_base = self.config.worktree_base.clone();
                         let event_tx = self.hub_event_tx.clone();
@@ -652,7 +839,8 @@ impl Hub {
                                     std::path::Path::new(&path_clone),
                                     &branch_clone,
                                 )
-                            }).await;
+                            })
+                            .await;
 
                             let outcome = match result {
                                 Ok(Ok(())) => Ok(()),
@@ -660,26 +848,29 @@ impl Hub {
                                 Err(e) => Err(format!("spawn_blocking panicked: {e}")),
                             };
 
-                            let _ = event_tx.send(super::events::HubEvent::WorktreeDeleteCompleted {
-                                path,
-                                branch,
-                                result: outcome,
-                            });
+                            let _ =
+                                event_tx.send(super::events::HubEvent::WorktreeDeleteCompleted {
+                                    path,
+                                    branch,
+                                    result: outcome,
+                                });
                         });
                     }
                 }
             }
-            HubEvent::WorktreeDeleteCompleted { path, branch, result } => {
-                match result {
-                    Ok(()) => {
-                        log::info!("[Worktree] Async deletion complete: {} ({})", branch, path);
-                        self.handle_cache.remove_worktree_by_branch(&branch);
-                    }
-                    Err(e) => {
-                        log::error!("[Worktree] Async deletion failed for {}: {}", branch, e);
-                    }
+            HubEvent::WorktreeDeleteCompleted {
+                path,
+                branch,
+                result,
+            } => match result {
+                Ok(()) => {
+                    log::info!("[Worktree] Async deletion complete: {} ({})", branch, path);
+                    self.handle_cache.remove_worktree_by_branch(&branch);
                 }
-            }
+                Err(e) => {
+                    log::error!("[Worktree] Async deletion failed for {}: {}", branch, e);
+                }
+            },
             HubEvent::MessageDelivered { message_len } => {
                 log::info!("[MessageDelivery] Delivered message ({message_len} bytes)");
             }
@@ -689,11 +880,11 @@ impl Hub {
 
             // Store the session → agent mapping so BrokerPtyOutput can
             // be routed to the correct PtyHandle.
-            HubEvent::BrokerSessionRegistered { session_id, session_uuid } => {
-                log::debug!(
-                    "[Broker] Session {} → '{}'",
-                    session_id, session_uuid
-                );
+            HubEvent::BrokerSessionRegistered {
+                session_id,
+                session_uuid,
+            } => {
+                log::debug!("[Broker] Session {} → '{}'", session_id, session_uuid);
                 self.broker_sessions.insert(session_id, session_uuid);
             }
 
@@ -706,7 +897,8 @@ impl Hub {
                     } else {
                         log::debug!(
                             "[Broker] BrokerPtyOutput session={}: session '{}' not in cache",
-                            session_id, session_uuid
+                            session_id,
+                            session_uuid
                         );
                     }
                 } else {
@@ -717,14 +909,35 @@ impl Hub {
                 }
             }
 
-            // NOT sent in broker v1 (reader thread exits silently on child
-            // death). Retained for future use; logged but not acted upon.
-            HubEvent::BrokerPtyExited { session_id, session_uuid, exit_code } => {
+            HubEvent::BrokerPtyExited {
+                session_id,
+                session_uuid,
+                exit_code,
+            } => {
                 log::info!(
                     "[Broker] PtyExited session={} uuid='{}' exit={:?}",
-                    session_id, session_uuid, exit_code
+                    session_id,
+                    session_uuid,
+                    exit_code
                 );
                 self.broker_sessions.remove(&session_id);
+
+                // Bridge broker-side exit into the PtyHandle broadcast channel.
+                // This makes the notification watcher fire `process_exited` for
+                // live broker-owned sessions (without this, the Lua handler
+                // early-returns and no cleanup happens).
+                if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
+                    session_handle.pty().notify_process_exited(exit_code);
+                }
+
+                let data = serde_json::json!({
+                    "session_id": session_id,
+                    "session_uuid": session_uuid,
+                    "exit_code": exit_code,
+                });
+                if let Err(e) = self.lua.fire_json_event("broker_pty_exited", &data) {
+                    log::error!("[Broker] Failed to fire broker_pty_exited event: {e}");
+                }
             }
 
             HubEvent::SessionUnregistered { session_uuid } => {
@@ -763,7 +976,10 @@ impl Hub {
                     return;
                 }
 
-                if let Some(mut replaced) = self.webrtc_channels.insert(browser_identity.clone(), channel) {
+                if let Some(mut replaced) = self
+                    .webrtc_channels
+                    .insert(browser_identity.clone(), channel)
+                {
                     log::warn!(
                         "[WebRTC] Replaced existing channel on offer completion for {}, disconnecting replaced channel",
                         &browser_identity[..browser_identity.len().min(8)]
@@ -773,7 +989,9 @@ impl Hub {
                     });
                 }
 
-                if let Some(candidates) = self.webrtc_pending_ice_candidates.remove(&browser_identity) {
+                if let Some(candidates) =
+                    self.webrtc_pending_ice_candidates.remove(&browser_identity)
+                {
                     if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
                         for (candidate_generation, candidate) in candidates {
                             if candidate_generation != offer_generation {
@@ -803,9 +1021,11 @@ impl Hub {
                                 .map(|i| i as u16);
 
                             if let Err(e) = tokio::task::block_in_place(|| {
-                                self.tokio_runtime.block_on(
-                                    channel.handle_ice_candidate(candidate_str, sdp_mid, sdp_mline_index),
-                                )
+                                self.tokio_runtime.block_on(channel.handle_ice_candidate(
+                                    candidate_str,
+                                    sdp_mid,
+                                    sdp_mline_index,
+                                ))
                             }) {
                                 log::warn!(
                                     "[WebRTC] Failed to apply queued ICE candidate for {}: {} (gen={}, mid={:?}, mline={:?}, candidate='{}')",
@@ -834,6 +1054,10 @@ impl Hub {
                 }
             }
         }
+
+        // Resolve attach intents after every event so session registration and
+        // subscribe handling converge immediately without client-side retry loops.
+        self.process_pending_terminal_attaches();
     }
 
     /// Handle a single TUI request from the TuiRunner thread.
@@ -845,10 +1069,7 @@ impl Hub {
                     log::error!("[TUI] Lua message handling error: {}", e);
                 }
             }
-            TuiRequest::PtyInput {
-                session_uuid,
-                data,
-            } => {
+            TuiRequest::PtyInput { session_uuid, data } => {
                 // Track per-client focus state in Lua pty_clients
                 // (before notify_pty_input so focus is current).
                 if data == b"\x1b[I" {
@@ -864,7 +1085,8 @@ impl Hub {
                 } else {
                     log::warn!(
                         "[PTY-INPUT] No session for UUID {} (cache has {} agents)",
-                        session_uuid, self.handle_cache.len()
+                        session_uuid,
+                        self.handle_cache.len()
                     );
                 }
             }
@@ -874,9 +1096,11 @@ impl Hub {
     /// Handle a single binary PTY input from a browser (WebRTC).
     pub fn handle_pty_input(&mut self, input: crate::channel::webrtc::PtyInputIncoming) {
         if input.data == b"\x1b[I" {
-            self.lua.set_pty_focused(&input.session_uuid, &input.browser_identity, true);
+            self.lua
+                .set_pty_focused(&input.session_uuid, &input.browser_identity, true);
         } else if input.data == b"\x1b[O" {
-            self.lua.set_pty_focused(&input.session_uuid, &input.browser_identity, false);
+            self.lua
+                .set_pty_focused(&input.session_uuid, &input.browser_identity, false);
         }
         self.lua.notify_pty_input(&input.session_uuid);
 
@@ -940,7 +1164,10 @@ impl Hub {
                 .push(path.clone());
 
             let path_with_space = format!("{} ", path.display());
-            if let Err(e) = agent_handle.pty().write_input_direct(path_with_space.as_bytes()) {
+            if let Err(e) = agent_handle
+                .pty()
+                .write_input_direct(path_with_space.as_bytes())
+            {
                 log::error!("[FILE-INPUT] Failed to inject path into PTY: {e}");
             }
         }
@@ -951,11 +1178,17 @@ impl Hub {
         if let Some(files) = self.paste_files.remove(agent_key) {
             for path in &files {
                 if let Err(e) = std::fs::remove_file(path) {
-                    log::warn!("[FILE-INPUT] Failed to clean up paste file {}: {e}", path.display());
+                    log::warn!(
+                        "[FILE-INPUT] Failed to clean up paste file {}: {e}",
+                        path.display()
+                    );
                 }
             }
             if !files.is_empty() {
-                log::info!("[FILE-INPUT] Cleaned up {} paste file(s) for agent {agent_key}", files.len());
+                log::info!(
+                    "[FILE-INPUT] Cleaned up {} paste file(s) for agent {agent_key}",
+                    files.len()
+                );
             }
         }
     }
@@ -996,10 +1229,7 @@ impl Hub {
     }
 
     /// Handle a single worktree creation result.
-    pub fn handle_worktree_result(
-        &mut self,
-        result: crate::lua::primitives::WorktreeCreateResult,
-    ) {
+    pub fn handle_worktree_result(&mut self, result: crate::lua::primitives::WorktreeCreateResult) {
         match result.result {
             Ok(ref path) => {
                 let path_str = path.to_string_lossy().to_string();
@@ -1039,12 +1269,11 @@ impl Hub {
                     "branch": result.branch,
                     "error": error,
                 });
-                if let Err(e) =
-                    self.lua.fire_json_event("worktree_create_failed", &event_data)
+                if let Err(e) = self
+                    .lua
+                    .fire_json_event("worktree_create_failed", &event_data)
                 {
-                    log::error!(
-                        "[Worktree] Failed to fire worktree_create_failed event: {e}"
-                    );
+                    log::error!("[Worktree] Failed to fire worktree_create_failed event: {e}");
                 }
             }
         }
@@ -1075,7 +1304,6 @@ impl Hub {
         // Observers are populated by poll_webrtc_pty_output above.
         self.poll_pty_observers();
     }
-
 
     /// Poll user file watches created by `watch.directory()` in Lua.
     ///
@@ -1128,7 +1356,10 @@ impl Hub {
         // Abort any existing watcher for this key
         if let Some(old) = self.notification_watcher_handles.remove(&watcher_key) {
             old.abort();
-            log::debug!("[NotifWatcher] Aborted existing watcher for {}", watcher_key);
+            log::debug!(
+                "[NotifWatcher] Aborted existing watcher for {}",
+                watcher_key
+            );
         }
 
         let hub_tx = self.hub_event_tx.clone();
@@ -1150,7 +1381,10 @@ impl Hub {
                             session_name: session_name.clone(),
                             notification: notif,
                         };
-                        if hub_tx.send(super::events::HubEvent::PtyNotification(event)).is_err() {
+                        if hub_tx
+                            .send(super::events::HubEvent::PtyNotification(event))
+                            .is_err()
+                        {
                             log::warn!("[NotifWatcher] Hub event channel closed for {}", key);
                             break;
                         }
@@ -1158,7 +1392,8 @@ impl Hub {
                     Ok(PtyEvent::ProcessExited { exit_code }) => {
                         log::info!(
                             "[NotifWatcher] Process exited (code={:?}) for {}",
-                            exit_code, key
+                            exit_code,
+                            key
                         );
                         let event = super::events::HubEvent::PtyProcessExited {
                             agent_key: agent_key.clone(),
@@ -1503,7 +1738,10 @@ impl Hub {
         if let Some(state) = self.webrtc_send_tasks.remove(browser_identity) {
             drop(state.tx);
             state.task.abort();
-            log::debug!("[WebRTC] Stopped send task for {}", &browser_identity[..browser_identity.len().min(8)]);
+            log::debug!(
+                "[WebRTC] Stopped send task for {}",
+                &browser_identity[..browser_identity.len().min(8)]
+            );
         }
 
         // Stop DC ping task for this peer
@@ -1514,15 +1752,28 @@ impl Hub {
         // Close and remove stream multiplexer for this browser
         if let Some(mut mux) = self.stream_muxes.remove(browser_identity) {
             mux.close_all();
-            log::debug!("[WebRTC] Closed stream multiplexer for {}", &browser_identity[..browser_identity.len().min(8)]);
+            log::debug!(
+                "[WebRTC] Closed stream multiplexer for {}",
+                &browser_identity[..browser_identity.len().min(8)]
+            );
         }
 
         // Abort any PTY forwarders for this browser.
         // Forwarder keys are "{peer_id}:{session_uuid}" where peer_id = browser_identity
+        let peer_prefix = format!("{browser_identity}:");
         self.pty_forwarders.retain(|key, task| {
-            if key.starts_with(browser_identity) {
+            if key.starts_with(&peer_prefix) {
                 task.abort();
                 log::debug!("[WebRTC] Aborted PTY forwarder: {}", key);
+                false
+            } else {
+                true
+            }
+        });
+        self.pending_terminal_attaches.retain(|key, intent| {
+            if key.starts_with(&peer_prefix) {
+                intent.request.deactivate();
+                log::debug!("[WebRTC] Dropped pending terminal attach intent: {}", key);
                 false
             } else {
                 true
@@ -1592,7 +1843,10 @@ impl Hub {
                     // doesn't declare the connection stalled after 3 missed pongs.
                     let pong = serde_json::to_vec(&serde_json::json!({ "type": "dc_pong" }))
                         .expect("static JSON serialization cannot fail");
-                    self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: pong });
+                    self.try_send_to_peer(
+                        browser_identity,
+                        super::WebRtcSendItem::Json { data: pong },
+                    );
                     return;
                 }
                 "dc_pong" => {
@@ -1622,7 +1876,6 @@ impl Hub {
         if let Err(e) = self.lua.call_webrtc_message(browser_identity, msg) {
             log::error!("[WebRTC-LUA] Lua callback error: {e}");
         }
-
     }
 
     /// Poll WebSocket connections for events and fire Lua callbacks.
@@ -1653,10 +1906,11 @@ impl Hub {
             } => {
                 let handle = self.tokio_runtime.handle().clone();
                 let _guard = handle.enter();
-                let connection = crate::hub::action_cable_connection::ActionCableConnection::connect(
-                    &self.config.server_url,
-                    self.config.get_api_key(),
-                );
+                let connection =
+                    crate::hub::action_cable_connection::ActionCableConnection::connect(
+                        &self.config.server_url,
+                        self.config.get_api_key(),
+                    );
                 self.lua_ac_connections.insert(
                     connection_id.clone(),
                     LuaAcConnection {
@@ -1697,10 +1951,13 @@ impl Hub {
                         let handle = self.tokio_runtime.handle().clone();
                         Some(handle.spawn(async move {
                             while let Some(msg) = rx.recv().await {
-                                if tx.send(super::events::HubEvent::AcChannelMessage {
-                                    channel_id: ch_id.clone(),
-                                    message: msg,
-                                }).is_err() {
+                                if tx
+                                    .send(super::events::HubEvent::AcChannelMessage {
+                                        channel_id: ch_id.clone(),
+                                        message: msg,
+                                    })
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
@@ -1758,10 +2015,7 @@ impl Hub {
                             let _ = self.lua.lua_ref().remove_registry_value(key);
                         }
                     }
-                    log::info!(
-                        "[ActionCable-Lua] Channel '{}' unsubscribed",
-                        channel_id
-                    );
+                    log::info!("[ActionCable-Lua] Channel '{}' unsubscribed", channel_id);
                 } else {
                     log::warn!(
                         "[ActionCable-Lua] Unsubscribe failed: channel '{}' not found",
@@ -1772,7 +2026,8 @@ impl Hub {
 
             ActionCableRequest::Close { connection_id } => {
                 // Remove all channels belonging to this connection
-                let orphaned: Vec<String> = self.lua_ac_channels
+                let orphaned: Vec<String> = self
+                    .lua_ac_channels
                     .iter()
                     .filter(|(_, ch)| ch.connection_id == connection_id)
                     .map(|(id, _)| id.clone())
@@ -1813,10 +2068,7 @@ impl Hub {
     /// Handles connect/send/close operations. When connecting, spawns read and
     /// write tokio tasks. The read task sends `HubEvent::HubClientMessage` for
     /// each incoming JSON frame and `HubEvent::HubClientDisconnected` on EOF.
-    fn process_hub_client_request(
-        &mut self,
-        request: crate::lua::primitives::HubClientRequest,
-    ) {
+    fn process_hub_client_request(&mut self, request: crate::lua::primitives::HubClientRequest) {
         use crate::lua::primitives::hub_client::LuaHubClientConn;
         use crate::lua::primitives::HubClientRequest;
         use crate::socket::framing::{Frame, FrameDecoder};
@@ -1837,7 +2089,8 @@ impl Hub {
                 // required because hub_client.request() blocks the event loop
                 // thread via recv_timeout() — the event loop cannot process
                 // HubClientMessage while Lua is blocked.
-                let pending_requests2 = std::sync::Arc::clone(self.lua.hub_client_pending_requests());
+                let pending_requests2 =
+                    std::sync::Arc::clone(self.lua.hub_client_pending_requests());
 
                 // Use std UnixStream::connect (synchronous) and convert to tokio.
                 // Cannot use tokio's async connect here because we're inside the
@@ -1845,11 +2098,7 @@ impl Hub {
                 let std_stream = match std::os::unix::net::UnixStream::connect(&socket_path) {
                     Ok(s) => s,
                     Err(e) => {
-                        log::warn!(
-                            "[HubClient] Failed to connect to {}: {}",
-                            socket_path,
-                            e
-                        );
+                        log::warn!("[HubClient] Failed to connect to {}: {}", socket_path, e);
                         return;
                     }
                 };
@@ -1874,8 +2123,7 @@ impl Hub {
                 };
 
                 let (read_half, write_half) = stream.into_split();
-                let (frame_tx, mut frame_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
                 // Subscribe immediately (same as TuiBridge)
                 let sub_frame = Frame::Json(serde_json::json!({
@@ -2000,10 +2248,7 @@ impl Hub {
                             connection_id
                         );
                     } else {
-                        log::trace!(
-                            "[HubClient] Sent frame to '{}'",
-                            connection_id
-                        );
+                        log::trace!("[HubClient] Sent frame to '{}'", connection_id);
                     }
                 } else {
                     log::warn!(
@@ -2014,7 +2259,11 @@ impl Hub {
             }
 
             HubClientRequest::Close { connection_id } => {
-                if self.lua_hub_client_connections.remove(&connection_id).is_some() {
+                if self
+                    .lua_hub_client_connections
+                    .remove(&connection_id)
+                    .is_some()
+                {
                     // Clean up the callback registry entry and release the RegistryKey.
                     if let Ok(mut reg) = self.lua.hub_client_callback_registry().lock() {
                         if let Some(key) = reg.remove(&connection_id) {
@@ -2025,10 +2274,7 @@ impl Hub {
                     if let Ok(mut senders) = self.lua.hub_client_frame_senders().lock() {
                         senders.remove(&connection_id);
                     }
-                    log::info!(
-                        "[HubClient] Connection '{}' closed",
-                        connection_id
-                    );
+                    log::info!("[HubClient] Connection '{}' closed", connection_id);
                 } else {
                     log::warn!(
                         "[HubClient] Close failed: connection '{}' not found",
@@ -2068,7 +2314,9 @@ impl Hub {
     /// `handle_worktree_result()` via `select!`.
     #[cfg(test)]
     fn poll_worktree_results(&mut self) {
-        let Some(ref mut rx) = self.worktree_result_rx else { return; };
+        let Some(ref mut rx) = self.worktree_result_rx else {
+            return;
+        };
         let results: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for result in results {
             match result.result {
@@ -2117,56 +2365,79 @@ impl Hub {
                         "branch": result.branch,
                         "error": error,
                     });
-                    if let Err(e) =
-                        self.lua.fire_json_event("worktree_create_failed", &event_data)
+                    if let Err(e) = self
+                        .lua
+                        .fire_json_event("worktree_create_failed", &event_data)
                     {
-                        log::error!(
-                            "[Worktree] Failed to fire worktree_create_failed event: {e}"
-                        );
+                        log::error!("[Worktree] Failed to fire worktree_create_failed event: {e}");
                     }
                 }
             }
         }
     }
 
-    /// Create a PTY forwarder requested by Lua.
+    /// Send terminal attach state to a WebRTC subscription.
+    fn send_terminal_attach_state(
+        &self,
+        peer_id: &str,
+        subscription_id: &str,
+        session_uuid: &str,
+        state: &str,
+    ) {
+        let payload = serde_json::json!({
+            "type": "terminal_attach",
+            "subscriptionId": subscription_id,
+            "session_uuid": session_uuid,
+            "state": state,
+        });
+        match serde_json::to_vec(&payload) {
+            Ok(data) => self.try_send_to_peer(peer_id, super::WebRtcSendItem::Json { data }),
+            Err(e) => {
+                log::warn!(
+                    "[WebRTC] Failed to serialize terminal_attach state '{}': {}",
+                    state,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Try to attach a terminal forwarder immediately.
     ///
-    /// Spawns a new forwarder task that streams PTY output to WebRTC.
-    fn create_lua_pty_forwarder(&mut self, req: crate::lua::CreateForwarderRequest) {
+    /// Returns `true` when attached, `false` when the session is not yet
+    /// available in `HandleCache`.
+    fn try_attach_terminal_forwarder(&mut self, req: &crate::lua::CreateForwarderRequest) -> bool {
         let forwarder_key = format!("{}:{}", req.peer_id, req.session_uuid);
 
-        // Check if session exists
         let Some(session_handle) = self.handle_cache.get_session(&req.session_uuid) else {
-            log::warn!("[Lua] Cannot create forwarder: no session '{}'", req.session_uuid);
-            // Mark forwarder as inactive
-            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
-            return;
+            return false;
         };
 
-        let pty_handle = session_handle.pty();
+        let pty_handle = session_handle.pty().clone();
 
-        // Abort any existing forwarder for this key
+        // Abort any existing forwarder for this key.
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
             log::debug!("[Lua] Aborted existing PTY forwarder for {}", forwarder_key);
         }
 
-        // Get snapshot BEFORE subscribing to avoid duplicate data.
-        // If we subscribe first, PTY output between subscribe and snapshot
-        // gets both captured in the snapshot AND buffered as a live event.
-        let snapshot = pty_handle.get_snapshot();
-        let pty_rx = pty_handle.subscribe();
+        // Snapshot retrieval and subscription setup can block.
+        // Run it inside the spawned forwarder task so Hub event processing stays
+        // responsive while attach state is being prepared.
+        let pty_for_snapshot = pty_handle.clone();
 
-        // Spawn forwarder task
+        // Spawn forwarder task.
         let output_tx = self.webrtc_pty_output_tx.clone();
         let hub_event_tx = self.hub_event_tx.clone();
         let peer_id = req.peer_id.clone();
         let session_uuid = req.session_uuid.clone();
-        let prefix = req.prefix.unwrap_or_else(|| vec![0x01]);
-        let active_flag = req.active_flag;
+        let target_rows = req.rows;
+        let target_cols = req.cols;
+        let prefix = req.prefix.clone().unwrap_or_else(|| vec![0x01]);
+        let active_flag = req.active_flag.clone();
 
-        // Use browser-provided subscription ID for message routing
-        let subscription_id = req.subscription_id;
+        // Use browser-provided subscription ID for message routing.
+        let subscription_id = req.subscription_id.clone();
 
         let _guard = self.tokio_runtime.enter();
         let task = tokio::spawn(async move {
@@ -2176,6 +2447,46 @@ impl Hub {
                 "[Lua] Started PTY forwarder for peer {} session {}",
                 &peer_id[..peer_id.len().min(8)],
                 session_uuid
+            );
+
+            let (snapshot, mut pty_rx) = match tokio::task::spawn_blocking(move || {
+                if pty_for_snapshot.is_broker_backed() {
+                    let (current_rows, current_cols) = pty_for_snapshot.dims();
+                    if (current_rows, current_cols) == (target_rows, target_cols) {
+                        // Force a redraw pulse for full-screen TUIs. Resizing to the
+                        // same dimensions often does not trigger a redraw path.
+                        let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
+                        pty_for_snapshot.resize_direct(target_rows, bounce_cols);
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    pty_for_snapshot.resize_direct(target_rows, target_cols);
+                    // Broker-backed sessions redraw asynchronously after SIGWINCH.
+                    // Let a short settle window pass so replayed snapshot and
+                    // cursor state include that redraw.
+                    std::thread::sleep(std::time::Duration::from_millis(125));
+                }
+                let (snapshot, _kitty_enabled, _rows, _cols, pty_rx) =
+                    pty_for_snapshot.snapshot_and_subscribe_cached();
+                (snapshot, pty_rx)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    log::warn!(
+                        "[Lua] Snapshot fetch task failed for session {}: {}",
+                        session_uuid,
+                        e
+                    );
+                    (Vec::new(), pty_handle.subscribe())
+                }
+            };
+
+            log::debug!(
+                "[Lua] Snapshot bytes for peer {} session {}: {}",
+                &peer_id[..peer_id.len().min(8)],
+                session_uuid,
+                snapshot.len()
             );
 
             // Send terminal snapshot first (if any), chunked to fit within
@@ -2220,10 +2531,12 @@ impl Hub {
                                 "[Lua] WebRTC PTY output queue full during snapshot send for {}",
                                 &peer_id[..peer_id.len().min(8)]
                             );
-                            let _ = hub_event_tx.send(super::events::HubEvent::WebRtcIngressBackpressure {
-                                browser_identity: peer_id.clone(),
-                                source: "pty_output_snapshot_queue_full",
-                            });
+                            let _ = hub_event_tx.send(
+                                super::events::HubEvent::WebRtcIngressBackpressure {
+                                    browser_identity: peer_id.clone(),
+                                    source: "pty_output_snapshot_queue_full",
+                                },
+                            );
                             return;
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -2234,11 +2547,12 @@ impl Hub {
                 }
             }
 
-            let mut pty_rx = pty_rx;
             loop {
-                // Check if forwarder was stopped by Lua
+                // Check if forwarder was stopped by Lua.
                 {
-                    let active = active_flag.lock().expect("Forwarder active_flag mutex poisoned");
+                    let active = active_flag
+                        .lock()
+                        .expect("Forwarder active_flag mutex poisoned");
                     if !*active {
                         log::debug!("[Lua] PTY forwarder stopped by Lua");
                         break;
@@ -2247,7 +2561,7 @@ impl Hub {
 
                 match pty_rx.recv().await {
                     Ok(PtyEvent::Output(data)) => {
-                        // Send raw bytes with prefix
+                        // Send raw bytes with prefix.
                         let mut raw_message = Vec::with_capacity(prefix.len() + data.len());
                         raw_message.extend(&prefix);
                         raw_message.extend(&data);
@@ -2264,10 +2578,12 @@ impl Hub {
                                     "[Lua] WebRTC PTY output queue full for {}; forcing reconnect",
                                     &peer_id[..peer_id.len().min(8)]
                                 );
-                                let _ = hub_event_tx.send(super::events::HubEvent::WebRtcIngressBackpressure {
-                                    browser_identity: peer_id.clone(),
-                                    source: "pty_output_queue_full",
-                                });
+                                let _ = hub_event_tx.send(
+                                    super::events::HubEvent::WebRtcIngressBackpressure {
+                                        browser_identity: peer_id.clone(),
+                                        source: "pty_output_queue_full",
+                                    },
+                                );
                                 break;
                             }
                             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -2285,7 +2601,7 @@ impl Hub {
                         break;
                     }
                     Ok(_other_event) => {
-                        // Ignore other events
+                        // Ignore other events.
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!(
@@ -2295,17 +2611,16 @@ impl Hub {
                         );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        log::info!(
-                            "[Lua] PTY channel closed for session {}",
-                            session_uuid
-                        );
+                        log::info!("[Lua] PTY channel closed for session {}", session_uuid);
                         break;
                     }
                 }
             }
 
-            // Mark forwarder as inactive
-            *active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
+            // Mark forwarder as inactive.
+            *active_flag
+                .lock()
+                .expect("Forwarder active_flag mutex poisoned") = false;
 
             log::info!(
                 "[Lua] Stopped PTY forwarder for peer {} session {}",
@@ -2315,46 +2630,202 @@ impl Hub {
         });
 
         self.pty_forwarders.insert(forwarder_key, task);
+        true
+    }
+
+    /// Process pending terminal attach intents.
+    ///
+    /// Attach intents are created when a terminal subscription arrives before
+    /// the target session has been registered in `HandleCache`.
+    fn process_pending_terminal_attaches(&mut self) {
+        if self.pending_terminal_attaches.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut ready_keys = Vec::new();
+        let mut stale_keys = Vec::new();
+        let mut inactive_keys = Vec::new();
+
+        for (key, intent) in &self.pending_terminal_attaches {
+            if !intent.request.is_active() {
+                inactive_keys.push(key.clone());
+                continue;
+            }
+
+            if self
+                .handle_cache
+                .get_session(intent.request.session_uuid())
+                .is_some()
+            {
+                ready_keys.push(key.clone());
+                continue;
+            }
+
+            if now.duration_since(intent.requested_at) >= Self::TERMINAL_ATTACH_NOT_FOUND_TIMEOUT {
+                stale_keys.push(key.clone());
+            }
+        }
+
+        for key in inactive_keys {
+            self.pending_terminal_attaches.remove(&key);
+        }
+
+        for key in ready_keys {
+            let Some(intent) = self.pending_terminal_attaches.remove(&key) else {
+                continue;
+            };
+            if self.try_attach_pending_terminal_request(&intent.request) {
+                self.send_pending_terminal_attach_state(&intent.request, "attached");
+            } else {
+                // Session may have disappeared between lookup and attach attempt.
+                self.pending_terminal_attaches.insert(key, intent);
+            }
+        }
+
+        for key in stale_keys {
+            let Some(intent) = self.pending_terminal_attaches.remove(&key) else {
+                continue;
+            };
+            intent.request.deactivate();
+            self.send_pending_terminal_attach_state(&intent.request, "not_found");
+        }
+    }
+
+    fn try_attach_pending_terminal_request(
+        &mut self,
+        request: &PendingTerminalAttachRequest,
+    ) -> bool {
+        match request {
+            PendingTerminalAttachRequest::WebRtc(req) => self.try_attach_terminal_forwarder(req),
+            PendingTerminalAttachRequest::Tui(req) => self.try_attach_tui_terminal_forwarder(req),
+            PendingTerminalAttachRequest::Socket(req) => {
+                self.try_attach_socket_terminal_forwarder(req)
+            }
+        }
+    }
+
+    fn send_pending_terminal_attach_state(
+        &self,
+        request: &PendingTerminalAttachRequest,
+        state: &str,
+    ) {
+        if let PendingTerminalAttachRequest::WebRtc(req) = request {
+            self.send_terminal_attach_state(
+                &req.peer_id,
+                &req.subscription_id,
+                &req.session_uuid,
+                state,
+            );
+        }
+    }
+
+    fn replace_pending_terminal_attach(
+        &mut self,
+        forwarder_key: &str,
+        request: PendingTerminalAttachRequest,
+    ) {
+        if let Some(prev) = self.pending_terminal_attaches.remove(forwarder_key) {
+            prev.request.deactivate();
+        }
+
+        self.pending_terminal_attaches.insert(
+            forwarder_key.to_string(),
+            PendingTerminalAttach {
+                request,
+                requested_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Create a PTY forwarder requested by Lua.
+    ///
+    /// Spawns a new forwarder task that streams PTY output to WebRTC.
+    fn create_lua_pty_forwarder(&mut self, req: crate::lua::CreateForwarderRequest) {
+        let forwarder_key = format!("{}:{}", req.peer_id, req.session_uuid);
+
+        if self.try_attach_terminal_forwarder(&req) {
+            self.send_terminal_attach_state(
+                &req.peer_id,
+                &req.subscription_id,
+                &req.session_uuid,
+                "attached",
+            );
+            return;
+        }
+
+        self.replace_pending_terminal_attach(
+            &forwarder_key,
+            PendingTerminalAttachRequest::WebRtc(req.clone()),
+        );
+        self.send_terminal_attach_state(
+            &req.peer_id,
+            &req.subscription_id,
+            &req.session_uuid,
+            "pending",
+        );
     }
 
     /// Create a TUI PTY forwarder requested by Lua.
     ///
-    /// Spawns a forwarder task that streams PTY output to TUI via `tui_output_tx`.
-    /// Unlike the WebRTC forwarder, no encryption or subscription wrapping is needed.
-    fn create_lua_tui_pty_forwarder(&mut self, req: crate::lua::primitives::CreateTuiForwarderRequest) {
+    /// Uses pending-attach semantics so early subscribe calls are retried until
+    /// the session appears (or timeout), matching WebRTC behavior.
+    fn create_lua_tui_pty_forwarder(
+        &mut self,
+        req: crate::lua::primitives::CreateTuiForwarderRequest,
+    ) {
+        let forwarder_key = format!("tui:{}", req.session_uuid);
+
+        if self.try_attach_tui_terminal_forwarder(&req) {
+            return;
+        }
+
+        self.replace_pending_terminal_attach(
+            &forwarder_key,
+            PendingTerminalAttachRequest::Tui(req),
+        );
+    }
+
+    /// Try to attach a TUI PTY forwarder immediately.
+    ///
+    /// Returns `true` when attached, `false` when prerequisites are not ready.
+    fn try_attach_tui_terminal_forwarder(
+        &mut self,
+        req: &crate::lua::primitives::CreateTuiForwarderRequest,
+    ) -> bool {
         use crate::client::TuiOutput;
 
         let forwarder_key = format!("tui:{}", req.session_uuid);
 
         // Check if session exists
         let Some(session_handle) = self.handle_cache.get_session(&req.session_uuid) else {
-            log::warn!("[Lua-TUI] Cannot create forwarder: no session '{}'", req.session_uuid);
-            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
-            return;
+            return false;
         };
 
-        let pty_handle = session_handle.pty();
+        let pty_handle = session_handle.pty().clone();
 
         let Some(ref output_tx) = self.tui_output_tx else {
-            log::warn!("[Lua-TUI] Cannot create forwarder: no TUI output channel");
-            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
-            return;
+            return false;
         };
 
         // Abort any existing forwarder for this key
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
-            log::debug!("[Lua-TUI] Aborted existing PTY forwarder for {}", forwarder_key);
+            log::debug!(
+                "[Lua-TUI] Aborted existing PTY forwarder for {}",
+                forwarder_key
+            );
         }
 
-        // Get snapshot and kitty state BEFORE subscribing to avoid duplicate data.
-        let snapshot = pty_handle.get_snapshot();
-        let kitty_enabled = pty_handle.kitty_enabled();
-        let pty_rx = pty_handle.subscribe();
+        // Snapshot retrieval and subscription setup may block. Fetch them in
+        // the forwarder task so this handler never blocks the Hub event loop.
+        let pty_for_snapshot = pty_handle.clone();
 
         let sink = output_tx.clone();
         let session_uuid = req.session_uuid.clone();
-        let active_flag = req.active_flag;
+        let target_rows = req.rows;
+        let target_cols = req.cols;
+        let active_flag = Arc::clone(&req.active_flag);
         let wake_fd = self.tui_wake_fd;
 
         let _guard = self.tokio_runtime.enter();
@@ -2366,28 +2837,80 @@ impl Hub {
                 session_uuid
             );
 
-            // Send terminal snapshot first (if any)
-            if !snapshot.is_empty() {
-                log::debug!(
-                    "[Lua-TUI] Sending {} bytes of snapshot for session {}",
-                    snapshot.len(), session_uuid
-                );
-                if sink.send(TuiOutput::Scrollback {
+            let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, mut pty_rx) =
+                match tokio::task::spawn_blocking(move || {
+                    if pty_for_snapshot.is_broker_backed() {
+                        let (current_rows, current_cols) = pty_for_snapshot.dims();
+                        if (current_rows, current_cols) == (target_rows, target_cols) {
+                            // Force a redraw pulse for full-screen TUIs. Resizing to the
+                            // same dimensions often does not trigger a redraw path.
+                            let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
+                            pty_for_snapshot.resize_direct(target_rows, bounce_cols);
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                        }
+                        pty_for_snapshot.resize_direct(target_rows, target_cols);
+                        // Broker-backed sessions redraw asynchronously after SIGWINCH.
+                        // Let a short settle window pass so replayed snapshot and
+                        // cursor state include that redraw.
+                        std::thread::sleep(std::time::Duration::from_millis(125));
+                    }
+                    pty_for_snapshot.snapshot_and_subscribe_cached()
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        log::warn!(
+                            "[Lua-TUI] Snapshot fetch task failed for session {}: {}",
+                            session_uuid,
+                            e
+                        );
+                        (
+                            Vec::new(),
+                            false,
+                            target_rows,
+                            target_cols,
+                            pty_handle.subscribe(),
+                        )
+                    }
+                };
+
+            log::debug!(
+                "[Lua-TUI] Snapshot bytes for session {}: {}",
+                session_uuid,
+                snapshot.len()
+            );
+
+            // Always send a scrollback frame (even empty) so the TUI panel
+            // can transition out of Connecting and begin live streaming.
+            log::debug!(
+                "[Lua-TUI] Sending {} bytes of snapshot for session {}",
+                snapshot.len(),
+                session_uuid
+            );
+            if sink
+                .send(TuiOutput::Scrollback {
                     session_uuid: session_uuid.clone(),
+                    rows: snapshot_rows,
+                    cols: snapshot_cols,
                     data: snapshot,
                     kitty_enabled,
-                }).is_err() {
-                    log::trace!("[Lua-TUI] Output channel closed before snapshot sent");
-                    return;
-                }
-                if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+                })
+                .is_err()
+            {
+                log::trace!("[Lua-TUI] Output channel closed before snapshot sent");
+                return;
+            }
+            if let Some(fd) = wake_fd {
+                super::wake_tui_pipe(fd);
             }
 
-            let mut pty_rx = pty_rx;
             loop {
                 // Check if forwarder was stopped by Lua
                 {
-                    let active = active_flag.lock().expect("Forwarder active_flag mutex poisoned");
+                    let active = active_flag
+                        .lock()
+                        .expect("Forwarder active_flag mutex poisoned");
                     if !*active {
                         log::debug!("[Lua-TUI] PTY forwarder stopped by Lua");
                         break;
@@ -2408,18 +2931,26 @@ impl Hub {
                         loop {
                             match pty_rx.try_recv() {
                                 Ok(PtyEvent::Output(more)) => chunks.push(more),
-                                Ok(other) => { stashed = Some(other); break; }
+                                Ok(other) => {
+                                    stashed = Some(other);
+                                    break;
+                                }
                                 Err(_) => break,
                             }
                         }
-                        if sink.send(TuiOutput::OutputBatch {
-                            session_uuid: session_uuid.clone(),
-                            chunks,
-                        }).is_err() {
+                        if sink
+                            .send(TuiOutput::OutputBatch {
+                                session_uuid: session_uuid.clone(),
+                                chunks,
+                            })
+                            .is_err()
+                        {
                             log::trace!("[Lua-TUI] Output channel closed, stopping forwarder");
                             break;
                         }
-                        if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+                        if let Some(fd) = wake_fd {
+                            super::wake_tui_pipe(fd);
+                        }
 
                         // Process the stashed non-output event that was consumed
                         // during batching. These are rare (KittyChanged,
@@ -2435,7 +2966,9 @@ impl Hub {
                                         session_uuid: session_uuid.clone(),
                                         exit_code,
                                     });
-                                    if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+                                    if let Some(fd) = wake_fd {
+                                        super::wake_tui_pipe(fd);
+                                    }
                                     break; // exit forwarder on process exit
                                 }
                                 PtyEvent::KittyChanged(enabled) => {
@@ -2444,14 +2977,18 @@ impl Hub {
                                         "enabled": enabled,
                                         "session_uuid": session_uuid,
                                     })));
-                                    if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+                                    if let Some(fd) = wake_fd {
+                                        super::wake_tui_pipe(fd);
+                                    }
                                 }
                                 PtyEvent::FocusRequested => {
                                     let _ = sink.send(TuiOutput::Message(serde_json::json!({
                                         "type": "focus_requested",
                                         "session_uuid": session_uuid,
                                     })));
-                                    if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+                                    if let Some(fd) = wake_fd {
+                                        super::wake_tui_pipe(fd);
+                                    }
                                 }
                                 PtyEvent::Output(_) => unreachable!("output handled above"),
                                 _ => {} // Resized, Notification, etc. — not forwarded to TUI
@@ -2461,13 +2998,16 @@ impl Hub {
                     Ok(PtyEvent::ProcessExited { exit_code }) => {
                         log::info!(
                             "[Lua-TUI] PTY process exited (code={:?}) for session {}",
-                            exit_code, session_uuid
+                            exit_code,
+                            session_uuid
                         );
                         let _ = sink.send(TuiOutput::ProcessExited {
                             session_uuid: session_uuid.clone(),
                             exit_code,
                         });
-                        if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+                        if let Some(fd) = wake_fd {
+                            super::wake_tui_pipe(fd);
+                        }
                         break;
                     }
                     Ok(PtyEvent::KittyChanged(enabled)) => {
@@ -2476,34 +3016,38 @@ impl Hub {
                             "enabled": enabled,
                             "session_uuid": session_uuid,
                         })));
-                        if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+                        if let Some(fd) = wake_fd {
+                            super::wake_tui_pipe(fd);
+                        }
                     }
                     Ok(PtyEvent::FocusRequested) => {
                         let _ = sink.send(TuiOutput::Message(serde_json::json!({
                             "type": "focus_requested",
                             "session_uuid": session_uuid,
                         })));
-                        if let Some(fd) = wake_fd { super::wake_tui_pipe(fd); }
+                        if let Some(fd) = wake_fd {
+                            super::wake_tui_pipe(fd);
+                        }
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!(
                             "[Lua-TUI] PTY forwarder lagged by {} events for session {}",
-                            n, session_uuid
+                            n,
+                            session_uuid
                         );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        log::info!(
-                            "[Lua-TUI] PTY channel closed for session {}",
-                            session_uuid
-                        );
+                        log::info!("[Lua-TUI] PTY channel closed for session {}", session_uuid);
                         break;
                     }
                 }
             }
 
             // Mark forwarder as inactive
-            *active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
+            *active_flag
+                .lock()
+                .expect("Forwarder active_flag mutex poisoned") = false;
 
             log::info!(
                 "[Lua-TUI] Stopped PTY forwarder for session {}",
@@ -2512,46 +3056,69 @@ impl Hub {
         });
 
         self.pty_forwarders.insert(forwarder_key, task);
+        true
     }
 
     /// Create a socket PTY forwarder requested by Lua.
     ///
-    /// Spawns a forwarder task that streams PTY output as `Frame::PtyOutput`
-    /// to a specific socket client connection.
-    fn create_lua_socket_pty_forwarder(&mut self, req: crate::lua::primitives::CreateSocketForwarderRequest) {
+    /// Uses pending-attach semantics so early subscribe calls are retried until
+    /// the session appears (or timeout), matching WebRTC/TUI behavior.
+    fn create_lua_socket_pty_forwarder(
+        &mut self,
+        req: crate::lua::primitives::CreateSocketForwarderRequest,
+    ) {
+        let forwarder_key = format!("{}:{}", req.client_id, req.session_uuid);
+
+        if self.try_attach_socket_terminal_forwarder(&req) {
+            return;
+        }
+
+        self.replace_pending_terminal_attach(
+            &forwarder_key,
+            PendingTerminalAttachRequest::Socket(req),
+        );
+    }
+
+    /// Try to attach a socket PTY forwarder immediately.
+    ///
+    /// Returns `true` when attached, `false` when prerequisites are not ready.
+    fn try_attach_socket_terminal_forwarder(
+        &mut self,
+        req: &crate::lua::primitives::CreateSocketForwarderRequest,
+    ) -> bool {
         use crate::socket::framing::Frame;
 
         let forwarder_key = format!("{}:{}", req.client_id, req.session_uuid);
 
         let Some(session_handle) = self.handle_cache.get_session(&req.session_uuid) else {
-            log::warn!("[Lua-Socket] Cannot create forwarder: no session '{}'", req.session_uuid);
-            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
-            return;
+            return false;
         };
 
-        let pty_handle = session_handle.pty();
+        let pty_handle = session_handle.pty().clone();
 
         let Some(conn) = self.socket_clients.get(&req.client_id) else {
-            log::warn!("[Lua-Socket] Cannot create forwarder: no socket client {}", req.client_id);
-            *req.active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
-            return;
+            return false;
         };
 
         // Abort any existing forwarder for this key
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
-            log::debug!("[Lua-Socket] Aborted existing PTY forwarder for {}", forwarder_key);
+            log::debug!(
+                "[Lua-Socket] Aborted existing PTY forwarder for {}",
+                forwarder_key
+            );
         }
 
-        // Get snapshot and kitty state BEFORE subscribing to avoid duplicate data.
-        let snapshot = pty_handle.get_snapshot();
-        let kitty_enabled = pty_handle.kitty_enabled();
-        let pty_rx = pty_handle.subscribe();
+        // Snapshot retrieval and subscription setup may block. Fetch them in
+        // the forwarder task so this handler never blocks the Hub event loop.
+        let pty_for_snapshot = pty_handle.clone();
 
         // Clone the frame sender from the connection — we only need to send encoded frames.
         let frame_tx = conn.frame_sender();
         let session_uuid = req.session_uuid.clone();
-        let active_flag = req.active_flag;
+        let target_rows = req.rows;
+        let target_cols = req.cols;
+        let active_flag = Arc::clone(&req.active_flag);
         let client_id = req.client_id.clone();
         let hub_event_tx = self.hub_event_tx.clone();
 
@@ -2561,39 +3128,88 @@ impl Hub {
 
             log::info!(
                 "[Lua-Socket] Started PTY forwarder for {} session {}",
-                client_id, session_uuid
+                client_id,
+                session_uuid
             );
 
-            // Send scrollback snapshot first
-            if !snapshot.is_empty() {
-                let frame = Frame::Scrollback {
-                    session_uuid: session_uuid.clone(),
-                    kitty_enabled,
-                    data: snapshot,
-                };
-                match frame_tx.try_send(frame.encode()) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, mut pty_rx) =
+                match tokio::task::spawn_blocking(move || {
+                    if pty_for_snapshot.is_broker_backed() {
+                        let (current_rows, current_cols) = pty_for_snapshot.dims();
+                        if (current_rows, current_cols) == (target_rows, target_cols) {
+                            // Force a redraw pulse for full-screen TUIs. Resizing to the
+                            // same dimensions often does not trigger a redraw path.
+                            let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
+                            pty_for_snapshot.resize_direct(target_rows, bounce_cols);
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                        }
+                        pty_for_snapshot.resize_direct(target_rows, target_cols);
+                        // Broker-backed sessions redraw asynchronously after SIGWINCH.
+                        // Let a short settle window pass so replayed snapshot and
+                        // cursor state include that redraw.
+                        std::thread::sleep(std::time::Duration::from_millis(125));
+                    }
+                    pty_for_snapshot.snapshot_and_subscribe_cached()
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
                         log::warn!(
-                            "[Lua-Socket] Outbound queue full for {}, forcing reconnect",
-                            client_id
+                            "[Lua-Socket] Snapshot fetch task failed for {} session {}: {}",
+                            client_id,
+                            session_uuid,
+                            e
                         );
-                        let _ = hub_event_tx.send(super::events::HubEvent::SocketClientDisconnected {
-                            client_id: client_id.clone(),
-                        });
-                        return;
+                        (
+                            Vec::new(),
+                            false,
+                            target_rows,
+                            target_cols,
+                            pty_handle.subscribe(),
+                        )
                     }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        log::trace!("[Lua-Socket] Frame channel closed before snapshot sent");
-                        return;
-                    }
+                };
+
+            log::debug!(
+                "[Lua-Socket] Snapshot bytes for {} session {}: {}",
+                client_id,
+                session_uuid,
+                snapshot.len()
+            );
+
+            // Always send a scrollback frame (even empty) so clients can
+            // deterministically leave connecting state after subscribe.
+            let frame = Frame::Scrollback {
+                session_uuid: session_uuid.clone(),
+                rows: snapshot_rows,
+                cols: snapshot_cols,
+                kitty_enabled,
+                data: snapshot,
+            };
+            match frame_tx.try_send(frame.encode()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    log::warn!(
+                        "[Lua-Socket] Outbound queue full for {}, forcing reconnect",
+                        client_id
+                    );
+                    let _ = hub_event_tx.send(super::events::HubEvent::SocketClientDisconnected {
+                        client_id: client_id.clone(),
+                    });
+                    return;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    log::trace!("[Lua-Socket] Frame channel closed before snapshot sent");
+                    return;
                 }
             }
 
-            let mut pty_rx = pty_rx;
             loop {
                 {
-                    let active = active_flag.lock().expect("Forwarder active_flag mutex poisoned");
+                    let active = active_flag
+                        .lock()
+                        .expect("Forwarder active_flag mutex poisoned");
                     if !*active {
                         log::debug!("[Lua-Socket] PTY forwarder stopped by Lua");
                         break;
@@ -2613,13 +3229,17 @@ impl Hub {
                                     "[Lua-Socket] Outbound queue full for {}, forcing reconnect",
                                     client_id
                                 );
-                                let _ = hub_event_tx.send(super::events::HubEvent::SocketClientDisconnected {
-                                    client_id: client_id.clone(),
-                                });
+                                let _ = hub_event_tx.send(
+                                    super::events::HubEvent::SocketClientDisconnected {
+                                        client_id: client_id.clone(),
+                                    },
+                                );
                                 break;
                             }
                             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                log::trace!("[Lua-Socket] Frame channel closed, stopping forwarder");
+                                log::trace!(
+                                    "[Lua-Socket] Frame channel closed, stopping forwarder"
+                                );
                                 break;
                             }
                         }
@@ -2627,7 +3247,9 @@ impl Hub {
                     Ok(PtyEvent::ProcessExited { exit_code }) => {
                         log::info!(
                             "[Lua-Socket] PTY process exited (code={:?}) for {} session {}",
-                            exit_code, client_id, session_uuid
+                            exit_code,
+                            client_id,
+                            session_uuid
                         );
                         let frame = Frame::ProcessExited {
                             session_uuid: session_uuid.clone(),
@@ -2655,32 +3277,42 @@ impl Hub {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!(
                             "[Lua-Socket] PTY forwarder lagged by {} events for {} session {}",
-                            n, client_id, session_uuid
+                            n,
+                            client_id,
+                            session_uuid
                         );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         log::info!(
                             "[Lua-Socket] PTY channel closed for {} session {}",
-                            client_id, session_uuid
+                            client_id,
+                            session_uuid
                         );
                         break;
                     }
                 }
             }
 
-            *active_flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
+            *active_flag
+                .lock()
+                .expect("Forwarder active_flag mutex poisoned") = false;
 
             log::info!(
                 "[Lua-Socket] Stopped PTY forwarder for {} session {}",
-                client_id, session_uuid
+                client_id,
+                session_uuid
             );
         });
 
         self.pty_forwarders.insert(forwarder_key, task);
+        true
     }
 
     /// Stop a PTY forwarder by ID.
     fn stop_lua_pty_forwarder(&mut self, forwarder_id: &str) {
+        if let Some(pending) = self.pending_terminal_attaches.remove(forwarder_id) {
+            pending.request.deactivate();
+        }
         if let Some(task) = self.pty_forwarders.remove(forwarder_id) {
             task.abort();
             log::debug!("[Lua] Stopped PTY forwarder {}", forwarder_id);
@@ -2695,7 +3327,9 @@ impl Hub {
     /// `handle_pty_input()` via `select!`.
     #[cfg(test)]
     fn poll_pty_input(&mut self) {
-        let Some(ref mut rx) = self.pty_input_rx else { return; };
+        let Some(ref mut rx) = self.pty_input_rx else {
+            return;
+        };
         let inputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for input in inputs {
             if let Some(session_handle) = self.handle_cache.get_session(&input.session_uuid) {
@@ -2715,7 +3349,9 @@ impl Hub {
     fn poll_stream_frames_incoming(&mut self) {
         use crate::relay::stream_mux::StreamMultiplexer;
 
-        let Some(ref mut rx) = self.stream_frame_rx else { return; };
+        let Some(ref mut rx) = self.stream_frame_rx else {
+            return;
+        };
         let frames: Vec<crate::channel::webrtc::StreamIncoming> =
             std::iter::from_fn(|| rx.try_recv().ok()).collect();
 
@@ -2873,9 +3509,8 @@ impl Hub {
         };
 
         let sender = channel.sender();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<super::WebRtcSendItem>(
-            super::PEER_SEND_CHANNEL_CAPACITY,
-        );
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<super::WebRtcSendItem>(super::PEER_SEND_CHANNEL_CAPACITY);
         let dead = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dead_clone = std::sync::Arc::clone(&dead);
         let bi = browser_identity.to_string();
@@ -2885,23 +3520,29 @@ impl Hub {
                 let result = tokio::time::timeout(
                     super::PEER_SEND_TIMEOUT,
                     Self::execute_send(&sender, item),
-                ).await;
+                )
+                .await;
 
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         let msg = e.to_string();
-                        if msg.contains("not opened") || msg.contains("No data channel")
+                        if msg.contains("not opened")
+                            || msg.contains("No data channel")
                             || msg.contains("No peer connection")
                         {
                             log::warn!(
                                 "[WebRTC-Send] Peer {} dead ({}), exiting send task",
-                                &bi[..bi.len().min(8)], msg
+                                &bi[..bi.len().min(8)],
+                                msg
                             );
                             dead_clone.store(true, std::sync::atomic::Ordering::Relaxed);
                             break;
                         }
-                        log::warn!("[WebRTC-Send] Send error for {}: {e}", &bi[..bi.len().min(8)]);
+                        log::warn!(
+                            "[WebRTC-Send] Send error for {}: {e}",
+                            &bi[..bi.len().min(8)]
+                        );
                     }
                     Err(_elapsed) => {
                         log::warn!(
@@ -2913,7 +3554,10 @@ impl Hub {
                     }
                 }
             }
-            log::debug!("[WebRTC-Send] Send task exiting for {}", &bi[..bi.len().min(8)]);
+            log::debug!(
+                "[WebRTC-Send] Send task exiting for {}",
+                &bi[..bi.len().min(8)]
+            );
         });
 
         self.webrtc_send_tasks.insert(
@@ -2930,17 +3574,20 @@ impl Hub {
         item: super::WebRtcSendItem,
     ) -> Result<(), crate::channel::ChannelError> {
         match item {
-            super::WebRtcSendItem::Pty { subscription_id, data } => {
-                sender.send_pty_raw(&subscription_id, &data).await
-            }
-            super::WebRtcSendItem::Json { data } => {
-                sender.send_json(&data).await
-            }
-            super::WebRtcSendItem::Binary { data } => {
-                sender.send_json(&data).await
-            }
-            super::WebRtcSendItem::Stream { frame_type, stream_id, payload } => {
-                sender.send_stream_raw(frame_type, stream_id, &payload).await
+            super::WebRtcSendItem::Pty {
+                subscription_id,
+                data,
+            } => sender.send_pty_raw(&subscription_id, &data).await,
+            super::WebRtcSendItem::Json { data } => sender.send_json(&data).await,
+            super::WebRtcSendItem::Binary { data } => sender.send_json(&data).await,
+            super::WebRtcSendItem::Stream {
+                frame_type,
+                stream_id,
+                payload,
+            } => {
+                sender
+                    .send_stream_raw(frame_type, stream_id, &payload)
+                    .await
             }
             super::WebRtcSendItem::BundleRefresh { bundle_bytes } => {
                 sender.send_bundle_refresh(&bundle_bytes).await
@@ -2994,7 +3641,8 @@ impl Hub {
             }
         });
 
-        self.dc_ping_tasks.insert(browser_identity.to_string(), task);
+        self.dc_ping_tasks
+            .insert(browser_identity.to_string(), task);
     }
 
     /// Poll for queued PTY output and send via WebRTC.
@@ -3034,7 +3682,11 @@ impl Hub {
             msg.data
         };
 
-        if !self.send_webrtc_raw(&msg.subscription_id, &msg.browser_identity, final_data.clone()) {
+        if !self.send_webrtc_raw(
+            &msg.subscription_id,
+            &msg.browser_identity,
+            final_data.clone(),
+        ) {
             log::warn!(
                 "[WebRTC] DataChannel not open for {}, cleaning up dead channel",
                 &msg.browser_identity[..msg.browser_identity.len().min(8)]
@@ -3066,12 +3718,12 @@ impl Hub {
         const DRAIN_BUDGET: usize = 256;
 
         // Drain pending PTY output messages (budget-limited)
-        let Some(ref mut rx) = self.webrtc_pty_output_rx else { return; };
-        let messages: Vec<WebRtcPtyOutput> = std::iter::from_fn(|| {
-            rx.try_recv().ok()
-        })
-        .take(DRAIN_BUDGET)
-        .collect();
+        let Some(ref mut rx) = self.webrtc_pty_output_rx else {
+            return;
+        };
+        let messages: Vec<WebRtcPtyOutput> = std::iter::from_fn(|| rx.try_recv().ok())
+            .take(DRAIN_BUDGET)
+            .collect();
 
         // Track how many messages were drained for regression testing.
         #[cfg(test)]
@@ -3083,8 +3735,7 @@ impl Hub {
         let has_observers = self.lua.has_observers("pty_output");
 
         // Circuit breaker: peers whose DataChannel is dead (skip further sends)
-        let mut dead_peers: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut dead_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for msg in messages {
             // Skip peers with dead DataChannels
@@ -3112,7 +3763,11 @@ impl Hub {
             };
 
             // Fast path: send to browser immediately
-            if !self.send_webrtc_raw(&msg.subscription_id, &msg.browser_identity, final_data.clone()) {
+            if !self.send_webrtc_raw(
+                &msg.subscription_id,
+                &msg.browser_identity,
+                final_data.clone(),
+            ) {
                 log::warn!(
                     "[WebRTC] DataChannel not open for {}, skipping remaining PTY output this tick",
                     &msg.browser_identity[..msg.browser_identity.len().min(8)]
@@ -3161,7 +3816,8 @@ impl Hub {
             let Some(notification) = self.pty_observer_queue.pop_front() else {
                 break;
             };
-            self.lua.notify_pty_output_observers(&notification.ctx, &notification.data);
+            self.lua
+                .notify_pty_output_observers(&notification.ctx, &notification.data);
         }
     }
 
@@ -3190,10 +3846,7 @@ impl Hub {
                         log::error!("[TUI] Lua message handling error: {}", e);
                     }
                 }
-                TuiRequest::PtyInput {
-                    session_uuid,
-                    data,
-                } => {
+                TuiRequest::PtyInput { session_uuid, data } => {
                     if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
                         if let Err(e) = session_handle.pty().write_input_direct(&data) {
                             log::error!("[PTY-INPUT] Write failed: {e}");
@@ -3214,7 +3867,9 @@ impl Hub {
     fn poll_outgoing_webrtc_signals(&mut self) {
         use crate::channel::webrtc::OutgoingSignal;
 
-        let Some(ref mut rx) = self.webrtc_outgoing_signal_rx else { return; };
+        let Some(ref mut rx) = self.webrtc_outgoing_signal_rx else {
+            return;
+        };
         let signals: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for signal in signals {
             match signal {
@@ -3267,8 +3922,7 @@ impl Hub {
                 .webrtc_channels
                 .keys()
                 .filter(|id| {
-                    *id != browser_identity
-                        && crate::relay::extract_olm_key(id) == olm_key
+                    *id != browser_identity && crate::relay::extract_olm_key(id) == olm_key
                 })
                 .cloned()
                 .collect();
@@ -3287,16 +3941,16 @@ impl Hub {
                     log::debug!("[WebRTC] Previous connection already closed");
                 } else {
                     match tokio::task::block_in_place(|| {
-                        self.tokio_runtime.block_on(
-                            tokio::time::timeout(
-                                std::time::Duration::from_millis(500),
-                                close_rx.wait_for(|v| *v),
-                            )
-                        )
+                        self.tokio_runtime.block_on(tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            close_rx.wait_for(|v| *v),
+                        ))
                     }) {
                         Ok(Ok(_)) => log::debug!("[WebRTC] Previous connection sockets released"),
                         Ok(Err(_)) => log::debug!("[WebRTC] Close channel dropped, proceeding"),
-                        Err(_) => log::debug!("[WebRTC] Previous connection still closing, proceeding anyway"),
+                        Err(_) => log::debug!(
+                            "[WebRTC] Previous connection still closing, proceeding anyway"
+                        ),
                     }
                 }
             }
@@ -3327,9 +3981,9 @@ impl Hub {
             };
 
             // Connect the channel (sets up config — fast, does not fetch ICE).
-            if let Err(e) = tokio::task::block_in_place(|| {
-                self.tokio_runtime.block_on(channel.connect(config))
-            }) {
+            if let Err(e) =
+                tokio::task::block_in_place(|| self.tokio_runtime.block_on(channel.connect(config)))
+            {
                 log::error!("[WebRTC] Failed to configure channel: {e}");
                 return;
             }
@@ -3345,7 +3999,10 @@ impl Hub {
         // Remove the channel from the HashMap to pass it owned to the async task.
         // The task will re-insert it via HubEvent::WebRtcOfferCompleted.
         let Some(channel) = self.webrtc_channels.remove(browser_identity) else {
-            log::error!("[WebRTC] Channel missing after setup for {}", &browser_identity[..browser_identity.len().min(8)]);
+            log::error!(
+                "[WebRTC] Channel missing after setup for {}",
+                &browser_identity[..browser_identity.len().min(8)]
+            );
             return;
         };
 
@@ -3388,7 +4045,9 @@ impl Hub {
                             Ok(envelope) => match serde_json::to_value(&envelope) {
                                 Ok(v) => Some(v),
                                 Err(e) => {
-                                    log::error!("[WebRTC] Failed to serialize answer envelope: {e}");
+                                    log::error!(
+                                        "[WebRTC] Failed to serialize answer envelope: {e}"
+                                    );
                                     None
                                 }
                             },
@@ -3442,7 +4101,10 @@ impl Hub {
                 return;
             }
         };
-        self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: payload });
+        self.try_send_to_peer(
+            browser_identity,
+            super::WebRtcSendItem::Json { data: payload },
+        );
         log::info!(
             "[WebPush] Queued VAPID public key for {}",
             &browser_identity[..browser_identity.len().min(8)]
@@ -3491,9 +4153,8 @@ impl Hub {
             .upsert(storage_key.clone(), subscription);
 
         // Persist to encrypted storage
-        if let Err(e) = crate::relay::persistence::save_push_subscriptions(
-            &self.push_subscriptions,
-        ) {
+        if let Err(e) = crate::relay::persistence::save_push_subscriptions(&self.push_subscriptions)
+        {
             log::error!("[WebPush] Failed to save push subscriptions: {e}");
         }
 
@@ -3515,22 +4176,20 @@ impl Hub {
         // Load existing or generate fresh keys
         let keys = match crate::relay::persistence::load_vapid_keys() {
             Ok(Some(existing)) => existing,
-            Ok(None) => {
-                match crate::notifications::vapid::VapidKeys::generate() {
-                    Ok(new_keys) => {
-                        if let Err(e) = crate::relay::persistence::save_vapid_keys(&new_keys) {
-                            log::error!("[WebPush] Failed to save generated VAPID keys: {e}");
-                            return;
-                        }
-                        log::info!("[WebPush] Generated and saved new device-level VAPID keys");
-                        new_keys
-                    }
-                    Err(e) => {
-                        log::error!("[WebPush] Failed to generate VAPID keys: {e}");
+            Ok(None) => match crate::notifications::vapid::VapidKeys::generate() {
+                Ok(new_keys) => {
+                    if let Err(e) = crate::relay::persistence::save_vapid_keys(&new_keys) {
+                        log::error!("[WebPush] Failed to save generated VAPID keys: {e}");
                         return;
                     }
+                    log::info!("[WebPush] Generated and saved new device-level VAPID keys");
+                    new_keys
                 }
-            }
+                Err(e) => {
+                    log::error!("[WebPush] Failed to generate VAPID keys: {e}");
+                    return;
+                }
+            },
             Err(e) => {
                 log::error!("[WebPush] Failed to load VAPID keys: {e}");
                 return;
@@ -3563,8 +4222,7 @@ impl Hub {
             }
         };
 
-        let keys = match crate::notifications::vapid::VapidKeys::from_base64url(pub_key, priv_key)
-        {
+        let keys = match crate::notifications::vapid::VapidKeys::from_base64url(pub_key, priv_key) {
             Ok(k) => k,
             Err(e) => {
                 log::error!("[WebPush] Invalid VAPID keys in vapid_key_set: {e}");
@@ -3632,7 +4290,10 @@ impl Hub {
                 return;
             }
         };
-        self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: payload });
+        self.try_send_to_peer(
+            browser_identity,
+            super::WebRtcSendItem::Json { data: payload },
+        );
         log::info!("[WebPush] Queued VAPID keypair for browser copy");
     }
 
@@ -3646,7 +4307,10 @@ impl Hub {
                 return;
             }
         };
-        self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: payload });
+        self.try_send_to_peer(
+            browser_identity,
+            super::WebRtcSendItem::Json { data: payload },
+        );
     }
 
     /// Handle a test push request from the browser.
@@ -3728,9 +4392,8 @@ impl Hub {
             log::info!("[WebPush] Test push: {sent} sent, {} stale", stale.len());
 
             if !stale.is_empty() {
-                let _ = event_tx.send(super::events::HubEvent::PushSubscriptionsExpired {
-                    identities: stale,
-                });
+                let _ = event_tx
+                    .send(super::events::HubEvent::PushSubscriptionsExpired { identities: stale });
             }
         });
     }
@@ -3745,7 +4408,10 @@ impl Hub {
                 return;
             }
         };
-        self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: payload });
+        self.try_send_to_peer(
+            browser_identity,
+            super::WebRtcSendItem::Json { data: payload },
+        );
     }
 
     /// Handle browser request to disable push notifications.
@@ -3755,9 +4421,8 @@ impl Hub {
     fn handle_push_disable(&mut self, browser_identity: &str) {
         // Clear all stored push subscriptions
         self.push_subscriptions = crate::notifications::push::PushSubscriptionStore::default();
-        if let Err(e) = crate::relay::persistence::save_push_subscriptions(
-            &self.push_subscriptions,
-        ) {
+        if let Err(e) = crate::relay::persistence::save_push_subscriptions(&self.push_subscriptions)
+        {
             log::error!("[WebPush] Failed to clear push subscriptions: {e}");
         }
 
@@ -3774,7 +4439,10 @@ impl Hub {
                 return;
             }
         };
-        self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: payload });
+        self.try_send_to_peer(
+            browser_identity,
+            super::WebRtcSendItem::Json { data: payload },
+        );
     }
 
     /// Handle push status check from the device settings page.
@@ -3783,11 +4451,7 @@ impl Hub {
     /// to determine which notification buttons to show. Responds with the
     /// authoritative CLI state: whether VAPID keys exist and whether this
     /// specific browser has a stored push subscription.
-    fn handle_push_status_request(
-        &mut self,
-        browser_identity: &str,
-        msg: &serde_json::Value,
-    ) {
+    fn handle_push_status_request(&mut self, browser_identity: &str, msg: &serde_json::Value) {
         let has_keys = self.vapid_keys.is_some();
 
         // Use stable browser_id when available, fall back to ephemeral identity
@@ -3799,7 +4463,10 @@ impl Hub {
 
         let browser_subscribed = self.push_subscriptions.contains(browser_id);
 
-        let vapid_pub = self.vapid_keys.as_ref().map(|k| k.public_key_base64url().to_string());
+        let vapid_pub = self
+            .vapid_keys
+            .as_ref()
+            .map(|k| k.public_key_base64url().to_string());
 
         let response = serde_json::json!({
             "type": "push_status",
@@ -3815,7 +4482,10 @@ impl Hub {
                 return;
             }
         };
-        self.try_send_to_peer(browser_identity, super::WebRtcSendItem::Json { data: payload });
+        self.try_send_to_peer(
+            browser_identity,
+            super::WebRtcSendItem::Json { data: payload },
+        );
         log::info!(
             "[WebPush] Queued push_status for {} (has_keys={has_keys}, subscribed={browser_subscribed})",
             &browser_identity[..browser_identity.len().min(8)]
@@ -3959,8 +4629,15 @@ impl Hub {
         // Forward any extra Lua fields to the top-level payload (e.g. app_badge).
         // This keeps Rust generic — Lua uses Declarative Web Push field names directly.
         const CONSUMED_KEYS: &[&str] = &[
-            "kind", "title", "body", "url", "icon", "tag", "id",
-            "web_push", "notification", // prevent overwriting structured fields
+            "kind",
+            "title",
+            "body",
+            "url",
+            "icon",
+            "tag",
+            "id",
+            "web_push",
+            "notification", // prevent overwriting structured fields
         ];
         if let Some(obj) = lua {
             for (key, value) in obj {
@@ -4010,9 +4687,8 @@ impl Hub {
             }
 
             if !stale.is_empty() {
-                let _ = event_tx.send(super::events::HubEvent::PushSubscriptionsExpired {
-                    identities: stale,
-                });
+                let _ = event_tx
+                    .send(super::events::HubEvent::PushSubscriptionsExpired { identities: stale });
             }
         });
     }
@@ -4040,12 +4716,14 @@ impl Hub {
         // Store server-assigned ID (used for all server communication)
         self.botster_id = Some(botster_id.clone());
         // Sync to shared copy for Lua primitives
-        *self.shared_server_id.lock().expect("SharedServerId mutex poisoned") = Some(botster_id);
+        *self
+            .shared_server_id
+            .lock()
+            .expect("SharedServerId mutex poisoned") = Some(botster_id);
         // Keep runtime manifest aligned with server-assigned hub ID.
-        if let Err(e) = crate::hub::daemon::write_manifest(
-            &self.hub_identifier,
-            self.botster_id.as_deref(),
-        ) {
+        if let Err(e) =
+            crate::hub::daemon::write_manifest(&self.hub_identifier, self.botster_id.as_deref())
+        {
             log::warn!("Failed to refresh hub manifest after server registration: {e}");
         }
     }
@@ -4064,9 +4742,7 @@ impl Hub {
             }
             Ok(None) => {
                 // Try legacy per-hub keys (migration from earlier versions)
-                match crate::relay::persistence::load_legacy_hub_vapid_keys(
-                    &self.hub_identifier,
-                ) {
+                match crate::relay::persistence::load_legacy_hub_vapid_keys(&self.hub_identifier) {
                     Ok(Some(legacy_keys)) => {
                         log::info!("[WebPush] Migrating legacy per-hub VAPID keys to device level");
                         if let Err(e) = crate::relay::persistence::save_vapid_keys(&legacy_keys) {
@@ -4075,7 +4751,9 @@ impl Hub {
                         self.vapid_keys = Some(legacy_keys);
                     }
                     Ok(None) => {
-                        log::debug!("[WebPush] No VAPID keys yet (browser will trigger generation)");
+                        log::debug!(
+                            "[WebPush] No VAPID keys yet (browser will trigger generation)"
+                        );
                     }
                     Err(e) => log::error!("[WebPush] Failed to load legacy VAPID keys: {e}"),
                 }
@@ -4093,9 +4771,7 @@ impl Hub {
                         "[WebPush] Removed {} duplicate subscription(s) (same endpoint, different identity)",
                         removed
                     );
-                    if let Err(e) = crate::relay::persistence::save_push_subscriptions(
-                        &store,
-                    ) {
+                    if let Err(e) = crate::relay::persistence::save_push_subscriptions(&store) {
                         log::error!("[WebPush] Failed to save deduped subscriptions: {e}");
                     }
                 }
@@ -4175,7 +4851,65 @@ impl Hub {
 }
 
 #[cfg(test)]
+mod cargo_profile_tests {
+    use super::{detect_running_cargo_profile, detect_running_target_dir, CargoBuildProfile};
+    use std::path::Path;
+
+    #[test]
+    fn detects_debug_profile_from_target_path() {
+        let exe = Path::new("/repo/target/debug/botster");
+        assert_eq!(
+            detect_running_cargo_profile(exe),
+            Some(CargoBuildProfile::Debug)
+        );
+    }
+
+    #[test]
+    fn detects_release_profile_from_target_path() {
+        let exe = Path::new("/repo/target/release/botster");
+        assert_eq!(
+            detect_running_cargo_profile(exe),
+            Some(CargoBuildProfile::Release)
+        );
+    }
+
+    #[test]
+    fn detects_named_profile_from_target_path() {
+        let exe = Path::new("/repo/target/profiling/botster");
+        assert_eq!(
+            detect_running_cargo_profile(exe),
+            Some(CargoBuildProfile::Named("profiling".to_string()))
+        );
+    }
+
+    #[test]
+    fn returns_none_outside_cargo_target_tree() {
+        let exe = Path::new("/usr/local/bin/botster");
+        assert_eq!(detect_running_cargo_profile(exe), None);
+    }
+
+    #[test]
+    fn detects_target_dir_from_target_tree_path() {
+        let exe = Path::new("/repo/target/debug/botster");
+        assert_eq!(
+            detect_running_target_dir(exe),
+            Some(Path::new("/repo/target").to_path_buf())
+        );
+    }
+
+    #[test]
+    fn target_dir_none_outside_target_tree() {
+        let exe = Path::new("/usr/local/bin/botster");
+        assert_eq!(detect_running_target_dir(exe), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use crate::agent::pty::PtySession;
     /// Proves that nesting `block_on` inside `block_on` panics.
     ///
     /// This is the exact pattern that caused the WebRTC connection panic
@@ -4246,11 +4980,18 @@ mod tests {
     // These tests use Hub::setup() to load ALL real Lua handlers, then
     // exercise the full TUI → Lua → Hub → TUI pipeline without mocks.
 
+    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
 
+    use crate::broker::connection::BrokerConnection;
+    use crate::broker::protocol::{
+        encode_data, frame_type, BrokerFrame, BrokerFrameDecoder, HubMessage,
+    };
     use crate::client::{TuiOutput, TuiRequest};
     use crate::config::Config;
-    use crate::hub::Hub;
+    use crate::hub::agent_handle::{PtyHandle, SessionHandle, SessionType};
+    use crate::hub::{Hub, PendingTerminalAttachRequest};
+    use crate::lua::CreateForwarderRequest;
     use crate::relay::create_crypto_service;
 
     fn e2e_config() -> Config {
@@ -4303,6 +5044,94 @@ mod tests {
         let output_rx = hub.register_tui_via_lua(request_rx);
 
         (hub, request_tx, output_rx)
+    }
+
+    fn test_session_handle(session_uuid: &str) -> SessionHandle {
+        let pty_session = PtySession::new(24, 80);
+        let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) =
+            pty_session.get_direct_access();
+        std::mem::forget(pty_session);
+        let pty = PtyHandle::new(
+            event_tx,
+            shared_state,
+            shadow_screen,
+            kitty_enabled,
+            resize_pending,
+            true,
+            None,
+        );
+        SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
+    }
+
+    fn register_test_socket_client(hub: &mut Hub, client_id: &str) -> tokio::net::UnixStream {
+        let (client_std, server_std) =
+            std::os::unix::net::UnixStream::pair().expect("std UnixStream::pair");
+        client_std
+            .set_nonblocking(true)
+            .expect("set_nonblocking client socket");
+        server_std
+            .set_nonblocking(true)
+            .expect("set_nonblocking server socket");
+        let _guard = hub.tokio_runtime.enter();
+        let client_stream =
+            tokio::net::UnixStream::from_std(client_std).expect("tokio::UnixStream client");
+        let server_stream =
+            tokio::net::UnixStream::from_std(server_std).expect("tokio::UnixStream server");
+        let conn = crate::socket::client_conn::SocketClientConn::new(
+            client_id.to_string(),
+            server_stream,
+            hub.hub_event_tx.clone(),
+        );
+        hub.socket_clients.insert(client_id.to_string(), conn);
+        client_stream
+    }
+
+    fn test_broker_backed_session_handle(session_uuid: &str) -> (SessionHandle, UnixStream) {
+        let pty_session = PtySession::new(24, 80);
+        let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) =
+            pty_session.get_direct_access();
+        std::mem::forget(pty_session);
+
+        let (client_stream, server_stream) = UnixStream::pair().expect("UnixStream::pair");
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set read timeout");
+        let conn = BrokerConnection::from_stream(client_stream);
+        let shared = Arc::new(Mutex::new(Some(conn)));
+
+        let pty = PtyHandle::new_with_broker_relay(
+            event_tx,
+            shared_state,
+            shadow_screen,
+            kitty_enabled,
+            resize_pending,
+            true,
+            None,
+            (1, shared),
+        );
+        // Seed shadow state so cached snapshot is non-empty.
+        pty.feed_broker_output(b"cached-broker-output\n");
+
+        (
+            SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty),
+            server_stream,
+        )
+    }
+
+    fn test_forwarder_request(
+        peer_id: &str,
+        session_uuid: &str,
+        subscription_id: &str,
+    ) -> CreateForwarderRequest {
+        CreateForwarderRequest {
+            peer_id: peer_id.to_string(),
+            session_uuid: session_uuid.to_string(),
+            prefix: Some(vec![0x01]),
+            subscription_id: subscription_id.to_string(),
+            rows: 24,
+            cols: 80,
+            active_flag: Arc::new(Mutex::new(true)),
+        }
     }
 
     /// Drains all pending `TuiOutput::Message` JSON values from the output
@@ -4561,5 +5390,617 @@ mod tests {
         );
 
         hub.webrtc_pty_output_rx = rx;
+    }
+
+    #[test]
+    fn test_terminal_attach_intent_resolves_when_session_appears() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let key = "peer-attach:sess-attach".to_string();
+
+        let req = test_forwarder_request("peer-attach", "sess-attach", "terminal_sess-attach");
+        hub.create_lua_pty_forwarder(req);
+
+        assert!(
+            hub.pending_terminal_attaches.contains_key(&key),
+            "missing session should create pending attach intent"
+        );
+        assert!(
+            !hub.pty_forwarders.contains_key(&key),
+            "forwarder should not start until session is registered"
+        );
+
+        hub.handle_cache
+            .add_session(test_session_handle("sess-attach"));
+        hub.tick();
+
+        assert!(
+            !hub.pending_terminal_attaches.contains_key(&key),
+            "pending attach intent should clear once session exists"
+        );
+        assert!(
+            hub.pty_forwarders.contains_key(&key),
+            "forwarder should start after session registration"
+        );
+    }
+
+    #[test]
+    fn test_terminal_attach_intent_times_out_to_not_found() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let key = "peer-timeout:sess-timeout".to_string();
+
+        let req = test_forwarder_request("peer-timeout", "sess-timeout", "terminal_sess-timeout");
+        let active_flag = Arc::clone(&req.active_flag);
+        hub.create_lua_pty_forwarder(req);
+
+        {
+            let intent = hub
+                .pending_terminal_attaches
+                .get_mut(&key)
+                .expect("pending attach intent should exist");
+            intent.requested_at = Instant::now()
+                - (Hub::TERMINAL_ATTACH_NOT_FOUND_TIMEOUT + Duration::from_millis(1));
+        }
+
+        hub.tick();
+
+        assert!(
+            !hub.pending_terminal_attaches.contains_key(&key),
+            "stale pending attach should be removed"
+        );
+        assert!(
+            !*active_flag
+                .lock()
+                .expect("Forwarder active_flag mutex poisoned"),
+            "not_found transition should deactivate forwarder handle"
+        );
+    }
+
+    #[test]
+    fn test_terminal_attach_intent_replaces_previous_pending_request() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let key = "peer-replace:sess-replace".to_string();
+
+        let req1 = test_forwarder_request("peer-replace", "sess-replace", "terminal_old");
+        let req1_active = Arc::clone(&req1.active_flag);
+        hub.create_lua_pty_forwarder(req1);
+
+        let req2 = test_forwarder_request("peer-replace", "sess-replace", "terminal_new");
+        let req2_active = Arc::clone(&req2.active_flag);
+        hub.create_lua_pty_forwarder(req2);
+
+        let pending = hub
+            .pending_terminal_attaches
+            .get(&key)
+            .expect("pending attach should still exist for missing session");
+        let subscription_id = match &pending.request {
+            PendingTerminalAttachRequest::WebRtc(req) => req.subscription_id.as_str(),
+            other => panic!("expected WebRTC pending attach, got {other:?}"),
+        };
+        assert_eq!(
+            subscription_id, "terminal_new",
+            "latest subscribe should replace previous pending attach"
+        );
+        assert!(
+            !*req1_active
+                .lock()
+                .expect("Forwarder active_flag mutex poisoned"),
+            "previous pending attach should be deactivated"
+        );
+        assert!(
+            *req2_active
+                .lock()
+                .expect("Forwarder active_flag mutex poisoned"),
+            "replacement attach should remain active"
+        );
+    }
+
+    #[test]
+    fn test_tui_attach_intent_resolves_when_session_appears() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let key = "tui:sess-tui-attach".to_string();
+
+        let req = crate::lua::primitives::CreateTuiForwarderRequest {
+            session_uuid: "sess-tui-attach".to_string(),
+            subscription_id: "tui:sess-tui-attach".to_string(),
+            active_flag: Arc::new(Mutex::new(true)),
+            rows: 24,
+            cols: 80,
+        };
+        hub.create_lua_tui_pty_forwarder(req);
+
+        assert!(
+            hub.pending_terminal_attaches.contains_key(&key),
+            "missing session should create pending TUI attach intent"
+        );
+        assert!(
+            !hub.pty_forwarders.contains_key(&key),
+            "TUI forwarder should not start until session is registered"
+        );
+
+        hub.handle_cache
+            .add_session(test_session_handle("sess-tui-attach"));
+        hub.tick();
+
+        assert!(
+            !hub.pending_terminal_attaches.contains_key(&key),
+            "pending TUI attach should clear once session exists"
+        );
+        assert!(
+            hub.pty_forwarders.contains_key(&key),
+            "TUI forwarder should start after session registration"
+        );
+    }
+
+    #[test]
+    fn test_tui_attach_intent_times_out_to_not_found() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let key = "tui:sess-tui-timeout".to_string();
+
+        let req = crate::lua::primitives::CreateTuiForwarderRequest {
+            session_uuid: "sess-tui-timeout".to_string(),
+            subscription_id: "tui:sess-tui-timeout".to_string(),
+            active_flag: Arc::new(Mutex::new(true)),
+            rows: 24,
+            cols: 80,
+        };
+        let active_flag = Arc::clone(&req.active_flag);
+        hub.create_lua_tui_pty_forwarder(req);
+
+        {
+            let intent = hub
+                .pending_terminal_attaches
+                .get_mut(&key)
+                .expect("pending TUI attach intent should exist");
+            intent.requested_at = Instant::now()
+                - (Hub::TERMINAL_ATTACH_NOT_FOUND_TIMEOUT + Duration::from_millis(1));
+        }
+
+        hub.tick();
+
+        assert!(
+            !hub.pending_terminal_attaches.contains_key(&key),
+            "stale pending TUI attach should be removed"
+        );
+        assert!(
+            !*active_flag
+                .lock()
+                .expect("Forwarder active_flag mutex poisoned"),
+            "not_found transition should deactivate TUI forwarder handle"
+        );
+    }
+
+    #[test]
+    fn test_socket_attach_intent_times_out_to_not_found() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let key = "socket:dead:sess-socket-timeout".to_string();
+
+        let req = crate::lua::primitives::CreateSocketForwarderRequest {
+            client_id: "socket:dead".to_string(),
+            session_uuid: "sess-socket-timeout".to_string(),
+            subscription_id: "socket:sess-socket-timeout".to_string(),
+            active_flag: Arc::new(Mutex::new(true)),
+            rows: 24,
+            cols: 80,
+        };
+        let active_flag = Arc::clone(&req.active_flag);
+        hub.create_lua_socket_pty_forwarder(req);
+
+        assert!(
+            hub.pending_terminal_attaches.contains_key(&key),
+            "missing socket client/session should create pending socket attach intent"
+        );
+
+        {
+            let intent = hub
+                .pending_terminal_attaches
+                .get_mut(&key)
+                .expect("pending socket attach intent should exist");
+            intent.requested_at = Instant::now()
+                - (Hub::TERMINAL_ATTACH_NOT_FOUND_TIMEOUT + Duration::from_millis(1));
+        }
+
+        hub.tick();
+
+        assert!(
+            !hub.pending_terminal_attaches.contains_key(&key),
+            "stale pending socket attach should be removed"
+        );
+        assert!(
+            !*active_flag
+                .lock()
+                .expect("Forwarder active_flag mutex poisoned"),
+            "not_found transition should deactivate socket forwarder handle"
+        );
+    }
+
+    #[test]
+    fn test_socket_attach_intent_resolves_when_session_and_client_appear() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let client_id = "socket:live";
+        let key = format!("{client_id}:sess-socket-attach");
+
+        let req = crate::lua::primitives::CreateSocketForwarderRequest {
+            client_id: client_id.to_string(),
+            session_uuid: "sess-socket-attach".to_string(),
+            subscription_id: "socket:sess-socket-attach".to_string(),
+            active_flag: Arc::new(Mutex::new(true)),
+            rows: 24,
+            cols: 80,
+        };
+        hub.create_lua_socket_pty_forwarder(req);
+
+        assert!(
+            hub.pending_terminal_attaches.contains_key(&key),
+            "missing socket client/session should create pending socket attach intent"
+        );
+        assert!(
+            !hub.pty_forwarders.contains_key(&key),
+            "socket forwarder should not start until session and client are ready"
+        );
+
+        let _client_stream = register_test_socket_client(&mut hub, client_id);
+        hub.handle_cache
+            .add_session(test_session_handle("sess-socket-attach"));
+        hub.tick();
+
+        assert!(
+            !hub.pending_terminal_attaches.contains_key(&key),
+            "pending socket attach should clear once session and client exist"
+        );
+        assert!(
+            hub.pty_forwarders.contains_key(&key),
+            "socket forwarder should start after prerequisites are available"
+        );
+    }
+
+    /// Regression: broker-backed attach must not block on broker snapshot RPC.
+    ///
+    /// The forwarder should send broker-authoritative scrollback promptly once
+    /// the broker answers `GetSnapshot`.
+    #[test]
+    fn test_tui_forwarder_broker_backed_snapshot_is_prompt() {
+        let (mut hub, _request_tx, mut output_rx) = e2e_hub();
+        let session_uuid = "sess-broker-cached";
+        let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
+        hub.handle_cache.add_session(session);
+
+        let expected_snapshot = b"broker-authoritative-prompt\r\n$ ".to_vec();
+        let expected_for_thread = expected_snapshot.clone();
+        let broker = std::thread::spawn(move || -> bool {
+            use std::io::{Read, Write};
+
+            broker_peer
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("set fake broker read timeout");
+            let mut decoder = BrokerFrameDecoder::new();
+            let mut buf = [0u8; 512];
+            let deadline = Instant::now() + Duration::from_millis(1200);
+
+            while Instant::now() < deadline {
+                match broker_peer.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let frames = decoder.feed(&buf[..n]).expect("decode broker frame");
+                        for frame in frames {
+                            if let BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) =
+                                frame
+                            {
+                                assert_eq!(session_id, 1);
+                                let response =
+                                    encode_data(frame_type::SNAPSHOT, 1, &expected_for_thread);
+                                broker_peer
+                                    .write_all(&response)
+                                    .expect("write broker snapshot");
+                                return true;
+                            }
+                        }
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(err) => panic!("fake broker read failed: {err}"),
+                }
+            }
+
+            false
+        });
+
+        let req = crate::lua::primitives::CreateTuiForwarderRequest {
+            session_uuid: session_uuid.to_string(),
+            subscription_id: format!("tui:{session_uuid}"),
+            active_flag: Arc::new(Mutex::new(true)),
+            rows: 24,
+            cols: 80,
+        };
+
+        hub.create_lua_tui_pty_forwarder(req);
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut saw_scrollback = false;
+        while Instant::now() < deadline {
+            match output_rx.try_recv() {
+                Ok(TuiOutput::Scrollback {
+                    session_uuid: got,
+                    rows,
+                    cols,
+                    data,
+                    ..
+                }) if got == session_uuid => {
+                    assert_eq!((rows, cols), (24, 80));
+                    assert_eq!(data, expected_snapshot);
+                    saw_scrollback = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("TUI output channel disconnected unexpectedly");
+                }
+            }
+        }
+
+        assert!(
+            saw_scrollback,
+            "expected prompt scrollback delivery for broker-backed session"
+        );
+        assert!(
+            broker.join().expect("broker thread should finish"),
+            "broker never received GetSnapshot request"
+        );
+    }
+
+    /// Regression: output emitted during broker settle window must not replay twice.
+    ///
+    /// Bytes produced before snapshot capture should be represented by the
+    /// snapshot only, not re-delivered as live output after scrollback.
+    #[test]
+    fn test_tui_forwarder_no_duplicate_output_during_snapshot_window() {
+        let (mut hub, _request_tx, mut output_rx) = e2e_hub();
+        let session_uuid = "sess-broker-no-dup";
+        let injected = "during-window-output";
+        let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
+        hub.handle_cache.add_session(session);
+
+        let snapshot_payload = format!("pre-subscribe:{injected}\r\n$ ").into_bytes();
+        let payload_for_thread = snapshot_payload.clone();
+        let broker = std::thread::spawn(move || -> bool {
+            use std::io::{Read, Write};
+
+            broker_peer
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("set fake broker read timeout");
+            let mut decoder = BrokerFrameDecoder::new();
+            let mut buf = [0u8; 512];
+            let deadline = Instant::now() + Duration::from_millis(1200);
+
+            while Instant::now() < deadline {
+                match broker_peer.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let frames = decoder.feed(&buf[..n]).expect("decode broker frame");
+                        for frame in frames {
+                            if let BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) =
+                                frame
+                            {
+                                assert_eq!(session_id, 1);
+                                let response =
+                                    encode_data(frame_type::SNAPSHOT, 1, &payload_for_thread);
+                                broker_peer
+                                    .write_all(&response)
+                                    .expect("write broker snapshot");
+                                return true;
+                            }
+                        }
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(err) => panic!("fake broker read failed: {err}"),
+                }
+            }
+
+            false
+        });
+
+        let req = crate::lua::primitives::CreateTuiForwarderRequest {
+            session_uuid: session_uuid.to_string(),
+            subscription_id: format!("tui:{session_uuid}"),
+            active_flag: Arc::new(Mutex::new(true)),
+            rows: 24,
+            cols: 80,
+        };
+
+        hub.create_lua_tui_pty_forwarder(req);
+
+        let deadline = Instant::now() + Duration::from_millis(800);
+        let mut saw_scrollback = false;
+        let mut scrollback_contains_injected = false;
+        let mut saw_duplicate_live_output = false;
+        while Instant::now() < deadline {
+            match output_rx.try_recv() {
+                Ok(TuiOutput::Scrollback {
+                    session_uuid: got,
+                    data,
+                    ..
+                }) if got == session_uuid => {
+                    saw_scrollback = true;
+                    let text = String::from_utf8_lossy(&data);
+                    if text.contains(injected) {
+                        scrollback_contains_injected = true;
+                    }
+                }
+                Ok(TuiOutput::Output {
+                    session_uuid: got,
+                    data,
+                }) if got == session_uuid => {
+                    let text = String::from_utf8_lossy(&data);
+                    if text.contains(injected) {
+                        saw_duplicate_live_output = true;
+                    }
+                }
+                Ok(TuiOutput::OutputBatch {
+                    session_uuid: got,
+                    chunks,
+                }) if got == session_uuid => {
+                    for chunk in chunks {
+                        let text = String::from_utf8_lossy(&chunk);
+                        if text.contains(injected) {
+                            saw_duplicate_live_output = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("TUI output channel disconnected unexpectedly");
+                }
+            }
+        }
+
+        assert!(saw_scrollback, "expected a scrollback frame");
+        assert!(
+            scrollback_contains_injected,
+            "snapshot should include output emitted during settle window"
+        );
+        assert!(
+            !saw_duplicate_live_output,
+            "output emitted during snapshot window must not replay as live output"
+        );
+        assert!(
+            broker.join().expect("broker thread should finish"),
+            "broker never received GetSnapshot request"
+        );
+    }
+
+    /// Regression: same-dimension reconnect still needs a redraw pulse.
+    ///
+    /// Broker-backed forwarders should issue a bounce resize before
+    /// `GetSnapshot` when requested dims match current dims.
+    #[test]
+    fn test_tui_forwarder_same_dims_issues_resize_pulse_before_snapshot() {
+        let (mut hub, _request_tx, mut output_rx) = e2e_hub();
+        let session_uuid = "sess-broker-same-dims";
+        let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
+        hub.handle_cache.add_session(session);
+
+        let broker = std::thread::spawn(move || -> (bool, bool, bool) {
+            use std::io::{Read, Write};
+
+            broker_peer
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("set fake broker read timeout");
+            let mut decoder = BrokerFrameDecoder::new();
+            let mut buf = [0u8; 512];
+            let deadline = Instant::now() + Duration::from_millis(1200);
+            let mut saw_bounce_resize = false;
+            let mut saw_target_resize = false;
+
+            while Instant::now() < deadline {
+                match broker_peer.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let frames = decoder.feed(&buf[..n]).expect("decode broker frame");
+                        for frame in frames {
+                            match frame {
+                                BrokerFrame::HubControl(HubMessage::ResizePty {
+                                    session_id,
+                                    rows,
+                                    cols,
+                                }) => {
+                                    assert_eq!(session_id, 1);
+                                    if (rows, cols) == (24, 79) {
+                                        saw_bounce_resize = true;
+                                    }
+                                    if (rows, cols) == (24, 80) {
+                                        saw_target_resize = true;
+                                    }
+                                }
+                                BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) => {
+                                    assert_eq!(session_id, 1);
+                                    let response = encode_data(
+                                        frame_type::SNAPSHOT,
+                                        1,
+                                        b"same-dims-redraw-snapshot",
+                                    );
+                                    broker_peer
+                                        .write_all(&response)
+                                        .expect("write broker snapshot");
+                                    return (saw_bounce_resize, saw_target_resize, true);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(err) => panic!("fake broker read failed: {err}"),
+                }
+            }
+
+            (saw_bounce_resize, saw_target_resize, false)
+        });
+
+        let req = crate::lua::primitives::CreateTuiForwarderRequest {
+            session_uuid: session_uuid.to_string(),
+            subscription_id: format!("tui:{session_uuid}"),
+            active_flag: Arc::new(Mutex::new(true)),
+            rows: 24,
+            cols: 80,
+        };
+        hub.create_lua_tui_pty_forwarder(req);
+
+        let deadline = Instant::now() + Duration::from_millis(800);
+        let mut saw_scrollback = false;
+        while Instant::now() < deadline {
+            match output_rx.try_recv() {
+                Ok(TuiOutput::Scrollback {
+                    session_uuid: got, ..
+                }) if got == session_uuid => {
+                    saw_scrollback = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("TUI output channel disconnected unexpectedly");
+                }
+            }
+        }
+
+        assert!(saw_scrollback, "expected a scrollback frame");
+        let (saw_bounce, saw_target, saw_snapshot) =
+            broker.join().expect("broker thread should finish");
+        assert!(saw_snapshot, "broker never received GetSnapshot request");
+        assert!(
+            saw_bounce,
+            "expected same-dims attach to issue bounce resize before snapshot"
+        );
+        assert!(
+            saw_target,
+            "expected same-dims attach to issue target resize before snapshot"
+        );
     }
 }
