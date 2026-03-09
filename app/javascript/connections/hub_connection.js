@@ -19,6 +19,8 @@
  *   - agentCreated - New agent data
  *   - agentDeleted - { id }
  *   - connectionCode - { url, qr_ascii }
+ *   - hubRecoveryState - { state, ... }
+ *   - hubReady - { state: "ready", ... }
  *   - agentConfig - { agents, accessories, workspaces }
  *
  * Usage:
@@ -90,6 +92,15 @@ export class HubConnection extends HubRoute {
 
       case "connection_code":
         this.emit("connectionCode", message);
+        break;
+
+      case "hub_recovery_state":
+        this.emit("hubRecoveryState", message);
+        if (message.state === "ready") this.emit("hubReady", message);
+        break;
+
+      case "hub_ready":
+        this.emit("hubReady", message);
         break;
 
       case "agent_config":

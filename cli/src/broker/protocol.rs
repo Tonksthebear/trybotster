@@ -31,11 +31,34 @@
 
 // Rust guideline compliant 2026-02
 
+use std::io::{Read, Write};
+
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 
 /// Maximum frame payload size (16 MB — same cap as `socket/framing.rs`).
 const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+
+/// Control-plane protocol version supported by this binary.
+pub const CONTROL_PROTOCOL_VERSION: u8 = 1;
+
+/// Capabilities supported by this binary for the control connection.
+///
+/// Additional capabilities should be appended as independent bits.
+pub const CONTROL_SUPPORTED_CAPABILITIES: u32 = capability::FD_TRANSFER_V1;
+
+/// Fixed preamble for Hub -> Broker control handshake hello.
+pub const CONTROL_HELLO_MAGIC: [u8; 4] = *b"BCH1";
+/// Fixed preamble for Broker -> Hub control handshake ack.
+pub const CONTROL_ACK_MAGIC: [u8; 4] = *b"BCA1";
+/// Fixed byte length for hello/ack handshake records.
+const CONTROL_HANDSHAKE_LEN: usize = 9;
+
+/// Control-plane capability bitflags.
+pub mod capability {
+    /// Supports version-tagged `FdTransferPayload` encoding.
+    pub const FD_TRANSFER_V1: u32 = 1 << 0;
+}
 
 // ─── Frame type constants ──────────────────────────────────────────────────
 
@@ -122,6 +145,11 @@ pub enum HubMessage {
         /// Maximum bytes before rotation (e.g., 10 MiB = 10_485_760).
         cap_bytes: u64,
     },
+
+    /// Return the broker's currently live PTY session inventory.
+    ///
+    /// Used by Hub restart recovery to discover which sessions survived.
+    ListSessions,
 }
 
 /// Messages sent from Broker to Hub in `BrokerControl` frames (JSON payload).
@@ -137,6 +165,12 @@ pub enum BrokerMessage {
         session_uuid: String,
         /// Opaque session identifier assigned by the broker.
         session_id: u32,
+    },
+
+    /// Inventory of currently live broker sessions.
+    SessionInventory {
+        /// All sessions currently tracked by the broker.
+        sessions: Vec<BrokerSessionInventory>,
     },
 
     /// Generic acknowledgment (SetTimeout, UnregisterPty).
@@ -165,6 +199,15 @@ pub enum BrokerMessage {
     },
 }
 
+/// One live session entry from a broker inventory response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrokerSessionInventory {
+    /// Opaque session identifier assigned by the broker.
+    pub session_id: u32,
+    /// Session UUID provided by Hub at registration time.
+    pub session_uuid: String,
+}
+
 // ─── FdTransfer payload ────────────────────────────────────────────────────
 
 /// Payload carried in an `FdTransfer` frame (type `0x15`).
@@ -173,11 +216,18 @@ pub enum BrokerMessage {
 /// `sendmsg()` call.  This payload provides the metadata needed to register
 /// the session without a separate round-trip.
 ///
-/// Wire layout:
+/// Legacy wire layout (v0, no marker/version):
 /// ```text
-/// [u8: uuid_len] [uuid_bytes…] [u32 LE: child_pid]
-/// [u16 LE: rows] [u16 LE: cols]
+/// [u8: uuid_len] [uuid_bytes…] [u32 LE: child_pid] [u16 LE: rows] [u16 LE: cols]
 /// ```
+///
+/// Versioned wire layout (v1):
+/// ```text
+/// [0xff][u8: version=1][u8: uuid_len] [uuid_bytes…]
+/// [u32 LE: child_pid] [u16 LE: rows] [u16 LE: cols]
+/// ```
+///
+/// `v1` is enabled by capability negotiation during the control handshake.
 #[derive(Debug, Clone)]
 pub struct FdTransferPayload {
     /// Session UUID identifying this session in the Hub.
@@ -191,12 +241,50 @@ pub struct FdTransferPayload {
 }
 
 impl FdTransferPayload {
+    const V1_MARKER: u8 = 0xff;
+    const V1_VERSION: u8 = 1;
+
     /// Encode to wire bytes.
     ///
     /// # Errors
     ///
     /// Returns an error if `session_uuid` exceeds 255 bytes.
+    ///
+    /// This encodes the legacy v0 payload for compatibility.
     pub fn encode(&self) -> Result<Vec<u8>> {
+        self.encode_legacy()
+    }
+
+    /// Encode to versioned v1 wire bytes.
+    pub fn encode_v1(&self) -> Result<Vec<u8>> {
+        let key = self.session_uuid.as_bytes();
+        if key.len() > u8::MAX as usize {
+            bail!(
+                "FdTransfer session_uuid too long: {} bytes (max {})",
+                key.len(),
+                u8::MAX
+            );
+        }
+        let mut buf = Vec::with_capacity(3 + key.len() + 4 + 2 + 2);
+        buf.push(Self::V1_MARKER);
+        buf.push(Self::V1_VERSION);
+        buf.push(key.len() as u8);
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&self.child_pid.to_le_bytes());
+        buf.extend_from_slice(&self.rows.to_le_bytes());
+        buf.extend_from_slice(&self.cols.to_le_bytes());
+        Ok(buf)
+    }
+
+    /// Decode from wire bytes.
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() >= 3 && payload[0] == Self::V1_MARKER {
+            return Self::decode_v1(payload);
+        }
+        Self::decode_legacy(payload)
+    }
+
+    fn encode_legacy(&self) -> Result<Vec<u8>> {
         let key = self.session_uuid.as_bytes();
         if key.len() > u8::MAX as usize {
             bail!(
@@ -214,8 +302,7 @@ impl FdTransferPayload {
         Ok(buf)
     }
 
-    /// Decode from wire bytes.
-    pub fn decode(payload: &[u8]) -> Result<Self> {
+    fn decode_legacy(payload: &[u8]) -> Result<Self> {
         if payload.is_empty() {
             bail!("FdTransfer payload is empty");
         }
@@ -228,17 +315,65 @@ impl FdTransferPayload {
                 min_len
             );
         }
-        let session_uuid =
-            std::str::from_utf8(&payload[1..1 + key_len])
-                .map_err(|e| anyhow!("FdTransfer session_uuid is not UTF-8: {e}"))?
-                .to_owned();
+        let session_uuid = std::str::from_utf8(&payload[1..1 + key_len])
+            .map_err(|e| anyhow!("FdTransfer session_uuid is not UTF-8: {e}"))?
+            .to_owned();
         let mut off = 1 + key_len;
-        let child_pid = u32::from_le_bytes([payload[off], payload[off+1], payload[off+2], payload[off+3]]);
+        let child_pid = u32::from_le_bytes([
+            payload[off],
+            payload[off + 1],
+            payload[off + 2],
+            payload[off + 3],
+        ]);
         off += 4;
-        let rows = u16::from_le_bytes([payload[off], payload[off+1]]);
+        let rows = u16::from_le_bytes([payload[off], payload[off + 1]]);
         off += 2;
-        let cols = u16::from_le_bytes([payload[off], payload[off+1]]);
-        Ok(Self { session_uuid, child_pid, rows, cols })
+        let cols = u16::from_le_bytes([payload[off], payload[off + 1]]);
+        Ok(Self {
+            session_uuid,
+            child_pid,
+            rows,
+            cols,
+        })
+    }
+
+    fn decode_v1(payload: &[u8]) -> Result<Self> {
+        if payload.len() < 3 {
+            bail!("FdTransfer v1 payload too short: {} bytes", payload.len());
+        }
+        let version = payload[1];
+        if version != Self::V1_VERSION {
+            bail!("unsupported FdTransfer payload version: {version}");
+        }
+        let key_len = payload[2] as usize;
+        let min_len = 3 + key_len + 4 + 2 + 2;
+        if payload.len() < min_len {
+            bail!(
+                "FdTransfer v1 payload too short: {} bytes, expected >= {}",
+                payload.len(),
+                min_len
+            );
+        }
+        let session_uuid = std::str::from_utf8(&payload[3..3 + key_len])
+            .map_err(|e| anyhow!("FdTransfer session_uuid is not UTF-8: {e}"))?
+            .to_owned();
+        let mut off = 3 + key_len;
+        let child_pid = u32::from_le_bytes([
+            payload[off],
+            payload[off + 1],
+            payload[off + 2],
+            payload[off + 3],
+        ]);
+        off += 4;
+        let rows = u16::from_le_bytes([payload[off], payload[off + 1]]);
+        off += 2;
+        let cols = u16::from_le_bytes([payload[off], payload[off + 1]]);
+        Ok(Self {
+            session_uuid,
+            child_pid,
+            rows,
+            cols,
+        })
     }
 }
 
@@ -277,7 +412,91 @@ pub fn encode_data(frame_type: u8, session_id: u32, data: &[u8]) -> Vec<u8> {
 ///
 /// Propagates validation errors from [`FdTransferPayload::encode`].
 pub fn encode_fd_transfer(reg: &FdTransferPayload) -> Result<Vec<u8>> {
-    Ok(encode_raw(frame_type::FD_TRANSFER, &reg.encode()?))
+    Ok(encode_raw(frame_type::FD_TRANSFER, &reg.encode_legacy()?))
+}
+
+/// Encode an `FdTransfer` frame using negotiated control-plane capabilities.
+///
+/// When `capability::FD_TRANSFER_V1` is negotiated, emits v1 payload bytes.
+/// Otherwise emits legacy v0 bytes.
+pub fn encode_fd_transfer_with_capabilities(
+    reg: &FdTransferPayload,
+    capabilities: u32,
+) -> Result<Vec<u8>> {
+    let payload = if capabilities & capability::FD_TRANSFER_V1 != 0 {
+        reg.encode_v1()?
+    } else {
+        reg.encode_legacy()?
+    };
+    Ok(encode_raw(frame_type::FD_TRANSFER, &payload))
+}
+
+/// Result of control-plane handshake negotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlNegotiated {
+    /// Agreed control protocol version.
+    pub version: u8,
+    /// Agreed capability bitflags.
+    pub capabilities: u32,
+}
+
+/// Hub-side control handshake.
+///
+/// Wire format (one message each direction):
+/// - hello: `[magic:4][version:u8][capabilities:u32 LE]`
+/// - ack:   `[magic:4][version:u8][capabilities:u32 LE]`
+pub fn control_handshake_client<S: Read + Write>(stream: &mut S) -> Result<ControlNegotiated> {
+    let mut hello = [0u8; CONTROL_HANDSHAKE_LEN];
+    hello[..4].copy_from_slice(&CONTROL_HELLO_MAGIC);
+    hello[4] = CONTROL_PROTOCOL_VERSION;
+    hello[5..9].copy_from_slice(&CONTROL_SUPPORTED_CAPABILITIES.to_le_bytes());
+    stream.write_all(&hello)?;
+
+    let mut ack = [0u8; CONTROL_HANDSHAKE_LEN];
+    stream.read_exact(&mut ack)?;
+    if ack[..4] != CONTROL_ACK_MAGIC {
+        bail!("invalid control handshake ack magic");
+    }
+    let version = ack[4];
+    if version == 0 {
+        bail!("invalid control handshake ack version 0");
+    }
+    let capabilities = u32::from_le_bytes([ack[5], ack[6], ack[7], ack[8]]);
+    Ok(ControlNegotiated {
+        version,
+        capabilities,
+    })
+}
+
+/// Broker-side control handshake.
+///
+/// Negotiates:
+/// - `version = min(client_version, CONTROL_PROTOCOL_VERSION)`
+/// - `capabilities = client_capabilities & CONTROL_SUPPORTED_CAPABILITIES`
+pub fn control_handshake_server<S: Read + Write>(stream: &mut S) -> Result<ControlNegotiated> {
+    let mut hello = [0u8; CONTROL_HANDSHAKE_LEN];
+    stream.read_exact(&mut hello)?;
+    if hello[..4] != CONTROL_HELLO_MAGIC {
+        bail!("invalid control handshake hello magic");
+    }
+    let client_version = hello[4];
+    if client_version == 0 {
+        bail!("invalid control handshake client version 0");
+    }
+    let client_capabilities = u32::from_le_bytes([hello[5], hello[6], hello[7], hello[8]]);
+    let version = client_version.min(CONTROL_PROTOCOL_VERSION);
+    let capabilities = client_capabilities & CONTROL_SUPPORTED_CAPABILITIES;
+
+    let mut ack = [0u8; CONTROL_HANDSHAKE_LEN];
+    ack[..4].copy_from_slice(&CONTROL_ACK_MAGIC);
+    ack[4] = version;
+    ack[5..9].copy_from_slice(&capabilities.to_le_bytes());
+    stream.write_all(&ack)?;
+
+    Ok(ControlNegotiated {
+        version,
+        capabilities,
+    })
 }
 
 fn encode_raw(ft: u8, payload: &[u8]) -> Vec<u8> {
@@ -404,12 +623,19 @@ mod tests {
 
     #[test]
     fn hub_control_round_trip() {
-        let msg = HubMessage::ResizePty { session_id: 3, rows: 24, cols: 80 };
+        let msg = HubMessage::ResizePty {
+            session_id: 3,
+            rows: 24,
+            cols: 80,
+        };
         let encoded = encode_hub_control(&msg);
         let mut dec = BrokerFrameDecoder::new();
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
-        assert!(matches!(&frames[0], BrokerFrame::HubControl(HubMessage::ResizePty { session_id: 3, .. })));
+        assert!(matches!(
+            &frames[0],
+            BrokerFrame::HubControl(HubMessage::ResizePty { session_id: 3, .. })
+        ));
     }
 
     #[test]
@@ -422,7 +648,10 @@ mod tests {
         let mut dec = BrokerFrameDecoder::new();
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
-        assert!(matches!(&frames[0], BrokerFrame::BrokerControl(BrokerMessage::Registered { session_id: 42, .. })));
+        assert!(matches!(
+            &frames[0],
+            BrokerFrame::BrokerControl(BrokerMessage::Registered { session_id: 42, .. })
+        ));
     }
 
     #[test]
@@ -453,6 +682,57 @@ mod tests {
         assert_eq!(decoded.child_pid, 12345);
         assert_eq!(decoded.rows, 24);
         assert_eq!(decoded.cols, 80);
+    }
+
+    #[test]
+    fn fd_transfer_payload_v1_round_trip() {
+        let reg = FdTransferPayload {
+            session_uuid: "sess-v1-abcdef".into(),
+            child_pid: 4242,
+            rows: 30,
+            cols: 100,
+        };
+        let encoded = reg.encode_v1().unwrap();
+        let decoded = FdTransferPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.session_uuid, "sess-v1-abcdef");
+        assert_eq!(decoded.child_pid, 4242);
+        assert_eq!(decoded.rows, 30);
+        assert_eq!(decoded.cols, 100);
+    }
+
+    #[test]
+    fn encode_fd_transfer_with_capabilities_uses_v1() {
+        let reg = FdTransferPayload {
+            session_uuid: "sess-cap-v1".into(),
+            child_pid: 11,
+            rows: 25,
+            cols: 81,
+        };
+        let frame = encode_fd_transfer_with_capabilities(&reg, capability::FD_TRANSFER_V1).unwrap();
+        let mut dec = BrokerFrameDecoder::new();
+        let frames = dec.feed(&frame).unwrap();
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            BrokerFrame::FdTransfer(decoded) => {
+                assert_eq!(decoded.session_uuid, "sess-cap-v1");
+                assert_eq!(decoded.child_pid, 11);
+            }
+            other => panic!("expected FdTransfer, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_handshake_round_trip() {
+        use std::os::unix::net::UnixStream;
+        let (mut hub_side, mut broker_side) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || control_handshake_server(&mut broker_side));
+        let client = control_handshake_client(&mut hub_side).unwrap();
+        let server = server.join().unwrap().unwrap();
+        assert_eq!(client.version, CONTROL_PROTOCOL_VERSION);
+        assert_eq!(server.version, CONTROL_PROTOCOL_VERSION);
+        assert_eq!(client.capabilities, CONTROL_SUPPORTED_CAPABILITIES);
+        assert_eq!(server.capabilities, CONTROL_SUPPORTED_CAPABILITIES);
     }
 
     #[test]
@@ -516,7 +796,10 @@ mod tests {
         let mut dec = BrokerFrameDecoder::new();
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
-        assert!(matches!(&frames[0], BrokerFrame::HubControl(HubMessage::KillAll)));
+        assert!(matches!(
+            &frames[0],
+            BrokerFrame::HubControl(HubMessage::KillAll)
+        ));
     }
 
     #[test]
@@ -530,8 +813,11 @@ mod tests {
         let mut dec = BrokerFrameDecoder::new();
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
-        if let BrokerFrame::HubControl(HubMessage::ArmTee { session_id, log_path, cap_bytes }) =
-            &frames[0]
+        if let BrokerFrame::HubControl(HubMessage::ArmTee {
+            session_id,
+            log_path,
+            cap_bytes,
+        }) = &frames[0]
         {
             assert_eq!(*session_id, 12);
             assert_eq!(log_path, "/data/workspaces/my-agent/sessions/0/pty-0.log");
@@ -566,7 +852,10 @@ mod tests {
         let mut dec = BrokerFrameDecoder::new();
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
-        assert!(matches!(&frames[0], BrokerFrame::HubControl(HubMessage::Ping)));
+        assert!(matches!(
+            &frames[0],
+            BrokerFrame::HubControl(HubMessage::Ping)
+        ));
     }
 
     // ── BrokerMessage variants ────────────────────────────────────────────────
@@ -577,7 +866,10 @@ mod tests {
         let mut dec = BrokerFrameDecoder::new();
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
-        assert!(matches!(&frames[0], BrokerFrame::BrokerControl(BrokerMessage::Ack)));
+        assert!(matches!(
+            &frames[0],
+            BrokerFrame::BrokerControl(BrokerMessage::Ack)
+        ));
     }
 
     #[test]
@@ -586,7 +878,10 @@ mod tests {
         let mut dec = BrokerFrameDecoder::new();
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
-        assert!(matches!(&frames[0], BrokerFrame::BrokerControl(BrokerMessage::Pong)));
+        assert!(matches!(
+            &frames[0],
+            BrokerFrame::BrokerControl(BrokerMessage::Pong)
+        ));
     }
 
     #[test]
@@ -595,12 +890,17 @@ mod tests {
         let mut dec = BrokerFrameDecoder::new();
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
-        assert!(matches!(&frames[0], BrokerFrame::BrokerControl(BrokerMessage::Timeout)));
+        assert!(matches!(
+            &frames[0],
+            BrokerFrame::BrokerControl(BrokerMessage::Timeout)
+        ));
     }
 
     #[test]
     fn broker_control_error_round_trip() {
-        let msg = BrokerMessage::Error { message: "something went wrong".into() };
+        let msg = BrokerMessage::Error {
+            message: "something went wrong".into(),
+        };
         let encoded = encode_broker_control(&msg);
         let mut dec = BrokerFrameDecoder::new();
         let frames = dec.feed(&encoded).unwrap();
@@ -624,7 +924,9 @@ mod tests {
         let frames = dec.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
         if let BrokerFrame::BrokerControl(BrokerMessage::PtyExited {
-            session_id, session_uuid, exit_code,
+            session_id,
+            session_uuid,
+            exit_code,
         }) = &frames[0]
         {
             assert_eq!(*session_id, 3);
@@ -806,8 +1108,14 @@ mod tests {
 
         let frames = BrokerFrameDecoder::new().feed(&combined).unwrap();
         assert_eq!(frames.len(), 3);
-        assert!(matches!(&frames[0], BrokerFrame::HubControl(HubMessage::Ping)));
-        assert!(matches!(&frames[1], BrokerFrame::BrokerControl(BrokerMessage::Pong)));
+        assert!(matches!(
+            &frames[0],
+            BrokerFrame::HubControl(HubMessage::Ping)
+        ));
+        assert!(matches!(
+            &frames[1],
+            BrokerFrame::BrokerControl(BrokerMessage::Pong)
+        ));
         if let BrokerFrame::PtyOutput(sid, data) = &frames[2] {
             assert_eq!(*sid, 1);
             assert_eq!(data, b"out");
@@ -826,6 +1134,9 @@ mod tests {
             frames.append(&mut batch);
         }
         assert_eq!(frames.len(), 1);
-        assert!(matches!(&frames[0], BrokerFrame::HubControl(HubMessage::KillAll)));
+        assert!(matches!(
+            &frames[0],
+            BrokerFrame::HubControl(HubMessage::KillAll)
+        ));
     }
 }

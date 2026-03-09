@@ -2,10 +2,13 @@
 //!
 //! # Wire Format Compatibility
 //!
-//! The `FdTransferPayload` (0x15 frame) uses a binary format with no version
-//! byte. Changes to `FdTransferPayload::encode`/`decode` require both the
-//! Hub and Broker to be restarted together — a running old broker will
-//! silently misparse a new-format frame and vice versa.
+//! Broker and Hub perform a control-plane handshake on connect:
+//! - protocol `version`
+//! - `capabilities` bitflags
+//!
+//! `FdTransferPayload` encoding is capability-gated. When both sides negotiate
+//! `FD_TRANSFER_V1`, the payload carries an explicit format marker/version.
+//! Otherwise the broker accepts legacy v0 payload bytes.
 //!
 //! # Purpose
 //!
@@ -61,7 +64,9 @@ mod integration_test_full;
 
 pub(crate) use connection::{BrokerConnection, SharedBrokerConnection};
 
-use crate::terminal::{AlacrittyParser, DEFAULT_SCROLLBACK_LINES, NoopListener, generate_ansi_snapshot};
+use crate::terminal::{
+    generate_ansi_snapshot, AlacrittyParser, NoopListener, DEFAULT_SCROLLBACK_LINES,
+};
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -69,6 +74,7 @@ use std::mem::ManuallyDrop;
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -76,8 +82,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use protocol::{
-    BrokerFrameDecoder, BrokerMessage, FdTransferPayload, HubMessage,
-    encode_broker_control, encode_data, frame_type,
+    control_handshake_server, encode_broker_control, encode_data, frame_type, BrokerFrameDecoder,
+    BrokerMessage, BrokerSessionInventory, FdTransferPayload, HubMessage,
 };
 
 /// Maximum path length for a Unix domain socket (macOS kernel limit).
@@ -168,10 +174,7 @@ impl TeeState {
                 Ok(fresh) => {
                     self.file = fresh;
                     self.bytes_written = 0;
-                    log::info!(
-                        "[broker] tee rotated: {}",
-                        self.log_path.display()
-                    );
+                    log::info!("[broker] tee rotated: {}", self.log_path.display());
                 }
                 Err(e) => {
                     log::error!(
@@ -202,6 +205,21 @@ impl TeeState {
 /// `None` until `ArmTee` is received; may be replaced by a later `ArmTee`.
 type SharedTee = Arc<Mutex<Option<TeeState>>>;
 
+/// Per-session bounded queue depth for PTY write/resize commands.
+///
+/// Keeps broker memory bounded if the Hub sends input faster than the PTY can
+/// consume it.
+const PTY_WRITER_QUEUE_CAPACITY: usize = 1024;
+/// Per-connection bounded queue depth for broker -> Hub PTY output.
+const BROKER_OUTPUT_QUEUE_CAPACITY: usize = 256;
+
+/// Commands processed by the per-session PTY writer thread.
+enum PtyWriteCommand {
+    Input(Vec<u8>),
+    Resize { rows: u16, cols: u16 },
+    Shutdown,
+}
+
 // ─── Session ───────────────────────────────────────────────────────────────
 
 /// Broker-side state for a single PTY session.
@@ -226,32 +244,30 @@ struct Session {
     tee: SharedTee,
     /// Reader thread handle — joined on shutdown.
     reader: Option<thread::JoinHandle<()>>,
+    /// Writer thread command channel — sole path for PTY stdin writes/resizes.
+    writer_tx: std::sync::mpsc::SyncSender<PtyWriteCommand>,
+    /// Writer thread handle — joined on shutdown.
+    writer: Option<thread::JoinHandle<()>>,
 }
 
 impl Session {
-    /// Write raw bytes to the PTY master FD.
-    ///
-    /// Uses `ManuallyDrop<File>` so we borrow the FD without transferring
-    /// ownership (and thus without an accidental close on drop).
+    /// Queue raw bytes for PTY stdin write on the dedicated writer thread.
     fn write_input(&self, data: &[u8]) -> Result<()> {
-        let raw: RawFd = std::os::unix::io::AsRawFd::as_raw_fd(&self.master_fd);
-        let mut file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(raw) });
-        file.write_all(data).context("write to PTY master")?;
-        Ok(())
+        self.writer_tx
+            .try_send(PtyWriteCommand::Input(data.to_vec()))
+            .map_err(|e| anyhow::anyhow!("enqueue PTY input: {e}"))
     }
 
-    /// Resize the PTY via `ioctl(TIOCSWINSZ)` and keep the parser in sync.
+    /// Queue a PTY resize for the dedicated writer thread.
+    ///
+    /// The writer coalesces adjacent resize commands and applies only the last
+    /// one, which avoids jank during reconnect/layout resize bursts.
     fn resize(&self, rows: u16, cols: u16) {
-        let raw: RawFd = std::os::unix::io::AsRawFd::as_raw_fd(&self.master_fd);
-        let ws = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        unsafe { libc::ioctl(raw, libc::TIOCSWINSZ, &ws) };
-        if let Ok(mut p) = self.parser.lock() {
-            p.resize(rows, cols);
+        if let Err(e) = self.writer_tx.send(PtyWriteCommand::Resize { rows, cols }) {
+            log::warn!(
+                "[broker] queue resize failed for session {}: {e}",
+                self.session_id
+            );
         }
     }
 
@@ -264,9 +280,93 @@ impl Session {
     }
 }
 
+/// Apply a PTY resize ioctl and keep the shadow parser dimensions in sync.
+fn apply_pty_resize(
+    fd: RawFd,
+    rows: u16,
+    cols: u16,
+    parser: &Arc<Mutex<AlacrittyParser<NoopListener>>>,
+) {
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
+    if let Ok(mut p) = parser.lock() {
+        p.resize(rows, cols);
+    }
+}
+
+/// Drain queued resize commands and keep only the final dimensions.
+///
+/// Returns `(final_rows, final_cols, deferred_cmd)` where `deferred_cmd` is the
+/// first non-resize command encountered while draining.
+fn coalesce_resize_commands(
+    mut rows: u16,
+    mut cols: u16,
+    rx: &std::sync::mpsc::Receiver<PtyWriteCommand>,
+) -> (u16, u16, Option<PtyWriteCommand>) {
+    let mut deferred = None;
+    while let Ok(cmd) = rx.try_recv() {
+        match cmd {
+            PtyWriteCommand::Resize { rows: r, cols: c } => {
+                rows = r;
+                cols = c;
+            }
+            other => {
+                deferred = Some(other);
+                break;
+            }
+        }
+    }
+    (rows, cols, deferred)
+}
+
+/// Per-session PTY writer loop.
+///
+/// This is the sole writer for PTY input and resize operations to avoid
+/// read/write interleaving hazards in the broker main loop.
+fn pty_writer_loop(
+    fd: RawFd,
+    parser: Arc<Mutex<AlacrittyParser<NoopListener>>>,
+    rx: std::sync::mpsc::Receiver<PtyWriteCommand>,
+) {
+    // Borrow-only File wrapper — do not close the FD here.
+    let mut file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    let mut deferred: Option<PtyWriteCommand> = None;
+
+    loop {
+        let cmd = if let Some(cmd) = deferred.take() {
+            cmd
+        } else {
+            match rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            }
+        };
+
+        match cmd {
+            PtyWriteCommand::Input(data) => {
+                if let Err(e) = file.write_all(&data) {
+                    log::warn!("[broker] PTY input write failed: {e}");
+                    break;
+                }
+            }
+            PtyWriteCommand::Resize { rows, cols } => {
+                let (rows, cols, next) = coalesce_resize_commands(rows, cols, &rx);
+                apply_pty_resize(fd, rows, cols, &parser);
+                deferred = next;
+            }
+            PtyWriteCommand::Shutdown => break,
+        }
+    }
+}
+
 // ─── Broker ────────────────────────────────────────────────────────────────
 
-/// Shared writer channel — updated on every Hub connect and reconnect.
+/// Shared output sink — updated on every Hub connect and reconnect.
 ///
 /// All PTY reader threads hold an `Arc` clone of this mutex so that a
 /// single update in `handle_connection` re-wires every surviving reader
@@ -277,7 +377,12 @@ impl Session {
 /// the Hub reconnects.  This is intentional — output produced between
 /// disconnect and reconnect is already captured in each session's
 /// `AlacrittyParser` ring buffer and replayed via `GetSnapshot`.
-type SharedWriter = Arc<Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>>;
+struct OutputSink {
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    overflow_tx: std::sync::mpsc::Sender<()>,
+    overflow_notified: Arc<std::sync::atomic::AtomicBool>,
+}
+type SharedWriter = Arc<Mutex<Option<OutputSink>>>;
 
 /// The broker state: all registered PTY sessions plus configuration.
 struct Broker {
@@ -315,16 +420,15 @@ impl Broker {
     /// The reader thread uses `self.shared_writer` — the same `Arc` shared by
     /// all sessions — so a single update in `handle_connection` re-wires all
     /// reader threads to the current Hub connection on reconnect.
-    fn register(
-        &mut self,
-        fd: OwnedFd,
-        reg: FdTransferPayload,
-    ) -> u32 {
+    fn register(&mut self, fd: OwnedFd, reg: FdTransferPayload) -> u32 {
         let session_id = self.alloc_session_id();
-        let parser = Arc::new(Mutex::new(
-            AlacrittyParser::new_noop(reg.rows, reg.cols, DEFAULT_SCROLLBACK_LINES),
-        ));
+        let parser = Arc::new(Mutex::new(AlacrittyParser::new_noop(
+            reg.rows,
+            reg.cols,
+            DEFAULT_SCROLLBACK_LINES,
+        )));
         let parser_clone = Arc::clone(&parser);
+        let parser_for_writer = Arc::clone(&parser);
 
         // Reader thread: blocking read loop on the master PTY FD.
         // Uses Arc::clone of shared_writer so a reconnect updates ALL reader
@@ -340,17 +444,25 @@ impl Broker {
         let reader = thread::spawn(move || {
             reader_loop(raw, reader_sid, parser_clone, shared, tee_clone);
         });
+        let (writer_tx, writer_rx) =
+            std::sync::mpsc::sync_channel::<PtyWriteCommand>(PTY_WRITER_QUEUE_CAPACITY);
+        let writer = thread::spawn(move || pty_writer_loop(raw, parser_for_writer, writer_rx));
 
         self.key_map.insert(reg.session_uuid.clone(), session_id);
-        self.sessions.insert(session_id, Session {
+        self.sessions.insert(
             session_id,
-            session_uuid: reg.session_uuid,
-            master_fd: fd,
-            child_pid: reg.child_pid,
-            parser,
-            tee: shared_tee,
-            reader: Some(reader),
-        });
+            Session {
+                session_id,
+                session_uuid: reg.session_uuid,
+                master_fd: fd,
+                child_pid: reg.child_pid,
+                parser,
+                tee: shared_tee,
+                reader: Some(reader),
+                writer_tx,
+                writer: Some(writer),
+            },
+        );
 
         session_id
     }
@@ -359,6 +471,10 @@ impl Broker {
     fn unregister(&mut self, session_id: u32) {
         if let Some(mut sess) = self.sessions.remove(&session_id) {
             self.key_map.remove(&sess.session_uuid);
+            let _ = sess.writer_tx.send(PtyWriteCommand::Shutdown);
+            if let Some(handle) = sess.writer.take() {
+                let _ = handle.join();
+            }
             // Join the reader — it will exit when the PTY FD is closed on drop.
             if let Some(handle) = sess.reader.take() {
                 drop(sess.master_fd); // close FD first so reader unblocks
@@ -371,6 +487,10 @@ impl Broker {
     fn kill_all(&mut self) {
         for (_, mut sess) in self.sessions.drain() {
             sess.kill_child();
+            let _ = sess.writer_tx.send(PtyWriteCommand::Shutdown);
+            if let Some(handle) = sess.writer.take() {
+                let _ = handle.join();
+            }
             if let Some(handle) = sess.reader.take() {
                 drop(sess.master_fd);
                 let _ = handle.join();
@@ -447,8 +567,16 @@ fn reader_loop(
                 // window — drop the frame (already captured in parser and tee above).
                 let frame = encode_data(frame_type::PTY_OUTPUT, session_id, data);
                 if let Ok(guard) = shared_writer.lock() {
-                    if let Some(ref tx) = *guard {
-                        let _ = tx.send(frame);
+                    if let Some(ref sink) = *guard {
+                        match sink.tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                                if !sink.overflow_notified.swap(true, Ordering::AcqRel) {
+                                    let _ = sink.overflow_tx.send(());
+                                }
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+                        }
                     }
                 }
             }
@@ -462,10 +590,7 @@ fn reader_loop(
 /// capturing any file descriptors passed via SCM_RIGHTS ancillary data.
 ///
 /// Returns `(bytes_read, received_bytes, fds)`.
-fn recvmsg_fds(
-    sock_fd: RawFd,
-    max_bytes: usize,
-) -> std::io::Result<(Vec<u8>, Vec<OwnedFd>)> {
+fn recvmsg_fds(sock_fd: RawFd, max_bytes: usize) -> std::io::Result<(Vec<u8>, Vec<OwnedFd>)> {
     let mut data_buf = vec![0u8; max_bytes];
     // Ancillary buffer large enough for one FD.
     let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) } as usize;
@@ -497,12 +622,9 @@ fn recvmsg_fds(
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET
-                && (*cmsg).cmsg_type == libc::SCM_RIGHTS
-            {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
                 let data = libc::CMSG_DATA(cmsg);
-                let fd_count = ((*cmsg).cmsg_len as usize
-                    - libc::CMSG_LEN(0) as usize)
+                let fd_count = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize)
                     / std::mem::size_of::<libc::c_int>();
                 for i in 0..fd_count {
                     let fd: libc::c_int = std::ptr::read_unaligned(
@@ -520,33 +642,98 @@ fn recvmsg_fds(
 
 // ─── Hub connection handler ────────────────────────────────────────────────
 
+/// Spawn a writer thread that prioritizes control frames over output frames.
+fn spawn_connection_writer_thread(
+    stream: UnixStream,
+    control_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    output_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut stream = stream;
+        let mut control_open = true;
+        let mut output_open = true;
+        const POLL: Duration = Duration::from_millis(100);
+
+        loop {
+            let mut progressed = false;
+
+            // Control responses are latency-sensitive; always service them first.
+            if control_open {
+                match control_rx.try_recv() {
+                    Ok(frame) => {
+                        progressed = true;
+                        if frame.is_empty() || stream.write_all(&frame).is_err() {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        control_open = false;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+
+            if progressed {
+                continue;
+            }
+
+            if output_open {
+                match output_rx.recv_timeout(POLL) {
+                    Ok(frame) => {
+                        if frame.is_empty() || stream.write_all(&frame).is_err() {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        output_open = false;
+                    }
+                }
+            } else if control_open {
+                match control_rx.recv_timeout(POLL) {
+                    Ok(frame) => {
+                        if frame.is_empty() || stream.write_all(&frame).is_err() {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        control_open = false;
+                    }
+                }
+            }
+
+            if !control_open && !output_open {
+                break;
+            }
+        }
+    })
+}
+
 /// Handle one Hub connection until it disconnects.
 ///
 /// Returns the broker state so the caller can wait for a reconnect.
-fn handle_connection(
-    stream: UnixStream,
-    broker: &mut Broker,
-) -> Result<()> {
+fn handle_connection(mut stream: UnixStream, broker: &mut Broker) -> Result<()> {
     use protocol::BrokerFrame;
 
-    let sock_fd: RawFd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
+    let negotiated = control_handshake_server(&mut stream).context("control handshake from hub")?;
+    log::debug!(
+        "[broker] control handshake negotiated: version={} caps=0x{:x}",
+        negotiated.version,
+        negotiated.capabilities
+    );
 
-    // Single unbounded channel — control responses and PTY output both flow
-    // through here.  The writer blocks on recv() until any frame arrives;
-    // no polling or timeouts are needed.
-    //
-    // Why unbounded rather than bounded?  The old bounded SyncChannel(256)
-    // caused a dead-lock: PTY output filled all 256 slots, then try_send for
-    // a Registered/Snapshot/Ack frame silently dropped it, and the Hub's
-    // read_response() blocked forever.  An unbounded channel enqueues the
-    // control frame behind the pending output frames; the writer delivers them
-    // in FIFO order, and the Hub's read_response() unblocks once the writer
-    // catches up — which takes milliseconds at socket copy speeds.
-    //
-    // Memory bound: output accumulates only when the Hub is not draining the
-    // socket.  In practice the Hub's demux thread runs independently and keeps
-    // the socket clear, so the in-memory queue stays near zero.
-    let (writer_tx, writer_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let sock_fd: RawFd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+
+    // Per-consumer queues:
+    // - control_tx: unbounded, latency-sensitive control replies
+    // - output_tx: bounded, high-volume PTY output (disconnect on overflow)
+    let (control_tx, control_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (output_tx, output_rx) =
+        std::sync::mpsc::sync_channel::<Vec<u8>>(BROKER_OUTPUT_QUEUE_CAPACITY);
+    let (overflow_tx, overflow_rx) = std::sync::mpsc::channel::<()>();
+    let overflow_notified = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Re-wire all existing reader threads to this Hub connection.
     //
@@ -559,37 +746,40 @@ fn handle_connection(
             .shared_writer
             .lock()
             .expect("shared_writer mutex poisoned");
-        *guard = Some(writer_tx.clone());
+        *guard = Some(OutputSink {
+            tx: output_tx.clone(),
+            overflow_tx: overflow_tx.clone(),
+            overflow_notified: Arc::clone(&overflow_notified),
+        });
     }
 
-    // Writer thread — sends encoded frames from broker sessions to the Hub.
-    // Blocks on recv() until a frame arrives; exits on channel disconnect or
-    // the empty-Vec sentinel that handle_connection sends on Hub disconnect.
     let write_stream = stream.try_clone().context("clone socket for writer")?;
-    let writer = thread::spawn(move || {
-        let mut ws = write_stream;
-        for frame in writer_rx {
-            // Empty sentinel: main loop signals disconnect while reader-thread
-            // clones still keep the channel alive.  A zero-length Vec is never
-            // a valid encoded frame (all real frames have a ≥5-byte header).
-            if frame.is_empty() {
-                break;
-            }
-            if ws.write_all(&frame).is_err() {
-                break;
-            }
-        }
-    });
+    let writer = spawn_connection_writer_thread(write_stream, control_rx, output_rx);
 
     let mut decoder = BrokerFrameDecoder::new();
     let mut pending_fd: Option<OwnedFd> = None;
 
     loop {
+        if overflow_rx.try_recv().is_ok() {
+            log::warn!(
+                "[broker] output queue overflow (cap={BROKER_OUTPUT_QUEUE_CAPACITY}); disconnecting Hub"
+            );
+            break;
+        }
         // Use recvmsg so we capture SCM_RIGHTS ancillary data on FdTransfer.
         let (data, fds) = match recvmsg_fds(sock_fd, 65536) {
             Ok((d, f)) if d.is_empty() && f.is_empty() => break, // Hub disconnected
             Ok(r) => r,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue
+            }
             Err(_) => break,
         };
 
@@ -624,7 +814,7 @@ fn handle_connection(
                         session_uuid,
                         session_id,
                     });
-                    let _ = writer_tx.send(resp);
+                    let _ = control_tx.send(resp);
                 }
 
                 BrokerFrame::PtyInput(session_id, data) => {
@@ -635,7 +825,11 @@ fn handle_connection(
                     }
                 }
 
-                BrokerFrame::HubControl(HubMessage::ResizePty { session_id, rows, cols }) => {
+                BrokerFrame::HubControl(HubMessage::ResizePty {
+                    session_id,
+                    rows,
+                    cols,
+                }) => {
                     if let Some(sess) = broker.sessions.get(&session_id) {
                         sess.resize(rows, cols);
                     }
@@ -655,28 +849,37 @@ fn handle_connection(
                             message: format!("no session {session_id}"),
                         })
                     };
-                    let _ = writer_tx.send(frame);
+                    let _ = control_tx.send(frame);
+                }
+
+                BrokerFrame::HubControl(HubMessage::ListSessions) => {
+                    let mut sessions: Vec<BrokerSessionInventory> = broker
+                        .sessions
+                        .values()
+                        .map(|sess| BrokerSessionInventory {
+                            session_id: sess.session_id,
+                            session_uuid: sess.session_uuid.clone(),
+                        })
+                        .collect();
+                    sessions.sort_by_key(|s| s.session_id);
+                    let _ =
+                        control_tx.send(encode_broker_control(&BrokerMessage::SessionInventory {
+                            sessions,
+                        }));
                 }
 
                 BrokerFrame::HubControl(HubMessage::UnregisterPty { session_id }) => {
                     broker.unregister(session_id);
-                    let _ = writer_tx.send(encode_broker_control(&BrokerMessage::Ack));
+                    let _ = control_tx.send(encode_broker_control(&BrokerMessage::Ack));
                 }
 
                 BrokerFrame::HubControl(HubMessage::SetTimeout { seconds }) => {
                     broker.reconnect_timeout = Duration::from_secs(seconds);
-                    let _ = writer_tx.send(encode_broker_control(&BrokerMessage::Ack));
+                    let _ = control_tx.send(encode_broker_control(&BrokerMessage::Ack));
                 }
 
                 BrokerFrame::HubControl(HubMessage::KillAll) => {
                     broker.kill_all();
-                    // With SharedWriter, the channel has two senders: the
-                    // local `writer_tx` and the clone stored in shared_writer.
-                    // kill_all() only joins reader threads (which hold Arc clones
-                    // of shared_writer, not writer_tx clones), so the clone in
-                    // shared_writer still keeps the channel alive.  Clear it first
-                    // so that dropping writer_tx leaves zero senders and the
-                    // writer's for-loop exits via Disconnected rather than hanging.
                     {
                         let mut guard = broker
                             .shared_writer
@@ -684,38 +887,51 @@ fn handle_connection(
                             .expect("shared_writer mutex poisoned");
                         *guard = None;
                     }
-                    drop(writer_tx);
+                    let _ = control_tx.send(vec![]);
+                    let _ = output_tx.try_send(vec![]);
+                    drop(control_tx);
+                    drop(output_tx);
                     let _ = writer.join();
                     return Ok(());
                 }
 
-                BrokerFrame::HubControl(HubMessage::ArmTee { session_id, log_path, cap_bytes }) => {
+                BrokerFrame::HubControl(HubMessage::ArmTee {
+                    session_id,
+                    log_path,
+                    cap_bytes,
+                }) => {
                     // Arm (or re-arm) the file tee for this session.
                     //
                     // The SharedTee Arc is shared with the reader thread; replacing
                     // its contents here re-wires the tee without stopping the reader.
                     // cap_bytes defaults to DEFAULT_TEE_CAP_BYTES when the caller
                     // passes 0 (Lua may omit the argument).
-                    let effective_cap = if cap_bytes == 0 { DEFAULT_TEE_CAP_BYTES } else { cap_bytes };
+                    let effective_cap = if cap_bytes == 0 {
+                        DEFAULT_TEE_CAP_BYTES
+                    } else {
+                        cap_bytes
+                    };
                     let resp = if let Some(sess) = broker.sessions.get(&session_id) {
                         match TeeState::open(PathBuf::from(&log_path), effective_cap) {
-                            Ok(tee) => {
-                                match sess.tee.lock() {
-                                    Ok(mut guard) => {
-                                        *guard = Some(tee);
-                                        log::info!(
+                            Ok(tee) => match sess.tee.lock() {
+                                Ok(mut guard) => {
+                                    *guard = Some(tee);
+                                    log::info!(
                                             "[broker] tee armed: session={session_id} path={log_path} cap={effective_cap}"
                                         );
-                                        encode_broker_control(&BrokerMessage::Ack)
-                                    }
-                                    Err(_) => {
-                                        log::error!("[broker] tee mutex poisoned for session {session_id}");
-                                        encode_broker_control(&BrokerMessage::Error {
-                                            message: format!("tee mutex poisoned for session {session_id}"),
-                                        })
-                                    }
+                                    encode_broker_control(&BrokerMessage::Ack)
                                 }
-                            }
+                                Err(_) => {
+                                    log::error!(
+                                        "[broker] tee mutex poisoned for session {session_id}"
+                                    );
+                                    encode_broker_control(&BrokerMessage::Error {
+                                        message: format!(
+                                            "tee mutex poisoned for session {session_id}"
+                                        ),
+                                    })
+                                }
+                            },
                             Err(e) => {
                                 log::error!("[broker] ArmTee failed for session {session_id}: {e}");
                                 encode_broker_control(&BrokerMessage::Error {
@@ -729,11 +945,11 @@ fn handle_connection(
                             message: format!("no session {session_id}"),
                         })
                     };
-                    let _ = writer_tx.send(resp);
+                    let _ = control_tx.send(resp);
                 }
 
                 BrokerFrame::HubControl(HubMessage::Ping) => {
-                    let _ = writer_tx.send(encode_broker_control(&BrokerMessage::Pong));
+                    let _ = control_tx.send(encode_broker_control(&BrokerMessage::Pong));
                 }
 
                 _ => {
@@ -757,12 +973,11 @@ fn handle_connection(
         *guard = None;
     }
 
-    // Send the empty-Vec sentinel so the writer exits immediately rather than
-    // draining any PTY output frames queued just before the Hub disconnected.
-    // Dropping writer_tx after clearing shared_writer also disconnects the channel,
-    // but the sentinel avoids writing stale output to the now-closed socket.
-    let _ = writer_tx.send(vec![]); // sentinel: empty Vec is never a valid frame
-    drop(writer_tx);
+    // Send sentinel to stop writer promptly; then drop both senders.
+    let _ = control_tx.send(vec![]);
+    let _ = output_tx.try_send(vec![]);
+    drop(control_tx);
+    drop(output_tx);
     let _ = writer.join();
 
     Ok(())
@@ -794,10 +1009,7 @@ pub fn broker_socket_path(hub_id: &str) -> Result<PathBuf> {
 ///
 /// The listener is left in non-blocking mode; callers that need blocking
 /// accepts should call `set_nonblocking(false)` themselves.
-fn wait_for_reconnect(
-    listener: &UnixListener,
-    timeout: Duration,
-) -> Result<Option<UnixStream>> {
+fn wait_for_reconnect(listener: &UnixListener, timeout: Duration) -> Result<Option<UnixStream>> {
     listener.set_nonblocking(true)?;
     let deadline = Instant::now() + timeout;
 
@@ -849,7 +1061,9 @@ pub fn run(hub_id: &str, timeout_secs: u64) -> Result<()> {
 
     // Wait indefinitely for the first Hub connection.
     listener.set_nonblocking(false)?;
-    let (stream, _) = listener.accept().context("waiting for initial Hub connection")?;
+    let (stream, _) = listener
+        .accept()
+        .context("waiting for initial Hub connection")?;
     log::info!("[broker] Hub connected");
     let _ = handle_connection(stream, &mut broker);
     log::info!("[broker] Hub disconnected");
@@ -892,6 +1106,51 @@ pub fn run(hub_id: &str, timeout_secs: u64) -> Result<()> {
 }
 
 // ─── TeeState unit tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    #[test]
+    fn coalesce_resize_uses_last_and_defers_first_non_resize() {
+        let (tx, rx) = std::sync::mpsc::channel::<PtyWriteCommand>();
+        tx.send(PtyWriteCommand::Resize { rows: 30, cols: 90 })
+            .unwrap();
+        tx.send(PtyWriteCommand::Resize {
+            rows: 40,
+            cols: 120,
+        })
+        .unwrap();
+        tx.send(PtyWriteCommand::Input(b"abc".to_vec())).unwrap();
+        tx.send(PtyWriteCommand::Resize {
+            rows: 50,
+            cols: 140,
+        })
+        .unwrap();
+
+        let (rows, cols, deferred) = coalesce_resize_commands(24, 80, &rx);
+        assert_eq!((rows, cols), (40, 120));
+        assert!(matches!(
+            deferred,
+            Some(PtyWriteCommand::Input(ref data)) if data == b"abc"
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            PtyWriteCommand::Resize {
+                rows: 50,
+                cols: 140
+            }
+        ));
+    }
+
+    #[test]
+    fn coalesce_resize_empty_queue_returns_initial() {
+        let (_tx, rx) = std::sync::mpsc::channel::<PtyWriteCommand>();
+        let (rows, cols, deferred) = coalesce_resize_commands(24, 80, &rx);
+        assert_eq!((rows, cols), (24, 80));
+        assert!(deferred.is_none());
+    }
+}
 
 #[cfg(test)]
 mod tee_tests {
@@ -946,10 +1205,13 @@ mod tee_tests {
         let mut tee = TeeState::open(log_path.clone(), 5).unwrap();
 
         tee.write_data(b"abcde"); // 5 bytes — exactly at cap, rotation fires on next write
-        tee.write_data(b"X");    // triggers rotation before writing "X"
+        tee.write_data(b"X"); // triggers rotation before writing "X"
 
         // After rotation: .log.1 contains "abcde", .log contains "X".
-        assert!(rotated_path.exists(), "pty-0.log.1 should exist after rotation");
+        assert!(
+            rotated_path.exists(),
+            "pty-0.log.1 should exist after rotation"
+        );
         assert_eq!(std::fs::read(&rotated_path).unwrap(), b"abcde");
         assert_eq!(std::fs::read(&log_path).unwrap(), b"X");
         assert_eq!(tee.bytes_written, 1);
@@ -1001,7 +1263,10 @@ mod tee_tests {
         std::fs::write(&log_path, b"12345678").unwrap();
 
         let tee = TeeState::open(log_path, DEFAULT_TEE_CAP_BYTES).unwrap();
-        assert_eq!(tee.bytes_written, 8, "bytes_written should reflect pre-existing content");
+        assert_eq!(
+            tee.bytes_written, 8,
+            "bytes_written should reflect pre-existing content"
+        );
     }
 
     /// Once `degraded`, subsequent `write_data` calls are no-ops (no panic, no crash).

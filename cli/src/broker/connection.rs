@@ -61,9 +61,14 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use super::protocol::{
-    encode_data, encode_fd_transfer, encode_hub_control, frame_type, BrokerFrame,
-    BrokerFrameDecoder, BrokerMessage, FdTransferPayload, HubMessage,
+    control_handshake_client, encode_data, encode_fd_transfer_with_capabilities,
+    encode_hub_control, frame_type, BrokerFrame, BrokerFrameDecoder, BrokerMessage,
+    BrokerSessionInventory, ControlNegotiated, FdTransferPayload, HubMessage,
 };
+
+/// Upper bound for synchronous Hub->Broker control response waits once the
+/// demux thread owns socket reads.
+const DEMUX_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared, thread-safe broker connection.
 ///
@@ -114,6 +119,10 @@ pub struct BrokerConnection {
     /// checks this via `is_demux_alive()` during the cleanup tick to detect
     /// silent forwarder death and trigger broker reconnection.
     demux_alive: Arc<AtomicBool>,
+    /// Negotiated control protocol version for this connection.
+    control_protocol_version: u8,
+    /// Negotiated control-plane capabilities for this connection.
+    control_capabilities: u32,
 }
 
 impl std::fmt::Debug for BrokerConnection {
@@ -132,17 +141,23 @@ impl BrokerConnection {
     /// Returns an error if the socket does not exist, the connection is refused,
     /// or the read timeout cannot be configured.
     pub fn connect(path: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(path)
+        let mut stream = UnixStream::connect(path)
             .with_context(|| format!("connect to broker socket: {}", path.display()))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .context("set broker socket read timeout")?;
+        let ControlNegotiated {
+            version,
+            capabilities,
+        } = control_handshake_client(&mut stream).context("control handshake with broker")?;
         Ok(Self {
             stream,
             decoder: BrokerFrameDecoder::new(),
             frame_buffer: VecDeque::new(),
             response_rx: None,
             demux_alive: Arc::new(AtomicBool::new(false)),
+            control_protocol_version: version,
+            control_capabilities: capabilities,
         })
     }
 
@@ -178,9 +193,9 @@ impl BrokerConnection {
             rows,
             cols,
         };
-        let frame_bytes = encode_fd_transfer(&reg).context("encode FdTransfer")?;
-        send_with_fd(&self.stream, &frame_bytes, fd)
-            .context("sendmsg FdTransfer to broker")?;
+        let frame_bytes = encode_fd_transfer_with_capabilities(&reg, self.control_capabilities)
+            .context("encode FdTransfer")?;
+        send_with_fd(&self.stream, &frame_bytes, fd).context("sendmsg FdTransfer to broker")?;
 
         match self.read_response()? {
             BrokerFrame::BrokerControl(BrokerMessage::Registered { session_id, .. }) => {
@@ -219,6 +234,24 @@ impl BrokerConnection {
                 bail!("broker snapshot error: {message}")
             }
             other => bail!("unexpected broker response to GetSnapshot: {other:?}"),
+        }
+    }
+
+    /// Return broker inventory for all currently live PTY sessions.
+    ///
+    /// Used by Hub restart recovery as the liveness authority.
+    pub fn list_sessions(&mut self) -> Result<Vec<BrokerSessionInventory>> {
+        let frame = encode_hub_control(&HubMessage::ListSessions);
+        self.stream.write_all(&frame).context("send ListSessions")?;
+
+        match self.read_response()? {
+            BrokerFrame::BrokerControl(BrokerMessage::SessionInventory { sessions }) => {
+                Ok(sessions)
+            }
+            BrokerFrame::BrokerControl(BrokerMessage::Error { message }) => {
+                bail!("broker list_sessions error: {message}")
+            }
+            other => bail!("unexpected broker response to ListSessions: {other:?}"),
         }
     }
 
@@ -269,7 +302,11 @@ impl BrokerConnection {
     ///
     /// Returns an error if the write to the socket fails.
     pub fn resize_pty(&mut self, session_id: u32, rows: u16, cols: u16) -> Result<()> {
-        let frame = encode_hub_control(&HubMessage::ResizePty { session_id, rows, cols });
+        let frame = encode_hub_control(&HubMessage::ResizePty {
+            session_id,
+            rows,
+            cols,
+        });
         self.stream.write_all(&frame).context("send ResizePty")?;
         Ok(())
     }
@@ -298,7 +335,9 @@ impl BrokerConnection {
     /// Returns an error if the write to the socket fails.
     pub fn unregister_pty(&mut self, session_id: u32) -> Result<()> {
         let frame = encode_hub_control(&HubMessage::UnregisterPty { session_id });
-        self.stream.write_all(&frame).context("send UnregisterPty")?;
+        self.stream
+            .write_all(&frame)
+            .context("send UnregisterPty")?;
         let _ = self.read_response(); // Ack — best-effort, ignore timeout
         Ok(())
     }
@@ -389,6 +428,8 @@ impl BrokerConnection {
             frame_buffer: VecDeque::new(),
             response_rx: None,
             demux_alive: Arc::new(AtomicBool::new(false)),
+            control_protocol_version: super::protocol::CONTROL_PROTOCOL_VERSION,
+            control_capabilities: super::protocol::CONTROL_SUPPORTED_CAPABILITIES,
         }
     }
 
@@ -414,12 +455,21 @@ impl BrokerConnection {
         if let Some(ref rx) = self.response_rx {
             // Post-forwarder: demux thread owns all socket reads and sends
             // control frames here. No socket contention.
-            return rx.recv().context("broker demux reader thread disconnected");
+            return rx
+                .recv_timeout(DEMUX_RESPONSE_TIMEOUT)
+                .context("timed out waiting for broker control response via demux");
         }
 
         // Pre-forwarder: read directly from the socket (no race yet).
-        if let Some(frame) = self.frame_buffer.pop_front() {
-            return Ok(frame);
+        // Drop asynchronous output events and keep waiting for a control reply.
+        while let Some(frame) = self.frame_buffer.pop_front() {
+            if !matches!(
+                frame,
+                BrokerFrame::PtyOutput(_, _)
+                    | BrokerFrame::BrokerControl(BrokerMessage::PtyExited { .. })
+            ) {
+                return Ok(frame);
+            }
         }
         let mut buf = [0u8; 4096];
         loop {
@@ -427,9 +477,14 @@ impl BrokerConnection {
             if n == 0 {
                 bail!("broker closed connection unexpectedly");
             }
-            let mut frames = self.decoder.feed(&buf[..n])?.into_iter();
-            if let Some(frame) = frames.next() {
-                self.frame_buffer.extend(frames);
+            for frame in self.decoder.feed(&buf[..n])? {
+                if matches!(
+                    frame,
+                    BrokerFrame::PtyOutput(_, _)
+                        | BrokerFrame::BrokerControl(BrokerMessage::PtyExited { .. })
+                ) {
+                    continue;
+                }
                 return Ok(frame);
             }
         }
@@ -456,7 +511,9 @@ impl BrokerConnection {
         &mut self,
         event_tx: crate::hub::events::HubEventTx,
     ) -> Result<()> {
-        let reader_stream = self.stream.try_clone()
+        let reader_stream = self
+            .stream
+            .try_clone()
             .context("dup broker socket for demux reader")?;
         let (response_tx, response_rx) = std::sync::mpsc::channel::<BrokerFrame>();
         self.response_rx = Some(response_rx);
@@ -493,6 +550,18 @@ impl BrokerConnection {
     pub fn has_forwarder(&self) -> bool {
         self.response_rx.is_some()
     }
+
+    /// Negotiated control protocol version.
+    #[must_use]
+    pub fn control_protocol_version(&self) -> u8 {
+        self.control_protocol_version
+    }
+
+    /// Negotiated control capability bitflags.
+    #[must_use]
+    pub fn control_capabilities(&self) -> u32 {
+        self.control_capabilities
+    }
 }
 
 // ── SCM_RIGHTS send ──────────────────────────────────────────────────────────
@@ -511,8 +580,9 @@ fn send_with_fd(stream: &UnixStream, data: &[u8], fd: RawFd) -> Result<()> {
 
     let sock_fd = stream.as_raw_fd();
     let fd_size = std::mem::size_of::<libc::c_int>();
+    let fd_size_u32 = u32::try_from(fd_size).expect("c_int size should fit in u32");
     // CMSG_SPACE includes the cmsghdr header overhead.
-    let cmsg_space = unsafe { libc::CMSG_SPACE(fd_size as u32) } as usize;
+    let cmsg_space = unsafe { libc::CMSG_SPACE(fd_size_u32) } as usize;
     let mut cmsg_buf = vec![0u8; cmsg_space];
 
     let mut iov = libc::iovec {
@@ -536,8 +606,13 @@ fn send_with_fd(stream: &UnixStream, data: &[u8], fd: RawFd) -> Result<()> {
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         // CMSG_LEN returns u32 on both platforms, but cmsg_len is usize on Linux
-        // and u32 on macOS. Use `as _` to coerce portably.
-        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size as libc::c_uint) as _;
+        // and u32 on macOS. Normalize without trivial casts.
+        #[cfg(target_os = "macos")]
+        let cmsg_len = libc::CMSG_LEN(fd_size_u32);
+        #[cfg(not(target_os = "macos"))]
+        let cmsg_len = usize::try_from(libc::CMSG_LEN(fd_size_u32))
+            .expect("CMSG_LEN should fit into usize");
+        (*cmsg).cmsg_len = cmsg_len;
         let data_ptr = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
         std::ptr::write_unaligned(data_ptr, fd);
     }
@@ -556,8 +631,8 @@ fn send_with_fd(stream: &UnixStream, data: &[u8], fd: RawFd) -> Result<()> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::send_with_fd;
     use super::super::broker_socket_path;
+    use super::send_with_fd;
     use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::os::unix::net::UnixStream;
 
@@ -588,7 +663,11 @@ mod tests {
             let mut msg = msg;
 
             let n = libc::recvmsg(sock, &mut msg, 0);
-            assert!(n >= 0, "recvmsg failed: {}", std::io::Error::last_os_error());
+            assert!(
+                n >= 0,
+                "recvmsg failed: {}",
+                std::io::Error::last_os_error()
+            );
             data_buf.truncate(n as usize);
 
             let mut fds = Vec::new();
@@ -652,11 +731,18 @@ mod tests {
 
         // Write to the write end; read from the received (duplicated) read end.
         let msg = b"hello through SCM_RIGHTS";
-        let written = unsafe { libc::write(pipe_write, msg.as_ptr() as *const libc::c_void, msg.len()) };
+        let written =
+            unsafe { libc::write(pipe_write, msg.as_ptr() as *const libc::c_void, msg.len()) };
         assert_eq!(written as usize, msg.len());
 
         let mut read_buf = vec![0u8; msg.len()];
-        let n = unsafe { libc::read(received_fd, read_buf.as_mut_ptr() as *mut libc::c_void, read_buf.len()) };
+        let n = unsafe {
+            libc::read(
+                received_fd,
+                read_buf.as_mut_ptr() as *mut libc::c_void,
+                read_buf.len(),
+            )
+        };
         assert_eq!(n as usize, msg.len());
         assert_eq!(&read_buf, msg);
 
@@ -701,9 +787,17 @@ mod tests {
 
         let mut read_buf = vec![0u8; msg.len()];
         let n = unsafe {
-            libc::read(received_fd, read_buf.as_mut_ptr() as *mut libc::c_void, read_buf.len())
+            libc::read(
+                received_fd,
+                read_buf.as_mut_ptr() as *mut libc::c_void,
+                read_buf.len(),
+            )
         };
-        assert_eq!(n as usize, msg.len(), "received FD should be readable after sender closes original");
+        assert_eq!(
+            n as usize,
+            msg.len(),
+            "received FD should be readable after sender closes original"
+        );
         assert_eq!(&read_buf, msg);
 
         unsafe {
@@ -721,7 +815,10 @@ mod tests {
     fn test_broker_socket_path_format() {
         let path = broker_socket_path("abc123").expect("path should be valid");
         let s = path.to_string_lossy();
-        assert!(s.contains("broker-abc123.sock"), "path should contain hub_id: {s}");
+        assert!(
+            s.contains("broker-abc123.sock"),
+            "path should contain hub_id: {s}"
+        );
         assert!(s.starts_with("/tmp/"), "path should be under /tmp: {s}");
     }
 
@@ -730,7 +827,10 @@ mod tests {
     fn test_broker_socket_path_too_long_fails() {
         let long_id = "x".repeat(200);
         let result = broker_socket_path(&long_id);
-        assert!(result.is_err(), "excessively long hub_id should produce an error");
+        assert!(
+            result.is_err(),
+            "excessively long hub_id should produce an error"
+        );
     }
 }
 
@@ -772,22 +872,19 @@ fn demux_reader(
         for frame in frames {
             match frame {
                 BrokerFrame::PtyOutput(session_id, data) => {
-                    let _ = event_tx.send(
-                        crate::hub::events::HubEvent::BrokerPtyOutput { session_id, data },
-                    );
+                    let _ = event_tx
+                        .send(crate::hub::events::HubEvent::BrokerPtyOutput { session_id, data });
                 }
                 BrokerFrame::BrokerControl(BrokerMessage::PtyExited {
                     session_id,
                     session_uuid,
                     exit_code,
                 }) => {
-                    let _ = event_tx.send(
-                        crate::hub::events::HubEvent::BrokerPtyExited {
-                            session_id,
-                            session_uuid,
-                            exit_code,
-                        },
-                    );
+                    let _ = event_tx.send(crate::hub::events::HubEvent::BrokerPtyExited {
+                        session_id,
+                        session_uuid,
+                        exit_code,
+                    });
                 }
                 other => {
                     // Control response: Registered, Snapshot, Ack, Pong, Error, etc.
@@ -807,8 +904,8 @@ fn demux_reader(
 
 #[cfg(test)]
 mod integration_tests {
-    use super::*;
     use super::super::protocol::encode_broker_control;
+    use super::*;
     use crate::hub::events::HubEvent;
     use std::os::unix::io::AsRawFd;
 
@@ -836,15 +933,17 @@ mod integration_tests {
             let mut msg = msg;
 
             let n = libc::recvmsg(sock, &mut msg, 0);
-            assert!(n >= 0, "recvmsg failed: {}", std::io::Error::last_os_error());
+            assert!(
+                n >= 0,
+                "recvmsg failed: {}",
+                std::io::Error::last_os_error()
+            );
             data_buf.truncate(n as usize);
 
             let mut fds = Vec::new();
             let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
             while !cmsg.is_null() {
-                if (*cmsg).cmsg_level == libc::SOL_SOCKET
-                    && (*cmsg).cmsg_type == libc::SCM_RIGHTS
-                {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
                     let data = libc::CMSG_DATA(cmsg);
                     let count = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize)
                         / std::mem::size_of::<libc::c_int>();
@@ -923,8 +1022,13 @@ mod integration_tests {
         conn.install_forwarder(event_tx.into()).unwrap();
 
         // Register PTY — this must succeed (Registered routed to read_response via channel).
-        let session_id = conn.register_pty("test-agent", 0, 24, 80, pipe_read).unwrap();
-        assert_eq!(session_id, 42, "register_pty should return broker-assigned session_id");
+        let session_id = conn
+            .register_pty("test-agent", 0, 24, 80, pipe_read)
+            .unwrap();
+        assert_eq!(
+            session_id, 42,
+            "register_pty should return broker-assigned session_id"
+        );
 
         // Registered must NOT have leaked to the event channel.
         assert!(
@@ -1035,7 +1139,10 @@ mod integration_tests {
             let frames = decoder.feed(&buf[..n]).unwrap();
             assert_eq!(frames.len(), 1);
             assert!(
-                matches!(&frames[0], BrokerFrame::HubControl(super::super::protocol::HubMessage::Ping)),
+                matches!(
+                    &frames[0],
+                    BrokerFrame::HubControl(super::super::protocol::HubMessage::Ping)
+                ),
                 "expected Ping"
             );
 
@@ -1097,5 +1204,34 @@ mod integration_tests {
         );
 
         broker_handle.join().unwrap();
+    }
+
+    // ── Test 6: get_snapshot times out when broker is silent ───────────────
+
+    /// Regression: post-forwarder `read_response()` must not block forever if
+    /// the broker never replies to a control request.
+    #[test]
+    fn test_get_snapshot_with_forwarder_times_out_when_broker_silent() {
+        let (_broker_stream, client_stream) = UnixStream::pair().unwrap();
+        let mut conn = BrokerConnection::from_stream(client_stream);
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
+        conn.install_forwarder(event_tx.into()).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = conn
+            .get_snapshot(123)
+            .expect_err("silent broker should timeout");
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.to_string()
+                .contains("timed out waiting for broker control response via demux"),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            elapsed >= DEMUX_RESPONSE_TIMEOUT,
+            "request returned too quickly; timeout path not exercised"
+        );
     }
 }

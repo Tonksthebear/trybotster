@@ -65,8 +65,8 @@ use crate::channel::Channel;
 use crate::config::Config;
 use crate::device::Device;
 use crate::git::WorktreeManager;
-use crate::lua::LuaRuntime;
 use crate::lua::primitives::SharedServerId;
+use crate::lua::LuaRuntime;
 
 const WEBRTC_PTY_OUTPUT_QUEUE_CAPACITY: usize = 2048;
 const WEBRTC_OUTGOING_SIGNAL_QUEUE_CAPACITY: usize = 512;
@@ -89,6 +89,57 @@ pub struct WebRtcPtyOutput {
     pub data: Vec<u8>,
     /// Session UUID for hook context.
     pub session_uuid: String,
+}
+
+/// Pending terminal attach request across all client transports.
+#[derive(Debug, Clone)]
+pub(crate) enum PendingTerminalAttachRequest {
+    WebRtc(crate::lua::primitives::CreateForwarderRequest),
+    Tui(crate::lua::primitives::CreateTuiForwarderRequest),
+    Socket(crate::lua::primitives::CreateSocketForwarderRequest),
+}
+
+impl PendingTerminalAttachRequest {
+    #[must_use]
+    pub(crate) fn session_uuid(&self) -> &str {
+        match self {
+            Self::WebRtc(req) => &req.session_uuid,
+            Self::Tui(req) => &req.session_uuid,
+            Self::Socket(req) => &req.session_uuid,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_active(&self) -> bool {
+        let flag = match self {
+            Self::WebRtc(req) => &req.active_flag,
+            Self::Tui(req) => &req.active_flag,
+            Self::Socket(req) => &req.active_flag,
+        };
+        *flag.lock().expect("Forwarder active_flag mutex poisoned")
+    }
+
+    pub(crate) fn deactivate(&self) {
+        let flag = match self {
+            Self::WebRtc(req) => &req.active_flag,
+            Self::Tui(req) => &req.active_flag,
+            Self::Socket(req) => &req.active_flag,
+        };
+        *flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
+    }
+}
+
+/// Pending terminal attach intent.
+///
+/// Created when a client subscribes to a terminal session before the session
+/// is present in `HandleCache`. The Hub retries attach until either the session
+/// appears (`attached`) or the intent expires (`not_found`).
+#[derive(Debug, Clone)]
+pub(crate) struct PendingTerminalAttach {
+    /// Original forwarder request from Lua.
+    pub request: PendingTerminalAttachRequest,
+    /// Timestamp when the attach intent was first recorded.
+    pub requested_at: Instant,
 }
 
 /// Pending observer notification for PTY output.
@@ -173,7 +224,10 @@ pub(crate) struct PeerSendState {
 impl std::fmt::Debug for PeerSendState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerSendState")
-            .field("dead", &self.dead.load(std::sync::atomic::Ordering::Relaxed))
+            .field(
+                "dead",
+                &self.dead.load(std::sync::atomic::Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -323,17 +377,25 @@ pub struct Hub {
     ///
     /// Maps subscriptionId -> JoinHandle for the forwarder task.
     pty_forwarders: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    /// Pending terminal attach intents waiting for session registration.
+    ///
+    /// Keyed by forwarder ID (`{peer_id}:{session_uuid}` / `tui:{session_uuid}` /
+    /// `{client_id}:{session_uuid}`) so re-subscribe replaces stale intent
+    /// atomically (idempotent reattach) across all transport clients.
+    pending_terminal_attaches: std::collections::HashMap<String, PendingTerminalAttach>,
 
     /// Sender for outgoing WebRTC signals (ICE candidates) from async callbacks.
     ///
     /// Cloned for each new WebRTC channel. The async `on_ice_candidate` callback
     /// encrypts the candidate and sends it here. `poll_outgoing_signals()` drains
     /// the receiver and relays via `ChannelHandle::perform("signal", ...)`.
-    pub webrtc_outgoing_signal_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::OutgoingSignal>,
+    pub webrtc_outgoing_signal_tx:
+        tokio::sync::mpsc::Sender<crate::channel::webrtc::OutgoingSignal>,
     /// Receiver for outgoing WebRTC signals. Drained in `tick()`.
     ///
     /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
-    webrtc_outgoing_signal_rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::OutgoingSignal>>,
+    webrtc_outgoing_signal_rx:
+        Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::OutgoingSignal>>,
 
     /// TCP stream multiplexers per browser identity for preview tunneling.
     stream_muxes: std::collections::HashMap<String, crate::relay::stream_mux::StreamMultiplexer>,
@@ -373,13 +435,16 @@ pub struct Hub {
 
     // === Lua ActionCable ===
     /// Lua-managed ActionCable connections keyed by connection ID.
-    lua_ac_connections: std::collections::HashMap<String, crate::lua::primitives::action_cable::LuaAcConnection>,
+    lua_ac_connections:
+        std::collections::HashMap<String, crate::lua::primitives::action_cable::LuaAcConnection>,
     /// Lua-managed ActionCable channel subscriptions keyed by channel ID.
-    lua_ac_channels: std::collections::HashMap<String, crate::lua::primitives::action_cable::LuaAcChannel>,
+    lua_ac_channels:
+        std::collections::HashMap<String, crate::lua::primitives::action_cable::LuaAcChannel>,
 
     // === Lua Hub Client ===
     /// Lua-managed outgoing hub client connections keyed by connection ID.
-    lua_hub_client_connections: std::collections::HashMap<String, crate::lua::primitives::hub_client::LuaHubClientConn>,
+    lua_hub_client_connections:
+        std::collections::HashMap<String, crate::lua::primitives::hub_client::LuaHubClientConn>,
 
     /// Pending PTY output observer notifications.
     ///
@@ -417,6 +482,13 @@ pub struct Hub {
     /// Browser push subscriptions (persisted to encrypted storage).
     pub(crate) push_subscriptions: crate::notifications::push::PushSubscriptionStore,
 
+    // === Singleton Lock ===
+    /// OS-level exclusive lock held for the hub's lifetime.
+    ///
+    /// Acquired before socket bind to prevent duplicate hubs for the same
+    /// hub_id. Dropped on shutdown (RAII releases `flock`).
+    singleton_lock: Option<daemon::HubLock>,
+
     // === Socket IPC ===
     /// Unix domain socket server for external client connections.
     socket_server: Option<crate::socket::server::SocketServer>,
@@ -426,7 +498,7 @@ pub struct Hub {
     // === PTY Broker ===
     /// Connection to the PTY broker process.
     ///
-    /// Wrapped in `Arc<Mutex<Option<...>>>` so the Lua `hub.register_pty_with_broker()`
+    /// Wrapped in `Arc<Mutex<Option<...>>>` so the Lua `hub.spawn_pty_with_broker()`
     /// primitive can access it without going through Hub commands.
     ///
     /// `None` if the broker has not been started or the connection failed.
@@ -435,7 +507,7 @@ pub struct Hub {
     /// Maps broker session IDs to session UUIDs.
     ///
     /// Populated when Lua fires `HubEvent::BrokerSessionRegistered` after
-    /// calling `hub.register_pty_with_broker()`. Used to route incoming
+    /// calling `hub.spawn_pty_with_broker()`. Used to route incoming
     /// `HubEvent::BrokerPtyOutput` frames to the correct `PtyHandle`.
     broker_sessions: std::collections::HashMap<u32, String>,
 
@@ -556,7 +628,8 @@ impl Hub {
         // Unified event bus for background producers (HTTP, WS, timers, etc.)
         let (hub_event_raw_tx, hub_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let hub_event_metrics = Arc::new(events::HubEventMetrics::default());
-        let hub_event_tx = events::HubEventTx::new(hub_event_raw_tx, Arc::clone(&hub_event_metrics));
+        let hub_event_tx =
+            events::HubEventTx::new(hub_event_raw_tx, Arc::clone(&hub_event_metrics));
 
         // Initialize Lua scripting runtime
         let mut lua = LuaRuntime::new()?;
@@ -589,6 +662,7 @@ impl Hub {
             webrtc_pty_output_tx,
             webrtc_pty_output_rx: Some(webrtc_pty_output_rx),
             pty_forwarders: std::collections::HashMap::new(),
+            pending_terminal_attaches: std::collections::HashMap::new(),
             webrtc_outgoing_signal_tx,
             webrtc_outgoing_signal_rx: Some(webrtc_outgoing_signal_rx),
             stream_muxes: std::collections::HashMap::new(),
@@ -612,6 +686,7 @@ impl Hub {
             ratchet_restarted_peers: std::collections::HashSet::new(),
             vapid_keys: None,
             push_subscriptions: crate::notifications::push::PushSubscriptionStore::default(),
+            singleton_lock: None,
             socket_server: None,
             socket_clients: std::collections::HashMap::new(),
             broker_connection: Arc::new(Mutex::new(None)),
@@ -671,7 +746,6 @@ impl Hub {
         Ok(())
     }
 
-
     // === Event Loop ===
 
     /// Perform all initial setup steps.
@@ -709,13 +783,7 @@ impl Hub {
 
         // Load Lua init script (hot-reload is now handled by Lua's module_watcher)
         self.load_lua_init();
-
-        // Connect to (or spawn) the PTY broker for zero-downtime restarts.
-        // Must run after load_lua_init so Lua can call hub.register_pty_with_broker().
-        if !crate::env::is_test_mode() {
-            self.try_connect_broker();
-        }
-
+        self.fire_hub_recovery_state("starting", serde_json::json!({}));
 
         // Bundle generation is deferred - don't call generate_connection_url() here.
         // The bundle will be generated lazily when:
@@ -723,6 +791,73 @@ impl Hub {
         // 2. External automation requests the connection URL
         // 3. Headless mode calls setup_headless() which eagerly generates it
         // This avoids blocking boot for up to 10 seconds in TUI mode.
+    }
+
+    /// Emit a startup/recovery lifecycle transition for hub clients.
+    ///
+    /// Lua `handlers/connections.lua` persists and broadcasts this payload to
+    /// all hub subscribers as `hub_recovery_state`.
+    fn fire_hub_recovery_state(&self, state: &str, mut payload: serde_json::Value) {
+        if !payload.is_object() {
+            payload = serde_json::json!({});
+        }
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "state".to_string(),
+                serde_json::Value::String(state.to_string()),
+            );
+            obj.insert(
+                "hub_id".to_string(),
+                serde_json::Value::String(self.server_hub_id().to_string()),
+            );
+        }
+        if let Err(e) = self.lua.fire_json_event("hub_recovery_state", &payload) {
+            log::warn!("[hub] hub_recovery_state({state}) event error: {e}");
+        }
+    }
+
+    /// Query broker inventory and fire Lua recovery enrichment event.
+    ///
+    /// Returns the number of live sessions reported by the broker.
+    fn recover_broker_sessions(&mut self) -> usize {
+        let sessions = {
+            let mut guard = match self.broker_connection.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    log::warn!("[broker] recovery skipped: broker_connection mutex poisoned");
+                    return 0;
+                }
+            };
+            match guard.as_mut() {
+                Some(conn) => match conn.list_sessions() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("[broker] recovery inventory failed: {e}");
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            }
+        };
+
+        let sessions_payload: Vec<serde_json::Value> = sessions
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "session_id": s.session_id,
+                    "session_uuid": s.session_uuid,
+                })
+            })
+            .collect();
+
+        if let Err(e) = self.lua.fire_json_event(
+            "broker_sessions_recovered",
+            &serde_json::json!({ "sessions": sessions_payload }),
+        ) {
+            log::warn!("[broker] broker_sessions_recovered event error: {e}");
+        }
+
+        sessions.len()
     }
 
     // === PTY Broker ===
@@ -739,12 +874,12 @@ impl Hub {
     ///    connect to it.
     /// 4. On success, configure the reconnect timeout and start the async
     ///    output forwarder thread.
-    pub fn try_connect_broker(&mut self) {
+    pub fn try_connect_broker(&mut self) -> Option<bool> {
         let path = match crate::broker::broker_socket_path(&self.hub_identifier) {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("[broker] could not resolve socket path: {e}");
-                return;
+                return None;
             }
         };
 
@@ -753,10 +888,15 @@ impl Hub {
             match crate::broker::BrokerConnection::connect(&path) {
                 Ok(mut conn) => {
                     if conn.ping().is_ok() {
-                        log::info!("[broker] reconnected to existing broker at {}", path.display());
+                        log::info!(
+                            "[broker] reconnected to existing broker at {}",
+                            path.display()
+                        );
                         Some(conn)
                     } else {
-                        log::debug!("[broker] existing broker socket unresponsive, will spawn fresh");
+                        log::debug!(
+                            "[broker] existing broker socket unresponsive, will spawn fresh"
+                        );
                         None
                     }
                 }
@@ -770,8 +910,7 @@ impl Hub {
         };
 
         // Track whether this is a reconnect (existing broker) vs a fresh spawn.
-        // Used below to fire the `broker_reconnected` Lua event so the restart
-        // recovery handler can replay scrollback for surviving agents.
+        // Used by startup lifecycle events and recovery metrics.
         let is_reconnect = existing_conn.is_some();
 
         let mut conn = if let Some(c) = existing_conn {
@@ -793,7 +932,7 @@ impl Hub {
                 Some(c) => c,
                 None => {
                     log::warn!("[broker] failed to connect after 10 attempts (500 ms)");
-                    return;
+                    return None;
                 }
             }
         };
@@ -815,24 +954,30 @@ impl Hub {
         // kernel receive buffer (which caused silent registration failure and
         // zero TUI output).
         //
-        // install_forwarder() is called BEFORE broker_reconnected fires so the
-        // demux thread is running when get_pty_snapshot_from_broker() calls
-        // read_response() inside the Lua callback — responses come through the
-        // channel, not the socket, so there is no contention.
+        // install_forwarder() is called BEFORE recovery inventory is queried so
+        // any follow-up broker primitive calls run on the channel path, not
+        // the socket direct-read path.
         if let Err(e) = conn.install_forwarder(self.hub_event_tx.clone()) {
-            log::warn!("[broker] failed to install demux reader: {e}; output forwarding disabled");
+            log::warn!("[broker] failed to install demux reader: {e}; broker connect aborted");
+            return None;
         }
 
-        // Store the connection before firing broker_reconnected so that
-        // get_pty_snapshot_from_broker() works inside the Lua callback.
+        // If the demux thread exits immediately, do not store this connection.
+        // A dead demux leaves read_response() waiting on a broken channel path.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if !conn.is_demux_alive() {
+            log::warn!(
+                "[broker] demux reader died immediately after install; broker connect aborted"
+            );
+            return None;
+        }
+
+        // Store the connection before Rust-driven recovery so Lua broker
+        // primitives (snapshot fetch, ghost registration) can use it.
         *self.broker_connection.lock().unwrap() = Some(conn);
         log::info!("[broker] connected");
 
-        if is_reconnect {
-            if let Err(e) = self.lua.fire_json_event("broker_reconnected", &serde_json::json!({})) {
-                log::warn!("[broker] broker_reconnected event error: {e}");
-            }
-        }
+        Some(is_reconnect)
     }
 
     /// Spawn the broker subprocess detached from the current process.
@@ -867,8 +1012,14 @@ impl Hub {
     /// Creates the socket at `/tmp/botster-{uid}/{hub_id}.sock`,
     /// writes a PID file, and begins accepting client connections.
     /// Socket events are delivered via `HubEvent` variants.
-    pub fn start_socket_server(&mut self) {
+    pub fn start_socket_server(&mut self) -> anyhow::Result<()> {
         let _guard = self.tokio_runtime.enter();
+
+        // Acquire exclusive OS lock BEFORE any socket/PID operations.
+        // This is the atomic singleton gate — prevents TOCTOU races between
+        // the PID check in main.rs and socket bind below.
+        let lock = daemon::try_lock_hub(&self.hub_identifier)?;
+        self.singleton_lock = Some(lock);
 
         // Clean up stale files from previous runs
         daemon::cleanup_stale_files(&self.hub_identifier);
@@ -876,7 +1027,17 @@ impl Hub {
         // Sweep orphaned sockets left by crashed/killed processes
         daemon::cleanup_orphaned_sockets();
 
-        // Write PID file
+        let path = daemon::socket_path(&self.hub_identifier)?;
+        let socket_path = path.display().to_string();
+        let server = crate::socket::server::SocketServer::start(path, self.hub_event_tx.clone())?;
+        log::info!(
+            "Socket server started for hub {}",
+            &self.hub_identifier[..self.hub_identifier.len().min(8)]
+        );
+        self.socket_server = Some(server);
+
+        // Persist ownership metadata after a successful bind so failed startup
+        // attempts never steal pid/manifest ownership from a live hub.
         if let Err(e) = daemon::write_pid_file(&self.hub_identifier) {
             log::warn!("Failed to write PID file: {e}");
         }
@@ -884,23 +1045,39 @@ impl Hub {
             log::warn!("Failed to write hub manifest: {e}");
         }
 
-        // Start socket server
-        match daemon::socket_path(&self.hub_identifier) {
-            Ok(path) => {
-                match crate::socket::server::SocketServer::start(path, self.hub_event_tx.clone()) {
-                    Ok(server) => {
-                        log::info!("Socket server started for hub {}", &self.hub_identifier[..self.hub_identifier.len().min(8)]);
-                        self.socket_server = Some(server);
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to start socket server: {e}");
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!("Failed to resolve socket path: {e}");
+        self.fire_hub_recovery_state(
+            "socket_ready",
+            serde_json::json!({ "socket_path": socket_path }),
+        );
+
+        let mut broker_connected = false;
+        let mut broker_reconnected = false;
+        if !crate::env::is_test_mode() {
+            if let Some(is_reconnect) = self.try_connect_broker() {
+                broker_connected = true;
+                broker_reconnected = is_reconnect;
             }
         }
+
+        self.fire_hub_recovery_state(
+            "broker_connected",
+            serde_json::json!({
+                "connected": broker_connected,
+                "reconnected": broker_reconnected,
+            }),
+        );
+
+        let recovered_sessions = self.recover_broker_sessions();
+        self.fire_hub_recovery_state(
+            "sessions_recovered",
+            serde_json::json!({
+                "count": recovered_sessions,
+                "inventory_authority": true,
+            }),
+        );
+
+        self.fire_hub_recovery_state("ready", serde_json::json!({}));
+        Ok(())
     }
 
     /// Eagerly generate the connection URL.
@@ -938,10 +1115,12 @@ impl Hub {
                 self.lua.set_base_path(dev_lua_dir.clone());
 
                 // Expose base path to Lua so module_watcher can watch core modules
-                if let Err(e) = self.lua.lua().globals().set(
-                    "_lua_base_path",
-                    dev_lua_dir.to_string_lossy().to_string(),
-                ) {
+                if let Err(e) = self
+                    .lua
+                    .lua()
+                    .globals()
+                    .set("_lua_base_path", dev_lua_dir.to_string_lossy().to_string())
+                {
                     log::warn!("Failed to set _G._lua_base_path: {}", e);
                 }
 
@@ -1004,7 +1183,9 @@ impl Hub {
         if let Ok(mut guard) = self.broker_connection.lock() {
             if let Some(conn) = guard.take() {
                 if self.graceful_shutdown || self.exec_restart {
-                    log::info!("[broker] graceful disconnect — PTYs preserved for reconnect window");
+                    log::info!(
+                        "[broker] graceful disconnect — PTYs preserved for reconnect window"
+                    );
                     conn.disconnect_graceful();
                 } else {
                     log::info!("[broker] kill_all (clean shutdown)");
@@ -1021,6 +1202,10 @@ impl Hub {
         // Shutdown socket server
         if let Some(server) = self.socket_server.take() {
             server.shutdown();
+        }
+        // Release singleton lock (flock released on fd close)
+        if let Some(lock) = self.singleton_lock.take() {
+            log::info!("Released singleton lock: {}", lock.path.display());
         }
         // Clean up daemon files (PID, socket)
         daemon::cleanup_on_shutdown(&self.hub_identifier);
@@ -1045,6 +1230,9 @@ impl Hub {
         // Abort all PTY forwarder tasks
         for (_key, task) in self.pty_forwarders.drain() {
             task.abort();
+        }
+        for (_key, intent) in self.pending_terminal_attaches.drain() {
+            intent.request.deactivate();
         }
 
         // Abort all notification watcher tasks
@@ -1159,7 +1347,6 @@ impl Hub {
         self.handle_cache.set_connection_url(result.clone());
         result
     }
-
 }
 
 impl Drop for Hub {
@@ -1233,7 +1420,8 @@ mod tests {
             let mut hub = Hub::new(config).unwrap();
 
             let tx = hub.hub_event_tx.clone();
-            hub.lua.set_hub_event_tx(tx, hub.tokio_runtime.handle().clone());
+            hub.lua
+                .set_hub_event_tx(tx, hub.tokio_runtime.handle().clone());
 
             // Simulate the shutdown path: call shutdown then drop.
             // shutdown() stops watchers, and Drop is the safety net.
@@ -1276,7 +1464,8 @@ mod tests {
             let mut hub = Hub::new(config).unwrap();
 
             let tx = hub.hub_event_tx.clone();
-            hub.lua.set_hub_event_tx(tx, hub.tokio_runtime.handle().clone());
+            hub.lua
+                .set_hub_event_tx(tx, hub.tokio_runtime.handle().clone());
 
             // Drop WITHOUT calling shutdown() — Drop impl must handle it.
             drop(hub);
@@ -1319,6 +1508,557 @@ mod tests {
         assert!(hub.should_quit());
     }
 
+    /// Full singleton lifecycle: start → duplicate blocked → stop → restart succeeds.
+    ///
+    /// Exercises the actual `start_socket_server` path (lock + socket bind + PID write),
+    /// not just the low-level `try_lock_hub` primitive.
+    #[test]
+    fn test_singleton_lock_blocks_duplicate_hub_then_allows_reboot() {
+        let test_hub_id = format!("_test_singleton_reboot_{}", std::process::id());
+
+        // --- Hub A: starts successfully ---
+        let mut hub_a = Hub::new(test_config()).unwrap();
+        hub_a.hub_identifier = test_hub_id.clone();
+        hub_a
+            .start_socket_server()
+            .expect("Hub A should start successfully");
+
+        // Verify lock and socket exist
+        let lock_path = daemon::lock_file_path(&test_hub_id).unwrap();
+        assert!(
+            lock_path.exists(),
+            "lock file should exist while hub is running"
+        );
+        let sock_path = daemon::socket_path(&test_hub_id).unwrap();
+        assert!(
+            sock_path.exists(),
+            "socket should exist while hub is running"
+        );
+
+        // --- Hub B: blocked by singleton lock ---
+        let mut hub_b = Hub::new(test_config()).unwrap();
+        hub_b.hub_identifier = test_hub_id.clone();
+        let err = hub_b
+            .start_socket_server()
+            .expect_err("Hub B must fail while Hub A holds the lock");
+        assert!(
+            err.to_string().contains("Another hub is already running"),
+            "expected singleton error, got: {err}"
+        );
+
+        // --- Hub A shuts down ---
+        hub_a.shutdown();
+        drop(hub_a);
+
+        // Socket should be cleaned up after shutdown
+        assert!(
+            !sock_path.exists(),
+            "socket should be cleaned up after shutdown"
+        );
+
+        // --- Hub C: reboot succeeds after A released the lock ---
+        let mut hub_c = Hub::new(test_config()).unwrap();
+        hub_c.hub_identifier = test_hub_id.clone();
+        hub_c
+            .start_socket_server()
+            .expect("Hub C should start after Hub A released the lock");
+
+        // Clean up
+        hub_c.shutdown();
+        drop(hub_c);
+        let _ = std::fs::remove_file(lock_path);
+        let _ = std::fs::remove_dir(daemon::hub_dir(&test_hub_id).unwrap());
+    }
+
+    /// Full hub reboot cycle with real socket I/O and bidirectional PTY data.
+    ///
+    /// Proves the complete data path survives a hub restart:
+    /// 1. Hub boots with real socket server, full Lua handlers
+    /// 2. Real socket client connects, subscribes (hub + terminal channels)
+    /// 3. PTY input sent via socket → routed to session handle
+    /// 4. PTY output injected via feed_broker_output → forwarder → client reads Frame::PtyOutput
+    /// 5. Hub shuts down (simulates reboot)
+    /// 6. New hub boots, new client connects, repeat — both directions work
+    ///
+    /// Agent creation is not exercised in this test. Sessions are registered
+    /// directly in handle_cache; output path is still a real PTY round-trip
+    /// across hub reboot.
+    ///
+    /// This test uses NO mocks:
+    /// - Real bash process spawned via PtySession::spawn()
+    /// - Real master FD reader thread (simulating broker's role)
+    /// - Real socket client (same protocol the TUI uses)
+    /// - Real Lua handler processing for subscriptions
+    ///
+    /// Flow per phase:
+    ///   1. Spawn bash → reader thread reads master FD → feed_broker_output()
+    ///   2. Socket client subscribes to terminal channel
+    ///   3. Send "echo MARKER\n" via PtyInput frame → hub routes → bash
+    ///   4. bash echoes MARKER → reader thread → feed_broker_output → forwarder → PtyOutput frame
+    ///   5. Client reads PtyOutput, asserts MARKER present in output
+    ///   6. Hub shuts down, bash killed, reader exits
+    ///   7. New hub boots, repeat with fresh bash
+    #[test]
+    fn test_hub_reboot_cycle_with_socket_pty_roundtrip() {
+        use crate::agent::pty::{PtySession, PtySpawnConfig};
+        use crate::hub::agent_handle::{PtyHandle, SessionHandle, SessionType};
+        use crate::relay::create_crypto_service;
+        use crate::socket::framing::{Frame, FrameDecoder};
+        use std::collections::HashMap;
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let test_hub_id = format!("_test_reboot_pty_{}", std::process::id());
+
+        // --- Helpers ---
+
+        fn init_hub_with_lua(hub: &mut Hub) {
+            let crypto_service = create_crypto_service("test-reboot");
+            hub.browser.crypto_service = Some(crypto_service);
+            hub.lua
+                .register_hub_primitives(
+                    Arc::clone(&hub.handle_cache),
+                    hub.config.worktree_base.clone(),
+                    hub.hub_identifier.clone(),
+                    Arc::clone(&hub.shared_server_id),
+                    Arc::clone(&hub.state),
+                    Arc::clone(&hub.broker_connection),
+                )
+                .expect("register hub primitives");
+            hub.load_lua_init();
+        }
+
+        /// Spawn a real bash process and return:
+        /// - SessionHandle with real PTY writer
+        /// - PtySession (must stay alive to keep child process running)
+        /// - Stop flag for the reader thread
+        fn spawn_real_session(
+            uuid: &str,
+            pty_handle_ref: &Arc<std::sync::Mutex<Option<PtyHandle>>>,
+        ) -> (SessionHandle, PtySession, Arc<AtomicBool>) {
+            let mut pty_session = PtySession::new(24, 80);
+            let tmpdir = std::env::temp_dir();
+            pty_session
+                .spawn(PtySpawnConfig {
+                    worktree_path: tmpdir,
+                    command: "bash --norc --noprofile".to_string(),
+                    env: {
+                        let mut env = HashMap::new();
+                        env.insert("PS1".to_string(), "$ ".to_string());
+                        env.insert("TERM".to_string(), "dumb".to_string());
+                        env
+                    },
+                    init_commands: vec![],
+                    detect_notifications: false,
+                    port: None,
+                    context: String::new(),
+                })
+                .expect("spawn bash");
+
+            let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) =
+                pty_session.get_direct_access();
+
+            let pty = PtyHandle::new(
+                event_tx,
+                Arc::clone(&shared_state),
+                shadow_screen,
+                kitty_enabled,
+                resize_pending,
+                false,
+                None,
+            );
+
+            // Store the pty handle for the reader thread to use
+            *pty_handle_ref.lock().unwrap() = Some(pty.clone());
+
+            // Start a reader thread that reads from the master FD and feeds
+            // output through feed_broker_output — exactly what the broker does,
+            // but in-process with real PTY bytes.
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let stop_clone = Arc::clone(&stop_flag);
+            let pty_for_reader = pty.clone();
+
+            // Get a reader from the master PTY FD
+            let reader = {
+                let state = shared_state.lock().expect("shared_state lock");
+                state
+                    .master_pty
+                    .as_ref()
+                    .expect("master_pty should exist after spawn")
+                    .try_clone_reader()
+                    .expect("try_clone_reader")
+            };
+
+            std::thread::spawn(move || {
+                let mut reader = reader;
+                let mut buf = [0u8; 4096];
+                loop {
+                    if stop_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            pty_for_reader.feed_broker_output(&buf[..n]);
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break, // EIO = child exited
+                    }
+                }
+            });
+
+            let session = SessionHandle::new(uuid, "test-real-bash", SessionType::Agent, None, pty);
+            (session, pty_session, stop_flag)
+        }
+
+        /// Drain pending hub events and dispatch them.
+        fn drain_hub_events(hub: &mut Hub) {
+            let mut rx = hub.hub_event_rx.take();
+            if let Some(ref mut rx) = rx {
+                while let Ok(event) = rx.try_recv() {
+                    hub.handle_hub_event(event);
+                }
+            }
+            hub.hub_event_rx = rx;
+        }
+
+        /// Give async tasks time to fire events, then drain.
+        fn settle(hub: &mut Hub, ms: u64) {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            drain_hub_events(hub);
+        }
+
+        /// Read all available frames from a socket with a read timeout.
+        fn read_frames(stream: &mut std::os::unix::net::UnixStream) -> Vec<Frame> {
+            let mut buf = [0u8; 16384];
+            let mut decoder = FrameDecoder::new();
+            let mut all_frames = Vec::new();
+
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(frames) = decoder.feed(&buf[..n]) {
+                            all_frames.extend(frames);
+                        }
+                    }
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            all_frames
+        }
+
+        /// Wait until PtyOutput frames contain the expected marker string.
+        /// Retries up to `max_attempts` times with `interval_ms` between.
+        fn wait_for_output_containing(
+            stream: &mut std::os::unix::net::UnixStream,
+            hub: &mut Hub,
+            marker: &str,
+            max_attempts: usize,
+            interval_ms: u64,
+        ) -> bool {
+            for _ in 0..max_attempts {
+                settle(hub, interval_ms);
+                let frames = read_frames(stream);
+                for frame in &frames {
+                    if let Frame::PtyOutput { data, .. } = frame {
+                        let text = String::from_utf8_lossy(data);
+                        if text.contains(marker) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+
+        /// Wait for the terminal scrollback frame for `session_uuid`.
+        fn wait_for_scrollback(
+            stream: &mut std::os::unix::net::UnixStream,
+            hub: &mut Hub,
+            session_uuid: &str,
+            max_attempts: usize,
+            interval_ms: u64,
+        ) -> Option<Frame> {
+            for _ in 0..max_attempts {
+                settle(hub, interval_ms);
+                let frames = read_frames(stream);
+                for frame in frames {
+                    if let Frame::Scrollback {
+                        session_uuid: got, ..
+                    } = &frame
+                    {
+                        if got == session_uuid {
+                            return Some(frame);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        // ============================================================
+        // Phase 1: Hub A — real bash, real I/O
+        // ============================================================
+
+        let mut hub_a = Hub::new(test_config()).unwrap();
+        hub_a.hub_identifier = test_hub_id.clone();
+        init_hub_with_lua(&mut hub_a);
+        hub_a
+            .start_socket_server()
+            .expect("Hub A should start socket server");
+
+        let sock_path = daemon::socket_path(&test_hub_id).unwrap();
+
+        let pty_handle_a = Arc::new(std::sync::Mutex::new(None));
+        let (session_a, _pty_session_a, stop_a) =
+            spawn_real_session("sess-reboot-001", &pty_handle_a);
+        hub_a.handle_cache.add_session(session_a);
+
+        // Wait for bash to start and produce its initial prompt
+        settle(&mut hub_a, 300);
+
+        // Connect socket client
+        let mut client_a =
+            std::os::unix::net::UnixStream::connect(&sock_path).expect("[Phase 1] connect failed");
+        client_a
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        settle(&mut hub_a, 100);
+
+        assert!(
+            !hub_a.socket_clients.is_empty(),
+            "[Phase 1] no socket client after connect"
+        );
+
+        // Subscribe to hub channel
+        client_a
+            .write_all(
+                &Frame::Json(serde_json::json!({
+                    "type": "subscribe",
+                    "channel": "hub",
+                    "subscriptionId": "tui_hub"
+                }))
+                .encode(),
+            )
+            .unwrap();
+        settle(&mut hub_a, 100);
+
+        // Subscribe to terminal channel — Lua creates the socket PTY forwarder
+        client_a
+            .write_all(
+                &Frame::Json(serde_json::json!({
+                    "type": "subscribe",
+                    "channel": "terminal",
+                    "subscriptionId": "tui:sess-reboot-001",
+                    "params": {
+                        "session_uuid": "sess-reboot-001",
+                        "rows": 24,
+                        "cols": 80
+                    }
+                }))
+                .encode(),
+            )
+            .unwrap();
+        settle(&mut hub_a, 200);
+
+        let scrollback_a =
+            wait_for_scrollback(&mut client_a, &mut hub_a, "sess-reboot-001", 20, 100)
+                .expect("[Phase 1] expected terminal scrollback after subscribe");
+        match scrollback_a {
+            Frame::Scrollback {
+                rows, cols, data, ..
+            } => {
+                assert_eq!(
+                    (rows, cols),
+                    (24, 80),
+                    "[Phase 1] unexpected scrollback dims"
+                );
+                assert!(
+                    !data.is_empty(),
+                    "[Phase 1] scrollback should not be empty after bash startup"
+                );
+            }
+            other => panic!("[Phase 1] expected Scrollback frame, got {other:?}"),
+        }
+
+        // Send real input to bash: echo a unique marker
+        let marker_a = format!("REBOOT_TEST_{}", std::process::id());
+        client_a
+            .write_all(
+                &Frame::PtyInput {
+                    session_uuid: "sess-reboot-001".to_string(),
+                    data: format!("echo {marker_a}\n").into_bytes(),
+                }
+                .encode(),
+            )
+            .unwrap();
+
+        // Wait for bash to echo our marker back through the full pipeline:
+        // bash output → master FD → reader thread → feed_broker_output →
+        // PtyEvent::Output broadcast → socket forwarder → Frame::PtyOutput → client
+        let found_a = wait_for_output_containing(
+            &mut client_a,
+            &mut hub_a,
+            &marker_a,
+            20,  // up to 20 attempts
+            100, // 100ms between
+        );
+        assert!(
+            found_a,
+            "[Phase 1] never received marker '{marker_a}' in PtyOutput frames \
+             — real bash echo did not round-trip through hub"
+        );
+
+        // Verify input was registered on the PTY handle
+        let session_handle_a = hub_a
+            .handle_cache
+            .get_session("sess-reboot-001")
+            .expect("[Phase 1] session not in handle_cache");
+        assert!(
+            session_handle_a.pty().last_human_input_ms() > 0,
+            "[Phase 1] last_human_input_ms should be > 0 after real input"
+        );
+
+        // ============================================================
+        // Phase 2: Hub A shuts down (reboot)
+        // ============================================================
+
+        drop(client_a);
+        stop_a.store(true, Ordering::Relaxed);
+        drop(session_handle_a);
+        hub_a.shutdown();
+        drop(hub_a);
+
+        assert!(
+            !sock_path.exists(),
+            "Socket should be cleaned up after shutdown"
+        );
+
+        // ============================================================
+        // Phase 3: Hub B boots — fresh bash, same flow
+        // ============================================================
+
+        let mut hub_b = Hub::new(test_config()).unwrap();
+        hub_b.hub_identifier = test_hub_id.clone();
+        init_hub_with_lua(&mut hub_b);
+        hub_b
+            .start_socket_server()
+            .expect("Hub B should start after reboot");
+
+        let pty_handle_b = Arc::new(std::sync::Mutex::new(None));
+        let (session_b, _pty_session_b, stop_b) =
+            spawn_real_session("sess-reboot-002", &pty_handle_b);
+        hub_b.handle_cache.add_session(session_b);
+
+        settle(&mut hub_b, 300);
+
+        let mut client_b =
+            std::os::unix::net::UnixStream::connect(&sock_path).expect("[Phase 2] connect failed");
+        client_b
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        settle(&mut hub_b, 100);
+
+        assert!(
+            !hub_b.socket_clients.is_empty(),
+            "[Phase 2] no socket client after connect"
+        );
+
+        client_b
+            .write_all(
+                &Frame::Json(serde_json::json!({
+                    "type": "subscribe",
+                    "channel": "hub",
+                    "subscriptionId": "tui_hub"
+                }))
+                .encode(),
+            )
+            .unwrap();
+        settle(&mut hub_b, 100);
+
+        client_b
+            .write_all(
+                &Frame::Json(serde_json::json!({
+                    "type": "subscribe",
+                    "channel": "terminal",
+                    "subscriptionId": "tui:sess-reboot-002",
+                    "params": {
+                        "session_uuid": "sess-reboot-002",
+                        "rows": 24,
+                        "cols": 80
+                    }
+                }))
+                .encode(),
+            )
+            .unwrap();
+        settle(&mut hub_b, 200);
+
+        let scrollback_b =
+            wait_for_scrollback(&mut client_b, &mut hub_b, "sess-reboot-002", 20, 100)
+                .expect("[Phase 2] expected terminal scrollback after subscribe");
+        match scrollback_b {
+            Frame::Scrollback {
+                rows, cols, data, ..
+            } => {
+                assert_eq!(
+                    (rows, cols),
+                    (24, 80),
+                    "[Phase 2] unexpected scrollback dims"
+                );
+                assert!(
+                    !data.is_empty(),
+                    "[Phase 2] scrollback should not be empty after bash startup"
+                );
+            }
+            other => panic!("[Phase 2] expected Scrollback frame, got {other:?}"),
+        }
+
+        let marker_b = format!("REBOOT_PHASE2_{}", std::process::id());
+        client_b
+            .write_all(
+                &Frame::PtyInput {
+                    session_uuid: "sess-reboot-002".to_string(),
+                    data: format!("echo {marker_b}\n").into_bytes(),
+                }
+                .encode(),
+            )
+            .unwrap();
+
+        let found_b = wait_for_output_containing(&mut client_b, &mut hub_b, &marker_b, 20, 100);
+        assert!(
+            found_b,
+            "[Phase 2] never received marker '{marker_b}' in PtyOutput frames \
+             — real bash echo did not round-trip through hub after reboot"
+        );
+
+        let session_handle_b = hub_b
+            .handle_cache
+            .get_session("sess-reboot-002")
+            .expect("[Phase 2] session not in handle_cache");
+        assert!(
+            session_handle_b.pty().last_human_input_ms() > 0,
+            "[Phase 2] last_human_input_ms should be > 0 after real input"
+        );
+
+        // ============================================================
+        // Cleanup
+        // ============================================================
+
+        drop(client_b);
+        stop_b.store(true, Ordering::Relaxed);
+        drop(session_handle_b);
+        hub_b.shutdown();
+        drop(hub_b);
+        let _ = std::fs::remove_file(daemon::lock_file_path(&test_hub_id).unwrap());
+        let _ = std::fs::remove_dir(daemon::hub_dir(&test_hub_id).unwrap());
+    }
 }
 
 /// Write 1 byte to a wake pipe fd to unblock a `libc::poll()` waiter.

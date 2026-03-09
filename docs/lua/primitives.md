@@ -95,7 +95,12 @@ socket.create_pty_forwarder(opts)
 
 ### `pty`
 ```lua
-local handle = pty.spawn(config)  -- config: {cmd, args, env, rows, cols, ...}
+-- Runtime PTY spawn is broker-authoritative via the hub primitive.
+local handle, broker_session_id = hub.spawn_pty_with_broker(config, session_uuid)
+
+-- `pty.spawn(config)` exists only in Rust unit tests as a fixture primitive.
+-- Runtime Lua modules should not call it.
+
 handle:write(data)
 handle:kill()
 handle:resize(rows, cols)
@@ -263,7 +268,16 @@ mcp.count() -> number
 
 Tools track their source plugin automatically via `_G._loading_plugin_source` (set by `loader.lua`). On plugin hot-reload, `mcp.reset(source)` clears that plugin's tools before re-registering. The hub emits a `tools_list_changed` notification to connected MCP clients so they re-fetch the tool list.
 
-**MCP stdio bridge**: Run `botster mcp-serve` to expose registered tools over JSON-RPC stdio. This is how Claude Code agents call hub tools — configure it as an MCP server in `.mcp.json`:
+**MCP stdio bridge**: Run `botster mcp-serve` to expose registered tools over JSON-RPC stdio. For Codex, forward `BOTSTER_SESSION_UUID` into the MCP subprocess so the gateway can resolve the correct session manifest:
+
+```toml
+[mcp_servers.botster]
+command = "botster"
+args = ["mcp-serve"]
+env_vars = ["BOTSTER_SESSION_UUID"]
+```
+
+Editor clients that use `.mcp.json` can still configure the same command directly:
 
 ```json
 {

@@ -44,6 +44,7 @@
 
 // Rust guideline compliant 2026-02
 
+use std::collections::HashSet;
 use std::io::Stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -54,7 +55,6 @@ use anyhow::Result;
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 
-
 use ratatui::backend::CrosstermBackend;
 
 use crate::client::{TuiOutput, TuiRequest};
@@ -63,11 +63,10 @@ use crate::tui::layout::terminal_widget_inner_area;
 
 use super::actions::TuiAction;
 use super::layout_lua::{KeyContext, LayoutLua, LuaKeyAction};
-use super::raw_input::{InputEvent, RawInputReader, ScrollDirection};
 use super::qr::ConnectionCodeData;
+use super::raw_input::{InputEvent, RawInputReader, ScrollDirection};
 
 /// Default scrollback lines for VT100 parser.
-
 
 /// TUI Runner - owns all TUI state and runs the TUI event loop.
 ///
@@ -195,6 +194,12 @@ pub struct TuiRunner<B: Backend> {
     /// Set by any event that changes visible state (PTY output, input,
     /// resize, hot-reload). Cleared after render.
     dirty: bool,
+
+    /// Session UUIDs that explicitly requested focus reporting (CSI ? 1004 h).
+    ///
+    /// We only forward synthetic focus in/out sequences to these sessions to
+    /// avoid corrupting terminal state for apps that did not opt in.
+    focus_reporting_sessions: HashSet<String>,
 }
 
 impl<B: Backend> std::fmt::Debug for TuiRunner<B>
@@ -205,7 +210,10 @@ where
         f.debug_struct("TuiRunner")
             .field("mode", &self.mode)
             .field("selected_agent", &self.panel_pool.selected_agent())
-            .field("current_session_uuid", &self.panel_pool.current_session_uuid())
+            .field(
+                "current_session_uuid",
+                &self.panel_pool.current_session_uuid(),
+            )
             .field("terminal_dims", &self.panel_pool.terminal_dims())
             .field("quit", &self.quit)
             .finish_non_exhaustive()
@@ -260,6 +268,7 @@ where
             focused_list_id: None,
             focused_input_id: None,
             dirty: true, // render on first frame
+            focus_reporting_sessions: HashSet::new(),
         }
     }
 
@@ -330,18 +339,6 @@ where
         let (rows, cols) = self.panel_pool.terminal_dims();
         log::info!("Initial TUI dimensions: {}cols x {}rows", cols, rows);
 
-        // Send initial resize to Lua client so it knows the actual terminal
-        // dimensions before the first terminal subscription. Without this,
-        // the Lua Client defaults to 24x80 and the first PTY gets wrong dims.
-        self.send_msg(serde_json::json!({
-            "subscriptionId": "tui_hub",
-            "data": {
-                "type": "resize",
-                "rows": rows,
-                "cols": cols,
-            }
-        }));
-
         while !self.should_quit() {
             // 1. Handle keyboard/mouse input
             self.poll_input(layout_lua.as_ref());
@@ -353,9 +350,14 @@ where
             // 2. Poll PTY output and Lua events (via Hub output channel)
             self.poll_pty_events(layout_lua.as_ref());
 
-            // 2b. Mirror terminal modes from PTY to outer terminal
+            // 2b. Mirror terminal modes from PTY to outer terminal.
+            // Only sync from a fully connected panel; a connecting panel may
+            // still hold stale parser state until fresh scrollback arrives.
             {
-                let focused = self.panel_pool.focused_panel();
+                let focused = self
+                    .panel_pool
+                    .focused_panel()
+                    .filter(|panel| panel.state() == super::terminal_panel::PanelState::Connected);
                 self.terminal_modes.sync(focused, self.has_overlay);
             }
 
@@ -378,7 +380,10 @@ where
 
         // Signal main thread to exit too (bidirectional shutdown)
         self.shutdown.store(true, Ordering::SeqCst);
-        log::info!("TuiRunner event loop exiting (quit={}, shutdown=true)", self.quit);
+        log::info!(
+            "TuiRunner event loop exiting (quit={}, shutdown=true)",
+            self.quit
+        );
         Ok(())
     }
 
@@ -506,17 +511,37 @@ where
                 }
                 InputEvent::FocusGained => {
                     self.terminal_modes.on_focus_gained();
-                    log::debug!("[FOCUS] terminal gained focus, mode={} overlay={}", self.mode, self.has_overlay);
-                    if self.mode == "insert" && !self.has_overlay {
-                        log::debug!("[FOCUS] forwarding \\x1b[I to PTY session={:?}", self.panel_pool.current_session_uuid());
+                    log::debug!(
+                        "[FOCUS] terminal gained focus, mode={} overlay={}",
+                        self.mode,
+                        self.has_overlay
+                    );
+                    if self.mode == "insert"
+                        && !self.has_overlay
+                        && self.focus_reporting_enabled_for_current_session()
+                    {
+                        log::debug!(
+                            "[FOCUS] forwarding \\x1b[I to PTY session={:?}",
+                            self.panel_pool.current_session_uuid()
+                        );
                         self.handle_pty_input(b"\x1b[I");
                     }
                 }
                 InputEvent::FocusLost => {
                     self.terminal_modes.on_focus_lost();
-                    log::debug!("[FOCUS] terminal lost focus, mode={} overlay={}", self.mode, self.has_overlay);
-                    if self.mode == "insert" && !self.has_overlay {
-                        log::debug!("[FOCUS] forwarding \\x1b[O to PTY session={:?}", self.panel_pool.current_session_uuid());
+                    log::debug!(
+                        "[FOCUS] terminal lost focus, mode={} overlay={}",
+                        self.mode,
+                        self.has_overlay
+                    );
+                    if self.mode == "insert"
+                        && !self.has_overlay
+                        && self.focus_reporting_enabled_for_current_session()
+                    {
+                        log::debug!(
+                            "[FOCUS] forwarding \\x1b[O to PTY session={:?}",
+                            self.panel_pool.current_session_uuid()
+                        );
                         self.handle_pty_input(b"\x1b[O");
                     }
                 }
@@ -527,10 +552,7 @@ where
                     // (start marker + content + end marker) in one read to detect
                     // file drag/drop vs typed input.
                     if self.mode == "insert" && !self.has_overlay {
-                        log::debug!(
-                            "[PASTE] Forwarding {} bytes to PTY",
-                            raw_bytes.len()
-                        );
+                        log::debug!("[PASTE] Forwarding {} bytes to PTY", raw_bytes.len());
                         self.handle_pty_input(raw_bytes);
                     }
                 }
@@ -571,7 +593,10 @@ where
             #[expect(clippy::cast_sign_loss, reason = "delta is positive, checked above")]
             self.handle_tui_action(TuiAction::ScrollUp(delta as usize));
         } else {
-            #[expect(clippy::cast_sign_loss, reason = "delta is negative, negated to positive")]
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "delta is negative, negated to positive"
+            )]
             self.handle_tui_action(TuiAction::ScrollDown((-delta) as usize));
         }
     }
@@ -589,7 +614,10 @@ where
     /// Mouse scroll events are handled directly.
     fn handle_raw_input_event(&mut self, event: InputEvent, layout_lua: Option<&LayoutLua>) {
         match event {
-            InputEvent::Key { mut descriptor, mut raw_bytes } => {
+            InputEvent::Key {
+                mut descriptor,
+                mut raw_bytes,
+            } => {
                 // Ghostty workaround: shift+enter arrives as 0x0a (LF = ctrl+j)
                 // even when kitty keyboard protocol is active. With kitty mode 1,
                 // a real ctrl+j press arrives as CSI 106;5 u, so bare 0x0a can
@@ -626,7 +654,9 @@ where
                             Ok(Some(lua_action)) => {
                                 log::info!(
                                     "[TUI-KEY] '{}' in mode '{}' -> action='{}' char={:?}",
-                                    descriptor, self.mode, lua_action.action,
+                                    descriptor,
+                                    self.mode,
+                                    lua_action.action,
                                     lua_action.char
                                 );
                                 self.handle_lua_key_action(&lua_action, lua);
@@ -634,7 +664,10 @@ where
                             }
                             Ok(None) => {
                                 // Unbound key — forward raw bytes to PTY only in insert mode
-                                if self.mode == "insert" && !self.has_overlay && !raw_bytes.is_empty() {
+                                if self.mode == "insert"
+                                    && !self.has_overlay
+                                    && !raw_bytes.is_empty()
+                                {
                                     self.handle_pty_input(&raw_bytes);
                                 } else if !raw_bytes.is_empty() {
                                     log::debug!(
@@ -646,7 +679,10 @@ where
                             }
                             Err(e) => {
                                 log::warn!("Lua handle_key failed: {e}");
-                                if self.mode == "insert" && !self.has_overlay && !raw_bytes.is_empty() {
+                                if self.mode == "insert"
+                                    && !self.has_overlay
+                                    && !raw_bytes.is_empty()
+                                {
                                     self.handle_pty_input(&raw_bytes);
                                 }
                                 return;
@@ -670,6 +706,17 @@ where
         }
     }
 
+    fn focus_reporting_enabled_for(&self, session_uuid: &str) -> bool {
+        self.focus_reporting_sessions.contains(session_uuid)
+    }
+
+    fn focus_reporting_enabled_for_current_session(&self) -> bool {
+        self.panel_pool
+            .current_session_uuid()
+            .map(|uuid| self.focus_reporting_enabled_for(uuid))
+            .unwrap_or(false)
+    }
+
     /// Map a Lua key action to a `TuiAction` and handle it.
     ///
     /// Generic actions (scroll, list nav, input chars) are mapped directly to
@@ -683,12 +730,12 @@ where
         // Generic UI primitives that Rust handles directly.
         // Scroll actions are handled directly by Rust (no Lua state involved).
         let scroll_action = match action_str {
-            "scroll_half_up" => {
-                Some(TuiAction::ScrollUp(self.panel_pool.terminal_dims().0 as usize / 2))
-            }
-            "scroll_half_down" => {
-                Some(TuiAction::ScrollDown(self.panel_pool.terminal_dims().0 as usize / 2))
-            }
+            "scroll_half_up" => Some(TuiAction::ScrollUp(
+                self.panel_pool.terminal_dims().0 as usize / 2,
+            )),
+            "scroll_half_down" => Some(TuiAction::ScrollDown(
+                self.panel_pool.terminal_dims().0 as usize / 2,
+            )),
             "scroll_top" => Some(TuiAction::ScrollToTop),
             "scroll_bottom" => Some(TuiAction::ScrollToBottom),
             _ => None,
@@ -722,7 +769,10 @@ where
             }
 
             // Diagnostic: log all workflow actions with context
-            if matches!(action_str, "list_select" | "input_submit" | "open_menu" | "close_modal") {
+            if matches!(
+                action_str,
+                "list_select" | "input_submit" | "open_menu" | "close_modal"
+            ) {
                 log::info!(
                     "[TUI-ACTION] action='{}' mode='{}' overlay_actions={:?} focused_list={:?} focused_input={:?}",
                     action_str, self.mode, context.overlay_actions,
@@ -734,13 +784,18 @@ where
                 Ok(Some(ops)) => {
                     log::info!(
                         "[TUI-ACTION] action='{}' returned {} ops",
-                        action_str, ops.len()
+                        action_str,
+                        ops.len()
                     );
                     self.execute_lua_ops(ops);
                     return;
                 }
                 Ok(None) => {
-                    log::info!("Lua actions returned nil for '{}' in mode '{}', no-op", action_str, self.mode);
+                    log::info!(
+                        "Lua actions returned nil for '{}' in mode '{}', no-op",
+                        action_str,
+                        self.mode
+                    );
                 }
                 Err(e) => {
                     log::warn!("Lua on_action failed for '{action_str}': {e}");
@@ -805,7 +860,8 @@ where
                     .replace('\\', "\\\\")
                     .replace('"', "\\\"")
                     .replace('\n', "\\n");
-                if let Err(e) = layout_lua.exec(&format!("_tui_state.input_buffer = \"{escaped}\"")) {
+                if let Err(e) = layout_lua.exec(&format!("_tui_state.input_buffer = \"{escaped}\""))
+                {
                     log::warn!("Failed to sync input_buffer to Lua: {e}");
                 }
                 return true;
@@ -824,7 +880,9 @@ where
         if let Some(uuid) = self.panel_pool.current_session_uuid.clone() {
             log::trace!(
                 "[PTY-FWD] Sending {} bytes to session={} (overlay={})",
-                data.len(), uuid, self.has_overlay
+                data.len(),
+                uuid,
+                self.has_overlay
             );
             if let Err(e) = self.request_tx.send(TuiRequest::PtyInput {
                 session_uuid: uuid,
@@ -833,10 +891,7 @@ where
                 log::error!("Failed to send PTY input: {e}");
             }
         } else {
-            log::warn!(
-                "[PTY-FWD] Dropped {} bytes: no focused session",
-                data.len()
-            );
+            log::warn!("[PTY-FWD] Dropped {} bytes: no focused session", data.len());
         }
     }
 
@@ -848,6 +903,16 @@ where
     /// `sync_widget_dims()` which sends per-terminal resize through
     /// terminal subscriptions → `pty_clients.update()`.
     fn handle_resize(&mut self, rows: u16, cols: u16) {
+        let (prev_rows, prev_cols) = self.panel_pool.terminal_dims();
+        if (prev_rows, prev_cols) != (rows, cols) {
+            log::info!(
+                "[TUI] resize inner area: {}x{} -> {}x{}",
+                prev_cols,
+                prev_rows,
+                cols,
+                rows
+            );
+        }
         self.panel_pool.handle_resize(rows, cols);
     }
 
@@ -862,17 +927,37 @@ where
         // Drain all pending events (no arbitrary cap).
         loop {
             match self.output_rx.try_recv() {
-                Ok(TuiOutput::Scrollback { session_uuid, data, kitty_enabled }) => {
+                Ok(TuiOutput::Scrollback {
+                    session_uuid,
+                    rows,
+                    cols,
+                    data,
+                    kitty_enabled,
+                }) => {
                     self.dirty = true;
                     let panel = self.panel_pool.resolve_panel(&session_uuid);
-                    panel.on_scrollback(&data);
+                    let before = panel.state();
+                    let before_dims = panel.dims();
+                    panel.on_scrollback_with_dims(rows, cols, &data);
+                    let after = panel.state();
+                    let after_dims = panel.dims();
                     let is_focused = self.panel_pool.is_focused(&session_uuid);
                     if is_focused {
                         self.terminal_modes.on_kitty_changed(kitty_enabled);
                     }
                     log::debug!(
-                        "Processed {} bytes of scrollback (kitty={}{})",
-                        data.len(), kitty_enabled,
+                        "Processed {} bytes of scrollback for {} (state {:?}->{:?}, snapshot={}x{}, panel_dims {}x{} -> {}x{}, kitty={}{})",
+                        data.len(),
+                        session_uuid,
+                        before,
+                        after,
+                        cols,
+                        rows,
+                        before_dims.1,
+                        before_dims.0,
+                        after_dims.1,
+                        after_dims.0,
+                        kitty_enabled,
                         if is_focused { ", applied" } else { "" }
                     );
                 }
@@ -881,15 +966,22 @@ where
                     let panel = self.panel_pool.resolve_panel(&session_uuid);
                     panel.on_output(&data);
                 }
-                Ok(TuiOutput::OutputBatch { session_uuid, chunks }) => {
+                Ok(TuiOutput::OutputBatch {
+                    session_uuid,
+                    chunks,
+                }) => {
                     self.dirty = true;
                     let panel = self.panel_pool.resolve_panel(&session_uuid);
                     for data in &chunks {
                         panel.on_output(data);
                     }
                 }
-                Ok(TuiOutput::ProcessExited { session_uuid, exit_code }) => {
+                Ok(TuiOutput::ProcessExited {
+                    session_uuid,
+                    exit_code,
+                }) => {
                     self.dirty = true;
+                    self.focus_reporting_sessions.remove(&session_uuid);
                     log::info!("PTY process exited with code {:?}", exit_code);
                     if self.panel_pool.is_focused(&session_uuid) {
                         self.terminal_modes.clear_inner_kitty();
@@ -905,7 +997,9 @@ where
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     log::debug!("PTY output channel disconnected");
-                    if self.terminal_modes.terminal_focused() && self.panel_pool.current_session_uuid.is_some() {
+                    if self.terminal_modes.terminal_focused()
+                        && self.focus_reporting_enabled_for_current_session()
+                    {
                         self.handle_pty_input(b"\x1b[O");
                     }
                     let msgs = self.panel_pool.disconnect_all();
@@ -923,11 +1017,7 @@ where
     /// Extracts the event type from the message and passes it to Lua's
     /// `on_hub_event()`. If Lua returns ops, executes them. Falls back
     /// to logging for unhandled events.
-    fn dispatch_hub_event(
-        &mut self,
-        msg: serde_json::Value,
-        layout_lua: Option<&LayoutLua>,
-    ) {
+    fn dispatch_hub_event(&mut self, msg: serde_json::Value, layout_lua: Option<&LayoutLua>) {
         let event_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         // Handle kitty_changed directly — sets outer terminal keyboard mode.
@@ -942,13 +1032,43 @@ where
             return;
         }
 
+        // Attach bridge reconnected to the hub socket after EOF.
+        // Reset panel subscription state so the next render pass re-subscribes
+        // active terminal widgets on the fresh socket connection.
+        if event_type == "bridge_reconnected" {
+            self.terminal_modes.clear_inner_kitty();
+            self.panel_pool.reset_for_reattach();
+            self.focus_reporting_sessions.clear();
+            self.widget_states.reset_all();
+            self.focused_list_id = None;
+            self.focused_input_id = None;
+            self.overlay_list_actions.clear();
+            self.has_overlay = false;
+            self.dirty = true;
+            log::debug!("[TUI] Bridge reconnected: reset to attach-like state");
+        }
+
         // Handle focus_requested — PTY enabled focus reporting (CSI ? 1004 h).
         // Respond with current terminal focus state so the app knows immediately.
         if event_type == "focus_requested" {
             let msg_uuid = msg.get("session_uuid").and_then(|v| v.as_str());
+            if let Some(uuid) = msg_uuid {
+                self.focus_reporting_sessions.insert(uuid.to_string());
+            }
             if msg_uuid == self.panel_pool.current_session_uuid() {
-                let seq = if self.terminal_modes.terminal_focused() { b"\x1b[I" as &[u8] } else { b"\x1b[O" };
-                log::debug!("[FOCUS] PTY requested focus reporting, responding with {}", if self.terminal_modes.terminal_focused() { "focused" } else { "unfocused" });
+                let seq = if self.terminal_modes.terminal_focused() {
+                    b"\x1b[I" as &[u8]
+                } else {
+                    b"\x1b[O"
+                };
+                log::debug!(
+                    "[FOCUS] PTY requested focus reporting, responding with {}",
+                    if self.terminal_modes.terminal_focused() {
+                        "focused"
+                    } else {
+                        "unfocused"
+                    }
+                );
                 self.handle_pty_input(seq);
             }
             return;
@@ -981,15 +1101,13 @@ where
     }
 
     /// Render the TUI.
-    fn render(
-        &mut self,
-        layout_lua: Option<&LayoutLua>,
-        layout_error: Option<&str>,
-    ) -> Result<()> {
+    fn render(&mut self, layout_lua: Option<&LayoutLua>, layout_error: Option<&str>) -> Result<()> {
         use super::render::{render, RenderContext};
 
         // Read scroll state from the focused panel (no mutex needed)
-        let (scroll_offset, is_scrolled) = self.panel_pool.focused_panel()
+        let (scroll_offset, is_scrolled) = self
+            .panel_pool
+            .focused_panel()
             .map(|panel| (panel.scroll_offset(), panel.is_scrolled()))
             .unwrap_or((0, false));
 
@@ -1022,7 +1140,12 @@ where
 
         // Try Lua-driven render, fall back to hardcoded Rust layout
         let lua_result = if let Some(layout_lua) = layout_lua {
-            match render_with_lua(&mut self.terminal, layout_lua, &ctx, &mut self.widget_states) {
+            match render_with_lua(
+                &mut self.terminal,
+                layout_lua,
+                &ctx,
+                &mut self.widget_states,
+            ) {
                 Ok(result) => Some(result),
                 Err(e) => {
                     log::warn!("Lua layout render failed, using fallback: {e}");
@@ -1042,9 +1165,29 @@ where
         drop(ctx);
 
         if let Some(ref result) = lua_result {
+            if let Some(focused_uuid) = self.panel_pool.current_session_uuid() {
+                if let Some((rows, cols)) = rendered_areas.get(focused_uuid) {
+                    log::debug!(
+                        "[TUI] focused area for {} => {}x{}",
+                        focused_uuid,
+                        cols,
+                        rows
+                    );
+                } else {
+                    log::debug!(
+                        "[TUI] focused area missing for {} on this frame",
+                        focused_uuid
+                    );
+                }
+            }
+
             // Sync subscriptions to match what the render tree declares
-            let msgs = self.panel_pool.sync_subscriptions(&result.tree, &rendered_areas);
-            for msg in msgs { self.send_msg(msg); }
+            let msgs = self
+                .panel_pool
+                .sync_subscriptions(&result.tree, &rendered_areas);
+            for msg in msgs {
+                self.send_msg(msg);
+            }
 
             // Track overlay presence for input routing (PTY vs keybindings)
             self.has_overlay = result.overlay.is_some();
@@ -1075,7 +1218,9 @@ where
         // Resize parsers and PTYs to match actual widget areas from the render pass
         if !rendered_areas.is_empty() {
             let msgs = self.panel_pool.sync_widget_dims(&rendered_areas);
-            for msg in msgs { self.send_msg(msg); }
+            for msg in msgs {
+                self.send_msg(msg);
+            }
         }
 
         // Render error indicator overlay if there's a layout error
@@ -1117,7 +1262,10 @@ where
                     let now_insert = self.mode == "insert" && !self.has_overlay;
                     // Synthetic focus events on mode transition so the viewed
                     // PTY tracks whether it's "active" even across overlays.
-                    if self.terminal_modes.terminal_focused() && was_insert != now_insert {
+                    if self.terminal_modes.terminal_focused()
+                        && was_insert != now_insert
+                        && self.focus_reporting_enabled_for_current_session()
+                    {
                         if now_insert {
                             log::debug!("[FOCUS] synthetic focus-in on mode change to insert");
                             self.handle_pty_input(b"\x1b[I");
@@ -1143,10 +1291,7 @@ where
                     agent_id,
                     session_uuid,
                 } => {
-                    self.execute_focus_terminal_typed(
-                        agent_id.as_deref(),
-                        session_uuid.as_deref(),
-                    );
+                    self.execute_focus_terminal_typed(agent_id.as_deref(), session_uuid.as_deref());
                 }
                 LuaOp::SetConnectionCode { url, qr_ascii } => {
                     let qr_width = qr_ascii
@@ -1170,9 +1315,8 @@ where
                     let body: String = body.chars().filter(|c| !c.is_control()).collect();
                     // OSC 777 (rich: title + body) then OSC 9 (simple).
                     // Terminals silently ignore sequences they don't support.
-                    let osc = format!(
-                        "\x1b]777;notify;{title};{body}\x07\x1b]9;{title}: {body}\x07"
-                    );
+                    let osc =
+                        format!("\x1b]777;notify;{title};{body}\x07\x1b]9;{title}: {body}\x07");
                     let _ = std::io::Write::write_all(&mut std::io::stdout(), osc.as_bytes());
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                     log::debug!("[OSC_ALERT] title={title:?} body={body:?}");
@@ -1186,20 +1330,17 @@ where
     /// Delegates to [`PanelPool::focus_terminal`] for state logic, then
     /// applies the returned [`FocusEffects`] (PTY inputs, Hub messages,
     /// kitty state).
-    fn execute_focus_terminal_typed(
-        &mut self,
-        agent_id: Option<&str>,
-        session_uuid: Option<&str>,
-    ) {
+    fn execute_focus_terminal_typed(&mut self, agent_id: Option<&str>, session_uuid: Option<&str>) {
         log::info!(
             "focus_terminal: agent_id={:?}, session_uuid={:?}",
-            agent_id, session_uuid
+            agent_id,
+            session_uuid
         );
 
         let terminal_focused = self.terminal_modes.terminal_focused();
-        let effects = self.panel_pool.focus_terminal(
-            agent_id, session_uuid, terminal_focused,
-        );
+        let effects = self
+            .panel_pool
+            .focus_terminal(agent_id, session_uuid, terminal_focused);
         self.apply_focus_effects(effects);
     }
 
@@ -1207,16 +1348,20 @@ where
     ///
     /// Sends explicitly-targeted PTY inputs, Hub messages, and clears
     /// kitty state as needed.
-    fn apply_focus_effects(
-        &mut self,
-        effects: super::panel_pool::FocusEffects,
-    ) {
+    fn apply_focus_effects(&mut self, effects: super::panel_pool::FocusEffects) {
         // Subscribe/unsubscribe before focus sequences so pty_clients
         // has the "tui" entry registered before set_focused runs.
         for msg in effects.messages {
             self.send_msg(msg);
         }
         for input in effects.pty_inputs {
+            if !self.focus_reporting_enabled_for(&input.session_uuid) {
+                log::trace!(
+                    "[FOCUS] skipping synthetic focus sequence for {} (focus reporting not requested)",
+                    input.session_uuid
+                );
+                continue;
+            }
             if let Err(e) = self.request_tx.send(TuiRequest::PtyInput {
                 session_uuid: input.session_uuid.clone(),
                 data: input.data.to_vec(),
@@ -1391,7 +1536,11 @@ pub fn run_with_hub(
             libc::fcntl(pipe_fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
         hub.tui_wake_fd = Some(pipe_fds[1]);
-        log::info!("TUI wake pipe created: read={}, write={}", pipe_fds[0], pipe_fds[1]);
+        log::info!(
+            "TUI wake pipe created: read={}, write={}",
+            pipe_fds[0],
+            pipe_fds[1]
+        );
         (Some(pipe_fds[0]), Some(pipe_fds[1]))
     } else {
         log::warn!("Failed to create TUI wake pipe, falling back to sleep-based polling");
@@ -1417,9 +1566,7 @@ pub fn run_with_hub(
     #[cfg(unix)]
     {
         use signal_hook::consts::signal::SIGWINCH;
-        if let Err(e) =
-            signal_hook::flag::register(SIGWINCH, Arc::clone(&tui_runner.resize_flag))
-        {
+        if let Err(e) = signal_hook::flag::register(SIGWINCH, Arc::clone(&tui_runner.resize_flag)) {
             log::warn!("Failed to register SIGWINCH handler: {e}");
         }
     }
@@ -1451,10 +1598,14 @@ pub fn run_with_hub(
 
     // Close wake pipe fds
     if let Some(fd) = wake_read_fd {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
     if let Some(fd) = wake_write_fd {
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
     }
     hub.tui_wake_fd = None;
 
@@ -1673,7 +1824,8 @@ mod tests {
         lua.preload_module(
             "ui.workspace_helpers",
             include_str!("../../lua/ui/workspace_helpers.lua"),
-        ).expect("workspace_helpers.lua should preload");
+        )
+        .expect("workspace_helpers.lua should preload");
         lua.load_keybindings(kb_source)
             .expect("test keybindings should load");
         lua.load_actions(actions_source)
@@ -1695,7 +1847,11 @@ mod tests {
     /// Processes a keyboard event with a persistent LayoutLua.
     ///
     /// For multi-step e2e tests that need `_tui_state` to persist between keys.
-    fn process_key_with_lua(runner: &mut TuiRunner<TestBackend>, event: InputEvent, lua: &LayoutLua) {
+    fn process_key_with_lua(
+        runner: &mut TuiRunner<TestBackend>,
+        event: InputEvent,
+        lua: &LayoutLua,
+    ) {
         runner.handle_raw_input_event(event, Some(lua));
     }
 
@@ -1714,13 +1870,14 @@ mod tests {
     /// strings from the render tree + focused widget IDs. Tests don't run
     /// the render pass, so we stub both the action cache and focused widget.
     fn stub_menu_actions(runner: &mut TuiRunner<TestBackend>) {
-        runner.overlay_list_actions = vec![
-            "new_agent".to_string(),
-            "show_connection_code".to_string(),
-        ];
+        runner.overlay_list_actions =
+            vec!["new_agent".to_string(), "show_connection_code".to_string()];
         // Set up focused list widget so Rust handles list_up/list_down
         runner.focused_list_id = Some("menu".to_string());
-        runner.widget_states.list_state("menu").set_selectable_count(2);
+        runner
+            .widget_states
+            .list_state("menu")
+            .set_selectable_count(2);
     }
 
     /// Stub focused input widget for text entry tests.
@@ -1746,12 +1903,14 @@ mod tests {
 
     /// Read `_tui_state.list_selected` from Lua.
     fn lua_list_selected(lua: &LayoutLua) -> usize {
-        lua.eval_usize("return _tui_state.list_selected").unwrap_or(0)
+        lua.eval_usize("return _tui_state.list_selected")
+            .unwrap_or(0)
     }
 
     /// Read `_tui_state.input_buffer` from Lua.
     fn lua_input_buffer(lua: &LayoutLua) -> String {
-        lua.eval_string("return _tui_state.input_buffer").unwrap_or_default()
+        lua.eval_string("return _tui_state.input_buffer")
+            .unwrap_or_default()
     }
 
     // =========================================================================
@@ -1926,11 +2085,17 @@ mod tests {
 
         // Plain 'q' should NOT match any binding in normal mode -> nil -> PTY
         let result = lua.call_handle_key("q", "normal", &context).unwrap();
-        assert!(result.is_none(), "Plain 'q' should return nil (PTY forward)");
+        assert!(
+            result.is_none(),
+            "Plain 'q' should return nil (PTY forward)"
+        );
 
         // Plain 'p' should NOT match any binding in normal mode -> nil -> PTY
         let result = lua.call_handle_key("p", "normal", &context).unwrap();
-        assert!(result.is_none(), "Plain 'p' should return nil (PTY forward)");
+        assert!(
+            result.is_none(),
+            "Plain 'p' should return nil (PTY forward)"
+        );
     }
 
     // =========================================================================
@@ -2008,7 +2173,10 @@ mod tests {
 
         runner.overlay_list_actions = vec!["restart_hub".to_string()];
         runner.focused_list_id = Some("menu".to_string());
-        runner.widget_states.list_state("menu").set_selectable_count(1);
+        runner
+            .widget_states
+            .list_state("menu")
+            .set_selectable_count(1);
 
         // Select restart_hub with Enter.
         process_key_with_lua(&mut runner, make_key_enter(), &lua);
@@ -2017,7 +2185,10 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
 
         // 1. TUI quit flag must NOT be set — hub controls shutdown.
-        assert!(!runner.quit, "restart_hub must not set runner.quit (would race with GracefulRestart)");
+        assert!(
+            !runner.quit,
+            "restart_hub must not set runner.quit (would race with GracefulRestart)"
+        );
 
         // 2. A restart_hub message must have been sent to Hub.
         let mut found_restart = false;
@@ -2030,7 +2201,10 @@ mod tests {
                 }
             }
         }
-        assert!(found_restart, "restart_hub action must send a restart_hub message to Hub");
+        assert!(
+            found_restart,
+            "restart_hub action must send a restart_hub message to Hub"
+        );
 
         // 3. Menu must be closed — mode exits "menu" so the operator sees a clean TUI
         //    while waiting for Hub to process the graceful restart.
@@ -2078,15 +2252,16 @@ mod tests {
     /// 3. Sends AgentCreated event via TuiOutput channel to verify TUI transitions
     #[test]
     fn test_e2e_new_agent_full_flow() {
-        let (mut runner, _output_tx, mut request_rx, shutdown) = create_test_runner_with_mock_client();
+        let (mut runner, _output_tx, mut request_rx, shutdown) =
+            create_test_runner_with_mock_client();
         let lua = make_test_layout_with_keybindings();
 
         // 1. Open menu and navigate to New Agent using cached overlay actions
         process_key_with_lua(&mut runner, make_key_ctrl('p'), &lua);
         stub_menu_actions(&mut runner);
 
-        let new_agent_idx = find_action_index(&runner, "new_agent")
-            .expect("new_agent should be in menu");
+        let new_agent_idx =
+            find_action_index(&runner, "new_agent").expect("new_agent should be in menu");
         navigate_to_menu_index_with_lua(&mut runner, &lua, new_agent_idx);
         assert_eq!(lua_list_selected(&lua), new_agent_idx);
 
@@ -2105,8 +2280,10 @@ mod tests {
         {
             let profiles_event = serde_json::json!({ "profiles": ["claude"] });
             let ctx = crate::tui::layout_lua::ActionContext::default();
-            let ops = lua.call_on_hub_event("profiles", &profiles_event, &ctx)
-                .unwrap().unwrap();
+            let ops = lua
+                .call_on_hub_event("profiles", &profiles_event, &ctx)
+                .unwrap()
+                .unwrap();
             runner.execute_lua_ops(ops);
         }
 
@@ -2119,7 +2296,10 @@ mod tests {
         // 2. Select "Create new worktree" (index 1, after "Use Main Branch")
         // Set up worktree list focus (2 items: "Use Main Branch", "Create new worktree")
         runner.focused_list_id = Some("worktree_list".to_string());
-        runner.widget_states.list_state("worktree_list").set_selectable_count(2);
+        runner
+            .widget_states
+            .list_state("worktree_list")
+            .set_selectable_count(2);
         process_key_with_lua(&mut runner, make_key_down(), &lua);
         assert_eq!(lua_list_selected(&lua), 1);
         process_key_with_lua(&mut runner, make_key_enter(), &lua);
@@ -2159,10 +2339,7 @@ mod tests {
                         data.get("issue_or_branch").and_then(|v| v.as_str()),
                         Some("issue-42")
                     );
-                    assert_eq!(
-                        data.get("prompt").and_then(|v| v.as_str()),
-                        Some("Fix bug")
-                    );
+                    assert_eq!(data.get("prompt").and_then(|v| v.as_str()), Some("Fix bug"));
                     found_create = true;
                     break;
                 }
@@ -2193,7 +2370,8 @@ mod tests {
     /// 2. Verifies request includes from_worktree path
     #[test]
     fn test_e2e_reopen_existing_worktree() {
-        let (mut runner, _output_tx, mut request_rx, shutdown) = create_test_runner_with_mock_client();
+        let (mut runner, _output_tx, mut request_rx, shutdown) =
+            create_test_runner_with_mock_client();
         let lua = make_test_layout_with_keybindings();
 
         // Pre-populate worktrees in _tui_state (normally delivered via worktree_list event)
@@ -2203,14 +2381,15 @@ mod tests {
                 { path = "/path/worktree-2", branch = "bugfix-branch" },
             }"#,
             "test_worktrees",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Open menu and navigate to New Agent using cached overlay actions
         process_key_with_lua(&mut runner, make_key_ctrl('p'), &lua);
         stub_menu_actions(&mut runner);
 
-        let new_agent_idx = find_action_index(&runner, "new_agent")
-            .expect("new_agent should be in menu");
+        let new_agent_idx =
+            find_action_index(&runner, "new_agent").expect("new_agent should be in menu");
         navigate_to_menu_index_with_lua(&mut runner, &lua, new_agent_idx);
         assert_eq!(lua_list_selected(&lua), new_agent_idx);
 
@@ -2223,8 +2402,10 @@ mod tests {
         {
             let profiles_event = serde_json::json!({ "profiles": ["claude"] });
             let ctx = crate::tui::layout_lua::ActionContext::default();
-            let ops = lua.call_on_hub_event("profiles", &profiles_event, &ctx)
-                .unwrap().unwrap();
+            let ops = lua
+                .call_on_hub_event("profiles", &profiles_event, &ctx)
+                .unwrap()
+                .unwrap();
             runner.execute_lua_ops(ops);
         }
         assert_eq!(runner.mode(), "new_agent_select_worktree");
@@ -2237,7 +2418,10 @@ mod tests {
             "worktree_1".to_string(),
         ];
         runner.focused_list_id = Some("worktree_list".to_string());
-        runner.widget_states.list_state("worktree_list").set_selectable_count(4);
+        runner
+            .widget_states
+            .list_state("worktree_list")
+            .set_selectable_count(4);
         process_key_with_lua(&mut runner, make_key_down(), &lua);
         process_key_with_lua(&mut runner, make_key_down(), &lua);
         assert_eq!(lua_list_selected(&lua), 2);
@@ -2314,10 +2498,15 @@ mod tests {
 
         // Cancel at issue input
         runner.mode = "new_agent_create_worktree".to_string();
-        let _ = lua.exec("_tui_state.mode = 'new_agent_create_worktree'; _tui_state.input_buffer = 'partial'");
+        let _ = lua.exec(
+            "_tui_state.mode = 'new_agent_create_worktree'; _tui_state.input_buffer = 'partial'",
+        );
         process_key_with_lua(&mut runner, make_key_escape(), &lua);
         assert_eq!(runner.mode(), "normal");
-        assert!(lua_input_buffer(&lua).is_empty(), "Buffer should be cleared");
+        assert!(
+            lua_input_buffer(&lua).is_empty(),
+            "Buffer should be cleared"
+        );
 
         // Cancel at prompt
         runner.mode = "new_agent_prompt".to_string();
@@ -2376,9 +2565,13 @@ mod tests {
             "worktree_1".to_string(),
         ];
         runner.mode = "new_agent_select_worktree".to_string();
-        let _ = lua.exec("_tui_state.mode = 'new_agent_select_worktree'; _tui_state.list_selected = 0");
+        let _ =
+            lua.exec("_tui_state.mode = 'new_agent_select_worktree'; _tui_state.list_selected = 0");
         runner.focused_list_id = Some("worktree_list".to_string());
-        runner.widget_states.list_state("worktree_list").set_selectable_count(4);
+        runner
+            .widget_states
+            .list_state("worktree_list")
+            .set_selectable_count(4);
 
         // Navigate down
         process_key_with_lua(&mut runner, make_key_down(), &lua);
@@ -2463,18 +2656,14 @@ mod tests {
         let lua = make_test_layout_with_keybindings();
         let context = KeyContext::default();
 
-        let result = lua
-            .call_handle_key("ctrl+j", "normal", &context)
-            .unwrap();
+        let result = lua.call_handle_key("ctrl+j", "normal", &context).unwrap();
         assert_eq!(
             result.as_ref().map(|a| a.action.as_str()),
             Some("select_next"),
             "Ctrl+J should be select_next"
         );
 
-        let result = lua
-            .call_handle_key("ctrl+k", "normal", &context)
-            .unwrap();
+        let result = lua.call_handle_key("ctrl+k", "normal", &context).unwrap();
         assert_eq!(
             result.as_ref().map(|a| a.action.as_str()),
             Some("select_previous"),
@@ -2488,9 +2677,7 @@ mod tests {
         let lua = make_test_layout_with_keybindings();
         let context = KeyContext::default();
 
-        let result = lua
-            .call_handle_key("ctrl+]", "normal", &context)
-            .unwrap();
+        let result = lua.call_handle_key("ctrl+]", "normal", &context).unwrap();
         assert_eq!(
             result.as_ref().map(|a| a.action.as_str()),
             None,
@@ -2632,7 +2819,10 @@ mod tests {
         panel.connect("sess-0");
         runner.panel_pool.panels.insert("sess-0".to_string(), panel);
 
-        assert_eq!(runner.panel_pool.panels.get("sess-0").unwrap().dims(), (24, 80));
+        assert_eq!(
+            runner.panel_pool.panels.get("sess-0").unwrap().dims(),
+            (24, 80)
+        );
 
         // Simulate resize event
         runner.handle_resize(40, 120);
@@ -2640,7 +2830,8 @@ mod tests {
         // Verify: terminal_dims updated, panel dims invalidated (0,0)
         assert_eq!(runner.panel_pool.terminal_dims, (40, 120));
         assert_eq!(
-            runner.panel_pool.panels.get("sess-0").unwrap().dims(), (0, 0),
+            runner.panel_pool.panels.get("sess-0").unwrap().dims(),
+            (0, 0),
             "Panel dims should be invalidated so sync_widget_dims detects change"
         );
     }
@@ -2652,17 +2843,18 @@ mod tests {
     // These tests verify that TuiRunner sends the correct JSON messages
     // when navigating between agents and handling terminal resize events.
     //
-    // Agent navigation now uses the Lua subscribe/unsubscribe protocol (fire-and-forget),
-    // so tests use `create_test_runner()` and verify subscribe messages directly.
+    // Agent navigation now defers terminal subscribe to render-tree sync
+    // (for correct widget dimensions), so tests validate deferred behavior.
 
-    /// Verifies `focus_terminal` op subscribes immediately and updates state.
+    /// Verifies `focus_terminal` updates selection state and defers subscribe
+    /// until render-tree subscription sync.
     ///
     /// # Scenario
     ///
-    /// Given 3 agents, `focus_terminal` with agent-1 should subscribe to
-    /// that agent's PTY immediately and update all selection state.
+    /// Given 3 agents, `focus_terminal` with agent-1 should update selection
+    /// state immediately and defer subscribe to render sync.
     #[test]
-    fn test_focus_terminal_subscribes_and_updates_state() {
+    fn test_focus_terminal_updates_state_and_defers_subscribe() {
         let (mut runner, mut request_rx) = create_test_runner();
 
         // Action: focus agent-1 (Lua provides session_uuid)
@@ -2672,24 +2864,26 @@ mod tests {
             "session_uuid": "sess-1",
         }));
 
-        // Verify: subscribe message sent immediately (no deferral)
-        match request_rx.try_recv() {
-            Ok(req) => {
-                let msg = unwrap_lua_msg(req);
-                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
-                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:sess-1"));
-            }
-            Err(_) => panic!("Expected subscribe message"),
-        }
+        // Verify: no immediate subscribe message from focus op itself.
+        assert!(
+            request_rx.try_recv().is_err(),
+            "focus op should defer subscribe to render subscription sync"
+        );
 
         // Verify local state updated
         assert_eq!(runner.panel_pool.selected_agent.as_deref(), Some("agent-1"));
         assert_eq!(runner.panel_pool.current_session_uuid(), Some("sess-1"));
-        assert_eq!(runner.panel_pool.current_terminal_sub_id(), Some("tui:sess-1"));
+        assert_eq!(
+            runner.panel_pool.current_terminal_sub_id(),
+            Some("tui:sess-1")
+        );
 
-        // Verify panel created and in Connecting state
+        // Verify panel created and left idle until render sync subscribes.
         use crate::tui::terminal_panel::PanelState;
-        assert_eq!(runner.panel_pool.panels.get("sess-1").unwrap().state(), PanelState::Connecting);
+        assert_eq!(
+            runner.panel_pool.panels.get("sess-1").unwrap().state(),
+            PanelState::Idle
+        );
     }
 
     /// Verifies `focus_terminal` with nil agent_id clears selection.
@@ -2707,7 +2901,10 @@ mod tests {
         runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
         runner.panel_pool.current_terminal_sub_id = Some("tui:sess-0".to_string());
         {
-            let panel = runner.panel_pool.panels.entry("sess-0".to_string())
+            let panel = runner
+                .panel_pool
+                .panels
+                .entry("sess-0".to_string())
                 .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(24, 80));
             panel.connect("sess-0"); // put in Connecting state
         }
@@ -2721,7 +2918,10 @@ mod tests {
         match request_rx.try_recv() {
             Ok(req) => {
                 let msg = unwrap_lua_msg(req);
-                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("unsubscribe"));
+                assert_eq!(
+                    msg.get("type").and_then(|v| v.as_str()),
+                    Some("unsubscribe")
+                );
             }
             Err(_) => panic!("Expected unsubscribe message to be sent"),
         }
@@ -2732,12 +2932,12 @@ mod tests {
         assert_eq!(runner.panel_pool.current_terminal_sub_id(), None);
     }
 
-    /// Verifies `focus_terminal` sends unsubscribe for old and subscribe for new.
+    /// Verifies `focus_terminal` sends unsubscribe for old and defers subscribe for new.
     ///
     /// # Scenario
     ///
     /// When switching from one agent to another, `focus_terminal` immediately
-    /// unsubscribes from the old and subscribes to the new.
+    /// unsubscribes from the old and defers subscribe for the new to render sync.
     #[test]
     fn test_focus_terminal_unsubscribes_old_on_switch() {
         let (mut runner, mut request_rx) = create_test_runner();
@@ -2747,7 +2947,10 @@ mod tests {
         runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
         runner.panel_pool.current_terminal_sub_id = Some("tui:sess-0".to_string());
         {
-            let panel = runner.panel_pool.panels.entry("sess-0".to_string())
+            let panel = runner
+                .panel_pool
+                .panels
+                .entry("sess-0".to_string())
                 .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(24, 80));
             panel.connect("sess-0");
         }
@@ -2763,30 +2966,41 @@ mod tests {
         match request_rx.try_recv() {
             Ok(req) => {
                 let msg = unwrap_lua_msg(req);
-                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("unsubscribe"));
-                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:sess-0"));
+                assert_eq!(
+                    msg.get("type").and_then(|v| v.as_str()),
+                    Some("unsubscribe")
+                );
+                assert_eq!(
+                    msg.get("subscriptionId").and_then(|v| v.as_str()),
+                    Some("tui:sess-0")
+                );
             }
             Err(_) => panic!("Expected unsubscribe message to be sent"),
         }
 
-        // Verify: subscribe sent for new terminal (immediate, not deferred)
-        match request_rx.try_recv() {
-            Ok(req) => {
-                let msg = unwrap_lua_msg(req);
-                assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
-                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:sess-1"));
-            }
-            Err(_) => panic!("Expected subscribe message to be sent"),
-        }
+        // Verify: new subscribe is deferred (no second immediate message).
+        assert!(
+            request_rx.try_recv().is_err(),
+            "subscribe for new target should be deferred to render subscription sync"
+        );
 
         // Verify state
         assert_eq!(runner.panel_pool.selected_agent(), Some("agent-1"));
         assert_eq!(runner.panel_pool.current_session_uuid(), Some("sess-1"));
-        assert_eq!(runner.panel_pool.current_terminal_sub_id(), Some("tui:sess-1"));
+        assert_eq!(
+            runner.panel_pool.current_terminal_sub_id(),
+            Some("tui:sess-1")
+        );
 
         use crate::tui::terminal_panel::PanelState;
-        assert_eq!(runner.panel_pool.panels.get("sess-0").unwrap().state(), PanelState::Idle);
-        assert_eq!(runner.panel_pool.panels.get("sess-1").unwrap().state(), PanelState::Connecting);
+        assert_eq!(
+            runner.panel_pool.panels.get("sess-0").unwrap().state(),
+            PanelState::Idle
+        );
+        assert_eq!(
+            runner.panel_pool.panels.get("sess-1").unwrap().state(),
+            PanelState::Idle
+        );
     }
 
     /// Verifies `focus_terminal` with unknown agent_id is a no-op.
@@ -2822,10 +3036,14 @@ mod tests {
     fn test_focus_terminal_same_target_is_noop() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Setup: agent 0 already focused
+        // Setup: agent 0 already focused with an active panel subscription.
         runner.panel_pool.selected_agent = Some("agent-0".to_string());
         runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
         runner.panel_pool.current_terminal_sub_id = Some("tui:sess-0".to_string());
+        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        panel.connect("sess-0");
+        panel.on_scrollback(b"already connected");
+        runner.panel_pool.panels.insert("sess-0".to_string(), panel);
 
         // Action: focus same agent+session (Lua provides session_uuid)
         runner.execute_focus_terminal(&serde_json::json!({
@@ -2838,6 +3056,38 @@ mod tests {
         assert!(
             request_rx.try_recv().is_err(),
             "No JSON should be sent when already focused on target"
+        );
+    }
+
+    /// Verifies `focus_terminal` keeps focused panel idle after transport loss.
+    /// Re-subscribe is deferred to render-tree subscription sync.
+    #[test]
+    fn test_focus_terminal_same_target_keeps_idle_until_render_sync() {
+        let (mut runner, mut request_rx) = create_test_runner();
+
+        runner.panel_pool.selected_agent = Some("agent-0".to_string());
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.panel_pool.current_terminal_sub_id = Some("tui:sess-0".to_string());
+
+        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        panel.connect("sess-0");
+        panel.on_scrollback(b"stale");
+        panel.mark_transport_disconnected();
+        runner.panel_pool.panels.insert("sess-0".to_string(), panel);
+
+        runner.execute_focus_terminal(&serde_json::json!({
+            "op": "focus_terminal",
+            "agent_id": "agent-0",
+            "session_uuid": "sess-0",
+        }));
+
+        assert!(
+            request_rx.try_recv().is_err(),
+            "re-subscribe should be deferred to render subscription sync"
+        );
+        assert_eq!(
+            runner.panel_pool.panels.get("sess-0").unwrap().state(),
+            crate::tui::terminal_panel::PanelState::Idle
         );
     }
 
@@ -2879,31 +3129,42 @@ mod tests {
         );
     }
 
-    /// Verifies `focus_terminal` uses panel dims from previous render.
+    /// Verifies focused terminal subscribes with rendered-area dimensions.
     ///
     /// # Scenario
     ///
-    /// When a panel already exists with known dimensions from a previous
-    /// render, the subscribe message uses those dims.
+    /// Focus now defers subscribe to render-tree sync. The eventual subscribe
+    /// should use the current rendered area dimensions.
     #[test]
-    fn test_focus_terminal_uses_panel_dims() {
+    fn test_focus_terminal_subscribe_uses_rendered_area_dims() {
         let (mut runner, mut request_rx) = create_test_runner();
 
-        // Setup: panel with known dims from a previous render
-        let panel = crate::tui::terminal_panel::TerminalPanel::new(20, 60);
-        // Panel was previously connected and disconnected (has dims)
-        runner.panel_pool.panels.insert("sess-1".to_string(), panel);
-        // Simulate already viewing this agent (prevents stale-panel eviction)
-        runner.panel_pool.selected_agent = Some("agent-1".to_string());
-
-        // Action: focus agent-1
+        // Action: focus agent-1 (subscribe deferred until sync_subscriptions)
         runner.execute_focus_terminal(&serde_json::json!({
             "op": "focus_terminal",
             "agent_id": "agent-1",
             "session_uuid": "sess-1",
         }));
 
-        // Verify: subscribe uses the panel's dims (20x60), not terminal dims (24x80)
+        let tree = crate::tui::render_tree::RenderNode::Widget {
+            widget_type: crate::tui::render_tree::WidgetType::Terminal,
+            id: None,
+            block: None,
+            custom_lines: None,
+            props: Some(crate::tui::render_tree::WidgetProps::Terminal(
+                crate::tui::render_tree::TerminalBinding {
+                    session_uuid: Some("sess-1".to_string()),
+                },
+            )),
+        };
+        let mut areas = std::collections::HashMap::new();
+        areas.insert("sess-1".to_string(), (20, 60));
+        let msgs = runner.panel_pool.sync_subscriptions(&tree, &areas);
+        for msg in msgs {
+            runner.send_msg(msg);
+        }
+
+        // Verify: subscribe uses rendered area dims (20x60)
         match request_rx.try_recv() {
             Ok(req) => {
                 let msg = unwrap_lua_msg(req);
@@ -2913,6 +3174,46 @@ mod tests {
             }
             Err(_) => panic!("Expected subscribe message"),
         }
+    }
+
+    #[test]
+    fn test_bridge_reconnected_resets_to_attach_state() {
+        use crate::tui::terminal_panel::PanelState;
+
+        let (mut runner, _request_rx) = create_test_runner();
+        runner.mode = "restarting".to_string();
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.panel_pool.selected_agent = Some("agent-0".to_string());
+        runner.overlay_list_actions = vec!["restart_hub".to_string()];
+        runner.has_overlay = true;
+        runner.focused_list_id = Some("menu".to_string());
+        runner.focused_input_id = Some("prompt".to_string());
+        runner.terminal_modes.on_kitty_changed(true);
+
+        {
+            let panel = runner.panel_pool.resolve_panel("sess-0");
+            let _ = panel.connect("sess-0");
+            panel.on_scrollback(b"boot");
+            assert_eq!(panel.state(), PanelState::Connected);
+        }
+
+        runner.dispatch_hub_event(serde_json::json!({"type":"bridge_reconnected"}), None);
+
+        assert_eq!(runner.mode, "restarting");
+        assert!(!runner.panel_pool.panels().contains_key("sess-0"));
+        assert_eq!(runner.panel_pool.current_session_uuid(), None);
+        assert_eq!(runner.panel_pool.selected_agent(), None);
+        assert_eq!(runner.panel_pool.current_terminal_sub_id(), None);
+        assert!(!runner.has_overlay);
+        assert!(runner.overlay_list_actions.is_empty());
+        assert_eq!(runner.focused_list_id, None);
+        assert_eq!(runner.focused_input_id, None);
+        assert!(!runner.terminal_modes.inner_kitty_enabled());
+        assert_eq!(
+            runner.panel_pool.panels().len(),
+            0,
+            "bridge reconnect should hard-reset panel state"
+        );
     }
 
     /// Verifies scrollback event clears parser before processing snapshot.
@@ -2943,9 +3244,12 @@ mod tests {
         runner.output_rx = rx;
         tx.send(TuiOutput::Scrollback {
             session_uuid: "sess-0".into(),
+            rows: 24,
+            cols: 80,
             data: b"fresh snapshot\r\n".to_vec(),
             kitty_enabled: false,
-        }).unwrap();
+        })
+        .unwrap();
 
         // Process the event
         runner.poll_pty_events(None);
@@ -2961,10 +3265,7 @@ mod tests {
             contents.contains("fresh snapshot"),
             "Snapshot should be processed, got: {contents:?}"
         );
-        assert!(
-            !panel.is_scrolled(),
-            "Scroll should be reset to bottom"
-        );
+        assert!(!panel.is_scrolled(), "Scroll should be reset to bottom");
     }
 
     /// Verifies `handle_resize()` invalidates panel dims for next render.
@@ -2991,13 +3292,19 @@ mod tests {
         runner.handle_resize(40, 120);
 
         // Verify: no messages sent (resize flows through sync_widget_dims on next render)
-        assert!(request_rx.try_recv().is_err(), "handle_resize should not send any messages");
+        assert!(
+            request_rx.try_recv().is_err(),
+            "handle_resize should not send any messages"
+        );
 
         // Verify: local state updated
         assert_eq!(runner.panel_pool.terminal_dims, (40, 120));
 
         // Verify: panel dims invalidated (will trigger resize on next render)
-        assert_eq!(runner.panel_pool.panels.get("sess-0").unwrap().dims(), (0, 0));
+        assert_eq!(
+            runner.panel_pool.panels.get("sess-0").unwrap().dims(),
+            (0, 0)
+        );
     }
 
     /// Verifies `handle_resize()` updates state without sending messages
@@ -3010,7 +3317,10 @@ mod tests {
         runner.handle_resize(40, 120);
 
         // Verify: no messages sent (PTY resize handled by pty_clients via terminal channel)
-        assert!(request_rx.try_recv().is_err(), "handle_resize should not send any messages");
+        assert!(
+            request_rx.try_recv().is_err(),
+            "handle_resize should not send any messages"
+        );
 
         // Verify: local state still updated
         assert_eq!(runner.panel_pool.terminal_dims, (40, 120));
@@ -3042,13 +3352,18 @@ mod tests {
         // on exec, so a failed load doesn't clear the old functions. Verify:
         let ctx = make_test_render_context();
         let result = lua.call_render(&ctx);
-        assert!(result.is_ok(), "Old render function should still work after failed reload");
+        assert!(
+            result.is_ok(),
+            "Old render function should still work after failed reload"
+        );
     }
 
     fn make_test_render_context() -> super::super::render::RenderContext<'static> {
         // 'static requires leaked reference for the empty panels map
-        let panels: &'static std::collections::HashMap<String, crate::tui::terminal_panel::TerminalPanel> =
-            Box::leak(Box::new(std::collections::HashMap::new()));
+        let panels: &'static std::collections::HashMap<
+            String,
+            crate::tui::terminal_panel::TerminalPanel,
+        > = Box::leak(Box::new(std::collections::HashMap::new()));
         super::super::render::RenderContext {
             error_message: None,
             connection_code: None,
@@ -3087,23 +3402,91 @@ mod tests {
             )),
         };
 
-        let msgs = runner.panel_pool.sync_subscriptions(&tree, &std::collections::HashMap::new());
-        for msg in msgs { runner.send_msg(msg); }
+        let mut areas = std::collections::HashMap::new();
+        areas.insert("sess-0".to_string(), (24, 80));
+        let msgs = runner.panel_pool.sync_subscriptions(&tree, &areas);
+        for msg in msgs {
+            runner.send_msg(msg);
+        }
 
         // Should have sent a subscribe message for sess-0
         match request_rx.try_recv() {
             Ok(req) => {
                 let msg = unwrap_lua_msg(req);
                 assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
-                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:sess-0"));
+                assert_eq!(
+                    msg.get("subscriptionId").and_then(|v| v.as_str()),
+                    Some("tui:sess-0")
+                );
                 let params = msg.get("params").expect("should have params");
-                assert_eq!(params.get("session_uuid").and_then(|v| v.as_str()), Some("sess-0"));
+                assert_eq!(
+                    params.get("session_uuid").and_then(|v| v.as_str()),
+                    Some("sess-0")
+                );
             }
             Err(_) => panic!("Expected subscribe message"),
         }
 
         use crate::tui::terminal_panel::PanelState;
-        assert_eq!(runner.panel_pool.panels.get("sess-0").unwrap().state(), PanelState::Connecting);
+        assert_eq!(
+            runner.panel_pool.panels.get("sess-0").unwrap().state(),
+            PanelState::Connecting
+        );
+    }
+
+    /// Verifies reconnect resubscribe uses current render-area dimensions.
+    ///
+    /// Regression: an idle panel can survive socket reconnect with stale cached
+    /// dims from before restart. `sync_subscriptions` must refresh dims from
+    /// `areas` before calling connect, or subscribe sends stale cols/rows and
+    /// scrollback renders incorrectly until a full reattach.
+    #[test]
+    fn test_sync_subscriptions_refreshes_idle_panel_dims_before_subscribe() {
+        let (mut runner, mut request_rx) = create_test_runner();
+
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.panel_pool.selected_agent = Some("agent-0".to_string());
+        runner.panel_pool.panels.insert(
+            "sess-0".to_string(),
+            crate::tui::terminal_panel::TerminalPanel::new(57, 181),
+        );
+
+        let tree = crate::tui::render_tree::RenderNode::Widget {
+            widget_type: crate::tui::render_tree::WidgetType::Terminal,
+            id: None,
+            block: None,
+            custom_lines: None,
+            props: Some(crate::tui::render_tree::WidgetProps::Terminal(
+                crate::tui::render_tree::TerminalBinding {
+                    session_uuid: Some("sess-0".to_string()),
+                },
+            )),
+        };
+
+        let mut areas = std::collections::HashMap::new();
+        areas.insert("sess-0".to_string(), (57, 148));
+
+        let msgs = runner.panel_pool.sync_subscriptions(&tree, &areas);
+        for msg in msgs {
+            runner.send_msg(msg);
+        }
+
+        let msg = unwrap_lua_msg(request_rx.try_recv().expect("Expected subscribe message"));
+        assert_eq!(msg.get("type").and_then(|v| v.as_str()), Some("subscribe"));
+        let params = msg.get("params").expect("should have params");
+        assert_eq!(params.get("rows").and_then(|v| v.as_u64()), Some(57));
+        assert_eq!(params.get("cols").and_then(|v| v.as_u64()), Some(148));
+
+        let panel = runner
+            .panel_pool
+            .panels
+            .get("sess-0")
+            .expect("panel exists");
+        assert_eq!(panel.dims(), (57, 148));
+        assert_eq!(
+            panel.state(),
+            crate::tui::terminal_panel::PanelState::Connecting
+        );
     }
 
     /// Verifies `sync_subscriptions` unsubscribes when a binding is removed.
@@ -3138,19 +3521,29 @@ mod tests {
             )),
         };
 
-        let msgs = runner.panel_pool.sync_subscriptions(&tree, &std::collections::HashMap::new());
-        for msg in msgs { runner.send_msg(msg); }
+        let msgs = runner
+            .panel_pool
+            .sync_subscriptions(&tree, &std::collections::HashMap::new());
+        for msg in msgs {
+            runner.send_msg(msg);
+        }
 
         // Should have sent unsubscribe for sess-1
         let mut found_unsubscribe = false;
         while let Ok(req) = request_rx.try_recv() {
             let msg = unwrap_lua_msg(req);
             if msg.get("type").and_then(|v| v.as_str()) == Some("unsubscribe") {
-                assert_eq!(msg.get("subscriptionId").and_then(|v| v.as_str()), Some("tui:sess-1"));
+                assert_eq!(
+                    msg.get("subscriptionId").and_then(|v| v.as_str()),
+                    Some("tui:sess-1")
+                );
                 found_unsubscribe = true;
             }
         }
-        assert!(found_unsubscribe, "Should send unsubscribe for removed binding");
+        assert!(
+            found_unsubscribe,
+            "Should send unsubscribe for removed binding"
+        );
 
         // Panel sess-0 still exists, sess-1 removed
         assert!(runner.panel_pool.panels.contains_key("sess-0"));
@@ -3185,8 +3578,12 @@ mod tests {
             )),
         };
 
-        let msgs = runner.panel_pool.sync_subscriptions(&tree, &std::collections::HashMap::new());
-        for msg in msgs { runner.send_msg(msg); }
+        let msgs = runner
+            .panel_pool
+            .sync_subscriptions(&tree, &std::collections::HashMap::new());
+        for msg in msgs {
+            runner.send_msg(msg);
+        }
 
         // No messages should be sent (already connected)
         assert!(
@@ -3219,11 +3616,16 @@ mod tests {
         lua.preload_module(
             "ui.workspace_helpers",
             include_str!("../../lua/ui/workspace_helpers.lua"),
-        ).expect("workspace_helpers.lua should preload");
-        lua.load_keybindings(kb_source).expect("keybindings.lua should load");
-        lua.load_actions(actions_source).expect("actions.lua should load");
-        lua.load_events(events_source).expect("events.lua should load");
-        lua.load_extension(botster_source, "botster").expect("botster.lua should load");
+        )
+        .expect("workspace_helpers.lua should preload");
+        lua.load_keybindings(kb_source)
+            .expect("keybindings.lua should load");
+        lua.load_actions(actions_source)
+            .expect("actions.lua should load");
+        lua.load_events(events_source)
+            .expect("events.lua should load");
+        lua.load_extension(botster_source, "botster")
+            .expect("botster.lua should load");
         lua
     }
 
@@ -3269,10 +3671,7 @@ mod tests {
             .expect("initial render should succeed");
 
         assert_eq!(runner.mode(), "normal");
-        assert!(
-            !runner.has_overlay,
-            "no overlay in normal mode"
-        );
+        assert!(!runner.has_overlay, "no overlay in normal mode");
 
         // === Step 1: Ctrl+P opens menu ===
         press_key_and_render(&mut runner, make_key_ctrl('p'), &lua);
@@ -3314,11 +3713,15 @@ mod tests {
         {
             let profiles_event = serde_json::json!({ "profiles": ["claude"] });
             let ctx = crate::tui::layout_lua::ActionContext::default();
-            let ops = lua.call_on_hub_event("profiles", &profiles_event, &ctx)
-                .unwrap().unwrap();
+            let ops = lua
+                .call_on_hub_event("profiles", &profiles_event, &ctx)
+                .unwrap()
+                .unwrap();
             runner.execute_lua_ops(ops);
         }
-        runner.render(Some(&lua), None).expect("render after profile skip");
+        runner
+            .render(Some(&lua), None)
+            .expect("render after profile skip");
 
         assert_eq!(
             runner.mode(),
@@ -3354,7 +3757,10 @@ mod tests {
         let buffer = lua
             .eval_string("return _tui_state.input_buffer")
             .expect("should read input_buffer");
-        assert_eq!(buffer, "test prompt", "typed text should be in input_buffer");
+        assert_eq!(
+            buffer, "test prompt",
+            "typed text should be in input_buffer"
+        );
 
         // === Step 5: Submit prompt ===
         press_key_and_render(&mut runner, make_key_enter(), &lua);
@@ -3434,11 +3840,15 @@ mod tests {
         {
             let profiles_event = serde_json::json!({ "profiles": ["claude"] });
             let ctx = crate::tui::layout_lua::ActionContext::default();
-            let ops = lua.call_on_hub_event("profiles", &profiles_event, &ctx)
-                .unwrap().unwrap();
+            let ops = lua
+                .call_on_hub_event("profiles", &profiles_event, &ctx)
+                .unwrap()
+                .unwrap();
             runner.execute_lua_ops(ops);
         }
-        runner.render(Some(&lua), None).expect("render after profile skip");
+        runner
+            .render(Some(&lua), None)
+            .expect("render after profile skip");
         assert_eq!(runner.mode(), "new_agent_select_worktree");
 
         // Step 3: Navigate to "Create New Worktree" (index 1) and select
@@ -3504,10 +3914,7 @@ mod tests {
                 }
             }
         }
-        assert!(
-            found_create,
-            "create_agent with worktree should be sent"
-        );
+        assert!(found_create, "create_agent with worktree should be sent");
         assert_eq!(runner.mode(), "normal");
 
         shutdown.store(true, Ordering::Relaxed);
@@ -3516,19 +3923,20 @@ mod tests {
     /// Escape cancels at every stage — real render pipeline.
     #[test]
     fn test_e2e_full_render_escape_cancels() {
-        let (mut runner, _output_tx, _request_rx, shutdown) =
-            create_test_runner_with_mock_client();
+        let (mut runner, _output_tx, _request_rx, shutdown) = create_test_runner_with_mock_client();
         let lua = make_real_layout_lua();
 
-        runner
-            .render(Some(&lua), None)
-            .expect("initial render");
+        runner.render(Some(&lua), None).expect("initial render");
 
         // Open menu, then escape
         press_key_and_render(&mut runner, make_key_ctrl('p'), &lua);
         assert_eq!(runner.mode(), "menu");
         press_key_and_render(&mut runner, make_key_escape(), &lua);
-        assert_eq!(runner.mode(), "normal", "Escape from menu should return to normal");
+        assert_eq!(
+            runner.mode(),
+            "normal",
+            "Escape from menu should return to normal"
+        );
 
         // Open menu → New Agent → escape from profile selection
         press_key_and_render(&mut runner, make_key_ctrl('p'), &lua);

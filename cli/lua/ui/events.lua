@@ -61,6 +61,34 @@ local function update_agent_status(agent_id, status)
   end
 end
 
+--- Resolve the currently selected agent from client-side state.
+-- Prefer selected_session_uuid because it survives Rust-side transport resets.
+-- Falls back to context.selected_agent when UUID is missing.
+local function resolve_selected_agent(context)
+  local selected_uuid = _tui_state and _tui_state.selected_session_uuid
+  if selected_uuid then
+    for _, a in ipairs(_tui_state.agents or {}) do
+      if a.session_uuid == selected_uuid then
+        return a
+      end
+    end
+  end
+
+  local selected_id = context and context.selected_agent
+  if selected_id and selected_uuid then
+    return { id = selected_id, session_uuid = selected_uuid }
+  end
+  if selected_id then
+    for _, a in ipairs(_tui_state.agents or {}) do
+      if a.id == selected_id then
+        return a
+      end
+    end
+  end
+
+  return nil
+end
+
 -- =============================================================================
 -- Workspace grouping helpers (Phase 3)
 -- =============================================================================
@@ -356,6 +384,33 @@ function M.on_hub_event(event_type, event_data, context)
     return {
       { op = "clear_connection_code" },
     }
+  end
+
+  if event_type == "bridge_reconnected" then
+    return {}
+  end
+
+  if event_type == "hub_recovery_state" or event_type == "hub_ready" then
+    -- Only exit the restart overlay when we were explicitly waiting on a hub
+    -- restart. Initial boot events should not force mode transitions.
+    if _tui_state.mode ~= "restarting" then
+      return {}
+    end
+    local state = event_data and event_data.state or nil
+    if event_type == "hub_ready" or state == "ready" then
+      local ops = {}
+      local selected = resolve_selected_agent(context)
+      if selected and selected.id and selected.session_uuid then
+        ops[#ops + 1] = {
+          op = "focus_terminal",
+          agent_id = selected.id,
+          session_uuid = selected.session_uuid,
+        }
+      end
+      ops[#ops + 1] = set_mode_ops(selected and "insert" or "normal")
+      return ops
+    end
+    return {}
   end
 
   -- subscribed, error — just logging, no state changes needed
