@@ -12,7 +12,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-
 /// Manages git worktrees for agent sessions.
 #[derive(Debug)]
 pub struct WorktreeManager {
@@ -66,13 +65,8 @@ impl WorktreeManager {
     /// the hub under VFS cache pressure. Individual gitignored files inside tracked
     /// directories (credentials, `.key` files, `.env`) are still found — pruning
     /// happens at the directory level only.
-    pub fn copy_from_patterns(
-        source_repo: &Path,
-        dest: &Path,
-        patterns_file: &Path,
-    ) -> Result<()> {
-        let content =
-            fs::read_to_string(patterns_file).context("Failed to read patterns file")?;
+    pub fn copy_from_patterns(source_repo: &Path, dest: &Path, patterns_file: &Path) -> Result<()> {
+        let content = fs::read_to_string(patterns_file).context("Failed to read patterns file")?;
 
         let patterns: Vec<String> = content
             .lines()
@@ -82,7 +76,10 @@ impl WorktreeManager {
             .collect();
 
         if patterns.is_empty() {
-            log::debug!("No patterns in {}, skipping file copy", patterns_file.display());
+            log::debug!(
+                "No patterns in {}, skipping file copy",
+                patterns_file.display()
+            );
             return Ok(());
         }
 
@@ -117,7 +114,14 @@ impl WorktreeManager {
         let ignored_dirs = git_ignored_directories(source_repo);
 
         let mut copied: usize = 0;
-        copy_matching_files(source_repo, dest, source_repo, &globset, &ignored_dirs, &mut copied)?;
+        copy_matching_files(
+            source_repo,
+            dest,
+            source_repo,
+            &globset,
+            &ignored_dirs,
+            &mut copied,
+        )?;
 
         log::info!("Copied {} file(s) into {}", copied, dest.display());
         Ok(())
@@ -143,9 +147,7 @@ impl WorktreeManager {
             anyhow::bail!("Not in a git repository");
         }
 
-        let repo_path = PathBuf::from(
-            String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        );
+        let repo_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
 
         // Get the repo name: env var > origin remote > directory name
         let repo_name = if let Ok(env_repo) = std::env::var("BOTSTER_REPO") {
@@ -243,7 +245,11 @@ impl WorktreeManager {
             log::info!("Cloning {}...", repo);
             let url = format!("https://github.com/{}.git", repo);
             let output = std::process::Command::new("git")
-                .args(["clone", &url, clone_dir.to_str().expect("path is valid UTF-8")])
+                .args([
+                    "clone",
+                    &url,
+                    clone_dir.to_str().expect("path is valid UTF-8"),
+                ])
                 .output()
                 .context("Failed to run git clone")?;
             if !output.status.success() {
@@ -731,7 +737,10 @@ fn git_ignored_directories(repo: &Path) -> HashSet<PathBuf> {
 
     match output {
         Err(e) => {
-            log::warn!("git ls-files --directory failed, walk will not prune ignored dirs: {}", e);
+            log::warn!(
+                "git ls-files --directory failed, walk will not prune ignored dirs: {}",
+                e
+            );
             HashSet::new()
         }
         Ok(out) if !out.status.success() => {
@@ -866,7 +875,12 @@ fn git_remote_url(path: &Path) -> Result<String> {
 /// Checks whether a local branch exists in the repo at `path`.
 fn git_branch_exists(path: &Path, branch_name: &str) -> bool {
     std::process::Command::new("git")
-        .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch_name}")])
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch_name}"),
+        ])
         .current_dir(path)
         .output()
         .is_ok_and(|o| o.status.success())

@@ -105,7 +105,9 @@ fn test_render_no_deadlock() {
             let block = Block::default().borders(Borders::ALL).title("Test");
             let p = parser.lock().unwrap();
             let widget = if scroll_offset > 0 {
-                TerminalWidget::new(p.term(), scroll_offset).block(block).hide_cursor()
+                TerminalWidget::new(p.term(), scroll_offset)
+                    .block(block)
+                    .hide_cursor()
             } else {
                 TerminalWidget::new(p.term(), scroll_offset).block(block)
             };
@@ -121,7 +123,10 @@ fn test_scroll_then_render() {
 
     // Scroll up 20 lines.
     let scroll_offset = scroll_up(0, &parser, 20);
-    assert!(scroll_offset > 0, "scroll_offset should be > 0 after scroll_up");
+    assert!(
+        scroll_offset > 0,
+        "scroll_offset should be > 0 after scroll_up"
+    );
 
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -130,7 +135,9 @@ fn test_scroll_then_render() {
         .draw(|f| {
             let block = Block::default().borders(Borders::ALL).title("Scrolled");
             let p = parser.lock().unwrap();
-            let widget = TerminalWidget::new(p.term(), scroll_offset).block(block).hide_cursor();
+            let widget = TerminalWidget::new(p.term(), scroll_offset)
+                .block(block)
+                .hide_cursor();
             f.render_widget(widget, f.area());
         })
         .unwrap();
@@ -142,7 +149,10 @@ fn test_extreme_scrollback_render() {
     let parser = create_parser_with_content(24, 80, 1000);
 
     let scroll_offset = scroll_to_top(&parser);
-    assert!(scroll_offset > 0, "Should have scrollback after loading 1000 lines");
+    assert!(
+        scroll_offset > 0,
+        "Should have scrollback after loading 1000 lines"
+    );
 
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -151,7 +161,9 @@ fn test_extreme_scrollback_render() {
         .draw(|f| {
             let block = Block::default().borders(Borders::ALL).title("Top");
             let p = parser.lock().unwrap();
-            let widget = TerminalWidget::new(p.term(), scroll_offset).block(block).hide_cursor();
+            let widget = TerminalWidget::new(p.term(), scroll_offset)
+                .block(block)
+                .hide_cursor();
             f.render_widget(widget, f.area());
         })
         .unwrap();
@@ -247,7 +259,9 @@ fn test_main_render_loop_pattern() {
 
             let p = parser.lock().unwrap();
             let widget = if scroll_offset > 0 {
-                TerminalWidget::new(p.term(), scroll_offset).block(block).hide_cursor()
+                TerminalWidget::new(p.term(), scroll_offset)
+                    .block(block)
+                    .hide_cursor()
             } else {
                 TerminalWidget::new(p.term(), scroll_offset).block(block)
             };
@@ -281,7 +295,9 @@ fn test_render_with_timeout() {
                     let block = Block::default().borders(Borders::ALL);
                     let p = parser.lock().unwrap();
                     let widget = if scroll_offset > 0 {
-                        TerminalWidget::new(p.term(), scroll_offset).block(block).hide_cursor()
+                        TerminalWidget::new(p.term(), scroll_offset)
+                            .block(block)
+                            .hide_cursor()
                     } else {
                         TerminalWidget::new(p.term(), scroll_offset).block(block)
                     };
@@ -360,7 +376,8 @@ fn test_spawn_real_pty_with_init_script() {
         // Spawn bash and source the init script
         use botster::agent::spawn::PtySpawnConfig;
         agent
-            .pty.spawn(PtySpawnConfig {
+            .pty
+            .spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),
                 command: "bash".to_string(),
                 env: env_vars,
@@ -420,7 +437,8 @@ fn test_spawn_pty_with_server_script() {
 
         use botster::agent::spawn::PtySpawnConfig;
         agent
-            .pty.spawn(PtySpawnConfig {
+            .pty
+            .spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),
                 command: server_script.display().to_string(),
                 env: server_env,
@@ -477,7 +495,8 @@ fn test_real_pty_spawn_and_output() {
         // Spawn PTY
         use botster::agent::spawn::PtySpawnConfig;
         agent
-            .pty.spawn(PtySpawnConfig {
+            .pty
+            .spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),
                 command: "bash".to_string(),
                 env: HashMap::new(),
@@ -544,7 +563,9 @@ fn test_rapid_scroll_parser_no_deadlock() {
                     let block = Block::default().borders(Borders::ALL).title(title);
                     let p = parser.lock().unwrap();
                     let widget = if scroll_offset > 0 {
-                        TerminalWidget::new(p.term(), scroll_offset).block(block).hide_cursor()
+                        TerminalWidget::new(p.term(), scroll_offset)
+                            .block(block)
+                            .hide_cursor()
                     } else {
                         TerminalWidget::new(p.term(), scroll_offset).block(block)
                     };
@@ -576,28 +597,15 @@ fn test_rapid_scroll_parser_no_deadlock() {
 // - Task #3: Output forwarding tasks spawn per-channel, input routes via BrowserCommand
 // - Task #4: Input/resize use terminal subscriptions (WebRTC), not hub channel
 
-/// Test that Agent provides PTY handle for event subscription.
+/// Test that Agent exposes its configured PTY dimensions.
 ///
-/// This tests the foundation of PTY output routing: agents expose PTY handles
-/// that clients (including browser forwarding tasks) can subscribe to.
+/// `Agent::get_pty_handle()` is test-only inside the library crate. Integration
+/// tests validate public Agent behavior through stable APIs.
 #[test]
-fn test_agent_pty_handle_subscription() {
-
+fn test_agent_reports_pty_dimensions() {
     let (agent, _temp_dir) = create_test_agent();
-
-    // Get PTY handle (single PTY per agent)
-    let handle = agent.get_pty_handle();
-
-    // Subscribe to events
-    let mut rx = handle.subscribe();
-
-    // Verify subscription is active (can receive events)
-    // Note: Without a spawned process, no events will be sent,
-    // but the subscription mechanism should work
-    assert!(
-        rx.try_recv().is_err(),
-        "Should not have events before spawn"
-    );
+    let (rows, cols) = agent.get_pty_size();
+    assert_eq!((rows, cols), (24, 80));
 }
 
 /// Test that multiple subscribers can receive PTY events (broadcast pattern).
@@ -633,8 +641,8 @@ fn test_pty_broadcast_to_multiple_subscribers() {
 /// is written to the PTY via the command channel.
 #[test]
 fn test_pty_input_via_command_channel() {
-    use botster::agent::pty::PtySession;
     use botster::agent::pty::PtyCommand;
+    use botster::agent::pty::PtySession;
 
     // Create a PTY session
     let session = PtySession::new(24, 80);
@@ -646,7 +654,8 @@ fn test_pty_input_via_command_channel() {
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
 
     // Send input command (even without spawned process, channel should accept)
-    let result = runtime.block_on(async { cmd_tx.send(PtyCommand::Input(b"test input".to_vec())).await });
+    let result =
+        runtime.block_on(async { cmd_tx.send(PtyCommand::Input(b"test input".to_vec())).await });
 
     // Command should be accepted (channel is open)
     assert!(result.is_ok(), "Command channel should accept input");

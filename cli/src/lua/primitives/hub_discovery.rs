@@ -81,9 +81,7 @@ pub(crate) fn register(lua: &Lua) -> Result<()> {
     //
     // Returns true if the hub with the given ID has a live process.
     let is_running_fn = lua
-        .create_function(|_, hub_id: String| {
-            Ok(crate::hub::daemon::is_hub_running(&hub_id))
-        })
+        .create_function(|_, hub_id: String| Ok(crate::hub::daemon::is_hub_running(&hub_id)))
         .map_err(|e| anyhow!("Failed to create hub_discovery.is_running function: {e}"))?;
 
     table

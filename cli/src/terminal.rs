@@ -120,6 +120,18 @@ impl EventListener for NoopListener {
 pub struct AlacrittyParser<L: EventListener> {
     term: Term<L>,
     processor: Processor,
+    /// Tracked DECSTBM scrolling region (1-indexed top/bottom).
+    ///
+    /// `None` means default full-screen region.
+    scroll_region: Option<(u16, u16)>,
+    scan_state: ControlScanState,
+}
+
+#[derive(Debug, Clone)]
+enum ControlScanState {
+    Ground,
+    Esc,
+    Csi(Vec<u8>),
 }
 
 impl<L: EventListener> std::fmt::Debug for AlacrittyParser<L> {
@@ -151,7 +163,10 @@ impl<L: EventListener> AlacrittyParser<L> {
     pub fn new_with_listener(rows: u16, cols: u16, scrollback: usize, listener: L) -> Self {
         let rows = (rows.max(MIN_ROWS)) as usize;
         let cols = (cols.max(MIN_COLS)) as usize;
-        let size = TermSize { columns: cols, screen_lines: rows };
+        let size = TermSize {
+            columns: cols,
+            screen_lines: rows,
+        };
         let config = Config {
             scrolling_history: scrollback,
             // Enable kitty keyboard protocol processing so \x1b[>Nu push sequences
@@ -162,7 +177,12 @@ impl<L: EventListener> AlacrittyParser<L> {
         };
         let term = Term::new(config, &size, listener);
         let processor = Processor::new();
-        Self { term, processor }
+        Self {
+            term,
+            processor,
+            scroll_region: None,
+            scan_state: ControlScanState::Ground,
+        }
     }
 
     /// Feed raw PTY bytes into the terminal emulator.
@@ -170,6 +190,7 @@ impl<L: EventListener> AlacrittyParser<L> {
     /// Hot path — bytes from the broker or PTY reader arrive here and update
     /// the internal grid, cursor, and mode state atomically.
     pub fn process(&mut self, data: &[u8]) {
+        self.track_control_state(data);
         self.processor.advance(&mut self.term, data);
     }
 
@@ -180,13 +201,25 @@ impl<L: EventListener> AlacrittyParser<L> {
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let rows = (rows.max(MIN_ROWS)) as usize;
         let cols = (cols.max(MIN_COLS)) as usize;
-        let size = TermSize { columns: cols, screen_lines: rows };
+        let size = TermSize {
+            columns: cols,
+            screen_lines: rows,
+        };
         self.term.resize(size);
+        // Alacritty resets scroll region to full screen on resize.
+        self.scroll_region = None;
     }
 
     /// Borrow the underlying [`Term`] for reading grid state.
     pub fn term(&self) -> &Term<L> {
         &self.term
+    }
+
+    /// Tracked DECSTBM scrolling region (1-indexed top/bottom).
+    ///
+    /// `None` means default full-screen region.
+    pub fn scroll_region(&self) -> Option<(u16, u16)> {
+        self.scroll_region
     }
 
     /// Mutably borrow the underlying [`Term`].
@@ -223,7 +256,9 @@ impl<L: EventListener> AlacrittyParser<L> {
     /// mode flags, set by CSI > flags u sequences. Replaces the manual atomic
     /// bool previously updated by byte-scanning for `\x1b[>1u` / `\x1b[<u`.
     pub fn kitty_enabled(&self) -> bool {
-        self.term.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL)
+        self.term
+            .mode()
+            .intersects(TermMode::KITTY_KEYBOARD_PROTOCOL)
     }
 
     /// Whether DECCKM (application cursor keys) mode is active.
@@ -263,6 +298,96 @@ impl<L: EventListener> AlacrittyParser<L> {
             }
         }
         out
+    }
+
+    fn track_control_state(&mut self, data: &[u8]) {
+        let rows = self.term.grid().screen_lines() as u16;
+        for &b in data {
+            let state = std::mem::replace(&mut self.scan_state, ControlScanState::Ground);
+            self.scan_state = match state {
+                ControlScanState::Ground => {
+                    if b == 0x1b {
+                        ControlScanState::Esc
+                    } else {
+                        ControlScanState::Ground
+                    }
+                }
+                ControlScanState::Esc => match b {
+                    b'[' => ControlScanState::Csi(Vec::new()),
+                    // RIS - Reset to Initial State.
+                    b'c' => {
+                        self.scroll_region = None;
+                        ControlScanState::Ground
+                    }
+                    _ => ControlScanState::Ground,
+                },
+                ControlScanState::Csi(mut buf) => {
+                    buf.push(b);
+                    // Final bytes are 0x40..0x7e.
+                    if (0x40..=0x7e).contains(&b) {
+                        if b == b'r' {
+                            self.update_scroll_region_from_csi(&buf, rows);
+                        }
+                        ControlScanState::Ground
+                    } else if buf.len() > 64 {
+                        // Defensive reset on malformed/unbounded CSI payloads.
+                        ControlScanState::Ground
+                    } else {
+                        ControlScanState::Csi(buf)
+                    }
+                }
+            };
+        }
+    }
+
+    fn update_scroll_region_from_csi(&mut self, csi_payload: &[u8], rows: u16) {
+        // `csi_payload` includes the final `r`.
+        if csi_payload.is_empty() {
+            return;
+        }
+        let params = &csi_payload[..csi_payload.len() - 1];
+        if params.is_empty() {
+            self.scroll_region = None;
+            return;
+        }
+        if !params.iter().all(|b| b.is_ascii_digit() || *b == b';') {
+            return;
+        }
+
+        let param_str = match std::str::from_utf8(params) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut parts = param_str.split(';');
+        let top = parts
+            .next()
+            .and_then(|s| {
+                if s.is_empty() {
+                    Some(1)
+                } else {
+                    s.parse::<u16>().ok()
+                }
+            })
+            .unwrap_or(1);
+        let bottom = parts
+            .next()
+            .and_then(|s| {
+                if s.is_empty() {
+                    Some(rows)
+                } else {
+                    s.parse::<u16>().ok()
+                }
+            })
+            .unwrap_or(rows);
+        if top == 0 || bottom == 0 || top >= bottom {
+            return;
+        }
+
+        if top == 1 && bottom == rows {
+            self.scroll_region = None;
+        } else {
+            self.scroll_region = Some((top, bottom));
+        }
     }
 }
 
@@ -343,33 +468,50 @@ pub fn generate_ansi_snapshot<L: EventListener>(
     let screen_lines = grid.screen_lines();
     let history = grid.history_size();
 
-    // Emit scrollback history oldest-first so RESTTY processes the lines in
-    // chronological order and builds its own scrollback buffer. This preserves
-    // the ability to scroll up in the browser after reconnect.
-    //
-    // Line(-history as i32) is the oldest stored history line.
-    // Line(-1) is the most recent history line (one row above the viewport).
+    // Emit scrollback + viewport oldest-first as one contiguous stream.
+    // Preserve soft-wrap semantics: only emit CRLF between lines that are
+    // not flagged WRAPLINE; wrapped lines should flow into the next row.
+    let mut lines = Vec::with_capacity(history + screen_lines);
     if history > 0 {
         for hist in (1..=history).rev() {
-            emit_grid_line(&mut out, grid, Line(-(hist as i32)), cols);
-            out.extend_from_slice(b"\r\n");
+            lines.push(Line(-(hist as i32)));
         }
     }
-
-    // Emit viewport lines.
-    // Line(0) is the top of the viewport; Line(screen_lines - 1) is the bottom.
     for line_idx in 0..screen_lines {
-        emit_grid_line(&mut out, grid, Line(line_idx as i32), cols);
-        if line_idx < screen_lines - 1 {
+        lines.push(Line(line_idx as i32));
+    }
+    for (idx, line) in lines.iter().enumerate() {
+        let wrapped = line_wraps(grid, *line, cols);
+        // Non-wrapped lines should avoid serializing default trailing cells.
+        // Writing up to the last column can trigger implicit autowrap in some
+        // terminals and shift subsequent rendered rows.
+        emit_grid_line(&mut out, grid, *line, cols, !wrapped);
+        let has_next = idx + 1 < lines.len();
+        if has_next && !wrapped {
             out.extend_from_slice(b"\r\n");
         }
     }
 
-    // Reset SGR then position cursor using RenderableCursor (wide-char corrected).
-    // ANSI cursor addressing is 1-indexed; Line/Column are 0-indexed.
+    // Reset SGR before restoring terminal modes/cursor state.
     out.extend_from_slice(b"\x1b[0m");
-    // line.0 is always non-negative for a viewport cursor.
-    let row = renderable_cursor.point.line.0 as usize + 1;
+
+    // Restore DECSTBM scroll region first.
+    //
+    // DECSTBM resets cursor to home; this must happen before final cursor CUP.
+    restore_scroll_region(&mut out, parser.scroll_region());
+
+    // Restore core terminal modes before cursor positioning.
+    restore_core_modes(&mut out, term.mode());
+
+    // Position cursor using RenderableCursor (wide-char corrected).
+    // ANSI cursor addressing is 1-indexed; Line/Column are 0-indexed.
+    let mut row = renderable_cursor.point.line.0 + 1;
+    if term.mode().contains(TermMode::ORIGIN) {
+        if let Some((top, _bottom)) = parser.scroll_region() {
+            row -= i32::from(top.saturating_sub(1));
+        }
+        row = row.max(1);
+    }
     let col = renderable_cursor.point.column.0 + 1;
     out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
 
@@ -392,6 +534,76 @@ pub fn generate_ansi_snapshot<L: EventListener>(
     }
 
     out
+}
+
+fn restore_scroll_region(out: &mut Vec<u8>, region: Option<(u16, u16)>) {
+    match region {
+        Some((top, bottom)) => out.extend_from_slice(format!("\x1b[{top};{bottom}r").as_bytes()),
+        None => out.extend_from_slice(b"\x1b[r"),
+    }
+}
+
+/// Emit core mode restore sequences based on the terminal's active mode bits.
+fn restore_core_modes(out: &mut Vec<u8>, mode: &TermMode) {
+    if mode.contains(TermMode::APP_CURSOR) {
+        out.extend_from_slice(b"\x1b[?1h");
+    } else {
+        out.extend_from_slice(b"\x1b[?1l");
+    }
+
+    if mode.contains(TermMode::APP_KEYPAD) {
+        out.extend_from_slice(b"\x1b=");
+    } else {
+        out.extend_from_slice(b"\x1b>");
+    }
+
+    if mode.contains(TermMode::LINE_WRAP) {
+        out.extend_from_slice(b"\x1b[?7h");
+    } else {
+        out.extend_from_slice(b"\x1b[?7l");
+    }
+
+    if mode.contains(TermMode::LINE_FEED_NEW_LINE) {
+        out.extend_from_slice(b"\x1b[20h");
+    } else {
+        out.extend_from_slice(b"\x1b[20l");
+    }
+
+    if mode.contains(TermMode::ORIGIN) {
+        out.extend_from_slice(b"\x1b[?6h");
+    } else {
+        out.extend_from_slice(b"\x1b[?6l");
+    }
+
+    if mode.contains(TermMode::INSERT) {
+        out.extend_from_slice(b"\x1b[4h");
+    } else {
+        out.extend_from_slice(b"\x1b[4l");
+    }
+
+    if mode.contains(TermMode::BRACKETED_PASTE) {
+        out.extend_from_slice(b"\x1b[?2004h");
+    } else {
+        out.extend_from_slice(b"\x1b[?2004l");
+    }
+
+    if mode.contains(TermMode::FOCUS_IN_OUT) {
+        out.extend_from_slice(b"\x1b[?1004h");
+    } else {
+        out.extend_from_slice(b"\x1b[?1004l");
+    }
+}
+
+/// Whether a rendered grid line is soft-wrapped into the following line.
+///
+/// Alacritty stores wrap state on the last cell of a line.
+fn line_wraps(grid: &Grid<Cell>, line: Line, cols: usize) -> bool {
+    if cols == 0 {
+        return false;
+    }
+    grid[Point::new(line, Column(cols - 1))]
+        .flags
+        .contains(Flags::WRAPLINE)
 }
 
 /// Map a [`CursorStyle`] to the corresponding DECSCUSR escape sequence bytes.
@@ -424,11 +636,29 @@ fn cursor_shape_decscusr(style: CursorStyle) -> &'static [u8] {
 /// wide character was already emitted by the preceding cell. Zero-width
 /// combining characters stored in [`alacritty_terminal::term::cell::CellExtra`]
 /// are appended immediately after their base character.
-fn emit_grid_line(out: &mut Vec<u8>, grid: &Grid<Cell>, line: Line, cols: usize) {
+fn emit_grid_line(
+    out: &mut Vec<u8>,
+    grid: &Grid<Cell>,
+    line: Line,
+    cols: usize,
+    trim_trailing: bool,
+) {
     let mut sgr = SgrState::reset();
     let mut char_buf = [0u8; 4];
+    let mut end_col = cols;
 
-    for col in 0..cols {
+    if trim_trailing {
+        while end_col > 0 {
+            let cell = &grid[Point::new(line, Column(end_col - 1))];
+            if is_trimmable_trailing_blank(cell) {
+                end_col -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    for col in 0..end_col {
         let cell = &grid[Point::new(line, Column(col))];
 
         // Skip wide-char continuation spacer — rendered as part of the wide char.
@@ -455,6 +685,22 @@ fn emit_grid_line(out: &mut Vec<u8>, grid: &Grid<Cell>, line: Line, cols: usize)
             }
         }
     }
+}
+
+fn is_trimmable_trailing_blank(cell: &Cell) -> bool {
+    const VISUAL_FLAGS: Flags = Flags::BOLD
+        .union(Flags::ITALIC)
+        .union(Flags::UNDERLINE)
+        .union(Flags::DIM)
+        .union(Flags::INVERSE)
+        .union(Flags::HIDDEN)
+        .union(Flags::STRIKEOUT);
+
+    let default_fg = cell.fg == Color::Named(NamedColor::Foreground);
+    let default_bg = cell.bg == Color::Named(NamedColor::Background);
+    let visual_default = cell.flags.intersection(VISUAL_FLAGS).is_empty();
+
+    cell.c == ' ' && cell.zerowidth().is_none() && default_fg && default_bg && visual_default
 }
 
 // ── SGR state ─────────────────────────────────────────────────────────────────
@@ -546,9 +792,7 @@ impl SgrState {
                 out.extend_from_slice(format!(";38;5;{idx}").as_bytes());
             }
             Color::Spec(rgb) => {
-                out.extend_from_slice(
-                    format!(";38;2;{};{};{}", rgb.r, rgb.g, rgb.b).as_bytes(),
-                );
+                out.extend_from_slice(format!(";38;2;{};{};{}", rgb.r, rgb.g, rgb.b).as_bytes());
             }
         }
 
@@ -564,9 +808,7 @@ impl SgrState {
                 out.extend_from_slice(format!(";48;5;{idx}").as_bytes());
             }
             Color::Spec(rgb) => {
-                out.extend_from_slice(
-                    format!(";48;2;{};{};{}", rgb.r, rgb.g, rgb.b).as_bytes(),
-                );
+                out.extend_from_slice(format!(";48;2;{};{};{}", rgb.r, rgb.g, rgb.b).as_bytes());
             }
         }
 
@@ -750,13 +992,19 @@ mod tests {
         // Cursor visible by default — snapshot must NOT contain hide sequence.
         let p = AlacrittyParser::new_noop(24, 80, 100);
         let snap = generate_ansi_snapshot(&p, false);
-        assert!(!snap.contains_slice(b"\x1b[?25l"), "visible cursor should not emit hide");
+        assert!(
+            !snap.contains_slice(b"\x1b[?25l"),
+            "visible cursor should not emit hide"
+        );
 
         // After app hides cursor, snapshot must contain DECTCEM hide sequence.
         let mut p = AlacrittyParser::new_noop(24, 80, 100);
         p.process(b"\x1b[?25l");
         let snap = generate_ansi_snapshot(&p, false);
-        assert!(snap.contains_slice(b"\x1b[?25l"), "hidden cursor must be preserved in snapshot");
+        assert!(
+            snap.contains_slice(b"\x1b[?25l"),
+            "hidden cursor must be preserved in snapshot"
+        );
     }
 
     #[test]
@@ -777,6 +1025,161 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_replay_preserves_soft_wrap_and_cursor() {
+        let mut src = AlacrittyParser::new_noop(2, 5, 100);
+        src.process(b"abcdef");
+        let src_cursor = src.term().renderable_content().cursor.point;
+
+        let snap = generate_ansi_snapshot(&src, false);
+
+        let mut dst = AlacrittyParser::new_noop(2, 5, 100);
+        dst.process(&snap);
+        let dst_cursor = dst.term().renderable_content().cursor.point;
+
+        assert_eq!(
+            src.term().grid()[Point::new(Line(0), Column(0))].c,
+            dst.term().grid()[Point::new(Line(0), Column(0))].c
+        );
+        assert_eq!(
+            src.term().grid()[Point::new(Line(0), Column(4))].c,
+            dst.term().grid()[Point::new(Line(0), Column(4))].c
+        );
+        assert_eq!(
+            src.term().grid()[Point::new(Line(1), Column(0))].c,
+            dst.term().grid()[Point::new(Line(1), Column(0))].c
+        );
+        assert_eq!(src_cursor, dst_cursor, "cursor position must round-trip");
+    }
+
+    #[test]
+    fn snapshot_replay_preserves_multiline_layout_without_extra_wrap() {
+        let mut src = AlacrittyParser::new_noop(4, 12, 100);
+        src.process(b"line-one\r\nline-two\r\nline-three");
+        let src_cursor = src.term().renderable_content().cursor.point;
+
+        let snap = generate_ansi_snapshot(&src, false);
+
+        let mut dst = AlacrittyParser::new_noop(4, 12, 100);
+        dst.process(&snap);
+        let dst_cursor = dst.term().renderable_content().cursor.point;
+
+        for row in 0..4 {
+            for col in 0..12 {
+                let src_cell = src.term().grid()[Point::new(Line(row), Column(col))].c;
+                let dst_cell = dst.term().grid()[Point::new(Line(row), Column(col))].c;
+                assert_eq!(
+                    src_cell, dst_cell,
+                    "cell mismatch at row={}, col={}",
+                    row, col
+                );
+            }
+        }
+        assert_eq!(
+            src_cursor, dst_cursor,
+            "cursor position should not drift after snapshot replay"
+        );
+    }
+
+    #[test]
+    fn snapshot_replay_restores_core_modes() {
+        let mut src = AlacrittyParser::new_noop(6, 20, 100);
+        src.process(b"\x1b[?1h\x1b=\x1b[20h\x1b[4h\x1b[?6h\x1b[?7l\x1b[?2004h\x1b[?1004h");
+
+        let snap = generate_ansi_snapshot(&src, false);
+
+        let mut dst = AlacrittyParser::new_noop(6, 20, 100);
+        dst.process(&snap);
+
+        for flag in [
+            TermMode::APP_CURSOR,
+            TermMode::APP_KEYPAD,
+            TermMode::LINE_FEED_NEW_LINE,
+            TermMode::INSERT,
+            TermMode::ORIGIN,
+            TermMode::LINE_WRAP,
+            TermMode::BRACKETED_PASTE,
+            TermMode::FOCUS_IN_OUT,
+        ] {
+            assert_eq!(
+                src.term().mode().contains(flag),
+                dst.term().mode().contains(flag),
+                "mode mismatch for flag {:?}",
+                flag
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_replay_preserves_post_attach_newline_behavior() {
+        let mut src = AlacrittyParser::new_noop(4, 12, 100);
+        src.process(b"\x1b[20hhello");
+
+        let snap = generate_ansi_snapshot(&src, false);
+
+        let mut dst = AlacrittyParser::new_noop(4, 12, 100);
+        dst.process(&snap);
+
+        src.process(b"\nX");
+        dst.process(b"\nX");
+
+        assert_eq!(
+            src.term().renderable_content().cursor.point,
+            dst.term().renderable_content().cursor.point,
+            "cursor should stay aligned for post-snapshot newline input"
+        );
+    }
+
+    #[test]
+    fn snapshot_replay_preserves_cursor_with_origin_and_scroll_region() {
+        let mut src = AlacrittyParser::new_noop(8, 20, 100);
+        src.process(b"\x1b[2;7r\x1b[?6h\x1b[4;1Hhello");
+
+        let snap = generate_ansi_snapshot(&src, false);
+
+        let mut dst = AlacrittyParser::new_noop(8, 20, 100);
+        dst.process(&snap);
+
+        assert_eq!(
+            src.term().renderable_content().cursor.point,
+            dst.term().renderable_content().cursor.point,
+            "cursor should stay aligned when origin mode is active"
+        );
+    }
+
+    #[test]
+    fn scroll_region_tracker_handles_chunked_decstbm() {
+        let mut parser = AlacrittyParser::new_noop(8, 20, 100);
+
+        parser.process(b"\x1b[2;");
+        parser.process(b"7r");
+        assert_eq!(parser.scroll_region(), Some((2, 7)));
+
+        parser.process(b"\x1b[r");
+        assert_eq!(parser.scroll_region(), None);
+    }
+
+    #[test]
+    fn snapshot_replay_preserves_post_attach_origin_relative_cursor_moves() {
+        let mut src = AlacrittyParser::new_noop(8, 20, 100);
+        src.process(b"\x1b[2;7r\x1b[?6h\x1b[4;1H");
+
+        let snap = generate_ansi_snapshot(&src, false);
+
+        let mut dst = AlacrittyParser::new_noop(8, 20, 100);
+        dst.process(&snap);
+
+        // App continues emitting origin-relative CUP after reconnect.
+        src.process(b"\x1b[4;1HX");
+        dst.process(b"\x1b[4;1HX");
+
+        assert_eq!(
+            src.term().renderable_content().cursor.point,
+            dst.term().renderable_content().cursor.point,
+            "post-snapshot origin-relative cursor addressing must stay aligned"
+        );
+    }
+
+    #[test]
     fn sgr_state_reset_matches_defaults() {
         let state = SgrState::reset();
         assert_eq!(state.fg, Color::Named(NamedColor::Foreground));
@@ -794,7 +1197,11 @@ mod tests {
 
     #[test]
     fn to_ratatui_color_spec() {
-        let rgb = alacritty_terminal::vte::ansi::Rgb { r: 10, g: 20, b: 30 };
+        let rgb = alacritty_terminal::vte::ansi::Rgb {
+            r: 10,
+            g: 20,
+            b: 30,
+        };
         assert_eq!(
             to_ratatui_color(Color::Spec(rgb)),
             ratatui::style::Color::Rgb(10, 20, 30)

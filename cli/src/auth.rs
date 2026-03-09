@@ -116,18 +116,16 @@ pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
             };
 
             match response.status().as_u16() {
-                200 => {
-                    match response.json::<TokenResponse>() {
-                        Ok(token) => {
-                            let _ = tx.send(Ok(token));
-                            return;
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Invalid token response: {e}")));
-                            return;
-                        }
+                200 => match response.json::<TokenResponse>() {
+                    Ok(token) => {
+                        let _ = tx.send(Ok(token));
+                        return;
                     }
-                }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("Invalid token response: {e}")));
+                        return;
+                    }
+                },
                 202 => continue, // Still pending
                 400 | 401 | 403 => {
                     let error: ErrorResponse = response.json().unwrap_or(ErrorResponse {
@@ -142,7 +140,11 @@ pub fn device_flow(server_url: &str) -> Result<TokenResponse> {
                     }
                 }
                 status => {
-                    log::warn!("Unexpected status {} on poll attempt {}", status, attempt + 1);
+                    log::warn!(
+                        "Unexpected status {} on poll attempt {}",
+                        status,
+                        attempt + 1
+                    );
                     continue;
                 }
             }

@@ -126,24 +126,29 @@ pub async fn send_push_direct(
     subscription: &PushSubscription,
     payload: &[u8],
 ) -> Result<bool> {
-    use web_push::{ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushMessageBuilder};
+    use web_push::{
+        ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushMessageBuilder,
+    };
 
-    let sub_info =
-        SubscriptionInfo::new(&subscription.endpoint, &subscription.p256dh, &subscription.auth);
+    let sub_info = SubscriptionInfo::new(
+        &subscription.endpoint,
+        &subscription.p256dh,
+        &subscription.auth,
+    );
 
     let mut sig_builder = VapidSignatureBuilder::from_base64(vapid_private_b64, &sub_info)
         .context("Failed to build VAPID signature")?;
     sig_builder.add_claim("sub", "https://trybotster.com");
-    let sig = sig_builder
-        .build()
-        .context("Failed to sign VAPID JWT")?;
+    let sig = sig_builder.build().context("Failed to sign VAPID JWT")?;
 
     let mut builder = WebPushMessageBuilder::new(&sub_info);
     builder.set_payload(ContentEncoding::Aes128Gcm, payload);
     builder.set_vapid_signature(sig);
     builder.set_ttl(86400); // 24 hours
 
-    let message = builder.build().context("Failed to build web push message")?;
+    let message = builder
+        .build()
+        .context("Failed to build web push message")?;
 
     // Build the HTTP request manually to set Content-Type: application/notification+json
     // (the web-push crate hardcodes application/octet-stream).
@@ -171,7 +176,10 @@ pub async fn send_push_direct(
         request = request.body(push_payload.content);
     }
 
-    let response = request.send().await.context("Web push HTTP request failed")?;
+    let response = request
+        .send()
+        .await
+        .context("Web push HTTP request failed")?;
     let status = response.status().as_u16();
 
     match status {
@@ -186,7 +194,9 @@ pub async fn send_push_direct(
         }
         _ => {
             let body = response.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!("Web push send failed (HTTP {status}): {body}"))
+            Err(anyhow::anyhow!(
+                "Web push send failed (HTTP {status}): {body}"
+            ))
         }
     }
 }

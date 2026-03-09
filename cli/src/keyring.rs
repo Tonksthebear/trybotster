@@ -253,9 +253,7 @@ fn prompt_file_storage_fallback() -> Result<()> {
     eprintln!();
     eprintln!("    Then start the keyring:");
     eprintln!("      eval $(dbus-launch --sh-syntax) && \\");
-    eprintln!(
-        "        echo \"\" | gnome-keyring-daemon --unlock --start --components=secrets"
-    );
+    eprintln!("        echo \"\" | gnome-keyring-daemon --unlock --start --components=secrets");
     eprintln!();
     eprintln!("  Note: WSL2 keyring support is unreliable and not recommended.");
     eprintln!();

@@ -228,9 +228,12 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     Some(handle.spawn(async move {
                         loop {
                             tokio::time::sleep(interval).await;
-                            if tx.send(HubEvent::TimerFired {
-                                timer_id: timer_id.clone(),
-                            }).is_err() {
+                            if tx
+                                .send(HubEvent::TimerFired {
+                                    timer_id: timer_id.clone(),
+                                })
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -622,9 +625,7 @@ mod tests {
         register(&lua, Arc::clone(&registry)).expect("Should register");
 
         // Set up a counter
-        lua.load("fired_count = 0")
-            .exec()
-            .expect("setup counter");
+        lua.load("fired_count = 0").exec().expect("setup counter");
 
         // Create a timer with 0s delay (fires immediately)
         lua.load(
@@ -643,15 +644,15 @@ mod tests {
         let count = poll_timers(&lua, &registry);
         assert_eq!(count, 1);
 
-        let fired: i32 = lua
-            .load("return fired_count")
-            .eval()
-            .expect("read counter");
+        let fired: i32 = lua.load("return fired_count").eval().expect("read counter");
         assert_eq!(fired, 1);
 
         // One-shot should be removed after firing
         let entries = registry.lock().expect("mutex");
-        assert!(entries.entries.is_empty(), "One-shot timer should be removed after firing");
+        assert!(
+            entries.entries.is_empty(),
+            "One-shot timer should be removed after firing"
+        );
     }
 
     #[test]
@@ -661,9 +662,7 @@ mod tests {
 
         register(&lua, Arc::clone(&registry)).expect("Should register");
 
-        lua.load("repeat_count = 0")
-            .exec()
-            .expect("setup counter");
+        lua.load("repeat_count = 0").exec().expect("setup counter");
 
         // Create a repeating timer with 0s interval
         lua.load(
@@ -685,7 +684,11 @@ mod tests {
         // Repeating timer should still be in the registry
         {
             let entries = registry.lock().expect("mutex");
-            assert_eq!(entries.entries.len(), 1, "Repeating timer should still exist");
+            assert_eq!(
+                entries.entries.len(),
+                1,
+                "Repeating timer should still exist"
+            );
             assert!(!entries.entries[0].1.cancelled);
         }
 
@@ -709,9 +712,7 @@ mod tests {
 
         register(&lua, Arc::clone(&registry)).expect("Should register");
 
-        lua.load("should_not_fire = false")
-            .exec()
-            .expect("setup");
+        lua.load("should_not_fire = false").exec().expect("setup");
 
         // Create and immediately cancel
         lua.load(
@@ -744,9 +745,7 @@ mod tests {
 
         register(&lua, Arc::clone(&registry)).expect("Should register");
 
-        lua.load("future_fired = false")
-            .exec()
-            .expect("setup");
+        lua.load("future_fired = false").exec().expect("setup");
 
         // Create a timer far in the future (60 seconds)
         lua.load(
@@ -762,10 +761,7 @@ mod tests {
         let count = poll_timers(&lua, &registry);
         assert_eq!(count, 0);
 
-        let fired: bool = lua
-            .load("return future_fired")
-            .eval()
-            .expect("read flag");
+        let fired: bool = lua.load("return future_fired").eval().expect("read flag");
         assert!(!fired, "Future timer should not fire yet");
 
         // Timer should still be in registry

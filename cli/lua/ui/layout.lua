@@ -487,6 +487,24 @@ function render_overlay(state)
         },
       },
     }
+  elseif _tui_state.mode == "restarting" then
+    return {
+      type = "centered", width = 42, height = 20,
+      child = {
+        type = "paragraph",
+        block = { title = " Hub Restart ", borders = "all" },
+        props = {
+          lines = {
+            "",
+            { { text = "◌ Rebooting...", style = { fg = "yellow", bold = true } } },
+            "",
+            { { text = "Waiting for hub to reconnect", style = "dim" } },
+          },
+          alignment = "center",
+          wrap = true,
+        },
+      },
+    }
   end
 
   return nil

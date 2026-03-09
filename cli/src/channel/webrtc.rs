@@ -28,15 +28,16 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use rustrtc::transports::ice::IceCandidate;
-use rustrtc::{
-    IceServer, PeerConnection, PeerConnectionEvent, RtcConfiguration, SdpType,
-    SessionDescription,
-};
 use rustrtc::transports::sctp::DataChannel;
 use rustrtc::DataChannelEvent;
+use rustrtc::{
+    IceServer, PeerConnection, PeerConnectionEvent, RtcConfiguration, SdpType, SessionDescription,
+};
 
 use crate::relay::crypto_service::CryptoService;
-use crate::relay::olm_crypto::{CONTENT_FILE, CONTENT_FILE_CHUNK, CONTENT_MSG, CONTENT_PTY, CONTENT_STREAM};
+use crate::relay::olm_crypto::{
+    CONTENT_FILE, CONTENT_FILE_CHUNK, CONTENT_MSG, CONTENT_PTY, CONTENT_STREAM,
+};
 
 /// Incoming PTY input from browser via binary DataChannel frame.
 ///
@@ -228,10 +229,7 @@ impl WebRtcChannelBuilder {
 
     /// Set the Hub event channel sender for DC opened notifications.
     #[must_use]
-    pub(crate) fn hub_event_tx(
-        mut self,
-        tx: crate::hub::events::HubEventTx,
-    ) -> Self {
+    pub(crate) fn hub_event_tx(mut self, tx: crate::hub::events::HubEventTx) -> Self {
         self.hub_event_tx = Some(tx);
         self
     }
@@ -355,14 +353,18 @@ impl WebRtcChannel {
         let client = reqwest::Client::builder()
             .timeout(Self::ICE_CONFIG_TIMEOUT)
             .build()
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to build HTTP client: {e:#}")))?;
+            .map_err(|e| {
+                ChannelError::ConnectionFailed(format!("Failed to build HTTP client: {e:#}"))
+            })?;
 
         let response = client
             .get(&url)
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to fetch ICE config: {e:#}")))?;
+            .map_err(|e| {
+                ChannelError::ConnectionFailed(format!("Failed to fetch ICE config: {e:#}"))
+            })?;
 
         if !response.status().is_success() {
             return Err(ChannelError::ConnectionFailed(format!(
@@ -383,10 +385,9 @@ impl WebRtcChannel {
             credential: Option<String>,
         }
 
-        let config: IceConfig = response
-            .json()
-            .await
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to parse ICE config: {e:#}")))?;
+        let config: IceConfig = response.json().await.map_err(|e| {
+            ChannelError::ConnectionFailed(format!("Failed to parse ICE config: {e:#}"))
+        })?;
 
         Ok(config
             .ice_servers
@@ -416,7 +417,11 @@ impl WebRtcChannel {
     /// Handle incoming SDP offer from browser and create answer.
     ///
     /// Called when CLI receives an encrypted offer via ActionCable signal channel.
-    pub async fn handle_sdp_offer(&self, sdp: &str, browser_identity: &str) -> Result<String, ChannelError> {
+    pub async fn handle_sdp_offer(
+        &self,
+        sdp: &str,
+        browser_identity: &str,
+    ) -> Result<String, ChannelError> {
         // Check for existing connection
         let mut pc_guard = self.peer_connection.lock().await;
 
@@ -434,17 +439,17 @@ impl WebRtcChannel {
             let offer = SessionDescription::parse(SdpType::Offer, sdp)
                 .map_err(|e| ChannelError::ConnectionFailed(format!("Invalid SDP offer: {e}")))?;
 
-            pc.set_remote_description(offer)
-                .await
-                .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to set remote description: {e}")))?;
+            pc.set_remote_description(offer).await.map_err(|e| {
+                ChannelError::ConnectionFailed(format!("Failed to set remote description: {e}"))
+            })?;
 
-            let answer = pc
-                .create_answer()
-                .await
-                .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to create answer: {e}")))?;
+            let answer = pc.create_answer().await.map_err(|e| {
+                ChannelError::ConnectionFailed(format!("Failed to create answer: {e}"))
+            })?;
 
-            pc.set_local_description(answer.clone())
-                .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to set local description: {e}")))?;
+            pc.set_local_description(answer.clone()).map_err(|e| {
+                ChannelError::ConnectionFailed(format!("Failed to set local description: {e}"))
+            })?;
 
             let mut sdp = answer.to_sdp_string();
             if !sdp.contains("max-message-size") {
@@ -475,9 +480,9 @@ impl WebRtcChannel {
         let offer = SessionDescription::parse(SdpType::Offer, sdp)
             .map_err(|e| ChannelError::ConnectionFailed(format!("Invalid SDP offer: {e}")))?;
 
-        pc.set_remote_description(offer)
-            .await
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to set remote description: {e}")))?;
+        pc.set_remote_description(offer).await.map_err(|e| {
+            ChannelError::ConnectionFailed(format!("Failed to set remote description: {e}"))
+        })?;
 
         // Create and set local description (answer)
         let answer = pc
@@ -485,8 +490,9 @@ impl WebRtcChannel {
             .await
             .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to create answer: {e}")))?;
 
-        pc.set_local_description(answer.clone())
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to set local description: {e}")))?;
+        pc.set_local_description(answer.clone()).map_err(|e| {
+            ChannelError::ConnectionFailed(format!("Failed to set local description: {e}"))
+        })?;
 
         // Store the peer's Olm key for encrypt routing.
         {
@@ -519,7 +525,11 @@ impl WebRtcChannel {
 
         // Log the application section of SDP answer for debugging
         if let Some(app_idx) = sdp.find("m=application") {
-            let section: String = sdp[app_idx..].lines().take(5).collect::<Vec<_>>().join(" | ");
+            let section: String = sdp[app_idx..]
+                .lines()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(" | ");
             log::debug!("[WebRTC] SDP answer application section: {section}");
         } else {
             log::warn!("[WebRTC] SDP answer has no m=application section!");
@@ -587,7 +597,10 @@ impl WebRtcChannel {
                             let envelope = if let Some(ref cs) = ice_crypto {
                                 let plaintext = serde_json::to_vec(&payload).unwrap_or_default();
                                 match cs.lock() {
-                                    Ok(mut guard) => match guard.encrypt(&plaintext, crate::relay::extract_olm_key(&ice_browser_id)) {
+                                    Ok(mut guard) => match guard.encrypt(
+                                        &plaintext,
+                                        crate::relay::extract_olm_key(&ice_browser_id),
+                                    ) {
                                         Ok(env) => match serde_json::to_value(&env) {
                                             Ok(v) => v,
                                             Err(e) => {
@@ -596,7 +609,9 @@ impl WebRtcChannel {
                                             }
                                         },
                                         Err(e) => {
-                                            log::error!("[WebRTC] Failed to encrypt ICE candidate: {e}");
+                                            log::error!(
+                                                "[WebRTC] Failed to encrypt ICE candidate: {e}"
+                                            );
                                             continue;
                                         }
                                     },
@@ -622,7 +637,9 @@ impl WebRtcChannel {
                                         );
                                     }
                                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        log::warn!("[WebRTC] Signal queue closed; dropping ICE candidate");
+                                        log::warn!(
+                                            "[WebRTC] Signal queue closed; dropping ICE candidate"
+                                        );
                                     }
                                 }
                             } else {
@@ -831,8 +848,9 @@ impl WebRtcChannel {
             }
         };
 
-        pc.add_ice_candidate(ice_candidate)
-            .map_err(|e| ChannelError::ConnectionFailed(format!("Failed to add ICE candidate: {e}")))?;
+        pc.add_ice_candidate(ice_candidate).map_err(|e| {
+            ChannelError::ConnectionFailed(format!("Failed to add ICE candidate: {e}"))
+        })?;
 
         Ok(())
     }
@@ -867,11 +885,9 @@ impl WebRtcChannel {
 
     /// Get the peer's Olm identity key for encrypting messages.
     async fn get_peer_olm_key(&self) -> Result<String, ChannelError> {
-        self.peer_olm_key
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| ChannelError::EncryptionError("No peer Olm key (SDP offer not yet handled)".into()))
+        self.peer_olm_key.lock().await.clone().ok_or_else(|| {
+            ChannelError::EncryptionError("No peer Olm key (SDP offer not yet handled)".into())
+        })
     }
 }
 
@@ -937,7 +953,10 @@ impl Channel for WebRtcChannel {
             .as_ref()
             .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
 
-        let dc_id = self.data_channel_id.lock().await
+        let dc_id = self
+            .data_channel_id
+            .lock()
+            .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
         let cs = self
@@ -1080,7 +1099,10 @@ impl WebRtcChannel {
             .as_ref()
             .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
 
-        let dc_id = self.data_channel_id.lock().await
+        let dc_id = self
+            .data_channel_id
+            .lock()
+            .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
         let cs = self
@@ -1090,9 +1112,7 @@ impl WebRtcChannel {
 
         // Compress raw bytes (gzip is very effective on terminal output)
         let config_guard = self.config.lock().await;
-        let threshold = config_guard
-            .as_ref()
-            .and_then(|c| c.compression_threshold);
+        let threshold = config_guard.as_ref().and_then(|c| c.compression_threshold);
         drop(config_guard);
 
         // Compress if above threshold. Cow avoids cloning the common uncompressed path.
@@ -1150,7 +1170,10 @@ impl WebRtcChannel {
             .as_ref()
             .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
 
-        let dc_id = self.data_channel_id.lock().await
+        let dc_id = self
+            .data_channel_id
+            .lock()
+            .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
         let cs = self
@@ -1191,7 +1214,10 @@ impl WebRtcChannel {
             .as_ref()
             .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
 
-        let dc_id = self.data_channel_id.lock().await
+        let dc_id = self
+            .data_channel_id
+            .lock()
+            .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
         let mut frame = Vec::with_capacity(1 + bundle_bytes.len());
@@ -1249,7 +1275,10 @@ impl WebRtcSender {
             .as_ref()
             .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
 
-        let dc_id = self.data_channel_id.lock().await
+        let dc_id = self
+            .data_channel_id
+            .lock()
+            .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
         let cs = self
@@ -1258,9 +1287,7 @@ impl WebRtcSender {
             .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
 
         let config_guard = self.config.lock().await;
-        let threshold = config_guard
-            .as_ref()
-            .and_then(|c| c.compression_threshold);
+        let threshold = config_guard.as_ref().and_then(|c| c.compression_threshold);
         drop(config_guard);
 
         let (payload, was_compressed): (std::borrow::Cow<'_, [u8]>, bool) =
@@ -1303,16 +1330,16 @@ impl WebRtcSender {
     /// Send a JSON message: serialize, encrypt, send via DataChannel.
     ///
     /// Same logic as [`WebRtcChannel::send_to`] but for the extracted handle.
-    pub async fn send_json(
-        &self,
-        payload: &[u8],
-    ) -> Result<(), ChannelError> {
+    pub async fn send_json(&self, payload: &[u8]) -> Result<(), ChannelError> {
         let pc_guard = self.peer_connection.lock().await;
         let pc = pc_guard
             .as_ref()
             .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
 
-        let dc_id = self.data_channel_id.lock().await
+        let dc_id = self
+            .data_channel_id
+            .lock()
+            .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
         let cs = self
@@ -1352,7 +1379,10 @@ impl WebRtcSender {
             .as_ref()
             .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
 
-        let dc_id = self.data_channel_id.lock().await
+        let dc_id = self
+            .data_channel_id
+            .lock()
+            .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
         let cs = self
@@ -1389,7 +1419,10 @@ impl WebRtcSender {
             .as_ref()
             .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
 
-        let dc_id = self.data_channel_id.lock().await
+        let dc_id = self
+            .data_channel_id
+            .lock()
+            .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
         let mut frame = Vec::with_capacity(1 + bundle_bytes.len());
@@ -1503,17 +1536,22 @@ async fn handle_dc_message(
                 log::warn!("[WebRTC-DC] CONTENT_PTY sub_id truncated");
                 return;
             }
-            let sub_id = std::str::from_utf8(&plaintext[3..3 + sub_id_len])
-                .unwrap_or("");
+            let sub_id = std::str::from_utf8(&plaintext[3..3 + sub_id_len]).unwrap_or("");
             let payload = plaintext[3 + sub_id_len..].to_vec();
 
             // Parse "terminal_{session_uuid}" and send directly to PTY
-            if let Some(incoming) = parse_pty_input_sub_id(sub_id, payload, browser_identity.to_string()) {
+            if let Some(incoming) =
+                parse_pty_input_sub_id(sub_id, payload, browser_identity.to_string())
+            {
                 if let Some(ref tx) = pty_input_tx {
                     match tx.try_send(incoming) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            notify_ingress_backpressure(hub_event_tx, browser_identity, "pty_input_queue_full");
+                            notify_ingress_backpressure(
+                                hub_event_tx,
+                                browser_identity,
+                                "pty_input_queue_full",
+                            );
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             log::debug!("[WebRTC-DC] PTY input queue closed");
@@ -1521,9 +1559,7 @@ async fn handle_dc_message(
                     }
                 }
             } else {
-                log::warn!(
-                    "[WebRTC-DC] Failed to parse PTY input sub_id: {sub_id}"
-                );
+                log::warn!("[WebRTC-DC] Failed to parse PTY input sub_id: {sub_id}");
             }
             return;
         }
@@ -1546,7 +1582,11 @@ async fn handle_dc_message(
                 }) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        notify_ingress_backpressure(hub_event_tx, browser_identity, "stream_frame_queue_full");
+                        notify_ingress_backpressure(
+                            hub_event_tx,
+                            browser_identity,
+                            "stream_frame_queue_full",
+                        );
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         log::debug!("[WebRTC-DC] Stream frame queue closed");
@@ -1566,27 +1606,24 @@ async fn handle_dc_message(
                 log::warn!("[WebRTC-DC] CONTENT_FILE sub_id/filename truncated");
                 return;
             }
-            let sub_id = std::str::from_utf8(&plaintext[2..2 + sub_id_len])
-                .unwrap_or("");
+            let sub_id = std::str::from_utf8(&plaintext[2..2 + sub_id_len]).unwrap_or("");
             let fname_offset = 2 + sub_id_len;
-            let filename_len = u16::from_le_bytes([
-                plaintext[fname_offset],
-                plaintext[fname_offset + 1],
-            ]) as usize;
+            let filename_len =
+                u16::from_le_bytes([plaintext[fname_offset], plaintext[fname_offset + 1]]) as usize;
             let fname_start = fname_offset + 2;
             if plaintext.len() < fname_start + filename_len {
                 log::warn!("[WebRTC-DC] CONTENT_FILE filename truncated");
                 return;
             }
-            let filename = std::str::from_utf8(
-                &plaintext[fname_start..fname_start + filename_len],
-            )
-            .unwrap_or("paste.png")
-            .to_string();
+            let filename = std::str::from_utf8(&plaintext[fname_start..fname_start + filename_len])
+                .unwrap_or("paste.png")
+                .to_string();
             let data = plaintext[fname_start + filename_len..].to_vec();
 
             // Parse sub_id for agent/pty routing
-            if let Some(pty_info) = parse_pty_input_sub_id(sub_id, Vec::new(), browser_identity.to_string()) {
+            if let Some(pty_info) =
+                parse_pty_input_sub_id(sub_id, Vec::new(), browser_identity.to_string())
+            {
                 if let Some(ref tx) = file_input_tx {
                     match tx.try_send(FileInputIncoming {
                         session_uuid: pty_info.session_uuid,
@@ -1595,7 +1632,11 @@ async fn handle_dc_message(
                     }) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            notify_ingress_backpressure(hub_event_tx, browser_identity, "file_input_queue_full");
+                            notify_ingress_backpressure(
+                                hub_event_tx,
+                                browser_identity,
+                                "file_input_queue_full",
+                            );
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             log::debug!("[WebRTC-DC] File input queue closed");
@@ -1603,9 +1644,7 @@ async fn handle_dc_message(
                     }
                 }
             } else {
-                log::warn!(
-                    "[WebRTC-DC] Failed to parse file input sub_id: {sub_id}"
-                );
+                log::warn!("[WebRTC-DC] Failed to parse file input sub_id: {sub_id}");
             }
             return;
         }
@@ -1636,18 +1675,17 @@ async fn handle_dc_message(
                 }
                 let sub_id = std::str::from_utf8(&payload[1..1 + sub_id_len]).unwrap_or("");
                 let fname_offset = 1 + sub_id_len;
-                let filename_len = u16::from_le_bytes([
-                    payload[fname_offset],
-                    payload[fname_offset + 1],
-                ]) as usize;
+                let filename_len =
+                    u16::from_le_bytes([payload[fname_offset], payload[fname_offset + 1]]) as usize;
                 let fname_start = fname_offset + 2;
                 if payload.len() < fname_start + filename_len {
                     log::warn!("[WebRTC-DC] CONTENT_FILE_CHUNK START filename truncated");
                     return;
                 }
-                let filename = std::str::from_utf8(&payload[fname_start..fname_start + filename_len])
-                    .unwrap_or("paste.png")
-                    .to_string();
+                let filename =
+                    std::str::from_utf8(&payload[fname_start..fname_start + filename_len])
+                        .unwrap_or("paste.png")
+                        .to_string();
                 let file_data = &payload[fname_start + filename_len..];
 
                 // Parse routing info
@@ -1682,7 +1720,11 @@ async fn handle_dc_message(
                         }) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                notify_ingress_backpressure(hub_event_tx, browser_identity, "file_input_queue_full");
+                                notify_ingress_backpressure(
+                                    hub_event_tx,
+                                    browser_identity,
+                                    "file_input_queue_full",
+                                );
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 log::debug!("[WebRTC-DC] File input queue closed");
@@ -1726,7 +1768,11 @@ async fn handle_dc_message(
                         }) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                notify_ingress_backpressure(hub_event_tx, browser_identity, "file_input_queue_full");
+                                notify_ingress_backpressure(
+                                    hub_event_tx,
+                                    browser_identity,
+                                    "file_input_queue_full",
+                                );
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 log::debug!("[WebRTC-DC] File input queue closed");
@@ -1763,7 +1809,11 @@ async fn handle_dc_message(
 }
 
 /// Parse a terminal subscription ID ("terminal_{session_uuid}") into a [`PtyInputIncoming`].
-fn parse_pty_input_sub_id(sub_id: &str, data: Vec<u8>, browser_identity: String) -> Option<PtyInputIncoming> {
+fn parse_pty_input_sub_id(
+    sub_id: &str,
+    data: Vec<u8>,
+    browser_identity: String,
+) -> Option<PtyInputIncoming> {
     let session_uuid = sub_id.strip_prefix("terminal_")?;
     if session_uuid.is_empty() {
         return None;

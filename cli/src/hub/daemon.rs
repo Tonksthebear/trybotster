@@ -16,11 +16,70 @@
 //! Sockets live in `/tmp` because macOS limits Unix socket paths to 104 bytes,
 //! and `~/Library/Application Support/...` exceeds that.
 
-use std::fs;
+use std::fs::{self, File};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// RAII exclusive lock on a per-hub lock file.
+///
+/// Acquired via [`try_lock_hub`] before socket bind / PID writes.
+/// The OS-level `flock` is released when this struct is dropped,
+/// which happens when the `Hub` that owns it is dropped or shut down.
+#[derive(Debug)]
+pub struct HubLock {
+    /// Kept open to hold the flock. Dropped = lock released.
+    _file: File,
+    /// Path stored for diagnostics only.
+    pub path: PathBuf,
+}
+
+/// Path to the lock file for a hub.
+pub fn lock_file_path(hub_id: &str) -> Result<PathBuf> {
+    Ok(hub_dir(hub_id)?.join("hub.lock"))
+}
+
+/// Attempt to acquire an exclusive, non-blocking lock for the given hub ID.
+///
+/// Returns `Ok(HubLock)` on success. The lock is held for the lifetime of the
+/// returned `HubLock` (RAII via `flock` on the underlying fd).
+///
+/// Returns `Err` if another process already holds the lock.
+pub fn try_lock_hub(hub_id: &str) -> Result<HubLock> {
+    let path = lock_file_path(hub_id)?;
+    let file = File::create(&path)
+        .with_context(|| format!("Failed to create lock file: {}", path.display()))?;
+
+    let fd = file.as_raw_fd();
+    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            anyhow::bail!(
+                "Another hub is already running for this directory.\n\
+                 Lock file: {}\n\
+                 Use `botster attach` to connect to the existing hub, \
+                 or stop it first.",
+                path.display()
+            );
+        }
+        return Err(err).with_context(|| format!("Failed to lock: {}", path.display()));
+    }
+
+    // Write our PID into the lock file for diagnostics.
+    use std::io::Write;
+    let mut f = &file;
+    let _ = f.write_all(format!("{}", std::process::id()).as_bytes());
+
+    log::info!(
+        "Acquired singleton lock: {} (pid={})",
+        path.display(),
+        std::process::id()
+    );
+    Ok(HubLock { _file: file, path })
+}
 
 /// Hub runtime manifest persisted under `{config_dir}/hubs/{hub_id}/manifest.json`.
 ///
@@ -34,6 +93,9 @@ pub struct HubManifest {
     pub server_id: Option<String>,
     /// Absolute socket path for the hub.
     pub socket_path: String,
+    /// Absolute socket path for the PTY broker process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_socket_path: Option<String>,
     /// PID of the hub process that wrote this manifest.
     pub pid: u32,
     /// Last write timestamp (unix seconds).
@@ -44,7 +106,9 @@ pub struct HubManifest {
 ///
 /// Returns `{config_dir}/hubs/{hub_id}/`, creating it if needed.
 pub fn hub_dir(hub_id: &str) -> Result<PathBuf> {
-    let dir = crate::config::Config::config_dir()?.join("hubs").join(hub_id);
+    let dir = crate::config::Config::config_dir()?
+        .join("hubs")
+        .join(hub_id);
     if !dir.exists() {
         fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create hub directory: {}", dir.display()))?;
@@ -75,7 +139,9 @@ pub fn socket_path(hub_id: &str) -> Result<PathBuf> {
         // race between mkdir and chmod on shared /tmp.
         let old_umask = unsafe { libc::umask(0o077) };
         let result = fs::create_dir_all(&dir);
-        unsafe { libc::umask(old_umask); }
+        unsafe {
+            libc::umask(old_umask);
+        }
         result?;
     }
     Ok(dir.join(format!("{hub_id}.sock")))
@@ -94,6 +160,7 @@ pub fn write_pid_file(hub_id: &str) -> Result<()> {
 /// Write or update the hub runtime manifest.
 pub fn write_manifest(hub_id: &str, server_id: Option<&str>) -> Result<()> {
     let socket = socket_path(hub_id)?;
+    let broker_socket = crate::broker::broker_socket_path(hub_id)?;
     let path = manifest_path(hub_id)?;
     let manifest = HubManifest {
         hub_id: hub_id.to_string(),
@@ -101,6 +168,7 @@ pub fn write_manifest(hub_id: &str, server_id: Option<&str>) -> Result<()> {
             .filter(|s| !s.is_empty())
             .map(std::string::ToString::to_string),
         socket_path: socket.to_string_lossy().into_owned(),
+        broker_socket_path: Some(broker_socket.to_string_lossy().into_owned()),
         pid: std::process::id(),
         updated_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -125,9 +193,31 @@ pub fn read_manifest(hub_id: &str) -> Option<HubManifest> {
 
 /// Return true if a manifest appears live (PID alive + socket exists).
 fn manifest_is_live(manifest: &HubManifest) -> bool {
-    let pid_alive = unsafe { libc::kill(manifest.pid as libc::pid_t, 0) == 0 };
+    let pid_alive = pid_is_live(manifest.pid);
     let socket_alive = PathBuf::from(&manifest.socket_path).exists();
     pid_alive && socket_alive
+}
+
+/// Interpret `kill(pid, 0)` probe results.
+///
+/// `EPERM` means the process exists but the caller lacks permission to signal
+/// it; this must still be treated as "alive" for daemon liveness checks.
+fn kill_probe_indicates_alive(rc: i32, errno: Option<i32>) -> bool {
+    if rc == 0 {
+        return true;
+    }
+    matches!(errno, Some(code) if code == libc::EPERM)
+}
+
+/// Check whether a PID is live using `kill(pid, 0)`.
+fn pid_is_live(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let errno = if rc == 0 {
+        None
+    } else {
+        std::io::Error::last_os_error().raw_os_error()
+    };
+    kill_probe_indicates_alive(rc, errno)
 }
 
 /// Resolve a hub socket by server-assigned hub ID using persisted manifests.
@@ -182,15 +272,12 @@ pub fn read_pid_file(hub_id: &str) -> Option<u32> {
 /// Returns `true` if:
 /// 1. The PID file exists
 /// 2. The PID is parseable
-/// 3. The process with that PID is alive (via `kill(pid, 0)`)
+/// 3. The process with that PID is alive (`kill(pid, 0)` returns 0 or EPERM)
 pub fn is_hub_running(hub_id: &str) -> bool {
     let Some(pid) = read_pid_file(hub_id) else {
         return false;
     };
-
-    // Check if process is alive using kill(pid, 0)
-    // This sends no signal but checks if the process exists
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    pid_is_live(pid)
 }
 
 /// Remove stale PID and socket files for a hub that is no longer running.
@@ -201,7 +288,10 @@ pub fn is_hub_running(hub_id: &str) -> bool {
 pub fn cleanup_stale_files(hub_id: &str) {
     // If the hub is still running, don't touch its files
     if is_hub_running(hub_id) {
-        log::debug!("Hub {} is still running, skipping stale cleanup", &hub_id[..hub_id.len().min(8)]);
+        log::debug!(
+            "Hub {} is still running, skipping stale cleanup",
+            &hub_id[..hub_id.len().min(8)]
+        );
         return;
     }
 
@@ -261,7 +351,10 @@ pub fn cleanup_on_shutdown(hub_id: &str) {
     if let Ok(path) = manifest_path(hub_id) {
         let _ = fs::remove_file(&path);
     }
-    log::info!("Cleaned up daemon files for hub {}", &hub_id[..hub_id.len().min(8)]);
+    log::info!(
+        "Cleaned up daemon files for hub {}",
+        &hub_id[..hub_id.len().min(8)]
+    );
 }
 
 /// Remove orphaned socket files from `/tmp/botster-{uid}/`.
@@ -284,7 +377,9 @@ pub fn cleanup_orphaned_sockets() {
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(ext) = path.extension() else { continue };
+        let Some(ext) = path.extension() else {
+            continue;
+        };
         if ext != "sock" {
             continue;
         }
@@ -318,7 +413,10 @@ pub fn cleanup_orphaned_sockets() {
     }
 
     if removed > 0 {
-        log::info!("Cleaned up {removed} orphaned socket(s) from {}", dir.display());
+        log::info!(
+            "Cleaned up {removed} orphaned socket(s) from {}",
+            dir.display()
+        );
     }
 }
 
@@ -344,7 +442,7 @@ pub fn discover_running_hubs() -> Vec<(String, u32)> {
         let hub_id = entry.file_name().to_string_lossy().into_owned();
 
         if let Some(pid) = read_pid_file(&hub_id) {
-            if unsafe { libc::kill(pid as libc::pid_t, 0) == 0 } {
+            if pid_is_live(pid) {
                 running.push((hub_id, pid));
             } else {
                 // Process dead, clean up stale files
@@ -364,8 +462,14 @@ mod tests {
     fn test_socket_path_format() {
         let path = socket_path("abc123").unwrap();
         let path_str = path.to_string_lossy();
-        assert!(path_str.starts_with("/tmp/botster-"), "Expected /tmp/botster-*, got: {path_str}");
-        assert!(path_str.ends_with("/abc123.sock"), "Expected *.sock, got: {path_str}");
+        assert!(
+            path_str.starts_with("/tmp/botster-"),
+            "Expected /tmp/botster-*, got: {path_str}"
+        );
+        assert!(
+            path_str.ends_with("/abc123.sock"),
+            "Expected *.sock, got: {path_str}"
+        );
     }
 
     #[test]
@@ -382,6 +486,14 @@ mod tests {
     #[test]
     fn test_is_hub_running_nonexistent() {
         assert!(!is_hub_running("nonexistent_hub_id_12345"));
+    }
+
+    #[test]
+    fn test_kill_probe_indicates_alive_accepts_eperm() {
+        assert!(kill_probe_indicates_alive(0, None));
+        assert!(kill_probe_indicates_alive(-1, Some(libc::EPERM)));
+        assert!(!kill_probe_indicates_alive(-1, Some(libc::ESRCH)));
+        assert!(!kill_probe_indicates_alive(-1, None));
     }
 
     #[test]
@@ -424,7 +536,11 @@ mod tests {
         let manifest = HubManifest {
             hub_id: test_id.clone(),
             server_id: Some("server-xyz".to_string()),
-            socket_path: socket_path(&test_id).unwrap().to_string_lossy().into_owned(),
+            socket_path: socket_path(&test_id)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            broker_socket_path: None,
             pid: 999999,
             updated_at: 1,
         };
@@ -438,9 +554,18 @@ mod tests {
 
         cleanup_on_shutdown(&test_id);
 
-        assert!(manifest_path(&test_id).unwrap().exists(), "foreign manifest should remain");
-        assert!(pid_path.exists(), "pid file should remain when cleanup is skipped");
-        assert!(socket_path.exists(), "socket should remain when cleanup is skipped");
+        assert!(
+            manifest_path(&test_id).unwrap().exists(),
+            "foreign manifest should remain"
+        );
+        assert!(
+            pid_path.exists(),
+            "pid file should remain when cleanup is skipped"
+        );
+        assert!(
+            socket_path.exists(),
+            "socket should remain when cleanup is skipped"
+        );
 
         let _ = fs::remove_file(pid_path);
         let _ = fs::remove_file(socket_path);
@@ -468,7 +593,9 @@ mod tests {
         fs::write(&socket, b"").unwrap();
         let socket =
             resolve_socket_for_server_id("hub-server-id-xyz").expect("socket should resolve");
-        assert!(socket.to_string_lossy().ends_with(&format!("/{test_id}.sock")));
+        assert!(socket
+            .to_string_lossy()
+            .ends_with(&format!("/{test_id}.sock")));
         cleanup_on_shutdown(&test_id);
     }
 
@@ -480,7 +607,9 @@ mod tests {
         let socket = socket_path(&test_id).unwrap();
         fs::write(&socket, b"").unwrap();
         let resolved = resolve_socket_for_hub_id(&test_id).expect("socket should resolve");
-        assert!(resolved.to_string_lossy().ends_with(&format!("/{test_id}.sock")));
+        assert!(resolved
+            .to_string_lossy()
+            .ends_with(&format!("/{test_id}.sock")));
         cleanup_on_shutdown(&test_id);
     }
 
@@ -490,8 +619,13 @@ mod tests {
         write_pid_file(&test_id).unwrap();
 
         let running = discover_running_hubs();
-        let found = running.iter().any(|(id, pid)| id == &test_id && *pid == std::process::id());
-        assert!(found, "discover_running_hubs should find our test hub, got: {running:?}");
+        let found = running
+            .iter()
+            .any(|(id, pid)| id == &test_id && *pid == std::process::id());
+        assert!(
+            found,
+            "discover_running_hubs should find our test hub, got: {running:?}"
+        );
 
         cleanup_on_shutdown(&test_id);
     }
@@ -541,7 +675,10 @@ mod tests {
         fs::write(&stale_sock, b"").unwrap();
 
         // Precondition: no PID file exists for this id.
-        assert!(read_pid_file(&stale_id).is_none(), "test precondition: no PID file");
+        assert!(
+            read_pid_file(&stale_id).is_none(),
+            "test precondition: no PID file"
+        );
 
         cleanup_orphaned_sockets();
 
@@ -550,5 +687,64 @@ mod tests {
             "cleanup_orphaned_sockets should remove stale hub socket: {}",
             stale_sock.display()
         );
+    }
+
+    #[test]
+    fn test_singleton_lock_second_acquire_fails() {
+        let test_id = format!("_test_lock_dup_{}", std::process::id());
+
+        let lock1 = try_lock_hub(&test_id).expect("first lock should succeed");
+
+        let result = try_lock_hub(&test_id);
+        assert!(result.is_err(), "second lock must fail while first is held");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Another hub is already running"),
+            "expected singleton error, got: {err_msg}"
+        );
+
+        // Lock file should still exist while held.
+        assert!(lock1.path.exists());
+
+        drop(lock1);
+        // After drop, a new lock should succeed.
+        let lock2 = try_lock_hub(&test_id).expect("lock after drop should succeed");
+        drop(lock2);
+
+        // Clean up.
+        let _ = fs::remove_file(lock_file_path(&test_id).unwrap());
+        let _ = fs::remove_dir(hub_dir(&test_id).unwrap());
+    }
+
+    #[test]
+    fn test_singleton_lock_released_on_drop() {
+        let test_id = format!("_test_lock_drop_{}", std::process::id());
+
+        {
+            let _lock = try_lock_hub(&test_id).expect("lock should succeed");
+            // Lock held inside this scope.
+        }
+        // Lock dropped — re-acquire must succeed.
+        let lock2 = try_lock_hub(&test_id).expect("lock after drop should succeed");
+        drop(lock2);
+
+        let _ = fs::remove_file(lock_file_path(&test_id).unwrap());
+        let _ = fs::remove_dir(hub_dir(&test_id).unwrap());
+    }
+
+    #[test]
+    fn test_singleton_lock_early_failure_no_leak() {
+        let test_id = format!("_test_lock_leak_{}", std::process::id());
+
+        // Simulate: lock acquired, then "startup fails" (lock dropped).
+        let lock = try_lock_hub(&test_id).expect("lock should succeed");
+        drop(lock); // Simulates startup failure + RAII cleanup.
+
+        // New startup attempt must succeed.
+        let lock2 = try_lock_hub(&test_id).expect("lock after failed startup should succeed");
+        drop(lock2);
+
+        let _ = fs::remove_file(lock_file_path(&test_id).unwrap());
+        let _ = fs::remove_dir(hub_dir(&test_id).unwrap());
     }
 }

@@ -31,5 +31,5 @@
 
 // Rust guideline compliant 2026-02
 
-pub mod vapid;
 pub mod push;
+pub mod vapid;

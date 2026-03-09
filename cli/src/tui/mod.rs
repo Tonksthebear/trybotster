@@ -58,11 +58,11 @@ pub use actions::TuiAction;
 #[doc(inline)]
 pub use guard::TerminalGuard;
 #[doc(inline)]
-pub use raw_input::{InputEvent, RawInputReader};
-#[doc(inline)]
 pub use layout::terminal_widget_inner_area;
 #[doc(inline)]
 pub use qr::{generate_qr_code_lines, ConnectionCodeData};
+#[doc(inline)]
+pub use raw_input::{InputEvent, RawInputReader};
 #[doc(inline)]
 pub use render::{render, RenderContext, RenderResult};
 #[doc(inline)]

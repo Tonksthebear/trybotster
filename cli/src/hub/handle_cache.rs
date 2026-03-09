@@ -94,11 +94,7 @@ impl HandleCache {
     /// This is a direct read - no command channel involved.
     #[must_use]
     pub fn get_session(&self, uuid: &str) -> Option<SessionHandle> {
-        self.sessions
-            .read()
-            .ok()?
-            .get(uuid)
-            .cloned()
+        self.sessions.read().ok()?.get(uuid).cloned()
     }
 
     /// Get session handle by display index (for TUI navigation).
@@ -146,10 +142,7 @@ impl HandleCache {
     /// Get the number of cached sessions.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.sessions
-            .read()
-            .map(|s| s.len())
-            .unwrap_or(0)
+        self.sessions.read().map(|s| s.len()).unwrap_or(0)
     }
 
     /// Check if cache is empty.
@@ -161,11 +154,7 @@ impl HandleCache {
     /// Get the display index for a session UUID.
     #[must_use]
     pub fn index_of(&self, uuid: &str) -> Option<usize> {
-        self.order
-            .read()
-            .ok()?
-            .iter()
-            .position(|u| u == uuid)
+        self.order.read().ok()?.iter().position(|u| u == uuid)
     }
 
     /// Add or update a session handle.
@@ -319,9 +308,10 @@ mod tests {
     fn test_remove_worktree_by_branch_ignores_path_format() {
         // Branch match is immune to path variations (trailing slash, etc.)
         let cache = HandleCache::new();
-        cache.set_worktrees(vec![
-            ("/worktrees/repo-feat/".to_string(), "feature".to_string()),
-        ]);
+        cache.set_worktrees(vec![(
+            "/worktrees/repo-feat/".to_string(),
+            "feature".to_string(),
+        )]);
 
         // Passing a different path format — branch still matches
         cache.remove_worktree_by_branch("feature");
@@ -332,9 +322,10 @@ mod tests {
     #[test]
     fn test_remove_worktree_by_branch_noop_when_not_found() {
         let cache = HandleCache::new();
-        cache.set_worktrees(vec![
-            ("/worktrees/repo-main".to_string(), "main".to_string()),
-        ]);
+        cache.set_worktrees(vec![(
+            "/worktrees/repo-main".to_string(),
+            "main".to_string(),
+        )]);
 
         cache.remove_worktree_by_branch("nonexistent");
 

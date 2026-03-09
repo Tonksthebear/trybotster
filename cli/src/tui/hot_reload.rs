@@ -236,8 +236,9 @@ impl LuaBootstrap {
     /// `self.mode = initial_mode` after this returns.
     pub fn init(self) -> (Option<LayoutLua>, String, HotReloader) {
         // Create LayoutLua from stored source (if any).
-        let mut layout_lua = self.layout_source.and_then(|source| {
-            match LayoutLua::new(&source) {
+        let mut layout_lua = self
+            .layout_source
+            .and_then(|source| match LayoutLua::new(&source) {
                 Ok(lua) => {
                     log::info!("Lua layout engine initialized");
                     Some(lua)
@@ -246,8 +247,7 @@ impl LuaBootstrap {
                     log::warn!("Failed to initialize Lua layout engine: {e}");
                     None
                 }
-            }
-        });
+            });
 
         // Load keybindings, actions, events into the same Lua state.
         if let Some(ref mut lua) = layout_lua {
@@ -757,7 +757,10 @@ mod tests {
 
         ensure_customization_dirs(&lua_base);
 
-        assert!(lua_base.join("user/ui").is_dir(), "user/ui/ must be created");
+        assert!(
+            lua_base.join("user/ui").is_dir(),
+            "user/ui/ must be created"
+        );
     }
 
     #[test]

@@ -20,6 +20,7 @@ import { BrowserStatus, ConnectionState } from "connections/constants"
  */
 export function setupHubEventListeners(bridge, hubId, cb) {
   const unsubs = []
+  let sessionRefreshInFlight = false
 
   // WebRTC peer connection state changes
   unsubs.push(bridge.on("connection:state", (event) => {
@@ -58,7 +59,7 @@ export function setupHubEventListeners(bridge, hubId, cb) {
   // Session refreshed (ratchet restart succeeded)
   unsubs.push(bridge.on("session:refreshed", async (event) => {
     if (event.hubId !== hubId) return
-    await handleSessionRefreshed(event, cb)
+    await handleSessionRefreshed(event, cb, () => sessionRefreshInFlight, (value) => { sessionRefreshInFlight = value })
   }))
 
   // SCTP send buffer backing up — ICE path is dead during network transition
@@ -154,9 +155,29 @@ function handleSessionInvalid(event, hubId, bridge, cb) {
   cb.setError("session_invalid", event.message)
 }
 
-async function handleSessionRefreshed(event, cb) {
+async function handleSessionRefreshed(event, cb, getInFlight, setInFlight) {
   cb.log("Session refreshed via ratchet restart")
   cb.clearSessionError()
+
+  // During initial connect, the peer/DataChannel may still be negotiating and
+  // subscribe() has not completed yet. Tearing the peer down here can trap the
+  // connection in a refresh/reconnect loop on Safari. Let the in-flight
+  // connect continue with the new session instead.
+  if (!cb.hasSubscription()) {
+    cb.log("Session refreshed before subscribe completed — skipping peer restart")
+    return
+  }
+
+  if (getInFlight()) {
+    cb.log("Session refresh already handling reconnect — ignoring duplicate refresh")
+    return
+  }
+
+  setInFlight(true)
+  try {
   await cb.disconnectPeer()
   await cb.ensureConnectedAsync()
+  } finally {
+    setInFlight(false)
+  }
 }

@@ -543,9 +543,7 @@ fn parse_terminal_props(table: &LuaTable) -> Option<WidgetProps> {
     let session_uuid: Option<String> = props_table.get("session_uuid").ok();
 
     if session_uuid.is_some() {
-        Some(WidgetProps::Terminal(TerminalBinding {
-            session_uuid,
-        }))
+        Some(WidgetProps::Terminal(TerminalBinding { session_uuid }))
     } else {
         None
     }
@@ -556,7 +554,9 @@ fn parse_terminal_props(table: &LuaTable) -> Option<WidgetProps> {
 /// Items can be plain strings or tables with `text`, `header`, and `style` fields.
 fn parse_list_props(table: &LuaTable) -> Option<WidgetProps> {
     let props_value: LuaValue = table.get("props").ok()?;
-    let LuaValue::Table(props_table) = props_value else { return None; };
+    let LuaValue::Table(props_table) = props_value else {
+        return None;
+    };
 
     let items_table: LuaTable = props_table.get("items").ok()?;
     let mut items = Vec::new();
@@ -595,7 +595,13 @@ fn parse_list_props(table: &LuaTable) -> Option<WidgetProps> {
                     .ok()
                     .and_then(|v| parse_span_style(&v).ok());
                 let action: Option<String> = item_table.get("action").ok();
-                items.push(ListItemProps { content, secondary, header, style, action });
+                items.push(ListItemProps {
+                    content,
+                    secondary,
+                    header,
+                    style,
+                    action,
+                });
             }
             _ => continue,
         }
@@ -619,7 +625,9 @@ fn parse_list_props(table: &LuaTable) -> Option<WidgetProps> {
 /// Parse paragraph widget props from a Lua table.
 fn parse_paragraph_props(table: &LuaTable) -> Option<WidgetProps> {
     let props_value: LuaValue = table.get("props").ok()?;
-    let LuaValue::Table(props_table) = props_value else { return None; };
+    let LuaValue::Table(props_table) = props_value else {
+        return None;
+    };
 
     let lines = parse_styled_lines(&props_table, "lines").unwrap_or_default();
 
@@ -642,7 +650,9 @@ fn parse_paragraph_props(table: &LuaTable) -> Option<WidgetProps> {
 /// Parse input widget props from a Lua table.
 fn parse_input_props(table: &LuaTable) -> Option<WidgetProps> {
     let props_value: LuaValue = table.get("props").ok()?;
-    let LuaValue::Table(props_table) = props_value else { return None; };
+    let LuaValue::Table(props_table) = props_value else {
+        return None;
+    };
 
     let lines = parse_styled_lines(&props_table, "lines").unwrap_or_default();
     let value: Option<String> = props_table.get("value").ok();
@@ -696,7 +706,12 @@ fn parse_block_config(table: &LuaTable) -> Option<BlockConfig> {
         _ => None,
     };
 
-    Some(BlockConfig { title, borders, border_style, border_type })
+    Some(BlockConfig {
+        title,
+        borders,
+        border_style,
+        border_type,
+    })
 }
 
 // =============================================================================
@@ -710,9 +725,7 @@ fn parse_block_config(table: &LuaTable) -> Option<BlockConfig> {
 /// - An array of span tables/strings → `StyledContent::Styled`
 fn parse_styled_content(value: &LuaValue) -> Result<StyledContent> {
     match value {
-        LuaValue::String(s) => {
-            Ok(StyledContent::Plain(s.to_string_lossy()))
-        }
+        LuaValue::String(s) => Ok(StyledContent::Plain(s.to_string_lossy())),
         LuaValue::Table(table) => {
             let mut spans = Vec::new();
             for val in table.clone().sequence_values::<LuaValue>() {
@@ -733,12 +746,10 @@ fn parse_styled_content(value: &LuaValue) -> Result<StyledContent> {
 /// - A table with `text` and optional `style` fields
 fn parse_styled_span(value: &LuaValue) -> Result<StyledSpan> {
     match value {
-        LuaValue::String(s) => {
-            Ok(StyledSpan {
-                text: s.to_string_lossy(),
-                style: SpanStyle::default(),
-            })
-        }
+        LuaValue::String(s) => Ok(StyledSpan {
+            text: s.to_string_lossy(),
+            style: SpanStyle::default(),
+        }),
         LuaValue::Table(table) => {
             let text: String = table
                 .get("text")
@@ -783,10 +794,22 @@ fn parse_span_style(value: &LuaValue) -> Result<SpanStyle> {
                 .unwrap_or(None)
                 .map(|s| parse_span_color(&s))
                 .transpose()?;
-            let bold = table.get::<Option<bool>>("bold").unwrap_or(None).unwrap_or(false);
-            let dim = table.get::<Option<bool>>("dim").unwrap_or(None).unwrap_or(false);
-            let reversed = table.get::<Option<bool>>("reversed").unwrap_or(None).unwrap_or(false);
-            let italic = table.get::<Option<bool>>("italic").unwrap_or(None).unwrap_or(false);
+            let bold = table
+                .get::<Option<bool>>("bold")
+                .unwrap_or(None)
+                .unwrap_or(false);
+            let dim = table
+                .get::<Option<bool>>("dim")
+                .unwrap_or(None)
+                .unwrap_or(false);
+            let reversed = table
+                .get::<Option<bool>>("reversed")
+                .unwrap_or(None)
+                .unwrap_or(false);
+            let italic = table
+                .get::<Option<bool>>("italic")
+                .unwrap_or(None)
+                .unwrap_or(false);
 
             Ok(SpanStyle {
                 fg,
@@ -929,7 +952,17 @@ pub fn interpret_tree(
             custom_lines,
             props,
         } => {
-            render_widget(widget_type, id.as_deref(), block.as_ref(), custom_lines.as_deref(), props.as_ref(), f, ctx, area, widget_states);
+            render_widget(
+                widget_type,
+                id.as_deref(),
+                block.as_ref(),
+                custom_lines.as_deref(),
+                props.as_ref(),
+                f,
+                ctx,
+                area,
+                widget_states,
+            );
         }
     }
 }
@@ -959,7 +992,14 @@ fn render_widget(
         }
         WidgetType::List => {
             if let Some(WidgetProps::List(list_props)) = props {
-                super::render::render_list_widget(f, area, block, list_props, widget_id, widget_states);
+                super::render::render_list_widget(
+                    f,
+                    area,
+                    block,
+                    list_props,
+                    widget_id,
+                    widget_states,
+                );
             } else {
                 f.render_widget(block, area);
             }
@@ -981,7 +1021,14 @@ fn render_widget(
         }
         WidgetType::Input => {
             if let Some(WidgetProps::Input(input_props)) = props {
-                super::render::render_input_widget(f, area, block, input_props, widget_id, widget_states);
+                super::render::render_input_widget(
+                    f,
+                    area,
+                    block,
+                    input_props,
+                    widget_id,
+                    widget_states,
+                );
             } else {
                 f.render_widget(block, area);
             }
@@ -1014,10 +1061,7 @@ pub fn collect_terminal_bindings(
     set
 }
 
-fn collect_bindings_recursive(
-    node: &RenderNode,
-    set: &mut std::collections::HashSet<String>,
-) {
+fn collect_bindings_recursive(node: &RenderNode, set: &mut std::collections::HashSet<String>) {
     match node {
         RenderNode::HSplit { children, .. } | RenderNode::VSplit { children, .. } => {
             for child in children {
@@ -1028,9 +1072,7 @@ fn collect_bindings_recursive(
             collect_bindings_recursive(child, set);
         }
         RenderNode::Widget {
-            widget_type,
-            props,
-            ..
+            widget_type, props, ..
         } => {
             if matches!(widget_type, WidgetType::Terminal) {
                 // Only collect a binding when the terminal widget has explicit
@@ -1075,9 +1117,7 @@ fn extract_list_actions_recursive(node: &RenderNode, actions: &mut Vec<String>) 
             return extract_list_actions_recursive(child, actions);
         }
         RenderNode::Widget {
-            widget_type,
-            props,
-            ..
+            widget_type, props, ..
         } => {
             if matches!(widget_type, WidgetType::List) {
                 if let Some(WidgetProps::List(list_props)) = props {
@@ -1254,11 +1294,16 @@ mod tests {
         .and_then(|table| {
             let node = RenderNode::from_lua_table(&table).unwrap();
             match node {
-                RenderNode::Widget { widget_type, block, .. } => {
+                RenderNode::Widget {
+                    widget_type, block, ..
+                } => {
                     assert!(matches!(widget_type, WidgetType::Empty));
                     assert!(block.is_some());
                     let block = block.unwrap();
-                    assert_eq!(block.title.as_ref().and_then(|t| t.as_plain_str()), Some(" Agents "));
+                    assert_eq!(
+                        block.title.as_ref().and_then(|t| t.as_plain_str()),
+                        Some(" Agents ")
+                    );
                     assert!(matches!(block.borders, BorderStyle::All));
                 }
                 _ => panic!("Expected Widget node"),
@@ -1391,9 +1436,7 @@ mod tests {
         let node = RenderNode::from_lua_table(&table).unwrap();
         match node {
             RenderNode::Widget {
-                widget_type,
-                props,
-                ..
+                widget_type, props, ..
             } => {
                 assert!(matches!(widget_type, WidgetType::Paragraph));
                 let WidgetProps::Paragraph(para) = props.expect("should have props") else {
@@ -1433,9 +1476,7 @@ mod tests {
         let node = RenderNode::from_lua_table(&table).unwrap();
         match node {
             RenderNode::Widget {
-                widget_type,
-                props,
-                ..
+                widget_type, props, ..
             } => {
                 assert!(matches!(widget_type, WidgetType::List));
                 let WidgetProps::List(list) = props.expect("should have props") else {
@@ -1473,9 +1514,7 @@ mod tests {
         let node = RenderNode::from_lua_table(&table).unwrap();
         match node {
             RenderNode::Widget {
-                widget_type,
-                props,
-                ..
+                widget_type, props, ..
             } => {
                 assert!(matches!(widget_type, WidgetType::Input));
                 let WidgetProps::Input(input) = props.expect("should have props") else {
@@ -1491,10 +1530,7 @@ mod tests {
     #[test]
     fn test_parse_widget_without_block() {
         let lua = mlua::Lua::new();
-        let table: LuaTable = lua
-            .load(r#"return { type = "terminal" }"#)
-            .eval()
-            .unwrap();
+        let table: LuaTable = lua.load(r#"return { type = "terminal" }"#).eval().unwrap();
 
         let node = RenderNode::from_lua_table(&table).unwrap();
         match node {
@@ -1605,7 +1641,9 @@ mod tests {
             table.set("type", *type_str).unwrap();
             let node = RenderNode::from_lua_table(&table).unwrap();
             match &node {
-                RenderNode::Widget { widget_type, block, .. } => {
+                RenderNode::Widget {
+                    widget_type, block, ..
+                } => {
                     assert!(block.is_none(), "{label} should have no block");
                     let dbg = format!("{widget_type:?}");
                     assert!(dbg.contains(label), "Expected {label} in {dbg}");
@@ -1642,10 +1680,15 @@ mod tests {
                 assert_eq!(*width_pct, 50);
                 assert_eq!(*height_pct, 40);
                 match child.as_ref() {
-                    RenderNode::Widget { widget_type, block, .. } => {
+                    RenderNode::Widget {
+                        widget_type, block, ..
+                    } => {
                         assert!(matches!(widget_type, WidgetType::List));
                         let b = block.as_ref().unwrap();
-                        assert_eq!(b.title.as_ref().and_then(|t| t.as_plain_str()), Some(" Menu "));
+                        assert_eq!(
+                            b.title.as_ref().and_then(|t| t.as_plain_str()),
+                            Some(" Menu ")
+                        );
                     }
                     _ => panic!("Expected Widget child"),
                 }
@@ -1666,7 +1709,11 @@ mod tests {
             props: None,
         };
         let bindings = collect_terminal_bindings(&tree, "");
-        assert_eq!(bindings.len(), 0, "Unbound terminal should not produce a binding");
+        assert_eq!(
+            bindings.len(),
+            0,
+            "Unbound terminal should not produce a binding"
+        );
     }
 
     #[test]
@@ -1697,7 +1744,11 @@ mod tests {
             })),
         };
         let bindings = collect_terminal_bindings(&tree, "default-uuid");
-        assert_eq!(bindings.len(), 0, "None session_uuid should not produce a binding");
+        assert_eq!(
+            bindings.len(),
+            0,
+            "None session_uuid should not produce a binding"
+        );
     }
 
     #[test]
@@ -1759,7 +1810,11 @@ mod tests {
             ],
         };
         let bindings = collect_terminal_bindings(&tree, "");
-        assert_eq!(bindings.len(), 0, "Unbound terminals should not produce bindings");
+        assert_eq!(
+            bindings.len(),
+            0,
+            "Unbound terminals should not produce bindings"
+        );
     }
 
     #[test]
@@ -1812,6 +1867,10 @@ mod tests {
             ],
         };
         let bindings = collect_terminal_bindings(&tree, "");
-        assert_eq!(bindings.len(), 1, "Duplicate bindings should be deduplicated");
+        assert_eq!(
+            bindings.len(),
+            1,
+            "Duplicate bindings should be deduplicated"
+        );
     }
 }

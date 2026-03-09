@@ -25,7 +25,7 @@
 //!
 //! See [`framing`] for frame types and codec.
 
+pub mod client_conn;
 pub mod framing;
 pub mod server;
-pub mod client_conn;
 pub mod tui_bridge;

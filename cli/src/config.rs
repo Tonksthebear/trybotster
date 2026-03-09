@@ -5,9 +5,9 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::collections::HashMap;
 use std::{fs, path::PathBuf};
 
 use crate::keyring::Credentials;
@@ -275,10 +275,8 @@ impl HubRegistry {
 
     /// Store a hub name for a given identifier.
     pub fn set_hub_name(&mut self, hub_id: &str, name: String, repo_path: Option<String>) {
-        self.hubs.insert(
-            hub_id.to_string(),
-            HubEntry { name, repo_path },
-        );
+        self.hubs
+            .insert(hub_id.to_string(), HubEntry { name, repo_path });
     }
 
     fn registry_path() -> Result<PathBuf> {
@@ -322,7 +320,11 @@ mod tests {
         let mut registry = HubRegistry::default();
         assert!(registry.get_hub_name("abc123").is_none());
 
-        registry.set_hub_name("abc123", "my-api".to_string(), Some("/home/user/my-api".to_string()));
+        registry.set_hub_name(
+            "abc123",
+            "my-api".to_string(),
+            Some("/home/user/my-api".to_string()),
+        );
         assert_eq!(registry.get_hub_name("abc123"), Some("my-api"));
 
         registry.set_hub_name("def456", "frontend".to_string(), None);

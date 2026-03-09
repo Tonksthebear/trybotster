@@ -228,8 +228,8 @@ pub fn save_vodozemac_crypto_store(hub_id: &str, state: &VodozemacCryptoState) -
 // VAPID Key Persistence
 // ============================================================================
 
-use crate::notifications::vapid::VapidKeys;
 use crate::notifications::push::PushSubscriptionStore;
+use crate::notifications::vapid::VapidKeys;
 
 /// VAPID persistence format version.
 const VAPID_VERSION: u8 = 1;
@@ -359,8 +359,7 @@ pub fn save_push_subscriptions(store: &PushSubscriptionStore) -> Result<()> {
     let state_dir = device_state_dir()?;
     let subs_path = state_dir.join("push_subscriptions.enc");
 
-    let plaintext =
-        serde_json::to_vec(store).context("Failed to serialize push subscriptions")?;
+    let plaintext = serde_json::to_vec(store).context("Failed to serialize push subscriptions")?;
     let encrypted = crate::crypto::encrypt(&key, &plaintext, PUSH_SUB_VERSION)?;
     let content = serde_json::to_string_pretty(&encrypted)
         .context("Failed to serialize encrypted push subscriptions")?;
@@ -374,7 +373,10 @@ pub fn save_push_subscriptions(store: &PushSubscriptionStore) -> Result<()> {
             .context("Failed to set push subscriptions file permissions")?;
     }
 
-    log::debug!("Saved encrypted device-level push subscriptions to {:?}", subs_path);
+    log::debug!(
+        "Saved encrypted device-level push subscriptions to {:?}",
+        subs_path
+    );
     Ok(())
 }
 
@@ -479,8 +481,12 @@ mod tests {
         let mut state = VodozemacCryptoState::default();
         state.pickled_account = "test_pickled_account".to_string();
         state.hub_id = hub_id.to_string();
-        state.pickled_sessions.insert("peer_key_1".to_string(), "pickled_session_1".to_string());
-        state.pickled_sessions.insert("peer_key_2".to_string(), "pickled_session_2".to_string());
+        state
+            .pickled_sessions
+            .insert("peer_key_1".to_string(), "pickled_session_1".to_string());
+        state
+            .pickled_sessions
+            .insert("peer_key_2".to_string(), "pickled_session_2".to_string());
 
         // Save
         save_vodozemac_crypto_store(hub_id, &state).unwrap();

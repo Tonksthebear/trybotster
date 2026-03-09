@@ -232,7 +232,9 @@ pub(crate) fn fire_hub_client_message(
             Ok(cb) => match lua.create_registry_value(cb) {
                 Ok(cloned) => cloned,
                 Err(e) => {
-                    log::warn!("[HubClient-Lua] Failed to clone callback key for {connection_id}: {e}");
+                    log::warn!(
+                        "[HubClient-Lua] Failed to clone callback key for {connection_id}: {e}"
+                    );
                     return;
                 }
             },
@@ -274,9 +276,7 @@ fn send_hc_event(tx: &HubEventSender, request: HubClientRequest) {
     if let Some(ref sender) = *guard {
         let _ = sender.send(HubEvent::LuaHubClientRequest(request));
     } else {
-        ::log::warn!(
-            "[HubClient] request sent before hub_event_tx set — event dropped"
-        );
+        ::log::warn!("[HubClient] request sent before hub_event_tx set — event dropped");
     }
 }
 
@@ -320,10 +320,13 @@ pub(crate) fn register(
                 id
             };
 
-            send_hc_event(&tx, HubClientRequest::Connect {
-                connection_id: connection_id.clone(),
-                socket_path,
-            });
+            send_hc_event(
+                &tx,
+                HubClientRequest::Connect {
+                    connection_id: connection_id.clone(),
+                    socket_path,
+                },
+            );
 
             Ok(connection_id)
         })
@@ -339,25 +342,23 @@ pub(crate) fn register(
     // Messages arriving via HubEvent::HubClientMessage will look up and fire this callback.
     let cb_registry = Arc::clone(&callback_registry);
     let on_message_fn = lua
-        .create_function(
-            move |lua, (conn_id, callback): (String, mlua::Function)| {
-                let callback_key = lua.create_registry_value(callback).map_err(|e| {
-                    mlua::Error::external(format!(
-                        "hub_client.on_message: failed to store callback: {e}"
-                    ))
-                })?;
+        .create_function(move |lua, (conn_id, callback): (String, mlua::Function)| {
+            let callback_key = lua.create_registry_value(callback).map_err(|e| {
+                mlua::Error::external(format!(
+                    "hub_client.on_message: failed to store callback: {e}"
+                ))
+            })?;
 
-                // Store callback in registry (Lua-thread-pinned).
-                {
-                    let mut registry = cb_registry
-                        .lock()
-                        .expect("HubClientCallbackRegistry mutex poisoned");
-                    registry.insert(conn_id, callback_key);
-                }
+            // Store callback in registry (Lua-thread-pinned).
+            {
+                let mut registry = cb_registry
+                    .lock()
+                    .expect("HubClientCallbackRegistry mutex poisoned");
+                registry.insert(conn_id, callback_key);
+            }
 
-                Ok(())
-            },
-        )
+            Ok(())
+        })
         .map_err(|e| anyhow!("Failed to create hub_client.on_message function: {e}"))?;
 
     hc_table
@@ -367,22 +368,21 @@ pub(crate) fn register(
     // hub_client.send(conn_id, data)
     let tx = Arc::clone(&hub_event_tx);
     let send_fn = lua
-        .create_function(
-            move |lua, (connection_id, data): (String, Value)| {
-                let data_json: serde_json::Value = lua.from_value(data).map_err(|e| {
-                    mlua::Error::external(format!(
-                        "hub_client.send: failed to serialize data: {e}"
-                    ))
-                })?;
+        .create_function(move |lua, (connection_id, data): (String, Value)| {
+            let data_json: serde_json::Value = lua.from_value(data).map_err(|e| {
+                mlua::Error::external(format!("hub_client.send: failed to serialize data: {e}"))
+            })?;
 
-                send_hc_event(&tx, HubClientRequest::Send {
+            send_hc_event(
+                &tx,
+                HubClientRequest::Send {
                     connection_id,
                     data: data_json,
-                });
+                },
+            );
 
-                Ok(())
-            },
-        )
+            Ok(())
+        })
         .map_err(|e| anyhow!("Failed to create hub_client.send function: {e}"))?;
 
     hc_table
@@ -407,18 +407,14 @@ pub(crate) fn register(
             move |lua, (connection_id, data, timeout_ms): (String, Value, Option<u64>)| {
                 let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
 
-                let mut data_json: serde_json::Value =
-                    lua.from_value(data).map_err(|e| {
-                        mlua::Error::external(format!(
-                            "hub_client.request: failed to serialize data: {e}"
-                        ))
-                    })?;
+                let mut data_json: serde_json::Value = lua.from_value(data).map_err(|e| {
+                    mlua::Error::external(format!(
+                        "hub_client.request: failed to serialize data: {e}"
+                    ))
+                })?;
 
                 // Generate a unique correlation ID and inject it.
-                let rid = format!(
-                    "hcr_{}",
-                    REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
-                );
+                let rid = format!("hcr_{}", REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed));
                 if let Some(obj) = data_json.as_object_mut() {
                     obj.insert(
                         "_mcp_rid".to_string(),
@@ -449,9 +445,7 @@ pub(crate) fn register(
                     Frame::Json(data_json).encode()
                 };
                 let sent = {
-                    let senders = frames
-                        .lock()
-                        .expect("HubClientFrameSenders mutex poisoned");
+                    let senders = frames.lock().expect("HubClientFrameSenders mutex poisoned");
                     if let Some(tx) = senders.get(&connection_id) {
                         tx.send(frame_bytes).is_ok()
                     } else {
@@ -528,8 +522,8 @@ pub(crate) fn register(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::new_hub_event_sender;
+    use super::*;
 
     /// Create a test sender with a wired-up channel for event capture.
     fn setup_with_channel() -> (
@@ -547,7 +541,14 @@ mod tests {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
         let registry = new_hub_client_callback_registry();
-        register(&lua, tx, registry, new_hub_client_pending_requests(), new_hub_client_frame_senders()).expect("Should register hub_client primitives");
+        register(
+            &lua,
+            tx,
+            registry,
+            new_hub_client_pending_requests(),
+            new_hub_client_frame_senders(),
+        )
+        .expect("Should register hub_client primitives");
 
         let globals = lua.globals();
         let hc_table: mlua::Table = globals
@@ -566,7 +567,14 @@ mod tests {
         let lua = Lua::new();
         let (tx, _rx) = setup_with_channel();
         let registry = new_hub_client_callback_registry();
-        register(&lua, tx, registry, new_hub_client_pending_requests(), new_hub_client_frame_senders()).expect("Should register hub_client primitives");
+        register(
+            &lua,
+            tx,
+            registry,
+            new_hub_client_pending_requests(),
+            new_hub_client_frame_senders(),
+        )
+        .expect("Should register hub_client primitives");
 
         let conn_id: String = lua
             .load(r#"return hub_client.connect("/tmp/test.sock")"#)
@@ -584,7 +592,14 @@ mod tests {
         let lua = Lua::new();
         let (tx, mut rx) = setup_with_channel();
         let registry = new_hub_client_callback_registry();
-        register(&lua, tx, registry, new_hub_client_pending_requests(), new_hub_client_frame_senders()).expect("Should register hub_client primitives");
+        register(
+            &lua,
+            tx,
+            registry,
+            new_hub_client_pending_requests(),
+            new_hub_client_frame_senders(),
+        )
+        .expect("Should register hub_client primitives");
 
         let conn_id: String = lua
             .load(r#"return hub_client.connect("/tmp/other-hub.sock")"#)
@@ -609,7 +624,14 @@ mod tests {
         let lua = Lua::new();
         let (tx, mut rx) = setup_with_channel();
         let registry = new_hub_client_callback_registry();
-        register(&lua, tx, registry, new_hub_client_pending_requests(), new_hub_client_frame_senders()).expect("Should register hub_client primitives");
+        register(
+            &lua,
+            tx,
+            registry,
+            new_hub_client_pending_requests(),
+            new_hub_client_frame_senders(),
+        )
+        .expect("Should register hub_client primitives");
 
         lua.load(r#"hub_client.send("hc_conn_0", { type = "ping", seq = 42 })"#)
             .exec()
@@ -634,7 +656,14 @@ mod tests {
         let lua = Lua::new();
         let (tx, mut rx) = setup_with_channel();
         let registry = new_hub_client_callback_registry();
-        register(&lua, tx, registry, new_hub_client_pending_requests(), new_hub_client_frame_senders()).expect("Should register hub_client primitives");
+        register(
+            &lua,
+            tx,
+            registry,
+            new_hub_client_pending_requests(),
+            new_hub_client_frame_senders(),
+        )
+        .expect("Should register hub_client primitives");
 
         lua.load(r#"hub_client.close("hc_conn_0")"#)
             .exec()
@@ -652,8 +681,14 @@ mod tests {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
         let registry = new_hub_client_callback_registry();
-        register(&lua, tx, Arc::clone(&registry), new_hub_client_pending_requests(), new_hub_client_frame_senders())
-            .expect("Should register hub_client primitives");
+        register(
+            &lua,
+            tx,
+            Arc::clone(&registry),
+            new_hub_client_pending_requests(),
+            new_hub_client_frame_senders(),
+        )
+        .expect("Should register hub_client primitives");
 
         lua.load(
             r#"
@@ -675,7 +710,14 @@ mod tests {
         let lua = Lua::new();
         let (tx, _rx) = setup_with_channel();
         let registry = new_hub_client_callback_registry();
-        register(&lua, tx, registry, new_hub_client_pending_requests(), new_hub_client_frame_senders()).expect("Should register hub_client primitives");
+        register(
+            &lua,
+            tx,
+            registry,
+            new_hub_client_pending_requests(),
+            new_hub_client_frame_senders(),
+        )
+        .expect("Should register hub_client primitives");
 
         let id1: String = lua
             .load(r#"return hub_client.connect("/tmp/a.sock")"#)
@@ -702,10 +744,19 @@ mod tests {
 
         // Pre-populate a fake frame channel for "hc_conn_0".
         let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        frames.lock().unwrap().insert("hc_conn_0".to_string(), frame_tx);
+        frames
+            .lock()
+            .unwrap()
+            .insert("hc_conn_0".to_string(), frame_tx);
 
-        register(&lua, tx, registry, Arc::clone(&pending), Arc::clone(&frames))
-            .expect("Should register hub_client primitives");
+        register(
+            &lua,
+            tx,
+            registry,
+            Arc::clone(&pending),
+            Arc::clone(&frames),
+        )
+        .expect("Should register hub_client primitives");
 
         // Spawn a thread: read the frame from the channel, extract _mcp_rid,
         // and deliver the response directly to pending (simulating the read task).
@@ -724,7 +775,10 @@ mod tests {
                 Frame::Json(v) => v,
                 _ => panic!("Expected JSON frame"),
             };
-            let rid = data["_mcp_rid"].as_str().expect("Should have _mcp_rid").to_string();
+            let rid = data["_mcp_rid"]
+                .as_str()
+                .expect("Should have _mcp_rid")
+                .to_string();
             assert_eq!(data["method"], "test", "Frame should contain original data");
 
             // Deliver the response to pending (as the read task would).
@@ -739,9 +793,7 @@ mod tests {
 
         // Call request from Lua (blocks until response).
         let result: mlua::Result<Value> = lua
-            .load(
-                r#"return hub_client.request("hc_conn_0", { method = "test" }, 5000)"#,
-            )
+            .load(r#"return hub_client.request("hc_conn_0", { method = "test" }, 5000)"#)
             .eval();
 
         handle.join().unwrap();
@@ -766,16 +818,17 @@ mod tests {
         // Pre-populate a frame sender so request() can write — but nobody reads,
         // so no response is delivered and recv_timeout() fires.
         let (frame_tx, _frame_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        frames.lock().unwrap().insert("hc_conn_0".to_string(), frame_tx);
+        frames
+            .lock()
+            .unwrap()
+            .insert("hc_conn_0".to_string(), frame_tx);
 
         register(&lua, tx, registry, pending, frames)
             .expect("Should register hub_client primitives");
 
         // Call with a very short timeout — no one will respond.
         let result: mlua::Result<Value> = lua
-            .load(
-                r#"return hub_client.request("hc_conn_0", { method = "test" }, 50)"#,
-            )
+            .load(r#"return hub_client.request("hc_conn_0", { method = "test" }, 50)"#)
             .eval();
 
         assert!(result.is_err(), "Should timeout");

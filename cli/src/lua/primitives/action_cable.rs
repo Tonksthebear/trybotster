@@ -140,7 +140,6 @@ pub enum ActionCableRequest {
     },
 }
 
-
 // =============================================================================
 // Hub-owned state
 // =============================================================================
@@ -189,7 +188,6 @@ impl Drop for LuaAcChannel {
     }
 }
 
-
 /// Poll all Lua ActionCable channels for incoming messages and fire callbacks.
 ///
 /// For each channel, drains `handle.try_recv()`. If the channel's connection
@@ -218,7 +216,9 @@ pub fn poll_lua_action_cable_channels(
     // Phase 1: collect all pending messages with cloned callback keys and channel IDs.
     let mut pending: Vec<(mlua::RegistryKey, serde_json::Value, String)> = Vec::new();
 
-    let registry = callback_registry.lock().expect("ActionCableCallbackRegistry mutex poisoned");
+    let registry = callback_registry
+        .lock()
+        .expect("ActionCableCallbackRegistry mutex poisoned");
 
     for (channel_id, channel) in channels.iter_mut() {
         let Some(callback_key) = registry.get(channel_id) else {
@@ -323,7 +323,9 @@ pub(crate) fn fire_single_ac_message(
             Ok(cb) => match lua.create_registry_value(cb) {
                 Ok(cloned) => cloned,
                 Err(e) => {
-                    log::warn!("[ActionCable-Lua] Failed to clone callback key for {channel_id}: {e}");
+                    log::warn!(
+                        "[ActionCable-Lua] Failed to clone callback key for {channel_id}: {e}"
+                    );
                     return;
                 }
             },
@@ -412,18 +414,13 @@ fn decrypt_signal_envelope(
                 );
                 let mut result = msg.clone();
                 if let Some(obj) = result.as_object_mut() {
-                    obj.insert(
-                        "decrypt_failed".to_string(),
-                        serde_json::Value::Bool(true),
-                    );
+                    obj.insert("decrypt_failed".to_string(), serde_json::Value::Bool(true));
                 }
                 return result;
             }
         },
         Err(e) => {
-            log::error!(
-                "[ActionCable-Lua] CryptoService mutex poisoned: {e}"
-            );
+            log::error!("[ActionCable-Lua] CryptoService mutex poisoned: {e}");
             return msg.clone();
         }
     };
@@ -461,9 +458,7 @@ fn send_ac_event(tx: &HubEventSender, request: ActionCableRequest) {
     if let Some(ref sender) = *guard {
         let _ = sender.send(HubEvent::LuaActionCableRequest(request));
     } else {
-        ::log::warn!(
-            "[ActionCable] request sent before hub_event_tx set — event dropped"
-        );
+        ::log::warn!("[ActionCable] request sent before hub_event_tx set — event dropped");
     }
 }
 
@@ -514,10 +509,13 @@ pub(crate) fn register_action_cable(
                 id
             };
 
-            send_ac_event(&tx, ActionCableRequest::Connect {
-                connection_id: connection_id.clone(),
-                crypto,
-            });
+            send_ac_event(
+                &tx,
+                ActionCableRequest::Connect {
+                    connection_id: connection_id.clone(),
+                    crypto,
+                },
+            );
 
             Ok(connection_id)
         })
@@ -574,12 +572,15 @@ pub(crate) fn register_action_cable(
                 }
 
                 // Send request without callback — only Send-safe data crosses the channel.
-                send_ac_event(&tx, ActionCableRequest::Subscribe {
-                    connection_id: conn_id,
-                    channel_id: channel_id.clone(),
-                    channel_name,
-                    params: params_json,
-                });
+                send_ac_event(
+                    &tx,
+                    ActionCableRequest::Subscribe {
+                        connection_id: conn_id,
+                        channel_id: channel_id.clone(),
+                        channel_name,
+                        params: params_json,
+                    },
+                );
 
                 Ok(channel_id)
             },
@@ -601,11 +602,14 @@ pub(crate) fn register_action_cable(
                     ))
                 })?;
 
-                send_ac_event(&tx, ActionCableRequest::Perform {
-                    channel_id,
-                    action,
-                    data: data_json,
-                });
+                send_ac_event(
+                    &tx,
+                    ActionCableRequest::Perform {
+                        channel_id,
+                        action,
+                        data: data_json,
+                    },
+                );
 
                 Ok(())
             },
@@ -651,8 +655,8 @@ pub(crate) fn register_action_cable(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::new_hub_event_sender;
+    use super::*;
 
     /// Create a test sender with a wired-up channel for event capture.
     fn setup_with_channel() -> (
@@ -691,8 +695,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, mut rx) = setup_with_channel();
         let registry = new_callback_registry();
-        register_action_cable(&lua, tx, registry)
-            .expect("Should register action_cable primitives");
+        register_action_cable(&lua, tx, registry).expect("Should register action_cable primitives");
 
         let conn_id: String = lua
             .load(r#"return action_cable.connect({ crypto = true })"#)
@@ -722,8 +725,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, mut rx) = setup_with_channel();
         let registry = new_callback_registry();
-        register_action_cable(&lua, tx, registry)
-            .expect("Should register action_cable primitives");
+        register_action_cable(&lua, tx, registry).expect("Should register action_cable primitives");
 
         let _: String = lua
             .load(r#"return action_cable.connect()"#)
@@ -785,7 +787,10 @@ mod tests {
 
         // Verify callback was stored in the registry (not in the event)
         let reg = registry.lock().unwrap();
-        assert!(reg.contains_key(&ch_id), "Callback should be stored in registry");
+        assert!(
+            reg.contains_key(&ch_id),
+            "Callback should be stored in registry"
+        );
     }
 
     #[test]
@@ -793,8 +798,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, mut rx) = setup_with_channel();
         let registry = new_callback_registry();
-        register_action_cable(&lua, tx, registry)
-            .expect("Should register action_cable primitives");
+        register_action_cable(&lua, tx, registry).expect("Should register action_cable primitives");
 
         lua.load(r#"action_cable.perform("ac_ch_0", "ack", { sequence = 42 })"#)
             .exec()
@@ -820,8 +824,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, mut rx) = setup_with_channel();
         let registry = new_callback_registry();
-        register_action_cable(&lua, tx, registry)
-            .expect("Should register action_cable primitives");
+        register_action_cable(&lua, tx, registry).expect("Should register action_cable primitives");
 
         lua.load(r#"action_cable.unsubscribe("ac_ch_0")"#)
             .exec()
@@ -839,8 +842,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, mut rx) = setup_with_channel();
         let registry = new_callback_registry();
-        register_action_cable(&lua, tx, registry)
-            .expect("Should register action_cable primitives");
+        register_action_cable(&lua, tx, registry).expect("Should register action_cable primitives");
 
         lua.load(r#"action_cable.close("ac_conn_0")"#)
             .exec()
@@ -858,17 +860,10 @@ mod tests {
         let lua = Lua::new();
         let (tx, _rx) = setup_with_channel();
         let registry = new_callback_registry();
-        register_action_cable(&lua, tx, registry)
-            .expect("Should register action_cable primitives");
+        register_action_cable(&lua, tx, registry).expect("Should register action_cable primitives");
 
-        let id1: String = lua
-            .load(r#"return action_cable.connect()"#)
-            .eval()
-            .unwrap();
-        let id2: String = lua
-            .load(r#"return action_cable.connect()"#)
-            .eval()
-            .unwrap();
+        let id1: String = lua.load(r#"return action_cable.connect()"#).eval().unwrap();
+        let id2: String = lua.load(r#"return action_cable.connect()"#).eval().unwrap();
 
         assert_eq!(id1, "ac_conn_0");
         assert_eq!(id2, "ac_conn_1");
@@ -895,7 +890,8 @@ mod tests {
         let connections: HashMap<String, LuaAcConnection> = HashMap::new();
 
         let registry = new_callback_registry();
-        let count = poll_lua_action_cable_channels(&lua, &mut channels, &connections, &registry, None);
+        let count =
+            poll_lua_action_cable_channels(&lua, &mut channels, &connections, &registry, None);
         assert_eq!(count, 0);
     }
 }

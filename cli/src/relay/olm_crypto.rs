@@ -49,9 +49,9 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use vodozemac::olm::{Account, OlmMessage, Session};
 #[cfg(test)]
 use vodozemac::olm::SessionConfig;
+use vodozemac::olm::{Account, OlmMessage, Session};
 use vodozemac::Curve25519PublicKey;
 
 use super::persistence;
@@ -62,17 +62,17 @@ use super::persistence;
 /// Returns the identity key portion (before first colon), or the
 /// full string if no colon is present.
 pub fn extract_olm_key(browser_identity: &str) -> &str {
-    browser_identity.split(':').next().unwrap_or(browser_identity)
+    browser_identity
+        .split(':')
+        .next()
+        .unwrap_or(browser_identity)
 }
 
 /// Decode base64 that may or may not have padding.
 fn decode_b64(input: &str) -> Result<Vec<u8>> {
     STANDARD_NO_PAD
         .decode(input)
-        .or_else(|_| {
-            base64::engine::general_purpose::STANDARD
-                .decode(input)
-        })
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(input))
         .context("Invalid base64")
 }
 
@@ -198,13 +198,19 @@ impl DeviceKeyBundle {
         use binary_format::*;
 
         let curve25519 = decode_b64(&self.curve25519_key)?;
-        anyhow::ensure!(curve25519.len() == CURVE25519_KEY_SIZE, "curve25519_key wrong size");
+        anyhow::ensure!(
+            curve25519.len() == CURVE25519_KEY_SIZE,
+            "curve25519_key wrong size"
+        );
 
         let ed25519 = decode_b64(&self.ed25519_key)?;
         anyhow::ensure!(ed25519.len() == ED25519_KEY_SIZE, "ed25519_key wrong size");
 
         let one_time = decode_b64(&self.one_time_key)?;
-        anyhow::ensure!(one_time.len() == ONE_TIME_KEY_SIZE, "one_time_key wrong size");
+        anyhow::ensure!(
+            one_time.len() == ONE_TIME_KEY_SIZE,
+            "one_time_key wrong size"
+        );
 
         let signature = decode_b64(&self.signature)?;
         anyhow::ensure!(signature.len() == SIGNATURE_SIZE, "signature wrong size");
@@ -213,12 +219,10 @@ impl DeviceKeyBundle {
         buf[VERSION_OFFSET] = self.version;
         buf[CURVE25519_KEY_OFFSET..CURVE25519_KEY_OFFSET + CURVE25519_KEY_SIZE]
             .copy_from_slice(&curve25519);
-        buf[ED25519_KEY_OFFSET..ED25519_KEY_OFFSET + ED25519_KEY_SIZE]
-            .copy_from_slice(&ed25519);
+        buf[ED25519_KEY_OFFSET..ED25519_KEY_OFFSET + ED25519_KEY_SIZE].copy_from_slice(&ed25519);
         buf[ONE_TIME_KEY_OFFSET..ONE_TIME_KEY_OFFSET + ONE_TIME_KEY_SIZE]
             .copy_from_slice(&one_time);
-        buf[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_SIZE]
-            .copy_from_slice(&signature);
+        buf[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_SIZE].copy_from_slice(&signature);
 
         Ok(buf)
     }
@@ -229,7 +233,12 @@ impl DeviceKeyBundle {
     pub fn from_binary(bytes: &[u8]) -> Result<Self> {
         use binary_format::*;
 
-        anyhow::ensure!(bytes.len() >= BUNDLE_SIZE, "Binary bundle too small: {} < {}", bytes.len(), BUNDLE_SIZE);
+        anyhow::ensure!(
+            bytes.len() >= BUNDLE_SIZE,
+            "Binary bundle too small: {} < {}",
+            bytes.len(),
+            BUNDLE_SIZE
+        );
 
         let version = bytes[VERSION_OFFSET];
 
@@ -239,8 +248,8 @@ impl DeviceKeyBundle {
             .encode(&bytes[ED25519_KEY_OFFSET..ED25519_KEY_OFFSET + ED25519_KEY_SIZE]);
         let one_time_key = STANDARD_NO_PAD
             .encode(&bytes[ONE_TIME_KEY_OFFSET..ONE_TIME_KEY_OFFSET + ONE_TIME_KEY_SIZE]);
-        let signature = STANDARD_NO_PAD
-            .encode(&bytes[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_SIZE]);
+        let signature =
+            STANDARD_NO_PAD.encode(&bytes[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_SIZE]);
 
         Ok(Self {
             version,
@@ -333,9 +342,8 @@ impl VodozemacCrypto {
     fn load(hub_id: &str) -> Result<Self> {
         let state = persistence::load_vodozemac_crypto_store(hub_id)?;
 
-        let pickle: vodozemac::olm::AccountPickle =
-            serde_json::from_str(&state.pickled_account)
-                .context("Failed to deserialize AccountPickle")?;
+        let pickle: vodozemac::olm::AccountPickle = serde_json::from_str(&state.pickled_account)
+            .context("Failed to deserialize AccountPickle")?;
         let account = Account::from(pickle);
         let identity_key = account.curve25519_key().to_base64();
 
@@ -343,8 +351,7 @@ impl VodozemacCrypto {
 
         for (peer_key, pickled) in &state.pickled_sessions {
             let pickle: vodozemac::olm::SessionPickle =
-                serde_json::from_str(pickled)
-                    .context("Failed to deserialize SessionPickle")?;
+                serde_json::from_str(pickled).context("Failed to deserialize SessionPickle")?;
             sessions.insert(peer_key.clone(), Session::from(pickle));
         }
 
@@ -367,10 +374,7 @@ impl VodozemacCrypto {
         // Generate a fresh one-time key
         self.account.generate_one_time_keys(1);
         let otk_map = self.account.one_time_keys();
-        let (_key_id, otk) = otk_map
-            .iter()
-            .next()
-            .context("No one-time key generated")?;
+        let (_key_id, otk) = otk_map.iter().next().context("No one-time key generated")?;
         let one_time_key = otk.to_base64();
         self.account.mark_keys_as_published();
 
@@ -418,10 +422,12 @@ impl VodozemacCrypto {
     /// `peer_key` is the peer's Curve25519 identity key (base64).
     /// Requires an established session with that peer.
     pub fn encrypt(&mut self, plaintext: &[u8], peer_key: &str) -> Result<OlmEnvelope> {
-        let session = self
-            .sessions
-            .get_mut(peer_key)
-            .with_context(|| format!("No Olm session for peer {}...", &peer_key[..peer_key.len().min(16)]))?;
+        let session = self.sessions.get_mut(peer_key).with_context(|| {
+            format!(
+                "No Olm session for peer {}...",
+                &peer_key[..peer_key.len().min(16)]
+            )
+        })?;
 
         let olm_message = session.encrypt(plaintext);
 
@@ -454,8 +460,9 @@ impl VodozemacCrypto {
 
         match envelope.message_type {
             MSG_TYPE_PREKEY => {
-                let prekey_message = vodozemac::olm::PreKeyMessage::try_from(ciphertext_bytes.as_slice())
-                    .map_err(|e| anyhow::anyhow!("Invalid PreKey message: {e}"))?;
+                let prekey_message =
+                    vodozemac::olm::PreKeyMessage::try_from(ciphertext_bytes.as_slice())
+                        .map_err(|e| anyhow::anyhow!("Invalid PreKey message: {e}"))?;
 
                 let sender_key = envelope
                     .sender_key
@@ -540,10 +547,12 @@ impl VodozemacCrypto {
     ///
     /// `peer_key` is the peer's Curve25519 identity key (base64).
     pub fn encrypt_binary(&mut self, plaintext: &[u8], peer_key: &str) -> Result<Vec<u8>> {
-        let session = self
-            .sessions
-            .get_mut(peer_key)
-            .with_context(|| format!("No Olm session for peer {}...", &peer_key[..peer_key.len().min(16)]))?;
+        let session = self.sessions.get_mut(peer_key).with_context(|| {
+            format!(
+                "No Olm session for peer {}...",
+                &peer_key[..peer_key.len().min(16)]
+            )
+        })?;
 
         let olm_message = session.encrypt(plaintext);
 
@@ -582,16 +591,14 @@ impl VodozemacCrypto {
         match msg_type {
             MSG_TYPE_PREKEY => {
                 anyhow::ensure!(data.len() > 33, "PreKey frame too short");
-                let sender_key_bytes: [u8; 32] = data[1..33]
-                    .try_into()
-                    .expect("slice is exactly 32 bytes");
+                let sender_key_bytes: [u8; 32] =
+                    data[1..33].try_into().expect("slice is exactly 32 bytes");
                 let sender_curve25519 = Curve25519PublicKey::from_bytes(sender_key_bytes);
                 let sender_key_b64 = sender_curve25519.to_base64();
                 let ciphertext = &data[33..];
 
-                let prekey_message =
-                    vodozemac::olm::PreKeyMessage::try_from(ciphertext)
-                        .map_err(|e| anyhow::anyhow!("Invalid PreKey message: {e}"))?;
+                let prekey_message = vodozemac::olm::PreKeyMessage::try_from(ciphertext)
+                    .map_err(|e| anyhow::anyhow!("Invalid PreKey message: {e}"))?;
 
                 // Try existing session for this sender first.
                 if let Some(session) = self.sessions.get_mut(&sender_key_b64) {
@@ -624,9 +631,8 @@ impl VodozemacCrypto {
             }
             MSG_TYPE_NORMAL => {
                 let ciphertext = &data[1..];
-                let normal_message =
-                    vodozemac::olm::Message::try_from(ciphertext)
-                        .map_err(|e| anyhow::anyhow!("Invalid Normal message: {e}"))?;
+                let normal_message = vodozemac::olm::Message::try_from(ciphertext)
+                    .map_err(|e| anyhow::anyhow!("Invalid Normal message: {e}"))?;
 
                 // Fast path: direct session lookup when peer key is known.
                 if let Some(key) = peer_key {
@@ -748,9 +754,9 @@ impl VodozemacCrypto {
         let otk = Curve25519PublicKey::from_base64(peer_one_time_key)
             .map_err(|e| anyhow::anyhow!("Invalid peer one-time key: {e}"))?;
 
-        let session = self
-            .account
-            .create_outbound_session(SessionConfig::version_2(), identity, otk);
+        let session =
+            self.account
+                .create_outbound_session(SessionConfig::version_2(), identity, otk);
 
         self.sessions.insert(peer_identity_key.to_string(), session);
         Ok(())
@@ -826,11 +832,7 @@ mod tests {
         let bundle = crypto.build_device_key_bundle().unwrap();
         let bytes = bundle.to_binary().unwrap();
 
-        assert_eq!(
-            bytes.len(),
-            161,
-            "v6 bundle should be exactly 161 bytes"
-        );
+        assert_eq!(bytes.len(), 161, "v6 bundle should be exactly 161 bytes");
     }
 
     #[test]
@@ -895,7 +897,10 @@ mod tests {
 
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(json.contains(r#""t":1"#));
-        assert!(!json.contains(r#""k""#), "sender_key should be skipped when None");
+        assert!(
+            !json.contains(r#""k""#),
+            "sender_key should be skipped when None"
+        );
 
         let restored: OlmEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(envelope.message_type, restored.message_type);
@@ -929,7 +934,10 @@ mod tests {
         let bytes1 = bundle.to_binary().unwrap();
         let bytes2 = bundle.to_binary().unwrap();
 
-        assert_eq!(bytes1, bytes2, "Binary serialization should be deterministic");
+        assert_eq!(
+            bytes1, bytes2,
+            "Binary serialization should be deterministic"
+        );
     }
 
     /// Verify CLI can decrypt multiple PreKey messages from the same outbound
@@ -954,7 +962,10 @@ mod tests {
         for i in 0..5 {
             let msg = format!("browser msg {i}");
             let env = browser.encrypt(msg.as_bytes(), &cli_key).unwrap();
-            assert_eq!(env.message_type, MSG_TYPE_PREKEY, "msg {i} should be PreKey");
+            assert_eq!(
+                env.message_type, MSG_TYPE_PREKEY,
+                "msg {i} should be PreKey"
+            );
             envelopes.push((msg, env));
         }
 
@@ -1088,8 +1099,14 @@ mod tests {
         let reply_desktop = cli.encrypt(b"reply to desktop", &desktop_key).unwrap();
         let reply_phone = cli.encrypt(b"reply to phone", &phone_key).unwrap();
 
-        assert_eq!(desktop.decrypt(&reply_desktop, None).unwrap(), b"reply to desktop");
-        assert_eq!(phone.decrypt(&reply_phone, None).unwrap(), b"reply to phone");
+        assert_eq!(
+            desktop.decrypt(&reply_desktop, None).unwrap(),
+            b"reply to desktop"
+        );
+        assert_eq!(
+            phone.decrypt(&reply_phone, None).unwrap(),
+            b"reply to phone"
+        );
 
         // Continued messages from desktop still work (session not broken by phone).
         let env3 = desktop.encrypt(b"desktop still here", &cli_key).unwrap();
@@ -1195,10 +1212,7 @@ mod tests {
         // (In production, handleCreateSession clears old state and recreates)
         let mut browser2 = VodozemacCrypto::new("test-restart-browser2");
         browser2
-            .create_outbound_session(
-                &refresh_bundle.curve25519_key,
-                &refresh_bundle.one_time_key,
-            )
+            .create_outbound_session(&refresh_bundle.curve25519_key, &refresh_bundle.one_time_key)
             .unwrap();
 
         // Step 4: Browser sends PreKey with new session

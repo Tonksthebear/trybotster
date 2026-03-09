@@ -9,7 +9,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Once;
+use std::sync::{Mutex, MutexGuard, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,20 @@ use std::time::{Duration, Instant};
 /// Sets BOTSTER_ENV=test and BOTSTER_HUB_ID=test-hub once for the process.
 /// This is the single source of truth — individual tests don't need to set these.
 static INIT: Once = Once::new();
+static SERIAL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Serialize PTY integration tests.
+///
+/// These tests spawn real `botster start` processes that bind deterministic
+/// socket paths. Running them in parallel can race on socket ownership and
+/// produce flaky "address already in use" startup failures.
+fn test_lock() -> MutexGuard<'static, ()> {
+    SERIAL_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("PTY integration test lock poisoned")
+}
+
 fn ensure_test_env() {
     INIT.call_once(|| {
         std::env::set_var("BOTSTER_ENV", "test");
@@ -164,6 +178,7 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
 fn test_ctrl_q_exits_cleanly() {
+    let _serial = test_lock();
     ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping: release binary not found");
@@ -172,25 +187,40 @@ fn test_ctrl_q_exits_cleanly() {
 
     let temp_dir = tempfile::TempDir::new().unwrap();
     let pair = open_pty();
-    let mut child = pair.slave.spawn_command(build_start_cmd(&temp_dir)).unwrap();
+    let mut child = pair
+        .slave
+        .spawn_command(build_start_cmd(&temp_dir))
+        .unwrap();
     let mut writer = pair.master.take_writer().unwrap();
     let reader = pair.master.try_clone_reader().unwrap();
     let (_h, output_buf) = spawn_output_capture(reader);
 
     if !wait_for_tui_ready(&output_buf, TUI_READY_TIMEOUT) {
         let _ = child.kill();
-        panic!("TUI did not start within {:?}.\nOutput:\n{}", TUI_READY_TIMEOUT, get_output(&output_buf));
+        panic!(
+            "TUI did not start within {:?}.\nOutput:\n{}",
+            TUI_READY_TIMEOUT,
+            get_output(&output_buf)
+        );
     }
 
     if let Err(e) = safe_pty_write(&mut writer, &mut child, &[0x11]) {
-        panic!("Failed to send Ctrl+Q: {}\nOutput:\n{}", e, get_output(&output_buf));
+        panic!(
+            "Failed to send Ctrl+Q: {}\nOutput:\n{}",
+            e,
+            get_output(&output_buf)
+        );
     }
 
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                assert!(status.success(), "CLI should exit successfully on Ctrl+Q, got: {:?}", status);
+                assert!(
+                    status.success(),
+                    "CLI should exit successfully on Ctrl+Q, got: {:?}",
+                    status
+                );
                 return;
             }
             Ok(None) => {
@@ -207,6 +237,7 @@ fn test_ctrl_q_exits_cleanly() {
 
 #[test]
 fn test_sigint_triggers_graceful_shutdown() {
+    let _serial = test_lock();
     ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping: release binary not found");
@@ -215,17 +246,26 @@ fn test_sigint_triggers_graceful_shutdown() {
 
     let temp_dir = tempfile::TempDir::new().unwrap();
     let pair = open_pty();
-    let mut child = pair.slave.spawn_command(build_start_cmd(&temp_dir)).unwrap();
+    let mut child = pair
+        .slave
+        .spawn_command(build_start_cmd(&temp_dir))
+        .unwrap();
     let reader = pair.master.try_clone_reader().unwrap();
     let (_h, output_buf) = spawn_output_capture(reader);
 
     if !wait_for_tui_ready(&output_buf, TUI_READY_TIMEOUT) {
         let _ = child.kill();
-        panic!("TUI did not start within {:?}.\nOutput:\n{}", TUI_READY_TIMEOUT, get_output(&output_buf));
+        panic!(
+            "TUI did not start within {:?}.\nOutput:\n{}",
+            TUI_READY_TIMEOUT,
+            get_output(&output_buf)
+        );
     }
 
     let pid = child.process_id().expect("Failed to get PID");
-    unsafe { libc::kill(pid as i32, libc::SIGINT); }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGINT);
+    }
 
     let start = Instant::now();
     loop {
@@ -245,6 +285,7 @@ fn test_sigint_triggers_graceful_shutdown() {
 
 #[test]
 fn test_sigterm_triggers_graceful_shutdown() {
+    let _serial = test_lock();
     ensure_test_env();
     if !binary_exists() {
         eprintln!("Skipping: release binary not found");
@@ -253,17 +294,26 @@ fn test_sigterm_triggers_graceful_shutdown() {
 
     let temp_dir = tempfile::TempDir::new().unwrap();
     let pair = open_pty();
-    let mut child = pair.slave.spawn_command(build_start_cmd(&temp_dir)).unwrap();
+    let mut child = pair
+        .slave
+        .spawn_command(build_start_cmd(&temp_dir))
+        .unwrap();
     let reader = pair.master.try_clone_reader().unwrap();
     let (_h, output_buf) = spawn_output_capture(reader);
 
     if !wait_for_tui_ready(&output_buf, TUI_READY_TIMEOUT) {
         let _ = child.kill();
-        panic!("TUI did not start within {:?}.\nOutput:\n{}", TUI_READY_TIMEOUT, get_output(&output_buf));
+        panic!(
+            "TUI did not start within {:?}.\nOutput:\n{}",
+            TUI_READY_TIMEOUT,
+            get_output(&output_buf)
+        );
     }
 
     let pid = child.process_id().expect("Failed to get PID");
-    unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
 
     let start = Instant::now();
     loop {
@@ -283,6 +333,7 @@ fn test_sigterm_triggers_graceful_shutdown() {
 
 #[test]
 fn test_pty_close_triggers_cleanup() {
+    let _serial = test_lock();
     // When the PTY is closed (simulating terminal window close),
     // the CLI should receive SIGHUP and exit cleanly.
     ensure_test_env();
@@ -293,7 +344,10 @@ fn test_pty_close_triggers_cleanup() {
 
     let temp_dir = tempfile::TempDir::new().unwrap();
     let pair = open_pty();
-    let mut child = pair.slave.spawn_command(build_start_cmd(&temp_dir)).unwrap();
+    let mut child = pair
+        .slave
+        .spawn_command(build_start_cmd(&temp_dir))
+        .unwrap();
 
     // Don't capture output — cloned readers keep FDs open and interfere with PTY closure.
     // Use a generous sleep since we can't detect TUI readiness without a reader.
@@ -313,7 +367,10 @@ fn test_pty_close_triggers_cleanup() {
             Ok(None) => {
                 if start.elapsed() > EXIT_TIMEOUT {
                     let _ = child.kill();
-                    panic!("CLI did not exit within {:?} after PTY close (SIGHUP)", EXIT_TIMEOUT);
+                    panic!(
+                        "CLI did not exit within {:?} after PTY close (SIGHUP)",
+                        EXIT_TIMEOUT
+                    );
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -324,6 +381,7 @@ fn test_pty_close_triggers_cleanup() {
 
 #[test]
 fn test_input_is_responsive() {
+    let _serial = test_lock();
     // Verifies that input is processed promptly once the TUI is ready.
     ensure_test_env();
     if !binary_exists() {
@@ -333,20 +391,31 @@ fn test_input_is_responsive() {
 
     let temp_dir = tempfile::TempDir::new().unwrap();
     let pair = open_pty();
-    let mut child = pair.slave.spawn_command(build_start_cmd(&temp_dir)).unwrap();
+    let mut child = pair
+        .slave
+        .spawn_command(build_start_cmd(&temp_dir))
+        .unwrap();
     let mut writer = pair.master.take_writer().unwrap();
     let reader = pair.master.try_clone_reader().unwrap();
     let (_h, output_buf) = spawn_output_capture(reader);
 
     if !wait_for_tui_ready(&output_buf, TUI_READY_TIMEOUT) {
         let _ = child.kill();
-        panic!("TUI did not start within {:?}.\nOutput:\n{}", TUI_READY_TIMEOUT, get_output(&output_buf));
+        panic!(
+            "TUI did not start within {:?}.\nOutput:\n{}",
+            TUI_READY_TIMEOUT,
+            get_output(&output_buf)
+        );
     }
 
     let input_start = Instant::now();
 
     if let Err(e) = safe_pty_write(&mut writer, &mut child, &[0x11]) {
-        panic!("Failed to send Ctrl+Q: {}\nOutput:\n{}", e, get_output(&output_buf));
+        panic!(
+            "Failed to send Ctrl+Q: {}\nOutput:\n{}",
+            e,
+            get_output(&output_buf)
+        );
     }
 
     // Once TUI is in raw mode, response should be fast
@@ -375,6 +444,7 @@ fn test_input_is_responsive() {
 
 #[test]
 fn test_no_orphan_processes_after_exit() {
+    let _serial = test_lock();
     // After the CLI exits, the specific child process should be gone.
     ensure_test_env();
     if !binary_exists() {
@@ -384,7 +454,10 @@ fn test_no_orphan_processes_after_exit() {
 
     let temp_dir = tempfile::TempDir::new().unwrap();
     let pair = open_pty();
-    let mut child = pair.slave.spawn_command(build_start_cmd(&temp_dir)).unwrap();
+    let mut child = pair
+        .slave
+        .spawn_command(build_start_cmd(&temp_dir))
+        .unwrap();
     let mut writer = pair.master.take_writer().unwrap();
     let reader = pair.master.try_clone_reader().unwrap();
     let (_h, output_buf) = spawn_output_capture(reader);
@@ -394,12 +467,20 @@ fn test_no_orphan_processes_after_exit() {
 
     if !wait_for_tui_ready(&output_buf, TUI_READY_TIMEOUT) {
         let _ = child.kill();
-        panic!("TUI did not start within {:?}.\nOutput:\n{}", TUI_READY_TIMEOUT, get_output(&output_buf));
+        panic!(
+            "TUI did not start within {:?}.\nOutput:\n{}",
+            TUI_READY_TIMEOUT,
+            get_output(&output_buf)
+        );
     }
 
     // Exit cleanly with Ctrl+Q
     if let Err(e) = safe_pty_write(&mut writer, &mut child, &[0x11]) {
-        panic!("Failed to send Ctrl+Q: {}\nOutput:\n{}", e, get_output(&output_buf));
+        panic!(
+            "Failed to send Ctrl+Q: {}\nOutput:\n{}",
+            e,
+            get_output(&output_buf)
+        );
     }
 
     // Wait for exit

@@ -730,9 +730,7 @@ mod tests {
             .expect("set global");
 
         let result: LuaResult<String> = lua
-            .load(
-                r#"return watch.directory(watch_dir, { pattern = "[invalid" }, function() end)"#,
-            )
+            .load(r#"return watch.directory(watch_dir, { pattern = "[invalid" }, function() end)"#)
             .eval();
 
         assert!(result.is_err());
@@ -943,7 +941,10 @@ mod tests {
         // If OS delivered the event, the callback should have run and unwatched
         if called {
             let entries = registry.lock().expect("mutex");
-            assert!(entries.is_empty(), "Watch should have been removed by callback");
+            assert!(
+                entries.is_empty(),
+                "Watch should have been removed by callback"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&dir);

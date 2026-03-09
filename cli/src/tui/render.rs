@@ -35,8 +35,7 @@ use ratatui::{
 use crate::app::buffer_to_ansi;
 
 use super::render_tree::{
-    InputProps, ListProps, ParagraphAlignment, ParagraphProps, SpanStyle,
-    StyledContent,
+    InputProps, ListProps, ParagraphAlignment, ParagraphProps, SpanStyle, StyledContent,
 };
 use super::widget_state::WidgetStateStore;
 use crate::compat::{BrowserDimensions, VpnStatus};
@@ -134,7 +133,7 @@ where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     // Helper to render UI to a frame
-    let render_ui = |f: &mut Frame| { render_frame(f, ctx) };
+    let render_ui = |f: &mut Frame| render_frame(f, ctx);
 
     // Always render to real terminal for local display
     terminal.draw(render_ui)?;
@@ -243,10 +242,8 @@ pub(super) fn render_terminal_panel(
         if is_scrolled && scrollback_depth > 0 {
             let content_length = scrollback_depth + inner.height as usize;
             // scroll_offset=max means top of history; position=0 means scrollbar at top
-            let position =
-                content_length.saturating_sub(scroll_offset + inner.height as usize);
-            let mut scrollbar_state =
-                ScrollbarState::new(content_length).position(position);
+            let position = content_length.saturating_sub(scroll_offset + inner.height as usize);
+            let mut scrollbar_state = ScrollbarState::new(content_length).position(position);
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
             scrollbar.render(inner, f.buffer_mut(), &mut scrollbar_state);
         }
@@ -468,13 +465,19 @@ pub(super) fn render_connection_code_widget(
     // Custom lines format: [header, used_header, footer]
     let (header, footer) = if let Some(lines) = custom_lines {
         let h = if ctx.bundle_used {
-            lines.get(1).map(StyledContent::to_line)
+            lines
+                .get(1)
+                .map(StyledContent::to_line)
                 .unwrap_or_else(|| Line::from("Link used - [r] to pair new device"))
         } else {
-            lines.first().map(StyledContent::to_line)
+            lines
+                .first()
+                .map(StyledContent::to_line)
                 .unwrap_or_else(|| Line::from("Scan QR to connect securely"))
         };
-        let f = lines.last().map(StyledContent::to_line)
+        let f = lines
+            .last()
+            .map(StyledContent::to_line)
             .unwrap_or_else(|| Line::from("[r] new link  [c] copy  [Esc] close"));
         (h, f)
     } else {
