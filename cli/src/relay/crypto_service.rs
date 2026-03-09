@@ -42,8 +42,16 @@ mod tests {
         let cs = create_crypto_service("test-crypto-clone");
         let cs2 = Arc::clone(&cs);
 
-        let id1 = cs.lock().expect("mutex poisoned").identity_key().to_string();
-        let id2 = cs2.lock().expect("mutex poisoned").identity_key().to_string();
+        let id1 = cs
+            .lock()
+            .expect("mutex poisoned")
+            .identity_key()
+            .to_string();
+        let id2 = cs2
+            .lock()
+            .expect("mutex poisoned")
+            .identity_key()
+            .to_string();
         assert_eq!(id1, id2);
     }
 

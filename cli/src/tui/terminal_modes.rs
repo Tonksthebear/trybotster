@@ -80,21 +80,13 @@ impl TerminalModes {
 
         if app_cursor != self.outer_app_cursor {
             self.outer_app_cursor = app_cursor;
-            let seq: &[u8] = if app_cursor {
-                b"\x1b[?1h"
-            } else {
-                b"\x1b[?1l"
-            };
+            let seq: &[u8] = if app_cursor { b"\x1b[?1h" } else { b"\x1b[?1l" };
             let _ = std::io::Write::write_all(&mut std::io::stdout(), seq);
         }
 
         if bp != self.outer_bracketed_paste {
             self.outer_bracketed_paste = bp;
-            let seq: &[u8] = if bp {
-                b"\x1b[?2004h"
-            } else {
-                b"\x1b[?2004l"
-            };
+            let seq: &[u8] = if bp { b"\x1b[?2004h" } else { b"\x1b[?2004l" };
             let _ = std::io::Write::write_all(&mut std::io::stdout(), seq);
         }
 
@@ -183,7 +175,6 @@ impl TerminalModes {
     pub fn inner_kitty_enabled(&self) -> bool {
         self.inner_kitty_enabled
     }
-
 }
 
 /// Map a [`CursorStyle`] to the corresponding DECSCUSR escape sequence bytes.

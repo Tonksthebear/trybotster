@@ -3,14 +3,14 @@
 //! Each accepted socket connection gets a `SocketClientConn` that manages
 //! the read/write tasks and translates between frames and `HubEvent`s.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::hub::events::HubEvent;
 use super::framing::{Frame, FrameDecoder};
+use crate::hub::events::HubEvent;
 
 /// Hub-side connection state for a single socket client.
 ///
@@ -65,11 +65,7 @@ impl SocketClientConn {
         ));
 
         let write_client_id = client_id.clone();
-        let write_handle = tokio::spawn(Self::write_loop(
-            write_client_id,
-            write_half,
-            frame_rx,
-        ));
+        let write_handle = tokio::spawn(Self::write_loop(write_client_id, write_half, frame_rx));
 
         Self {
             client_id,
@@ -202,13 +198,11 @@ impl SocketClientConn {
                 client_id: client_id.to_string(),
                 msg,
             },
-            Frame::PtyInput { session_uuid, data } => {
-                HubEvent::SocketPtyInput {
-                    client_id: client_id.to_string(),
-                    session_uuid,
-                    data,
-                }
-            }
+            Frame::PtyInput { session_uuid, data } => HubEvent::SocketPtyInput {
+                client_id: client_id.to_string(),
+                session_uuid,
+                data,
+            },
             // Clients shouldn't send these frame types — ignore them
             Frame::PtyOutput { .. }
             | Frame::Scrollback { .. }

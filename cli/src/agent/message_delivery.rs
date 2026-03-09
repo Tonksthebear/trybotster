@@ -113,7 +113,6 @@ impl MessageDeliveryState {
         let q = self.queue.lock().expect("delivery queue lock poisoned");
         !q.is_empty()
     }
-
 }
 
 /// Check if a human was recently active on this PTY.
@@ -186,7 +185,15 @@ pub(crate) fn spawn_delivery_task(
                 }
 
                 // Attempt probe-based delivery.
-                match attempt_delivery(&delivery, &shared_state, &event_tx, &human_input_ts, &kitty_enabled).await {
+                match attempt_delivery(
+                    &delivery,
+                    &shared_state,
+                    &event_tx,
+                    &human_input_ts,
+                    &kitty_enabled,
+                )
+                .await
+                {
                     DeliveryResult::Delivered(msg) => {
                         log::info!("[MessageDelivery] Message delivered ({} bytes)", msg.len());
                         // Notify via hub event if available.
@@ -314,7 +321,11 @@ async fn attempt_delivery(
                 // Each phase is a separate write with a small delay so the
                 // app processes each action before receiving the next.
                 let kitty = kitty_enabled.load(Ordering::Relaxed);
-                let bs: &[u8] = if kitty { BACKSPACE_KITTY } else { BACKSPACE_LEGACY };
+                let bs: &[u8] = if kitty {
+                    BACKSPACE_KITTY
+                } else {
+                    BACKSPACE_LEGACY
+                };
 
                 // Phase 1: Erase probe characters one at a time.
                 // Claude Code processes one key event per frame, so each
@@ -345,7 +356,8 @@ async fn attempt_delivery(
 
                 log::info!(
                     "[MessageDelivery] Delivered {} bytes (kitty={}) in 3 phases",
-                    msg.len(), kitty
+                    msg.len(),
+                    kitty
                 );
                 return DeliveryResult::Delivered(msg);
             }
@@ -375,10 +387,10 @@ async fn attempt_delivery(
 
                 // Drain any output events that arrived during the backoff,
                 // then wait for the next one (or the periodic 5 s timer).
-                while let Ok(Ok(_)) = tokio::time::timeout(
-                    Duration::from_millis(0),
-                    rx.recv(),
-                ).await {}
+                while let Ok(Ok(_)) =
+                    tokio::time::timeout(Duration::from_millis(0), rx.recv()).await
+                {
+                }
 
                 // Wait for next PTY output event or a new wake signal.
                 tokio::select! {

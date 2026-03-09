@@ -98,9 +98,9 @@ pub fn register(lua: &Lua) -> Result<()> {
     // to a compact JSON string.
     let encode_fn = lua
         .create_function(|lua, value: Value| {
-            let json_value: serde_json::Value = lua.from_value(value).map_err(|e| {
-                mlua::Error::external(format!("Failed to convert Lua value: {e}"))
-            })?;
+            let json_value: serde_json::Value = lua
+                .from_value(value)
+                .map_err(|e| mlua::Error::external(format!("Failed to convert Lua value: {e}")))?;
 
             match serde_json::to_string(&json_value) {
                 Ok(s) => Ok((Some(s), None::<String>)),
@@ -118,8 +118,8 @@ pub fn register(lua: &Lua) -> Result<()> {
     // Deserializes a JSON string into a Lua value (table, string,
     // number, boolean, or nil).
     let decode_fn = lua
-        .create_function(|lua, s: String| {
-            match serde_json::from_str::<serde_json::Value>(&s) {
+        .create_function(
+            |lua, s: String| match serde_json::from_str::<serde_json::Value>(&s) {
                 Ok(json_value) => {
                     let lua_value = json_to_lua(lua, &json_value).map_err(|e| {
                         mlua::Error::external(format!("Failed to convert to Lua value: {e}"))
@@ -127,8 +127,8 @@ pub fn register(lua: &Lua) -> Result<()> {
                     Ok((Some(lua_value), None::<String>))
                 }
                 Err(e) => Ok((None::<Value>, Some(format!("Failed to decode JSON: {e}")))),
-            }
-        })
+            },
+        )
         .map_err(|e| anyhow!("Failed to create json.decode function: {e}"))?;
 
     json_table
@@ -140,16 +140,13 @@ pub fn register(lua: &Lua) -> Result<()> {
     // Same as encode but produces indented, human-readable JSON output.
     let encode_pretty_fn = lua
         .create_function(|lua, value: Value| {
-            let json_value: serde_json::Value = lua.from_value(value).map_err(|e| {
-                mlua::Error::external(format!("Failed to convert Lua value: {e}"))
-            })?;
+            let json_value: serde_json::Value = lua
+                .from_value(value)
+                .map_err(|e| mlua::Error::external(format!("Failed to convert Lua value: {e}")))?;
 
             match serde_json::to_string_pretty(&json_value) {
                 Ok(s) => Ok((Some(s), None::<String>)),
-                Err(e) => Ok((
-                    None::<String>,
-                    Some(format!("Failed to encode JSON: {e}")),
-                )),
+                Err(e) => Ok((None::<String>, Some(format!("Failed to encode JSON: {e}")))),
             }
         })
         .map_err(|e| anyhow!("Failed to create json.encode_pretty function: {e}"))?;

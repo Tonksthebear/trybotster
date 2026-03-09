@@ -194,11 +194,8 @@ impl ReliableMessage {
                 if bytes.len() < 9 {
                     anyhow::bail!("Data message too short: {} bytes", bytes.len());
                 }
-                let seq = u64::from_le_bytes(
-                    bytes[1..9]
-                        .try_into()
-                        .context("Failed to read seq bytes")?,
-                );
+                let seq =
+                    u64::from_le_bytes(bytes[1..9].try_into().context("Failed to read seq bytes")?);
                 let payload = bytes[9..].to_vec();
                 Ok(Self::Data { seq, payload })
             }

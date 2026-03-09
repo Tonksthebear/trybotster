@@ -274,28 +274,24 @@ async fn run_connection_loop(
         log::info!("[ActionCable] Connecting to {}", ws_url);
 
         let bearer = format!("Bearer {}", config.api_key);
-        let (mut writer, mut reader) = match crate::ws::connect(
-            &ws_url,
-            &[("Authorization", &bearer)],
-        )
-        .await
-        {
-            Ok(pair) => {
-                log::info!("[ActionCable] WebSocket connected");
-                backoff_secs = INITIAL_BACKOFF_SECS;
-                pair
-            }
-            Err(e) => {
-                log::warn!(
-                    "[ActionCable] Connection failed: {} (retry in {}s)",
-                    e,
-                    backoff_secs
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-                continue;
-            }
-        };
+        let (mut writer, mut reader) =
+            match crate::ws::connect(&ws_url, &[("Authorization", &bearer)]).await {
+                Ok(pair) => {
+                    log::info!("[ActionCable] WebSocket connected");
+                    backoff_secs = INITIAL_BACKOFF_SECS;
+                    pair
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[ActionCable] Connection failed: {} (retry in {}s)",
+                        e,
+                        backoff_secs
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                    continue;
+                }
+            };
 
         // Wait for ActionCable welcome message
         if !wait_for_welcome(&mut writer, &mut reader).await {
@@ -571,7 +567,10 @@ async fn handle_text_message(
     pending_confirm: &mut HashMap<String, tokio::time::Instant>,
 ) -> TextMessageResult {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
-        log::warn!("[ActionCable] Failed to parse message as JSON: {}", &text[..text.len().min(100)]);
+        log::warn!(
+            "[ActionCable] Failed to parse message as JSON: {}",
+            &text[..text.len().min(100)]
+        );
         return TextMessageResult::Continue;
     };
 
@@ -629,17 +628,12 @@ async fn handle_text_message(
             ) {
                 if let Some(tx) = subscriptions.get(identifier) {
                     if tx.send(message.clone()).await.is_err() {
-                        log::warn!(
-                            "[ActionCable] Channel receiver dropped, removing subscription"
-                        );
+                        log::warn!("[ActionCable] Channel receiver dropped, removing subscription");
                         subscriptions.remove(identifier);
                         confirmed.remove(identifier);
                     }
                 } else {
-                    log::trace!(
-                        "[ActionCable] Message for unknown channel: {}",
-                        identifier
-                    );
+                    log::trace!("[ActionCable] Message for unknown channel: {}", identifier);
                 }
             }
             TextMessageResult::Continue
@@ -650,7 +644,6 @@ async fn handle_text_message(
         }
     }
 }
-
 
 /// Send an ActionCable perform command over the WebSocket.
 async fn send_perform(

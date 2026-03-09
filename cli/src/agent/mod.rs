@@ -30,10 +30,7 @@ pub use notification::{detect_notifications, AgentNotification, AgentStatus};
 pub use pty::PtySession;
 
 use anyhow::Result;
-use std::{
-    path::PathBuf,
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 
 /// An agent running in a git worktree.
 ///
@@ -94,12 +91,7 @@ impl Agent {
     /// Uses default PTY dimensions (24x80). For production use, prefer
     /// `new_with_dims()` which accepts actual terminal dimensions.
     #[must_use]
-    pub fn new(
-        id: uuid::Uuid,
-        repo: String,
-        branch_name: String,
-        worktree_path: PathBuf,
-    ) -> Self {
+    pub fn new(id: uuid::Uuid, repo: String, branch_name: String, worktree_path: PathBuf) -> Self {
         Self::new_with_dims(
             id,
             repo,
@@ -145,6 +137,7 @@ impl Agent {
 
     /// Get a PtyHandle for this agent's PTY.
     #[must_use]
+    #[cfg(test)]
     pub fn get_pty_handle(&self) -> crate::hub::agent_handle::PtyHandle {
         let (shared_state, shadow_screen, event_tx, kitty, resize) = self.pty.get_direct_access();
         crate::hub::agent_handle::PtyHandle::new(
@@ -218,7 +211,6 @@ impl Agent {
         let (rows, cols) = self.pty.dimensions();
         ScreenInfo { rows, cols }
     }
-
 }
 
 impl Drop for Agent {

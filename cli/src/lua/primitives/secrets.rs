@@ -122,7 +122,9 @@ fn get_or_create_master_key() -> Result<[u8; 32]> {
 
     // Check cache
     {
-        let cache = master_key_cache().read().expect("secrets key cache poisoned");
+        let cache = master_key_cache()
+            .read()
+            .expect("secrets key cache poisoned");
         if let Some(key) = *cache {
             return Ok(key);
         }
@@ -151,7 +153,9 @@ fn get_or_create_master_key() -> Result<[u8; 32]> {
 
     // Cache
     {
-        let mut cache = master_key_cache().write().expect("secrets key cache poisoned");
+        let mut cache = master_key_cache()
+            .write()
+            .expect("secrets key cache poisoned");
         *cache = Some(key);
     }
 
@@ -428,8 +432,14 @@ mod tests {
         write_secret("ns-a", "token", "secret_a").unwrap();
         write_secret("ns-b", "token", "secret_b").unwrap();
 
-        assert_eq!(read_secret("ns-a", "token").unwrap(), Some("secret_a".to_string()));
-        assert_eq!(read_secret("ns-b", "token").unwrap(), Some("secret_b".to_string()));
+        assert_eq!(
+            read_secret("ns-a", "token").unwrap(),
+            Some("secret_a".to_string())
+        );
+        assert_eq!(
+            read_secret("ns-b", "token").unwrap(),
+            Some("secret_b".to_string())
+        );
 
         // Cleanup
         delete_secret("ns-a", "token").unwrap();

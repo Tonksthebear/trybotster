@@ -35,8 +35,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
 
-use super::HubEventSender;
 use super::pty::{CreateSocketForwarderRequest, PtyForwarder, PtyRequest};
+use super::HubEventSender;
 use crate::hub::events::HubEvent;
 
 /// Request to send a message to a socket client.
@@ -150,7 +150,9 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
                     data: bytes,
                 }));
             } else {
-                ::log::warn!("[Socket] send_binary() called before hub_event_tx set — event dropped");
+                ::log::warn!(
+                    "[Socket] send_binary() called before hub_event_tx set — event dropped"
+                );
             }
             Ok(())
         })
@@ -159,7 +161,7 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
         .set("send_binary", send_binary_fn)
         .map_err(|e| anyhow!("Failed to set socket.send_binary: {e}"))?;
 
-    // socket.create_pty_forwarder({ client_id, session_uuid, subscription_id })
+    // socket.create_pty_forwarder({ client_id, session_uuid, subscription_id, rows?, cols? })
     //
     // Creates a PTY forwarder that streams output as Frame::PtyOutput to a socket client.
     let tx_fwd = hub_event_tx_for_pty.clone();
@@ -174,20 +176,24 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
             let subscription_id: String = opts
                 .get("subscription_id")
                 .map_err(|_| LuaError::runtime("subscription_id is required"))?;
+            let rows: u16 = opts.get("rows").unwrap_or(24);
+            let cols: u16 = opts.get("cols").unwrap_or(80);
 
             let forwarder_id = format!("{}:{}", client_id, session_uuid);
             let active_flag = Arc::new(Mutex::new(true));
 
             let guard = tx_fwd.lock().expect("HubEventSender mutex poisoned");
             if let Some(ref sender) = *guard {
-                let _ = sender.send(HubEvent::LuaPtyRequest(
-                    PtyRequest::CreateSocketForwarder(CreateSocketForwarderRequest {
+                let _ = sender.send(HubEvent::LuaPtyRequest(PtyRequest::CreateSocketForwarder(
+                    CreateSocketForwarderRequest {
                         client_id: client_id.clone(),
                         session_uuid: session_uuid.clone(),
                         subscription_id,
+                        rows,
+                        cols,
                         active_flag: Arc::clone(&active_flag),
-                    }),
-                ));
+                    },
+                )));
             }
 
             Ok(PtyForwarder {
@@ -212,8 +218,8 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::new_hub_event_sender;
+    use super::*;
 
     fn setup() -> (Lua, HubEventSender) {
         let lua = Lua::new();
@@ -236,23 +242,34 @@ mod tests {
         let (lua, _tx) = setup();
 
         let globals = lua.globals();
-        let socket_table: mlua::Table =
-            globals.get("socket").expect("socket table should exist");
+        let socket_table: mlua::Table = globals.get("socket").expect("socket table should exist");
 
-        let _: mlua::Function = socket_table.get("on_client_connected").expect("on_client_connected should exist");
-        let _: mlua::Function = socket_table.get("on_client_disconnected").expect("on_client_disconnected should exist");
-        let _: mlua::Function = socket_table.get("on_message").expect("on_message should exist");
+        let _: mlua::Function = socket_table
+            .get("on_client_connected")
+            .expect("on_client_connected should exist");
+        let _: mlua::Function = socket_table
+            .get("on_client_disconnected")
+            .expect("on_client_disconnected should exist");
+        let _: mlua::Function = socket_table
+            .get("on_message")
+            .expect("on_message should exist");
         let _: mlua::Function = socket_table.get("send").expect("send should exist");
-        let _: mlua::Function = socket_table.get("send_binary").expect("send_binary should exist");
+        let _: mlua::Function = socket_table
+            .get("send_binary")
+            .expect("send_binary should exist");
     }
 
     #[test]
     fn test_send_delivers_json_event() {
         let (lua, mut rx) = setup_with_channel();
 
-        lua.load(r#"
+        lua.load(
+            r#"
             socket.send("socket:abc123", { type = "agent_list", count = 3 })
-        "#).exec().expect("Should send message");
+        "#,
+        )
+        .exec()
+        .expect("Should send message");
 
         let event = rx.try_recv().expect("Should have received event");
         match event {
@@ -269,9 +286,13 @@ mod tests {
     fn test_send_binary_delivers_binary_event() {
         let (lua, mut rx) = setup_with_channel();
 
-        lua.load(r#"
+        lua.load(
+            r#"
             socket.send_binary("socket:abc123", "hello bytes")
-        "#).exec().expect("Should send binary");
+        "#,
+        )
+        .exec()
+        .expect("Should send binary");
 
         let event = rx.try_recv().expect("Should have received event");
         match event {

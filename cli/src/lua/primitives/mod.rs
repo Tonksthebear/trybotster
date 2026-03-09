@@ -41,8 +41,8 @@ pub mod hub_client;
 pub mod hub_discovery;
 pub mod json;
 pub mod log;
-pub mod push;
 pub mod pty;
+pub mod push;
 pub mod secrets;
 pub mod socket;
 pub mod timer;
@@ -77,34 +77,31 @@ pub(crate) fn new_hub_event_sender() -> HubEventSender {
     Arc::new(Mutex::new(None))
 }
 
-pub use events::{
-    new_event_callbacks, EventCallbackId, EventCallbacks, SharedEventCallbacks,
+pub use action_cable::{
+    new_callback_registry as new_ac_callback_registry, ActionCableCallbackRegistry,
+    ActionCableRequest, LuaAcChannel, LuaAcConnection,
 };
 pub use connection::ConnectionRequest;
+pub use events::{new_event_callbacks, EventCallbackId, EventCallbacks, SharedEventCallbacks};
+pub use http::{new_http_registry, HttpAsyncRegistry};
 pub use hub::{HubRequest, SharedServerId};
+pub use hub_client::{
+    new_hub_client_callback_registry, new_hub_client_frame_senders,
+    new_hub_client_pending_requests, HubClientCallbackRegistry, HubClientFrameSenders,
+    HubClientPendingRequests, HubClientRequest, LuaHubClientConn,
+};
 pub use pty::{
-    CreateForwarderRequest, CreateSocketForwarderRequest, CreateTuiForwarderRequest,
-    PtyForwarder, PtyOutputContext, PtyRequest, PtySessionHandle,
+    CreateForwarderRequest, CreateSocketForwarderRequest, CreateTuiForwarderRequest, PtyForwarder,
+    PtyOutputContext, PtyRequest, PtySessionHandle,
 };
 pub use socket::SocketSendRequest;
-pub use tui::TuiSendRequest;
-pub use webrtc::WebRtcSendRequest;
-pub use http::{new_http_registry, HttpAsyncRegistry};
 pub use timer::{new_timer_registry, TimerRegistry};
+pub use tui::TuiSendRequest;
 pub use watch::{new_watcher_registry, WatcherRegistry};
-pub use action_cable::{
-    ActionCableCallbackRegistry, ActionCableRequest, LuaAcChannel, LuaAcConnection,
-    new_callback_registry as new_ac_callback_registry,
-};
+pub use webrtc::WebRtcSendRequest;
 pub use websocket::{new_websocket_registry, WebSocketRegistry};
-pub use hub_client::{
-    HubClientCallbackRegistry, HubClientFrameSenders, HubClientPendingRequests,
-    HubClientRequest, LuaHubClientConn,
-    new_hub_client_callback_registry, new_hub_client_frame_senders, new_hub_client_pending_requests,
-};
 pub use worktree::{
-    WorktreeCreateResult, WorktreeRequest, WorktreeResultReceiver,
-    WorktreeResultSender,
+    WorktreeCreateResult, WorktreeRequest, WorktreeResultReceiver, WorktreeResultSender,
 };
 
 /// Register all primitive functions with the Lua state.
@@ -230,7 +227,15 @@ pub(crate) fn register_hub(
     shared_state: Arc<std::sync::RwLock<crate::hub::state::HubState>>,
     broker_connection: crate::broker::SharedBrokerConnection,
 ) -> Result<()> {
-    hub::register(lua, hub_event_tx, handle_cache, hub_identifier, server_id, shared_state, broker_connection)?;
+    hub::register(
+        lua,
+        hub_event_tx,
+        handle_cache,
+        hub_identifier,
+        server_id,
+        shared_state,
+        broker_connection,
+    )?;
     Ok(())
 }
 
@@ -419,6 +424,12 @@ pub(crate) fn register_hub_client(
     pending_requests: HubClientPendingRequests,
     frame_senders: HubClientFrameSenders,
 ) -> Result<()> {
-    hub_client::register(lua, hub_event_tx, callback_registry, pending_requests, frame_senders)?;
+    hub_client::register(
+        lua,
+        hub_event_tx,
+        callback_registry,
+        pending_requests,
+        frame_senders,
+    )?;
     Ok(())
 }

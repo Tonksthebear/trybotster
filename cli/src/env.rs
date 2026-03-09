@@ -214,4 +214,101 @@ mod tests {
         assert!(!Environment::Production.is_any_test());
         assert!(!Environment::Development.is_any_test());
     }
+
+    // ── session_manifest_path fault injection ─────────────────────────────
+
+    /// Serialize env-mutating tests to prevent BOTSTER_CONFIG_DIR races.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// session_manifest_path returns None when the workspaces dir doesn't exist.
+    #[test]
+    fn session_manifest_path_missing_workspaces_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("BOTSTER_CONFIG_DIR", dir.path());
+        let result = session_manifest_path("sess-nonexistent");
+        assert!(result.is_none(), "missing workspaces dir must return None");
+        std::env::remove_var("BOTSTER_CONFIG_DIR");
+    }
+
+    /// session_manifest_path returns None when workspaces exist but session UUID
+    /// doesn't match any.
+    #[test]
+    fn session_manifest_path_no_matching_uuid() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws_dir = dir
+            .path()
+            .join("workspaces")
+            .join("ws-1")
+            .join("sessions")
+            .join("other-uuid");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(ws_dir.join("manifest.json"), "{}").unwrap();
+
+        std::env::set_var("BOTSTER_CONFIG_DIR", dir.path());
+        let result = session_manifest_path("sess-not-here");
+        assert!(result.is_none(), "non-matching UUID must return None");
+        std::env::remove_var("BOTSTER_CONFIG_DIR");
+    }
+
+    /// session_manifest_path finds the correct manifest across multiple workspaces.
+    #[test]
+    fn session_manifest_path_finds_across_workspaces() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = "sess-target-uuid";
+
+        let decoy = dir
+            .path()
+            .join("workspaces")
+            .join("ws-1")
+            .join("sessions")
+            .join("other");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::fs::write(decoy.join("manifest.json"), "{}").unwrap();
+
+        let target = dir
+            .path()
+            .join("workspaces")
+            .join("ws-2")
+            .join("sessions")
+            .join(uuid);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            target.join("manifest.json"),
+            r#"{"uuid":"sess-target-uuid"}"#,
+        )
+        .unwrap();
+
+        std::env::set_var("BOTSTER_CONFIG_DIR", dir.path());
+        let result = session_manifest_path(uuid);
+        assert!(result.is_some(), "should find manifest in ws-2");
+        assert!(
+            result.unwrap().to_string_lossy().contains("ws-2"),
+            "should resolve to ws-2"
+        );
+        std::env::remove_var("BOTSTER_CONFIG_DIR");
+    }
+
+    /// session_manifest_path returns None when the session dir exists but
+    /// manifest.json is missing (stale/incomplete session directory).
+    #[test]
+    fn session_manifest_path_missing_manifest_file() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let uuid = "sess-no-manifest";
+        let sess_dir = dir
+            .path()
+            .join("workspaces")
+            .join("ws-1")
+            .join("sessions")
+            .join(uuid);
+        std::fs::create_dir_all(&sess_dir).unwrap();
+
+        std::env::set_var("BOTSTER_CONFIG_DIR", dir.path());
+        let result = session_manifest_path(uuid);
+        assert!(result.is_none(), "missing manifest.json must return None");
+        std::env::remove_var("BOTSTER_CONFIG_DIR");
+    }
 }

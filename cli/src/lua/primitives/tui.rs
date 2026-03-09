@@ -170,8 +170,8 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::new_hub_event_sender;
+    use super::*;
 
     fn setup() -> (Lua, HubEventSender) {
         let lua = Lua::new();
@@ -194,37 +194,52 @@ mod tests {
         let (lua, _tx) = setup();
 
         let globals = lua.globals();
-        let tui_table: mlua::Table =
-            globals.get("tui").expect("tui table should exist");
+        let tui_table: mlua::Table = globals.get("tui").expect("tui table should exist");
 
-        let _: mlua::Function = tui_table.get("on_connected").expect("on_connected should exist");
-        let _: mlua::Function = tui_table.get("on_disconnected").expect("on_disconnected should exist");
-        let _: mlua::Function = tui_table.get("on_message").expect("on_message should exist");
+        let _: mlua::Function = tui_table
+            .get("on_connected")
+            .expect("on_connected should exist");
+        let _: mlua::Function = tui_table
+            .get("on_disconnected")
+            .expect("on_disconnected should exist");
+        let _: mlua::Function = tui_table
+            .get("on_message")
+            .expect("on_message should exist");
         let _: mlua::Function = tui_table.get("send").expect("send should exist");
-        let _: mlua::Function = tui_table.get("send_binary").expect("send_binary should exist");
+        let _: mlua::Function = tui_table
+            .get("send_binary")
+            .expect("send_binary should exist");
     }
 
     #[test]
     fn test_on_connected_stores_callback() {
         let (lua, _tx) = setup();
 
-        lua.load(r#"
+        lua.load(
+            r#"
             tui.on_connected(function()
                 connected_called = true
             end)
-        "#).exec().expect("Should register callback");
+        "#,
+        )
+        .exec()
+        .expect("Should register callback");
 
         let key: mlua::RegistryKey = lua
             .named_registry_value(registry_keys::ON_CONNECTED)
             .expect("Callback should be stored in registry");
 
-        let callback: mlua::Function =
-            lua.registry_value(&key).expect("Should retrieve callback");
+        let callback: mlua::Function = lua.registry_value(&key).expect("Should retrieve callback");
 
-        lua.globals().set("connected_called", LuaValue::Nil).unwrap();
+        lua.globals()
+            .set("connected_called", LuaValue::Nil)
+            .unwrap();
         callback.call::<()>(()).expect("Should call callback");
 
-        let result: bool = lua.globals().get("connected_called").expect("connected_called should be set");
+        let result: bool = lua
+            .globals()
+            .get("connected_called")
+            .expect("connected_called should be set");
         assert!(result);
     }
 
@@ -232,25 +247,31 @@ mod tests {
     fn test_on_message_stores_callback() {
         let (lua, _tx) = setup();
 
-        lua.load(r#"
+        lua.load(
+            r#"
             tui.on_message(function(msg)
                 received_type = msg.type
             end)
-        "#).exec().expect("Should register callback");
+        "#,
+        )
+        .exec()
+        .expect("Should register callback");
 
         let key: mlua::RegistryKey = lua
             .named_registry_value(registry_keys::ON_MESSAGE)
             .expect("Callback should be stored in registry");
 
-        let callback: mlua::Function =
-            lua.registry_value(&key).expect("Should retrieve callback");
+        let callback: mlua::Function = lua.registry_value(&key).expect("Should retrieve callback");
 
         lua.globals().set("received_type", LuaValue::Nil).unwrap();
         let msg = lua.create_table().unwrap();
         msg.set("type", "test_msg").unwrap();
         callback.call::<()>(msg).expect("Should call callback");
 
-        let result: String = lua.globals().get("received_type").expect("received_type should be set");
+        let result: String = lua
+            .globals()
+            .get("received_type")
+            .expect("received_type should be set");
         assert_eq!(result, "test_msg");
     }
 
@@ -258,9 +279,13 @@ mod tests {
     fn test_send_delivers_json_event() {
         let (lua, mut rx) = setup_with_channel();
 
-        lua.load(r#"
+        lua.load(
+            r#"
             tui.send({ type = "agent_list", count = 3 })
-        "#).exec().expect("Should send message");
+        "#,
+        )
+        .exec()
+        .expect("Should send message");
 
         let event = rx.try_recv().expect("Should have received event");
         match event {
@@ -276,9 +301,13 @@ mod tests {
     fn test_send_binary_delivers_binary_event() {
         let (lua, mut rx) = setup_with_channel();
 
-        lua.load(r#"
+        lua.load(
+            r#"
             tui.send_binary("hello bytes")
-        "#).exec().expect("Should send binary");
+        "#,
+        )
+        .exec()
+        .expect("Should send binary");
 
         let event = rx.try_recv().expect("Should have received event");
         match event {
@@ -293,11 +322,15 @@ mod tests {
     fn test_multiple_sends_deliver_in_order() {
         let (lua, mut rx) = setup_with_channel();
 
-        lua.load(r#"
+        lua.load(
+            r#"
             tui.send({ msg = "first" })
             tui.send({ msg = "second" })
             tui.send_binary("third")
-        "#).exec().expect("Should send messages");
+        "#,
+        )
+        .exec()
+        .expect("Should send messages");
 
         match rx.try_recv().unwrap() {
             HubEvent::TuiSend(TuiSendRequest::Json { data }) => assert_eq!(data["msg"], "first"),

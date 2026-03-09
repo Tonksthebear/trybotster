@@ -68,7 +68,10 @@ fn debug_worktree_path_detection() {
 
     // Main repo should have .git as a directory
     let main_git = main_repo.join(".git");
-    assert!(main_git.is_dir(), "Main repo should have .git as a directory");
+    assert!(
+        main_git.is_dir(),
+        "Main repo should have .git as a directory"
+    );
 
     // Resolve common dir via git CLI
     let output = Command::new("git")

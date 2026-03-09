@@ -103,7 +103,8 @@ fn test_full_pipeline_pty_output_reaches_subscriber() {
     conn.set_timeout(10).expect("set_timeout");
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
-    conn.install_forwarder(event_tx.into()).expect("install_forwarder");
+    conn.install_forwarder(event_tx.into())
+        .expect("install_forwarder");
 
     // ── 3. Create a pipe pair ─────────────────────────────────────────────────
     //
@@ -158,7 +159,10 @@ fn test_full_pipeline_pty_output_reaches_subscriber() {
                 .unwrap_or(Duration::ZERO);
 
             match tokio::time::timeout(remaining, event_rx.recv()).await {
-                Ok(Some(HubEvent::BrokerPtyOutput { session_id: sid, data })) => {
+                Ok(Some(HubEvent::BrokerPtyOutput {
+                    session_id: sid,
+                    data,
+                })) => {
                     assert_eq!(
                         sid, session_id,
                         "received BrokerPtyOutput for wrong session_id"
@@ -219,9 +223,7 @@ fn test_full_pipeline_pty_output_reaches_subscriber() {
     rt2.block_on(async {
         let found = loop {
             match tokio::time::timeout(Duration::from_secs(1), sub.recv()).await {
-                Ok(Ok(crate::agent::pty::PtyEvent::Output(data)))
-                    if data == received_data =>
-                {
+                Ok(Ok(crate::agent::pty::PtyEvent::Output(data))) if data == received_data => {
                     break true;
                 }
                 // Other PtyEvent variants (title, cwd, kitty, etc.): keep draining.
@@ -246,13 +248,19 @@ fn test_full_pipeline_pty_output_reaches_subscriber() {
     // syscall on macOS — the reader hangs until the write end is also closed.
     // Closing write_end first delivers EOF to the broker reader, letting
     // handle.join() return before kill_all tries to join it.
-    unsafe { libc::close(write_end); }
+    unsafe {
+        libc::close(write_end);
+    }
 
     conn.kill_all();
-    broker_thread.join().expect("broker thread must exit cleanly after kill_all");
+    broker_thread
+        .join()
+        .expect("broker thread must exit cleanly after kill_all");
 
     // Hub-side read_end is the only remaining pipe FD (broker closed its dup).
-    unsafe { libc::close(read_end); }
+    unsafe {
+        libc::close(read_end);
+    }
 }
 
 /// Prove that Hub B can reconnect to a live broker after Hub A disconnects and
@@ -353,7 +361,11 @@ fn test_hub_reconnect_snapshot_and_output() {
             payload_a.len(),
         )
     };
-    assert_eq!(written1 as usize, payload_a.len(), "pipe1 write must not short-write");
+    assert_eq!(
+        written1 as usize,
+        payload_a.len(),
+        "pipe1 write must not short-write"
+    );
 
     // Give the broker reader_loop one generous scheduling quantum to read the
     // pipe and feed the bytes into the AlacrittyParser.  200 ms is well above
@@ -387,7 +399,9 @@ fn test_hub_reconnect_snapshot_and_output() {
     conn_b.set_timeout(10).expect("Hub B: set_timeout");
 
     let (event_tx_b, mut event_rx_b) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
-    conn_b.install_forwarder(event_tx_b.into()).expect("Hub B: install_forwarder");
+    conn_b
+        .install_forwarder(event_tx_b.into())
+        .expect("Hub B: install_forwarder");
 
     // ── 5. get_snapshot: AlacrittyParser must have Hub A's data ──────────────
     //
@@ -428,7 +442,11 @@ fn test_hub_reconnect_snapshot_and_output() {
             payload_b.len(),
         )
     };
-    assert_eq!(written2 as usize, payload_b.len(), "pipe2 write must not short-write");
+    assert_eq!(
+        written2 as usize,
+        payload_b.len(),
+        "pipe2 write must not short-write"
+    );
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime for Hub B events");
     let received_b: Vec<u8> = rt.block_on(async {
@@ -439,7 +457,10 @@ fn test_hub_reconnect_snapshot_and_output() {
                 .checked_duration_since(tokio::time::Instant::now())
                 .unwrap_or(Duration::ZERO);
             match tokio::time::timeout(remaining, event_rx_b.recv()).await {
-                Ok(Some(HubEvent::BrokerPtyOutput { session_id: sid, data })) => {
+                Ok(Some(HubEvent::BrokerPtyOutput {
+                    session_id: sid,
+                    data,
+                })) => {
                     assert_eq!(sid, session_id2, "BrokerPtyOutput for wrong session_id");
                     accumulated.extend_from_slice(&data);
                     if accumulated.windows(payload_b.len()).any(|w| w == payload_b) {
@@ -472,7 +493,9 @@ fn test_hub_reconnect_snapshot_and_output() {
     }
 
     conn_b.kill_all();
-    broker_thread.join().expect("broker thread must exit cleanly after kill_all");
+    broker_thread
+        .join()
+        .expect("broker thread must exit cleanly after kill_all");
 
     // Close Hub-side read ends (broker already closed its dups via kill_all).
     unsafe {
@@ -559,7 +582,9 @@ fn test_existing_session_routes_to_hub_b_after_reconnect() {
     conn_b.set_timeout(10).expect("Hub B: set_timeout");
 
     let (event_tx_b, mut event_rx_b) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
-    conn_b.install_forwarder(event_tx_b.into()).expect("Hub B: install_forwarder");
+    conn_b
+        .install_forwarder(event_tx_b.into())
+        .expect("Hub B: install_forwarder");
 
     // ── 5. Write to the ORIGINAL pipe1 after Hub B is connected ──────────────
     //
@@ -574,7 +599,11 @@ fn test_existing_session_routes_to_hub_b_after_reconnect() {
             payload.len(),
         )
     };
-    assert_eq!(written as usize, payload.len(), "pipe1 write must not short-write");
+    assert_eq!(
+        written as usize,
+        payload.len(),
+        "pipe1 write must not short-write"
+    );
 
     // ── 6. Hub B must receive BrokerPtyOutput for the original session ────────
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -588,7 +617,10 @@ fn test_existing_session_routes_to_hub_b_after_reconnect() {
                 .checked_duration_since(tokio::time::Instant::now())
                 .unwrap_or(Duration::ZERO);
             match tokio::time::timeout(remaining, event_rx_b.recv()).await {
-                Ok(Some(HubEvent::BrokerPtyOutput { session_id: sid, data })) => {
+                Ok(Some(HubEvent::BrokerPtyOutput {
+                    session_id: sid,
+                    data,
+                })) => {
                     assert_eq!(
                         sid, session_id1,
                         "SharedWriter must route pipe1 output to Hub B under session_id1"
@@ -615,12 +647,18 @@ fn test_existing_session_routes_to_hub_b_after_reconnect() {
     // the pipe and its blocking read() returns, allowing handle.join() to
     // succeed.  Closing the broker's dup of read_end1 from kill_all does NOT
     // interrupt a blocking read() on Linux — only closing all write ends does.
-    unsafe { libc::close(write_end1); }
+    unsafe {
+        libc::close(write_end1);
+    }
 
     conn_b.kill_all();
-    broker_thread.join().expect("broker thread must exit cleanly");
+    broker_thread
+        .join()
+        .expect("broker thread must exit cleanly");
 
-    unsafe { libc::close(read_end1); }
+    unsafe {
+        libc::close(read_end1);
+    }
 }
 
 /// Regression test: `get_snapshot` must be delivered even while PTY output is
@@ -668,7 +706,8 @@ fn test_ctrl_delivery_under_output_flood() {
     // event_rx intentionally unused — demux ignores send errors to a dropped
     // receiver and keeps running, so the control-response path stays alive.
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<HubEvent>();
-    conn.install_forwarder(event_tx.into()).expect("install_forwarder");
+    conn.install_forwarder(event_tx.into())
+        .expect("install_forwarder");
 
     let (read_end, write_end) = make_pipe();
 
@@ -708,12 +747,85 @@ fn test_ctrl_delivery_under_output_flood() {
     // Close write_end BEFORE kill_all so the broker reader_loop sees EOF and
     // its blocking read() returns, allowing the broker to join the reader
     // thread cleanly.  Same ordering requirement as the other pipeline tests.
-    unsafe { libc::close(write_end); }
+    unsafe {
+        libc::close(write_end);
+    }
 
     conn.kill_all();
-    broker_thread.join().expect("broker thread must exit cleanly after kill_all");
+    broker_thread
+        .join()
+        .expect("broker thread must exit cleanly after kill_all");
 
-    unsafe { libc::close(read_end); }
+    unsafe {
+        libc::close(read_end);
+    }
+}
+
+/// Regression: control requests must still work even when no forwarder is
+/// installed and PTY output floods broker output queues.
+#[test]
+fn test_split_plane_get_snapshot_without_forwarder_under_flood() {
+    let hub_id = format!("test-split-flood-{}", std::process::id());
+    let socket_path = broker_socket_path(&hub_id).expect("broker_socket_path");
+
+    let hub_id_clone = hub_id.clone();
+    let broker_thread = std::thread::spawn(move || {
+        let _ = crate::broker::run(&hub_id_clone, 2);
+    });
+
+    assert!(
+        wait_for_broker_socket(&socket_path, Duration::from_secs(2)),
+        "broker socket did not appear within 2 s"
+    );
+
+    // Intentionally skip install_forwarder() in this test.
+    let mut conn = BrokerConnection::connect(&socket_path).expect("connect");
+    conn.set_timeout(10).expect("set_timeout");
+
+    let (read_end, write_end) = make_pipe();
+    let session_id = conn
+        .register_pty("test-agent-split", 99999, 24, 80, read_end)
+        .expect("register_pty");
+
+    // Flood PTY output while no forwarder is draining the stream socket.
+    let flood_handle = std::thread::spawn(move || {
+        let chunk = vec![b'Z'; 4096];
+        for _ in 0..512 {
+            unsafe {
+                libc::write(
+                    write_end,
+                    chunk.as_ptr() as *const libc::c_void,
+                    chunk.len(),
+                );
+            }
+        }
+        write_end
+    });
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    let started = std::time::Instant::now();
+    conn.get_snapshot(session_id)
+        .expect("get_snapshot must succeed while stream plane is flooded");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "get_snapshot should not stall behind output flood in split mode (elapsed={elapsed:?})"
+    );
+
+    let write_end = flood_handle.join().expect("flood thread");
+    unsafe {
+        libc::close(write_end);
+    }
+
+    conn.kill_all();
+    broker_thread
+        .join()
+        .expect("broker thread must exit cleanly");
+
+    unsafe {
+        libc::close(read_end);
+    }
 }
 
 /// Diagnostic: verify that `shutdown(SHUT_WR)` on one end of a Unix domain
@@ -728,11 +840,10 @@ fn test_ctrl_delivery_under_output_flood() {
 /// the reconnect test hang.
 #[test]
 fn test_shutdown_write_interrupts_blocking_recvmsg() {
-    use std::os::unix::net::UnixStream;
     use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
 
-    let (hub_stream, broker_stream) = UnixStream::pair()
-        .expect("socketpair for shutdown test");
+    let (hub_stream, broker_stream) = UnixStream::pair().expect("socketpair for shutdown test");
 
     // Broker thread: block in recvmsg until peer sends EOF, then record
     // the result.  A 2-second timeout prevents infinite hang on failure.
@@ -768,8 +879,7 @@ fn test_shutdown_write_interrupts_blocking_recvmsg() {
     let result = broker_handle.join().expect("broker thread must not panic");
 
     assert_eq!(
-        result,
-        0,
+        result, 0,
         "shutdown(SHUT_WR) must cause blocking recvmsg on peer to return 0 (EOF); \
          got {result} — this means shutdown does NOT interrupt blocking recvmsg on this platform, \
          which explains the test_hub_reconnect_snapshot_and_output hang"

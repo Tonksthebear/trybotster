@@ -151,10 +151,7 @@ impl HttpAsyncEntries {
     ///
     /// When set, background threads send `HubEvent::HttpResponse` through
     /// this channel instead of pushing to the shared vec.
-    pub(crate) fn set_hub_event_tx(
-        &mut self,
-        tx: crate::hub::events::HubEventTx,
-    ) {
+    pub(crate) fn set_hub_event_tx(&mut self, tx: crate::hub::events::HubEventTx) {
         self.hub_event_tx = Some(tx);
     }
 
@@ -266,10 +263,9 @@ fn parse_opts(lua: &Lua, opts: Option<Table>) -> mlua::Result<RequestOpts> {
         // Parse json body
         if let Ok(json_val) = opts.get::<Value>("json") {
             if json_val != Value::Nil {
-                let serde_val: serde_json::Value =
-                    lua.from_value(json_val).map_err(|e| {
-                        mlua::Error::external(format!("Failed to serialize json option: {e}"))
-                    })?;
+                let serde_val: serde_json::Value = lua.from_value(json_val).map_err(|e| {
+                    mlua::Error::external(format!("Failed to serialize json option: {e}"))
+                })?;
                 json_body = Some(serde_val);
             }
         }
@@ -777,7 +773,10 @@ pub fn register(lua: &Lua, registry: HttpAsyncRegistry) -> Result<()> {
 /// The number of HTTP callbacks fired.
 pub fn poll_http_responses(lua: &Lua, registry: &HttpAsyncRegistry) -> usize {
     // Phase 1: drain responses and collect callback keys under the lock.
-    let fired: Vec<(mlua::RegistryKey, std::result::Result<HttpResponseData, String>)> = {
+    let fired: Vec<(
+        mlua::RegistryKey,
+        std::result::Result<HttpResponseData, String>,
+    )> = {
         let mut entries = registry.lock().expect("HttpAsyncEntries mutex poisoned");
 
         if entries.responses.is_empty() {
@@ -1082,15 +1081,16 @@ mod tests {
 
         // Request to an invalid URL — will fail in the background thread
         let (id, err): (Option<String>, Option<String>) = lua
-            .load(
-                r#"return http.request("GET", "not-a-valid-url", {}, function(resp, err) end)"#,
-            )
+            .load(r#"return http.request("GET", "not-a-valid-url", {}, function(resp, err) end)"#)
             .eval()
             .expect("http.request should be callable");
 
         assert!(err.is_none(), "Should not error: {:?}", err);
         let id = id.expect("Should return a request ID");
-        assert!(id.starts_with("http_"), "ID should start with 'http_', got: {id}");
+        assert!(
+            id.starts_with("http_"),
+            "ID should start with 'http_', got: {id}"
+        );
 
         // Pending should have 1 entry, in_flight should be 1
         let entries = registry.lock().unwrap();
@@ -1183,9 +1183,7 @@ mod tests {
 
         // Next request should be rejected
         let (id, err): (Option<String>, Option<String>) = lua
-            .load(
-                r#"return http.request("GET", "http://example.com", {}, function() end)"#,
-            )
+            .load(r#"return http.request("GET", "http://example.com", {}, function() end)"#)
             .eval()
             .expect("http.request should be callable");
 
@@ -1210,16 +1208,21 @@ mod tests {
         register(&lua, Arc::clone(&registry)).expect("Should register http primitives");
 
         let (id, err): (Option<String>, Option<String>) = lua
-            .load(r#"return http.request(
+            .load(
+                r#"return http.request(
                 { method = "GET", url = "not-a-valid-url" },
                 function(resp, err) end
-            )"#)
+            )"#,
+            )
             .eval()
             .expect("http.request table-first form should be callable");
 
         assert!(err.is_none(), "Should not error on valid call: {:?}", err);
         let id = id.expect("Should return a request ID");
-        assert!(id.starts_with("http_"), "ID should start with 'http_', got: {id}");
+        assert!(
+            id.starts_with("http_"),
+            "ID should start with 'http_', got: {id}"
+        );
     }
 
     #[test]
@@ -1229,12 +1232,14 @@ mod tests {
         register(&lua, Arc::clone(&registry)).expect("Should register http primitives");
 
         let (id, err): (Option<String>, Option<String>) = lua
-            .load(r#"return http.request({
+            .load(
+                r#"return http.request({
                 method     = "GET",
                 url        = "not-a-valid-url",
                 timeout_ms = 1000,
                 headers    = { ["X-Test"] = "yes" },
-            }, function(resp, err) end)"#)
+            }, function(resp, err) end)"#,
+            )
             .eval()
             .expect("http.request table-first with opts should be callable");
 
@@ -1254,7 +1259,11 @@ mod tests {
             .eval()
             .expect("http.request 3-arg form should be callable");
 
-        assert!(err.is_none(), "Should not error on valid 3-arg call: {:?}", err);
+        assert!(
+            err.is_none(),
+            "Should not error on valid 3-arg call: {:?}",
+            err
+        );
         assert!(id.is_some(), "Should return a request ID");
     }
 
@@ -1268,7 +1277,10 @@ mod tests {
             .eval();
 
         // Should return a Lua runtime error (not a (nil, err) tuple)
-        assert!(result.is_err(), "Should error when 'method' field is missing");
+        assert!(
+            result.is_err(),
+            "Should error when 'method' field is missing"
+        );
     }
 
     #[test]
@@ -1292,7 +1304,10 @@ mod tests {
             .load(r#"return http.request(42, "https://example.com", function() end)"#)
             .eval();
 
-        assert!(result.is_err(), "Should error when first arg is not a string or table");
+        assert!(
+            result.is_err(),
+            "Should error when first arg is not a string or table"
+        );
     }
 
     #[test]
@@ -1317,8 +1332,13 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let done = { !registry.lock().unwrap().responses.is_empty() };
-            if done { break; }
-            assert!(std::time::Instant::now() < deadline, "Background HTTP thread timed out");
+            if done {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Background HTTP thread timed out"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
@@ -1362,6 +1382,10 @@ mod tests {
 
         // After thread completes, in_flight should be 0
         let entries = registry.lock().unwrap();
-        assert_eq!(entries.in_flight_count(), 0, "in_flight should decrement after thread completes");
+        assert_eq!(
+            entries.in_flight_count(),
+            0,
+            "in_flight should decrement after thread completes"
+        );
     }
 }

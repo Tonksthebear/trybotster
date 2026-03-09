@@ -356,11 +356,7 @@ impl ActionCableChannel {
     ///
     /// For more options, use `ActionCableChannel::builder()`.
     #[must_use]
-    pub fn encrypted(
-        crypto_service: CryptoService,
-        server_url: String,
-        api_key: String,
-    ) -> Self {
+    pub fn encrypted(crypto_service: CryptoService, server_url: String, api_key: String) -> Self {
         Self::builder()
             .server_url(server_url)
             .api_key(api_key)
@@ -794,7 +790,9 @@ impl ActionCableChannel {
             let envelope_data = if let Some(ref cs) = crypto_service {
                 // Encrypt via CryptoService (synchronous mutex lock)
                 match cs.lock() {
-                    Ok(mut guard) => match guard.encrypt(&to_encrypt, crate::relay::extract_olm_key(target.as_ref())) {
+                    Ok(mut guard) => match guard
+                        .encrypt(&to_encrypt, crate::relay::extract_olm_key(target.as_ref()))
+                    {
                         Ok(envelope) => {
                             serde_json::json!({
                                 "action": "relay",
@@ -1066,10 +1064,7 @@ impl ActionCableChannel {
                     }
                 };
 
-                log::debug!(
-                    "[Reliable] Decompressed to {} bytes",
-                    decompressed.len()
-                );
+                log::debug!("[Reliable] Decompressed to {} bytes", decompressed.len());
 
                 // Process through receiver, which handles reordering
                 let deliverable = {
@@ -1249,19 +1244,21 @@ impl ActionCableChannel {
 
         let envelope_data = if let Some(ref cs) = crypto_service {
             match cs.lock() {
-                Ok(mut guard) => match guard.encrypt(&msg_bytes, crate::relay::extract_olm_key(peer.as_ref())) {
-                    Ok(envelope) => {
-                        serde_json::json!({
-                            "action": "relay",
-                            "recipient_identity": peer.as_ref(),
-                            "envelope": envelope,
-                        })
+                Ok(mut guard) => {
+                    match guard.encrypt(&msg_bytes, crate::relay::extract_olm_key(peer.as_ref())) {
+                        Ok(envelope) => {
+                            serde_json::json!({
+                                "action": "relay",
+                                "recipient_identity": peer.as_ref(),
+                                "envelope": envelope,
+                            })
+                        }
+                        Err(e) => {
+                            log::error!("Failed to encrypt message to {}: {}", peer, e);
+                            return;
+                        }
                     }
-                    Err(e) => {
-                        log::error!("Failed to encrypt message to {}: {}", peer, e);
-                        return;
-                    }
-                },
+                }
                 Err(e) => {
                     log::error!("Crypto mutex poisoned: {}", e);
                     return;
@@ -1310,19 +1307,21 @@ impl ActionCableChannel {
         // Encrypt if needed
         let envelope_data = if let Some(ref cs) = crypto_service {
             match cs.lock() {
-                Ok(mut guard) => match guard.encrypt(&ack_bytes, crate::relay::extract_olm_key(peer.as_ref())) {
-                    Ok(envelope) => {
-                        serde_json::json!({
-                            "action": "relay",
-                            "recipient_identity": peer.as_ref(),
-                            "envelope": envelope,
-                        })
+                Ok(mut guard) => {
+                    match guard.encrypt(&ack_bytes, crate::relay::extract_olm_key(peer.as_ref())) {
+                        Ok(envelope) => {
+                            serde_json::json!({
+                                "action": "relay",
+                                "recipient_identity": peer.as_ref(),
+                                "envelope": envelope,
+                            })
+                        }
+                        Err(e) => {
+                            log::error!("Failed to encrypt ACK: {}", e);
+                            return;
+                        }
                     }
-                    Err(e) => {
-                        log::error!("Failed to encrypt ACK: {}", e);
-                        return;
-                    }
-                },
+                }
                 Err(e) => {
                     log::error!("Crypto mutex poisoned: {}", e);
                     return;

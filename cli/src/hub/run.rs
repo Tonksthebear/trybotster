@@ -97,7 +97,10 @@ pub(crate) fn run_event_loop(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if cleanup_tx.send(super::events::HubEvent::CleanupTick).is_err() {
+            if cleanup_tx
+                .send(super::events::HubEvent::CleanupTick)
+                .is_err()
+            {
                 break; // Hub shut down
             }
         }
@@ -215,7 +218,6 @@ pub(crate) fn run_event_loop(
                     hub.handle_hub_event(event);
                 }
             }
-
 
             // Check shutdown conditions
             if hub.quit || shutdown_flag.load(Ordering::SeqCst) {

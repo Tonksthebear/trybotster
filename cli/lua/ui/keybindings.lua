@@ -115,6 +115,8 @@ M.error = {
   ["enter"]  = "close_modal",
 }
 
+M.restarting = {}
+
 -- =============================================================================
 -- Key Handler
 -- =============================================================================
@@ -162,7 +164,7 @@ function M.handle_key(key, mode, context)
     return nil
   end
 
-  if mode == "close_agent_confirm" or mode == "connection_code" or mode == "error" then
+  if mode == "close_agent_confirm" or mode == "connection_code" or mode == "error" or mode == "restarting" then
     return nil
   end
 

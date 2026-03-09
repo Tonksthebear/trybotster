@@ -165,7 +165,7 @@ function M.on_action(action, context)
           subscriptionId = "tui_hub",
           data = { type = "restart_hub" },
         }},
-        set_mode_ops(base_mode(context)),
+        set_mode_ops("restarting"),
       }
     elseif selected == "dev_rebuild" then
       -- Dev rebuild: cargo build in background, Hub exec-restarts on success.
@@ -176,7 +176,7 @@ function M.on_action(action, context)
           subscriptionId = "tui_hub",
           data = { type = "dev_rebuild" },
         }},
-        set_mode_ops(base_mode(context)),
+        set_mode_ops("restarting"),
       }
     end
     -- Unknown or nil action: close menu

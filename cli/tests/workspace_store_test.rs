@@ -38,16 +38,20 @@ fn create_lua_vm(data_dir: &std::path::Path) -> Lua {
     .expect("set package.path");
 
     // Load hooks module and make it a global (same as hub/init.lua does)
-    lua.load(r#"
+    lua.load(
+        r#"
         _G.hooks = require("hub.hooks")
-    "#)
+    "#,
+    )
     .exec()
     .expect("load hooks module");
 
     // Stub out `worktree` global (migrate() calls worktree.list())
-    lua.load(r#"
+    lua.load(
+        r#"
         _G.worktree = { list = function() return {} end }
-    "#)
+    "#,
+    )
     .exec()
     .expect("stub worktree");
 
@@ -275,7 +279,10 @@ fn test_ensure_workspace_manifest_fields() {
         .eval()
         .expect("ensure_workspace manifest fields");
 
-    assert!(has_fields, "Manifest should have all expected top-level fields");
+    assert!(
+        has_fields,
+        "Manifest should have all expected top-level fields"
+    );
     assert!(meta_ok, "Manifest metadata should preserve plugin data");
 }
 
@@ -537,10 +544,7 @@ fn test_migrate_v2_skips_already_migrated() {
         .eval()
         .expect("migrate_v2 skips already migrated");
 
-    assert!(
-        unchanged,
-        "Manifests with name should not be modified"
-    );
+    assert!(unchanged, "Manifests with name should not be modified");
 }
 
 // =============================================================================
@@ -634,7 +638,10 @@ fn test_migrate_v3_skips_already_migrated() {
         .eval()
         .expect("migrate_v3 skips already migrated");
 
-    assert!(unchanged, "Manifests with name should not be modified by v3 migration");
+    assert!(
+        unchanged,
+        "Manifests with name should not be modified by v3 migration"
+    );
 }
 
 #[test]

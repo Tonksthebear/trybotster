@@ -158,7 +158,10 @@ fn test_pty_input_receiver_ignores_non_pty_commands() {
 
         let cmd = parsed.unwrap();
         assert!(
-            !matches!(cmd, BrowserCommand::Input { .. } | BrowserCommand::Resize { .. }),
+            !matches!(
+                cmd,
+                BrowserCommand::Input { .. } | BrowserCommand::Resize { .. }
+            ),
             "Expected non-PTY command, got {:?}",
             cmd
         );
