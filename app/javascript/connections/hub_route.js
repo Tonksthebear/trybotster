@@ -709,7 +709,7 @@ export class HubRoute {
       ensureConnectedAsync: () => this.#ensureConnected(),
       disconnectPeer: () => this.#disconnectPeer(),
       handleHealthMessage: (msg) => this.#health.handleHealthMessage(msg),
-      probeOnVisibility: () => this.#probeOnVisibility(),
+      probeOnVisibility: (opts = {}) => this.#probeOnVisibility(0, opts),
 
       // Session errors
       clearIdentity: () => { this.identityKey = null },
@@ -1243,7 +1243,11 @@ export class HubRoute {
    * Falls back to #ensureConnected() when not in CONNECTED state (cold start,
    * already disconnected, etc.).
    */
-  #probeOnVisibility(hiddenForMs = 0) {
+  #probeOnVisibility(hiddenForMs = 0, options = {}) {
+    const force = options.force === true
+    const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 2000
+    const reason = options.reason || "visibility"
+
     if (!this.#isLivenessOwner()) return
     if (this.state !== ConnectionState.CONNECTED) {
       this.#ensureConnected().catch(() => {})
@@ -1252,14 +1256,14 @@ export class HubRoute {
 
     // Ignore quick tab-switch visibility flips. We only need this probe after
     // meaningful background time (phone unlock, app resume, long tab idle).
-    if (hiddenForMs < 5000) {
+    if (!force && hiddenForMs < 5000) {
       return
     }
 
     // Recent heartbeat pong means DC is healthy; avoid extra probe traffic and
     // false reconnects when users bounce between hub/pty views.
     const sinceLastPong = Date.now() - this.#lastDcPongAt
-    if (this.#lastDcPongAt > 0 && sinceLastPong < 12000) {
+    if (!force && this.#lastDcPongAt > 0 && sinceLastPong < 12000) {
       return
     }
 
@@ -1276,14 +1280,16 @@ export class HubRoute {
       this.#visibilityProbeTimer = setTimeout(() => {
         this.#visibilityProbeTimer = null
         if (!this.#visibilityPongReceived) {
-          console.debug(`[${this.constructor.name}] Visibility probe: no pong in 2s — reconnecting`)
+          console.debug(
+            `[${this.constructor.name}] ${reason} probe: no pong in ${timeoutMs}ms — reconnecting`,
+          )
           this.#stopDcHeartbeat()
           this.#disconnectPeer().then(() => this.#schedulePeerReconnect())
         }
-      }, 2000)
+      }, timeoutMs)
     }).catch(() => {
       // dc.send() threw — DC is already closed
-      console.debug(`[${this.constructor.name}] Visibility probe: ping send failed — reconnecting`)
+      console.debug(`[${this.constructor.name}] ${reason} probe: ping send failed — reconnecting`)
       this.#stopDcHeartbeat()
       this.#disconnectPeer().then(() => this.#schedulePeerReconnect())
     })

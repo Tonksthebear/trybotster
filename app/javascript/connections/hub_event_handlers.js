@@ -65,7 +65,9 @@ export function setupHubEventListeners(bridge, hubId, cb) {
   // SCTP send buffer backing up — ICE path is dead during network transition
   unsubs.push(bridge.on("connection:stalled", (event) => {
     if (event.hubId !== hubId) return
-    cb.probeOnVisibility()
+    // Force a probe immediately. This path is triggered by bufferedAmount
+    // growth, not tab visibility, so hidden-time heuristics don't apply.
+    cb.probeOnVisibility({ force: true, reason: "stalled" })
   }))
 
   return unsubs
