@@ -938,7 +938,13 @@ where
                     let panel = self.panel_pool.resolve_panel(&session_uuid);
                     let before = panel.state();
                     let before_dims = panel.dims();
-                    panel.on_scrollback_with_dims(rows, cols, &data);
+                    let (applied_rows, applied_cols, used_local_dims) = if rows >= 2 && cols >= 2 {
+                        (rows, cols, false)
+                    } else {
+                        let (local_rows, local_cols) = panel.dims();
+                        (local_rows, local_cols, true)
+                    };
+                    panel.on_scrollback_with_dims(applied_rows, applied_cols, &data);
                     let after = panel.state();
                     let after_dims = panel.dims();
                     let is_focused = self.panel_pool.is_focused(&session_uuid);
@@ -946,19 +952,20 @@ where
                         self.terminal_modes.on_kitty_changed(kitty_enabled);
                     }
                     log::debug!(
-                        "Processed {} bytes of scrollback for {} (state {:?}->{:?}, snapshot={}x{}, panel_dims {}x{} -> {}x{}, kitty={}{})",
+                        "Processed {} bytes of scrollback for {} (state {:?}->{:?}, snapshot={}x{}, panel_dims {}x{} -> {}x{}, kitty={}{}{})",
                         data.len(),
                         session_uuid,
                         before,
                         after,
-                        cols,
-                        rows,
+                        applied_cols,
+                        applied_rows,
                         before_dims.1,
                         before_dims.0,
                         after_dims.1,
                         after_dims.0,
                         kitty_enabled,
-                        if is_focused { ", applied" } else { "" }
+                        if is_focused { ", applied" } else { "" },
+                        if used_local_dims { " (legacy dims fallback)" } else { "" }
                     );
                 }
                 Ok(TuiOutput::Output { session_uuid, data }) => {
@@ -3266,6 +3273,34 @@ mod tests {
             "Snapshot should be processed, got: {contents:?}"
         );
         assert!(!panel.is_scrolled(), "Scroll should be reset to bottom");
+    }
+
+    #[test]
+    fn test_scrollback_legacy_zero_dims_uses_panel_dims() {
+        let (mut runner, _request_rx) = create_test_runner();
+
+        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        panel.connect("sess-0");
+        runner.panel_pool.panels.insert("sess-0".to_string(), panel);
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+
+        runner.output_rx.close();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        runner.output_rx = rx;
+        tx.send(TuiOutput::Scrollback {
+            session_uuid: "sess-0".into(),
+            rows: 0,
+            cols: 0,
+            data: b"legacy snapshot\r\n".to_vec(),
+            kitty_enabled: false,
+        })
+        .unwrap();
+
+        runner.poll_pty_events(None);
+
+        let panel = runner.panel_pool.panels.get("sess-0").unwrap();
+        assert_eq!(panel.dims(), (24, 80));
+        assert!(panel.contents().contains("legacy snapshot"));
     }
 
     /// Verifies `handle_resize()` invalidates panel dims for next render.

@@ -400,8 +400,19 @@ pub fn cleanup_orphaned_sockets() {
             continue;
         }
 
-        // If the hub has a live PID, keep its socket
+        // If the hub has a live PID, keep its socket.
         if is_hub_running(hub_id) {
+            continue;
+        }
+
+        // Safety check: if the path is still serving a live listener, do not
+        // unlink it. This protects hubs running under a different
+        // BOTSTER_CONFIG_DIR from cross-deletion.
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            log::debug!(
+                "Preserving live socket owned outside current config dir: {}",
+                path.display()
+            );
             continue;
         }
 
@@ -687,6 +698,38 @@ mod tests {
             "cleanup_orphaned_sockets should remove stale hub socket: {}",
             stale_sock.display()
         );
+    }
+
+    /// Verifies that `cleanup_orphaned_sockets` preserves live sockets even
+    /// when there is no local PID file for the socket stem.
+    ///
+    /// This protects hubs started with a different `BOTSTER_CONFIG_DIR`.
+    #[test]
+    fn test_cleanup_orphaned_sockets_preserves_live_unknown_socket() {
+        let uid = unsafe { libc::getuid() };
+        let dir = PathBuf::from(format!("/tmp/botster-{uid}"));
+        fs::create_dir_all(&dir).unwrap();
+
+        let live_id = format!("_test_live_unknown_{}", std::process::id());
+        let live_sock = dir.join(format!("{live_id}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&live_sock).unwrap();
+
+        // No local PID file should exist for this synthetic id.
+        assert!(
+            read_pid_file(&live_id).is_none(),
+            "test precondition: no local PID file"
+        );
+
+        cleanup_orphaned_sockets();
+
+        assert!(
+            live_sock.exists(),
+            "cleanup_orphaned_sockets must preserve live socket: {}",
+            live_sock.display()
+        );
+
+        drop(listener);
+        let _ = fs::remove_file(&live_sock);
     }
 
     #[test]

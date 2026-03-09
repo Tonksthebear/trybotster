@@ -11,6 +11,7 @@
 //! - `0x02`: PTY output binary (hub→client) — `[u16 uuid_len][uuid][raw bytes]`
 //! - `0x03`: PTY input binary (client→hub) — `[u16 uuid_len][uuid][raw bytes]`
 //! - `0x04`: PTY scrollback (hub→client) — `[u16 uuid_len][uuid][u16 rows][u16 cols][u8 kitty][raw bytes]`
+//!   (legacy v1 decode fallback: `[u16 uuid_len][uuid][u8 kitty][raw bytes]`)
 //! - `0x05`: Process exited (hub→client) — `[u16 uuid_len][uuid][i32 exit_code]`
 //! - `0x06`: Raw binary (bidirectional) — `[raw bytes]`
 
@@ -200,19 +201,39 @@ fn decode_frame(frame_type: u8, payload: &[u8]) -> Result<Frame> {
         }
         frame_type::SCROLLBACK => {
             let (session_uuid, consumed) = decode_session_uuid(payload)?;
-            if payload.len() < consumed + 5 {
-                bail!("Scrollback frame too short for rows/cols/kitty");
+            // Backward-compatible decode:
+            // v2 = [rows:u16][cols:u16][kitty:u8][data...]
+            // v1 = [kitty:u8][data...]
+            if payload.len() >= consumed + 5 {
+                let rows = u16::from_le_bytes([payload[consumed], payload[consumed + 1]]);
+                let cols = u16::from_le_bytes([payload[consumed + 2], payload[consumed + 3]]);
+                let kitty_byte = payload[consumed + 4];
+                let plausible_dims = rows >= 2 && cols >= 2 && rows <= 1024 && cols <= 1024;
+                let plausible_kitty = kitty_byte <= 1;
+                if plausible_dims && plausible_kitty {
+                    let kitty_enabled = kitty_byte != 0;
+                    return Ok(Frame::Scrollback {
+                        session_uuid,
+                        rows,
+                        cols,
+                        kitty_enabled,
+                        data: payload[consumed + 5..].to_vec(),
+                    });
+                }
             }
-            let rows = u16::from_le_bytes([payload[consumed], payload[consumed + 1]]);
-            let cols = u16::from_le_bytes([payload[consumed + 2], payload[consumed + 3]]);
-            let kitty_enabled = payload[consumed + 4] != 0;
-            Ok(Frame::Scrollback {
-                session_uuid,
-                rows,
-                cols,
-                kitty_enabled,
-                data: payload[consumed + 5..].to_vec(),
-            })
+            if payload.len() >= consumed + 1 {
+                let kitty_enabled = payload[consumed] != 0;
+                return Ok(Frame::Scrollback {
+                    session_uuid,
+                    // Legacy payloads carry no source dimensions.
+                    // Callers should treat 0x0 as "use local panel dims".
+                    rows: 0,
+                    cols: 0,
+                    kitty_enabled,
+                    data: payload[consumed + 1..].to_vec(),
+                });
+            }
+            bail!("Scrollback frame too short for kitty or rows/cols/kitty")
         }
         frame_type::PROCESS_EXITED => {
             let (session_uuid, consumed) = decode_session_uuid(payload)?;
@@ -362,6 +383,38 @@ mod tests {
         let frames = decoder.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0], frame);
+    }
+
+    #[test]
+    fn test_scrollback_legacy_v1_decode() {
+        let session_uuid = "sess-legacy";
+        let data = b"legacy scrollback".to_vec();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(session_uuid.len() as u16).to_le_bytes());
+        payload.extend_from_slice(session_uuid.as_bytes());
+        payload.push(1u8); // kitty enabled
+        payload.extend_from_slice(&data);
+
+        let encoded = encode_raw(frame_type::SCROLLBACK, &payload);
+        let mut decoder = FrameDecoder::new();
+        let frames = decoder.feed(&encoded).unwrap();
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            Frame::Scrollback {
+                session_uuid: decoded_uuid,
+                rows,
+                cols,
+                kitty_enabled,
+                data: decoded_data,
+            } => {
+                assert_eq!(decoded_uuid, session_uuid);
+                assert_eq!((*rows, *cols), (0, 0));
+                assert!(*kitty_enabled);
+                assert_eq!(decoded_data, &data);
+            }
+            other => panic!("Expected Scrollback, got: {other:?}"),
+        }
     }
 
     #[test]

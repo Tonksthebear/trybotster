@@ -4033,7 +4033,10 @@ mod tests {
             )
             .eval()
             .expect("Session.get should return real session after replacement");
-        assert!(real_get_exists, "Session.get should resolve replaced real entry");
+        assert!(
+            real_get_exists,
+            "Session.get should resolve replaced real entry"
+        );
     }
 
     // =========================================================================

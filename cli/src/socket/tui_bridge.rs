@@ -24,6 +24,10 @@ const RECONNECT_RETRIES: u32 = 10;
 
 /// Fixed delay between reconnect attempts.
 const RECONNECT_RETRY_MS: u64 = 1_000;
+/// Current socket protocol version spoken by attach-mode TUI bridge.
+const SOCKET_PROTOCOL_VERSION: u32 = 2;
+/// Oldest socket protocol version still accepted by this bridge.
+const SOCKET_PROTOCOL_MIN_SUPPORTED: u32 = 1;
 
 /// Why a bridge session ended.
 enum SessionExit {
@@ -149,6 +153,17 @@ impl TuiBridge {
     }
 
     async fn run_session(&mut self) -> SessionExit {
+        let hello = Frame::Json(serde_json::json!({
+            "type": "hello",
+            "protocol_version": SOCKET_PROTOCOL_VERSION,
+            "min_supported_version": SOCKET_PROTOCOL_MIN_SUPPORTED,
+            "client": "tui_bridge",
+        }));
+        if let Err(e) = self.socket_writer.write_all(&hello.encode()).await {
+            log::error!("[TuiBridge] Failed to send hello: {e}");
+            return SessionExit::HubDisconnected;
+        }
+
         // Subscribe to hub channel on every fresh socket connection.
         let subscribe = Frame::Json(serde_json::json!({
             "type": "subscribe",
@@ -195,19 +210,41 @@ impl TuiBridge {
                             match decoder.feed(&buf[..n]) {
                                 Ok(frames) => {
                                     for frame in frames {
-                                        if let Some(output) = frame_to_tui_output(frame) {
-                                            if self.output_tx.send(output).is_err() {
-                                                log::info!("[TuiBridge] TuiRunner channel closed");
-                                                return SessionExit::Shutdown;
+                                        match frame {
+                                            Frame::Json(value)
+                                                if value.get("type").and_then(|v| v.as_str())
+                                                    == Some("hello_ack") =>
+                                            {
+                                                let peer = value
+                                                    .get("protocol_version")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0);
+                                                let peer_min = value
+                                                    .get("min_supported_version")
+                                                    .and_then(|v| v.as_u64())
+                                                    .unwrap_or(0);
+                                                log::debug!(
+                                                    "[TuiBridge] Negotiated socket protocol: peer={} min={}",
+                                                    peer,
+                                                    peer_min
+                                                );
                                             }
-                                            // Wake TuiRunner from libc::poll()
-                                            if let Some(fd) = self.wake_write_fd {
-                                                unsafe {
-                                                    libc::write(
-                                                        fd,
-                                                        [1u8].as_ptr() as *const libc::c_void,
-                                                        1,
-                                                    );
+                                            other => {
+                                                if let Some(output) = frame_to_tui_output(other) {
+                                                    if self.output_tx.send(output).is_err() {
+                                                        log::info!("[TuiBridge] TuiRunner channel closed");
+                                                        return SessionExit::Shutdown;
+                                                    }
+                                                    // Wake TuiRunner from libc::poll()
+                                                    if let Some(fd) = self.wake_write_fd {
+                                                        unsafe {
+                                                            libc::write(
+                                                                fd,
+                                                                [1u8].as_ptr() as *const libc::c_void,
+                                                                1,
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -714,18 +751,33 @@ mod tests {
         );
         let handle = tokio::spawn(bridge.run());
 
-        // Initial connection always auto-subscribes to hub.
+        // Initial connection sends hello + hub subscribe.
         let mut decoder_a = FrameDecoder::new();
         let mut buf = [0u8; 4096];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(2), server_read_a.read(&mut buf))
-            .await
-            .expect("timed out waiting for initial subscribe")
-            .expect("read error on initial socket");
-        let frames = decoder_a.feed(&buf[..n]).expect("decode initial frame");
+        let mut frames = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !frames.iter().any(
+            |f| matches!(f, Frame::Json(v) if v["type"] == "subscribe" && v["channel"] == "hub"),
+        ) {
+            let n = tokio::time::timeout_at(deadline, server_read_a.read(&mut buf))
+                .await
+                .expect("timed out waiting for initial subscribe")
+                .expect("read error on initial socket");
+            if n == 0 {
+                break;
+            }
+            frames.extend(decoder_a.feed(&buf[..n]).expect("decode initial frame"));
+        }
         assert!(
             frames
                 .iter()
-                .any(|f| matches!(f, Frame::Json(v) if v["type"] == "subscribe" && v["channel"] == "hub")),
+                .any(|f| matches!(f, Frame::Json(v) if v["type"] == "hello")),
+            "expected hello frame, got: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(
+                |f| matches!(f, Frame::Json(v) if v["type"] == "subscribe" && v["channel"] == "hub")
+            ),
             "expected initial hub subscribe frame, got: {frames:?}"
         );
 
@@ -765,23 +817,38 @@ mod tests {
             other => panic!("expected bridge_reconnected message, got: {other:?}"),
         }
 
-        // New socket session should begin with fresh hub subscribe only.
+        // New socket session should begin with fresh hello + hub subscribe.
         let mut decoder_b = FrameDecoder::new();
-        let n = tokio::time::timeout(std::time::Duration::from_secs(2), server_read_b.read(&mut buf))
-            .await
-            .expect("timed out waiting for reconnect subscribe")
-            .expect("read error on reconnect socket");
-        let frames = decoder_b.feed(&buf[..n]).expect("decode reconnect frame");
+        let mut frames = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !frames.iter().any(
+            |f| matches!(f, Frame::Json(v) if v["type"] == "subscribe" && v["channel"] == "hub"),
+        ) {
+            let n = tokio::time::timeout_at(deadline, server_read_b.read(&mut buf))
+                .await
+                .expect("timed out waiting for reconnect subscribe")
+                .expect("read error on reconnect socket");
+            if n == 0 {
+                break;
+            }
+            frames.extend(decoder_b.feed(&buf[..n]).expect("decode reconnect frame"));
+        }
         assert!(
             frames
                 .iter()
-                .any(|f| matches!(f, Frame::Json(v) if v["type"] == "subscribe" && v["channel"] == "hub")),
+                .any(|f| matches!(f, Frame::Json(v) if v["type"] == "hello")),
+            "expected reconnect hello frame, got: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(
+                |f| matches!(f, Frame::Json(v) if v["type"] == "subscribe" && v["channel"] == "hub")
+            ),
             "expected reconnect hub subscribe frame, got: {frames:?}"
         );
         assert!(
-            !frames.iter().any(
-                |f| matches!(f, Frame::Json(v) if v["type"] == "stale_before_reconnect")
-            ),
+            !frames
+                .iter()
+                .any(|f| matches!(f, Frame::Json(v) if v["type"] == "stale_before_reconnect")),
             "stale request should be dropped on reconnect, got: {frames:?}"
         );
 
@@ -804,14 +871,11 @@ mod tests {
                 break;
             }
             let frames = decoder_b.feed(&buf[..n]).expect("decode frame");
-            saw_fresh = frames.iter().any(
-                |f| matches!(f, Frame::Json(v) if v["type"] == "fresh_after_reconnect"),
-            );
+            saw_fresh = frames
+                .iter()
+                .any(|f| matches!(f, Frame::Json(v) if v["type"] == "fresh_after_reconnect"));
         }
-        assert!(
-            saw_fresh,
-            "expected fresh request to flow after reconnect"
-        );
+        assert!(saw_fresh, "expected fresh request to flow after reconnect");
 
         drop(listener_b);
         teardown(handle, channels, shutdown, server_read_b, server_write_b).await;

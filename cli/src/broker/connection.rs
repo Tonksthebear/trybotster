@@ -610,8 +610,8 @@ fn send_with_fd(stream: &UnixStream, data: &[u8], fd: RawFd) -> Result<()> {
         #[cfg(target_os = "macos")]
         let cmsg_len = libc::CMSG_LEN(fd_size_u32);
         #[cfg(not(target_os = "macos"))]
-        let cmsg_len = usize::try_from(libc::CMSG_LEN(fd_size_u32))
-            .expect("CMSG_LEN should fit into usize");
+        let cmsg_len =
+            usize::try_from(libc::CMSG_LEN(fd_size_u32)).expect("CMSG_LEN should fit into usize");
         (*cmsg).cmsg_len = cmsg_len;
         let data_ptr = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
         std::ptr::write_unaligned(data_ptr, fd);
@@ -859,7 +859,14 @@ fn demux_reader(
 
     loop {
         let n = match stream.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                log::warn!("[broker-demux] broker socket EOF");
+                break;
+            }
+            Err(e) => {
+                log::warn!("[broker-demux] read error: {e}");
+                break;
+            }
             Ok(n) => n,
         };
         let frames = match decoder.feed(&buf[..n]) {
