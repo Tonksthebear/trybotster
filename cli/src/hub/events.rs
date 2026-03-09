@@ -8,15 +8,15 @@
 // Rust guideline compliant 2026-02
 
 use crate::file_watcher::FileEvent;
+use crate::lua::primitives::action_cable::ActionCableRequest;
 use crate::lua::primitives::connection::ConnectionRequest;
 use crate::lua::primitives::http::CompletedHttpResponse;
 use crate::lua::primitives::hub::HubRequest;
+use crate::lua::primitives::hub_client::HubClientRequest;
 use crate::lua::primitives::pty::PtyRequest;
 use crate::lua::primitives::tui::TuiSendRequest;
 use crate::lua::primitives::webrtc::WebRtcSendRequest;
 use crate::lua::primitives::websocket::WsEvent;
-use crate::lua::primitives::action_cable::ActionCableRequest;
-use crate::lua::primitives::hub_client::HubClientRequest;
 use crate::lua::primitives::worktree::WorktreeRequest;
 use crate::socket::client_conn::SocketClientConn;
 use std::collections::BTreeMap;
@@ -141,7 +141,6 @@ pub(crate) enum HubEvent {
     // =========================================================================
     // Lua primitive events — sent directly from Lua closures via HubEventSender
     // =========================================================================
-
     /// WebRTC send request from a Lua callback.
     WebRtcSend(WebRtcSendRequest),
 
@@ -202,7 +201,6 @@ pub(crate) enum HubEvent {
     // =========================================================================
     // Socket IPC events — Unix domain socket client connections
     // =========================================================================
-
     /// A new socket client has connected.
     ///
     /// Sent from the socket server accept loop. The Hub stores the connection
@@ -260,7 +258,6 @@ pub(crate) enum HubEvent {
     // =========================================================================
     // Broker IPC events — PTY broker process output relay
     // =========================================================================
-
     /// Raw PTY output forwarded from the broker (relay mode after Hub restart).
     ///
     /// Sent by the demux reader thread installed via
@@ -289,7 +286,7 @@ pub(crate) enum HubEvent {
 
     /// Register a broker session → session UUID mapping in the Hub.
     ///
-    /// Sent by the `hub.register_pty_with_broker()` Lua primitive after the
+    /// Sent by the `hub.spawn_pty_with_broker()` Lua primitive after the
     /// broker returns a session ID for a newly transferred PTY FD. The Hub
     /// stores this mapping so `BrokerPtyOutput` frames can be routed to the
     /// correct session's shadow screen and event broadcast channel.
@@ -392,19 +389,27 @@ impl HubEvent {
                 browser_identity,
                 payload,
             } => BASE + browser_identity.len() + payload.len(),
-            Self::SocketPtyInput { client_id, data, .. } => BASE + client_id.len() + data.len(),
+            Self::SocketPtyInput {
+                client_id, data, ..
+            } => BASE + client_id.len() + data.len(),
             Self::BrokerPtyOutput { data, .. } => BASE + data.len(),
-            Self::SocketMessage { client_id, msg } => BASE + client_id.len() + msg.to_string().len(),
+            Self::SocketMessage { client_id, msg } => {
+                BASE + client_id.len() + msg.to_string().len()
+            }
             Self::HubClientMessage {
                 connection_id,
                 message,
             } => BASE + connection_id.len() + message.to_string().len(),
-            Self::AcChannelMessage { channel_id, message } => {
-                BASE + channel_id.len() + message.to_string().len()
-            }
+            Self::AcChannelMessage {
+                channel_id,
+                message,
+            } => BASE + channel_id.len() + message.to_string().len(),
             Self::UserFileWatch { watch_id, events } => BASE + watch_id.len() + (events.len() * 48),
             Self::PushSubscriptionsExpired { identities } => {
-                BASE + identities.iter().map(std::string::String::len).sum::<usize>()
+                BASE + identities
+                    .iter()
+                    .map(std::string::String::len)
+                    .sum::<usize>()
             }
             Self::LuaPushRequest { payload } => BASE + payload.to_string().len(),
             _ => BASE,
@@ -557,7 +562,10 @@ pub(crate) struct HubEventTx {
 
 impl HubEventTx {
     #[must_use]
-    pub(crate) fn new(inner: mpsc::UnboundedSender<HubEvent>, metrics: Arc<HubEventMetrics>) -> Self {
+    pub(crate) fn new(
+        inner: mpsc::UnboundedSender<HubEvent>,
+        metrics: Arc<HubEventMetrics>,
+    ) -> Self {
         Self { inner, metrics }
     }
 
@@ -571,7 +579,6 @@ impl HubEventTx {
         }
         Ok(())
     }
-
 }
 
 impl From<mpsc::UnboundedSender<HubEvent>> for HubEventTx {

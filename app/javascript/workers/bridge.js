@@ -22,6 +22,7 @@ class WorkerBridge {
   #cryptoWorkerPort = null
   #pendingCryptoRequests = new Map()
   #cryptoRequestId = 0
+  #cryptoReadyPromise = null
 
   #initialized = false
   #initPromise = null
@@ -59,7 +60,15 @@ class WorkerBridge {
       this.#cryptoWorker = new SharedWorker(cryptoWorkerUrl, { type: "module", name: "vodozemac-crypto" })
       this.#cryptoWorkerPort = this.#cryptoWorker.port
       this.#cryptoWorkerPort.onmessage = (e) => this.#handleCryptoMessage(e)
+      this.#cryptoWorkerPort.onmessageerror = (e) => {
+        console.error("[WorkerBridge] Crypto worker message error:", e)
+      }
+      this.#cryptoWorker.onerror = (e) => {
+        console.error("[WorkerBridge] Crypto worker error:", e)
+      }
       this.#cryptoWorkerPort.start()
+      this.#cryptoReadyPromise = this.#waitForCryptoReady()
+      await this.#cryptoReadyPromise
 
       // Initialize WASM via crypto worker
       await this.sendCrypto("init", { wasmJsUrl, wasmBinaryUrl })
@@ -102,6 +111,11 @@ class WorkerBridge {
   #handleCryptoMessage(messageEvent) {
     const data = messageEvent.data
 
+    if (data.event === "ready") {
+      console.debug("[WorkerBridge] Crypto worker connected", data)
+      return
+    }
+
     // Handle ping (heartbeat) - respond with pong
     if (data.event === "ping") {
       this.#cryptoWorkerPort.postMessage({ action: "pong" })
@@ -121,6 +135,32 @@ class WorkerBridge {
         pending.reject(new Error(data.error))
       }
     }
+  }
+
+  #waitForCryptoReady(timeout = 10000) {
+    return new Promise((resolve, reject) => {
+      if (!this.#cryptoWorkerPort) {
+        reject(new Error("Crypto worker not initialized"))
+        return
+      }
+
+      const previousHandler = this.#cryptoWorkerPort.onmessage
+      const timer = setTimeout(() => {
+        this.#cryptoWorkerPort.onmessage = previousHandler
+        reject(new Error("Crypto worker ready timeout"))
+      }, timeout)
+
+      this.#cryptoWorkerPort.onmessage = (event) => {
+        if (event.data?.event === "ready") {
+          clearTimeout(timer)
+          this.#cryptoWorkerPort.onmessage = previousHandler
+          resolve(event.data)
+          return
+        }
+
+        previousHandler?.(event)
+      }
+    })
   }
 
   /**

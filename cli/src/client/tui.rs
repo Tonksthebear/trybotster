@@ -61,6 +61,13 @@ pub enum TuiOutput {
     Scrollback {
         /// Session UUID for parser routing.
         session_uuid: String,
+        /// Authoritative terminal rows used to build this snapshot.
+        ///
+        /// Applying snapshot bytes at these dimensions avoids cursor/layout
+        /// drift when reconnect races local render-area updates.
+        rows: u16,
+        /// Authoritative terminal columns used to build this snapshot.
+        cols: u16,
         /// Raw scrollback data.
         data: Vec<u8>,
         /// Whether the inner PTY has kitty keyboard protocol active.
@@ -123,9 +130,21 @@ mod tests {
 
     #[test]
     fn test_tui_output_debug() {
-        let scrollback = TuiOutput::Scrollback { session_uuid: "sess-0".into(), data: vec![1, 2, 3], kitty_enabled: false };
-        let output = TuiOutput::Output { session_uuid: "sess-0".into(), data: vec![4, 5, 6] };
-        let exited = TuiOutput::ProcessExited { session_uuid: "sess-0".into(), exit_code: Some(0) };
+        let scrollback = TuiOutput::Scrollback {
+            session_uuid: "sess-0".into(),
+            rows: 24,
+            cols: 80,
+            data: vec![1, 2, 3],
+            kitty_enabled: false,
+        };
+        let output = TuiOutput::Output {
+            session_uuid: "sess-0".into(),
+            data: vec![4, 5, 6],
+        };
+        let exited = TuiOutput::ProcessExited {
+            session_uuid: "sess-0".into(),
+            exit_code: Some(0),
+        };
         let message = TuiOutput::Message(serde_json::json!({"type": "agent_created"}));
         let binary = TuiOutput::Binary(vec![0xFF, 0xFE]);
 

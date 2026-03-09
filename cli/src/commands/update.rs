@@ -148,41 +148,56 @@ pub fn check_on_boot_headless() -> Result<()> {
 
     if let (Some(cur), Some(lat)) = (current, latest) {
         if lat > cur {
-            log::warn!("Update available: v{VERSION} -> v{latest_str}. Run 'botster update' to install.");
+            log::warn!(
+                "Update available: v{VERSION} -> v{latest_str}. Run 'botster update' to install."
+            );
         }
     }
 
     Ok(())
 }
 
-/// Replaces the current process with the updated binary using the same arguments.
+/// Restarts the current process using the same executable and arguments.
 ///
-/// On success this function never returns — the current process image is replaced.
+/// This must behave like an in-place replacement from the user's perspective:
+/// the same session, stdio, and process identity continue into the rebuilt
+/// binary. Spawning a child and exiting breaks that contract for attached
+/// development workflows.
 ///
 /// # Errors
 ///
-/// Returns an error if `exec` fails (e.g., binary not found or permission denied).
+/// Returns an error if the replacement process cannot be executed.
 pub fn exec_restart() -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+
     let exe = std::env::current_exe()?;
     let args: Vec<String> = std::env::args().collect();
 
     println!("Restarting with updated binary...");
 
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(&args[1..]);
+
+    // Restart should behave like an in-place replacement from the user's
+    // perspective, so preserve the current stdio handles.
+    cmd.stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(&exe)
-            .args(&args[1..])
-            .exec();
-        // exec() only returns on error
-        anyhow::bail!("Failed to exec into updated binary: {err}");
+        let err = cmd.exec();
+        anyhow::bail!("failed to exec replacement process: {err}");
     }
 
     #[cfg(not(unix))]
     {
-        // Fallback for non-Unix: just tell the user to restart
-        println!("Please restart botster to use the new version.");
-        Ok(())
+        let status = cmd.status()?;
+        if status.success() {
+            std::process::exit(0);
+        }
+        anyhow::bail!("replacement process exited with status {status}");
     }
 }
 
@@ -480,7 +495,10 @@ fn replace_binary(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
     }
 
     // Fall back to sudo — this passes the password prompt through to the terminal
-    println!("Installing to {} requires elevated permissions.", dest.display());
+    println!(
+        "Installing to {} requires elevated permissions.",
+        dest.display()
+    );
     let status = std::process::Command::new("sudo")
         .arg("mv")
         .arg(src)
@@ -575,5 +593,4 @@ mod tests {
         }
         // On unsupported platforms, it should fail
     }
-
 }

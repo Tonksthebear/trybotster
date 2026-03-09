@@ -113,8 +113,7 @@ fn ensure_authenticated() -> Result<()> {
         log::info!(
             "New token saved and verified: {}...{}",
             &verify_config.get_api_key()[..10.min(verify_config.get_api_key().len())],
-            &verify_config.get_api_key()
-                [verify_config.get_api_key().len().saturating_sub(4)..]
+            &verify_config.get_api_key()[verify_config.get_api_key().len().saturating_sub(4)..]
         );
         return Ok(());
     }
@@ -160,8 +159,7 @@ fn ensure_authenticated() -> Result<()> {
         log::info!(
             "New token saved and verified: {}...{}",
             &verify_config.get_api_key()[..10.min(verify_config.get_api_key().len())],
-            &verify_config.get_api_key()
-                [verify_config.get_api_key().len().saturating_sub(4)..]
+            &verify_config.get_api_key()[verify_config.get_api_key().len().saturating_sub(4)..]
         );
     } else {
         println!("  Authentication valid.");
@@ -171,10 +169,7 @@ fn ensure_authenticated() -> Result<()> {
 }
 
 /// Save both hub and MCP tokens from auth response.
-fn save_tokens(
-    config: &mut Config,
-    token_response: &botster::auth::TokenResponse,
-) -> Result<()> {
+fn save_tokens(config: &mut Config, token_response: &botster::auth::TokenResponse) -> Result<()> {
     use botster::keyring::Credentials;
 
     // Save hub token via config (which updates Credentials internally)
@@ -315,7 +310,7 @@ fn run_headless() -> Result<()> {
     hub.setup();
 
     // Start socket server for IPC (allows `botster attach` and plugin access)
-    hub.start_socket_server();
+    hub.start_socket_server()?;
 
     // In headless mode, eagerly generate the connection URL so external
     // tools (system tests, automation) can read it from connection_url.txt
@@ -401,14 +396,19 @@ fn run_with_tui() -> Result<()> {
     hub.setup();
 
     // Start socket server for IPC (allows `botster attach` and plugin access)
-    hub.start_socket_server();
+    hub.start_socket_server()?;
 
     println!("Starting TUI...");
 
     // NOW setup terminal (after all initialization that could fail)
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, crossterm::event::EnableFocusChange)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        crossterm::event::EnableFocusChange
+    )?;
 
     // Kitty keyboard protocol is NOT pushed here — it's mirrored dynamically
     // from the inner PTY's state by sync_terminal_modes() in the event loop.
@@ -567,23 +567,37 @@ impl WakePipe {
                 let flags = libc::fcntl(fds[1], libc::F_GETFL);
                 libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
-            Self { read_fd: Some(fds[0]), write_fd: Some(fds[1]) }
+            Self {
+                read_fd: Some(fds[0]),
+                write_fd: Some(fds[1]),
+            }
         } else {
-            Self { read_fd: None, write_fd: None }
+            Self {
+                read_fd: None,
+                write_fd: None,
+            }
         }
     }
 
-    fn read_fd(&self) -> Option<i32> { self.read_fd }
-    fn write_fd(&self) -> Option<i32> { self.write_fd }
+    fn read_fd(&self) -> Option<i32> {
+        self.read_fd
+    }
+    fn write_fd(&self) -> Option<i32> {
+        self.write_fd
+    }
 }
 
 impl Drop for WakePipe {
     fn drop(&mut self) {
         if let Some(fd) = self.read_fd {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
         if let Some(fd) = self.write_fd {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
     }
 }
@@ -611,30 +625,31 @@ fn resolve_mcp_serve_socket() -> Result<String> {
     let session_uuid = std::env::var("BOTSTER_SESSION_UUID")
         .ok()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("BOTSTER_SESSION_UUID is required for mcp-serve")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("BOTSTER_SESSION_UUID is required for mcp-serve"))?;
 
-    let session_manifest = botster::env::session_manifest_path(&session_uuid)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Session manifest not found for BOTSTER_SESSION_UUID={session_uuid}"
-            )
-        })?;
+    let session_manifest = botster::env::session_manifest_path(&session_uuid).ok_or_else(|| {
+        anyhow::anyhow!("Session manifest not found for BOTSTER_SESSION_UUID={session_uuid}")
+    })?;
 
-    let content = std::fs::read_to_string(&session_manifest)
-        .with_context(|| format!("Failed to read session manifest at {}", session_manifest.display()))?;
-    let session: serde_json::Value = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse session manifest at {}", session_manifest.display()))?;
+    let content = std::fs::read_to_string(&session_manifest).with_context(|| {
+        format!(
+            "Failed to read session manifest at {}",
+            session_manifest.display()
+        )
+    })?;
+    let session: serde_json::Value = serde_json::from_str(&content).with_context(|| {
+        format!(
+            "Failed to parse session manifest at {}",
+            session_manifest.display()
+        )
+    })?;
 
     let hub_manifest_path = session
         .get("hub_manifest_path")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Session manifest missing hub_manifest_path for session {session_uuid}"
-            )
+            anyhow::anyhow!("Session manifest missing hub_manifest_path for session {session_uuid}")
         })?;
 
     let hub_content = std::fs::read_to_string(hub_manifest_path)
@@ -653,14 +668,13 @@ fn resolve_mcp_serve_socket() -> Result<String> {
     Ok(hub_manifest.socket_path)
 }
 
-
 ///
 /// Discovers a running hub (by directory or explicit `--hub` arg),
 /// connects to its socket, and runs the TUI with a bridge adapter.
 fn run_attach(hub_arg: Option<String>) -> Result<()> {
-    use std::sync::atomic::Ordering;
     use botster::hub::daemon;
     use botster::socket::tui_bridge::TuiBridge;
+    use std::sync::atomic::Ordering;
 
     // Require an interactive terminal
     if !atty::is(atty::Stream::Stdin) {
@@ -704,9 +718,9 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     // Connect to socket
-    let stream = rt.block_on(async {
-        tokio::net::UnixStream::connect(&socket_path).await
-    }).with_context(|| format!("Failed to connect to socket: {}", socket_path.display()))?;
+    let stream = rt
+        .block_on(async { tokio::net::UnixStream::connect(&socket_path).await })
+        .with_context(|| format!("Failed to connect to socket: {}", socket_path.display()))?;
 
     // Create wake pipe for TuiRunner (RAII guard ensures cleanup on any exit path)
     let pipe = WakePipe::new();
@@ -714,7 +728,12 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Create bridge
-    let (bridge, channels) = TuiBridge::connect(stream, pipe.write_fd(), Arc::clone(&shutdown));
+    let (bridge, channels) = TuiBridge::connect_with_reconnect(
+        stream,
+        Some(socket_path.clone()),
+        pipe.write_fd(),
+        Arc::clone(&shutdown),
+    );
 
     // Set up terminal — create guard BEFORE execute! so raw mode is restored
     // even if the crossterm commands fail.
@@ -722,7 +741,12 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
     let _terminal_guard = tui::TerminalGuard::new();
 
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, crossterm::event::EnableFocusChange)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        crossterm::event::EnableFocusChange
+    )?;
 
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
@@ -821,17 +845,17 @@ fn timestamp_now() -> String {
     let m = (secs / 60) % 60;
     let h = (secs / 3600) % 24;
     let days = secs / 86400; // days since 1970-01-01 (UTC)
-    // Gregorian calendar decomposition.
-    // Algorithm: http://howardhinnant.github.io/date_algorithms.html ("civil_from_days")
+                             // Gregorian calendar decomposition.
+                             // Algorithm: http://howardhinnant.github.io/date_algorithms.html ("civil_from_days")
     let z = days as i64 + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;                                    // day of era [0, 146096]
+    let doe = z - era * 146_097; // day of era [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // year of era [0, 399]
     let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);             // day of year [0, 365]
-    let mp = (5 * doy + 2) / 153;                                   // month prime [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1;                          // day [1, 31]
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };                // month [1, 12]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month prime [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
     let y = if mo <= 2 { y + 1 } else { y };
     format!("{y:04}{mo:02}{d:02}-{h:02}{m:02}{s:02}")
 }
@@ -880,7 +904,11 @@ struct CappedFileWriter {
 
 impl CappedFileWriter {
     fn new(file: std::fs::File, cap: u64) -> Self {
-        Self { file, bytes_written: 0, cap }
+        Self {
+            file,
+            bytes_written: 0,
+            cap,
+        }
     }
 }
 
@@ -976,7 +1004,7 @@ fn main() -> Result<()> {
         let _ = disable_raw_mode();
 
         // Reset mirrored terminal modes
-        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1l");    // Reset DECCKM
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1l"); // Reset DECCKM
         let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?2004l"); // Reset bracketed paste
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
 
@@ -994,12 +1022,18 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Start { headless } => {
             // Strict singleton policy: one live hub per directory-local hub ID.
-            let existing_hub = resolve_hub_id_for_cwd().and_then(|id| {
-                botster::hub::daemon::resolve_socket_for_hub_id(&id).map(|socket| (id, socket))
+            //
+            // A missing socket does not imply no live hub: startup races or an
+            // unsafe unlink can leave a live PID without a socket path. Treat a
+            // live PID as authoritative to avoid spawning duplicates.
+            let existing_hub = resolve_hub_id_for_cwd().map(|id| {
+                let socket = botster::hub::daemon::resolve_socket_for_hub_id(&id);
+                let pid_alive = botster::hub::daemon::is_hub_running(&id);
+                (id, socket, pid_alive)
             });
 
             if headless {
-                if let Some((hub_id, socket)) = existing_hub {
+                if let Some((hub_id, Some(socket), _)) = existing_hub.as_ref() {
                     anyhow::bail!(
                         "Hub already running for this directory (hub_id={}, socket={}). \
                          Use `botster attach --hub {}` or stop the existing hub first.",
@@ -1008,11 +1042,30 @@ fn main() -> Result<()> {
                         hub_id
                     );
                 }
+                if let Some((hub_id, None, true)) = existing_hub.as_ref() {
+                    let expected_socket = botster::hub::daemon::socket_path(hub_id)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| "<unknown>".to_string());
+                    anyhow::bail!(
+                        "Hub process already running for this directory (hub_id={hub_id}) \
+                         but socket is unavailable ({expected_socket}). Refusing to start a \
+                         duplicate hub. Stop the existing hub first."
+                    );
+                }
                 run_headless()?;
             } else {
-                if existing_hub.is_some() {
+                if let Some((_hub_id, Some(_socket), _)) = existing_hub.as_ref() {
                     println!("Hub already running — attaching...");
                     run_attach(None)?;
+                } else if let Some((hub_id, None, true)) = existing_hub.as_ref() {
+                    let expected_socket = botster::hub::daemon::socket_path(hub_id)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| "<unknown>".to_string());
+                    anyhow::bail!(
+                        "Hub process already running for this directory (hub_id={hub_id}) \
+                         but socket is unavailable ({expected_socket}). Refusing to start a \
+                         duplicate hub."
+                    );
                 } else {
                     run_with_tui()?;
                 }
@@ -1118,10 +1171,10 @@ mod tests {
         }
 
         let cases: &[(u64, &str)] = &[
-            (0,          "19700101-000000"), // Unix epoch
-            (86399,      "19700101-235959"), // last second of day 0
-            (86400,      "19700102-000000"), // first second of day 1
-            (951782400,  "20000229-000000"), // 2000-02-29 (Y2K leap year)
+            (0, "19700101-000000"),          // Unix epoch
+            (86399, "19700101-235959"),      // last second of day 0
+            (86400, "19700102-000000"),      // first second of day 1
+            (951782400, "20000229-000000"),  // 2000-02-29 (Y2K leap year)
             (1000000000, "20010909-014640"), // round billion
             (1709251200, "20240301-000000"), // 2024-03-01 (leap year boundary)
             (1740787200, "20250301-000000"), // 2025-03-01 (non-leap)

@@ -289,8 +289,8 @@ impl RawInputReader {
                 b @ (0x01..=0x1a | 0x1c..=0x1f) => {
                     let raw = vec![b];
                     let descriptor = match b {
-                        0x09 => "tab".to_string(),       // Ctrl+I = Tab
-                        0x0d => "enter".to_string(),     // Ctrl+M = Enter (CR)
+                        0x09 => "tab".to_string(),   // Ctrl+I = Tab
+                        0x0d => "enter".to_string(), // Ctrl+M = Enter (CR)
                         _ => {
                             let ch = (b + b'@') as char;
                             format!("ctrl+{}", ch.to_ascii_lowercase())
@@ -683,13 +683,11 @@ fn kitty_codepoint_to_descriptor(codepoint: Option<u32>, modifier_prefix: &str) 
             }
         }
         // Any other Unicode codepoint (including Kitty PUA functional keys)
-        Some(cp) => {
-            match char::from_u32(cp) {
-                Some(ch) if modifier_prefix.is_empty() => ch.to_string(),
-                Some(ch) => format!("{modifier_prefix}{ch}"),
-                None => String::new(),
-            }
-        }
+        Some(cp) => match char::from_u32(cp) {
+            Some(ch) if modifier_prefix.is_empty() => ch.to_string(),
+            Some(ch) => format!("{modifier_prefix}{ch}"),
+            None => String::new(),
+        },
         None => String::new(),
     }
 }
@@ -1091,12 +1089,12 @@ mod tests {
 
     #[test]
     fn test_modifier_to_prefix() {
-        assert_eq!(modifier_to_prefix(1), "");       // No modifier
-        assert_eq!(modifier_to_prefix(2), "shift+");  // Shift
-        assert_eq!(modifier_to_prefix(3), "alt+");     // Alt
-        assert_eq!(modifier_to_prefix(5), "ctrl+");    // Ctrl
+        assert_eq!(modifier_to_prefix(1), ""); // No modifier
+        assert_eq!(modifier_to_prefix(2), "shift+"); // Shift
+        assert_eq!(modifier_to_prefix(3), "alt+"); // Alt
+        assert_eq!(modifier_to_prefix(5), "ctrl+"); // Ctrl
         assert_eq!(modifier_to_prefix(6), "ctrl+shift+"); // Ctrl+Shift
-        assert_eq!(modifier_to_prefix(7), "ctrl+alt+");   // Ctrl+Alt
+        assert_eq!(modifier_to_prefix(7), "ctrl+alt+"); // Ctrl+Alt
         assert_eq!(modifier_to_prefix(8), "ctrl+shift+alt+"); // Ctrl+Shift+Alt
     }
 
@@ -1341,9 +1339,6 @@ mod tests {
         let mut r = reader_with_bytes(b"\x1b[200~\x1b[201~");
         let events = r.parse_events();
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            first_paste_bytes(&events),
-            b"\x1b[200~\x1b[201~"
-        );
+        assert_eq!(first_paste_bytes(&events), b"\x1b[200~\x1b[201~");
     }
 }

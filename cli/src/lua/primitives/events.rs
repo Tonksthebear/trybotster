@@ -156,9 +156,7 @@ impl EventCallbacks {
     /// Check if any callbacks are registered for an event.
     #[must_use]
     pub fn has_callbacks(&self, event: &str) -> bool {
-        self.callbacks
-            .get(event)
-            .map_or(false, |v| !v.is_empty())
+        self.callbacks.get(event).map_or(false, |v| !v.is_empty())
     }
 
     /// Get total number of registered callbacks across all events.
@@ -212,8 +210,7 @@ pub fn register(lua: &Lua, callbacks: SharedEventCallbacks) -> Result<()> {
     let cb = Arc::clone(&callbacks);
     let on_fn = lua
         .create_function(move |lua, (event, callback): (String, LuaFunction)| {
-            let mut cbs = cb.lock()
-                .expect("Event callbacks mutex poisoned");
+            let mut cbs = cb.lock().expect("Event callbacks mutex poisoned");
             let id = cbs
                 .register(lua, &event, callback)
                 .map_err(LuaError::external)?;
@@ -229,8 +226,7 @@ pub fn register(lua: &Lua, callbacks: SharedEventCallbacks) -> Result<()> {
     let cb2 = Arc::clone(&callbacks);
     let off_fn = lua
         .create_function(move |lua, subscription_id: String| {
-            let mut cbs = cb2.lock()
-                .expect("Event callbacks mutex poisoned");
+            let mut cbs = cb2.lock().expect("Event callbacks mutex poisoned");
             cbs.unregister(lua, &subscription_id);
             Ok(())
         })
@@ -244,8 +240,7 @@ pub fn register(lua: &Lua, callbacks: SharedEventCallbacks) -> Result<()> {
     let cb3 = Arc::clone(&callbacks);
     let has_fn = lua
         .create_function(move |_, event: String| {
-            let cbs = cb3.lock()
-                .expect("Event callbacks mutex poisoned");
+            let cbs = cb3.lock().expect("Event callbacks mutex poisoned");
             Ok(cbs.has_callbacks(&event))
         })
         .map_err(|e| anyhow!("Failed to create events.has function: {e}"))?;
@@ -386,7 +381,10 @@ mod tests {
 
         register(&lua, callbacks).expect("Should register events primitives");
 
-        let events: LuaTable = lua.globals().get("events").expect("events table should exist");
+        let events: LuaTable = lua
+            .globals()
+            .get("events")
+            .expect("events table should exist");
         assert!(events.contains_key("on").unwrap());
         assert!(events.contains_key("off").unwrap());
         assert!(events.contains_key("has").unwrap());
@@ -411,8 +409,7 @@ mod tests {
 
         assert!(id.starts_with("evt_"));
 
-        let cbs = callbacks.lock()
-            .expect("Event callbacks mutex poisoned");
+        let cbs = callbacks.lock().expect("Event callbacks mutex poisoned");
         assert!(cbs.has_callbacks("test_event"));
     }
 
@@ -432,8 +429,7 @@ mod tests {
         .exec()
         .unwrap();
 
-        let cbs = callbacks.lock()
-            .expect("Event callbacks mutex poisoned");
+        let cbs = callbacks.lock().expect("Event callbacks mutex poisoned");
         assert!(!cbs.has_callbacks("test_event"));
     }
 
@@ -444,17 +440,26 @@ mod tests {
 
         register(&lua, callbacks).expect("Should register");
 
-        let has_before: bool = lua.load(r#"return events.has("test_event")"#).eval().unwrap();
+        let has_before: bool = lua
+            .load(r#"return events.has("test_event")"#)
+            .eval()
+            .unwrap();
         assert!(!has_before);
 
         lua.load(r#"events.on("test_event", function() end)"#)
             .exec()
             .unwrap();
 
-        let has_after: bool = lua.load(r#"return events.has("test_event")"#).eval().unwrap();
+        let has_after: bool = lua
+            .load(r#"return events.has("test_event")"#)
+            .eval()
+            .unwrap();
         assert!(has_after);
 
-        let has_other: bool = lua.load(r#"return events.has("other_event")"#).eval().unwrap();
+        let has_other: bool = lua
+            .load(r#"return events.has("other_event")"#)
+            .eval()
+            .unwrap();
         assert!(!has_other);
     }
 
@@ -475,8 +480,7 @@ mod tests {
         .exec()
         .unwrap();
 
-        let cbs = callbacks.lock()
-            .expect("Event callbacks mutex poisoned");
+        let cbs = callbacks.lock().expect("Event callbacks mutex poisoned");
         assert_eq!(cbs.get_callbacks("test_event").len(), 3);
     }
 
@@ -502,8 +506,7 @@ mod tests {
         .unwrap();
 
         // Get the callback and invoke it
-        let cbs = callbacks.lock()
-            .expect("Event callbacks mutex poisoned");
+        let cbs = callbacks.lock().expect("Event callbacks mutex poisoned");
         let keys = cbs.get_callbacks("test_event");
         assert_eq!(keys.len(), 1);
 

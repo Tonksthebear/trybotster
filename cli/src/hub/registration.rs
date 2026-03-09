@@ -24,7 +24,6 @@
 
 // Rust guideline compliant 2026-02
 
-
 use reqwest::blocking::Client;
 
 use crate::config::Config;
@@ -64,13 +63,11 @@ pub fn register_hub_with_server(
     hub_name: Option<&str>,
 ) -> String {
     // Detect repo: env var > git detection (optional — not stored on server)
-    let repo_name: Option<String> = std::env::var("BOTSTER_REPO")
-        .ok()
-        .or_else(|| {
-            crate::git::WorktreeManager::detect_current_repo()
-                .map(|(_, name)| name)
-                .ok()
-        });
+    let repo_name: Option<String> = std::env::var("BOTSTER_REPO").ok().or_else(|| {
+        crate::git::WorktreeManager::detect_current_repo()
+            .map(|(_, name)| name)
+            .ok()
+    });
 
     if repo_name.is_none() && !crate::env::is_any_test() {
         log::warn!("Not in a git repository — GitHub event subscription disabled. Run from a git repo or set BOTSTER_REPO env var.");
@@ -92,6 +89,8 @@ pub fn register_hub_with_server(
     log::info!("Registering hub with server to get Botster ID...");
     match reqwest::blocking::Client::builder()
         .user_agent(crate::constants::user_agent())
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .expect("failed to build HTTP client")
         .post(&url)
@@ -152,7 +151,6 @@ pub fn init_crypto_service(browser: &mut BrowserState, local_identifier: &str) {
     browser.relay_connected = true;
     log::info!("CryptoService created - bundle will be generated on first request");
 }
-
 
 /// Generate the DeviceKeyBundle lazily on first request.
 ///
@@ -325,9 +323,18 @@ mod tests {
         init_crypto_service(&mut browser, "test-hub-id");
 
         // After init: crypto service started, but no bundle yet
-        assert!(browser.crypto_service.is_some(), "CryptoService should be started");
-        assert!(browser.device_key_bundle.is_none(), "Bundle should NOT be generated at init");
-        assert!(browser.relay_connected, "relay_connected should be true after init");
+        assert!(
+            browser.crypto_service.is_some(),
+            "CryptoService should be started"
+        );
+        assert!(
+            browser.device_key_bundle.is_none(),
+            "Bundle should NOT be generated at init"
+        );
+        assert!(
+            browser.relay_connected,
+            "relay_connected should be true after init"
+        );
     }
 
     #[test]
@@ -345,7 +352,10 @@ mod tests {
         // First call should generate bundle
         let result1 = get_or_generate_connection_bundle(&mut browser, &runtime);
         assert!(result1.is_ok(), "First bundle generation should succeed");
-        assert!(browser.device_key_bundle.is_some(), "Bundle should be cached");
+        assert!(
+            browser.device_key_bundle.is_some(),
+            "Bundle should be cached"
+        );
         assert!(!browser.bundle_used, "Bundle should not be marked as used");
 
         // Get the curve25519 key from first bundle (identity key equivalent)
@@ -354,7 +364,11 @@ mod tests {
         // Second call should return cached bundle (same identity)
         let result2 = get_or_generate_connection_bundle(&mut browser, &runtime);
         assert!(result2.is_ok());
-        assert_eq!(result2.unwrap().curve25519_key, curve25519_1, "Should return cached bundle");
+        assert_eq!(
+            result2.unwrap().curve25519_key,
+            curve25519_1,
+            "Should return cached bundle"
+        );
     }
 
     #[test]
@@ -381,12 +395,21 @@ mod tests {
         let bundle2 = result2.unwrap();
 
         // bundle_used should be reset after regeneration
-        assert!(!browser.bundle_used, "bundle_used should be reset after regeneration");
+        assert!(
+            !browser.bundle_used,
+            "bundle_used should be reset after regeneration"
+        );
 
         // Both bundles should have the same curve25519 key (same crypto service)
-        assert_eq!(bundle1.curve25519_key, bundle2.curve25519_key, "Curve25519 key should remain same");
+        assert_eq!(
+            bundle1.curve25519_key, bundle2.curve25519_key,
+            "Curve25519 key should remain same"
+        );
 
         // Both bundles should have valid one-time keys
-        assert!(!bundle2.one_time_key.is_empty(), "Regenerated bundle should have a one-time key");
+        assert!(
+            !bundle2.one_time_key.is_empty(),
+            "Regenerated bundle should have a one-time key"
+        );
     }
 }

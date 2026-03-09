@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
-use crate::hub::events::HubEvent;
 use super::client_conn::SocketClientConn;
+use crate::hub::events::HubEvent;
 
 /// Unix domain socket server for Hub IPC.
 ///
@@ -51,10 +51,23 @@ impl SocketServer {
             );
         }
 
-        // Remove stale socket file if it exists
+        // If the socket path is already serving a live listener, refuse to
+        // start and let the caller handle singleton semantics. Only unlink
+        // when connect fails (stale filesystem entry).
         if socket_path.exists() {
-            std::fs::remove_file(&socket_path)
-                .with_context(|| format!("Failed to remove stale socket: {}", socket_path.display()))?;
+            match std::os::unix::net::UnixStream::connect(&socket_path) {
+                Ok(_) => {
+                    anyhow::bail!(
+                        "Socket already in use by a live hub: {}",
+                        socket_path.display()
+                    );
+                }
+                Err(_) => {
+                    std::fs::remove_file(&socket_path).with_context(|| {
+                        format!("Failed to remove stale socket: {}", socket_path.display())
+                    })?;
+                }
+            }
         }
 
         // Ensure parent directory exists
@@ -100,16 +113,13 @@ impl SocketServer {
                     let client_id = generate_client_id();
                     log::info!("[Socket] Client connected: {}", client_id);
 
-                    let conn = SocketClientConn::new(
-                        client_id.clone(),
-                        stream,
-                        hub_event_tx.clone(),
-                    );
+                    let conn =
+                        SocketClientConn::new(client_id.clone(), stream, hub_event_tx.clone());
 
-                    if hub_event_tx.send(HubEvent::SocketClientConnected {
-                        client_id,
-                        conn,
-                    }).is_err() {
+                    if hub_event_tx
+                        .send(HubEvent::SocketClientConnected { client_id, conn })
+                        .is_err()
+                    {
                         log::warn!("[Socket] Hub event channel closed, stopping accept loop");
                         break;
                     }
@@ -166,13 +176,10 @@ mod tests {
 
         let _stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            hub_rx.recv(),
-        )
-        .await
-        .expect("Timed out waiting for connect event")
-        .expect("Channel closed");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
+            .await
+            .expect("Timed out waiting for connect event")
+            .expect("Channel closed");
 
         match event {
             HubEvent::SocketClientConnected { client_id, conn } => {
@@ -198,17 +205,15 @@ mod tests {
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
 
         // Consume connect event, grab client_id
-        let connected_id = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            hub_rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        {
-            HubEvent::SocketClientConnected { client_id, .. } => client_id,
-            other => panic!("Expected SocketClientConnected, got: {other:?}"),
-        };
+        let connected_id =
+            match tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                HubEvent::SocketClientConnected { client_id, .. } => client_id,
+                other => panic!("Expected SocketClientConnected, got: {other:?}"),
+            };
 
         // Send a JSON frame from the "client" side
         let frame = Frame::Json(serde_json::json!({
@@ -218,13 +223,10 @@ mod tests {
         }));
         stream.write_all(&frame.encode()).await.unwrap();
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            hub_rx.recv(),
-        )
-        .await
-        .expect("Timed out waiting for message event")
-        .expect("Channel closed");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
+            .await
+            .expect("Timed out waiting for message event")
+            .expect("Channel closed");
 
         match event {
             HubEvent::SocketMessage { client_id, msg } => {
@@ -248,7 +250,9 @@ mod tests {
 
         // Consume connect event
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
 
         let frame = Frame::PtyInput {
             session_uuid: "sess-abc-123".to_string(),
@@ -257,10 +261,14 @@ mod tests {
         stream.write_all(&frame.encode()).await.unwrap();
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
-            .await.expect("Timed out").expect("Channel closed");
+            .await
+            .expect("Timed out")
+            .expect("Channel closed");
 
         match event {
-            HubEvent::SocketPtyInput { session_uuid, data, .. } => {
+            HubEvent::SocketPtyInput {
+                session_uuid, data, ..
+            } => {
                 assert_eq!(session_uuid, "sess-abc-123");
                 assert_eq!(data, b"ls -la\n");
             }
@@ -278,7 +286,9 @@ mod tests {
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
 
         let conn = match tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
-            .await.unwrap().unwrap()
+            .await
+            .unwrap()
+            .unwrap()
         {
             HubEvent::SocketClientConnected { conn, .. } => conn,
             other => panic!("Expected SocketClientConnected, got: {other:?}"),
@@ -293,7 +303,9 @@ mod tests {
         // Read it from the client side
         let mut buf = [0u8; 4096];
         let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
-            .await.expect("Timed out").expect("Read failed");
+            .await
+            .expect("Timed out")
+            .expect("Read failed");
 
         let mut decoder = FrameDecoder::new();
         let frames = decoder.feed(&buf[..n]).unwrap();
@@ -318,18 +330,23 @@ mod tests {
         let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
 
-        let connected_id = match tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
-            .await.unwrap().unwrap()
-        {
-            HubEvent::SocketClientConnected { client_id, .. } => client_id,
-            other => panic!("Expected SocketClientConnected, got: {other:?}"),
-        };
+        let connected_id =
+            match tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                HubEvent::SocketClientConnected { client_id, .. } => client_id,
+                other => panic!("Expected SocketClientConnected, got: {other:?}"),
+            };
 
         // Drop stream to disconnect
         drop(stream);
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
-            .await.expect("Timed out").expect("Channel closed");
+            .await
+            .expect("Timed out")
+            .expect("Channel closed");
 
         match event {
             HubEvent::SocketClientDisconnected { client_id } => {
@@ -354,7 +371,9 @@ mod tests {
         let mut ids = Vec::new();
         for _ in 0..3 {
             let event = tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
-                .await.expect("Timed out").expect("Channel closed");
+                .await
+                .expect("Timed out")
+                .expect("Channel closed");
             match event {
                 HubEvent::SocketClientConnected { client_id, .. } => ids.push(client_id),
                 other => panic!("Expected SocketClientConnected, got: {other:?}"),
@@ -362,7 +381,11 @@ mod tests {
         }
 
         let unique: std::collections::HashSet<&String> = ids.iter().collect();
-        assert_eq!(unique.len(), 3, "All client IDs should be unique, got: {ids:?}");
+        assert_eq!(
+            unique.len(),
+            3,
+            "All client IDs should be unique, got: {ids:?}"
+        );
     }
 
     #[tokio::test]
@@ -376,7 +399,9 @@ mod tests {
 
         // Consume connect event
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
 
         // Send PtyOutput (hub→client only, unexpected from client)
         let bad = Frame::PtyOutput {
@@ -391,7 +416,9 @@ mod tests {
 
         // The valid frame should still arrive (bad one was ignored, not fatal)
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
-            .await.expect("Timed out").expect("Channel closed");
+            .await
+            .expect("Timed out")
+            .expect("Channel closed");
 
         match event {
             HubEvent::SocketMessage { msg, .. } => assert_eq!(msg["type"], "ping"),
@@ -409,7 +436,9 @@ mod tests {
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
 
         let conn = match tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
-            .await.unwrap().unwrap()
+            .await
+            .unwrap()
+            .unwrap()
         {
             HubEvent::SocketClientConnected { conn, .. } => conn,
             other => panic!("Expected SocketClientConnected, got: {other:?}"),
@@ -420,7 +449,9 @@ mod tests {
 
         let mut buf = [0u8; 4096];
         let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
-            .await.expect("Timed out").expect("Read error");
+            .await
+            .expect("Timed out")
+            .expect("Read error");
 
         let mut decoder = FrameDecoder::new();
         let frames = decoder.feed(&buf[..n]).unwrap();
@@ -444,6 +475,29 @@ mod tests {
         let result = SocketServer::start(sock_path, hub_tx.into());
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("too long"), "Error should mention path too long: {err_msg}");
+        assert!(
+            err_msg.contains("too long"),
+            "Error should mention path too long: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_refuses_live_socket_instead_of_unlinking() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock_path = tmp.path().join("test.sock");
+        let (hub_tx, _hub_rx) = mpsc::unbounded_channel::<HubEvent>();
+
+        let server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
+
+        let (hub_tx2, _hub_rx2) = mpsc::unbounded_channel::<HubEvent>();
+        let err = SocketServer::start(sock_path.clone(), hub_tx2.into())
+            .expect_err("second start must fail while first listener is alive");
+        assert!(
+            err.to_string().contains("already in use"),
+            "expected live-socket error, got: {err}"
+        );
+        assert!(sock_path.exists(), "live socket file must not be unlinked");
+
+        server.shutdown();
     }
 }

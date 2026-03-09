@@ -192,11 +192,7 @@ impl StreamMultiplexer {
                 let mut write_rx = write_rx;
                 while let Some(data) = write_rx.recv().await {
                     if let Err(e) = write_half.write_all(&data).await {
-                        log::debug!(
-                            "[StreamMux] Write error on stream {}: {}",
-                            stream_id,
-                            e
-                        );
+                        log::debug!("[StreamMux] Write error on stream {}: {}", stream_id, e);
                         break;
                     }
                 }

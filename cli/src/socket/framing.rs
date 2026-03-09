@@ -10,7 +10,7 @@
 //! - `0x01`: JSON message (UTF-8 `serde_json::Value`)
 //! - `0x02`: PTY output binary (hub→client) — `[u16 uuid_len][uuid][raw bytes]`
 //! - `0x03`: PTY input binary (client→hub) — `[u16 uuid_len][uuid][raw bytes]`
-//! - `0x04`: PTY scrollback (hub→client) — `[u16 uuid_len][uuid][u8 kitty][raw bytes]`
+//! - `0x04`: PTY scrollback (hub→client) — `[u16 uuid_len][uuid][u16 rows][u16 cols][u8 kitty][raw bytes]`
 //! - `0x05`: Process exited (hub→client) — `[u16 uuid_len][uuid][i32 exit_code]`
 //! - `0x06`: Raw binary (bidirectional) — `[raw bytes]`
 
@@ -61,6 +61,10 @@ pub enum Frame {
     Scrollback {
         /// Session UUID identifying the PTY.
         session_uuid: String,
+        /// Authoritative rows used to generate this snapshot.
+        rows: u16,
+        /// Authoritative cols used to generate this snapshot.
+        cols: u16,
         /// Whether kitty keyboard protocol is active.
         kitty_enabled: bool,
         /// Raw scrollback bytes.
@@ -99,7 +103,10 @@ fn decode_session_uuid(payload: &[u8]) -> Result<(String, usize)> {
     let uuid_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
     let total = 2 + uuid_len;
     if payload.len() < total {
-        bail!("Frame too short for session UUID: need {total}, have {}", payload.len());
+        bail!(
+            "Frame too short for session UUID: need {total}, have {}",
+            payload.len()
+        );
     }
     let uuid = std::str::from_utf8(&payload[2..total])
         .map_err(|e| anyhow!("Invalid UTF-8 in session UUID: {e}"))?
@@ -129,22 +136,32 @@ impl Frame {
                 payload.extend_from_slice(data);
                 encode_raw(frame_type::PTY_INPUT, &payload)
             }
-            Frame::Scrollback { session_uuid, kitty_enabled, data } => {
-                let mut payload = Vec::with_capacity(2 + session_uuid.len() + 1 + data.len());
+            Frame::Scrollback {
+                session_uuid,
+                rows,
+                cols,
+                kitty_enabled,
+                data,
+            } => {
+                let mut payload =
+                    Vec::with_capacity(2 + session_uuid.len() + 2 + 2 + 1 + data.len());
                 encode_session_uuid(&mut payload, session_uuid);
+                payload.extend_from_slice(&rows.to_le_bytes());
+                payload.extend_from_slice(&cols.to_le_bytes());
                 payload.push(u8::from(*kitty_enabled));
                 payload.extend_from_slice(data);
                 encode_raw(frame_type::SCROLLBACK, &payload)
             }
-            Frame::ProcessExited { session_uuid, exit_code } => {
+            Frame::ProcessExited {
+                session_uuid,
+                exit_code,
+            } => {
                 let mut payload = Vec::with_capacity(2 + session_uuid.len() + 4);
                 encode_session_uuid(&mut payload, session_uuid);
                 payload.extend_from_slice(&exit_code.unwrap_or(-1).to_le_bytes());
                 encode_raw(frame_type::PROCESS_EXITED, &payload)
             }
-            Frame::Binary(data) => {
-                encode_raw(frame_type::BINARY, data)
-            }
+            Frame::Binary(data) => encode_raw(frame_type::BINARY, data),
         }
     }
 }
@@ -163,8 +180,8 @@ fn encode_raw(frame_type: u8, payload: &[u8]) -> Vec<u8> {
 fn decode_frame(frame_type: u8, payload: &[u8]) -> Result<Frame> {
     match frame_type {
         frame_type::JSON => {
-            let value: serde_json::Value = serde_json::from_slice(payload)
-                .map_err(|e| anyhow!("Invalid JSON frame: {e}"))?;
+            let value: serde_json::Value =
+                serde_json::from_slice(payload).map_err(|e| anyhow!("Invalid JSON frame: {e}"))?;
             Ok(Frame::Json(value))
         }
         frame_type::PTY_OUTPUT => {
@@ -183,14 +200,18 @@ fn decode_frame(frame_type: u8, payload: &[u8]) -> Result<Frame> {
         }
         frame_type::SCROLLBACK => {
             let (session_uuid, consumed) = decode_session_uuid(payload)?;
-            if payload.len() < consumed + 1 {
-                bail!("Scrollback frame too short for kitty flag");
+            if payload.len() < consumed + 5 {
+                bail!("Scrollback frame too short for rows/cols/kitty");
             }
-            let kitty_enabled = payload[consumed] != 0;
+            let rows = u16::from_le_bytes([payload[consumed], payload[consumed + 1]]);
+            let cols = u16::from_le_bytes([payload[consumed + 2], payload[consumed + 3]]);
+            let kitty_enabled = payload[consumed + 4] != 0;
             Ok(Frame::Scrollback {
                 session_uuid,
+                rows,
+                cols,
                 kitty_enabled,
-                data: payload[consumed + 1..].to_vec(),
+                data: payload[consumed + 5..].to_vec(),
             })
         }
         frame_type::PROCESS_EXITED => {
@@ -210,9 +231,7 @@ fn decode_frame(frame_type: u8, payload: &[u8]) -> Result<Frame> {
                 exit_code,
             })
         }
-        frame_type::BINARY => {
-            Ok(Frame::Binary(payload.to_vec()))
-        }
+        frame_type::BINARY => Ok(Frame::Binary(payload.to_vec())),
         _ => bail!("Unknown frame type: 0x{frame_type:02x}"),
     }
 }
@@ -333,6 +352,8 @@ mod tests {
     fn test_scrollback_round_trip() {
         let frame = Frame::Scrollback {
             session_uuid: "sess-ghi-789".to_string(),
+            rows: 24,
+            cols: 80,
             kitty_enabled: true,
             data: b"scrollback content".to_vec(),
         };
@@ -372,7 +393,10 @@ mod tests {
     #[test]
     fn test_multiple_frames_in_single_feed() {
         let f1 = Frame::Json(serde_json::json!({"msg": 1}));
-        let f2 = Frame::PtyOutput { session_uuid: "sess-0".to_string(), data: b"data".to_vec() };
+        let f2 = Frame::PtyOutput {
+            session_uuid: "sess-0".to_string(),
+            data: b"data".to_vec(),
+        };
         let f3 = Frame::Json(serde_json::json!({"msg": 2}));
 
         let mut buf = Vec::new();
@@ -493,7 +517,10 @@ mod tests {
         let mut decoder = FrameDecoder::new();
         let frames = decoder.feed(&encoded).unwrap();
         assert_eq!(frames.len(), 1);
-        if let Frame::PtyOutput { data: decoded_data, .. } = &frames[0] {
+        if let Frame::PtyOutput {
+            data: decoded_data, ..
+        } = &frames[0]
+        {
             assert_eq!(decoded_data.len(), data.len());
         } else {
             panic!("Expected PtyOutput");

@@ -78,7 +78,6 @@ use crate::terminal::{AlacrittyParser, DEFAULT_SCROLLBACK_LINES};
 /// Default channel capacity for PTY command channels.
 const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
 
-
 /// Default broadcast channel capacity.
 ///
 /// This determines how many events can be buffered before slow receivers
@@ -305,9 +304,12 @@ impl PtySession {
             reader_thread: None,
             command_processor_handle: None,
             child: None,
-            shadow_screen: Arc::new(Mutex::new(
-                AlacrittyParser::new_with_listener(rows, cols, DEFAULT_SCROLLBACK_LINES, listener),
-            )),
+            shadow_screen: Arc::new(Mutex::new(AlacrittyParser::new_with_listener(
+                rows,
+                cols,
+                DEFAULT_SCROLLBACK_LINES,
+                listener,
+            ))),
             event_tx,
             command_tx,
             command_rx: Some(command_rx),
@@ -505,7 +507,13 @@ impl PtySession {
     /// Returns a tuple of (event_tx, command_tx, port) that can be used to create
     /// a `PtyHandle` for client access.
     #[must_use]
-    pub fn get_channels(&self) -> (broadcast::Sender<PtyEvent>, mpsc::Sender<PtyCommand>, Option<u16>) {
+    pub fn get_channels(
+        &self,
+    ) -> (
+        broadcast::Sender<PtyEvent>,
+        mpsc::Sender<PtyCommand>,
+        Option<u16>,
+    ) {
         (self.event_tx.clone(), self.command_tx.clone(), self.port)
     }
 
@@ -842,7 +850,6 @@ impl PtySession {
     pub fn kitty_enabled(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.kitty_enabled)
     }
-
 }
 
 impl Drop for PtySession {
@@ -883,10 +890,7 @@ async fn run_command_processor(
 ///
 /// Handles Input commands using the shared state.
 /// This is called from the async command processor task.
-fn process_single_command(
-    cmd: PtyCommand,
-    shared_state: &Arc<Mutex<SharedPtyState>>,
-) {
+fn process_single_command(cmd: PtyCommand, shared_state: &Arc<Mutex<SharedPtyState>>) {
     match cmd {
         PtyCommand::Input(data) => {
             let mut state = shared_state.lock().expect("shared_state lock poisoned");
@@ -920,9 +924,7 @@ pub(crate) fn do_resize(
 ) {
     // 1. Shadow screen first — ready for new-size output.
     let old_dims = {
-        let mut parser = shadow_screen
-            .lock()
-            .expect("shadow_screen lock poisoned");
+        let mut parser = shadow_screen.lock().expect("shadow_screen lock poisoned");
         let old = (
             parser.term().grid().screen_lines() as u16,
             parser.term().grid().columns() as u16,
@@ -946,9 +948,7 @@ pub(crate) fn do_resize(
             }) {
                 log::warn!("Failed to resize PTY: {e}");
                 // Revert shadow screen to match the actual PTY dimensions.
-                let mut parser = shadow_screen
-                    .lock()
-                    .expect("shadow_screen lock poisoned");
+                let mut parser = shadow_screen.lock().expect("shadow_screen lock poisoned");
                 parser.resize(old_dims.0, old_dims.1);
                 state.dimensions = (old_dims.0, old_dims.1);
                 return;
@@ -966,7 +966,6 @@ pub(crate) fn do_resize(
     // Broadcast resize event
     let _ = event_tx.send(PtyEvent::resized(rows, cols));
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1062,7 +1061,10 @@ mod tests {
         let snapshot = session.get_snapshot();
         let snapshot_str = String::from_utf8_lossy(&snapshot);
 
-        assert!(snapshot_str.contains("hello"), "snapshot should contain screen content");
+        assert!(
+            snapshot_str.contains("hello"),
+            "snapshot should contain screen content"
+        );
         assert!(
             snapshot.windows(5).any(|w| w == b"\x1b[>1u"),
             "snapshot should end with kitty push sequence (CSI > 1 u)"
@@ -1073,11 +1075,7 @@ mod tests {
     fn test_snapshot_excludes_kitty_when_disabled() {
         let session = PtySession::new(24, 80);
 
-        session
-            .shadow_screen
-            .lock()
-            .unwrap()
-            .process(b"hello");
+        session.shadow_screen.lock().unwrap().process(b"hello");
 
         // kitty_enabled defaults to false
         let snapshot = session.get_snapshot();
@@ -1096,7 +1094,7 @@ mod tests {
         {
             let mut p = session.shadow_screen.lock().unwrap();
             p.process(b"\x1b[>1u"); // push
-            p.process(b"\x1b[<u");  // pop
+            p.process(b"\x1b[<u"); // pop
         }
 
         let snapshot = session.get_snapshot();
@@ -1215,7 +1213,11 @@ mod tests {
         session.broadcast(PtyEvent::output(b"second".to_vec()));
         session.broadcast(PtyEvent::output(b"third".to_vec()));
 
-        let expected = [b"first".as_slice(), b"second".as_slice(), b"third".as_slice()];
+        let expected = [
+            b"first".as_slice(),
+            b"second".as_slice(),
+            b"third".as_slice(),
+        ];
         for (i, expected_data) in expected.iter().enumerate() {
             let event = rx
                 .try_recv()
@@ -1255,7 +1257,9 @@ mod tests {
         let output_data = b"PTY output from reader thread";
         let _ = tx.send(PtyEvent::output(output_data.to_vec()));
 
-        let event = rx.try_recv().expect("Should receive event from cloned sender");
+        let event = rx
+            .try_recv()
+            .expect("Should receive event from cloned sender");
         match event {
             PtyEvent::Output(data) => assert_eq!(data, output_data),
             _ => panic!("Expected Output event"),
@@ -1279,7 +1283,12 @@ mod tests {
                 .unwrap_or_else(|_| panic!("Event {} should exist", i));
             match event {
                 PtyEvent::Output(data) => {
-                    assert_eq!(String::from_utf8_lossy(&data), expected, "Event {} wrong", i);
+                    assert_eq!(
+                        String::from_utf8_lossy(&data),
+                        expected,
+                        "Event {} wrong",
+                        i
+                    );
                 }
                 _ => panic!("Event {} should be Output", i),
             }
@@ -1299,10 +1308,7 @@ mod tests {
             last_human_input_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }));
 
-        process_single_command(
-            PtyCommand::Input(b"test input".to_vec()),
-            &shared_state,
-        );
+        process_single_command(PtyCommand::Input(b"test input".to_vec()), &shared_state);
     }
 
     #[test]

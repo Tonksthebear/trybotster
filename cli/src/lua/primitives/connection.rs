@@ -95,11 +95,9 @@ pub(crate) fn register(
     //   failure: nil, error_message
     let cache = Arc::clone(&handle_cache);
     let get_url_fn = lua
-        .create_function(move |_, ()| {
-            match cache.get_connection_url() {
-                Ok(url) => Ok((Some(url), None::<String>)),
-                Err(err) => Ok((None::<String>, Some(err))),
-            }
+        .create_function(move |_, ()| match cache.get_connection_url() {
+            Ok(url) => Ok((Some(url), None::<String>)),
+            Err(err) => Ok((None::<String>, Some(err))),
         })
         .map_err(|e| anyhow!("Failed to create connection.get_url function: {e}"))?;
 
@@ -121,7 +119,9 @@ pub(crate) fn register(
             if let Some(ref sender) = *guard {
                 let _ = sender.send(HubEvent::LuaConnectionRequest(ConnectionRequest::Generate));
             } else {
-                ::log::warn!("[Connection] generate() called before hub_event_tx set — event dropped");
+                ::log::warn!(
+                    "[Connection] generate() called before hub_event_tx set — event dropped"
+                );
             }
             Ok(())
         })
@@ -137,9 +137,13 @@ pub(crate) fn register(
         .create_function(move |_, ()| {
             let guard = tx.lock().expect("HubEventSender mutex poisoned");
             if let Some(ref sender) = *guard {
-                let _ = sender.send(HubEvent::LuaConnectionRequest(ConnectionRequest::Regenerate));
+                let _ = sender.send(HubEvent::LuaConnectionRequest(
+                    ConnectionRequest::Regenerate,
+                ));
             } else {
-                ::log::warn!("[Connection] regenerate() called before hub_event_tx set — event dropped");
+                ::log::warn!(
+                    "[Connection] regenerate() called before hub_event_tx set — event dropped"
+                );
             }
             Ok(())
         })
@@ -177,16 +181,19 @@ pub(crate) fn register(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::new_hub_event_sender;
+    use super::*;
 
     fn create_test_sender_and_cache() -> (HubEventSender, Arc<HandleCache>) {
         (new_hub_event_sender(), Arc::new(HandleCache::new()))
     }
 
     /// Wire up an actual channel so events are captured.
-    fn create_test_sender_and_cache_with_channel(
-    ) -> (HubEventSender, Arc<HandleCache>, tokio::sync::mpsc::UnboundedReceiver<HubEvent>) {
+    fn create_test_sender_and_cache_with_channel() -> (
+        HubEventSender,
+        Arc<HandleCache>,
+        tokio::sync::mpsc::UnboundedReceiver<HubEvent>,
+    ) {
         let tx = new_hub_event_sender();
         let cache = Arc::new(HandleCache::new());
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -218,10 +225,8 @@ mod tests {
 
         register(&lua, tx, cache).expect("Should register");
 
-        let (url, err): (Option<String>, Option<String>) = lua
-            .load("return connection.get_url()")
-            .eval()
-            .unwrap();
+        let (url, err): (Option<String>, Option<String>) =
+            lua.load("return connection.get_url()").eval().unwrap();
 
         assert!(url.is_none(), "URL should be nil when not generated");
         assert!(err.is_some(), "Error should be present");
@@ -241,10 +246,8 @@ mod tests {
 
         register(&lua, tx, cache).expect("Should register");
 
-        let (url, err): (Option<String>, Option<String>) = lua
-            .load("return connection.get_url()")
-            .eval()
-            .unwrap();
+        let (url, err): (Option<String>, Option<String>) =
+            lua.load("return connection.get_url()").eval().unwrap();
 
         assert_eq!(url, Some("https://example.com/connect#abc123".to_string()));
         assert!(err.is_none(), "Error should be nil on success");
@@ -260,10 +263,8 @@ mod tests {
 
         register(&lua, tx, cache).expect("Should register");
 
-        let (url, err): (Option<String>, Option<String>) = lua
-            .load("return connection.get_url()")
-            .eval()
-            .unwrap();
+        let (url, err): (Option<String>, Option<String>) =
+            lua.load("return connection.get_url()").eval().unwrap();
 
         assert!(url.is_none());
         assert_eq!(err, Some("Crypto init failed".to_string()));

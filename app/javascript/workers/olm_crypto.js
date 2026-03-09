@@ -49,55 +49,82 @@ const DB_NAME = "vodozemac-crypto"
 const DB_VERSION = 1
 const STORE_NAME = "sessions"
 const PICKLE_KEY_ID = "__pickle_key__"
+const DB_TIMEOUT_MS = 3000
 
 let dbInstance = null
+
+function withTimeout(label, promise, timeoutMs = DB_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timeout after ${timeoutMs}ms`)), timeoutMs)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error)
+      }
+    )
+  })
+}
 
 function openDB() {
   if (dbInstance) return Promise.resolve(dbInstance)
 
-  return new Promise((resolve, reject) => {
+  return withTimeout("IndexedDB open", new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION)
     req.onupgradeneeded = () => {
-      req.result.createObjectStore(STORE_NAME)
+      if (!req.result.objectStoreNames.contains(STORE_NAME)) {
+        req.result.createObjectStore(STORE_NAME)
+      }
     }
     req.onsuccess = () => {
       dbInstance = req.result
+      dbInstance.onclose = () => {
+        console.warn("[VodozemacCrypto] IndexedDB connection closed")
+        dbInstance = null
+      }
       resolve(dbInstance)
     }
     req.onerror = () => reject(req.error)
-  })
+    req.onblocked = () => reject(new Error("IndexedDB open blocked"))
+  }))
 }
 
 function dbGet(key) {
-  return openDB().then(db => new Promise((resolve, reject) => {
+  return openDB().then(db => withTimeout(`IndexedDB get ${key}`, new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readonly")
     const req = tx.objectStore(STORE_NAME).get(key)
     req.onsuccess = () => resolve(req.result)
     req.onerror = () => reject(req.error)
-  }))
+    tx.onabort = () => reject(tx.error || new Error(`IndexedDB get aborted: ${key}`))
+  })))
 }
 
 function dbPut(key, value) {
-  return openDB().then(db => new Promise((resolve, reject) => {
+  return openDB().then(db => withTimeout(`IndexedDB put ${key}`, new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readwrite")
     const req = tx.objectStore(STORE_NAME).put(value, key)
     req.onsuccess = () => resolve()
     req.onerror = () => reject(req.error)
-  }))
+    tx.onabort = () => reject(tx.error || new Error(`IndexedDB put aborted: ${key}`))
+  })))
 }
 
 function dbDelete(key) {
-  return openDB().then(db => new Promise((resolve, reject) => {
+  return openDB().then(db => withTimeout(`IndexedDB delete ${key}`, new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readwrite")
     const req = tx.objectStore(STORE_NAME).delete(key)
     req.onsuccess = () => resolve()
     req.onerror = () => reject(req.error)
-  }))
+    tx.onabort = () => reject(tx.error || new Error(`IndexedDB delete aborted: ${key}`))
+  })))
 }
 
 /** Delete all hub:* keys from IndexedDB, preserving __pickle_key__. */
 function dbDeleteAllHubs() {
-  return openDB().then(db => new Promise((resolve, reject) => {
+  return openDB().then(db => withTimeout("IndexedDB delete all hubs", new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readwrite")
     const store = tx.objectStore(STORE_NAME)
     const req = store.getAllKeys()
@@ -108,7 +135,8 @@ function dbDeleteAllHubs() {
       tx.onerror = () => reject(tx.error)
     }
     req.onerror = () => reject(req.error)
-  }))
+    tx.onabort = () => reject(tx.error || new Error("IndexedDB delete all aborted"))
+  })))
 }
 
 // =============================================================================
@@ -248,6 +276,7 @@ async function restoreState(hubId) {
 
   if (!wasmModule) return false
 
+  console.log(`[VodozemacCrypto] restoreState start for hub ${hubId.substring(0, 8)}...`)
   const raw = await dbGet(`hub:${hubId}`)
   if (!raw) return false
 
@@ -289,6 +318,32 @@ async function restoreState(hubId) {
     accounts.delete(hubId)
     sessions.delete(hubId)
     bundles.delete(hubId)
+    return false
+  }
+}
+
+async function restoreStateSafely(hubId, reason) {
+  try {
+    return await restoreState(hubId)
+  } catch (e) {
+    console.warn(
+      `[VodozemacCrypto] restoreState failed during ${reason} for hub ${hubId.substring(0, 8)}...:`,
+      e
+    )
+
+    // Safari can wedge SharedWorker IndexedDB operations. Treat restore
+    // failures as "no persisted session" so crypto startup keeps moving.
+    accounts.delete(hubId)
+    sessions.delete(hubId)
+    bundles.delete(hubId)
+
+    if (dbInstance) {
+      try {
+        dbInstance.close()
+      } catch {}
+      dbInstance = null
+    }
+
     return false
   }
 }
@@ -399,10 +454,12 @@ async function handleCreateSession(hubId, bundleJson) {
  * Attempts to restore from IndexedDB if not in memory.
  */
 async function handleHasSession(hubId) {
+  console.log(`[VodozemacCrypto] hasSession start for hub ${hubId.substring(0, 8)}...`)
   if (sessions.has(hubId)) return { hasSession: true }
 
   // Try restoring from IndexedDB
-  const restored = await restoreState(hubId)
+  const restored = await restoreStateSafely(hubId, "hasSession")
+  console.log(`[VodozemacCrypto] hasSession result for hub ${hubId.substring(0, 8)}... restored=${restored} inMemory=${sessions.has(hubId)}`)
   return { hasSession: restored && sessions.has(hubId) }
 }
 
@@ -416,7 +473,7 @@ async function handleHasSession(hubId) {
  */
 async function handleEncrypt(hubId, message) {
   // Try restore if not in memory
-  if (!sessions.has(hubId)) await restoreState(hubId)
+  if (!sessions.has(hubId)) await restoreStateSafely(hubId, "encrypt")
 
   const session = sessions.get(hubId)
   const account = accounts.get(hubId)
@@ -455,7 +512,7 @@ async function handleEncrypt(hubId, message) {
  */
 async function handleDecrypt(hubId, encryptedData) {
   // Try restore if not in memory
-  if (!accounts.has(hubId)) await restoreState(hubId)
+  if (!accounts.has(hubId)) await restoreStateSafely(hubId, "decrypt")
 
   const envelope = typeof encryptedData === "string" ? JSON.parse(encryptedData) : encryptedData
   const ciphertext = base64ToBytes(envelope.b)
@@ -511,7 +568,7 @@ async function handleDecrypt(hubId, encryptedData) {
  * @returns {{ data: Uint8Array }}
  */
 async function handleEncryptBinary(hubId, plaintext) {
-  if (!sessions.has(hubId)) await restoreState(hubId)
+  if (!sessions.has(hubId)) await restoreStateSafely(hubId, "encryptBinary")
 
   const session = sessions.get(hubId)
   const account = accounts.get(hubId)
@@ -552,7 +609,7 @@ async function handleEncryptBinary(hubId, plaintext) {
  * @returns {{ data: Uint8Array }}
  */
 async function handleDecryptBinary(hubId, data) {
-  if (!accounts.has(hubId)) await restoreState(hubId)
+  if (!accounts.has(hubId)) await restoreStateSafely(hubId, "decryptBinary")
 
   const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
   if (bytes.length === 0) throw new Error("Empty binary frame")
@@ -601,7 +658,7 @@ async function handleDecryptBinary(hubId, data) {
  * Attempts to restore from IndexedDB if not in memory.
  */
 async function handleGetIdentityKey(hubId) {
-  if (!accounts.has(hubId)) await restoreState(hubId)
+  if (!accounts.has(hubId)) await restoreStateSafely(hubId, "getIdentityKey")
 
   const account = accounts.get(hubId)
   if (!account) throw new Error(`No account for hub ${hubId}`)
@@ -739,6 +796,7 @@ self.onconnect = (event) => {
   const portId = generatePortId()
 
   ports.set(portId, { port, lastPong: Date.now() })
+  port.postMessage({ event: "ready", portId })
 
   port.onmessage = (msgEvent) => {
     handleMessage(msgEvent, portId, (msg) => port.postMessage(msg))
@@ -756,6 +814,9 @@ self.onconnect = (event) => {
 // =============================================================================
 
 self.onmessage = (event) => {
+  if (typeof self.postMessage === "function") {
+    self.postMessage({ event: "ready", portId: "worker" })
+  }
   handleMessage(event, null, (msg) => self.postMessage(msg))
 }
 

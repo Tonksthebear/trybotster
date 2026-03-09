@@ -21,10 +21,10 @@
 //! - [`config`] - Configuration loading/saving
 
 // Library modules
-pub mod broker;
 pub mod agent;
 pub mod app;
 pub mod auth;
+pub mod broker;
 pub mod channel;
 pub mod client;
 pub mod commands;
@@ -38,14 +38,14 @@ pub mod ws;
 
 pub mod compat;
 pub mod config;
-pub mod crypto;
-pub mod notifications;
-pub mod file_watcher;
 pub mod constants;
+pub mod crypto;
 pub mod device;
 pub mod env;
+pub mod file_watcher;
 pub mod git;
 pub mod keyring;
+pub mod notifications;
 pub mod process;
 pub mod server;
 pub mod terminal;
@@ -60,4 +60,3 @@ pub use terminal_widget::TerminalWidget;
 
 // Re-export Hub
 pub use hub::Hub;
-

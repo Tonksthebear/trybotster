@@ -85,7 +85,10 @@ impl FileWatcher {
         })
         .context("Failed to create file watcher")?;
 
-        Ok(Self { watcher: Box::new(watcher), rx: Some(rx) })
+        Ok(Self {
+            watcher: Box::new(watcher),
+            rx: Some(rx),
+        })
     }
 
     /// Create a new watcher backed by mtime polling.
@@ -113,7 +116,10 @@ impl FileWatcher {
         )
         .context("Failed to create poll watcher")?;
 
-        Ok(Self { watcher: Box::new(watcher), rx: Some(rx) })
+        Ok(Self {
+            watcher: Box::new(watcher),
+            rx: Some(rx),
+        })
     }
 
     /// Start watching `path` for file system events.
@@ -194,7 +200,14 @@ impl FileWatcher {
     /// the extracted receiver (via [`take_rx`](Self::take_rx)).
     pub fn classify_event(event: &notify::Event) -> Vec<FileEvent> {
         let kind = Self::classify(&event.kind);
-        event.paths.iter().map(|p| FileEvent { path: p.clone(), kind }).collect()
+        event
+            .paths
+            .iter()
+            .map(|p| FileEvent {
+                path: p.clone(),
+                kind,
+            })
+            .collect()
     }
 
     /// Map `notify::EventKind` to [`FileEventKind`].

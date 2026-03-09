@@ -128,12 +128,7 @@ impl Widget for TerminalWidget<'_> {
 ///
 /// With scroll_offset N, the top of the rendered area shows the line that
 /// is N lines above the top of the viewport.
-fn render_grid(
-    term: &Term<NoopListener>,
-    scroll_offset: usize,
-    area: Rect,
-    buf: &mut Buffer,
-) {
+fn render_grid(term: &Term<NoopListener>, scroll_offset: usize, area: Rect, buf: &mut Buffer) {
     let grid = term.grid();
 
     for row in 0..area.height {
@@ -255,10 +250,7 @@ fn render_cursor(
 }
 
 /// Apply alacritty cell properties to ratatui buffer cell.
-fn apply_cell(
-    cell: &alacritty_terminal::term::cell::Cell,
-    buf_cell: &mut ratatui::buffer::Cell,
-) {
+fn apply_cell(cell: &alacritty_terminal::term::cell::Cell, buf_cell: &mut ratatui::buffer::Cell) {
     // Set content — alacritty stores a single char + optional zerowidth extras.
     if cell.c != ' ' && cell.c != '\0' {
         let mut s = String::with_capacity(4);

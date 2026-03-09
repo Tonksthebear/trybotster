@@ -83,7 +83,10 @@ pub fn register(lua: &Lua) -> Result<()> {
             if let Some(parent) = file_path.parent() {
                 if !parent.exists() {
                     if let Err(e) = std::fs::create_dir_all(parent) {
-                        return Ok((None::<bool>, Some(format!("Failed to create parent directories: {e}"))));
+                        return Ok((
+                            None::<bool>,
+                            Some(format!("Failed to create parent directories: {e}")),
+                        ));
                     }
                 }
             }
@@ -103,11 +106,9 @@ pub fn register(lua: &Lua) -> Result<()> {
     //
     // Reads the entire file contents as a UTF-8 string.
     let read_fn = lua
-        .create_function(|_, path: String| {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => Ok((Some(content), None::<String>)),
-                Err(e) => Ok((None::<String>, Some(format!("Failed to read file: {e}")))),
-            }
+        .create_function(|_, path: String| match std::fs::read_to_string(&path) {
+            Ok(content) => Ok((Some(content), None::<String>)),
+            Err(e) => Ok((None::<String>, Some(format!("Failed to read file: {e}")))),
         })
         .map_err(|e| anyhow!("Failed to create fs.read function: {e}"))?;
 
@@ -130,12 +131,12 @@ pub fn register(lua: &Lua) -> Result<()> {
     //
     // Copies a file from src to dst. Overwrites dst if it already exists.
     let copy_fn = lua
-        .create_function(|_, (src, dst): (String, String)| {
-            match std::fs::copy(&src, &dst) {
+        .create_function(
+            |_, (src, dst): (String, String)| match std::fs::copy(&src, &dst) {
                 Ok(_) => Ok((Some(true), None::<String>)),
                 Err(e) => Ok((None::<bool>, Some(format!("Failed to copy file: {e}")))),
-            }
-        })
+            },
+        )
         .map_err(|e| anyhow!("Failed to create fs.copy function: {e}"))?;
 
     fs_table
@@ -147,21 +148,22 @@ pub fn register(lua: &Lua) -> Result<()> {
     // Returns an array of entry names (files and directories) in the given directory.
     // Does not include "." or "..".
     let listdir_fn = lua
-        .create_function(|lua, path: String| {
-            match std::fs::read_dir(&path) {
-                Ok(entries) => {
-                    let table = lua.create_table()?;
-                    let mut i = 1;
-                    for entry in entries.flatten() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            table.set(i, name.to_string())?;
-                            i += 1;
-                        }
+        .create_function(|lua, path: String| match std::fs::read_dir(&path) {
+            Ok(entries) => {
+                let table = lua.create_table()?;
+                let mut i = 1;
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        table.set(i, name.to_string())?;
+                        i += 1;
                     }
-                    Ok((Some(table), None::<String>))
                 }
-                Err(e) => Ok((None::<mlua::Table>, Some(format!("Failed to list directory: {e}")))),
+                Ok((Some(table), None::<String>))
             }
+            Err(e) => Ok((
+                None::<mlua::Table>,
+                Some(format!("Failed to list directory: {e}")),
+            )),
         })
         .map_err(|e| anyhow!("Failed to create fs.listdir function: {e}"))?;
 
@@ -209,11 +211,12 @@ pub fn register(lua: &Lua) -> Result<()> {
     //
     // Creates a directory and all parent directories.
     let mkdir_fn = lua
-        .create_function(|_, path: String| {
-            match std::fs::create_dir_all(&path) {
-                Ok(()) => Ok((Some(true), None::<String>)),
-                Err(e) => Ok((None::<bool>, Some(format!("Failed to create directory: {e}")))),
-            }
+        .create_function(|_, path: String| match std::fs::create_dir_all(&path) {
+            Ok(()) => Ok((Some(true), None::<String>)),
+            Err(e) => Ok((
+                None::<bool>,
+                Some(format!("Failed to create directory: {e}")),
+            )),
         })
         .map_err(|e| anyhow!("Failed to create fs.mkdir function: {e}"))?;
 
@@ -235,7 +238,10 @@ pub fn register(lua: &Lua) -> Result<()> {
                 return Ok((None::<mlua::Table>, Some("Path does not exist".to_string())));
             }
             if !p.is_dir() {
-                return Ok((None::<mlua::Table>, Some("Path is not a directory".to_string())));
+                return Ok((
+                    None::<mlua::Table>,
+                    Some("Path is not a directory".to_string()),
+                ));
             }
             match std::fs::read_dir(&path) {
                 Ok(entries) => {
@@ -276,9 +282,10 @@ pub fn register(lua: &Lua) -> Result<()> {
             }
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => Ok((Some(true), None::<String>)),
-                Err(e) => {
-                    Ok((None::<bool>, Some(format!("Failed to remove directory: {e}"))))
-                }
+                Err(e) => Ok((
+                    None::<bool>,
+                    Some(format!("Failed to remove directory: {e}")),
+                )),
             }
         })
         .map_err(|e| anyhow!("Failed to create fs.rmdir function: {e}"))?;
@@ -302,10 +309,7 @@ pub fn register(lua: &Lua) -> Result<()> {
                 Ok(meta) => {
                     let table = lua.create_table()?;
                     table.set("exists", true)?;
-                    table.set(
-                        "type",
-                        if meta.is_dir() { "dir" } else { "file" },
-                    )?;
+                    table.set("type", if meta.is_dir() { "dir" } else { "file" })?;
                     table.set("size", meta.len())?;
                     Ok((Some(table), None::<String>))
                 }
@@ -385,10 +389,7 @@ pub fn register(lua: &Lua) -> Result<()> {
             let root_path = match std::fs::canonicalize(&root) {
                 Ok(p) => p,
                 Err(e) => {
-                    return Ok((
-                        None::<String>,
-                        Some(format!("Failed to resolve root: {e}")),
-                    ))
+                    return Ok((None::<String>, Some(format!("Failed to resolve root: {e}"))))
                 }
             };
 
@@ -399,10 +400,7 @@ pub fn register(lua: &Lua) -> Result<()> {
                 match std::fs::canonicalize(&joined) {
                     Ok(p) => p,
                     Err(e) => {
-                        return Ok((
-                            None::<String>,
-                            Some(format!("Failed to resolve path: {e}")),
-                        ))
+                        return Ok((None::<String>, Some(format!("Failed to resolve path: {e}"))))
                     }
                 }
             } else {
@@ -446,7 +444,10 @@ pub fn register(lua: &Lua) -> Result<()> {
                     let lua_str = lua.create_string(&bytes)?;
                     Ok((Some(lua_str), None::<String>))
                 }
-                Err(e) => Ok((None::<mlua::String>, Some(format!("Failed to read file: {e}")))),
+                Err(e) => Ok((
+                    None::<mlua::String>,
+                    Some(format!("Failed to read file: {e}")),
+                )),
             }
         })
         .map_err(|e| anyhow!("Failed to create fs.read_bytes function: {e}"))?;
@@ -525,7 +526,9 @@ mod tests {
         // Verify all functions exist
         let _: Function = fs_table.get("write").expect("fs.write should exist");
         let _: Function = fs_table.get("read").expect("fs.read should exist");
-        let _: Function = fs_table.get("read_bytes").expect("fs.read_bytes should exist");
+        let _: Function = fs_table
+            .get("read_bytes")
+            .expect("fs.read_bytes should exist");
         let _: Function = fs_table.get("append").expect("fs.append should exist");
         let _: Function = fs_table.get("exists").expect("fs.exists should exist");
         let _: Function = fs_table.get("copy").expect("fs.copy should exist");
@@ -690,7 +693,9 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let (ok, err): (Option<bool>, Option<String>) = lua
-            .load(format!(r#"return fs.write("{path_str}", "nested content")"#))
+            .load(format!(
+                r#"return fs.write("{path_str}", "nested content")"#
+            ))
             .eval()
             .expect("fs.write should be callable");
 
@@ -837,10 +842,12 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let result: mlua::Table = lua
-            .load(format!(r#"
+            .load(format!(
+                r#"
                 local stat, err = fs.stat("{path_str}")
                 return stat
-            "#))
+            "#
+            ))
             .eval()
             .expect("fs.stat should be callable");
 
@@ -858,10 +865,12 @@ mod tests {
         let path_str = dir.path().to_str().unwrap();
 
         let result: mlua::Table = lua
-            .load(format!(r#"
+            .load(format!(
+                r#"
                 local stat, err = fs.stat("{path_str}")
                 return stat
-            "#))
+            "#
+            ))
             .eval()
             .expect("fs.stat should be callable");
 
@@ -875,10 +884,12 @@ mod tests {
         register(&lua).expect("Should register fs primitives");
 
         let result: mlua::Table = lua
-            .load(r#"
+            .load(
+                r#"
                 local stat, err = fs.stat("/nonexistent/path/file.txt")
                 return stat
-            "#)
+            "#,
+            )
             .eval()
             .expect("fs.stat should be callable");
 

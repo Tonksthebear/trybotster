@@ -117,7 +117,10 @@ impl VapidKeys {
             sk
         };
 
-        log::info!("[WebPush] Migrated VAPID key from legacy DER ({} bytes) to raw scalar", priv_bytes.len());
+        log::info!(
+            "[WebPush] Migrated VAPID key from legacy DER ({} bytes) to raw scalar",
+            priv_bytes.len()
+        );
 
         Ok(Self {
             private_key_b64: BASE64URL.encode(signing_key.to_bytes().as_slice()),
@@ -143,7 +146,11 @@ mod tests {
 
         // Public key should be 65 bytes (uncompressed P-256 point)
         let pub_bytes = keys.public_key_bytes().expect("decode public key");
-        assert_eq!(pub_bytes.len(), 65, "uncompressed P-256 public key is 65 bytes");
+        assert_eq!(
+            pub_bytes.len(),
+            65,
+            "uncompressed P-256 public key is 65 bytes"
+        );
         assert_eq!(pub_bytes[0], 0x04, "uncompressed point starts with 0x04");
 
         // Private key should be raw 32-byte scalar
@@ -156,11 +163,9 @@ mod tests {
     #[test]
     fn test_from_base64url_roundtrip() {
         let keys = VapidKeys::generate().expect("should generate keys");
-        let reconstructed = VapidKeys::from_base64url(
-            keys.public_key_base64url(),
-            keys.private_key_base64url(),
-        )
-        .expect("should reconstruct from base64url");
+        let reconstructed =
+            VapidKeys::from_base64url(keys.public_key_base64url(), keys.private_key_base64url())
+                .expect("should reconstruct from base64url");
 
         assert_eq!(
             keys.public_key_base64url(),
@@ -183,11 +188,11 @@ mod tests {
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "AAAAAAAAAAAAAAAAAAAAAA",
         );
-        let builder = VapidSignatureBuilder::from_base64(
-            keys.private_key_base64url(),
-            &sub,
+        let builder = VapidSignatureBuilder::from_base64(keys.private_key_base64url(), &sub);
+        assert!(
+            builder.is_ok(),
+            "from_base64 should accept our raw key scalar"
         );
-        assert!(builder.is_ok(), "from_base64 should accept our raw key scalar");
     }
 
     #[test]
@@ -215,7 +220,9 @@ mod tests {
         };
 
         // Migrate should convert to 32-byte scalar
-        let migrated = old_keys.migrate_if_needed().expect("migration should succeed");
+        let migrated = old_keys
+            .migrate_if_needed()
+            .expect("migration should succeed");
         let priv_bytes = BASE64URL.decode(migrated.private_key_base64url()).unwrap();
         assert_eq!(priv_bytes.len(), 32, "migrated key should be 32 bytes");
 
@@ -225,10 +232,7 @@ mod tests {
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "AAAAAAAAAAAAAAAAAAAAAA",
         );
-        let builder = VapidSignatureBuilder::from_base64(
-            migrated.private_key_base64url(),
-            &sub,
-        );
+        let builder = VapidSignatureBuilder::from_base64(migrated.private_key_base64url(), &sub);
         assert!(builder.is_ok(), "migrated key should work with from_base64");
     }
 
@@ -244,9 +248,6 @@ mod tests {
         let loaded: VapidKeys = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(keys.public_key_base64url(), loaded.public_key_base64url());
-        assert_eq!(
-            keys.private_key_base64url(),
-            loaded.private_key_base64url(),
-        );
+        assert_eq!(keys.private_key_base64url(), loaded.private_key_base64url(),);
     }
 }

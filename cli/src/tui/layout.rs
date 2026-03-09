@@ -12,8 +12,8 @@ use ratatui::widgets::{Block, Borders};
 /// Calculate the inner area of the terminal widget for given terminal dimensions.
 ///
 /// The layout is:
-/// - 30% for agent list (left panel)
-/// - 70% for terminal widget (right panel)
+/// - 15% for agent list (left panel)
+/// - 85% for terminal widget (right panel)
 /// - Terminal widget has a 1-char border all around
 ///
 /// This calculation must match the layout in `render.rs` to ensure PTY
@@ -32,10 +32,10 @@ use ratatui::widgets::{Block, Borders};
 pub fn terminal_widget_inner_area(cols: u16, rows: u16) -> (u16, u16) {
     let area = Rect::new(0, 0, cols, rows);
 
-    // Split 30/70 horizontally (matches render.rs)
+    // Split 15/85 horizontally (matches lua/ui/layout.lua)
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
+        .constraints([Constraint::Percentage(15), Constraint::Percentage(85)].as_ref())
         .split(area);
 
     // Terminal widget is in chunks[1]
@@ -62,8 +62,8 @@ mod tests {
         // Standard 80x24 terminal
         let (rows, cols) = terminal_widget_inner_area(80, 24);
 
-        // 70% of 80 = 56, minus 2 for borders = 54
-        assert_eq!(cols, 54);
+        // 85% of 80 = 68, minus 2 for borders = 66
+        assert_eq!(cols, 66);
         // 24 minus 2 for borders = 22
         assert_eq!(rows, 22);
     }
@@ -73,8 +73,8 @@ mod tests {
         // Large 200x50 terminal
         let (rows, cols) = terminal_widget_inner_area(200, 50);
 
-        // 70% of 200 = 140, minus 2 for borders = 138
-        assert_eq!(cols, 138);
+        // 85% of 200 = 170, minus 2 for borders = 168
+        assert_eq!(cols, 168);
         // 50 minus 2 for borders = 48
         assert_eq!(rows, 48);
     }
@@ -94,9 +94,9 @@ mod tests {
         // Odd dimensions (rounding test)
         let (rows, cols) = terminal_widget_inner_area(101, 25);
 
-        // 70% of 101 ≈ 70, minus 2 = 68
+        // 85% of 101 ≈ 85/86, minus 2 ~= 83/84
         // (actual may vary based on ratatui's layout algorithm)
-        assert!(cols > 50);
+        assert!(cols > 80);
         assert!(rows == 23); // 25 - 2
     }
 
@@ -107,12 +107,12 @@ mod tests {
 
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+            .constraints([Constraint::Percentage(15), Constraint::Percentage(85)])
             .split(area);
 
         eprintln!("Total area: {:?}", area);
-        eprintln!("Left chunk (30%): {:?}", chunks[0]);
-        eprintln!("Right chunk (70%): {:?}", chunks[1]);
+        eprintln!("Left chunk (15%): {:?}", chunks[0]);
+        eprintln!("Right chunk (85%): {:?}", chunks[1]);
         eprintln!(
             "Left + Right widths: {} + {} = {}",
             chunks[0].width,

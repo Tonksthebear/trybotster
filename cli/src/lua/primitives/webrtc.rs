@@ -157,7 +157,9 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
                     data: bytes,
                 }));
             } else {
-                ::log::warn!("[WebRTC] send_binary() called before hub_event_tx set — event dropped");
+                ::log::warn!(
+                    "[WebRTC] send_binary() called before hub_event_tx set — event dropped"
+                );
             }
             Ok(())
         })
@@ -176,8 +178,8 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::new_hub_event_sender;
+    use super::*;
 
     fn setup() -> (Lua, HubEventSender) {
         let lua = Lua::new();
@@ -203,22 +205,34 @@ mod tests {
         let globals = lua.globals();
         let webrtc_table: mlua::Table = globals.get("webrtc").expect("webrtc table should exist");
 
-        let _: mlua::Function = webrtc_table.get("on_peer_connected").expect("on_peer_connected should exist");
-        let _: mlua::Function = webrtc_table.get("on_peer_disconnected").expect("on_peer_disconnected should exist");
-        let _: mlua::Function = webrtc_table.get("on_message").expect("on_message should exist");
+        let _: mlua::Function = webrtc_table
+            .get("on_peer_connected")
+            .expect("on_peer_connected should exist");
+        let _: mlua::Function = webrtc_table
+            .get("on_peer_disconnected")
+            .expect("on_peer_disconnected should exist");
+        let _: mlua::Function = webrtc_table
+            .get("on_message")
+            .expect("on_message should exist");
         let _: mlua::Function = webrtc_table.get("send").expect("send should exist");
-        let _: mlua::Function = webrtc_table.get("send_binary").expect("send_binary should exist");
+        let _: mlua::Function = webrtc_table
+            .get("send_binary")
+            .expect("send_binary should exist");
     }
 
     #[test]
     fn test_on_peer_connected_stores_callback() {
         let (lua, _tx) = setup();
 
-        lua.load(r#"
+        lua.load(
+            r#"
             webrtc.on_peer_connected(function(peer_id)
                 log_result = "connected: " .. peer_id
             end)
-        "#).exec().expect("Should register callback");
+        "#,
+        )
+        .exec()
+        .expect("Should register callback");
 
         let key: mlua::RegistryKey = lua
             .named_registry_value(registry_keys::ON_PEER_CONNECTED)
@@ -227,9 +241,14 @@ mod tests {
         let callback: mlua::Function = lua.registry_value(&key).expect("Should retrieve callback");
 
         lua.globals().set("log_result", LuaValue::Nil).unwrap();
-        callback.call::<()>("test-peer").expect("Should call callback");
+        callback
+            .call::<()>("test-peer")
+            .expect("Should call callback");
 
-        let result: String = lua.globals().get("log_result").expect("log_result should be set");
+        let result: String = lua
+            .globals()
+            .get("log_result")
+            .expect("log_result should be set");
         assert_eq!(result, "connected: test-peer");
     }
 
@@ -237,9 +256,13 @@ mod tests {
     fn test_send_delivers_json_event() {
         let (lua, mut rx) = setup_with_channel();
 
-        lua.load(r#"
+        lua.load(
+            r#"
             webrtc.send("peer-123", { type = "ping", value = 42 })
-        "#).exec().expect("Should send message");
+        "#,
+        )
+        .exec()
+        .expect("Should send message");
 
         let event = rx.try_recv().expect("Should have received event");
         match event {
@@ -256,9 +279,13 @@ mod tests {
     fn test_send_binary_delivers_binary_event() {
         let (lua, mut rx) = setup_with_channel();
 
-        lua.load(r#"
+        lua.load(
+            r#"
             webrtc.send_binary("peer-456", "hello bytes")
-        "#).exec().expect("Should send binary");
+        "#,
+        )
+        .exec()
+        .expect("Should send binary");
 
         let event = rx.try_recv().expect("Should have received event");
         match event {
@@ -274,22 +301,32 @@ mod tests {
     fn test_multiple_sends_deliver_in_order() {
         let (lua, mut rx) = setup_with_channel();
 
-        lua.load(r#"
+        lua.load(
+            r#"
             webrtc.send("peer-1", { msg = "first" })
             webrtc.send("peer-2", { msg = "second" })
             webrtc.send_binary("peer-3", "third")
-        "#).exec().expect("Should send messages");
+        "#,
+        )
+        .exec()
+        .expect("Should send messages");
 
         match rx.try_recv().unwrap() {
-            HubEvent::WebRtcSend(WebRtcSendRequest::Json { peer_id, .. }) => assert_eq!(peer_id, "peer-1"),
+            HubEvent::WebRtcSend(WebRtcSendRequest::Json { peer_id, .. }) => {
+                assert_eq!(peer_id, "peer-1")
+            }
             _ => panic!("Expected Json"),
         }
         match rx.try_recv().unwrap() {
-            HubEvent::WebRtcSend(WebRtcSendRequest::Json { peer_id, .. }) => assert_eq!(peer_id, "peer-2"),
+            HubEvent::WebRtcSend(WebRtcSendRequest::Json { peer_id, .. }) => {
+                assert_eq!(peer_id, "peer-2")
+            }
             _ => panic!("Expected Json"),
         }
         match rx.try_recv().unwrap() {
-            HubEvent::WebRtcSend(WebRtcSendRequest::Binary { peer_id, .. }) => assert_eq!(peer_id, "peer-3"),
+            HubEvent::WebRtcSend(WebRtcSendRequest::Binary { peer_id, .. }) => {
+                assert_eq!(peer_id, "peer-3")
+            }
             _ => panic!("Expected Binary"),
         }
     }
@@ -298,8 +335,12 @@ mod tests {
     fn test_send_before_tx_set_does_not_panic() {
         let (lua, _tx) = setup();
         // tx is None — send should silently drop, not panic
-        lua.load(r#"
+        lua.load(
+            r#"
             webrtc.send("peer-1", { msg = "dropped" })
-        "#).exec().expect("Should not panic when tx is None");
+        "#,
+        )
+        .exec()
+        .expect("Should not panic when tx is None");
     }
 }

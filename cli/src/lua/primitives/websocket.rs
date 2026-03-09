@@ -151,10 +151,7 @@ impl WebSocketRegistryInner {
     }
 
     /// Set the Hub event channel sender for event-driven delivery.
-    pub(crate) fn set_hub_event_tx(
-        &mut self,
-        tx: crate::hub::events::HubEventTx,
-    ) {
+    pub(crate) fn set_hub_event_tx(&mut self, tx: crate::hub::events::HubEventTx) {
         self.hub_event_tx = Some(tx);
     }
 
@@ -510,11 +507,7 @@ struct CallbackKeys {
 ///
 /// The registry lock is released before any Lua callback is invoked, matching
 /// the same pattern used in [`poll_websocket_events`].
-pub(crate) fn fire_single_websocket_event(
-    lua: &Lua,
-    registry: &WebSocketRegistry,
-    event: WsEvent,
-) {
+pub(crate) fn fire_single_websocket_event(lua: &Lua, registry: &WebSocketRegistry, event: WsEvent) {
     let is_terminal = matches!(
         event.kind,
         WsEventKind::Close { .. } | WsEventKind::Error(_)
@@ -531,11 +524,7 @@ pub(crate) fn fire_single_websocket_event(
 ///
 /// Locks the registry to resolve the Lua callback `Function` from the
 /// stored `RegistryKey`, drops the lock, then fires the callback.
-fn fire_nonterminal_ws_event(
-    lua: &Lua,
-    registry: &WebSocketRegistry,
-    event: WsEvent,
-) {
+fn fire_nonterminal_ws_event(lua: &Lua, registry: &WebSocketRegistry, event: WsEvent) {
     // Resolve callback Function under the lock, then drop the lock.
     let callback_result: mlua::Result<()> = (|| {
         match &event.kind {
@@ -576,11 +565,7 @@ fn fire_nonterminal_ws_event(
 ///
 /// Removes the connection under the lock (taking ownership of callback keys),
 /// drops the lock, fires the callback, then cleans up all owned keys.
-fn fire_terminal_ws_event(
-    lua: &Lua,
-    registry: &WebSocketRegistry,
-    event: WsEvent,
-) {
+fn fire_terminal_ws_event(lua: &Lua, registry: &WebSocketRegistry, event: WsEvent) {
     // Phase 1: remove connection and take ownership of keys under the lock.
     let conn = {
         let mut inner = registry.lock().expect("WebSocketRegistry mutex poisoned");
@@ -786,15 +771,23 @@ pub fn register(lua: &Lua, registry: WebSocketRegistry) -> Result<()> {
     let send_registry = Arc::clone(&registry);
     let send_fn = lua
         .create_function(move |_lua, (id, data): (String, String)| {
-            let inner = send_registry.lock().expect("WebSocketRegistry mutex poisoned");
+            let inner = send_registry
+                .lock()
+                .expect("WebSocketRegistry mutex poisoned");
             if let Some(conn) = inner.connections.get(&id) {
                 if conn.send_tx.send(WsOutgoing::Text(data)).is_err() {
-                    Ok((Value::Nil, Some("WebSocket connection thread has exited".to_string())))
+                    Ok((
+                        Value::Nil,
+                        Some("WebSocket connection thread has exited".to_string()),
+                    ))
                 } else {
                     Ok((Value::Boolean(true), None::<String>))
                 }
             } else {
-                Ok((Value::Nil, Some(format!("Unknown WebSocket connection: {id}"))))
+                Ok((
+                    Value::Nil,
+                    Some(format!("Unknown WebSocket connection: {id}")),
+                ))
             }
         })
         .map_err(|e| anyhow!("Failed to create websocket.send function: {e}"))?;
@@ -807,15 +800,23 @@ pub fn register(lua: &Lua, registry: WebSocketRegistry) -> Result<()> {
     let close_registry = Arc::clone(&registry);
     let close_fn = lua
         .create_function(move |_lua, id: String| {
-            let inner = close_registry.lock().expect("WebSocketRegistry mutex poisoned");
+            let inner = close_registry
+                .lock()
+                .expect("WebSocketRegistry mutex poisoned");
             if let Some(conn) = inner.connections.get(&id) {
                 if conn.send_tx.send(WsOutgoing::Close).is_err() {
-                    Ok((Value::Nil, Some("WebSocket connection thread has exited".to_string())))
+                    Ok((
+                        Value::Nil,
+                        Some("WebSocket connection thread has exited".to_string()),
+                    ))
                 } else {
                     Ok((Value::Boolean(true), None::<String>))
                 }
             } else {
-                Ok((Value::Nil, Some(format!("Unknown WebSocket connection: {id}"))))
+                Ok((
+                    Value::Nil,
+                    Some(format!("Unknown WebSocket connection: {id}")),
+                ))
             }
         })
         .map_err(|e| anyhow!("Failed to create websocket.close function: {e}"))?;
@@ -842,9 +843,13 @@ mod tests {
         register(&lua, registry).expect("Should register websocket primitives");
 
         let globals = lua.globals();
-        let ws_table: Table = globals.get("websocket").expect("websocket table should exist");
+        let ws_table: Table = globals
+            .get("websocket")
+            .expect("websocket table should exist");
 
-        let _: mlua::Function = ws_table.get("connect").expect("websocket.connect should exist");
+        let _: mlua::Function = ws_table
+            .get("connect")
+            .expect("websocket.connect should exist");
         let _: mlua::Function = ws_table.get("send").expect("websocket.send should exist");
         let _: mlua::Function = ws_table.get("close").expect("websocket.close should exist");
     }

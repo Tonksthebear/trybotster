@@ -153,22 +153,21 @@ pub fn register(lua: &Lua) -> Result<()> {
     // Returns nil (not an error) if the key doesn't exist.
     let cache_get = Arc::clone(&cache);
     let get_fn = lua
-        .create_function(move |lua, key: String| match read_config_cached(&cache_get) {
-            Ok(config) => {
-                if let Some(value) = config.get(&key) {
-                    let lua_value = json_to_lua(lua, value).map_err(|e| {
-                        mlua::Error::external(format!("Failed to convert config value: {e}"))
-                    })?;
-                    Ok((Some(lua_value), None::<String>))
-                } else {
-                    Ok((None::<Value>, None::<String>))
+        .create_function(
+            move |lua, key: String| match read_config_cached(&cache_get) {
+                Ok(config) => {
+                    if let Some(value) = config.get(&key) {
+                        let lua_value = json_to_lua(lua, value).map_err(|e| {
+                            mlua::Error::external(format!("Failed to convert config value: {e}"))
+                        })?;
+                        Ok((Some(lua_value), None::<String>))
+                    } else {
+                        Ok((None::<Value>, None::<String>))
+                    }
                 }
-            }
-            Err(e) => Ok((
-                None::<Value>,
-                Some(format!("Failed to read config: {e}")),
-            )),
-        })
+                Err(e) => Ok((None::<Value>, Some(format!("Failed to read config: {e}")))),
+            },
+        )
         .map_err(|e| anyhow!("Failed to create config.get function: {e}"))?;
 
     config_table
@@ -185,17 +184,12 @@ pub fn register(lua: &Lua) -> Result<()> {
         .create_function(move |lua, (key, value): (String, Value)| {
             let mut config = match read_config() {
                 Ok(c) => c,
-                Err(e) => {
-                    return Ok((
-                        None::<bool>,
-                        Some(format!("Failed to read config: {e}")),
-                    ))
-                }
+                Err(e) => return Ok((None::<bool>, Some(format!("Failed to read config: {e}")))),
             };
 
-            let json_value: serde_json::Value = lua.from_value(value).map_err(|e| {
-                mlua::Error::external(format!("Failed to convert value: {e}"))
-            })?;
+            let json_value: serde_json::Value = lua
+                .from_value(value)
+                .map_err(|e| mlua::Error::external(format!("Failed to convert value: {e}")))?;
 
             if let Some(obj) = config.as_object_mut() {
                 obj.insert(key, json_value);
@@ -214,10 +208,7 @@ pub fn register(lua: &Lua) -> Result<()> {
                     }
                     Ok((Some(true), None::<String>))
                 }
-                Err(e) => Ok((
-                    None::<bool>,
-                    Some(format!("Failed to write config: {e}")),
-                )),
+                Err(e) => Ok((None::<bool>, Some(format!("Failed to write config: {e}")))),
             }
         })
         .map_err(|e| anyhow!("Failed to create config.set function: {e}"))?;
@@ -233,15 +224,11 @@ pub fn register(lua: &Lua) -> Result<()> {
     let all_fn = lua
         .create_function(move |lua, ()| match read_config_cached(&cache_all) {
             Ok(config) => {
-                let lua_value = json_to_lua(lua, &config).map_err(|e| {
-                    mlua::Error::external(format!("Failed to convert config: {e}"))
-                })?;
+                let lua_value = json_to_lua(lua, &config)
+                    .map_err(|e| mlua::Error::external(format!("Failed to convert config: {e}")))?;
                 Ok((Some(lua_value), None::<String>))
             }
-            Err(e) => Ok((
-                None::<Value>,
-                Some(format!("Failed to read config: {e}")),
-            )),
+            Err(e) => Ok((None::<Value>, Some(format!("Failed to read config: {e}")))),
         })
         .map_err(|e| anyhow!("Failed to create config.all function: {e}"))?;
 

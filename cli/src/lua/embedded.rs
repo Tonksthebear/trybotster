@@ -64,19 +64,31 @@ mod tests {
     fn test_debug_build_has_empty_stubs() {
         if cfg!(debug_assertions) {
             assert!(all().is_empty(), "Debug builds should not embed Lua files");
-            assert!(get("hub/init.lua").is_none(), "Debug builds return None for all lookups");
+            assert!(
+                get("hub/init.lua").is_none(),
+                "Debug builds return None for all lookups"
+            );
         }
     }
 
     #[test]
     fn test_release_build_embeds_core_files() {
         if !cfg!(debug_assertions) {
-            assert!(contains("hub/init.lua"), "Release build should embed hub/init.lua");
+            assert!(
+                contains("hub/init.lua"),
+                "Release build should embed hub/init.lua"
+            );
             let content = get("hub/init.lua").unwrap();
-            assert!(content.contains("Botster"), "Should contain Botster identifier");
+            assert!(
+                content.contains("Botster"),
+                "Should contain Botster identifier"
+            );
 
             let files = all();
-            assert!(!files.is_empty(), "Release build should have embedded files");
+            assert!(
+                !files.is_empty(),
+                "Release build should have embedded files"
+            );
 
             let paths: Vec<_> = files.iter().map(|(p, _)| *p).collect();
             assert!(paths.contains(&"hub/init.lua"));
@@ -120,9 +132,14 @@ mod tests {
         }
 
         // Resolve cli/lua/ relative to CARGO_MANIFEST_DIR (the cli/ crate root)
-        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set");
+        let manifest =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set");
         let lua_dir = Path::new(&manifest).join("lua");
-        assert!(lua_dir.exists(), "cli/lua/ directory should exist: {}", lua_dir.display());
+        assert!(
+            lua_dir.exists(),
+            "cli/lua/ directory should exist: {}",
+            lua_dir.display()
+        );
 
         let mut files = Vec::new();
         walk(&lua_dir, &lua_dir, &mut files);
@@ -134,10 +151,12 @@ mod tests {
     ///
     /// Returns module names like `"lib.agent"`, `"handlers.connections"`, etc.
     fn extract_init_requires() -> Vec<String> {
-        let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set");
+        let manifest =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set");
         let init_path = std::path::Path::new(&manifest).join("lua/hub/init.lua");
-        let content = std::fs::read_to_string(&init_path)
-            .unwrap_or_else(|e| panic!("Should read hub/init.lua at {}: {}", init_path.display(), e));
+        let content = std::fs::read_to_string(&init_path).unwrap_or_else(|e| {
+            panic!("Should read hub/init.lua at {}: {}", init_path.display(), e)
+        });
 
         // Simple parser: find require("...") and safe_require("...") patterns
         let mut modules = Vec::new();

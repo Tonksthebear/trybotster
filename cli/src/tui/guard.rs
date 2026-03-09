@@ -57,10 +57,10 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
 
         // Reset mirrored terminal modes (may have been pushed by sync_terminal_modes)
-        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1l");    // Reset DECCKM (application cursor)
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1l"); // Reset DECCKM (application cursor)
         let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?2004l"); // Reset bracketed paste
         let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?1004l"); // Disable focus reporting
-        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[0q");     // Reset DECSCUSR cursor shape
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[0q"); // Reset DECSCUSR cursor shape
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
 
         let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);

@@ -317,7 +317,8 @@ mod tests {
         assert!(!resized.is_notification());
         assert!(!resized.is_cursor_visibility_changed());
 
-        let notification = PtyEvent::notification(AgentNotification::Osc9(Some("test".to_string())));
+        let notification =
+            PtyEvent::notification(AgentNotification::Osc9(Some("test".to_string())));
         assert!(!notification.is_output());
         assert!(!notification.is_resized());
         assert!(!notification.is_process_exited());

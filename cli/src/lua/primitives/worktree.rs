@@ -265,14 +265,16 @@ pub(crate) fn register(
             let agent_key: String = params.get("agent_key").map_err(|e| {
                 mlua::Error::runtime(format!("create_async: missing agent_key: {e}"))
             })?;
-            let branch: String = params.get("branch").map_err(|e| {
-                mlua::Error::runtime(format!("create_async: missing branch: {e}"))
-            })?;
-            let prompt: String = params.get::<Option<String>>("prompt")
+            let branch: String = params
+                .get("branch")
+                .map_err(|e| mlua::Error::runtime(format!("create_async: missing branch: {e}")))?;
+            let prompt: String = params
+                .get::<Option<String>>("prompt")
                 .unwrap_or(None)
                 .unwrap_or_default();
             let metadata_lua: mlua::Value = params.get("metadata").unwrap_or(mlua::Value::Nil);
-            let metadata_json = lua_inner.from_value::<serde_json::Value>(metadata_lua)
+            let metadata_json = lua_inner
+                .from_value::<serde_json::Value>(metadata_lua)
                 .unwrap_or(serde_json::Value::Null);
             let profile_name: Option<String> = params.get("profile_name").unwrap_or(None);
             let client_rows: u16 = params.get("client_rows").unwrap_or(24);
@@ -290,7 +292,9 @@ pub(crate) fn register(
                     client_cols,
                 }));
             } else {
-                ::log::warn!("[Worktree] create_async() called before hub_event_tx set — event dropped");
+                ::log::warn!(
+                    "[Worktree] create_async() called before hub_event_tx set — event dropped"
+                );
             }
             Ok(())
         })
@@ -346,10 +350,12 @@ pub(crate) fn register(
                     Path::new(&patterns_file),
                 )
                 .map(|()| true)
-                .map_err(|e| mlua::Error::runtime(format!(
-                    "Failed to copy patterns from '{}': {}",
-                    patterns_file, e
-                )))
+                .map_err(|e| {
+                    mlua::Error::runtime(format!(
+                        "Failed to copy patterns from '{}': {}",
+                        patterns_file, e
+                    ))
+                })
             },
         )
         .map_err(|e| anyhow!("Failed to create worktree.copy_from_patterns function: {e}"))?;
@@ -366,7 +372,10 @@ pub(crate) fn register(
         .create_function(move |_, (path, branch): (String, String)| {
             let guard = tx.lock().expect("HubEventSender mutex poisoned");
             if let Some(ref sender) = *guard {
-                let _ = sender.send(HubEvent::LuaWorktreeRequest(WorktreeRequest::Delete { path, branch }));
+                let _ = sender.send(HubEvent::LuaWorktreeRequest(WorktreeRequest::Delete {
+                    path,
+                    branch,
+                }));
             } else {
                 ::log::warn!("[Worktree] delete() called before hub_event_tx set — event dropped");
             }
@@ -388,8 +397,8 @@ pub(crate) fn register(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::new_hub_event_sender;
+    use super::*;
 
     fn create_test_queue_and_cache() -> (HubEventSender, Arc<HandleCache>, PathBuf) {
         (
@@ -440,7 +449,11 @@ mod tests {
         register(&lua, tx, cache, base).expect("Should register");
 
         let worktrees: LuaTable = lua.load("return worktree.list()").eval().unwrap();
-        assert_eq!(worktrees.len().unwrap(), 0, "Empty worktree list should have length 0");
+        assert_eq!(
+            worktrees.len().unwrap(),
+            0,
+            "Empty worktree list should have length 0"
+        );
     }
 
     #[test]
@@ -479,10 +492,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, cache, base) = create_test_queue_and_cache();
 
-        cache.set_worktrees(vec![(
-            "/path/to/wt1".to_string(),
-            "feature-a".to_string(),
-        )]);
+        cache.set_worktrees(vec![("/path/to/wt1".to_string(), "feature-a".to_string())]);
 
         register(&lua, tx, cache, base).expect("Should register");
 
@@ -498,10 +508,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, cache, base) = create_test_queue_and_cache();
 
-        cache.set_worktrees(vec![(
-            "/path/to/wt1".to_string(),
-            "feature-a".to_string(),
-        )]);
+        cache.set_worktrees(vec![("/path/to/wt1".to_string(), "feature-a".to_string())]);
 
         register(&lua, tx, cache, base).expect("Should register");
 
@@ -531,10 +538,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, cache, base) = create_test_queue_and_cache();
 
-        cache.set_worktrees(vec![(
-            "/path/to/wt1".to_string(),
-            "feature-a".to_string(),
-        )]);
+        cache.set_worktrees(vec![("/path/to/wt1".to_string(), "feature-a".to_string())]);
 
         register(&lua, tx, cache, base).expect("Should register");
 
@@ -621,7 +625,10 @@ mod tests {
             }
             LuaValue::String(s) => {
                 // OK - should be a valid path
-                assert!(!s.to_str().unwrap().is_empty(), "repo_root should not be empty string");
+                assert!(
+                    !s.to_str().unwrap().is_empty(),
+                    "repo_root should not be empty string"
+                );
             }
             _ => panic!("repo_root should return nil or string, got {:?}", result),
         }
@@ -666,7 +673,10 @@ mod tests {
                 assert_eq!(agent_key, "test-repo-42");
                 assert_eq!(branch, "feature-branch");
                 assert_eq!(metadata["issue_number"], 42);
-                assert_eq!(metadata["invocation_url"], "https://github.com/test/repo/issues/42");
+                assert_eq!(
+                    metadata["invocation_url"],
+                    "https://github.com/test/repo/issues/42"
+                );
                 assert_eq!(prompt, "Fix the bug");
                 assert_eq!(profile_name.as_deref(), Some("default"));
                 assert_eq!(client_rows, 30);

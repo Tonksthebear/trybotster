@@ -45,7 +45,6 @@ pub enum HubAction {
     Quit,
 }
 
-
 /// Dispatch a hub action, modifying hub state accordingly.
 ///
 /// This is the central dispatch point for all actions. TUI input,

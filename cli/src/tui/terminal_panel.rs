@@ -16,6 +16,8 @@
 //!
 //! ```text
 //! Idle ──connect()──> Connecting ──on_scrollback()──> Connected
+//!  │                                             ^
+//!  └──────────────on_scrollback()────────────────┘
 //!  ^                       |                              |
 //!  └───disconnect()────────┴──────────disconnect()────────┘
 //! ```
@@ -168,17 +170,34 @@ impl TerminalPanel {
         }))
     }
 
+    /// Mark the transport disconnected without sending an unsubscribe.
+    ///
+    /// Used when the outer hub socket drops unexpectedly and all subscriptions
+    /// vanish server-side already. Preserves parser contents so the panel can
+    /// show stale output while the next render pass re-subscribes.
+    pub fn mark_transport_disconnected(&mut self) {
+        self.state = PanelState::Idle;
+    }
+
     /// Process a scrollback snapshot, transitioning to `Connected`.
     ///
-    /// Clears the parser before writing the snapshot so the widget
-    /// starts from a clean state. Ignored if `Idle` — a panel must
-    /// have been subscribed via `connect()` before scrollback arrives.
+    /// Clears the parser before writing the snapshot so the widget starts
+    /// from a clean state. Accepts snapshots from `Idle` too, since
+    /// reconnect races can deliver a valid snapshot before local state
+    /// observes `Connecting`.
     pub fn on_scrollback(&mut self, data: &[u8]) {
-        if self.state == PanelState::Idle {
-            return;
-        }
-        // Replace the parser entirely so the old scrollback buffer is discarded.
         let (rows, cols) = self.dims;
+        self.on_scrollback_with_dims(rows, cols, data);
+    }
+
+    /// Process a scrollback snapshot with authoritative source dimensions.
+    ///
+    /// The snapshot producer's dimensions are applied before parse so replayed
+    /// cursor/line layout matches the source terminal exactly.
+    pub fn on_scrollback_with_dims(&mut self, rows: u16, cols: u16, data: &[u8]) {
+        self.dims = (rows, cols);
+
+        // Replace the parser entirely so the old scrollback buffer is discarded.
         self.parser = AlacrittyParser::new_noop(rows, cols, TUI_SCROLLBACK);
         self.parser.process(data);
 
@@ -343,6 +362,14 @@ mod tests {
     }
 
     #[test]
+    fn on_empty_scrollback_transitions_to_connected() {
+        let mut panel = TerminalPanel::new(24, 80);
+        panel.connect("sess-0");
+        panel.on_scrollback(b"");
+        assert_eq!(panel.state(), PanelState::Connected);
+    }
+
+    #[test]
     fn on_output_ignored_when_idle() {
         let mut panel = TerminalPanel::new(24, 80);
         panel.on_output(b"should be ignored");
@@ -450,13 +477,13 @@ mod tests {
     }
 
     #[test]
-    fn on_scrollback_ignored_when_idle() {
+    fn on_scrollback_connects_from_idle() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.on_scrollback(b"should be ignored");
-        assert_eq!(panel.state(), PanelState::Idle);
+        panel.on_scrollback(b"idle snapshot");
+        assert_eq!(panel.state(), PanelState::Connected);
 
         let cell = &panel.term().grid()[Point::new(Line(0), Column(0))];
-        assert_eq!(cell.c, ' ');
+        assert_eq!(cell.c, 'i');
     }
 
     #[test]
@@ -469,7 +496,10 @@ mod tests {
             panel.on_output(format!("line {i}\r\n").as_bytes());
         }
 
-        assert!(panel.scrollback_depth() > 0, "should have scrollback before clear");
+        assert!(
+            panel.scrollback_depth() > 0,
+            "should have scrollback before clear"
+        );
 
         // Send CSI 3 J (clear scrollback) — alacritty handles this natively.
         panel.on_output(b"\x1b[3J");

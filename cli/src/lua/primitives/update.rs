@@ -46,8 +46,7 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
     // update.check() — Query GitHub for latest version (bounded timeout)
     let check_fn = lua
         .create_function(|lua, ()| {
-            let status =
-                update::get_update_status_with_timeout().map_err(LuaError::external)?;
+            let status = update::get_update_status_with_timeout().map_err(LuaError::external)?;
 
             let table = lua.create_table()?;
             match status {
@@ -135,7 +134,9 @@ mod tests {
         let globals = lua.globals();
         let update_table: Table = globals.get("update").expect("update table should exist");
 
-        let _: Function = update_table.get("check").expect("update.check should exist");
+        let _: Function = update_table
+            .get("check")
+            .expect("update.check should exist");
         let _: Function = update_table
             .get("install")
             .expect("update.install should exist");

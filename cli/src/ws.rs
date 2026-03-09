@@ -20,9 +20,8 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite;
 
 /// Concrete WebSocket stream type (avoids repeating the 6-line generic everywhere).
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Received WebSocket message.
 #[derive(Debug)]

@@ -374,7 +374,9 @@ mod tests {
 
         store.list_state("menu").set_selectable_count(3);
         store.list_state("menu").select(2);
-        store.input_state("prompt").handle(InputRequest::InsertChar('x'));
+        store
+            .input_state("prompt")
+            .handle(InputRequest::InsertChar('x'));
 
         store.reset_all();
 
