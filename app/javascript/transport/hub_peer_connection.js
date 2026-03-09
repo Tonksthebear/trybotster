@@ -84,6 +84,8 @@ const ICE_RESTART_MAX_ATTEMPTS = 3       // Max restarts before full reconnect
 const ICE_RESTART_BACKOFF_MULTIPLIER = 2 // Exponential backoff
 const STALLED_EVENT_COOLDOWN_MS = 2000   // Throttle repeated stalled notifications
 const MAX_PENDING_REMOTE_ICE = 128        // Bound pre-answer/pre-peer candidate buffering
+const ICE_CONFIG_CACHE_TTL_MS = 60_000    // Reuse ICE config for fast reconnects
+const ICE_CONFIG_FETCH_TIMEOUT_MS = 3000  // Hard cap for /webrtc fetch latency
 
 class HubPeerConnection {
   #connections = new Map() // hubId -> { pc, dataChannel, state, subscriptions }
@@ -169,6 +171,7 @@ class HubPeerConnection {
 
     let conn = this.#connections.get(hubId)
     if (conn) {
+      this.#prefetchIceConfig(hubId, conn)
       // Re-emit cached health so new Connections (Turbo navigation) get the
       // current CLI status. Without this, cliStatus stays UNKNOWN because no
       // new ActionCable subscription is created (no server-side transmit).
@@ -195,6 +198,9 @@ class HubPeerConnection {
       activeFileTransferIds: new Set(),
       nextFileTransferId: 0,
       lastStalledAt: 0,
+      iceConfig: null,
+      iceConfigFetchedAt: 0,
+      iceConfigPromise: null,
       // Start true — ActionCable buffers messages until confirmed.
       // Set false by disconnected callback, true again by connected.
       signalingConnected: true,
@@ -202,6 +208,7 @@ class HubPeerConnection {
     this.#connections.set(hubId, newConn)
 
     await this.#createSignalingChannel(hubId, browserIdentity)
+    this.#prefetchIceConfig(hubId, newConn)
 
     return { state: TransportState.DISCONNECTED }
   }
@@ -260,7 +267,7 @@ class HubPeerConnection {
 
     console.debug(`[WebRTCTransport] Creating peer connection for hub ${hubId}`)
 
-    const iceConfig = await this.#fetchIceConfig(hubId)
+    const iceConfig = await this.#getIceConfig(hubId, conn)
     const pc = new RTCPeerConnection({ iceServers: iceConfig.ice_servers })
     conn.pc = pc
     conn.state = TransportState.CONNECTING
@@ -975,10 +982,74 @@ class HubPeerConnection {
     }
   }
 
+  #hasFreshIceConfig(conn) {
+    return !!conn?.iceConfig && (Date.now() - conn.iceConfigFetchedAt) < ICE_CONFIG_CACHE_TTL_MS
+  }
+
+  #prefetchIceConfig(hubId, conn) {
+    if (!conn || conn.iceConfigPromise || this.#hasFreshIceConfig(conn)) return
+
+    conn.iceConfigPromise = this.#fetchIceConfig(hubId)
+      .then((iceConfig) => {
+        conn.iceConfig = iceConfig
+        conn.iceConfigFetchedAt = Date.now()
+        return iceConfig
+      })
+      .catch((error) => {
+        console.debug(
+          `[WebRTCTransport] ICE prefetch failed for hub ${hubId}: ${error?.message || error}`,
+        )
+        return null
+      })
+      .finally(() => {
+        conn.iceConfigPromise = null
+      })
+  }
+
+  async #getIceConfig(hubId, conn) {
+    if (this.#hasFreshIceConfig(conn)) return conn.iceConfig
+
+    if (conn.iceConfigPromise) {
+      const prefetched = await conn.iceConfigPromise
+      if (prefetched) return prefetched
+      if (this.#hasFreshIceConfig(conn)) return conn.iceConfig
+    }
+
+    try {
+      const iceConfig = await this.#fetchIceConfig(hubId)
+      conn.iceConfig = iceConfig
+      conn.iceConfigFetchedAt = Date.now()
+      return iceConfig
+    } catch (error) {
+      if (conn.iceConfig) {
+        console.warn(
+          `[WebRTCTransport] ICE fetch failed for hub ${hubId}, using stale cached config:`,
+          error,
+        )
+        return conn.iceConfig
+      }
+      throw error
+    }
+  }
+
   async #fetchIceConfig(hubId) {
-    const response = await fetch(`/hubs/${hubId}/webrtc`, {
-      credentials: "include",
-    })
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), ICE_CONFIG_FETCH_TIMEOUT_MS)
+
+    let response
+    try {
+      response = await fetch(`/hubs/${hubId}/webrtc`, {
+        credentials: "include",
+        signal: controller.signal,
+      })
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        throw new Error(`Failed to fetch ICE config: timeout after ${ICE_CONFIG_FETCH_TIMEOUT_MS}ms`)
+      }
+      throw error
+    } finally {
+      clearTimeout(timeout)
+    }
 
     if (!response.ok) {
       throw new Error(`Failed to fetch ICE config: ${response.status}`)
