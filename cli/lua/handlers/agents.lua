@@ -209,15 +209,26 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, agen
     local workspace_name = metadata and metadata.workspace or nil
     local workspace_id = metadata and metadata.workspace_id or nil
     local workspace_metadata = metadata and metadata.workspace_metadata or nil
+    local workspace_expect_new = metadata and metadata.workspace_expect_new or false
+    local session_metadata = metadata
+    if metadata and metadata.workspace_expect_new ~= nil then
+        session_metadata = {}
+        for k, v in pairs(metadata) do
+            if k ~= "workspace_expect_new" then
+                session_metadata[k] = v
+            end
+        end
+    end
 
     local ok, agent = pcall(Agent.new, {
         repo = repo,
         branch_name = branch_name,
         worktree_path = wt_path,
         prompt = prompt,
-        metadata = metadata,
+        metadata = session_metadata,
         workspace = workspace_name,
         workspace_id = workspace_id,
+        workspace_expect_new = workspace_expect_new,
         workspace_metadata = workspace_metadata,
         session_type = "agent",
         session = session_config,
@@ -300,15 +311,26 @@ spawn_accessory = function(branch_name, wt_path, accessory_name, agent_key, agen
 
     local workspace_name = metadata and metadata.workspace or nil
     local workspace_id = metadata and metadata.workspace_id or nil
+    local workspace_expect_new = metadata and metadata.workspace_expect_new or false
+    local session_metadata = metadata
+    if metadata and metadata.workspace_expect_new ~= nil then
+        session_metadata = {}
+        for k, v in pairs(metadata) do
+            if k ~= "workspace_expect_new" then
+                session_metadata[k] = v
+            end
+        end
+    end
 
     local ok, agent = pcall(Accessory.new, {
         repo = repo,
         branch_name = branch_name,
         worktree_path = wt_path,
         session = session_config,
-        metadata = metadata,
+        metadata = session_metadata,
         workspace = workspace_name,
         workspace_id = workspace_id,
+        workspace_expect_new = workspace_expect_new,
         dims = { rows = 24, cols = 80 },
         agent_key = agent_key,
         agent_name = agent_name,
@@ -709,6 +731,14 @@ _event_subs[#_event_subs + 1] = events.on("worktree_created", function(info)
             log.warn(string.format("Failed to copy workspace files: %s", tostring(copy_err)))
         end
     end
+
+    hooks.notify("worktree_created", {
+        path = info.path,
+        branch = info.branch,
+        repo = worktree.repo_root(),
+        agent_key = info.agent_key,
+        metadata = info.metadata or {},
+    })
 
     local client = { rows = info.client_rows, cols = info.client_cols }
 

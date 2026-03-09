@@ -20,6 +20,17 @@ local M = {}
 -- the same second. Incremented before each math.randomseed() call.
 local _id_counter = 0
 
+--- Normalize a workspace name for comparisons and persistence.
+-- Trims surrounding whitespace and returns nil for empty values.
+-- @param name string|nil
+-- @return string|nil
+local function normalize_workspace_name(name)
+    if name == nil then return nil end
+    local normalized = tostring(name):match("^%s*(.-)%s*$")
+    if normalized == "" then return nil end
+    return normalized
+end
+
 -- =============================================================================
 -- ID Generation
 -- =============================================================================
@@ -257,13 +268,29 @@ function M.read_workspace(data_dir, workspace_id)
     return manifest
 end
 
+--- Read the effective status for a workspace without mutating it.
+-- Prefers derived session status over stale manifest status.
+-- @param data_dir string
+-- @param workspace_id string
+-- @param manifest table|nil
+-- @return string|nil
+local function effective_workspace_status(data_dir, workspace_id, manifest)
+    local status = M.compute_workspace_status(data_dir, workspace_id)
+    if status == "suspended" and manifest and manifest.status == "active" then
+        return "active"
+    end
+    if status then return status end
+    return manifest and manifest.status or nil
+end
+
 --- Find an existing workspace manifest matching a name.
 -- @param data_dir string
 -- @param name string  Workspace display name (e.g. "owner/repo#42")
 -- @return string|nil workspace_id
 -- @return table|nil manifest
 function M.find_workspace(data_dir, name)
-    if not name or name == "" then return nil, nil end
+    local normalized_name = normalize_workspace_name(name)
+    if not normalized_name then return nil, nil end
 
     local ws_dir = M.workspaces_dir(data_dir)
     if not fs.exists(ws_dir) then return nil, nil end
@@ -277,8 +304,42 @@ function M.find_workspace(data_dir, name)
 
     for _, workspace_id in ipairs(entries) do
         local manifest = M.read_workspace(data_dir, workspace_id)
-        if manifest and manifest.name == name then
+        if manifest and manifest.name == normalized_name then
             return workspace_id, manifest
+        end
+    end
+
+    return nil, nil
+end
+
+--- Find an active workspace by display name.
+-- Closed workspaces do not block reuse of the same name.
+-- @param data_dir string
+-- @param name string
+-- @param exclude_workspace_id string|nil
+-- @return string|nil workspace_id
+-- @return table|nil manifest
+function M.find_active_workspace(data_dir, name, exclude_workspace_id)
+    local normalized_name = normalize_workspace_name(name)
+    if not normalized_name then return nil, nil end
+
+    local ws_dir = M.workspaces_dir(data_dir)
+    if not fs.exists(ws_dir) then return nil, nil end
+
+    local entries, err = fs.list_dir(ws_dir)
+    if not entries then
+        log.debug(string.format("[workspace_store] find_active_workspace: could not list %s: %s",
+            ws_dir, tostring(err)))
+        return nil, nil
+    end
+
+    for _, workspace_id in ipairs(entries) do
+        if workspace_id ~= exclude_workspace_id then
+            local manifest = M.read_workspace(data_dir, workspace_id)
+            local status = effective_workspace_status(data_dir, workspace_id, manifest)
+            if manifest and manifest.name == normalized_name and status == "active" then
+                return workspace_id, manifest
+            end
         end
     end
 
@@ -293,15 +354,19 @@ end
 -- @return table|nil manifest
 -- @return boolean created_new
 function M.ensure_workspace(data_dir, opts)
-    local name = opts and opts.name
-    if not name or name == "" then
+    local name = normalize_workspace_name(opts and opts.name)
+    if not name then
         log.warn("[workspace_store] ensure_workspace: missing name")
-        return nil, nil, false
+        return nil, nil, false, "Workspace name is required"
     end
 
-    local existing_id, existing_manifest = M.find_workspace(data_dir, name)
+    local expect_new = opts and opts.expect_new or false
+    local existing_id, existing_manifest = M.find_active_workspace(data_dir, name)
     if existing_id then
-        return existing_id, existing_manifest, false
+        if expect_new then
+            return nil, nil, false, string.format("Active workspace '%s' already exists", name)
+        end
+        return existing_id, existing_manifest, false, nil
     end
 
     local workspace_id = M.generate_workspace_id()
@@ -317,9 +382,17 @@ function M.ensure_workspace(data_dir, opts)
 
     local ok = M.write_workspace(data_dir, workspace_id, manifest)
     if not ok then
-        return nil, nil, false
+        return nil, nil, false, string.format("Failed to create workspace '%s'", name)
     end
-    return workspace_id, manifest, true
+    local hooks_ok, hooks_mod = pcall(require, "hub.hooks")
+    if hooks_ok and hooks_mod then
+        hooks_mod.notify("workspace_created", {
+            workspace_id = workspace_id,
+            name = name,
+            manifest = manifest,
+        })
+    end
+    return workspace_id, manifest, true, nil
 end
 
 --- Rename a workspace (update the display name).
@@ -328,18 +401,28 @@ end
 -- @param new_name string
 -- @return boolean success
 function M.rename_workspace(data_dir, workspace_id, new_name)
-    if not new_name or new_name == "" then
+    local normalized_name = normalize_workspace_name(new_name)
+    if not normalized_name then
         log.warn("[workspace_store] rename_workspace: empty new_name")
-        return false
+        return false, "Workspace name is required"
     end
+
+    local conflict_id = M.find_active_workspace(data_dir, normalized_name, workspace_id)
+    if conflict_id then
+        return false, string.format("Active workspace '%s' already exists", normalized_name)
+    end
+
     local manifest = M.read_workspace(data_dir, workspace_id)
     if not manifest then
         log.warn(string.format("[workspace_store] rename_workspace: workspace %s not found", workspace_id))
-        return false
+        return false, string.format("Workspace '%s' not found", tostring(workspace_id))
     end
-    manifest.name = new_name
+    manifest.name = normalized_name
     manifest.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
-    return M.write_workspace(data_dir, workspace_id, manifest)
+    if not M.write_workspace(data_dir, workspace_id, manifest) then
+        return false, string.format("Failed to rename workspace '%s'", tostring(workspace_id))
+    end
+    return true, nil
 end
 
 --- List all workspace manifests.
