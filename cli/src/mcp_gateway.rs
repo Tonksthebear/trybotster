@@ -122,10 +122,7 @@ fn handle_hub_message(
         }
 
         "tool_result" => {
-            let call_id = msg
-                .get("call_id")
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
+            let call_id = msg.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
             if !call_id.is_empty() {
                 if let Some(tx) = pending.remove(call_id) {
                     let _ = tx.send(Ok(msg));
@@ -140,10 +137,7 @@ fn handle_hub_message(
         }
 
         "prompt_result" => {
-            let call_id = msg
-                .get("call_id")
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
+            let call_id = msg.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
             if !call_id.is_empty() {
                 if let Some(tx) = pending.remove(call_id) {
                     let _ = tx.send(Ok(msg));
@@ -166,10 +160,7 @@ fn handle_hub_message(
         }
 
         "resource_result" => {
-            let call_id = msg
-                .get("call_id")
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
+            let call_id = msg.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
             if !call_id.is_empty() {
                 if let Some(tx) = pending.remove(call_id) {
                     let _ = tx.send(Ok(msg));
@@ -328,34 +319,34 @@ async fn connection_manager(
     loop {
         log::warn!("[mcp-gateway] Hub disconnected, reconnecting...");
 
-        let stream =
-            match connect_to_hub(&socket_path, RECONNECT_RETRIES, RECONNECT_RETRY_MS, false).await
-            {
-                Ok(s) => {
-                    log::info!("[mcp-gateway] Reconnected to hub");
-                    s
-                }
-                Err(e) => {
-                    log::error!(
-                        "[mcp-gateway] Failed to reconnect after {RECONNECT_RETRIES} attempts: {e}"
-                    );
-                    // Drain and fail remaining requests
-                    while let Ok(req) = request_rx.try_recv() {
-                        let _ = req
-                            .response_tx
-                            .send(Err("hub reconnection failed".to_string()));
-                    }
-                    return;
-                }
-            };
-
-        let exit = run_hub_session(
-            stream,
-            &mut request_rx,
-            &notification_tx,
-            &caller_context,
+        let stream = match connect_to_hub(
+            &socket_path,
+            RECONNECT_RETRIES,
+            RECONNECT_RETRY_MS,
+            false,
         )
-        .await;
+        .await
+        {
+            Ok(s) => {
+                log::info!("[mcp-gateway] Reconnected to hub");
+                s
+            }
+            Err(e) => {
+                log::error!(
+                    "[mcp-gateway] Failed to reconnect after {RECONNECT_RETRIES} attempts: {e}"
+                );
+                // Drain and fail remaining requests
+                while let Ok(req) = request_rx.try_recv() {
+                    let _ = req
+                        .response_tx
+                        .send(Err("hub reconnection failed".to_string()));
+                }
+                return;
+            }
+        };
+
+        let exit =
+            run_hub_session(stream, &mut request_rx, &notification_tx, &caller_context).await;
 
         if matches!(exit, SessionExit::RequestChannelClosed) {
             return;
@@ -412,13 +403,14 @@ impl McpGateway {
                     start.elapsed().as_millis()
                 );
                 ErrorData::internal_error(
-                    format!("Hub request timed out after {}s", HUB_REQUEST_TIMEOUT.as_secs()),
+                    format!(
+                        "Hub request timed out after {}s",
+                        HUB_REQUEST_TIMEOUT.as_secs()
+                    ),
                     None,
                 )
             })?
-            .map_err(|_| {
-                ErrorData::internal_error("Hub connection lost".to_string(), None)
-            })?
+            .map_err(|_| ErrorData::internal_error("Hub connection lost".to_string(), None))?
             .map_err(|e| ErrorData::internal_error(e, None))?;
 
         log::info!(
@@ -443,10 +435,7 @@ impl McpGateway {
 /// rmcp needs: `Tool { name, description, input_schema: Arc<JsonObject> }`
 fn hub_tool_to_mcp(t: &Value) -> Option<Tool> {
     let name = t.get("name")?.as_str()?;
-    let description = t
-        .get("description")
-        .and_then(|d| d.as_str())
-        .unwrap_or("");
+    let description = t.get("description").and_then(|d| d.as_str()).unwrap_or("");
     let schema = t
         .get("input_schema")
         .and_then(|s| s.as_object())
@@ -463,7 +452,10 @@ fn hub_tool_to_mcp(t: &Value) -> Option<Tool> {
 /// Hub sends: `{ name, description, arguments: [{ name, description, required }] }`
 fn hub_prompt_to_mcp(p: &Value) -> Option<Prompt> {
     let name = p.get("name")?.as_str()?.to_string();
-    let description = p.get("description").and_then(|d| d.as_str()).map(String::from);
+    let description = p
+        .get("description")
+        .and_then(|d| d.as_str())
+        .map(String::from);
 
     let arguments = p.get("arguments").and_then(|a| a.as_array()).map(|args| {
         args.iter()
@@ -557,9 +549,7 @@ impl ServerHandler for McpGateway {
                                 peer.notify_prompt_list_changed().await
                             }
                             HubNotification::ResourcesListChanged => {
-                                log::info!(
-                                    "[mcp-gateway] Forwarding resources/list_changed"
-                                );
+                                log::info!("[mcp-gateway] Forwarding resources/list_changed");
                                 peer.notify_resource_list_changed().await
                             }
                         };
@@ -742,7 +732,11 @@ impl ServerHandler for McpGateway {
             let templates = msg
                 .get("resourceTemplates")
                 .and_then(|t| t.as_array())
-                .map(|arr| arr.iter().filter_map(hub_resource_template_to_mcp).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(hub_resource_template_to_mcp)
+                        .collect()
+                })
                 .unwrap_or_default();
 
             Ok(ListResourceTemplatesResult::with_all_items(templates))
@@ -794,26 +788,17 @@ impl ServerHandler for McpGateway {
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|item| {
-                            let item_uri = item
-                                .get("uri")
-                                .and_then(|u| u.as_str())
-                                .unwrap_or(uri);
+                            let item_uri = item.get("uri").and_then(|u| u.as_str()).unwrap_or(uri);
 
                             if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                                 let mut rc = ResourceContents::text(text, item_uri);
-                                if let Some(mime) =
-                                    item.get("mimeType").and_then(|m| m.as_str())
-                                {
+                                if let Some(mime) = item.get("mimeType").and_then(|m| m.as_str()) {
                                     rc = rc.with_mime_type(mime);
                                 }
                                 Some(rc)
-                            } else if let Some(blob) =
-                                item.get("blob").and_then(|b| b.as_str())
-                            {
+                            } else if let Some(blob) = item.get("blob").and_then(|b| b.as_str()) {
                                 let mut rc = ResourceContents::blob(blob, item_uri);
-                                if let Some(mime) =
-                                    item.get("mimeType").and_then(|m| m.as_str())
-                                {
+                                if let Some(mime) = item.get("mimeType").and_then(|m| m.as_str()) {
                                     rc = rc.with_mime_type(mime);
                                 }
                                 Some(rc)
@@ -843,8 +828,7 @@ pub fn run(socket_path: &str) -> Result<()> {
 /// Async entry point: connect to hub, start rmcp server on stdio.
 async fn run_async(socket_path: &str) -> Result<()> {
     // Initial connection — fail immediately if hub is unreachable
-    let stream =
-        connect_to_hub(socket_path, CONNECT_RETRIES, CONNECT_RETRY_BASE_MS, true).await?;
+    let stream = connect_to_hub(socket_path, CONNECT_RETRIES, CONNECT_RETRY_BASE_MS, true).await?;
 
     let (request_tx, request_rx) = mpsc::unbounded_channel();
     let (notification_tx, notification_rx) = mpsc::unbounded_channel();
@@ -889,7 +873,6 @@ async fn run_async(socket_path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::socket::framing::{Frame, FrameDecoder};
     use tokio::io::AsyncReadExt;
 
     /// Create a connected Unix socket pair.

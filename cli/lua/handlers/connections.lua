@@ -23,6 +23,9 @@ local stats = state.get("connections.stats", {
     agent_list_deduped = 0,
 })
 local last_agent_list_snapshot = state.get("connections.last_agent_list_snapshot", nil)
+local hub_recovery_state = state.get("connections.hub_recovery_state", {
+    state = "starting",
+})
 
 -- ============================================================================
 -- Client Registry
@@ -340,6 +343,26 @@ end)
 _event_subs[#_event_subs + 1] = events.on("connection_code_error", function(err)
     log.warn(string.format("Broadcasting connection_code_error: %s", err or "unknown"))
     broadcast_hub_event("connection_code_error", { error = err or "Connection code not available" })
+end)
+
+_event_subs[#_event_subs + 1] = events.on("hub_recovery_state", function(info)
+    local incoming = (type(info) == "table") and info or {}
+
+    -- Replace the persisted table in place so late subscribers can request
+    -- the exact latest lifecycle payload.
+    for k in pairs(hub_recovery_state) do
+        hub_recovery_state[k] = nil
+    end
+    for k, v in pairs(incoming) do
+        hub_recovery_state[k] = v
+    end
+    hub_recovery_state.state = hub_recovery_state.state or "starting"
+    state.set("connections.hub_recovery_state", hub_recovery_state)
+
+    broadcast_hub_event("hub_recovery_state", hub_recovery_state)
+    if hub_recovery_state.state == "ready" then
+        broadcast_hub_event("hub_ready", hub_recovery_state)
+    end
 end)
 
 _event_subs[#_event_subs + 1] = events.on("agent_status_changed", function(info)

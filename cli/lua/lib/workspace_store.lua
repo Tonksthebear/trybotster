@@ -559,6 +559,60 @@ function M.scan_active_sessions(data_dir)
     return results
 end
 
+--- Scan the workspaces directory for session metadata usable during restart.
+--
+-- Unlike scan_active_sessions(), this intentionally does NOT decide liveness.
+-- Liveness authority is the broker inventory; manifests are metadata-only.
+--
+-- Returns all session manifests except those explicitly closed.
+-- Each record has fields:
+--   workspace_id, session_uuid, manifest (decoded table), data_dir
+--
+-- @param data_dir string
+-- @return array
+function M.scan_recoverable_sessions(data_dir)
+    local results = {}
+    local ws_dir = M.workspaces_dir(data_dir)
+    if not fs.exists(ws_dir) then return results end
+
+    local ws_entries, ws_err = fs.list_dir(ws_dir)
+    if not ws_entries then
+        log.debug(string.format("[workspace_store] scan recoverable: could not list %s: %s",
+            ws_dir, tostring(ws_err)))
+        return results
+    end
+
+    for _, workspace_id in ipairs(ws_entries) do
+        local sessions_dir = M.workspace_dir(data_dir, workspace_id) .. "/sessions"
+        if not fs.exists(sessions_dir) then
+            goto continue_workspace
+        end
+
+        local sess_entries, sess_err = fs.list_dir(sessions_dir)
+        if not sess_entries then
+            log.debug(string.format("[workspace_store] scan recoverable: could not list %s: %s",
+                sessions_dir, tostring(sess_err)))
+            goto continue_workspace
+        end
+
+        for _, session_uuid in ipairs(sess_entries) do
+            local manifest = M.read_session(data_dir, workspace_id, session_uuid)
+            if manifest and manifest.status ~= "closed" then
+                results[#results + 1] = {
+                    workspace_id = workspace_id,
+                    session_uuid = session_uuid,
+                    manifest = manifest,
+                    data_dir = data_dir,
+                }
+            end
+        end
+
+        ::continue_workspace::
+    end
+
+    return results
+end
+
 -- =============================================================================
 -- Migration
 -- =============================================================================

@@ -90,6 +90,7 @@ function Client:handle_subscribe(msg)
 
     local channel = msg.channel or "unknown"
     local params = msg.params or {}
+    local session_uuid = params.session_uuid
 
     -- Interceptor: plugins can transform or block subscriptions (return nil)
     local result = hooks.call("before_client_subscribe", {
@@ -106,7 +107,60 @@ function Client:handle_subscribe(msg)
     channel = result.channel or channel
     params = result.params or params
 
-    local session_uuid = params.session_uuid
+    session_uuid = params.session_uuid
+
+    -- Idempotency: a reconnect race can deliver duplicate subscribe messages
+    -- for the same subscription ID. Treat exact duplicates as no-op setup to
+    -- avoid creating two forwarders and replaying scrollback twice.
+    local existing = self.subscriptions[sub_id]
+    if existing then
+        if existing.channel == channel and existing.session_uuid == session_uuid then
+            local rows = params.rows or 24
+            local cols = params.cols or 80
+            local recreated = false
+            if channel == "terminal" and session_uuid then
+                local existing_forwarder = self.forwarders[sub_id]
+                if (not existing_forwarder) or (not existing_forwarder:is_active()) then
+                    if existing_forwarder then
+                        existing_forwarder:stop()
+                    end
+                    self:setup_terminal_subscription(sub_id, session_uuid, rows, cols)
+                    recreated = true
+                end
+                pty_clients.update(session_uuid, self.peer_id, rows, cols)
+            end
+
+            if recreated then
+                log.info(string.format(
+                    "Duplicate subscribe recreated stale forwarder: %s (peer=%s)",
+                    sub_id:sub(1, 16), self.peer_id:sub(1, 8)))
+            else
+                log.debug(string.format(
+                    "Duplicate subscribe no-op: %s -> %s (peer=%s)",
+                    sub_id:sub(1, 16), channel, self.peer_id:sub(1, 8)))
+            end
+
+            self:send({
+                type = "subscribed",
+                subscriptionId = sub_id,
+            })
+            return
+        end
+
+        log.warn(string.format(
+            "Replacing existing subscription: %s (%s -> %s)",
+            sub_id:sub(1, 16), tostring(existing.channel), tostring(channel)))
+
+        local existing_forwarder = self.forwarders[sub_id]
+        if existing_forwarder then
+            existing_forwarder:stop()
+            self.forwarders[sub_id] = nil
+        end
+        if existing.channel == "terminal" and existing.session_uuid then
+            pty_clients.unregister(existing.session_uuid, self.peer_id)
+        end
+    end
+
     log.info(string.format("Subscribe: %s -> %s (peer=%s, session=%s, rows=%s, cols=%s)",
         sub_id:sub(1, 16), channel, self.peer_id:sub(1, 8),
         tostring(session_uuid and session_uuid:sub(1, 16) or "nil"),
@@ -150,14 +204,19 @@ function Client:handle_subscribe(msg)
         end
 
         if session_uuid then
+            -- Important ordering:
+            -- 1) create forwarder (captures authoritative snapshot)
+            -- 2) apply resize intent for this client
+            --
+            self:setup_terminal_subscription(sub_id, session_uuid, rows, cols)
             pty_clients.register(session_uuid, self.peer_id, rows, cols)
-            self:setup_terminal_subscription(sub_id, session_uuid)
         end
     elseif channel == "hub" then
         -- Send initial agent and worktree lists
         log.info(string.format("Hub subscription from %s...", self.peer_id:sub(1, 8)))
         self:send_agent_list(sub_id)
         self:send_worktree_list(sub_id)
+        self:send_hub_recovery_state(sub_id)
     elseif channel == "mcp" then
         -- MCP is pull-based: the client sends tools/list when ready.
         self.subscriptions[sub_id].caller_context = params.context or {}
@@ -173,22 +232,22 @@ end
 -- Creates a transport-agnostic forwarder that streams PTY output to the client.
 --
 -- @param sub_id The subscription ID
--- @param session_uuid The session UUID identifying the PTY
-function Client:setup_terminal_subscription(sub_id, session_uuid)
+-- @param rows number|nil Requested rows from subscriber
+-- @param cols number|nil Requested cols from subscriber
+function Client:setup_terminal_subscription(sub_id, session_uuid, rows, cols)
     if not session_uuid then
         log.warn("Terminal subscription missing session_uuid")
         return
     end
 
-    -- PTY was already resized by pty_clients.register() in handle_subscribe().
-    -- Now create the forwarder to stream output to this client.
-    local rows, cols = pty_clients.get_active_dims(session_uuid)
     rows = rows or 24
     cols = cols or 80
 
     local forwarder = self.transport.create_pty_forwarder({
         session_uuid = session_uuid,
         subscription_id = sub_id,
+        rows = rows,
+        cols = cols,
         prefix = "\x01",  -- Binary prefix for raw terminal data
     })
 
@@ -223,6 +282,20 @@ function Client:send_worktree_list(sub_id)
         type = "worktree_list",
         worktrees = worktrees,
     })
+end
+
+--- Send current hub recovery lifecycle state to a HubChannel subscription.
+-- @param sub_id The subscription ID to send to
+function Client:send_hub_recovery_state(sub_id)
+    local recovery = state.get("connections.hub_recovery_state", { state = "starting" })
+    local message = {
+        subscriptionId = sub_id,
+        type = "hub_recovery_state",
+    }
+    for k, v in pairs(recovery) do
+        message[k] = v
+    end
+    self:send(message)
 end
 
 --- Handle unsubscribe message - remove virtual subscription.

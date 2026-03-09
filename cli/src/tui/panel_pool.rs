@@ -73,10 +73,7 @@ impl PanelPool {
     // === Panel Access ===
 
     /// Get or create a panel for the given session UUID.
-    pub fn resolve_panel(
-        &mut self,
-        session_uuid: &str,
-    ) -> &mut TerminalPanel {
+    pub fn resolve_panel(&mut self, session_uuid: &str) -> &mut TerminalPanel {
         let (rows, cols) = self.terminal_dims;
         self.panels
             .entry(session_uuid.to_string())
@@ -130,19 +127,30 @@ impl PanelPool {
 
         let default_uuid = self.current_session_uuid.clone().unwrap_or_default();
 
-        let desired =
-            super::render_tree::collect_terminal_bindings(tree, &default_uuid);
+        let desired = super::render_tree::collect_terminal_bindings(tree, &default_uuid);
 
         // Connect panels for new bindings
         for uuid in &desired {
-            let (rows, cols) = areas
-                .get(uuid)
-                .copied()
-                .unwrap_or(self.terminal_dims);
+            let Some((rows, cols)) = areas.get(uuid).copied() else {
+                // Subscription geometry must come from the actual rendered widget
+                // area. Skip connect for this frame if the area is missing.
+                log::debug!(
+                    "sync_subscriptions: skipping connect for {} (no rendered area yet)",
+                    uuid
+                );
+                continue;
+            };
             let panel = self
                 .panels
                 .entry(uuid.clone())
                 .or_insert_with(|| TerminalPanel::new(rows, cols));
+
+            // Critical on reconnect: stale idle panels may keep old cached dims
+            // from the pre-restart frame. Refresh parser/panel dims before
+            // connect so subscribe carries current render-area rows/cols.
+            if panel.state() == PanelState::Idle {
+                let _ = panel.resize(rows, cols, uuid);
+            }
 
             if panel.state() == PanelState::Idle {
                 if let Some(msg) = panel.connect(uuid) {
@@ -175,10 +183,7 @@ impl PanelPool {
     /// Resize panels to match rendered widget areas.
     ///
     /// Returns resize messages for panels whose dimensions changed.
-    pub fn sync_widget_dims(
-        &mut self,
-        areas: &HashMap<String, (u16, u16)>,
-    ) -> OutMessages {
+    pub fn sync_widget_dims(&mut self, areas: &HashMap<String, (u16, u16)>) -> OutMessages {
         let mut msgs = OutMessages::new();
 
         for (uuid, &(rows, cols)) in areas {
@@ -219,6 +224,18 @@ impl PanelPool {
         msgs
     }
 
+    /// Reset to a fresh attach-like state after bridge reconnect.
+    ///
+    /// Unlike [`disconnect_all`], this emits no unsubscribe messages because
+    /// the old socket is already gone. Clears all panel/session state so the
+    /// next render+event cycle rebuilds subscriptions from scratch.
+    pub fn reset_for_reattach(&mut self) {
+        self.panels.clear();
+        self.current_terminal_sub_id = None;
+        self.current_session_uuid = None;
+        self.selected_agent = None;
+    }
+
     // === Focus ===
 
     /// Switch focus to a specific agent and session.
@@ -242,7 +259,10 @@ impl PanelPool {
             if terminal_focused && self.current_session_uuid.is_some() {
                 if let Some(uuid) = self.current_session_uuid.clone() {
                     log::debug!("[FOCUS] synthetic focus-out on clear, session={uuid}");
-                    effects.pty_inputs.push(PtyInput { session_uuid: uuid, data: b"\x1b[O" });
+                    effects.pty_inputs.push(PtyInput {
+                        session_uuid: uuid,
+                        data: b"\x1b[O",
+                    });
                 }
             }
             if let Some(uuid) = self.current_session_uuid.clone() {
@@ -267,15 +287,36 @@ impl PanelPool {
         if self.current_session_uuid.as_deref() == Some(uuid)
             && self.selected_agent.as_deref() == Some(agent_id)
         {
-            log::debug!("focus_terminal: already focused on agent {agent_id} session {uuid}");
-            return effects;
+            if let Some(panel) = self.panels.get_mut(uuid) {
+                match panel.state() {
+                    PanelState::Connected | PanelState::Connecting => {
+                        log::debug!(
+                            "focus_terminal: already focused on agent {agent_id} session {uuid} ({:?})",
+                            panel.state()
+                        );
+                        return effects;
+                    }
+                    PanelState::Idle => {
+                        log::debug!(
+                            "focus_terminal: re-subscribing focused agent {agent_id} session {uuid} after unavailable terminal state {:?}",
+                            panel.state()
+                        );
+                        panel.mark_transport_disconnected();
+                        self.current_terminal_sub_id = Some(format!("tui:{uuid}"));
+                        return effects;
+                    }
+                }
+            }
         }
 
         // Synthetic focus-out BEFORE changing state (targets old PTY)
         if terminal_focused && self.current_session_uuid.is_some() {
             if let Some(old_uuid) = self.current_session_uuid.clone() {
                 log::debug!("[FOCUS] synthetic focus-out on switch, old_session={old_uuid}");
-                effects.pty_inputs.push(PtyInput { session_uuid: old_uuid, data: b"\x1b[O" });
+                effects.pty_inputs.push(PtyInput {
+                    session_uuid: old_uuid,
+                    data: b"\x1b[O",
+                });
             }
         }
 
@@ -294,17 +335,19 @@ impl PanelPool {
         }
 
         // Get or create panel, inheriting dims from outgoing panel
-        let widget_dims = self.current_session_uuid.as_ref()
+        let widget_dims = self
+            .current_session_uuid
+            .as_ref()
             .and_then(|k| self.panels.get(k))
             .map(|p| p.dims())
             .unwrap_or(self.terminal_dims);
-        let panel = self.panels
+        let panel = self
+            .panels
             .entry(uuid.to_string())
             .or_insert_with(|| TerminalPanel::new(widget_dims.0, widget_dims.1));
-
-        if let Some(msg) = panel.connect(uuid) {
-            effects.messages.push(msg);
-        }
+        // Defer subscribe to `sync_subscriptions()`, which runs after render and
+        // has accurate widget areas for this session.
+        panel.mark_transport_disconnected();
 
         // Update focus state
         self.selected_agent = Some(agent_id.to_string());
@@ -314,7 +357,10 @@ impl PanelPool {
         // Synthetic focus-in AFTER updating state (targets new PTY)
         if terminal_focused {
             log::debug!("[FOCUS] synthetic focus-in on switch, new_session={uuid}");
-            effects.pty_inputs.push(PtyInput { session_uuid: uuid.to_string(), data: b"\x1b[I" });
+            effects.pty_inputs.push(PtyInput {
+                session_uuid: uuid.to_string(),
+                data: b"\x1b[I",
+            });
         } else {
             log::debug!("[FOCUS] skipping focus-in on switch (terminal not focused)");
         }
@@ -342,5 +388,40 @@ impl PanelPool {
     /// Subscription ID of the focused PTY.
     pub fn current_terminal_sub_id(&self) -> Option<&str> {
         self.current_terminal_sub_id.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_same_session_while_connecting_does_not_force_resubscribe() {
+        let mut pool = PanelPool::new((24, 80));
+        let agent_id = "agent-1";
+        let session_uuid = "sess-1";
+
+        let _ = pool.focus_terminal(Some(agent_id), Some(session_uuid), false);
+        {
+            let panel = pool
+                .panels
+                .get_mut(session_uuid)
+                .expect("panel must exist after initial focus");
+            let _ = panel
+                .connect(session_uuid)
+                .expect("initial connect message");
+            assert_eq!(panel.state(), PanelState::Connecting);
+        }
+
+        let effects = pool.focus_terminal(Some(agent_id), Some(session_uuid), false);
+        assert!(effects.messages.is_empty());
+        assert!(effects.pty_inputs.is_empty());
+        assert_eq!(
+            pool.panels
+                .get(session_uuid)
+                .expect("panel should remain present")
+                .state(),
+            PanelState::Connecting
+        );
     }
 }
