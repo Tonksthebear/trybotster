@@ -111,6 +111,45 @@ local function focus_agent_ops(agent_id, context)
   return ops
 end
 
+local function selected_agent_id(context)
+  if context.selected_agent then
+    return context.selected_agent
+  end
+  local item = current_cursor_item()
+  if item and item.type == "agent" then
+    return item.agent_id
+  end
+  return nil
+end
+
+local function workspace_for_agent(agent_id)
+  for _, ws in ipairs(_tui_state.workspaces or {}) do
+    for _, id in ipairs(ws.agents or {}) do
+      if id == agent_id then
+        return ws
+      end
+    end
+  end
+  return nil
+end
+
+local function selected_workspace(context)
+  local item = current_cursor_item()
+  if item and item.type == "workspace_header" then
+    for _, ws in ipairs(_tui_state.workspaces or {}) do
+      if ws.id == item.workspace_id then
+        return ws
+      end
+    end
+    return { id = item.workspace_id, name = item.name }
+  end
+  local agent_id = selected_agent_id(context)
+  if agent_id then
+    return workspace_for_agent(agent_id)
+  end
+  return nil
+end
+
 --- Dispatch an action string with context, returning compound ops or nil.
 -- @param action string Action name from keybindings
 -- @param context table Action context with all TUI state
@@ -274,6 +313,53 @@ function M.on_action(action, context)
       else
         return { set_mode_ops(base_mode(context)) }
       end
+    elseif _tui_state.mode == "rename_workspace_input" then
+      local workspace_id = _tui_state.pending_fields.workspace_id
+      local new_name = input and input:match("^%s*(.-)%s*$") or ""
+      _tui_state.pending_fields.workspace_id = nil
+      _tui_state.pending_fields.workspace_name = nil
+      if workspace_id and new_name ~= "" then
+        return {
+          { op = "send_msg", data = {
+            subscriptionId = "tui_hub",
+            data = {
+              type = "rename_workspace",
+              workspace_id = workspace_id,
+              new_name = new_name,
+            },
+          }},
+          set_mode_ops(base_mode(context)),
+        }
+      end
+      return { set_mode_ops(base_mode(context)) }
+    elseif _tui_state.mode == "move_workspace_input" then
+      local agent_id = _tui_state.pending_fields.move_agent_id
+      local target = input and input:match("^%s*(.-)%s*$") or ""
+      _tui_state.pending_fields.move_agent_id = nil
+      if agent_id and target ~= "" then
+        local target_workspace_id = nil
+        local target_workspace_name = target
+        for _, ws in ipairs(_tui_state.workspaces or {}) do
+          if ws.id == target or ws.name == target then
+            target_workspace_id = ws.id
+            target_workspace_name = ws.name or target
+            break
+          end
+        end
+        return {
+          { op = "send_msg", data = {
+            subscriptionId = "tui_hub",
+            data = {
+              type = "move_agent_workspace",
+              agent_id = agent_id,
+              workspace_id = target_workspace_id,
+              workspace_name = target_workspace_name,
+            },
+          }},
+          set_mode_ops(base_mode(context)),
+        }
+      end
+      return { set_mode_ops(base_mode(context)) }
     end
   end
 
@@ -336,7 +422,31 @@ function M.on_action(action, context)
   end
 
   if action == "close_modal" then
+    _tui_state.pending_fields.workspace_id = nil
+    _tui_state.pending_fields.workspace_name = nil
+    _tui_state.pending_fields.move_agent_id = nil
     return { set_mode_ops(base_mode(context)) }
+  end
+
+  -- === Workspace management ===
+  if action == "start_rename_workspace" then
+    local ws = selected_workspace(context)
+    if not ws or not ws.id then return nil end
+    _tui_state.pending_fields.workspace_id = ws.id
+    _tui_state.pending_fields.workspace_name = ws.name or ws.id
+    local ops = { set_mode_ops("rename_workspace_input") }
+    _tui_state.input_buffer = ws.name or ws.id
+    return ops
+  end
+
+  if action == "start_move_workspace" then
+    local agent_id = selected_agent_id(context)
+    if not agent_id then return nil end
+    local ws = workspace_for_agent(agent_id)
+    _tui_state.pending_fields.move_agent_id = agent_id
+    local ops = { set_mode_ops("move_workspace_input") }
+    _tui_state.input_buffer = ws and (ws.name or ws.id) or ""
+    return ops
   end
 
   -- === Agent/workspace navigation (Phase 3: flat_list aware) ===
@@ -463,6 +573,10 @@ function M.on_action(action, context)
       { op = "send_msg", data = {
         subscriptionId = "tui_hub",
         data = { type = "list_agents" },
+      }},
+      { op = "send_msg", data = {
+        subscriptionId = "tui_hub",
+        data = { type = "list_workspaces" },
       }},
     }
   end

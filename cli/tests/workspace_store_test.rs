@@ -6,7 +6,7 @@
 //! - find_workspace(data_dir, name) — match, no match, empty dir
 //! - ensure_workspace() — creates new, finds existing, missing name
 //! - rename_workspace() — updates name
-//! - update_workspace_worktree() — sets worktree_path
+//! - workspace schema invariants — no workspace-level branch/worktree fields
 //! - migrate_v2() — converts old manifests to name format
 //! - migrate_v3() — converts dedup_key manifests to name, deletes local: workspaces
 //! - build_workspace_groups() — uses name from manifest
@@ -16,7 +16,7 @@ use tempfile::TempDir;
 
 /// Create a Lua VM with fs, json, log primitives and package.path pointing
 /// to cli/lua/ so require("lib.workspace_store") works.
-fn create_lua_vm(data_dir: &std::path::Path) -> Lua {
+fn create_lua_vm(_data_dir: &std::path::Path) -> Lua {
     let lua = Lua::new();
 
     // Register core primitives needed by workspace_store
@@ -103,7 +103,6 @@ fn test_find_workspace_match() {
             -- Create a workspace with a known name
             ws.ensure_workspace(dd, {{
                 name = "owner/repo#42",
-                branch = "botster-issue-42",
                 metadata = {{ repo = "owner/repo", issue_number = 42 }},
             }})
             -- Find it
@@ -179,7 +178,6 @@ fn test_ensure_workspace_creates_new() {
             ws.init_dir(dd)
             local id, manifest, created = ws.ensure_workspace(dd, {{
                 name = "owner/repo#42",
-                branch = "botster-issue-42",
                 metadata = {{ custom = "data" }},
             }})
             return id, created
@@ -233,7 +231,7 @@ fn test_ensure_workspace_missing_name() {
             local dd = "{dd}"
             ws.init_dir(dd)
             local id, manifest, created = ws.ensure_workspace(dd, {{
-                branch = "some-branch",
+                metadata = {{ repo = "owner/repo" }},
             }})
             return id, manifest
             "#,
@@ -258,14 +256,12 @@ fn test_ensure_workspace_manifest_fields() {
             ws.init_dir(dd)
             local id, manifest = ws.ensure_workspace(dd, {{
                 name = "owner/repo#42",
-                branch = "botster-issue-42",
-                worktree_path = "/tmp/worktree",
                 metadata = {{ repo = "owner/repo", issue_number = 42 }},
             }})
             local ok = manifest.id ~= nil
                 and manifest.name == "owner/repo#42"
-                and manifest.branch == "botster-issue-42"
-                and manifest.worktree_path == "/tmp/worktree"
+                and manifest.branch == nil
+                and manifest.worktree_path == nil
                 and manifest.status == "active"
                 and manifest.created_at ~= nil
                 and manifest.updated_at ~= nil
@@ -317,17 +313,66 @@ fn test_rename_workspace() {
     assert_eq!(new_name, "My Custom Name");
 }
 
-// =============================================================================
-// Tier 1: update_workspace_worktree tests
-// =============================================================================
-
 #[test]
-fn test_update_workspace_worktree() {
+fn test_list_workspaces_returns_sorted_manifests_with_status() {
     let dir = TempDir::new().unwrap();
     let lua = create_lua_vm(dir.path());
     load_workspace_store(&lua);
 
-    let (updated, path): (bool, String) = lua
+    let (ordered, statuses): (bool, bool) = lua
+        .load(format!(
+            r#"
+            local dd = "{dd}"
+            ws.init_dir(dd)
+
+            ws.write_workspace(dd, "ws-b", {{
+                id = "ws-b",
+                name = "Second",
+                status = "active",
+                created_at = "2026-01-02T00:00:00Z",
+                updated_at = "2026-01-02T00:00:00Z",
+                metadata = {{}},
+            }})
+            ws.write_workspace(dd, "ws-a", {{
+                id = "ws-a",
+                name = "First",
+                status = "active",
+                created_at = "2026-01-01T00:00:00Z",
+                updated_at = "2026-01-01T00:00:00Z",
+                metadata = {{}},
+            }})
+
+            ws.write_session(dd, "ws-a", "sess-1", {{ status = "active" }})
+            ws.write_session(dd, "ws-b", "sess-2", {{ status = "closed" }})
+
+            local list = ws.list_workspaces(dd)
+            local ordered = #list == 2 and list[1].id == "ws-a" and list[2].id == "ws-b"
+            local statuses = list[1].status == "active" and list[2].status == "closed"
+            return ordered, statuses
+            "#,
+            dd = dir.path().to_str().unwrap()
+        ))
+        .eval()
+        .expect("list_workspaces returns sorted manifests");
+
+    assert!(ordered, "Workspaces should be sorted by created_at then id");
+    assert!(
+        statuses,
+        "Workspace statuses should be derived from session manifests"
+    );
+}
+
+// =============================================================================
+// Tier 1: workspace schema tests
+// =============================================================================
+
+#[test]
+fn test_workspace_manifest_omits_worktree_fields() {
+    let dir = TempDir::new().unwrap();
+    let lua = create_lua_vm(dir.path());
+    load_workspace_store(&lua);
+
+    let (no_branch, no_worktree): (bool, bool) = lua
         .load(format!(
             r#"
             local dd = "{dd}"
@@ -335,17 +380,19 @@ fn test_update_workspace_worktree() {
             local ws_id, _ = ws.ensure_workspace(dd, {{
                 name = "owner/repo#42",
             }})
-            local ok = ws.update_workspace_worktree(dd, ws_id, "/tmp/new-worktree")
             local manifest = ws.read_workspace(dd, ws_id)
-            return ok, manifest.worktree_path
+            return manifest.branch == nil, manifest.worktree_path == nil
             "#,
             dd = dir.path().to_str().unwrap()
         ))
         .eval()
-        .expect("update_workspace_worktree");
+        .expect("workspace manifest schema");
 
-    assert!(updated, "update should succeed");
-    assert_eq!(path, "/tmp/new-worktree");
+    assert!(no_branch, "Workspace manifest should not include branch");
+    assert!(
+        no_worktree,
+        "Workspace manifest should not include worktree_path"
+    );
 }
 
 // =============================================================================
@@ -716,4 +763,41 @@ fn test_build_workspace_groups_uses_name() {
 
     assert!(has_name, "Workspace group should include name");
     assert!(has_metadata, "Workspace group should include metadata");
+}
+
+#[test]
+fn test_build_workspace_groups_falls_back_to_branch_name_when_workspace_name_missing() {
+    let dir = TempDir::new().unwrap();
+    let lua = create_lua_vm(dir.path());
+    load_workspace_store(&lua);
+
+    let fallback_name: String = lua
+        .load(format!(
+            r#"
+            local dd = "{dd}"
+            ws.init_dir(dd)
+            local ws_id = ws.generate_workspace_id()
+            ws.write_workspace(dd, ws_id, {{
+                id = ws_id,
+                status = "active",
+                metadata = {{}},
+            }})
+            local agents = {{{{
+                id = "main-agent",
+                workspace_id = ws_id,
+                repo = "owner/repo",
+                branch_name = "main",
+            }}}}
+            local groups = ws.build_workspace_groups(dd, agents)
+            return groups[1].name
+            "#,
+            dd = dir.path().to_str().unwrap()
+        ))
+        .eval()
+        .expect("build_workspace_groups missing name fallback");
+
+    assert_eq!(
+        fallback_name, "main",
+        "Workspace group should default to branch name when manifest.name is missing"
+    );
 }

@@ -59,6 +59,17 @@ local function generate_session_uuid()
         math.random(0, 0xFFFFFFFF))
 end
 
+--- Default display name for anonymous orchestration workspaces.
+-- Keeps workspace identity stable via workspace_id while making UI labels readable.
+-- @param branch_name string|nil
+-- @return string
+local function default_workspace_name(branch_name)
+    if branch_name and branch_name ~= "" then
+        return branch_name
+    end
+    return "General"
+end
+
 -- =============================================================================
 -- Shared Initialization
 -- =============================================================================
@@ -113,7 +124,7 @@ function Session._init(self, config)
         metadata.invocation_url = config.invocation_url
     end
 
-    -- Workspace name: provided by plugins or nil for standalone sessions
+    -- Workspace name can be explicitly provided, or inferred from a supplied workspace_id.
     local workspace_name = config.workspace
     local pre_resolved_workspace_id = config.workspace_id
 
@@ -157,16 +168,25 @@ function Session._init(self, config)
     self.hub_manifest_path = env.BOTSTER_HUB_MANIFEST_PATH
 
     -- Initialize Central Session Store.
-    if data_dir and workspace_name then
+    if data_dir then
         local ws = require("lib.workspace_store")
         ws.init_dir(data_dir)
+
         local workspace_id = pre_resolved_workspace_id
-        if not workspace_id then
+        if workspace_id then
+            local existing = ws.read_workspace(data_dir, workspace_id)
+            if existing then
+                workspace_name = workspace_name or existing.name
+            else
+                log.warn(string.format("Workspace %s not found; creating standalone workspace", tostring(workspace_id)))
+                workspace_id = nil
+            end
+        end
+
+        if not workspace_id and workspace_name then
             local ok_ws, ws_id = pcall(function()
                 local id = ws.ensure_workspace(data_dir, {
                     name = workspace_name,
-                    branch = config.branch_name,
-                    worktree_path = config.worktree_path,
                     metadata = self._workspace_metadata,
                     created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
                 })
@@ -178,25 +198,27 @@ function Session._init(self, config)
                 log.warn(string.format("Failed to ensure workspace manifest: %s", tostring(ws_id)))
             end
         end
-        self._workspace_id = workspace_id or ws.generate_workspace_id()
+
+        -- Standalone session: allocate an anonymous orchestration workspace.
+        if not workspace_id then
+            if not workspace_name or workspace_name == "" then
+                workspace_name = default_workspace_name(config.branch_name)
+            end
+            workspace_id = ws.generate_workspace_id()
+            local anon_manifest = {
+                id         = workspace_id,
+                name       = workspace_name,
+                status     = "active",
+                created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
+                updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+                metadata   = {},
+            }
+            pcall(ws.write_workspace, data_dir, workspace_id, anon_manifest)
+        end
+
+        self._workspace_id = workspace_id
+        self._workspace_name = workspace_name
         self:_sync_workspace_manifest()
-        self:_sync_session_manifest()
-        ws.append_event(data_dir, self._workspace_id, session_uuid, "created")
-    elseif data_dir and not workspace_name then
-        -- Standalone session — still needs session tracking for broker restart recovery.
-        local ws = require("lib.workspace_store")
-        ws.init_dir(data_dir)
-        self._workspace_id = ws.generate_workspace_id()
-        local anon_manifest = {
-            id            = self._workspace_id,
-            worktree_path = config.worktree_path,
-            branch        = config.branch_name,
-            status        = "active",
-            created_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
-            updated_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
-            metadata      = {},
-        }
-        pcall(ws.write_workspace, data_dir, self._workspace_id, anon_manifest)
         self:_sync_session_manifest()
         ws.append_event(data_dir, self._workspace_id, session_uuid, "created")
     end
@@ -395,16 +417,21 @@ function Session:_sync_workspace_manifest()
     if not self._data_dir or not self._workspace_id then return end
     local ws = require("lib.workspace_store")
     local current = ws.read_workspace(self._data_dir, self._workspace_id) or {}
+    local merged_metadata = {}
+    for k, v in pairs(current.metadata or {}) do
+        merged_metadata[k] = v
+    end
+    for k, v in pairs(self._workspace_metadata or {}) do
+        merged_metadata[k] = v
+    end
 
     local manifest = {
-        id            = self._workspace_id,
-        name          = self._workspace_name or current.name,
-        worktree_path = current.worktree_path or self.worktree_path,
-        branch        = current.branch or self.branch_name,
-        status        = current.status or "active",
-        created_at    = current.created_at or os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
-        updated_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
-        metadata      = current.metadata or self._workspace_metadata or {},
+        id         = self._workspace_id,
+        name       = self._workspace_name or current.name or default_workspace_name(self.branch_name),
+        status     = current.status or "active",
+        created_at = current.created_at or os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
+        updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+        metadata   = merged_metadata,
     }
 
     local ok, err = pcall(ws.write_workspace, self._data_dir, self._workspace_id, manifest)
@@ -413,6 +440,131 @@ function Session:_sync_workspace_manifest()
         return
     end
     pcall(ws.refresh_workspace_status, self._data_dir, self._workspace_id)
+end
+
+--- Move this live session into a different workspace.
+-- Creates the target workspace when only workspace_name is provided.
+-- @param opts table { workspace_id, workspace_name, workspace_metadata }
+-- @return table|nil result
+-- @return string|nil error
+function Session:move_to_workspace(opts)
+    opts = opts or {}
+    if not self._data_dir then
+        return nil, "No data_dir configured for workspace operations"
+    end
+
+    local ws = require("lib.workspace_store")
+    local target_workspace_id = opts.workspace_id
+    local target_workspace_name = opts.workspace_name
+    local target_workspace_metadata = opts.workspace_metadata or {}
+
+    if target_workspace_id == "" then target_workspace_id = nil end
+    if target_workspace_name == "" then target_workspace_name = nil end
+
+    if not target_workspace_id and not target_workspace_name then
+        return nil, "workspace_id or workspace_name is required"
+    end
+
+    local now = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+    local old_workspace_id = self._workspace_id
+    local old_workspace_name = self._workspace_name
+    local workspace_id = target_workspace_id
+    local workspace_name = target_workspace_name
+
+    if workspace_id then
+        local target_manifest = ws.read_workspace(self._data_dir, workspace_id)
+        if not target_manifest then
+            return nil, string.format("Workspace '%s' not found", tostring(workspace_id))
+        end
+
+        if workspace_name and workspace_name ~= target_manifest.name then
+            local renamed = ws.rename_workspace(self._data_dir, workspace_id, workspace_name)
+            if renamed then
+                target_manifest.name = workspace_name
+            else
+                return nil, string.format("Failed to rename workspace '%s'", tostring(workspace_id))
+            end
+        end
+        workspace_name = workspace_name or target_manifest.name or default_workspace_name(self.branch_name)
+    else
+        local created_id, created_manifest = ws.ensure_workspace(self._data_dir, {
+            name = workspace_name,
+            metadata = target_workspace_metadata,
+            created_at = now,
+        })
+        if not created_id then
+            return nil, string.format("Failed to create workspace '%s'", tostring(workspace_name))
+        end
+        workspace_id = created_id
+        workspace_name = created_manifest and created_manifest.name or workspace_name
+    end
+
+    if old_workspace_id == workspace_id and old_workspace_name == workspace_name then
+        return {
+            workspace_id = workspace_id,
+            workspace_name = workspace_name,
+            previous_workspace_id = old_workspace_id,
+            previous_workspace_name = old_workspace_name,
+            changed = false,
+        }, nil
+    end
+
+    -- Keep metadata in sync for plugins that look up by workspace fields.
+    self.metadata = self.metadata or {}
+    self.metadata.workspace_id = workspace_id
+    self.metadata.workspace = workspace_name
+
+    -- Merge any workspace metadata updates onto this session.
+    self._workspace_metadata = self._workspace_metadata or {}
+    for k, v in pairs(target_workspace_metadata) do
+        self._workspace_metadata[k] = v
+    end
+
+    self._workspace_id = workspace_id
+    self._workspace_name = workspace_name
+
+    -- Update HandleCache metadata so Rust-side lookups see the new workspace_id.
+    if self.session then
+        local sid = tonumber(self.metadata["broker_session_id"])
+        if sid then
+            local ok_reg, reg_err = pcall(hub.register_session, self.session_uuid, self.session, {
+                session_type = self.session_type,
+                agent_key = self:agent_key(),
+                workspace_id = workspace_id,
+                broker_session_id = sid,
+            })
+            if not ok_reg then
+                log.warn(string.format("Session %s: failed to refresh HandleCache workspace: %s",
+                    self:agent_key(), tostring(reg_err)))
+            end
+        end
+    end
+
+    self:_sync_workspace_manifest()
+    self:_sync_session_manifest()
+    ws.append_event(self._data_dir, workspace_id, self.session_uuid, "moved")
+
+    if old_workspace_id and old_workspace_id ~= workspace_id then
+        local old_manifest = ws.read_session(self._data_dir, old_workspace_id, self.session_uuid)
+        if old_manifest then
+            old_manifest.status = "closed"
+            old_manifest.updated_at = now
+            old_manifest.moved_to_workspace_id = workspace_id
+            old_manifest.moved_to_workspace_name = workspace_name
+            pcall(ws.write_session, self._data_dir, old_workspace_id, self.session_uuid, old_manifest)
+            ws.append_event(self._data_dir, old_workspace_id, self.session_uuid, "moved")
+        end
+        pcall(ws.refresh_workspace_status, self._data_dir, old_workspace_id)
+    end
+    pcall(ws.refresh_workspace_status, self._data_dir, workspace_id)
+
+    return {
+        workspace_id = workspace_id,
+        workspace_name = workspace_name,
+        previous_workspace_id = old_workspace_id,
+        previous_workspace_name = old_workspace_name,
+        changed = true,
+    }, nil
 end
 
 --- Close the session and clean up resources.

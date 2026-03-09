@@ -288,7 +288,7 @@ end
 --- Find or create a workspace manifest for a new session.
 -- Callers provide the name (display name); the store matches on it.
 -- @param data_dir string
--- @param opts table { name, branch, worktree_path, metadata, created_at }
+-- @param opts table { name, metadata, created_at }
 -- @return string|nil workspace_id
 -- @return table|nil manifest
 -- @return boolean created_new
@@ -307,14 +307,12 @@ function M.ensure_workspace(data_dir, opts)
     local workspace_id = M.generate_workspace_id()
     local now = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
     local manifest = {
-        id            = workspace_id,
-        name          = name,
-        worktree_path = opts.worktree_path,
-        branch        = opts.branch,
-        status        = "active",
-        created_at    = opts.created_at or now,
-        updated_at    = now,
-        metadata      = opts.metadata or {},
+        id         = workspace_id,
+        name       = name,
+        status     = "active",
+        created_at = opts.created_at or now,
+        updated_at = now,
+        metadata   = opts.metadata or {},
     }
 
     local ok = M.write_workspace(data_dir, workspace_id, manifest)
@@ -344,20 +342,47 @@ function M.rename_workspace(data_dir, workspace_id, new_name)
     return M.write_workspace(data_dir, workspace_id, manifest)
 end
 
---- Set the worktree_path on a workspace after async worktree creation completes.
+--- List all workspace manifests.
+-- Returns workspace objects sorted by created_at then id.
 -- @param data_dir string
--- @param workspace_id string
--- @param worktree_path string
--- @return boolean success
-function M.update_workspace_worktree(data_dir, workspace_id, worktree_path)
-    local manifest = M.read_workspace(data_dir, workspace_id)
-    if not manifest then
-        log.warn(string.format("[workspace_store] update_workspace_worktree: workspace %s not found", workspace_id))
-        return false
+-- @return array
+function M.list_workspaces(data_dir)
+    local out = {}
+    local ws_dir = M.workspaces_dir(data_dir)
+    if not fs.exists(ws_dir) then return out end
+
+    local entries, err = fs.list_dir(ws_dir)
+    if not entries then
+        log.debug(string.format("[workspace_store] list_workspaces: could not list %s: %s",
+            ws_dir, tostring(err)))
+        return out
     end
-    manifest.worktree_path = worktree_path
-    manifest.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
-    return M.write_workspace(data_dir, workspace_id, manifest)
+
+    for _, workspace_id in ipairs(entries) do
+        local manifest = M.read_workspace(data_dir, workspace_id)
+        if manifest then
+            if not manifest.id or manifest.id == "" then
+                manifest.id = workspace_id
+            end
+            if not manifest.name or manifest.name == "" then
+                manifest.name = manifest.id
+            end
+            local status = M.compute_workspace_status(data_dir, workspace_id)
+            if status then
+                manifest.status = status
+            end
+            out[#out + 1] = manifest
+        end
+    end
+
+    table.sort(out, function(a, b)
+        if a.created_at and b.created_at and a.created_at ~= b.created_at then
+            return a.created_at < b.created_at
+        end
+        return tostring(a.id) < tostring(b.id)
+    end)
+
+    return out
 end
 
 --- Read and decode all session manifests for a workspace.
@@ -474,6 +499,10 @@ function M.build_workspace_groups(data_dir, agents)
                     updated_at = nil,
                     metadata = {},
                 }
+                local display_name = manifest.name
+                if not display_name or display_name == "" then
+                    display_name = agent.workspace_name or agent.branch_name or "General"
+                end
 
                 -- Read-only status derivation for payloads: avoid write-on-read churn.
                 local status = M.compute_workspace_status(data_dir, workspace_id)
@@ -483,17 +512,28 @@ function M.build_workspace_groups(data_dir, agents)
 
                 by_id[workspace_id] = {
                     id = workspace_id,
-                    name = manifest.name,
-                    title = manifest.name,  -- backward compat for TUI
+                    name = display_name,
                     status = manifest.status,
                     created_at = manifest.created_at,
                     updated_at = manifest.updated_at,
                     metadata = manifest.metadata or {},
                     agents = {},
+                    session_counts = { agent = 0, accessory = 0, other = 0 },
                 }
                 grouped[#grouped + 1] = by_id[workspace_id]
             end
             by_id[workspace_id].agents[#by_id[workspace_id].agents + 1] = agent.id
+            local session_type = tostring(agent.session_type or "agent")
+            if session_type == "agent" then
+                by_id[workspace_id].session_counts.agent =
+                    by_id[workspace_id].session_counts.agent + 1
+            elseif session_type == "accessory" then
+                by_id[workspace_id].session_counts.accessory =
+                    by_id[workspace_id].session_counts.accessory + 1
+            else
+                by_id[workspace_id].session_counts.other =
+                    by_id[workspace_id].session_counts.other + 1
+            end
         end
     end
 
@@ -658,14 +698,12 @@ function M.migrate(data_dir)
         ws_metadata = { repo = ctx.repo, issue_number = issue_number }
 
         local workspace_manifest = {
-            id            = workspace_id,
-            name          = ws_name,
-            worktree_path = ctx.worktree_path or worktree_path,
-            branch        = ctx.branch_name,
-            status        = "active",
-            created_at    = ctx.created_at or now,
-            updated_at    = now,
-            metadata      = ws_metadata,
+            id         = workspace_id,
+            name       = ws_name,
+            status     = "active",
+            created_at = ctx.created_at or now,
+            updated_at = now,
+            metadata   = ws_metadata,
         }
 
         -- Lift flat broker_session_N / broker_pty_rows_N keys into structured tables
@@ -783,14 +821,12 @@ function M.migrate_v2(data_dir)
             local ws_metadata = { repo = manifest.repo, issue_number = manifest.issue_number }
 
             local migrated = {
-                id            = manifest.id,
-                name          = ws_name,
-                worktree_path = manifest.worktree_path,
-                branch        = manifest.branch,
-                status        = manifest.status,
-                created_at    = manifest.created_at,
-                updated_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
-                metadata      = ws_metadata,
+                id         = manifest.id,
+                name       = ws_name,
+                status     = manifest.status,
+                created_at = manifest.created_at,
+                updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+                metadata   = ws_metadata,
             }
 
             M.write_workspace(data_dir, workspace_id, migrated)
@@ -807,7 +843,6 @@ end
 -- Converts dedup_key-based manifests to the new name-based schema.
 -- - dedup_key starting "github:" → strip prefix, set as name
 -- - dedup_key starting "local:" → delete workspace (per-agent artifacts)
--- - Copy worktree_path from first agent's session that references this workspace
 -- - Remove dedup_key and title fields
 -- Idempotent: already-converted manifests (those with `name` set) are skipped.
 -- @param data_dir string
@@ -861,27 +896,13 @@ function M.migrate_v3(data_dir)
             ws_name = dk:sub(8)
         end
 
-        -- Find worktree_path from first session in this workspace
-        local wt_path = nil
-        local branch = nil
-        local sessions = M.read_workspace_sessions(data_dir, workspace_id)
-        for _, rec in ipairs(sessions) do
-            if rec.manifest and rec.manifest.worktree_path then
-                wt_path = rec.manifest.worktree_path
-                branch = rec.manifest.branch
-                break
-            end
-        end
-
         local migrated = {
-            id            = manifest.id,
-            name          = ws_name,
-            worktree_path = wt_path or manifest.worktree_path,
-            branch        = branch or manifest.branch,
-            status        = manifest.status,
-            created_at    = manifest.created_at,
-            updated_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
-            metadata      = manifest.metadata or {},
+            id         = manifest.id,
+            name       = ws_name,
+            status     = manifest.status,
+            created_at = manifest.created_at,
+            updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+            metadata   = manifest.metadata or {},
         }
 
         M.write_workspace(data_dir, workspace_id, migrated)

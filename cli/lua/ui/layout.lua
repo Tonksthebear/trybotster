@@ -119,7 +119,7 @@ local function build_list_items()
       items[#items+1] = {
         text = {
           { text = arrow, style = "dim" },
-          { text = entry.title },
+          { text = entry.name or entry.workspace_id },
         },
         secondary = {
           icon,
@@ -415,6 +415,41 @@ function render_overlay(state)
             "Enter prompt for agent (leave empty for default):",
           },
           placeholder = "Leave empty for default prompt",
+        },
+      },
+    }
+  elseif _tui_state.mode == "rename_workspace_input" then
+    local current_name = _tui_state.pending_fields and _tui_state.pending_fields.workspace_name or ""
+    return {
+      type = "centered", width = 62, height = 24,
+      child = {
+        type = "input",
+        id = "rename_workspace_input",
+        block = { title = " Rename Workspace [Enter confirm | Esc cancel] ", borders = "all" },
+        props = {
+          lines = {
+            "Rename selected workspace:",
+            "",
+            "Current: " .. (current_name ~= "" and current_name or "(unnamed)"),
+          },
+          placeholder = "Enter new workspace name",
+        },
+      },
+    }
+  elseif _tui_state.mode == "move_workspace_input" then
+    return {
+      type = "centered", width = 68, height = 26,
+      child = {
+        type = "input",
+        id = "move_workspace_input",
+        block = { title = " Move Session Workspace [Enter confirm | Esc cancel] ", borders = "all" },
+        props = {
+          lines = {
+            "Move selected session to workspace:",
+            "",
+            "Type an existing workspace name/id, or a new workspace name.",
+          },
+          placeholder = "Workspace name or workspace id",
         },
       },
     }

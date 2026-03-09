@@ -361,24 +361,31 @@ end
 -- @param issue_or_branch string Issue number or branch name
 -- @param prompt string|nil Task prompt
 -- @param profile string|nil Config profile name
--- @param workspace string|nil Workspace name (e.g. "owner/repo#42")
--- @return string Result message
-function Hub:create_agent(issue_or_branch, prompt, profile, workspace)
+-- @param workspace_id string|nil Workspace ID
+-- @param workspace_name string|nil Workspace display name
+-- @return table Result payload
+function Hub:create_agent(issue_or_branch, prompt, profile, workspace_id, workspace_name)
     if self._is_local then
         local agents_handler = require("handlers.agents")
         local metadata = nil
-        if workspace then
-            metadata = { workspace = workspace }
+        if workspace_id or workspace_name then
+            metadata = {
+                workspace_id = workspace_id,
+                workspace = workspace_name,
+            }
         end
         local agent, err = agents_handler.handle_create_agent(
             issue_or_branch, prompt, nil, nil, profile, metadata
         )
         if agent then
-            return "Agent created: " .. agent:agent_key()
+            return agent:info()
         elseif err then
             error(err)
         else
-            return "Agent creation initiated (worktree may be creating async)"
+            return {
+                status = "pending",
+                message = "Agent creation initiated (worktree may be creating async)",
+            }
         end
     end
 
@@ -387,11 +394,171 @@ function Hub:create_agent(issue_or_branch, prompt, profile, workspace)
         issue_or_branch = issue_or_branch,
         prompt = prompt,
         profile = profile,
-        workspace = workspace,
+        workspace_id = workspace_id,
+        workspace_name = workspace_name,
     }, 60000)
 
     if result.error then
         error(string.format("Hub:create_agent remote error: %s", result.error))
+    end
+
+    return result.result
+end
+
+--- List workspaces on this hub.
+-- Includes persisted workspace manifests and current running-session membership.
+-- @return array of workspace tables
+function Hub:list_workspaces()
+    if self._is_local then
+        local data_dir = config.data_dir and config.data_dir() or nil
+        if not data_dir then
+            return {}
+        end
+
+        local ws = require("lib.workspace_store")
+        local workspaces = ws.list_workspaces(data_dir)
+        local counts_by_id = {}
+
+        for _, session in ipairs(Agent.all_info()) do
+            local ws_id = session.workspace_id
+            if ws_id then
+                if not counts_by_id[ws_id] then
+                    counts_by_id[ws_id] = {
+                        agents = {},
+                        session_counts = { agent = 0, accessory = 0, other = 0 },
+                    }
+                end
+                local rec = counts_by_id[ws_id]
+                rec.agents[#rec.agents + 1] = session.id
+                if session.session_type == "agent" then
+                    rec.session_counts.agent = rec.session_counts.agent + 1
+                elseif session.session_type == "accessory" then
+                    rec.session_counts.accessory = rec.session_counts.accessory + 1
+                else
+                    rec.session_counts.other = rec.session_counts.other + 1
+                end
+            end
+        end
+
+        for _, workspace in ipairs(workspaces) do
+            local counts = counts_by_id[workspace.id]
+            workspace.agents = counts and counts.agents or {}
+            workspace.session_counts = counts and counts.session_counts or {
+                agent = 0,
+                accessory = 0,
+                other = 0,
+            }
+        end
+
+        return workspaces
+    end
+
+    local result = hub_client.request(self._conn_id, {
+        type = "list_workspaces",
+    }, 5000)
+
+    if result.error then
+        error(string.format("Hub:list_workspaces remote error: %s", result.error))
+    end
+
+    return result.result or {}
+end
+
+--- Rename a workspace on this hub.
+-- @param workspace_id string
+-- @param new_name string
+-- @return table
+function Hub:rename_workspace(workspace_id, new_name)
+    if self._is_local then
+        local data_dir = config.data_dir and config.data_dir() or nil
+        if not data_dir then
+            error("Hub:rename_workspace: no data_dir configured")
+        end
+
+        local ws = require("lib.workspace_store")
+        local ok = ws.rename_workspace(data_dir, workspace_id, new_name)
+        if not ok then
+            error(string.format("Hub:rename_workspace: failed for workspace %s", tostring(workspace_id)))
+        end
+
+        for _, session in ipairs(Agent.list()) do
+            if session._workspace_id == workspace_id then
+                session._workspace_name = new_name
+                session.metadata = session.metadata or {}
+                session.metadata.workspace = new_name
+                session:_sync_workspace_manifest()
+                session:_sync_session_manifest()
+            end
+        end
+
+        local connections = require("handlers.connections")
+        connections.broadcast_hub_event("agent_list", {
+            agents = Agent.all_info(),
+        })
+
+        return {
+            workspace_id = workspace_id,
+            name = new_name,
+        }
+    end
+
+    local result = hub_client.request(self._conn_id, {
+        type = "rename_workspace",
+        workspace_id = workspace_id,
+        new_name = new_name,
+    }, 10000)
+
+    if result.error then
+        error(string.format("Hub:rename_workspace remote error: %s", result.error))
+    end
+
+    return result.result
+end
+
+--- Move a live session to another workspace.
+-- @param agent_id string Session UUID or agent key
+-- @param workspace_id string|nil Target workspace ID
+-- @param workspace_name string|nil Target workspace name
+-- @return table
+function Hub:move_agent_workspace(agent_id, workspace_id, workspace_name)
+    if self._is_local then
+        local session = Agent.get(agent_id) or Agent.find_by_agent_key(agent_id)
+        if not session then
+            error(string.format("Hub:move_agent_workspace: session '%s' not found", tostring(agent_id)))
+        end
+
+        local moved, err = session:move_to_workspace({
+            workspace_id = workspace_id,
+            workspace_name = workspace_name,
+        })
+        if not moved then
+            error(string.format("Hub:move_agent_workspace failed: %s", tostring(err)))
+        end
+
+        local connections = require("handlers.connections")
+        connections.broadcast_hub_event("agent_list", {
+            agents = Agent.all_info(),
+        })
+
+        return {
+            agent_id = session:agent_key(),
+            session_uuid = session.session_uuid,
+            workspace_id = moved.workspace_id,
+            workspace_name = moved.workspace_name,
+            previous_workspace_id = moved.previous_workspace_id,
+            previous_workspace_name = moved.previous_workspace_name,
+        }
+    end
+
+    local result = hub_client.request(self._conn_id, {
+        type = "move_agent_workspace",
+        agent_id = agent_id,
+        workspace_id = workspace_id,
+        workspace_name = workspace_name,
+    }, 10000)
+
+    if result.error then
+        error(string.format("Hub:move_agent_workspace remote error: %s", result.error))
     end
 
     return result.result

@@ -205,9 +205,8 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, agen
     -- Default dimensions
     local dims = { rows = 24, cols = 80 }
 
-    -- Extract workspace fields from metadata; default to branch name so agents
-    -- on the same branch share a workspace.
-    local workspace_name = metadata and metadata.workspace or branch_name
+    -- Workspace orchestration is explicit; no implicit branch-based grouping.
+    local workspace_name = metadata and metadata.workspace or nil
     local workspace_id = metadata and metadata.workspace_id or nil
     local workspace_metadata = metadata and metadata.workspace_metadata or nil
 
@@ -299,7 +298,7 @@ spawn_accessory = function(branch_name, wt_path, accessory_name, agent_key, agen
         session_config = { name = accessory_name, command = "bash" }
     end
 
-    local workspace_name = metadata and metadata.workspace or branch_name
+    local workspace_name = metadata and metadata.workspace or nil
     local workspace_id = metadata and metadata.workspace_id or nil
 
     local ok, agent = pcall(Accessory.new, {
@@ -459,13 +458,14 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
 end
 
 --- Handle a request to create an accessory.
--- @param workspace string|nil         Workspace name (used to find worktree path)
--- @param accessory_name string        Accessory name from config (e.g., "rails-server")
--- @param agent_name string|nil        Agent name for config resolution
--- @param metadata table|nil           Plugin metadata
+-- @param workspace_id string|nil       Workspace identifier
+-- @param workspace_name string|nil     Workspace display name
+-- @param accessory_name string         Accessory name from config (e.g., "rails-server")
+-- @param agent_name string|nil         Agent name for config resolution
+-- @param metadata table|nil            Plugin metadata
 -- @return Accessory|nil
 -- @return string|nil
-local function handle_create_accessory(workspace, accessory_name, agent_name, metadata)
+local function handle_create_accessory(workspace_id, workspace_name, accessory_name, agent_name, metadata)
     if not accessory_name then
         return nil, "accessory_name is required for accessories"
     end
@@ -474,12 +474,22 @@ local function handle_create_accessory(workspace, accessory_name, agent_name, me
     local wt_path = worktree.repo_root()
     local branch_name = "main"
 
-    -- If workspace provided, try to find the worktree from existing agents
-    if workspace then
-        local existing = Agent.find_by_workspace(workspace)
+    -- If workspace provided, prefer explicit ID lookup.
+    if workspace_id then
+        for _, existing in ipairs(Agent.list()) do
+            if existing._workspace_id == workspace_id then
+                wt_path = existing.worktree_path
+                branch_name = existing.branch_name
+                workspace_name = workspace_name or existing._workspace_name
+                break
+            end
+        end
+    elseif workspace_name then
+        local existing = Agent.find_by_workspace(workspace_name)
         if #existing > 0 then
             wt_path = existing[1].worktree_path
             branch_name = existing[1].branch_name
+            workspace_id = existing[1]._workspace_id
         end
     end
 
@@ -488,9 +498,8 @@ local function handle_create_accessory(workspace, accessory_name, agent_name, me
     local agent_key = next_available_key(base_key)
 
     metadata = metadata or {}
-    if workspace then
-        metadata.workspace = workspace
-    end
+    metadata.workspace = workspace_name
+    metadata.workspace_id = workspace_id
 
     return spawn_accessory(branch_name, wt_path, accessory_name, agent_key, agent_name, metadata)
 end
@@ -601,9 +610,21 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
         -- Check if any agents already exist for this workspace — notify them
         if issue_or_branch then
             local meta = message.metadata or {}
+            if message.workspace_id and not meta.workspace_id then
+                meta.workspace_id = message.workspace_id
+            end
+            if message.workspace_name and not meta.workspace then
+                meta.workspace = message.workspace_name
+            end
             local existing = {}
 
-            if meta.workspace then
+            if meta.workspace_id then
+                for _, session in ipairs(Agent.list()) do
+                    if session._workspace_id == meta.workspace_id then
+                        existing[#existing + 1] = session
+                    end
+                end
+            elseif meta.workspace then
                 existing = Agent.find_by_workspace(meta.workspace)
             else
                 local repo = message.repo or config.env("BOTSTER_REPO") or hub.detect_repo() or "unknown/repo"
@@ -629,6 +650,12 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
 
         if issue_or_branch then
             local meta = message.metadata or {}
+            if message.workspace_id and not meta.workspace_id then
+                meta.workspace_id = message.workspace_id
+            end
+            if message.workspace_name and not meta.workspace then
+                meta.workspace = message.workspace_name
+            end
             if message.invocation_url and not meta.invocation_url then
                 meta.invocation_url = message.invocation_url
             end
@@ -645,9 +672,10 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
 
     elseif msg_type == "create_accessory" then
         local accessory_name = message.accessory_name or message.session_name or message.name
-        local workspace = message.workspace
+        local workspace_id = message.workspace_id
+        local workspace_name = message.workspace_name
         local agent_name = message.agent_name or message.profile
-        handle_create_accessory(workspace, accessory_name, agent_name, message.metadata)
+        handle_create_accessory(workspace_id, workspace_name, accessory_name, agent_name, message.metadata)
 
     elseif msg_type == "delete_agent" or msg_type == "delete_session" then
         local session_id = message.id or message.agent_id or message.session_uuid or message.session_key

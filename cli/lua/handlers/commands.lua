@@ -22,6 +22,22 @@ commands.register("list_worktrees", function(client, sub_id, _command)
     client:send_worktree_list(sub_id)
 end, { description = "Send worktree list to client" })
 
+commands.register("list_workspaces", function(client, sub_id, _command)
+    local Hub = require("lib.hub")
+    local ok, workspaces = pcall(function()
+        return Hub.get():list_workspaces()
+    end)
+    if not ok then
+        log.warn(string.format("list_workspaces failed: %s", tostring(workspaces)))
+        workspaces = {}
+    end
+    client:send({
+        subscriptionId = sub_id,
+        type = "workspace_list",
+        workspaces = workspaces,
+    })
+end, { description = "Send workspace list to client" })
+
 local function send_agent_config(client, sub_id)
     local ConfigResolver = require("lib.config_resolver")
     local device_root = config.data_dir and config.data_dir() or nil
@@ -70,16 +86,19 @@ commands.register("create_agent", function(client, _sub_id, command)
     local from_worktree = command.from_worktree
     -- Accept both "agent_name" (new) and "profile" (legacy)
     local agent_name = command.agent_name or command.profile
-    local workspace = command.workspace
+    local workspace_id = command.workspace_id
+    local workspace_name = command.workspace_name
 
     local metadata = nil
-    if workspace then
-        metadata = { workspace = workspace }
+    if workspace_id or workspace_name then
+        metadata = {
+            workspace_id = workspace_id,
+            workspace = workspace_name,
+        }
     end
 
-    -- If a workspace config name is provided, load the manifest
-    -- Browser sends "workspace", CLI may also use "workspace_config"
-    local workspace_config_name = command.workspace_config or workspace
+    -- Optional workspace template for auto-spawning accessory bundles.
+    local workspace_config_name = command.workspace_template
     if workspace_config_name then
         metadata = metadata or {}
         local ConfigResolver = require("lib.config_resolver")
@@ -92,18 +111,22 @@ commands.register("create_agent", function(client, _sub_id, command)
         })
         if resolved and resolved.workspaces[workspace_config_name] then
             metadata.workspace_config = resolved.workspaces[workspace_config_name]
+            -- If no explicit runtime workspace was supplied, use template name.
+            metadata.workspace = metadata.workspace or workspace_config_name
         end
     end
 
     require("handlers.agents").handle_create_agent(issue_or_branch, prompt, from_worktree, client, agent_name, metadata)
     log.info(string.format("Create agent request: %s (agent: %s, workspace: %s)",
-        tostring(issue_or_branch or "main"), tostring(agent_name or "auto"), tostring(workspace or "none")))
+        tostring(issue_or_branch or "main"), tostring(agent_name or "auto"),
+        tostring(workspace_id or workspace_name or "none")))
 end, { description = "Create a new agent (with optional worktree, agent name, and workspace)" })
 
 commands.register("create_accessory", function(client, _sub_id, command)
     -- Accept both "accessory_name" (new) and "session_name" (legacy)
     local accessory_name = command.accessory_name or command.session_name or command.name
-    local workspace = command.workspace
+    local workspace_id = command.workspace_id
+    local workspace_name = command.workspace_name
     local agent_name = command.agent_name or command.profile
     local metadata = command.metadata
 
@@ -112,9 +135,11 @@ commands.register("create_accessory", function(client, _sub_id, command)
         return
     end
 
-    require("handlers.agents").handle_create_accessory(workspace, accessory_name, agent_name, metadata)
+    require("handlers.agents").handle_create_accessory(
+        workspace_id, workspace_name, accessory_name, agent_name, metadata
+    )
     log.info(string.format("Create accessory request: %s (workspace: %s)",
-        accessory_name, tostring(workspace or "none")))
+        accessory_name, tostring(workspace_id or workspace_name or "none")))
 end, { description = "Create an accessory session (no AI autonomy)" })
 
 commands.register("rename_workspace", function(client, sub_id, command)
@@ -134,13 +159,64 @@ commands.register("rename_workspace", function(client, sub_id, command)
     local ws = require("lib.workspace_store")
     local ok = ws.rename_workspace(data_dir, workspace_id, new_name)
     if ok then
+        local Agent = require("lib.agent")
+        for _, session in ipairs(Agent.list()) do
+            if session._workspace_id == workspace_id then
+                session._workspace_name = new_name
+                session.metadata = session.metadata or {}
+                session.metadata.workspace = new_name
+                session:_sync_workspace_manifest()
+                session:_sync_session_manifest()
+            end
+        end
+
         local connections = require("handlers.connections")
         connections.broadcast_hub_event("agent_list", {
-            agents = require("lib.agent").all_info(),
+            agents = Agent.all_info(),
         })
         log.info(string.format("Workspace %s renamed to '%s'", workspace_id, new_name))
     end
 end, { description = "Rename a workspace" })
+
+commands.register("move_agent_workspace", function(_client, _sub_id, command)
+    local session_id = command.id or command.agent_id or command.session_uuid or command.session_key
+    local workspace_id = command.workspace_id
+    local workspace_name = command.workspace_name
+
+    if not session_id then
+        log.warn("move_agent_workspace missing session identifier")
+        return
+    end
+    if not workspace_id and not workspace_name then
+        log.warn("move_agent_workspace missing workspace_id/workspace_name")
+        return
+    end
+
+    local Agent = require("lib.agent")
+    local session = Agent.get(session_id) or Agent.find_by_agent_key(session_id)
+    if not session then
+        log.warn(string.format("move_agent_workspace: session '%s' not found", tostring(session_id)))
+        return
+    end
+
+    local moved, err = session:move_to_workspace({
+        workspace_id = workspace_id,
+        workspace_name = workspace_name,
+    })
+    if not moved then
+        log.warn(string.format("move_agent_workspace failed for %s: %s",
+            tostring(session_id), tostring(err)))
+        return
+    end
+
+    local connections = require("handlers.connections")
+    connections.broadcast_hub_event("agent_list", {
+        agents = Agent.all_info(),
+    })
+
+    log.info(string.format("Moved session %s to workspace %s (%s)",
+        session:agent_key(), moved.workspace_id, moved.workspace_name or "unnamed"))
+end, { description = "Move a live session to another workspace" })
 
 commands.register("reopen_worktree", function(client, _sub_id, command)
     local path = command.path
@@ -149,7 +225,14 @@ commands.register("reopen_worktree", function(client, _sub_id, command)
 
     if path then
         local agent_name = command.agent_name or command.profile
-        require("handlers.agents").handle_create_agent(branch, prompt, path, client, agent_name)
+        local metadata = nil
+        if command.workspace_id or command.workspace_name then
+            metadata = {
+                workspace_id = command.workspace_id,
+                workspace = command.workspace_name,
+            }
+        end
+        require("handlers.agents").handle_create_agent(branch, prompt, path, client, agent_name, metadata)
         log.info(string.format("Reopen worktree request: %s", path))
     else
         log.warn("reopen_worktree missing path")
