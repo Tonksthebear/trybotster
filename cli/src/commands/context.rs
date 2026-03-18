@@ -83,12 +83,12 @@ pub fn build() -> BTreeMap<String, String> {
 
     // Extract well-known fields from the session manifest
     let fields = [
-        ("session_uuid", "uuid"),
-        ("agent_key", "agent_key"),
+        ("session_uuid", "session_uuid"),
+        ("agent_key", "id"),
         ("hub_id", "hub_id"),
         ("hub_manifest_path", "hub_manifest_path"),
         ("repo", "repo"),
-        ("branch_name", "branch"),
+        ("branch_name", "branch_name"),
         ("worktree_path", "worktree_path"),
         ("agent_name", "agent_name"),
         ("workspace_id", "workspace_id"),
@@ -179,12 +179,12 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let (ctx, _dir) = build_with_manifest(
             r#"{
-            "uuid": "sess-test-0001-deadbeef",
-            "agent_key": "my-agent",
+            "session_uuid": "sess-test-0001-deadbeef",
+            "id": "my-agent",
             "hub_id": "hub-abc",
             "hub_manifest_path": "/data/hubs/abc/manifest.json",
             "repo": "owner/repo",
-            "branch": "feature-x",
+            "branch_name": "feature-x",
             "worktree_path": "/tmp/wt",
             "agent_name": "Claude",
             "workspace_id": "ws-test-001"
@@ -212,8 +212,8 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let (ctx, _dir) = build_with_manifest(
             r#"{
-            "uuid": "sess-test-0001-deadbeef",
-            "agent_key": "old-agent"
+            "session_uuid": "sess-test-0001-deadbeef",
+            "id": "old-agent"
         }"#,
         );
 
@@ -232,8 +232,8 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let (ctx, _dir) = build_with_manifest(
             r#"{
-            "uuid": "sess-test-0001-deadbeef",
-            "agent_key": "future-agent",
+            "session_uuid": "sess-test-0001-deadbeef",
+            "id": "future-agent",
             "hub_id": "hub-xyz",
             "future_field_v99": "some value",
             "another_new_thing": 42,
@@ -273,8 +273,8 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let (ctx, _dir) = build_with_manifest(
             r#"{
-            "uuid": "sess-test-0001-deadbeef",
-            "agent_key": "",
+            "session_uuid": "sess-test-0001-deadbeef",
+            "id": "",
             "hub_id": "hub-ok",
             "repo": ""
         }"#,
@@ -295,7 +295,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let (ctx, _dir) = build_with_manifest(
             r#"{
-            "uuid": "sess-test-0001-deadbeef",
+            "session_uuid": "sess-test-0001-deadbeef",
             "hub_id": "real-hub",
             "metadata": {
                 "hub_id": "should-not-override",

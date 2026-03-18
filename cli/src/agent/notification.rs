@@ -41,6 +41,12 @@ pub enum AgentNotification {
         /// Notification body text.
         body: String,
     },
+
+    /// Simple terminal bell (BEL, 0x07).
+    ///
+    /// Fired by alacritty's parser when the PTY emits a bare BEL character.
+    /// Distinct from OSC 9/777 which carry structured notification payloads.
+    Bell,
 }
 
 /// Agent execution status.

@@ -262,11 +262,16 @@ pub(crate) enum HubEvent {
     ///
     /// Sent by the demux reader thread installed via
     /// [`crate::broker::BrokerConnection::install_forwarder`].
-    /// The Hub feeds these bytes into the corresponding agent's shadow screen
-    /// and event broadcast channel so connected clients receive live output.
+    /// The Hub broadcasts raw bytes to connected clients and updates terminal
+    /// mode state from the sideband flags — no local shadow screen needed.
+    ///
+    /// The `flags` byte carries terminal sideband state from the broker's
+    /// `AlacrittyParser` (see [`crate::broker::protocol::sideband`]).
     BrokerPtyOutput {
         /// Broker-assigned session identifier.
         session_id: u32,
+        /// Sideband flags (cursor_visible, kitty_enabled) from the broker.
+        flags: u8,
         /// Raw PTY output bytes from the master FD.
         data: Vec<u8>,
     },
@@ -284,12 +289,24 @@ pub(crate) enum HubEvent {
         exit_code: Option<i32>,
     },
 
+    /// A terminal event forwarded from the broker's alacritty parser.
+    ///
+    /// Sent when the broker's parser fires `Event::Title`, `Event::ResetTitle`,
+    /// or `Event::Bell`. The Hub routes these to the appropriate session's
+    /// `PtyEvent` broadcast channel.
+    BrokerTermEvent {
+        /// Broker-assigned session identifier.
+        session_id: u32,
+        /// The terminal event.
+        event: crate::broker::protocol::BrokerTermEvent,
+    },
+
     /// Register a broker session → session UUID mapping in the Hub.
     ///
     /// Sent by the `hub.spawn_pty_with_broker()` Lua primitive after the
     /// broker returns a session ID for a newly transferred PTY FD. The Hub
     /// stores this mapping so `BrokerPtyOutput` frames can be routed to the
-    /// correct session's shadow screen and event broadcast channel.
+    /// correct session's event broadcast channel.
     BrokerSessionRegistered {
         /// Broker-assigned session identifier (returned by `register_pty`).
         session_id: u32,
@@ -374,6 +391,7 @@ impl HubEvent {
             Self::MessageDelivered { .. } => "message_delivered",
             Self::BrokerPtyOutput { .. } => "broker_pty_output",
             Self::BrokerPtyExited { .. } => "broker_pty_exited",
+            Self::BrokerTermEvent { .. } => "broker_term_event",
             Self::BrokerSessionRegistered { .. } => "broker_session_registered",
             Self::SessionUnregistered { .. } => "session_unregistered",
             Self::WorktreeDeleteCompleted { .. } => "worktree_delete_completed",

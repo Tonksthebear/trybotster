@@ -139,12 +139,14 @@ impl Agent {
     #[must_use]
     #[cfg(test)]
     pub fn get_pty_handle(&self) -> crate::hub::agent_handle::PtyHandle {
-        let (shared_state, shadow_screen, event_tx, kitty, resize) = self.pty.get_direct_access();
+        let (shared_state, shadow_screen, event_tx, kitty, cursor_vis, resize) =
+            self.pty.get_direct_access();
         crate::hub::agent_handle::PtyHandle::new(
             event_tx,
             shared_state,
             shadow_screen,
             kitty,
+            cursor_vis,
             resize,
             true, // detect OSC notifications
             self.pty.port(),

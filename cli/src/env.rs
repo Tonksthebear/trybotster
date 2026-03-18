@@ -135,6 +135,16 @@ pub fn is_any_test() -> bool {
     Environment::current().is_any_test()
 }
 
+/// Returns `true` if running in offline mode (`BOTSTER_OFFLINE=1`).
+///
+/// When offline, all network primitives are disabled: no auth validation,
+/// no server registration, no WebRTC/ActionCable, no browser relay.
+/// The hub runs as a purely local PTY manager.
+#[must_use]
+pub fn is_offline() -> bool {
+    std::env::var("BOTSTER_OFFLINE").as_deref() == Ok("1")
+}
+
 /// Returns `true` if keyring should be bypassed (any test mode).
 ///
 /// Use this instead of `is_test_mode()` when deciding whether to use
@@ -213,6 +223,34 @@ mod tests {
         assert!(Environment::SystemTest.is_any_test());
         assert!(!Environment::Production.is_any_test());
         assert!(!Environment::Development.is_any_test());
+    }
+
+    // ── is_offline ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_offline_default_false() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("BOTSTER_OFFLINE");
+        assert!(!is_offline(), "is_offline should be false by default");
+    }
+
+    #[test]
+    fn test_is_offline_with_env_var() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BOTSTER_OFFLINE", "1");
+        assert!(is_offline(), "is_offline should be true when BOTSTER_OFFLINE=1");
+        std::env::remove_var("BOTSTER_OFFLINE");
+    }
+
+    #[test]
+    fn test_is_offline_wrong_value() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BOTSTER_OFFLINE", "true");
+        assert!(
+            !is_offline(),
+            "is_offline should be false for values other than '1'"
+        );
+        std::env::remove_var("BOTSTER_OFFLINE");
     }
 
     // ── session_manifest_path fault injection ─────────────────────────────

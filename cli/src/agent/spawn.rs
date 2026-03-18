@@ -185,6 +185,7 @@ pub(crate) fn process_pty_bytes(
     shadow_screen: &Arc<Mutex<AlacrittyParser<HubEventListener>>>,
     event_tx: &broadcast::Sender<PtyEvent>,
     kitty_enabled: &AtomicBool,
+    cursor_visible: &AtomicBool,
     resize_pending: &AtomicBool,
     detect_notifs: bool,
     last_cursor_visible: &mut Option<bool>,
@@ -231,6 +232,7 @@ pub(crate) fn process_pty_bytes(
     let visible = !new_cursor_hidden;
     if *last_cursor_visible != Some(visible) {
         *last_cursor_visible = Some(visible);
+        cursor_visible.store(visible, Ordering::Relaxed);
         let _ = event_tx.send(PtyEvent::cursor_visibility_changed(visible));
     }
 
@@ -241,6 +243,73 @@ pub(crate) fn process_pty_bytes(
     // ── 8. Broadcast raw bytes ───────────────────────────────────────────
     // Clients parse bytes in their own parsers (xterm.js, TUI).
     // Lagged receivers skip missed frames — same behavior as a live PTY.
+    let _ = event_tx.send(PtyEvent::output(data.to_vec()));
+}
+
+/// Process broker-relayed PTY output without a shadow screen.
+///
+/// Like [`process_pty_bytes`] but reads terminal mode state from the broker's
+/// sideband flags byte instead of a local `AlacrittyParser`. This eliminates
+/// the need for a redundant shadow screen on the hub side for broker-backed
+/// sessions.
+///
+/// Steps:
+/// 1. OSC notification detection (raw byte scanning, same as process_pty_bytes)
+/// 2. CWD and prompt mark scanning (same as process_pty_bytes)
+/// 3. Update AtomicBools from sideband flags
+/// 4. Emit state-change events (KittyChanged, CursorVisibilityChanged)
+/// 5. Clear resize-pending flag
+/// 6. Broadcast raw bytes to subscribers
+pub(crate) fn process_broker_bytes(
+    data: &[u8],
+    flags: u8,
+    event_tx: &broadcast::Sender<PtyEvent>,
+    kitty_enabled: &AtomicBool,
+    cursor_visible: &AtomicBool,
+    resize_pending: &AtomicBool,
+    detect_notifs: bool,
+    last_cursor_visible: &mut Option<bool>,
+) {
+    use crate::broker::protocol::sideband;
+
+    // ── 1. OSC notification detection ────────────────────────────────────
+    if detect_notifs {
+        for notif in detect_notifications(data) {
+            log::info!("Broadcasting PTY notification: {:?}", notif);
+            let _ = event_tx.send(PtyEvent::notification(notif));
+        }
+    }
+
+    // ── 2. OSC metadata: CWD, prompt marks ─────────────────────────────
+    // Title changes (OSC 0/2) are forwarded by the broker's alacritty
+    // parser via BrokerTermEvent — no raw byte scanning needed here.
+    if let Some(cwd) = scan_cwd(data) {
+        let _ = event_tx.send(PtyEvent::cwd_changed(cwd));
+    }
+    for mark in scan_prompt_marks(data) {
+        let _ = event_tx.send(PtyEvent::prompt_mark(mark));
+    }
+
+    // ── 4. Kitty state from sideband flags ───────────────────────────────
+    let new_kitty = flags & sideband::KITTY_ENABLED != 0;
+    let old_kitty = kitty_enabled.load(Ordering::Relaxed);
+    if new_kitty != old_kitty {
+        kitty_enabled.store(new_kitty, Ordering::Relaxed);
+        let _ = event_tx.send(PtyEvent::kitty_changed(new_kitty));
+    }
+
+    // ── 5. Cursor visibility from sideband flags ─────────────────────────
+    let new_visible = flags & sideband::CURSOR_VISIBLE != 0;
+    if *last_cursor_visible != Some(new_visible) {
+        *last_cursor_visible = Some(new_visible);
+        cursor_visible.store(new_visible, Ordering::Relaxed);
+        let _ = event_tx.send(PtyEvent::cursor_visibility_changed(new_visible));
+    }
+
+    // ── 6. Clear resize-pending flag ─────────────────────────────────────
+    resize_pending.store(false, Ordering::Release);
+
+    // ── 7. Broadcast raw bytes ───────────────────────────────────────────
     let _ = event_tx.send(PtyEvent::output(data.to_vec()));
 }
 
@@ -266,6 +335,7 @@ pub(crate) fn spawn_reader_thread(
     event_tx: broadcast::Sender<PtyEvent>,
     detect_notifs: bool,
     kitty_enabled: Arc<AtomicBool>,
+    cursor_visible: Arc<AtomicBool>,
     resize_pending: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     let label = if detect_notifs { "CLI" } else { "Server" };
@@ -292,6 +362,7 @@ pub(crate) fn spawn_reader_thread(
                         &shadow_screen,
                         &event_tx,
                         &kitty_enabled,
+                        &cursor_visible,
                         &resize_pending,
                         detect_notifs,
                         &mut last_cursor_visible,
@@ -367,6 +438,7 @@ pub fn scan_cwd(data: &[u8]) -> Option<String> {
 
     last_cwd
 }
+
 
 /// Simple percent-decoding for file URIs.
 ///
@@ -549,6 +621,10 @@ mod tests {
         Arc::new(AtomicBool::new(false))
     }
 
+    fn test_cursor_visible_flag() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(true))
+    }
+
     fn test_resize_flag() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
     }
@@ -566,6 +642,7 @@ mod tests {
             tx,
             false,
             test_kitty_flag(),
+            test_cursor_visible_flag(),
             test_resize_flag(),
         );
         handle.join().expect("Reader thread panicked");
@@ -601,6 +678,7 @@ mod tests {
             event_tx,
             true,
             test_kitty_flag(),
+            test_cursor_visible_flag(),
             test_resize_flag(),
         );
         handle.join().expect("Reader thread panicked");
@@ -628,6 +706,7 @@ mod tests {
             event_tx,
             true,
             test_kitty_flag(),
+            test_cursor_visible_flag(),
             test_resize_flag(),
         );
         handle.join().expect("Reader thread panicked");
@@ -662,6 +741,7 @@ mod tests {
             event_tx,
             false,
             test_kitty_flag(),
+            test_cursor_visible_flag(),
             test_resize_flag(),
         );
         handle.join().expect("Reader thread panicked");
@@ -701,6 +781,7 @@ mod tests {
             event_tx,
             false,
             test_kitty_flag(),
+            test_cursor_visible_flag(),
             test_resize_flag(),
         );
         handle.join().expect("Reader thread panicked");
@@ -747,6 +828,7 @@ mod tests {
             event_tx,
             false,
             Arc::clone(&kitty),
+            test_cursor_visible_flag(),
             test_resize_flag(),
         );
         handle.join().expect("Reader thread panicked");
@@ -774,6 +856,7 @@ mod tests {
             event_tx,
             false,
             Arc::clone(&kitty),
+            test_cursor_visible_flag(),
             test_resize_flag(),
         );
         handle.join().expect("Reader thread panicked");
@@ -797,6 +880,7 @@ mod tests {
             event_tx,
             false,
             Arc::clone(&kitty),
+            test_cursor_visible_flag(),
             test_resize_flag(),
         );
         handle.join().expect("Reader thread panicked");
@@ -825,6 +909,7 @@ mod tests {
             event_tx,
             false,
             test_kitty_flag(),
+            test_cursor_visible_flag(),
             test_resize_flag(),
         );
         handle.join().expect("Reader thread panicked");
@@ -853,6 +938,7 @@ mod tests {
             event_tx,
             false,
             test_kitty_flag(),
+            test_cursor_visible_flag(),
             test_resize_flag(),
         );
         handle.join().expect("Reader thread panicked");
@@ -884,6 +970,7 @@ mod tests {
             event_tx,
             false,
             test_kitty_flag(),
+            test_cursor_visible_flag(),
             test_resize_flag(),
         );
         handle.join().expect("Reader thread panicked");
@@ -920,6 +1007,7 @@ mod tests {
             event_tx,
             false,
             test_kitty_flag(),
+            test_cursor_visible_flag(),
             test_resize_flag(),
         );
         handle.join().expect("Reader thread panicked");

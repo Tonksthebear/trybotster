@@ -286,7 +286,7 @@ hooks.on("pty_title_changed", "update_agent_title", function(info)
     local agent = info.agent_key and Agent.find_by_agent_key(info.agent_key)
     if agent then
         if agent.title ~= info.title then
-            agent.title = info.title
+            agent:update({ title = info.title })
             broadcast_hub_event("agent_list", { agents = Agent.all_info() })
         end
     end
@@ -297,7 +297,7 @@ hooks.on("pty_cwd_changed", "update_agent_cwd", function(info)
     local agent = info.agent_key and Agent.find_by_agent_key(info.agent_key)
     if agent then
         if agent.cwd ~= info.cwd then
-            agent.cwd = info.cwd
+            agent:update({ cwd = info.cwd })
             broadcast_hub_event("agent_list", { agents = Agent.all_info() })
         end
     end
@@ -383,7 +383,7 @@ _event_subs[#_event_subs + 1] = events.on("process_exited", function(data)
 
     local agent = Agent.find_by_agent_key(agent_key)
     if agent then
-        agent.status = "exited"
+        agent:update({ status = "exited" })
         broadcast_hub_event("agent_status_changed", {
             agent_id = agent_key,
             status = "exited",

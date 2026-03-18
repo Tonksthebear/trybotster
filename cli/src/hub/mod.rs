@@ -754,12 +754,19 @@ impl Hub {
     /// URL is first requested (TUI QR display, external automation, etc.).
     /// This avoids blocking boot on bundle generation.
     pub fn setup(&mut self) {
-        if !crate::env::is_test_mode() {
+        let offline = crate::env::is_offline();
+
+        if !crate::env::is_test_mode() && !offline {
             self.register_device();
             self.register_hub_with_server();
         }
-        self.init_crypto_service();
-        self.init_web_push();
+
+        if !offline {
+            self.init_crypto_service();
+            self.init_web_push();
+        } else {
+            log::info!("Offline mode: skipping crypto service and web push initialization");
+        }
 
         // ActionCable connections are now managed by Lua plugins
         // (hub_commands.lua and github.lua handle subscription lifecycle)
@@ -1287,13 +1294,15 @@ impl Hub {
             }
         }
 
-        // Notify server of shutdown
-        registration::shutdown(
-            &self.client,
-            &self.config.server_url,
-            self.server_hub_id(),
-            self.config.get_api_key(),
-        );
+        // Notify server of shutdown (skip in offline mode)
+        if !crate::env::is_offline() {
+            registration::shutdown(
+                &self.client,
+                &self.config.server_url,
+                self.server_hub_id(),
+                self.config.get_api_key(),
+            );
+        }
     }
 
     /// Register TUI with Hub-side request processing.
@@ -1355,6 +1364,9 @@ impl Hub {
     /// Always updates HandleCache so `connection.get_url()` in Lua returns
     /// the current value.
     pub(crate) fn generate_connection_url(&mut self) -> Result<String, String> {
+        if crate::env::is_offline() {
+            return Err("Connection URL unavailable in offline mode".to_string());
+        }
         let result = self.get_or_generate_connection_url();
         // Always update cache so Lua connection.get_url() returns current value
         self.handle_cache.set_connection_url(result.clone());
@@ -1408,6 +1420,60 @@ mod tests {
         let hub = Hub::new(config).unwrap();
 
         assert!(!hub.should_quit());
+    }
+
+    /// Offline mode: setup() skips registration and crypto without panicking.
+    ///
+    /// Verifies that `Hub::setup()` completes successfully when
+    /// `BOTSTER_OFFLINE=1`, even though no server is reachable.
+    ///
+    /// Runs single-threaded to prevent env var races with other tests.
+    #[test]
+    #[ignore = "env-var-mutating — run with: cargo test -- --ignored --test-threads=1 test_hub_setup_offline"]
+    fn test_hub_setup_offline_skips_registration() {
+        std::env::set_var("BOTSTER_OFFLINE", "1");
+
+        let config = test_config();
+        let mut hub = Hub::new(config).unwrap();
+        hub.setup();
+
+        // Server registration was skipped — botster_id should be None
+        assert!(
+            hub.botster_id.is_none(),
+            "botster_id should be None in offline mode"
+        );
+        // Crypto service was skipped
+        assert!(
+            hub.browser.crypto_service.is_none(),
+            "crypto_service should be None in offline mode"
+        );
+        // Connection URL should return an error, not panic
+        let url_result = hub.generate_connection_url();
+        assert!(
+            url_result.is_err(),
+            "generate_connection_url should return Err in offline mode"
+        );
+
+        std::env::remove_var("BOTSTER_OFFLINE");
+    }
+
+    /// Offline mode: generate_connection_url returns Err without panicking.
+    ///
+    /// This test does NOT require env var mutation — it tests the guard
+    /// indirectly by verifying the crypto_service=None path.
+    #[test]
+    fn test_generate_connection_url_without_crypto_returns_err() {
+        let config = test_config();
+        let mut hub = Hub::new(config).unwrap();
+        // Don't call setup() — crypto_service stays None
+        assert!(hub.browser.crypto_service.is_none());
+        // The non-offline path should also fail gracefully (no panic)
+        // when crypto isn't initialized
+        let result = hub.get_or_generate_connection_url();
+        assert!(
+            result.is_err(),
+            "connection URL without crypto should fail gracefully"
+        );
     }
 
     /// Verifies Hub drop completes without deadlocking.
@@ -1668,7 +1734,7 @@ mod tests {
                 })
                 .expect("spawn bash");
 
-            let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) =
+            let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
                 pty_session.get_direct_access();
 
             let pty = PtyHandle::new(
@@ -1676,6 +1742,7 @@ mod tests {
                 Arc::clone(&shared_state),
                 shadow_screen,
                 kitty_enabled,
+                cursor_visible,
                 resize_pending,
                 false,
                 None,
@@ -1712,7 +1779,7 @@ mod tests {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            pty_for_reader.feed_broker_output(&buf[..n]);
+                            pty_for_reader.feed_broker_output(&buf[..n], 0);
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break, // EIO = child exited

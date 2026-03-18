@@ -27,10 +27,6 @@ local Session = state.class("Session")
 -- Session registry keyed by session_uuid (persistent across reloads)
 local sessions = state.get("agent_registry", {})
 
-local function is_ghost_entry(entry)
-    return type(entry) == "table" and entry._is_ghost == true
-end
-
 -- Sequential port counter for forward_port sessions (persistent across reloads)
 local port_state = state.get("agent_port_state", { next_port = 8080 })
 
@@ -346,6 +342,103 @@ function Session._init(self, config)
     log.info(string.format("Session created: %s (uuid=%s, type=%s)", key, session_uuid, session_type))
 end
 
+--- Initialize a session from a persisted manifest during broker recovery.
+-- Hydrates all fields from the manifest + broker handle without spawning a
+-- new PTY or generating a new UUID. The resulting instance is a first-class
+-- session, identical to a freshly created one.
+--
+-- @param self The instance (metatable already set by subclass)
+-- @param config Table with manifest fields plus recovery-specific keys:
+--   handle (PtySessionHandle); broker_session_id (integer); dims ({ rows, cols })
+function Session._init_recovered(self, config)
+    self.session_uuid    = config.session_uuid
+    self.session_type    = config.session_type or "agent"
+    self.session_name    = config.session_name or self.session_type
+    self._agent_key      = config.agent_key
+    self.repo            = config.repo
+    self.branch_name     = config.branch_name
+    self.worktree_path   = config.worktree_path
+    self.prompt          = config.prompt
+    self.agent_name      = config.agent_name
+    self.profile_name    = config.profile_name or config.agent_name
+    self.created_at      = config.created_at or os.time()
+    self.status          = "running"
+    self.title           = config.title
+    self.cwd             = config.cwd
+    self.notification    = false
+    self.session         = config.handle
+    self._session_config = nil
+    self._port           = nil
+    self._workspace_id   = config.workspace_id
+    self._workspace_name = config.workspace_name
+    self._workspace_metadata = {}
+
+    -- Metadata: manifest metadata + broker runtime keys
+    local metadata = {}
+    if config.metadata then
+        for k, v in pairs(config.metadata) do metadata[k] = v end
+    end
+    metadata["broker_session_id"] = tostring(config.broker_session_id)
+    if config.dims then
+        metadata["broker_pty_rows"] = tostring(config.dims.rows or 24)
+        metadata["broker_pty_cols"] = tostring(config.dims.cols or 80)
+    end
+    self.metadata = metadata
+
+    -- Filesystem checks
+    if config.worktree_path then
+        local git_path = config.worktree_path .. "/.git"
+        self._is_worktree = config.in_worktree or (fs.exists(git_path) and not fs.is_dir(git_path))
+    else
+        self._is_worktree = false
+    end
+
+    local data_dir = _G.config and _G.config.data_dir and _G.config.data_dir() or nil
+    self._data_dir = data_dir
+
+    -- Derive hub_socket and hub_manifest_path (hub_discovery is a Rust global)
+    local local_hub_id = hub.hub_id and hub.hub_id() or nil
+    if local_hub_id and hub_discovery then
+        if hub_discovery.socket_path then
+            local ok, socket_path = pcall(hub_discovery.socket_path, local_hub_id)
+            if ok and type(socket_path) == "string" and socket_path ~= "" then
+                self.hub_socket = socket_path
+            end
+        end
+        if hub_discovery.manifest_path then
+            local ok, manifest_path = pcall(hub_discovery.manifest_path, local_hub_id)
+            if ok and type(manifest_path) == "string" and manifest_path ~= "" then
+                self.hub_manifest_path = manifest_path
+            end
+        end
+    end
+
+    local key = self:agent_key()
+
+    -- Register with HandleCache
+    local reg_ok, reg_index = pcall(hub.register_session, self.session_uuid, config.handle, {
+        session_type      = self.session_type,
+        session_name      = self.session_name,
+        agent_key         = key,
+        workspace_id      = self._workspace_id,
+        broker_session_id = config.broker_session_id,
+    })
+    if reg_ok then
+        log.info(string.format("Session %s: recovered (index=%s)", key, tostring(reg_index)))
+    else
+        log.warn(string.format("Session %s: recovery register failed: %s", key, tostring(reg_index)))
+    end
+
+    -- Replay broker scrollback
+    self:replay_broker_scrollback()
+
+    -- Register in session registry
+    sessions[self.session_uuid] = self
+
+    log.info(string.format("Session recovered: %s (uuid=%s, type=%s)",
+        key, self.session_uuid, self.session_type))
+end
+
 -- =============================================================================
 -- Instance Methods
 -- =============================================================================
@@ -361,6 +454,22 @@ function Session:agent_key()
     local repo_safe = self.repo:gsub("/", "-")
     local branch_safe = self.branch_name:gsub("/", "-")
     return repo_safe .. "-" .. branch_safe
+end
+
+--- Update one or more session fields and sync the manifest.
+-- This is the only way external code should mutate session state.
+-- @param fields table  Key-value pairs to update (e.g., { title = "foo", cwd = "/tmp" })
+function Session:update(fields)
+    local changed = false
+    for k, v in pairs(fields) do
+        if self[k] ~= v then
+            self[k] = v
+            changed = true
+        end
+    end
+    if changed then
+        self:_sync_session_manifest()
+    end
 end
 
 --- Set a metadata value and sync session manifest.
@@ -379,11 +488,28 @@ function Session:get_meta(key)
 end
 
 --- Sync the Central Session Store session manifest.
+-- Writes self:info() shape so broker recovery can load it directly.
 function Session:_sync_session_manifest()
     if not self._data_dir or not self._workspace_id then return end
     local ws = require("lib.workspace_store")
 
-    -- Collect broker session info from metadata (single session, no indices)
+    -- Start from the canonical info() shape — this is the contract.
+    local manifest = self:info()
+
+    -- Add persistence-only fields not in info()
+    manifest.prompt            = self.prompt
+    manifest.hub_id            = hub.hub_id() or hub.server_id()
+    manifest.hub_manifest_path = self.hub_manifest_path
+    manifest.role              = "developer"
+
+    -- Normalize status for persistence
+    if manifest.status == "running" then manifest.status = "active" end
+
+    -- Timestamps as ISO 8601 for human readability
+    manifest.created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at)
+    manifest.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+
+    -- Broker session mapping (structured, separate from plugin metadata)
     local broker_sessions = {}
     local pty_dimensions  = {}
     local sid = self.metadata["broker_session_id"]
@@ -395,9 +521,11 @@ function Session:_sync_session_manifest()
             pty_dimensions["0"] = { rows = dim_rows, cols = dim_cols }
         end
     end
+    manifest.broker_sessions = broker_sessions
+    manifest.pty_dimensions  = pty_dimensions
 
-    -- Build plugin metadata for the manifest, excluding internal broker keys
-    -- that are already represented as structured fields above.
+    -- Filter internal broker keys out of persisted metadata
+    -- (they're already represented as structured fields above)
     local plugin_metadata = {}
     local internal_keys = {
         broker_session_id = true,
@@ -410,28 +538,11 @@ function Session:_sync_session_manifest()
             plugin_metadata[k] = v
         end
     end
+    manifest.metadata = plugin_metadata
 
-    local manifest = {
-        uuid          = self.session_uuid,
-        workspace_id  = self._workspace_id,
-        agent_key     = self:agent_key(),
-        type          = self.session_type,
-        role          = "developer",
-        repo          = self.repo,
-        branch        = self.branch_name,
-        worktree_path = self.worktree_path,
-        agent_name    = self.agent_name,
-        profile_name  = self.profile_name,  -- backward compat
-        prompt        = self.prompt,  -- task description (read by `botster context prompt`)
-        metadata      = plugin_metadata,   -- flattened by `botster context` for template access
-        hub_id             = hub.hub_id() or hub.server_id(),
-        hub_manifest_path  = self.hub_manifest_path,
-        status        = (self.status == "running") and "active" or self.status,
-        broker_sessions = broker_sessions,
-        pty_dimensions  = pty_dimensions,
-        created_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
-        updated_at    = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
-    }
+    -- Strip runtime-only fields that shouldn't persist
+    manifest.port         = nil
+    manifest.notification = nil
 
     local ok, err = pcall(ws.write_session,
         self._data_dir, self._workspace_id, self.session_uuid, manifest)
@@ -732,10 +843,13 @@ function Session:info()
 
     local port = self._port
 
-    -- Build display name: prefer OSC title, fall back to branch_name + suffix
+    -- Build display name: prefer OSC title (set by running script), fall back to
+    -- agent_name (from config), then branch_name + suffix
     local display_name
     if self.title and self.title ~= "" then
         display_name = self.title
+    elseif self.agent_name and self.agent_name ~= "" then
+        display_name = self.agent_name
     else
         display_name = self.branch_name
         local base_key = (function()
@@ -779,11 +893,7 @@ end
 -- @param session_uuid string Session UUID
 -- @return Session subclass instance or nil
 function Session.get(session_uuid)
-    local entry = sessions[session_uuid]
-    if is_ghost_entry(entry) then
-        return nil
-    end
-    return entry
+    return sessions[session_uuid]
 end
 
 --- Find a session by its agent_key (display label).
@@ -803,11 +913,8 @@ end
 function Session.list()
     local result = {}
     for _, sess in pairs(sessions) do
-        if not is_ghost_entry(sess) then
-            table.insert(result, sess)
-        end
+        table.insert(result, sess)
     end
-    -- Sort by creation time for stable ordering
     table.sort(result, function(a, b)
         return (a.created_at or 0) < (b.created_at or 0)
     end)
@@ -885,27 +992,10 @@ end
 -- @return number
 function Session.count()
     local count = 0
-    for _, sess in pairs(sessions) do
-        if not is_ghost_entry(sess) then
-            count = count + 1
-        end
+    for _ in pairs(sessions) do
+        count = count + 1
     end
     return count
-end
-
---- Register a recovered ghost session info entry.
--- Ghost entries share the same `sessions` registry and are replaced
--- automatically when the real session with the same UUID is created.
--- @param ghost_info table Session-info style table
--- @return boolean
-function Session.register_ghost(ghost_info)
-    if type(ghost_info) ~= "table" then return false end
-    if not ghost_info.session_uuid or ghost_info.session_uuid == "" then return false end
-    if not ghost_info.id or ghost_info.id == "" then return false end
-    ghost_info._is_ghost = true
-    ghost_info.created_at = ghost_info.created_at or os.time()
-    sessions[ghost_info.session_uuid] = ghost_info
-    return true
 end
 
 --- Get info tables for all sessions (for client broadcast).
@@ -913,20 +1003,8 @@ end
 function Session.all_info()
     local result = {}
     for _, entry in pairs(sessions) do
-        if is_ghost_entry(entry) then
-            local info = {}
-            for k, v in pairs(entry) do
-                if k ~= "_is_ghost" then
-                    info[k] = v
-                end
-            end
-            result[#result + 1] = info
-        else
-            local info = entry:info()
-            result[#result + 1] = info
-        end
+        result[#result + 1] = entry:info()
     end
-    -- Stable client-facing ordering.
     table.sort(result, function(a, b)
         local ac = tonumber(a.created_at) or 0
         local bc = tonumber(b.created_at) or 0

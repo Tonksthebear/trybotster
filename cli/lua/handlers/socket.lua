@@ -35,7 +35,6 @@ end
 -- Called when a new socket client connects
 socket.on_client_connected(function(client_id)
     log.info("Socket client connected: " .. client_id)
-    print("TUI attached (" .. client_id .. ")")
 
     local client = Client.new(client_id, make_socket_transport(client_id))
     connections.register_client(client_id, client)
@@ -44,7 +43,6 @@ end)
 -- Called when a socket client disconnects
 socket.on_client_disconnected(function(client_id)
     log.info("Socket client disconnected: " .. client_id)
-    print("TUI detached (" .. client_id .. ")")
     connections.unregister_client(client_id)
 end)
 

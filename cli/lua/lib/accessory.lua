@@ -41,6 +41,16 @@ function Accessory.new(config)
     return self
 end
 
+--- Recover an Accessory from a persisted manifest during broker recovery.
+-- @param config Table with manifest fields + handle/broker_session_id/dims
+-- @return Accessory instance (first-class, identical to Accessory.new())
+function Accessory.from_recovery(config)
+    config.session_type = config.session_type or "accessory"
+    local self = setmetatable({}, Accessory)
+    Session._init_recovered(self, config)
+    return self
+end
+
 -- =============================================================================
 -- Lifecycle Hooks for Hot-Reload
 -- =============================================================================

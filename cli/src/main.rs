@@ -43,6 +43,22 @@ fn ensure_authenticated() -> Result<()> {
         return Ok(());
     }
 
+    // Skip auth in offline mode — no network available
+    if botster::env::is_offline() {
+        // Warn if no token exists — some Lua plugins may fail if they
+        // try to read hub.api_token() for authenticated requests.
+        let config = Config::load()?;
+        if !config.has_token() {
+            eprintln!(
+                "Warning: No cached authentication token found. \
+                 Run 'botster start' once with network to authenticate, \
+                 then use --offline."
+            );
+        }
+        log::info!("Skipping authentication (offline mode)");
+        return Ok(());
+    }
+
     let mut config = Config::load()?;
     let using_env_var =
         std::env::var("BOTSTER_TOKEN").is_ok() || std::env::var("BOTSTER_API_KEY").is_ok();
@@ -268,7 +284,9 @@ fn run_headless() -> Result<()> {
     println!("Starting Botster Hub v{} in headless mode...", VERSION);
 
     // Check for updates first (non-interactive — logs warning only)
-    let _ = commands::update::check_on_boot_headless();
+    if !botster::env::is_offline() {
+        let _ = commands::update::check_on_boot_headless();
+    }
 
     // Ensure we have a valid authentication token
     ensure_authenticated()?;
@@ -284,8 +302,8 @@ fn run_headless() -> Result<()> {
     let mut config = Config::load()?;
 
     // Verify token is available after load - catches keyring save/load issues
-    // Skip in test mode since ensure_authenticated() skips auth entirely
-    if !botster::env::is_test_mode() && !config.has_token() {
+    // Skip in test mode and offline mode since ensure_authenticated() skips auth
+    if !botster::env::is_test_mode() && !botster::env::is_offline() && !config.has_token() {
         anyhow::bail!(
             "Authentication token not found after auth flow. \
              This may indicate a keyring access issue. \
@@ -306,7 +324,11 @@ fn run_headless() -> Result<()> {
 
     let mut hub = Hub::new(config)?;
 
-    println!("Setting up connections...");
+    if botster::env::is_offline() {
+        println!("Setting up in offline mode (no network)...");
+    } else {
+        println!("Setting up connections...");
+    }
     hub.setup();
 
     // Start socket server for IPC (allows `botster attach` and plugin access)
@@ -315,7 +337,9 @@ fn run_headless() -> Result<()> {
     // In headless mode, eagerly generate the connection URL so external
     // tools (system tests, automation) can read it from connection_url.txt
     // without needing a TUI interaction to trigger lazy generation.
-    hub.eager_generate_connection_url();
+    if !botster::env::is_offline() {
+        hub.eager_generate_connection_url();
+    }
 
     println!("Hub ready. Waiting for connections...");
     log::info!("Botster Hub v{} started in headless mode", VERSION);
@@ -350,8 +374,10 @@ fn run_with_tui() -> Result<()> {
     }
 
     // Check for updates first — show errors so the user knows if an update failed
-    if let Err(e) = commands::update::check_on_boot() {
-        eprintln!("Update failed: {e:#}");
+    if !botster::env::is_offline() {
+        if let Err(e) = commands::update::check_on_boot() {
+            eprintln!("Update failed: {e:#}");
+        }
     }
 
     // Ensure we have a valid authentication token
@@ -369,8 +395,8 @@ fn run_with_tui() -> Result<()> {
     let mut config = Config::load()?;
 
     // Verify token is available after load - catches keyring save/load issues
-    // Skip in test mode since ensure_authenticated() skips auth entirely
-    if !botster::env::is_test_mode() && !config.has_token() {
+    // Skip in test mode and offline mode since ensure_authenticated() skips auth
+    if !botster::env::is_test_mode() && !botster::env::is_offline() && !config.has_token() {
         anyhow::bail!(
             "Authentication token not found after auth flow. \
              This may indicate a keyring access issue. \
@@ -392,7 +418,11 @@ fn run_with_tui() -> Result<()> {
     let mut hub = Hub::new(config)?;
 
     // Perform setup BEFORE entering raw mode so errors are visible
-    println!("Setting up connections...");
+    if botster::env::is_offline() {
+        println!("Setting up in offline mode (no network)...");
+    } else {
+        println!("Setting up connections...");
+    }
     hub.setup();
 
     // Start socket server for IPC (allows `botster attach` and plugin access)
@@ -449,6 +479,10 @@ enum Commands {
     Start {
         #[arg(long)]
         headless: bool,
+        /// Run without any network connectivity (no auth, no server registration,
+        /// no browser relay). Requires a previously authenticated device.
+        #[arg(long)]
+        offline: bool,
     },
     Status,
     Config {
@@ -957,7 +991,7 @@ fn main() -> Result<()> {
         // file so concurrent processes and sequential runs never overwrite each
         // other.  BOTSTER_LOG_FILE bypasses this for scripted overrides.
         let log_label = match &cli.command {
-            Commands::Start { headless: true } => "hub",
+            Commands::Start { headless: true, .. } => "hub",
             Commands::Start { .. } => "tui",
             Commands::Attach { .. } => "attach",
             _ => "cli",
@@ -1022,7 +1056,11 @@ fn main() -> Result<()> {
     }));
 
     match cli.command {
-        Commands::Start { headless } => {
+        Commands::Start { headless, offline } => {
+            if offline {
+                std::env::set_var("BOTSTER_OFFLINE", "1");
+                log::info!("Offline mode enabled — all network primitives disabled");
+            }
             // Strict singleton policy: one live hub per directory-local hub ID.
             //
             // A missing socket does not imply no live hub: startup races or an
