@@ -25,6 +25,15 @@
 //!
 //! -- Pretty-print JSON
 //! local pretty, err = json.encode_pretty({ name = "bot" })
+//!
+//! -- Read a value from a JSON file (dot-notation path, ~ expansion)
+//! local val, err = json.file_get("~/.claude.json", "projects.mypath.hasTrust")
+//!
+//! -- Set a value in a JSON file (creates intermediate objects)
+//! local ok, err = json.file_set("~/.claude.json", "projects.mypath.hasTrust", true)
+//!
+//! -- Delete a key from a JSON file (idempotent)
+//! local ok, err = json.file_delete("~/.claude.json", "projects.mypath")
 //! ```
 //!
 //! # Error Handling
@@ -35,6 +44,7 @@
 
 use anyhow::{anyhow, Result};
 use mlua::{Lua, LuaSerdeExt, Value};
+use std::path::Path;
 
 /// Convert a serde_json::Value to a Lua value, mapping JSON null to Lua nil.
 ///
@@ -154,6 +164,181 @@ pub fn register(lua: &Lua) -> Result<()> {
     json_table
         .set("encode_pretty", encode_pretty_fn)
         .map_err(|e| anyhow!("Failed to set json.encode_pretty: {e}"))?;
+
+    // json.file_get(file_path, key_path) -> (value, nil) or (nil, error_string)
+    //
+    // Reads a value from a JSON file using dot-notation path.
+    // Expands `~` in file paths. Returns the value as a Lua type.
+    let file_get_fn = lua
+        .create_function(|lua, (file_path, key_path): (String, String)| {
+            let expanded = shellexpand::tilde(&file_path);
+            let path = Path::new(expanded.as_ref());
+
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => return Ok((Value::Nil, Some(format!("Failed to read {file_path}: {e}")))),
+            };
+
+            let root: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok((
+                        Value::Nil,
+                        Some(format!("Failed to parse {file_path}: {e}")),
+                    ))
+                }
+            };
+
+            let mut current = &root;
+            for key in key_path.split('.') {
+                match current.get(key) {
+                    Some(v) => current = v,
+                    None => {
+                        return Ok((
+                            Value::Nil,
+                            Some(format!("Key '{key}' not found in path '{key_path}'")),
+                        ))
+                    }
+                }
+            }
+
+            let lua_val = json_to_lua(lua, current)
+                .map_err(|e| mlua::Error::external(format!("Conversion error: {e}")))?;
+            Ok((lua_val, None::<String>))
+        })
+        .map_err(|e| anyhow!("Failed to create json.file_get function: {e}"))?;
+
+    json_table
+        .set("file_get", file_get_fn)
+        .map_err(|e| anyhow!("Failed to set json.file_get: {e}"))?;
+
+    // json.file_set(file_path, key_path, value) -> (true, nil) or (nil, error_string)
+    //
+    // Sets a value in a JSON file using dot-notation path.
+    // Creates intermediate objects as needed. Expands `~` in file paths.
+    // The value can be any Lua type (string, number, boolean, table).
+    let file_set_fn = lua
+        .create_function(|lua, (file_path, key_path, value): (String, String, Value)| {
+            let expanded = shellexpand::tilde(&file_path);
+            let path = Path::new(expanded.as_ref());
+
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),
+                Err(e) => return Ok((None::<bool>, Some(format!("Failed to read {file_path}: {e}")))),
+            };
+
+            let mut root: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok((
+                        None::<bool>,
+                        Some(format!("Failed to parse {file_path}: {e}")),
+                    ))
+                }
+            };
+
+            let new_value: serde_json::Value = lua
+                .from_value(value)
+                .map_err(|e| mlua::Error::external(format!("Failed to convert value: {e}")))?;
+
+            let keys: Vec<&str> = key_path.split('.').collect();
+            let mut current = &mut root;
+
+            for (i, key) in keys.iter().enumerate() {
+                if i == keys.len() - 1 {
+                    if let Some(obj) = current.as_object_mut() {
+                        obj.insert(key.to_string(), new_value.clone());
+                    } else {
+                        return Ok((
+                            None::<bool>,
+                            Some(format!("Cannot set key '{key}' — parent is not an object")),
+                        ));
+                    }
+                } else {
+                    if !current.is_object() {
+                        return Ok((
+                            None::<bool>,
+                            Some(format!("Cannot navigate through '{key}' — not an object")),
+                        ));
+                    }
+                    let obj = current.as_object_mut().expect("checked is_object() above");
+                    if !obj.contains_key(*key) || !obj[*key].is_object() {
+                        obj.insert(key.to_string(), serde_json::json!({}));
+                    }
+                    current = obj.get_mut(*key).expect("key was just inserted if missing");
+                }
+            }
+
+            match std::fs::write(path, serde_json::to_string_pretty(&root).unwrap_or_default()) {
+                Ok(()) => Ok((Some(true), None::<String>)),
+                Err(e) => Ok((None::<bool>, Some(format!("Failed to write {file_path}: {e}")))),
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create json.file_set function: {e}"))?;
+
+    json_table
+        .set("file_set", file_set_fn)
+        .map_err(|e| anyhow!("Failed to set json.file_set: {e}"))?;
+
+    // json.file_delete(file_path, key_path) -> (true, nil) or (nil, error_string)
+    //
+    // Deletes a key from a JSON file using dot-notation path.
+    // Idempotent — succeeds silently if the key doesn't exist. Expands `~` in file paths.
+    let file_delete_fn = lua
+        .create_function(|_lua, (file_path, key_path): (String, String)| {
+            let expanded = shellexpand::tilde(&file_path);
+            let path = Path::new(expanded.as_ref());
+
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Some(true), None::<String>)),
+                Err(e) => return Ok((None::<bool>, Some(format!("Failed to read {file_path}: {e}")))),
+            };
+
+            let mut root: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok((
+                        None::<bool>,
+                        Some(format!("Failed to parse {file_path}: {e}")),
+                    ))
+                }
+            };
+
+            let keys: Vec<&str> = key_path.split('.').collect();
+            if keys.is_empty() || (keys.len() == 1 && keys[0].is_empty()) {
+                return Ok((None::<bool>, Some("Cannot delete root object".to_string())));
+            }
+
+            let mut current = &mut root;
+            for (i, key) in keys.iter().enumerate() {
+                if i == keys.len() - 1 {
+                    if let Some(obj) = current.as_object_mut() {
+                        obj.remove(*key);
+                    }
+                } else {
+                    if !current.is_object() {
+                        return Ok((Some(true), None::<String>));
+                    }
+                    let obj = current.as_object_mut().expect("checked is_object() above");
+                    if !obj.contains_key(*key) {
+                        return Ok((Some(true), None::<String>));
+                    }
+                    current = obj.get_mut(*key).expect("checked contains_key() above");
+                }
+            }
+
+            match std::fs::write(path, serde_json::to_string_pretty(&root).unwrap_or_default()) {
+                Ok(()) => Ok((Some(true), None::<String>)),
+                Err(e) => Ok((None::<bool>, Some(format!("Failed to write {file_path}: {e}")))),
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create json.file_delete function: {e}"))?;
+
+    json_table
+        .set("file_delete", file_delete_fn)
+        .map_err(|e| anyhow!("Failed to set json.file_delete: {e}"))?;
 
     lua.globals()
         .set("json", json_table)
@@ -366,6 +551,161 @@ mod tests {
         let s = result.expect("Should return a string");
         let parsed: serde_json::Value = serde_json::from_str(&s).expect("Should be valid JSON");
         assert_eq!(parsed["outer"]["inner"], "value");
+    }
+
+    #[test]
+    fn test_file_get_reads_nested_value() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register json primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.json");
+        std::fs::write(&file_path, r#"{"a": {"b": {"c": 42}}}"#).unwrap();
+
+        lua.globals()
+            .set("test_path", file_path.to_str().unwrap())
+            .unwrap();
+
+        lua.load(
+            r#"
+            local val, err = json.file_get(test_path, "a.b.c")
+            assert(err == nil, "Should not error: " .. tostring(err))
+            assert(val == 42, "Should read nested value")
+        "#,
+        )
+        .exec()
+        .expect("file_get test should pass");
+    }
+
+    #[test]
+    fn test_file_set_creates_intermediate_objects() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register json primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.json");
+        std::fs::write(&file_path, "{}").unwrap();
+
+        lua.globals()
+            .set("test_path", file_path.to_str().unwrap())
+            .unwrap();
+
+        lua.load(
+            r#"
+            local ok, err = json.file_set(test_path, "projects.mypath.hasTrust", true)
+            assert(err == nil, "Should not error: " .. tostring(err))
+            assert(ok == true, "Should return true")
+
+            local val, err2 = json.file_get(test_path, "projects.mypath.hasTrust")
+            assert(err2 == nil, "Read should not error")
+            assert(val == true, "Should read back the value we set")
+        "#,
+        )
+        .exec()
+        .expect("file_set test should pass");
+    }
+
+    #[test]
+    fn test_file_set_creates_file_if_missing() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register json primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("new.json");
+
+        lua.globals()
+            .set("test_path", file_path.to_str().unwrap())
+            .unwrap();
+
+        lua.load(
+            r#"
+            local ok, err = json.file_set(test_path, "key", "value")
+            assert(err == nil, "Should not error: " .. tostring(err))
+            assert(ok == true)
+        "#,
+        )
+        .exec()
+        .expect("file_set on missing file should pass");
+
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["key"], "value");
+    }
+
+    #[test]
+    fn test_file_delete_removes_key() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register json primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.json");
+        std::fs::write(&file_path, r#"{"keep": 1, "remove": 2}"#).unwrap();
+
+        lua.globals()
+            .set("test_path", file_path.to_str().unwrap())
+            .unwrap();
+
+        lua.load(
+            r#"
+            local ok, err = json.file_delete(test_path, "remove")
+            assert(err == nil, "Should not error: " .. tostring(err))
+            assert(ok == true)
+        "#,
+        )
+        .exec()
+        .expect("file_delete test should pass");
+
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.get("keep").is_some());
+        assert!(parsed.get("remove").is_none());
+    }
+
+    #[test]
+    fn test_file_delete_missing_key_is_idempotent() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register json primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.json");
+        std::fs::write(&file_path, r#"{"name": "test"}"#).unwrap();
+
+        lua.globals()
+            .set("test_path", file_path.to_str().unwrap())
+            .unwrap();
+
+        lua.load(
+            r#"
+            local ok, err = json.file_delete(test_path, "nonexistent.deep.key")
+            assert(err == nil, "Should not error")
+            assert(ok == true, "Should succeed idempotently")
+        "#,
+        )
+        .exec()
+        .expect("idempotent delete test should pass");
+    }
+
+    #[test]
+    fn test_file_delete_missing_file_is_idempotent() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register json primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("nonexistent.json");
+
+        lua.globals()
+            .set("test_path", file_path.to_str().unwrap())
+            .unwrap();
+
+        lua.load(
+            r#"
+            local ok, err = json.file_delete(test_path, "some.key")
+            assert(err == nil, "Should not error")
+            assert(ok == true, "Should succeed when file doesn't exist")
+        "#,
+        )
+        .exec()
+        .expect("delete on missing file should pass");
     }
 
     #[test]

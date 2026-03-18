@@ -10,7 +10,7 @@ module Hubs
     def show
       @config_metadata = config_metadata
       @templates = template_catalog
-      @session_templates = @templates["sessions"] || []
+      @agent_templates = @templates["agents"] || []
     end
 
     private
@@ -22,12 +22,6 @@ module Hubs
 
     def config_metadata
       {
-        shared_files: {
-          "workspace_include" => { description: "Glob patterns for files to copy into worktrees",
-            default: "# Glob patterns for files to copy into worktrees\n# One pattern per line\n# Example:\n# .env\n# config/secrets.yml\n" },
-          "workspace_teardown" => { description: "Cleanup commands before worktree deletion",
-            default: "# Teardown commands\n# Run before worktree is deleted\n" }
-        },
         session_files: {
           "initialization" => { description: "Session startup script",
             default: "#!/bin/bash\n# Session initialization\n# Commands run when this session starts\n" }

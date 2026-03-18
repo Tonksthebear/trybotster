@@ -134,9 +134,9 @@
                 <h3 class="text-sm font-medium text-zinc-300 mb-1">Get Started</h3>
                 <p class="text-xs text-zinc-500 mb-4">Choose a session template to initialize your hub:</p>
 
-                <% if @session_templates.any? %>
+                <% if @agent_templates.any? %>
                   <div class="space-y-2 mb-4">
-                    <% @session_templates.each do |template| %>
+                    <% @agent_templates.each do |template| %>
                       <button type="button"
                               data-action="hub-settings#quickSetup"
                               data-template-dest="<%= template[:dest] %>"
@@ -163,11 +163,110 @@
                 </button>
               </div>
 
-              <%# Tree view — dynamically rendered by Stimulus %>
+              <%# Tree view — populated by Stimulus from templates below %>
               <div data-hub-settings-target="treeContainer"
                    class="group-data-[view=tree]/tree:block hidden space-y-4">
               </div>
             </div>
+
+            <%# ── Tree component templates (cloned by Stimulus, never shown directly) ── %>
+
+            <%# Section header: AGENTS / ACCESSORIES / WORKSPACES / PLUGINS %>
+            <template data-hub-settings-target="tplSectionHeader">
+              <div class="mt-4">
+                <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3"
+                    data-slot="title"></h2>
+              </div>
+            </template>
+
+            <%# Section header (first): no top margin %>
+            <template data-hub-settings-target="tplSectionHeaderFirst">
+              <div class="mt-2">
+                <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3"
+                    data-slot="title"></h2>
+              </div>
+            </template>
+
+            <%# File entry button %>
+            <template data-hub-settings-target="tplFileEntry">
+              <button type="button"
+                      data-action="hub-settings#selectFile"
+                      class="w-full text-left px-2.5 py-1.5 rounded border border-zinc-700/50
+                             hover:border-zinc-700 hover:bg-zinc-800/50 transition-colors
+                             data-[selected]:bg-zinc-800/50 data-[selected]:border-primary-500/30
+                             data-[flash]:ring-1 data-[flash]:ring-primary-500/50">
+                <div class="flex items-center justify-between">
+                  <span class="text-xs font-mono text-zinc-300 truncate" data-slot="label"></span>
+                  <span class="shrink-0 ml-2 text-[10px] px-1.5 py-0.5 rounded
+                               data-[status=exists]:bg-emerald-500/10 data-[status=exists]:text-emerald-400
+                               data-[status=missing]:bg-zinc-700/50 data-[status=missing]:text-zinc-500"
+                        data-slot="status"></span>
+                </div>
+              </button>
+            </template>
+
+            <%# Agent/Accessory section wrapper with name + remove button %>
+            <template data-hub-settings-target="tplNamedSection">
+              <div class="mb-3 group/section
+                          data-[flash]:ring-1 data-[flash]:ring-primary-500/30 data-[flash]:rounded-lg">
+                <div class="flex items-center justify-between mb-2">
+                  <h3 class="text-xs font-medium text-zinc-500 uppercase tracking-wider"
+                      data-slot="name"></h3>
+                  <button type="button"
+                          class="text-zinc-700 hover:text-red-400 transition-colors
+                                 opacity-0 group-hover/section:opacity-100"
+                          data-slot="removeBtn">
+                    <%= icon "trash", class: "size-3.5" %>
+                  </button>
+                </div>
+                <div class="space-y-1" data-slot="files"></div>
+              </div>
+            </template>
+
+            <%# Add button (dashed border) %>
+            <template data-hub-settings-target="tplAddButton">
+              <button type="button"
+                      class="w-full mt-2 px-3 py-2 text-xs font-medium text-zinc-500
+                             hover:text-zinc-300 border border-dashed border-zinc-700
+                             hover:border-zinc-600 rounded-lg transition-colors"
+                      data-slot="label"></button>
+            </template>
+
+            <%# Port forward toggle %>
+            <template data-hub-settings-target="tplPortForward">
+              <div class="flex items-center justify-between px-2.5 py-1">
+                <div class="flex items-center gap-2">
+                  <label class="text-xs text-zinc-500 cursor-pointer" data-slot="label">port_forward</label>
+                  <span class="text-[10px] text-emerald-400/70 hidden data-[enabled]:block"
+                        data-slot="hint">$PORT available</span>
+                </div>
+                <div class="group relative inline-flex w-9 shrink-0 rounded-full p-0.5
+                            bg-white/5 inset-ring inset-ring-white/10
+                            has-checked:bg-primary-500
+                            transition-colors duration-200 ease-in-out
+                            outline-offset-2 outline-primary-500 has-focus-visible:outline-2">
+                  <span class="size-4 rounded-full bg-white shadow-xs ring-1 ring-gray-900/5
+                               transition-transform duration-200 ease-in-out
+                               group-has-checked:translate-x-4"></span>
+                  <input type="checkbox"
+                         data-action="hub-settings#togglePortForward"
+                         data-slot="checkbox"
+                         class="absolute inset-0 appearance-none cursor-pointer focus:outline-hidden">
+                </div>
+              </div>
+            </template>
+
+            <%# List wrapper (space-y-1 container for file entries) %>
+            <template data-hub-settings-target="tplFileList">
+              <div class="space-y-1"></div>
+            </template>
+
+            <%# Plugins empty state %>
+            <template data-hub-settings-target="tplPluginsEmpty">
+              <p class="text-xs text-zinc-600 italic">
+                No plugins installed. Browse the template catalog to add one.
+              </p>
+            </template>
           </div>
 
           <%# Editor (right) — data-editor drives which child + buttons are visible %>

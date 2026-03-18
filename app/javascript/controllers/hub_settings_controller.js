@@ -39,6 +39,15 @@ export default class extends Controller {
     "promptMessage",
     "promptInput",
     "promptError",
+    // Tree component templates (cloned, never shown directly)
+    "tplSectionHeader",
+    "tplSectionHeaderFirst",
+    "tplFileEntry",
+    "tplNamedSection",
+    "tplAddButton",
+    "tplPortForward",
+    "tplFileList",
+    "tplPluginsEmpty",
   ];
 
   static values = {
@@ -436,7 +445,7 @@ export default class extends Controller {
     const fsScope = scope === "device" ? "device" : undefined;
 
     try {
-      const tree = { agents: {}, accessories: {}, workspaces: {}, plugins: {}, files: {} };
+      const tree = { agents: {}, accessories: {}, workspaces: {}, plugins: {} };
       const prefix = scope === "device" ? "" : ".botster/";
 
       // Check if config root exists
@@ -462,17 +471,12 @@ export default class extends Controller {
       }
 
       // Scan all sections in parallel
-      const [agentNames, accessoryNames, workspaceEntries, pluginNames, wsInclude, wsTeardown] = await Promise.all([
+      const [agentNames, accessoryNames, workspaceEntries, pluginNames] = await Promise.all([
         this.#listDirs(`${prefix}agents`, fsScope),
         this.#listDirs(`${prefix}accessories`, fsScope),
         this.#listFiles(`${prefix}workspaces`, fsScope, ".json"),
         this.#listDirs(`${prefix}plugins`, fsScope),
-        this.hub.statFile(`${prefix}workspace_include`, fsScope).catch(() => ({ exists: false })),
-        this.hub.statFile(`${prefix}workspace_teardown`, fsScope).catch(() => ({ exists: false })),
       ]);
-
-      tree.files.workspace_include = wsInclude.exists;
-      tree.files.workspace_teardown = wsTeardown.exists;
 
       // Scan agents (each has initialization file)
       await Promise.all(
@@ -578,246 +582,143 @@ export default class extends Controller {
   #renderTree() {
     const container = this.treeContainerTarget;
     const newContainer = container.cloneNode(false);
-
     const prefix = this.#configPrefix();
 
-    // Top-level workspace files
-    const hasFiles = this.tree.files.workspace_include || this.tree.files.workspace_teardown;
-    if (hasFiles || Object.keys(this.tree.agents).length > 0) {
-      const filesSection = document.createElement("div");
-      filesSection.className = "mb-3";
-
-      const filesList = document.createElement("div");
-      filesList.className = "space-y-1";
-
-      for (const [fileName, exists] of Object.entries(this.tree.files)) {
-        const status = exists ? "exists" : "missing";
-        filesList.appendChild(this.#renderFileEntry(`${prefix}${fileName}`, fileName, status));
-      }
-
-      filesSection.appendChild(filesList);
-      newContainer.appendChild(filesSection);
-    }
-
-    // Agents section
+    // Agents
     const agentNames = Object.keys(this.tree.agents).sort();
     if (agentNames.length > 0) {
-      const header = document.createElement("div");
-      header.className = "mt-2";
-      header.innerHTML = `<h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">Agents</h2>`;
-      newContainer.appendChild(header);
-
+      newContainer.appendChild(this.#cloneSectionHeader("Agents", true));
       for (const name of agentNames) {
-        newContainer.appendChild(this.#renderAgentSection(name, prefix));
+        newContainer.appendChild(this.#buildNamedSection(name, "agents", prefix));
       }
     }
+    newContainer.appendChild(this.#cloneAddButton("+ Add Agent", "hub-settings#addAgent", "add-agent-btn"));
 
-    // Add agent button
-    const addAgentBtn = document.createElement("button");
-    addAgentBtn.type = "button";
-    addAgentBtn.id = "add-agent-btn";
-    addAgentBtn.className = "w-full mt-2 px-3 py-2 text-xs font-medium text-zinc-500 hover:text-zinc-300 border border-dashed border-zinc-700 hover:border-zinc-600 rounded-lg transition-colors";
-    addAgentBtn.textContent = "+ Add Agent";
-    addAgentBtn.dataset.action = "hub-settings#addAgent";
-    newContainer.appendChild(addAgentBtn);
-
-    // Accessories section
+    // Accessories
     const accessoryNames = Object.keys(this.tree.accessories).sort();
     if (accessoryNames.length > 0) {
-      const header = document.createElement("div");
-      header.className = "mt-4";
-      header.innerHTML = `<h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">Accessories</h2>`;
-      newContainer.appendChild(header);
-
+      newContainer.appendChild(this.#cloneSectionHeader("Accessories"));
       for (const name of accessoryNames) {
-        newContainer.appendChild(this.#renderAccessorySection(name, prefix));
+        newContainer.appendChild(this.#buildNamedSection(name, "accessories", prefix));
       }
     }
+    newContainer.appendChild(this.#cloneAddButton("+ Add Accessory", "hub-settings#addAccessory", "add-accessory-btn"));
 
-    // Add accessory button
-    const addAccBtn = document.createElement("button");
-    addAccBtn.type = "button";
-    addAccBtn.id = "add-accessory-btn";
-    addAccBtn.className = "w-full mt-2 px-3 py-2 text-xs font-medium text-zinc-500 hover:text-zinc-300 border border-dashed border-zinc-700 hover:border-zinc-600 rounded-lg transition-colors";
-    addAccBtn.textContent = "+ Add Accessory";
-    addAccBtn.dataset.action = "hub-settings#addAccessory";
-    newContainer.appendChild(addAccBtn);
-
-    // Workspaces section
+    // Workspaces
     const workspaceNames = Object.keys(this.tree.workspaces).sort();
     if (workspaceNames.length > 0) {
-      const header = document.createElement("div");
-      header.className = "mt-4";
-      header.innerHTML = `<h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">Workspaces</h2>`;
-      newContainer.appendChild(header);
-
-      const list = document.createElement("div");
-      list.className = "space-y-1";
+      newContainer.appendChild(this.#cloneSectionHeader("Workspaces"));
+      const list = this.#cloneFileList();
       for (const name of workspaceNames) {
-        const ws = this.tree.workspaces[name];
-        list.appendChild(this.#renderFileEntry(ws.file, `${name}.json`, "exists"));
+        list.appendChild(this.#cloneFileEntry(`${prefix}workspaces/${name}.json`, `${name}.json`, "exists"));
       }
       newContainer.appendChild(list);
     }
 
-    // Plugins section
+    // Plugins (always visible)
+    newContainer.appendChild(this.#cloneSectionHeader("Plugins"));
     const pluginNames = Object.keys(this.tree.plugins).sort();
     if (pluginNames.length > 0) {
-      const header = document.createElement("div");
-      header.className = "mt-4";
-      header.innerHTML = `<h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">Plugins</h2>`;
-      newContainer.appendChild(header);
-
-      const list = document.createElement("div");
-      list.className = "space-y-1";
+      const list = this.#cloneFileList();
       for (const name of pluginNames) {
-        const pluginPath = `${prefix}plugins/${name}/init.lua`;
-        list.appendChild(this.#renderFileEntry(pluginPath, `${name}/init.lua`, "exists"));
+        list.appendChild(this.#cloneFileEntry(`${prefix}plugins/${name}/init.lua`, `${name}/init.lua`, "exists"));
       }
       newContainer.appendChild(list);
+    } else {
+      newContainer.appendChild(this.tplPluginsEmptyTarget.content.cloneNode(true));
     }
 
-    window.Turbo.morphElements(container, newContainer, {
-      morphStyle: "innerHTML",
-    });
-
+    window.Turbo.morphElements(container, newContainer, { morphStyle: "innerHTML" });
     this.treePanelTarget.dataset.view = "tree";
 
-    // Re-apply selection highlight after morph
     if (this.currentFilePath) {
       this.#highlightSelected(this.currentFilePath);
     }
   }
 
-  #renderAgentSection(name, prefix) {
-    const section = document.createElement("div");
-    section.id = `section-agents-${name.replace(/[^a-zA-Z0-9-]/g, "-")}`;
-    section.className = "mb-3 group/section data-[flash]:ring-1 data-[flash]:ring-primary-500/30 data-[flash]:rounded-lg";
+  // ========== Template Cloners ==========
 
-    // Header with remove button
-    const headerDiv = document.createElement("div");
-    headerDiv.className = "flex items-center justify-between mb-2";
-    headerDiv.innerHTML = `<h3 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">${this.#escapeHtml(this.#capitalize(name))}</h3>`;
-
-    const removeBtn = document.createElement("button");
-    removeBtn.type = "button";
-    removeBtn.className =
-      "text-zinc-700 hover:text-red-400 transition-colors opacity-0 group-hover/section:opacity-100";
-    removeBtn.title = "Remove agent";
-    removeBtn.dataset.action = "hub-settings#removeAgent";
-    removeBtn.dataset.agentName = name;
-    removeBtn.innerHTML = `<svg class="size-3.5" viewBox="0 0 20 20" fill="currentColor">
-      <path fill-rule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.52.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clip-rule="evenodd"/>
-    </svg>`;
-    headerDiv.appendChild(removeBtn);
-
-    section.appendChild(headerDiv);
-
-    const list = document.createElement("div");
-    list.className = "space-y-1";
-
-    const agentPath = `${prefix}agents/${name}`;
-    const agent = this.tree.agents[name];
-    const initStatus = agent.initialization ? "exists" : "missing";
-    list.appendChild(this.#renderFileEntry(`${agentPath}/initialization`, "initialization", initStatus));
-
-    section.appendChild(list);
-    return section;
+  #cloneSectionHeader(title, first = false) {
+    const tpl = first ? this.tplSectionHeaderFirstTarget : this.tplSectionHeaderTarget;
+    const frag = tpl.content.cloneNode(true);
+    frag.querySelector('[data-slot="title"]').textContent = title;
+    return frag;
   }
 
-  #renderAccessorySection(name, prefix) {
-    const section = document.createElement("div");
-    section.id = `section-accessories-${name.replace(/[^a-zA-Z0-9-]/g, "-")}`;
-    section.className = "mb-3 group/section data-[flash]:ring-1 data-[flash]:ring-primary-500/30 data-[flash]:rounded-lg";
-
-    // Header with remove button
-    const headerDiv = document.createElement("div");
-    headerDiv.className = "flex items-center justify-between mb-2";
-    headerDiv.innerHTML = `<h3 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">${this.#escapeHtml(this.#capitalize(name))}</h3>`;
-
-    const removeBtn = document.createElement("button");
-    removeBtn.type = "button";
-    removeBtn.className =
-      "text-zinc-700 hover:text-red-400 transition-colors opacity-0 group-hover/section:opacity-100";
-    removeBtn.title = "Remove accessory";
-    removeBtn.dataset.action = "hub-settings#removeAccessory";
-    removeBtn.dataset.accessoryName = name;
-    removeBtn.innerHTML = `<svg class="size-3.5" viewBox="0 0 20 20" fill="currentColor">
-      <path fill-rule="evenodd" d="M8.75 1A2.75 2.75 0 006 3.75v.443c-.795.077-1.584.176-2.365.298a.75.75 0 10.23 1.482l.149-.022.841 10.518A2.75 2.75 0 007.596 19h4.807a2.75 2.75 0 002.742-2.53l.841-10.52.149.023a.75.75 0 00.23-1.482A41.03 41.03 0 0014 4.193V3.75A2.75 2.75 0 0011.25 1h-2.5zM10 4c.84 0 1.673.025 2.5.075V3.75c0-.69-.56-1.25-1.25-1.25h-2.5c-.69 0-1.25.56-1.25 1.25v.325C8.327 4.025 9.16 4 10 4zM8.58 7.72a.75.75 0 00-1.5.06l.3 7.5a.75.75 0 101.5-.06l-.3-7.5zm4.34.06a.75.75 0 10-1.5-.06l-.3 7.5a.75.75 0 101.5.06l.3-7.5z" clip-rule="evenodd"/>
-    </svg>`;
-    headerDiv.appendChild(removeBtn);
-
-    section.appendChild(headerDiv);
-
-    const list = document.createElement("div");
-    list.className = "space-y-1";
-
-    const accPath = `${prefix}accessories/${name}`;
-    const acc = this.tree.accessories[name];
-    const initStatus = acc.initialization ? "exists" : "missing";
-    list.appendChild(this.#renderFileEntry(`${accPath}/initialization`, "initialization", initStatus));
-
-    // Port forward toggle
-    list.appendChild(this.#renderPortForwardToggle(`${accPath}/port_forward`, name, acc.port_forward));
-
-    section.appendChild(list);
-    return section;
-  }
-
-  #renderFileEntry(filePath, label, status) {
-    const btn = document.createElement("button");
+  #cloneFileEntry(filePath, label, status) {
+    const frag = this.tplFileEntryTarget.content.cloneNode(true);
+    const btn = frag.querySelector("button");
     btn.id = `file-${filePath.replace(/[^a-zA-Z0-9-]/g, "-")}`;
-    btn.type = "button";
-    btn.className =
-      "w-full text-left px-2.5 py-1.5 rounded border border-zinc-700/50 hover:border-zinc-700 hover:bg-zinc-800/50 transition-colors " +
-      "data-[selected]:bg-zinc-800/50 data-[selected]:border-primary-500/30 " +
-      "data-[flash]:ring-1 data-[flash]:ring-primary-500/50";
-    btn.dataset.action = "hub-settings#selectFile";
     btn.dataset.filePath = filePath;
-
-    const styles = {
-      exists: "bg-emerald-500/10 text-emerald-400",
-      missing: "bg-zinc-700/50 text-zinc-500",
-    };
-
-    btn.innerHTML = `
-      <div class="flex items-center justify-between">
-        <span class="text-xs font-mono text-zinc-300 truncate">${this.#escapeHtml(label)}</span>
-        <span class="shrink-0 ml-2 text-[10px] px-1.5 py-0.5 rounded ${styles[status] || styles.missing}">${status}</span>
-      </div>
-    `;
-
-    return btn;
+    frag.querySelector('[data-slot="label"]').textContent = label;
+    const badge = frag.querySelector('[data-slot="status"]');
+    badge.textContent = status;
+    badge.dataset.status = status;
+    return frag;
   }
 
-  #renderPortForwardToggle(filePath, name, enabled) {
-    const div = document.createElement("div");
-    div.id = `pf-toggle-${filePath.replace(/[^a-zA-Z0-9-]/g, "-")}`;
-    div.className = "flex items-center justify-between px-2.5 py-1";
+  #cloneFileList() {
+    const frag = this.tplFileListTarget.content.cloneNode(true);
+    return frag.querySelector("div");
+  }
+
+  #cloneAddButton(label, action, id) {
+    const frag = this.tplAddButtonTarget.content.cloneNode(true);
+    const btn = frag.querySelector("button");
+    btn.id = id;
+    btn.textContent = label;
+    btn.dataset.action = action;
+    return frag;
+  }
+
+  #buildNamedSection(name, type, prefix) {
+    const frag = this.tplNamedSectionTarget.content.cloneNode(true);
+    const section = frag.querySelector("div");
+    section.id = `section-${type}-${name.replace(/[^a-zA-Z0-9-]/g, "-")}`;
+
+    frag.querySelector('[data-slot="name"]').textContent = this.#capitalize(name);
+
+    const removeBtn = frag.querySelector('[data-slot="removeBtn"]');
+    removeBtn.dataset.action = type === "agents" ? "hub-settings#removeAgent" : "hub-settings#removeAccessory";
+    if (type === "agents") {
+      removeBtn.dataset.agentName = name;
+      removeBtn.title = "Remove agent";
+    } else {
+      removeBtn.dataset.accessoryName = name;
+      removeBtn.title = "Remove accessory";
+    }
+
+    const files = frag.querySelector('[data-slot="files"]');
+    const itemPath = `${prefix}${type}/${name}`;
+    const item = this.tree[type][name];
+    const initStatus = item.initialization ? "exists" : "missing";
+    files.appendChild(this.#cloneFileEntry(`${itemPath}/initialization`, "initialization", initStatus));
+
+    if (type === "accessories") {
+      files.appendChild(this.#clonePortForward(`${itemPath}/port_forward`, name, item.port_forward));
+    }
+
+    return frag;
+  }
+
+  #clonePortForward(filePath, name, enabled) {
+    const frag = this.tplPortForwardTarget.content.cloneNode(true);
+    const wrapper = frag.querySelector("div");
+    wrapper.id = `pf-toggle-${filePath.replace(/[^a-zA-Z0-9-]/g, "-")}`;
 
     const id = `pf-${filePath.replace(/[/.]/g, "-")}`;
-    div.innerHTML = `
-      <div class="flex items-center gap-2">
-        <label for="${id}" class="text-xs text-zinc-500 cursor-pointer">port_forward</label>
-        <span class="text-[10px] text-emerald-400/70 ${enabled ? "" : "hidden"}" data-pf-hint="${id}">$PORT available</span>
-      </div>
-      <div class="group relative inline-flex w-9 shrink-0 rounded-full p-0.5
-                  bg-white/5 inset-ring inset-ring-white/10
-                  has-checked:bg-primary-500
-                  transition-colors duration-200 ease-in-out
-                  outline-offset-2 outline-primary-500 has-focus-visible:outline-2">
-        <span class="size-4 rounded-full bg-white shadow-xs ring-1 ring-gray-900/5
-                     transition-transform duration-200 ease-in-out
-                     group-has-checked:translate-x-4"></span>
-        <input type="checkbox" id="${id}"
-               ${enabled ? "checked" : ""}
-               data-action="hub-settings#togglePortForward"
-               data-file-path="${this.#escapeAttr(filePath)}"
-               class="absolute inset-0 appearance-none cursor-pointer focus:outline-hidden">
-      </div>
-    `;
+    const label = frag.querySelector('[data-slot="label"]');
+    label.setAttribute("for", id);
 
-    return div;
+    const hint = frag.querySelector('[data-slot="hint"]');
+    if (enabled) hint.dataset.enabled = "";
+
+    const checkbox = frag.querySelector('[data-slot="checkbox"]');
+    checkbox.id = id;
+    checkbox.dataset.filePath = filePath;
+    if (enabled) checkbox.checked = true;
+
+    return frag;
   }
 
   // ========== Editor State ==========
@@ -975,12 +876,6 @@ export default class extends Controller {
   #defaultContent(filePath) {
     const meta = this.configMetadataValue || {};
 
-    if (filePath.endsWith("/workspace_include")) {
-      return meta.shared_files?.workspace_include?.default || "";
-    }
-    if (filePath.endsWith("/workspace_teardown")) {
-      return meta.shared_files?.workspace_teardown?.default || "";
-    }
     if (filePath.endsWith("/initialization")) {
       return meta.session_files?.initialization?.default || "#!/bin/bash\n";
     }
@@ -1020,13 +915,4 @@ export default class extends Controller {
     this.hub.restartHub();
   }
 
-  #escapeHtml(text) {
-    const div = document.createElement("div");
-    div.textContent = text;
-    return div.innerHTML;
-  }
-
-  #escapeAttr(text) {
-    return text.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-  }
 }

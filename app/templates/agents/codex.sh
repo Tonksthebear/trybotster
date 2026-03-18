@@ -1,7 +1,7 @@
 #!/bin/bash
 # @template Codex
 # @description Minimal agent session that launches OpenAI Codex in a worktree
-# @category sessions
+# @category agents
 # @dest agents/codex/initialization
 # @scope device
 # @version 1.0.0
