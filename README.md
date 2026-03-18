@@ -10,7 +10,7 @@ Run autonomous AI agents on your machine. Monitor them from any device through P
 - **Multi-Agent Management** — Run 20+ agents simultaneously, each in isolated git worktrees. Manage from the TUI or your browser.
 - **Plugin System** — Extensible Lua plugin architecture with a template catalog for one-click install from the browser.
 - **Local-First Execution** — Agents run on your hardware. Keys live in your OS keychain. No cloud execution, no vendor lock-in.
-- **Profiles & Sessions** — Configure multiple named profiles per repo or device. Each agent can run multiple sessions (e.g., agent + dev server) with optional port forwarding over encrypted WebRTC.
+- **Agents & Accessories** — Define AI agents and plain PTY accessories at device or repo level. Workspace manifests auto-spawn groups of sessions with optional port forwarding over encrypted WebRTC.
 
 ## Privacy Model
 
@@ -162,65 +162,42 @@ Each repository that uses Botster needs a `.botster/` configuration directory. Y
 
 ```
 .botster/
-  shared/                          # merged into EVERY profile
-    workspace_include              # glob patterns for files to copy into worktrees
-    workspace_teardown             # script run before worktree deletion
-    sessions/
-      agent/                       # REQUIRED — the primary agent session
-        initialization             # startup script
-    plugins/
-      {name}/init.lua              # Lua plugins
-  profiles/
-    {profile-name}/                # named profile (e.g., "web", "api")
-      sessions/
-        {session-name}/
-          initialization           # startup script for this session
-          port_forward             # sentinel file — session gets $PORT
-      plugins/
-        {name}/init.lua
+  agents/
+    claude/                        # Agent definition (AI-driven PTY)
+      initialization               # startup script (required: at least one agent)
+  accessories/
+    rails-server/                  # Accessory definition (plain PTY, no AI)
+      initialization               # startup script
+      port_forward                 # sentinel file — session gets $PORT
+  workspaces/
+    dev.json                       # Workspace manifest (auto-spawn group)
+  plugins/
+    {name}/init.lua                # Lua plugins
 ```
 
 ### Config resolution
 
-Configuration is resolved across 4 layers (most specific wins):
+Configuration is resolved across 2 layers (repo wins on collision):
 
-1. **Device shared** (`~/.botster/shared/`) — Global defaults for all repos
-2. **Device profile** (`~/.botster/profiles/{profile}/`) — Global profile overrides
-3. **Repo shared** (`{repo}/.botster/shared/`) — Repo-specific defaults
-4. **Repo profile** (`{repo}/.botster/profiles/{profile}/`) — Repo + profile overrides
+1. **Device** (`~/.botster/`) — Personal defaults for all repos
+2. **Repo** (`{repo}/.botster/`) — Project-specific config (highest priority)
 
-Profile files win on collision. The `agent` session is required (in shared or profile) and always runs first.
+At least one agent config is required. Agents, accessories, and plugins are all merged per-name with repo overriding device.
 
-### Example: `shared/workspace_include`
+### Example: accessory with dev server
 
-```
-# Glob patterns for files to copy into worktrees
-config/credentials/*.key
-.claude/settings.local.json
-mise.toml
-```
-
-### Example: `shared/workspace_teardown`
-
-```bash
-# Remove the worktree from Claude's trusted projects
-botster json-delete ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH"
-```
-
-### Example: profile with dev server
-
-A profile called `web` that adds a dev server session with port forwarding:
+An accessory that runs a dev server with port forwarding:
 
 ```
-.botster/profiles/web/sessions/server/initialization   # contains: bin/dev
-.botster/profiles/web/sessions/server/port_forward      # empty sentinel file
+.botster/accessories/server/initialization   # contains: bin/dev
+.botster/accessories/server/port_forward      # empty sentinel file
 ```
 
 The `port_forward` sentinel file tells Botster to assign a `$PORT` and tunnel it over encrypted WebRTC for browser preview.
 
 ## Plugins
 
-Plugins are Lua scripts that extend Botster's behavior. They live in `.botster/{shared,profiles}/plugins/{name}/init.lua` and are resolved across all 4 config layers like sessions.
+Plugins are Lua scripts that extend Botster's behavior. They live in `.botster/plugins/{name}/init.lua` at either the device or repo level, with repo overriding device.
 
 ### Installing plugins
 

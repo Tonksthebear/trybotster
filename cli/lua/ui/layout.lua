@@ -148,15 +148,9 @@ local function build_list_items()
         end
 
         local item = { text = text }
-        -- Secondary: agent name · branch (when branch differs from display name)
-        local parts = {}
-        if agent.agent_name then parts[#parts+1] = agent.agent_name
-        elseif agent.profile_name then parts[#parts+1] = agent.profile_name end
-        if agent.branch_name and agent.branch_name ~= name then
-          parts[#parts+1] = agent.branch_name
-        end
-        if #parts > 0 then
-          item.secondary = { { text = "  " .. table.concat(parts, " · "), style = "dim" } }
+        -- Secondary: always show branch name
+        if agent.branch_name then
+          item.secondary = { { text = "  " .. agent.branch_name, style = "dim" } }
         end
         items[#items+1] = item
       else
@@ -197,11 +191,6 @@ local function build_agent_items(state)
   -- Existing agents from client-side cache
   for _, agent in ipairs(_tui_state and _tui_state.agents or {}) do
     local name = agent.display_name or agent.branch_name
-    local parts = {}
-    if agent.agent_name then table.insert(parts, agent.agent_name)
-    elseif agent.profile_name then table.insert(parts, agent.profile_name) end
-    if agent.branch_name then table.insert(parts, agent.branch_name) end
-    local secondary = #parts > 0 and table.concat(parts, " · ") or nil
     local item
     if agent.notification then
       item = { text = {
@@ -211,8 +200,8 @@ local function build_agent_items(state)
     else
       item = { text = name }
     end
-    if secondary then
-      item.secondary = { { text = secondary, style = "dim" } }
+    if agent.branch_name then
+      item.secondary = { { text = agent.branch_name, style = "dim" } }
     end
     table.insert(items, item)
   end
@@ -355,22 +344,64 @@ function render_overlay(state)
         },
       },
     }
-  elseif _tui_state.mode == "new_agent_select_profile" then
-    local profile_items = {}
-    for _, p in ipairs(_tui_state.available_profiles or {}) do
-      table.insert(profile_items, { text = p })
+  elseif _tui_state.mode == "new_agent_select_agent" then
+    local agent_items = {}
+    for _, a in ipairs(_tui_state.available_agents or {}) do
+      table.insert(agent_items, { text = a })
     end
-    if #profile_items == 0 then
-      profile_items = { { text = "Loading profiles...", style = "dim" } }
+    if #agent_items == 0 then
+      agent_items = { { text = "Loading agent configs...", style = "dim" } }
     end
     return {
       type = "centered", width = 50, height = 30,
       child = {
         type = "list",
-        id = "profile_list",
-        block = { title = " Select Profile [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
+        id = "agent_config_list",
+        block = { title = " Select Agent [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
         props = {
-          items = profile_items,
+          items = agent_items,
+        },
+      },
+    }
+  elseif _tui_state.mode == "new_agent_select_workspace" then
+    local ws_items = {
+      { text = "[Create New Workspace]" },
+    }
+    for _, ws in ipairs(_tui_state.available_workspaces or {}) do
+      local count_label = string.format(" (%d session%s)",
+        ws.agent_count, ws.agent_count == 1 and "" or "s")
+      ws_items[#ws_items + 1] = {
+        text = {
+          { text = ws.name or ws.id },
+          { text = count_label, style = "dim" },
+        },
+      }
+    end
+    return {
+      type = "centered", width = 55, height = 30,
+      child = {
+        type = "list",
+        id = "workspace_list",
+        block = { title = " Select Workspace [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
+        props = {
+          items = ws_items,
+        },
+      },
+    }
+  elseif _tui_state.mode == "new_workspace_name_input" then
+    return {
+      type = "centered", width = 55, height = 20,
+      child = {
+        type = "input",
+        id = "workspace_name_input",
+        block = { title = " New Workspace [Enter confirm | Esc cancel] ", borders = "all" },
+        props = {
+          lines = {
+            "Enter a name for the new workspace:",
+            "",
+            "Leave empty for auto-generated name.",
+          },
+          placeholder = "e.g. auth-feature, bug-fixes",
         },
       },
     }

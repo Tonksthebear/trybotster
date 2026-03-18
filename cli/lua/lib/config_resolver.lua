@@ -19,8 +19,6 @@
 --     plugins/
 --       github/
 --         init.lua
---     workspace_include            # glob patterns for file copying
---     workspace_teardown           # cleanup script
 --
 -- Resolution rules:
 -- - 2-layer merge: device (~/.botster/) then repo (.botster/), repo wins
@@ -217,7 +215,7 @@ end
 --   device_root: path to ~/.botster (nil to skip device layer)
 --   repo_root: path to repo root (nil to skip repo layer)
 --   require_agent: require at least one agent in merged result (default true)
--- @return table { agents{}, accessories{}, workspaces{}, plugins[], workspace_include, workspace_teardown } or nil, error
+-- @return table { agents{}, accessories{}, workspaces{}, plugins[] } or nil, error
 function M.resolve_all(opts)
     local device_root = opts.device_root
     local repo_root = opts.repo_root
@@ -227,8 +225,6 @@ function M.resolve_all(opts)
         accessories = {},
         workspaces = {},
         plugins = {},
-        workspace_include = nil,
-        workspace_teardown = nil,
     }
 
     -- Layer 1: device (~/.botster/)
@@ -246,14 +242,6 @@ function M.resolve_all(opts)
         for name, plugin in pairs(read_plugins(dr, "device")) do
             acc.plugins[name] = plugin
         end
-        local wi_path = dr .. "/workspace_include"
-        if fs.exists(wi_path) then
-            acc.workspace_include = { path = wi_path, source = "device" }
-        end
-        local wt_path = dr .. "/workspace_teardown"
-        if fs.exists(wt_path) then
-            acc.workspace_teardown = { path = wt_path, source = "device" }
-        end
     end
 
     -- Layer 2: repo ({repo}/.botster/) — wins on collision
@@ -270,14 +258,6 @@ function M.resolve_all(opts)
         end
         for name, plugin in pairs(read_plugins(rr, "repo")) do
             acc.plugins[name] = plugin
-        end
-        local wi_path = rr .. "/workspace_include"
-        if fs.exists(wi_path) then
-            acc.workspace_include = { path = wi_path, source = "repo" }
-        end
-        local wt_path = rr .. "/workspace_teardown"
-        if fs.exists(wt_path) then
-            acc.workspace_teardown = { path = wt_path, source = "repo" }
         end
     end
 
@@ -311,8 +291,6 @@ function M.resolve_all(opts)
         accessories = acc.accessories,
         workspaces = acc.workspaces,
         plugins = plugins_array,
-        workspace_include = acc.workspace_include,
-        workspace_teardown = acc.workspace_teardown,
     }
 end
 
@@ -559,27 +537,6 @@ function M.migrate(device_root, repo_root)
             end
         end
 
-        -- Migrate shared/workspace_include → workspace_include
-        local shared_wi = root .. "/shared/workspace_include"
-        local top_wi = root .. "/workspace_include"
-        if fs.exists(shared_wi) and not fs.exists(top_wi) then
-            local content = fs.read(shared_wi)
-            if content then
-                fs.write(top_wi, content)
-                log.info(string.format("ConfigResolver: migrated %s → %s", shared_wi, top_wi))
-            end
-        end
-
-        -- Migrate shared/workspace_teardown → workspace_teardown
-        local shared_wt = root .. "/shared/workspace_teardown"
-        local top_wt = root .. "/workspace_teardown"
-        if fs.exists(shared_wt) and not fs.exists(top_wt) then
-            local content = fs.read(shared_wt)
-            if content then
-                fs.write(top_wt, content)
-                log.info(string.format("ConfigResolver: migrated %s → %s", shared_wt, top_wt))
-            end
-        end
     end
 
     migrate_root(device_root)
@@ -588,27 +545,6 @@ function M.migrate(device_root, repo_root)
     end
 
     return true
-end
-
--- =============================================================================
--- Backward Compatibility Shims (deprecated, will be removed)
--- =============================================================================
-
---- DEPRECATED: Check if an agent exists without needing a profile.
--- Now checks if any agent exists in the new structure.
--- @param device_root string|nil Path to ~/.botster
--- @param repo_root string|nil Path to repo root
--- @return boolean
-function M.has_agent_without_profile(device_root, repo_root)
-    return #M.list_agents(device_root, repo_root) > 0
-end
-
---- DEPRECATED: List all profiles. Now returns agent names.
--- @param device_root string|nil Path to ~/.botster
--- @param repo_root string|nil Path to repo root
--- @return string[] Agent names (as profile stand-ins)
-function M.list_profiles_all(device_root, repo_root)
-    return M.list_agents(device_root, repo_root)
 end
 
 -- =============================================================================

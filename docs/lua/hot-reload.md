@@ -68,11 +68,9 @@ Core modules (`lib/`, `handlers/`) are watched by the Rust `LuaFileWatcher` (FSE
 
 **Why PollWatcher?** macOS FSEvents misses in-place file writes (the kind agent tools like Claude Code's Edit produce). PollWatcher checks mtimes every 2 seconds, reliably detecting all changes.
 
-The plugin watcher watches the same 4 layers that `ConfigResolver` scans:
-1. `~/.botster/shared/plugins/`
-2. `~/.botster/profiles/{profile}/plugins/`
-3. `{repo}/.botster/shared/plugins/`
-4. `{repo}/.botster/profiles/{profile}/plugins/`
+The plugin watcher watches the same 2 layers that `ConfigResolver` scans:
+1. `~/.botster/plugins/`
+2. `{repo}/.botster/plugins/`
 
 On file change:
 1. Debounce (0.2s) to avoid rapid-fire reloads from editors
@@ -90,7 +88,7 @@ MCP tools re-register automatically on reload, and the hub sends a `tools_list_c
 3. Handler modules: all `handlers/*`
 4. `events.on("shutdown", ...)` handler
 5. `safe_require("user.init")` — user entry point
-6. Plugin discovery via `ConfigResolver.resolve_all()` across 4 layers
+6. Plugin discovery via `ConfigResolver.resolve_all()` across 2 layers
 7. Each plugin loaded via `loader.load_plugin(init_path, name)`
 8. Agent improvements from `~/.botster/lua/improvements/*.lua` (sandboxed)
 
@@ -138,4 +136,4 @@ Template Lua files live in `app/templates/` and are installed via the `template:
 |----------|-------------|
 | `initialization/basic.lua` | `user/init.lua` — user's personal init |
 | `sessions/example.lua` | `sessions/example/init.lua` — starter session config |
-| `plugins/github.lua` | `shared/plugins/github/init.lua` — GitHub integration |
+| `plugins/github.lua` | `plugins/github/init.lua` — GitHub integration |

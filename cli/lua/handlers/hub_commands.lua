@@ -26,6 +26,12 @@ if config.env("BOTSTER_ENV") == "test" then
     return {}
 end
 
+-- Skip network connections in offline mode (--offline flag)
+if hub.is_offline() then
+    log.info("Offline mode: skipping ActionCable connection")
+    return {}
+end
+
 -- Reuse existing connection or create a new one
 if not handles.conn then
     handles.conn = action_cable.connect({ crypto = true })

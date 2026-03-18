@@ -9,7 +9,7 @@ class DocsController < ApplicationController
     { title: "Configuration", slug: "configuration", pages: [
       { title: "Config File", slug: "config-file" },
       { title: "Environment Variables", slug: "environment-variables" },
-      { title: "Profiles", slug: "profiles" }
+      { title: "Agents & Accessories", slug: "profiles" }
     ] },
     { title: "Project Setup", slug: "project-setup", pages: [
       { title: "Directory Structure", slug: "directory-structure" },

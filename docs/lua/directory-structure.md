@@ -13,7 +13,7 @@ cli/lua/
     agent.lua        # Agent class
     client.lua       # Generic client/subscription interface
     commands.lua     # Command registry
-    config_resolver.lua  # 4-layer .botster/ config resolution
+    config_resolver.lua  # 2-layer .botster/ config resolution
     mcp.lua          # MCP tool registry (plugins register tools here)
     pty_clients.lua  # PTY focus tracking
   handlers/
@@ -57,33 +57,30 @@ In **release builds**, all files are embedded via `build.rs` into `EMBEDDED_LUA_
 
 Override search chain for `require()`: `{repo}/.botster/lua/` -> `~/.botster/lua/` -> embedded binary (fallback). The `package.path` includes `?.lua`, `?/init.lua`, `lib/?.lua`, `handlers/?.lua`, `hub/?.lua`, `plugins/?.lua`, `plugins/?/init.lua`.
 
-## `.botster/` Config Directory (4-Layer Resolution)
+## `.botster/` Config Directory (2-Layer Resolution)
 
-ConfigResolver merges configs across 4 layers (most-specific wins on name collision):
+ConfigResolver merges configs across 2 layers (repo wins on name collision):
 
 ```
-~/.botster/                              # device_root
-  shared/                                # Layer 1: device shared
-    sessions/
-      agent/
-        initialization                   # REQUIRED: startup script for main agent PTY
-      server/                            # Optional: additional named sessions
-        initialization
-        port_forward                     # Sentinel file: session gets $PORT env var
-    plugins/{name}/init.lua              # Device-level plugins
-    workspace_include                    # Glob patterns for file copying to worktrees
-    workspace_teardown                   # Cleanup script
-  profiles/{profile-name}/              # Layer 2: device profile
-    sessions/ plugins/ workspace_include/ workspace_teardown  (same structure)
+~/.botster/                              # device_root (Layer 1)
+  agents/
+    claude/
+      initialization                     # REQUIRED: at least one agent config
+  accessories/
+    rails-server/                        # Optional: plain PTY sessions
+      initialization
+      port_forward                       # Sentinel file: session gets $PORT env var
+  workspaces/
+    dev.json                             # Workspace manifest (auto-spawn group)
+  plugins/{name}/init.lua                # Device-level plugins
 
-{repo}/.botster/                         # repo_root
-  shared/                                # Layer 3: repo shared
-    sessions/ plugins/ workspace_include/ workspace_teardown
-  profiles/{profile-name}/              # Layer 4: repo profile (highest priority)
-    sessions/ plugins/ workspace_include/ workspace_teardown
+{repo}/.botster/                         # repo_root (Layer 2, highest priority)
+  agents/ accessories/ workspaces/ plugins/
 ```
 
-Sessions, plugins, `workspace_include`, and `workspace_teardown` are all merged per-name with higher layers winning.
+Agents, accessories, and plugins are all merged per-name with repo overriding device.
+
+Worktree file copying and cleanup are handled via the **Workspace Include** plugin template (hooks into `worktree_created` and `worktree_deleted`).
 
 ## Runtime Config Paths
 
