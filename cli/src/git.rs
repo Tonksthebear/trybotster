@@ -25,34 +25,6 @@ impl WorktreeManager {
         Self { base_dir }
     }
 
-    /// Read workspace teardown commands from `.botster/shared/workspace_teardown`.
-    ///
-    /// Returns non-empty, non-comment lines from the teardown file.
-    /// Returns an empty vector if the file does not exist.
-    pub fn read_teardown_commands(repo_path: &Path) -> Result<Vec<String>> {
-        let teardown_path = repo_path.join(".botster/shared/workspace_teardown");
-
-        if !teardown_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let content = fs::read_to_string(&teardown_path)
-            .context("Failed to read .botster/shared/workspace_teardown")?;
-
-        let commands: Vec<String> = content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(std::string::ToString::to_string)
-            .collect();
-
-        log::info!(
-            "Read {} teardown command(s) from workspace_teardown",
-            commands.len()
-        );
-        Ok(commands)
-    }
-
     /// Copy files from `source_repo` to `dest` matching glob patterns in `patterns_file`.
     ///
     /// Reads one glob pattern per line from `patterns_file` (ignoring blanks and
@@ -220,9 +192,6 @@ impl WorktreeManager {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("Failed to create worktree: {}", stderr);
         }
-
-        // File copying is now Lua-driven via worktree.copy_from_patterns()
-        // using the resolved workspace_include from .botster/ config.
 
         Ok(worktree_path)
     }
@@ -533,40 +502,6 @@ impl WorktreeManager {
 
         log::info!("Deleting worktree at {}", worktree_path.display());
 
-        // Read and run teardown commands
-        let teardown_commands = Self::read_teardown_commands(&repo_path)?;
-
-        if !teardown_commands.is_empty() {
-            log::info!("Running {} teardown command(s)", teardown_commands.len());
-
-            for cmd in teardown_commands {
-                log::info!("Running teardown: {}", cmd);
-
-                // Run the command in a shell with environment variables.
-                // Task context (repo, issue, branch) lives in .botster/context.json
-                let output = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&cmd)
-                    .env(
-                        "BOTSTER_WORKTREE_PATH",
-                        worktree_path.to_str().expect("path is valid UTF-8"),
-                    )
-                    .output()?;
-
-                if output.status.success() {
-                    log::debug!(
-                        "Teardown output: {}",
-                        String::from_utf8_lossy(&output.stdout)
-                    );
-                } else {
-                    log::warn!(
-                        "Teardown command failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-            }
-        }
-
         // Remove the worktree using git
         log::info!("DEBUG: About to run git worktree remove");
         log::info!(
@@ -623,7 +558,7 @@ impl WorktreeManager {
         Ok(())
     }
 
-    /// Deletes a worktree by issue number, running teardown scripts first
+    /// Deletes a worktree by issue number.
     pub fn delete_worktree_by_issue_number(&self, issue_number: u32) -> Result<()> {
         // Detect the current repo
         let (repo_path, repo_name) = Self::detect_current_repo()?;
@@ -644,40 +579,6 @@ impl WorktreeManager {
         }
 
         log::info!("Deleting worktree for issue #{}", issue_number);
-
-        // Read and run teardown commands
-        let teardown_commands = Self::read_teardown_commands(&repo_path)?;
-
-        if !teardown_commands.is_empty() {
-            log::info!("Running {} teardown command(s)", teardown_commands.len());
-
-            for cmd in teardown_commands {
-                log::info!("Running teardown: {}", cmd);
-
-                // Run the command in a shell with environment variables.
-                // Task context (repo, issue, branch) lives in .botster/context.json
-                let output = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&cmd)
-                    .env(
-                        "BOTSTER_WORKTREE_PATH",
-                        worktree_path.to_str().expect("path is valid UTF-8"),
-                    )
-                    .output()?;
-
-                if output.status.success() {
-                    log::debug!(
-                        "Teardown output: {}",
-                        String::from_utf8_lossy(&output.stdout)
-                    );
-                } else {
-                    log::warn!(
-                        "Teardown command failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-            }
-        }
 
         // Remove the worktree using git
         log::info!("Removing worktree at {}", worktree_path.display());

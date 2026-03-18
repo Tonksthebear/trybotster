@@ -1825,7 +1825,7 @@ mod tests {
         let mut lua = LayoutLua::new(layout_source).expect("test layout should load");
         // Bootstrap _tui_state (actions.lua and events.lua read from it)
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
         lua.preload_module(
@@ -2279,16 +2279,16 @@ mod tests {
 
         assert_eq!(
             runner.mode(),
-            "new_agent_select_profile",
-            "Should enter profile selection"
+            "new_agent_select_agent",
+            "Should enter agent config selection"
         );
 
-        // Simulate single-profile response (auto-skips to worktree selection)
+        // Simulate single agent config response (auto-skips to workspace selection)
         {
-            let profiles_event = serde_json::json!({ "profiles": ["claude"] });
+            let agent_config_event = serde_json::json!({ "agents": ["claude"] });
             let ctx = crate::tui::layout_lua::ActionContext::default();
             let ops = lua
-                .call_on_hub_event("profiles", &profiles_event, &ctx)
+                .call_on_hub_event("agent_config", &agent_config_event, &ctx)
                 .unwrap()
                 .unwrap();
             runner.execute_lua_ops(ops);
@@ -2296,11 +2296,35 @@ mod tests {
 
         assert_eq!(
             runner.mode(),
-            "new_agent_select_worktree",
-            "Should auto-advance to worktree selection"
+            "new_agent_select_workspace",
+            "Should auto-advance to workspace selection"
         );
 
-        // 2. Select "Create new worktree" (index 1, after "Use Main Branch")
+        // 2a. Select "Create New Workspace" (index 0) → name input
+        runner.focused_list_id = Some("workspace_list".to_string());
+        runner
+            .widget_states
+            .list_state("workspace_list")
+            .set_selectable_count(1);
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
+
+        assert_eq!(
+            runner.mode(),
+            "new_workspace_name_input",
+            "Should enter workspace name input"
+        );
+
+        // 2a-ii. Submit empty workspace name → worktree selection
+        stub_input_focus(&mut runner, "workspace_name_input");
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
+
+        assert_eq!(
+            runner.mode(),
+            "new_agent_select_worktree",
+            "Should advance to worktree selection after workspace name"
+        );
+
+        // 2b. Select "Create new worktree" (index 1, after "Use Main Branch")
         // Set up worktree list focus (2 items: "Use Main Branch", "Create new worktree")
         runner.focused_list_id = Some("worktree_list".to_string());
         runner
@@ -2403,18 +2427,32 @@ mod tests {
         process_key_with_lua(&mut runner, make_key_enter(), &lua);
 
         thread::sleep(Duration::from_millis(10));
-        assert_eq!(runner.mode(), "new_agent_select_profile");
+        assert_eq!(runner.mode(), "new_agent_select_agent");
 
-        // Simulate single-profile response (auto-skips to worktree selection)
+        // Simulate single agent config response (auto-skips to workspace selection)
         {
-            let profiles_event = serde_json::json!({ "profiles": ["claude"] });
+            let agent_config_event = serde_json::json!({ "agents": ["claude"] });
             let ctx = crate::tui::layout_lua::ActionContext::default();
             let ops = lua
-                .call_on_hub_event("profiles", &profiles_event, &ctx)
+                .call_on_hub_event("agent_config", &agent_config_event, &ctx)
                 .unwrap()
                 .unwrap();
             runner.execute_lua_ops(ops);
         }
+        assert_eq!(runner.mode(), "new_agent_select_workspace");
+
+        // Select "Create New Workspace" (index 0) → name input
+        runner.focused_list_id = Some("workspace_list".to_string());
+        runner
+            .widget_states
+            .list_state("workspace_list")
+            .set_selectable_count(1);
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
+        assert_eq!(runner.mode(), "new_workspace_name_input");
+
+        // Submit empty workspace name → worktree selection
+        stub_input_focus(&mut runner, "workspace_name_input");
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
         assert_eq!(runner.mode(), "new_agent_select_worktree");
 
         // Navigate to first existing worktree (index 2, after "Use Main Branch" and "Create New Worktree")
@@ -3645,7 +3683,7 @@ mod tests {
 
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
         lua.preload_module(
@@ -3740,28 +3778,56 @@ mod tests {
 
         assert_eq!(
             runner.mode(),
-            "new_agent_select_profile",
-            "Selecting New Agent should enter profile selection"
+            "new_agent_select_agent",
+            "Selecting New Agent should enter agent config selection"
         );
 
-        // Simulate single-profile response (auto-skips to worktree selection)
+        // Simulate single agent config response (auto-skips to workspace selection)
         {
-            let profiles_event = serde_json::json!({ "profiles": ["claude"] });
+            let agent_config_event = serde_json::json!({ "agents": ["claude"] });
             let ctx = crate::tui::layout_lua::ActionContext::default();
             let ops = lua
-                .call_on_hub_event("profiles", &profiles_event, &ctx)
+                .call_on_hub_event("agent_config", &agent_config_event, &ctx)
                 .unwrap()
                 .unwrap();
             runner.execute_lua_ops(ops);
         }
         runner
             .render(Some(&lua), None)
-            .expect("render after profile skip");
+            .expect("render after agent config auto-select");
+
+        assert_eq!(
+            runner.mode(),
+            "new_agent_select_workspace",
+            "Should auto-advance to workspace selection"
+        );
+        assert!(
+            runner.focused_list_id.is_some(),
+            "workspace list should be focused after render, got focused_list_id={:?}",
+            runner.focused_list_id
+        );
+
+        // === Step 3a: Select "Create New Workspace" (index 0) → name input ===
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
+
+        assert_eq!(
+            runner.mode(),
+            "new_workspace_name_input",
+            "Should enter workspace name input"
+        );
+        assert!(
+            runner.focused_input_id.is_some(),
+            "workspace name input should be focused after render, got focused_input_id={:?}",
+            runner.focused_input_id
+        );
+
+        // === Step 3a-ii: Submit empty name → worktree selection ===
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
 
         assert_eq!(
             runner.mode(),
             "new_agent_select_worktree",
-            "Should auto-advance to worktree selection"
+            "Should advance to worktree selection after workspace name"
         );
         assert!(
             runner.focused_list_id.is_some(),
@@ -3769,7 +3835,7 @@ mod tests {
             runner.focused_list_id
         );
 
-        // === Step 3: Select "Use Main Branch" (index 0 — first item) ===
+        // === Step 3b: Select "Use Main Branch" (index 0 — first item) ===
         press_key_and_render(&mut runner, make_key_enter(), &lua);
 
         assert_eq!(
@@ -3869,24 +3935,32 @@ mod tests {
         }
         press_key_and_render(&mut runner, make_key_enter(), &lua);
         thread::sleep(Duration::from_millis(10));
-        assert_eq!(runner.mode(), "new_agent_select_profile");
+        assert_eq!(runner.mode(), "new_agent_select_agent");
 
-        // Simulate single-profile response (auto-skips to worktree selection)
+        // Simulate single agent config response (auto-skips to workspace selection)
         {
-            let profiles_event = serde_json::json!({ "profiles": ["claude"] });
+            let agent_config_event = serde_json::json!({ "agents": ["claude"] });
             let ctx = crate::tui::layout_lua::ActionContext::default();
             let ops = lua
-                .call_on_hub_event("profiles", &profiles_event, &ctx)
+                .call_on_hub_event("agent_config", &agent_config_event, &ctx)
                 .unwrap()
                 .unwrap();
             runner.execute_lua_ops(ops);
         }
         runner
             .render(Some(&lua), None)
-            .expect("render after profile skip");
+            .expect("render after agent config auto-select");
+        assert_eq!(runner.mode(), "new_agent_select_workspace");
+
+        // Step 3a: Select "Create New Workspace" (index 0) → name input
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
+        assert_eq!(runner.mode(), "new_workspace_name_input");
+
+        // Step 3a-ii: Submit empty name → worktree selection
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
         assert_eq!(runner.mode(), "new_agent_select_worktree");
 
-        // Step 3: Navigate to "Create New Worktree" (index 1) and select
+        // Step 3b: Navigate to "Create New Worktree" (index 1) and select
         press_key_and_render(&mut runner, make_key_down(), &lua);
         press_key_and_render(&mut runner, make_key_enter(), &lua);
 
@@ -3973,7 +4047,7 @@ mod tests {
             "Escape from menu should return to normal"
         );
 
-        // Open menu → New Agent → escape from profile selection
+        // Open menu → New Agent → escape from agent config selection
         press_key_and_render(&mut runner, make_key_ctrl('p'), &lua);
         let new_agent_idx = runner
             .overlay_list_actions
@@ -3985,12 +4059,12 @@ mod tests {
         }
         press_key_and_render(&mut runner, make_key_enter(), &lua);
         thread::sleep(Duration::from_millis(10));
-        assert_eq!(runner.mode(), "new_agent_select_profile");
+        assert_eq!(runner.mode(), "new_agent_select_agent");
         press_key_and_render(&mut runner, make_key_escape(), &lua);
         assert_eq!(
             runner.mode(),
             "normal",
-            "Escape from profile selection should return to normal"
+            "Escape from agent config selection should return to normal"
         );
 
         shutdown.store(true, Ordering::Relaxed);

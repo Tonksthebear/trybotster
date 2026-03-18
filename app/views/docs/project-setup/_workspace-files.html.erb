@@ -1,25 +1,42 @@
 <h1 class="text-2xl font-bold text-zinc-100 mb-6">Workspace Files</h1>
 
 <p class="text-zinc-400 mb-6">
-  Control which files are copied into agent worktrees and what happens when worktrees are cleaned up.
+  Worktree file management is handled through plugins that hook into lifecycle events.
+  Install the <strong class="text-zinc-200">Worktree Lifecycle</strong> plugin template from
+  Settings &gt; Templates to get started.
 </p>
 
-<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">workspace_include</h2>
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Worktree lifecycle hooks</h2>
 <p class="text-zinc-400 mb-4">
-  A file containing glob patterns (one per line) for files that should be copied from your main repo
-  into each agent's worktree. Useful for files that aren't tracked by git.
+  Plugins can observe two worktree events:
 </p>
-<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code># .botster/shared/workspace_include
-.env
-config/secrets.yml
-node_modules</code></pre>
+<ul class="list-disc list-inside text-zinc-400 space-y-1 mb-6">
+  <li><code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">worktree_created</code> &mdash;
+    fires after a new worktree is set up (copy files, install dependencies)</li>
+  <li><code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">worktree_deleted</code> &mdash;
+    fires when a worktree is removed (cleanup, deregister)</li>
+</ul>
 
-<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">workspace_teardown</h2>
-<p class="text-zinc-400 mb-4">
-  A bash script that runs before a worktree is deleted. Use it for cleanup tasks like stopping
-  services or removing generated files.
-</p>
-<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto"><code># .botster/shared/workspace_teardown
-#!/bin/bash
-docker compose down 2>/dev/null
-rm -rf tmp/pids</code></pre>
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Example: copy files into worktrees</h2>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>-- plugins/worktree-lifecycle/init.lua
+local hooks = require("hub.hooks")
+
+hooks.on("worktree_created", "my-copy", function(ctx)
+    local repo = ctx.repo or worktree.repo_root()
+    local src = repo .. "/.env"
+    if fs.exists(src) then
+        fs.copy(src, ctx.path .. "/.env")
+    end
+end)</code></pre>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Example: manage Claude trust</h2>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>-- Auto-trust worktree on create
+hooks.on("worktree_created", "claude-trust", function(ctx)
+    json.file_set("~/.claude.json",
+        "projects." .. ctx.path .. ".hasTrustDialogAccepted", true)
+end)
+
+-- Clean up trust entry on delete
+hooks.on("worktree_deleted", "claude-cleanup", function(ctx)
+    json.file_delete("~/.claude.json", "projects." .. ctx.path)
+end)</code></pre>

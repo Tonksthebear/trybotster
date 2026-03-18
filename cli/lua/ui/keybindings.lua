@@ -89,8 +89,10 @@ local text_input = {
 }
 
 -- Mode table aliases — mode strings match Lua layout mode names
+M.new_agent_select_workspace = list_nav
 M.new_agent_select_worktree = list_nav
-M.new_agent_select_profile = list_nav
+M.new_agent_select_agent = list_nav
+M.new_workspace_name_input = text_input
 M.new_agent_create_worktree = text_input
 M.new_agent_prompt = text_input
 M.rename_workspace_input = text_input
@@ -141,7 +143,7 @@ function M.handle_key(key, mode, context)
   end
 
   -- Mode-specific fallback logic
-  if mode == "new_agent_create_worktree" or mode == "new_agent_prompt" then
+  if mode == "new_workspace_name_input" or mode == "new_agent_create_worktree" or mode == "new_agent_prompt" then
     if key == "backspace" then
       return { action = "input_backspace" }
     end
@@ -157,7 +159,7 @@ function M.handle_key(key, mode, context)
     return nil
   end
 
-  if mode == "menu" or mode == "new_agent_select_worktree" or mode == "new_agent_select_profile" then
+  if mode == "menu" or mode == "new_agent_select_workspace" or mode == "new_agent_select_worktree" or mode == "new_agent_select_agent" then
     -- Number shortcuts 1-9 for list selection
     if mode == "menu" and #key == 1 and key:match("%d") then
       local idx = tonumber(key) - 1

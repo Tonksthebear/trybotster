@@ -717,21 +717,6 @@ _event_subs[#_event_subs + 1] = events.on("worktree_created", function(info)
     log.info(string.format("Worktree created for %s at %s, resuming agent spawn",
         info.branch, info.path))
 
-    local repo_root = worktree.repo_root()
-
-    local device_root_copy = config.data_dir and config.data_dir() or nil
-    local resolved_for_copy, _ = ConfigResolver.resolve_all({
-        device_root = device_root_copy,
-        repo_root = repo_root,
-    })
-    if resolved_for_copy and resolved_for_copy.workspace_include then
-        local ok_copy, copy_err = pcall(worktree.copy_from_patterns,
-            repo_root, info.path, resolved_for_copy.workspace_include.path)
-        if not ok_copy then
-            log.warn(string.format("Failed to copy workspace files: %s", tostring(copy_err)))
-        end
-    end
-
     hooks.notify("worktree_created", {
         path = info.path,
         branch = info.branch,

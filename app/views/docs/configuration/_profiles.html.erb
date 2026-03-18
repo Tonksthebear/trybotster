@@ -1,31 +1,47 @@
-<h1 class="text-2xl font-bold text-zinc-100 mb-6">Profiles</h1>
+<h1 class="text-2xl font-bold text-zinc-100 mb-6">Agents & Accessories</h1>
 
 <p class="text-zinc-400 mb-6">
-  Profiles let you define different agent configurations for different workflows. A profile groups
-  sessions, plugins, and workspace settings together.
+  Botster uses two types of session definitions: <strong class="text-zinc-200">agents</strong> (AI-driven PTY sessions)
+  and <strong class="text-zinc-200">accessories</strong> (plain PTY sessions like dev servers or log tailers).
 </p>
 
-<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">How profiles work</h2>
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Directory layout</h2>
 <p class="text-zinc-400 mb-4">
-  Profiles live in the <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">profiles/</code>
-  directory at either the device or repo level:
+  Session definitions live in the
+  <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">agents/</code> and
+  <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">accessories/</code>
+  directories at either the device or repo level:
 </p>
-<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>~/.botster/profiles/standard/    # Device-level profile
-your-repo/.botster/profiles/web/ # Repo-level profile</code></pre>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>~/.botster/agents/claude/             # Device-level agent
+~/.botster/accessories/rails-server/  # Device-level accessory
+your-repo/.botster/agents/claude/     # Repo-level agent (overrides device)</code></pre>
 
-<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Profile selection</h2>
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Agent selection</h2>
 <p class="text-zinc-400 mb-4">
-  If only one profile exists, it's selected automatically. With multiple profiles, specify one when creating an agent:
+  If only one agent config exists, it's selected automatically. With multiple agent configs, you choose one when creating an agent:
 </p>
-<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>create_agent(profile: "web")</code></pre>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>create_agent(agent_name: "claude")</code></pre>
 
 <h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Config resolution</h2>
 <p class="text-zinc-400 mb-4">
-  Botster merges configuration from four layers, most specific wins:
+  Botster merges configuration from two layers, repo wins on collision:
 </p>
 <ol class="list-decimal list-inside text-zinc-400 space-y-1">
-  <li>Device shared (<code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">~/.botster/shared/</code>)</li>
-  <li>Device profile (<code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">~/.botster/profiles/{name}/</code>)</li>
-  <li>Repo shared (<code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">{repo}/.botster/shared/</code>)</li>
-  <li>Repo profile (<code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">{repo}/.botster/profiles/{name}/</code>)</li>
+  <li>Device (<code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">~/.botster/</code>)</li>
+  <li>Repo (<code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">{repo}/.botster/</code>) &mdash; highest priority</li>
 </ol>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Workspaces</h2>
+<p class="text-zinc-400 mb-4">
+  Workspace manifests in <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">workspaces/</code>
+  define which agents and accessories auto-spawn together:
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>~/.botster/workspaces/dev.json
+your-repo/.botster/workspaces/full-stack.json</code></pre>
+
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Migration from profiles</h2>
+<p class="text-zinc-400">
+  If you have an existing <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">shared/</code> and
+  <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">profiles/</code> directory structure,
+  Botster auto-migrates to the new layout on first run. No manual changes needed.
+</p>

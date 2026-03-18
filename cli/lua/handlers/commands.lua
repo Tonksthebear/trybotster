@@ -163,10 +163,8 @@ commands.register("rename_workspace", function(client, sub_id, command)
         for _, session in ipairs(Agent.list()) do
             if session._workspace_id == workspace_id then
                 session._workspace_name = new_name
-                session.metadata = session.metadata or {}
-                session.metadata.workspace = new_name
+                session:set_meta("workspace", new_name)
                 session:_sync_workspace_manifest()
-                session:_sync_session_manifest()
             end
         end
 

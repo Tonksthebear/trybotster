@@ -837,7 +837,7 @@ mod tests {
 
         // Bootstrap _tui_state (layout.lua reads from it)
         layout.load_extension(
-            "_tui_state = { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state = { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).unwrap();
 
@@ -894,7 +894,7 @@ mod tests {
 
         // Bootstrap _tui_state (layout.lua reads from it)
         layout.load_extension(
-            "_tui_state = { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state = { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).unwrap();
 
@@ -1147,7 +1147,7 @@ mod tests {
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         // Bootstrap _tui_state (layout.lua and actions.lua read from it)
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
         lua.preload_module(
@@ -1507,7 +1507,7 @@ mod tests {
         lua.load_events(events_source)
             .expect("events.lua should load");
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).expect("bootstrap should succeed");
         lua.load_extension(botster_source, "botster")
@@ -1545,7 +1545,7 @@ mod tests {
         let layout_source = include_str!("../../lua/ui/layout.lua");
         let lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).unwrap();
 
@@ -1668,7 +1668,7 @@ mod tests {
 
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_profiles = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
         lua.preload_module(
@@ -1944,11 +1944,14 @@ mod tests {
             overlay_actions: vec!["new_agent".to_string()],
             ..Default::default()
         };
-        lua.call_on_action("list_select", &menu_ctx).unwrap(); // → profile select
-                                                               // Simulate single-profile response (auto-skips to worktree)
-        let profiles_event = serde_json::json!({ "profiles": ["claude"] });
-        lua.call_on_hub_event("profiles", &profiles_event, &ctx)
+        lua.call_on_action("list_select", &menu_ctx).unwrap(); // → agent config select
+                                                               // Simulate single agent config response (auto-skips to workspace)
+        let agent_config_event = serde_json::json!({ "agents": ["claude"] });
+        lua.call_on_hub_event("agent_config", &agent_config_event, &ctx)
             .unwrap();
+        lua.call_on_action("list_select", &ctx).unwrap(); // → Create New Workspace → name input
+        lua.exec("_tui_state.input_buffer = ''").unwrap();
+        lua.call_on_action("input_submit", &ctx).unwrap(); // → empty name → worktree
         lua.call_on_action("list_select", &ctx).unwrap(); // → Use Main Branch
         lua.exec("_tui_state.input_buffer = 'Fix bug'").unwrap();
         lua.call_on_action("input_submit", &ctx).unwrap(); // → sends create_agent
@@ -2039,11 +2042,14 @@ mod tests {
             overlay_actions: vec!["new_agent".to_string()],
             ..Default::default()
         };
-        lua.call_on_action("list_select", &menu_ctx).unwrap(); // → profile select
-                                                               // Simulate single-profile response (auto-skips to worktree)
-        let profiles_event = serde_json::json!({ "profiles": ["claude"] });
-        lua.call_on_hub_event("profiles", &profiles_event, &ctx)
+        lua.call_on_action("list_select", &menu_ctx).unwrap(); // → agent config select
+                                                               // Simulate single agent config response (auto-skips to workspace)
+        let agent_config_event = serde_json::json!({ "agents": ["claude"] });
+        lua.call_on_hub_event("agent_config", &agent_config_event, &ctx)
             .unwrap();
+        lua.call_on_action("list_select", &ctx).unwrap(); // → Create New Workspace → name input
+        lua.exec("_tui_state.input_buffer = ''").unwrap();
+        lua.call_on_action("input_submit", &ctx).unwrap(); // → empty name → worktree
         lua.exec("_tui_state.list_selected = 1").unwrap(); // Create New Worktree
         lua.call_on_action("list_select", &ctx).unwrap();
         lua.exec("_tui_state.input_buffer = '42'").unwrap();
@@ -2232,7 +2238,7 @@ mod tests {
     // ========================================================================
 
     /// Helper: open the menu and select "new_agent" to enter worktree selection.
-    /// Returns the ops from the "new_agent" selection.
+    /// Returns the ops from the workspace "Create New" selection.
     fn enter_new_agent_flow(lua: &LayoutLua) -> Vec<serde_json::Value> {
         // Step 1: Open menu (ctrl+p → open_menu action)
         let ctx = ActionContext::default();
@@ -2252,30 +2258,42 @@ mod tests {
         // list_selected defaults to 0 (first item = new_agent)
         let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
         assert_eq!(ops[0]["op"], "set_mode");
-        assert_eq!(ops[0]["mode"], "new_agent_select_profile");
-        // Should send list_profiles message
+        assert_eq!(ops[0]["mode"], "new_agent_select_agent");
+        // Should send list_agent_config message
         assert_eq!(ops[1]["op"], "send_msg");
         let msg_data = &ops[1]["data"]["data"];
-        assert_eq!(msg_data["type"], "list_profiles");
+        assert_eq!(msg_data["type"], "list_agent_config");
 
-        // Step 3: Simulate profiles event with single profile (auto-skips to worktree)
-        let event_data = serde_json::json!({ "profiles": ["claude"] });
+        // Step 3: Simulate agent_config event with single agent (auto-skips to workspace selection)
+        let event_data = serde_json::json!({ "agents": ["claude"] });
         let event_ops = lua
-            .call_on_hub_event("profiles", &event_data, &ctx)
+            .call_on_hub_event("agent_config", &event_data, &ctx)
             .unwrap()
             .unwrap();
         assert_eq!(event_ops[0]["op"], "set_mode");
-        assert_eq!(event_ops[0]["mode"], "new_agent_select_worktree");
-        assert_eq!(event_ops[1]["op"], "send_msg");
-        let msg_data = &event_ops[1]["data"]["data"];
+        assert_eq!(event_ops[0]["mode"], "new_agent_select_workspace");
+
+        // Step 4: Select "Create New Workspace" (index 0) → workspace name input
+        let ctx = ActionContext::default();
+        let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["op"], "set_mode");
+        assert_eq!(ops[0]["mode"], "new_workspace_name_input");
+
+        // Step 5: Submit empty workspace name → transitions to worktree selection
+        lua.exec("_tui_state.input_buffer = ''").unwrap();
+        let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["op"], "set_mode");
+        assert_eq!(ops[0]["mode"], "new_agent_select_worktree");
+        assert_eq!(ops[1]["op"], "send_msg");
+        let msg_data = &ops[1]["data"]["data"];
         assert_eq!(msg_data["type"], "list_worktrees");
 
-        event_ops
+        ops
     }
 
-    /// Helper: Enter new-agent flow with multiple profiles (requires manual selection).
-    fn enter_new_agent_flow_multi_profile(lua: &LayoutLua) -> Vec<serde_json::Value> {
-        // Steps 1-2: Open menu → select new_agent → enters profile selection
+    /// Helper: Enter new-agent flow with multiple agent configs (requires manual selection).
+    fn enter_new_agent_flow_multi_agent(lua: &LayoutLua) -> Vec<serde_json::Value> {
+        // Steps 1-2: Open menu → select new_agent → enters agent config selection
         let ctx = ActionContext::default();
         lua.call_on_action("open_menu", &ctx).unwrap().unwrap();
 
@@ -2285,44 +2303,54 @@ mod tests {
         };
         lua.call_on_action("list_select", &ctx).unwrap();
 
-        // Step 3: Multi-profile response — stays in profile selection
-        let event_data = serde_json::json!({ "profiles": ["claude", "web"] });
+        // Step 3: Multi-agent response — stays in agent config selection
+        let event_data = serde_json::json!({ "agents": ["claude", "web"] });
         let event_ops = lua
-            .call_on_hub_event("profiles", &event_data, &ctx)
+            .call_on_hub_event("agent_config", &event_data, &ctx)
             .unwrap()
             .unwrap();
-        // Multi-profile: no mode change, just populates list
+        // Multiple agent configs: no mode change, just populates list
         assert!(
             event_ops.is_empty(),
-            "Multi-profile should return empty ops (mode stays new_agent_select_profile)"
+            "Multiple agent configs should return empty ops (mode stays new_agent_select_agent)"
         );
 
         let mode = lua.eval_string("return _tui_state.mode").unwrap();
-        assert_eq!(mode, "new_agent_select_profile");
+        assert_eq!(mode, "new_agent_select_agent");
 
         event_ops
     }
 
-    /// Multi-profile: User selects second profile, then completes flow.
+    /// Multiple agent configs: User selects second config, then completes flow.
     #[test]
-    fn test_create_agent_flow_multi_profile_selection() {
+    fn test_create_agent_flow_multi_agent_selection() {
         let lua = make_full_lua();
-        enter_new_agent_flow_multi_profile(&lua);
+        enter_new_agent_flow_multi_agent(&lua);
 
-        // Select second profile (index 1 = "web")
+        // Select second agent config (index 1 = "web")
         lua.exec("_tui_state.list_selected = 1").unwrap();
         let ctx = ActionContext::default();
         let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
 
-        // Should transition to worktree selection
+        // Should transition to workspace selection
         assert_eq!(ops[0]["op"], "set_mode");
-        assert_eq!(ops[0]["mode"], "new_agent_select_worktree");
+        assert_eq!(ops[0]["mode"], "new_agent_select_workspace");
 
-        // Profile should be stored in pending_fields
-        let profile = lua
-            .eval_string("return _tui_state.pending_fields.profile")
+        // Agent name should be stored in pending_fields
+        let agent_name = lua
+            .eval_string("return _tui_state.pending_fields.agent_name")
             .unwrap();
-        assert_eq!(profile, "web");
+        assert_eq!(agent_name, "web");
+
+        // Select "Create New Workspace" (index 0) → workspace name input
+        lua.exec("_tui_state.list_selected = 0").unwrap();
+        let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["mode"], "new_workspace_name_input");
+
+        // Submit empty name → worktree selection
+        lua.exec("_tui_state.input_buffer = ''").unwrap();
+        let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["mode"], "new_agent_select_worktree");
 
         // Select "Use Main Branch"
         lua.exec("_tui_state.list_selected = 0").unwrap();
@@ -2332,13 +2360,13 @@ mod tests {
         lua.exec("_tui_state.input_buffer = 'test prompt'").unwrap();
         let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
 
-        // Verify create_agent includes the selected profile
+        // Verify create_agent includes the selected agent name
         let send_op = ops.iter().find(|op| op["op"] == "send_msg").unwrap();
         let data = &send_op["data"]["data"];
         assert_eq!(data["type"], "create_agent");
         assert_eq!(
-            data["profile"], "web",
-            "Selected profile should be included in create_agent message"
+            data["agent_name"], "web",
+            "Selected agent name should be included in create_agent message"
         );
         assert_eq!(data["prompt"], "test prompt");
     }
@@ -2702,17 +2730,34 @@ mod tests {
             .unwrap();
         assert_eq!(action.action, "list_select");
 
-        // Dispatch list_select with new_agent → mode becomes "new_agent_select_profile"
+        // Dispatch list_select with new_agent → mode becomes "new_agent_select_agent"
         let ctx = ActionContext {
             overlay_actions: vec!["new_agent".to_string()],
             ..Default::default()
         };
         lua.call_on_action("list_select", &ctx).unwrap();
 
-        // Simulate single-profile response (auto-skips to worktree selection)
-        let profiles_event = serde_json::json!({ "profiles": ["claude"] });
-        lua.call_on_hub_event("profiles", &profiles_event, &ctx)
+        // Simulate single agent config response (auto-skips to workspace selection)
+        let agent_config_event = serde_json::json!({ "agents": ["claude"] });
+        lua.call_on_hub_event("agent_config", &agent_config_event, &ctx)
             .unwrap();
+
+        // enter in workspace selection → list_select (selects "Create New Workspace")
+        let action = lua
+            .call_handle_key("enter", "new_agent_select_workspace", &key_ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(action.action, "list_select");
+        let ctx = ActionContext::default();
+        lua.call_on_action("list_select", &ctx).unwrap();
+
+        // enter in workspace name input → input_submit (empty name)
+        let action = lua
+            .call_handle_key("enter", "new_workspace_name_input", &key_ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(action.action, "input_submit");
+        lua.call_on_action("input_submit", &ctx).unwrap();
 
         // enter in worktree selection → list_select (selects "Use Main Branch")
         let action = lua
@@ -2720,7 +2765,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(action.action, "list_select");
-        let ctx = ActionContext::default();
         lua.call_on_action("list_select", &ctx).unwrap();
 
         // Type prompt characters

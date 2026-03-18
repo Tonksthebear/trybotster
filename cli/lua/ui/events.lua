@@ -352,22 +352,27 @@ function M.on_hub_event(event_type, event_data, context)
     return {}
   end
 
-  if event_type == "profiles" then
-    local profiles = event_data.profiles
-    if not profiles then return nil end
-    _tui_state.available_profiles = profiles
-    if #profiles <= 1 then
-      -- Single or no profile: auto-select and skip to worktree selection
-      _tui_state.pending_fields.profile = profiles[1]
-      return {
-        set_mode_ops("new_agent_select_worktree"),
-        { op = "send_msg", data = {
-          subscriptionId = "tui_hub",
-          data = { type = "list_worktrees" },
-        }},
-      }
+  if event_type == "agent_config" then
+    local agents = event_data.agents
+    if not agents then return nil end
+    _tui_state.available_agents = agents
+    if #agents <= 1 then
+      -- Single or no agent config: auto-select and skip to workspace selection
+      _tui_state.pending_fields.agent_name = agents[1]
+
+      -- Build workspace choices from current state
+      _tui_state.available_workspaces = {}
+      for _, ws in ipairs(_tui_state.workspaces or {}) do
+        _tui_state.available_workspaces[#_tui_state.available_workspaces + 1] = {
+          id = ws.id,
+          name = ws.name or ws.id,
+          agent_count = ws.agents and #ws.agents or 0,
+        }
+      end
+
+      return { set_mode_ops("new_agent_select_workspace") }
     end
-    -- Multiple profiles: populate list for user selection (mode already set)
+    -- Multiple agent configs: populate list for user selection (mode already set)
     return {}
   end
 
