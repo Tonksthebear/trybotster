@@ -68,6 +68,7 @@ use std::sync::{
 
 use crate::agent::pty::{HubEventListener, PtySession, SharedPtyState};
 use crate::agent::spawn::PtySpawnConfig;
+use crate::broker::SharedBrokerConnection;
 use crate::hub::events::HubEvent;
 use crate::terminal::AlacrittyParser;
 use tokio::sync::broadcast;
@@ -90,13 +91,14 @@ use crate::agent::pty::events::PtyEvent;
 ///
 /// The `_session` field keeps the `PtySession` alive via `Arc` -- dropping
 /// the last reference triggers `PtySession::drop()` which kills the child
-/// process and aborts the command processor task.
+/// process and aborts the command processor task. Ghost sessions (broker
+/// recovery) set this to `None` since they have no child process.
 ///
 /// Runtime sessions are created by `hub.spawn_pty_with_broker()`.
 pub struct PtySessionHandle {
     /// Keep `PtySession` alive -- its `Drop` impl kills the child process
-    /// and aborts the command processor task.
-    _session: Arc<Mutex<PtySession>>,
+    /// and aborts the command processor task. `None` for ghost sessions.
+    _session: Option<Arc<Mutex<PtySession>>>,
 
     /// Shared state for direct write/resize operations.
     shared_state: Arc<Mutex<SharedPtyState>>,
@@ -110,6 +112,12 @@ pub struct PtySessionHandle {
     /// Whether the inner PTY has kitty keyboard protocol active.
     kitty_enabled: Arc<AtomicBool>,
 
+    /// Whether the terminal cursor is currently visible (DECTCEM).
+    ///
+    /// Updated by `process_pty_bytes()` from the shadow screen's cursor state.
+    /// Read directly by `cursor_visible()` without any RPC.
+    cursor_visible: Arc<AtomicBool>,
+
     /// Whether a resize happened without the application redrawing yet.
     resize_pending: Arc<AtomicBool>,
 
@@ -121,6 +129,14 @@ pub struct PtySessionHandle {
 
     /// Hub event sender for delivery task notifications.
     hub_event_tx: HubEventSender,
+
+    /// Broker relay for RPC-based terminal state queries.
+    ///
+    /// Set once via [`set_broker_relay`] after broker registration.
+    /// When present, `get_screen()` and `get_snapshot()` route through the
+    /// broker instead of the local shadow screen. (`cursor_visible()` reads
+    /// directly from an `AtomicBool` — no RPC needed.)
+    broker_relay: Arc<std::sync::OnceLock<(u32, SharedBrokerConnection)>>,
 }
 
 impl std::fmt::Debug for PtySessionHandle {
@@ -132,45 +148,75 @@ impl std::fmt::Debug for PtySessionHandle {
 }
 
 impl PtySessionHandle {
+    /// Clone the event broadcast sender for subscribing to PTY events.
+    ///
+    /// Used by `register_session` to spawn a notification watcher for
+    /// ghost sessions that were created without one.
+    pub(crate) fn event_tx(&self) -> broadcast::Sender<PtyEvent> {
+        self.event_tx.clone()
+    }
+
+    /// Whether this is a ghost handle (no live PTY process).
+    ///
+    /// Ghost handles are created by `create_ghost_session` during broker
+    /// recovery. They skip the spawn path which normally creates a
+    /// notification watcher, so `register_session` must create one.
+    pub(crate) fn is_ghost(&self) -> bool {
+        self._session.is_none()
+    }
+
     /// Create a ghost `PtySessionHandle` for Hub restart recovery.
     ///
-    /// A ghost handle has no real PTY process — only the alacritty shadow screen
-    /// and broadcast channel are initialised with the given dimensions. Use
-    /// [`PtySessionHandle::feed_output`] (via Lua) to replay broker scrollback
-    /// bytes into the shadow screen, and [`PtySessionHandle::to_pty_handle`] to
-    /// register the handle with `HandleCache` for `BrokerPtyOutput` routing.
+    /// A ghost handle has no real PTY process and no heavy `PtySession`. Only
+    /// a minimal shadow screen (correct dimensions, zero scrollback), broadcast
+    /// channel, and AtomicBools are created. All terminal state queries route
+    /// through the broker RPC once `set_broker_relay()` is called.
     ///
     /// # Arguments
     ///
-    /// * `rows` - Terminal row count (read from context.json on restart)
-    /// * `cols` - Terminal column count (read from context.json on restart)
+    /// * `rows` - Terminal row count (read from session manifest on restart)
+    /// * `cols` - Terminal column count (read from session manifest on restart)
     /// * `hub_event_tx` - Hub event sender for message delivery tasks
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // In the broker_sessions_recovered Lua handler via hub.create_ghost_session():
-    /// let ghost = PtySessionHandle::new_ghost(24, 80, hub_event_tx.clone());
-    /// // Feed broker scrollback, then register via hub.register_session()
-    /// ```
     #[must_use]
     pub(crate) fn new_ghost(rows: u16, cols: u16, hub_event_tx: HubEventSender) -> Self {
-        let session = PtySession::new(rows, cols);
-        let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) =
-            session.get_direct_access();
-        let session_arc = Arc::new(Mutex::new(session));
+        let (event_tx, _) = broadcast::channel(64);
+        let shared_state = Arc::new(Mutex::new(SharedPtyState {
+            master_pty: None,
+            writer: None,
+            dimensions: (rows, cols),
+            last_human_input_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        }));
+
+        // Minimal shadow screen: correct dimensions, zero scrollback.
+        // All real reads go through broker RPCs; this exists only to satisfy
+        // do_resize() and fallback paths that expect the type.
+        let listener = HubEventListener::new(event_tx.clone());
+        let shadow_screen = Arc::new(Mutex::new(AlacrittyParser::new_with_listener(
+            rows, cols, 0, listener,
+        )));
 
         Self {
-            _session: session_arc,
+            _session: None,
             shared_state,
             shadow_screen,
             event_tx,
-            kitty_enabled,
-            resize_pending,
+            kitty_enabled: Arc::new(AtomicBool::new(false)),
+            cursor_visible: Arc::new(AtomicBool::new(true)),
+            resize_pending: Arc::new(AtomicBool::new(false)),
             port: None,
             delivery: Arc::new(std::sync::OnceLock::new()),
             hub_event_tx,
+            broker_relay: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Store the broker relay for RPC-based terminal state queries.
+    ///
+    /// Called after broker registration so Lua methods (`get_screen`,
+    /// `get_snapshot`) can route through the broker instead of the local
+    /// shadow screen.
+    pub fn set_broker_relay(&self, relay: (u32, SharedBrokerConnection)) {
+        let _ = self.broker_relay.set(relay);
     }
 
     /// Create a broker-backed `PtyHandle`.
@@ -181,13 +227,17 @@ impl PtySessionHandle {
     #[must_use]
     pub fn to_pty_handle_with_broker_relay(
         &self,
-        broker_relay: (u32, crate::broker::SharedBrokerConnection),
+        broker_relay: (u32, SharedBrokerConnection),
     ) -> crate::hub::agent_handle::PtyHandle {
+        // Store relay for Lua-facing RPC methods too.
+        self.set_broker_relay(broker_relay.clone());
+
         crate::hub::agent_handle::PtyHandle::new_with_broker_relay(
             self.event_tx.clone(),
             Arc::clone(&self.shared_state),
             Arc::clone(&self.shadow_screen),
             Arc::clone(&self.kitty_enabled),
+            Arc::clone(&self.cursor_visible),
             Arc::clone(&self.resize_pending),
             true, // Ghost PTYs are always CLI sessions (broker agents)
             self.port,
@@ -209,7 +259,7 @@ impl PtySessionHandle {
     #[cfg(unix)]
     #[must_use]
     pub fn get_master_fd(&self) -> Option<std::os::unix::io::RawFd> {
-        self._session.lock().ok()?.get_master_fd()
+        self._session.as_ref()?.lock().ok()?.get_master_fd()
     }
 
     /// Return the OS process ID of the child process, if available.
@@ -221,7 +271,7 @@ impl PtySessionHandle {
     /// so it can monitor the child process lifetime.
     #[must_use]
     pub fn get_child_pid(&self) -> Option<u32> {
-        self._session.lock().ok()?.get_child_pid()
+        self._session.as_ref()?.lock().ok()?.get_child_pid()
     }
 
     /// Return the current PTY dimensions `(rows, cols)`.
@@ -296,13 +346,9 @@ impl LuaUserData for PtySessionHandle {
         // session:cursor_visible() -> boolean
         // Returns true when the PTY's cursor is visible (free-text input expected),
         // false when hidden (generation, selection UI, or no input expected).
-        // Reads directly from the alacritty shadow screen state.
+        // Reads from a shared AtomicBool updated by process_pty_bytes().
         methods.add_method("cursor_visible", |_, this, ()| {
-            let parser = this
-                .shadow_screen
-                .lock()
-                .expect("PtySessionHandle shadow_screen lock poisoned");
-            Ok(!parser.cursor_hidden())
+            Ok(this.cursor_visible.load(Ordering::Relaxed))
         });
 
         // session:send_message(text) - Queue a message for probe-based delivery.
@@ -345,7 +391,17 @@ impl LuaUserData for PtySessionHandle {
 
         // session:get_snapshot() -> string (clean ANSI bytes)
         // Also aliased as get_scrollback for backwards compatibility.
+        // Prefers broker RPC when available, falls back to local shadow screen.
         methods.add_method("get_snapshot", |lua, this, ()| {
+            if let Some((session_id, conn)) = this.broker_relay.get() {
+                if let Ok(mut guard) = conn.lock() {
+                    if let Some(conn) = guard.as_mut() {
+                        if let Ok(snapshot) = conn.get_snapshot(*session_id) {
+                            return lua.create_string(&snapshot);
+                        }
+                    }
+                }
+            }
             let parser = this
                 .shadow_screen
                 .lock()
@@ -361,7 +417,17 @@ impl LuaUserData for PtySessionHandle {
         // ANSI escape sequences. Intended for agent/LLM consumption where escape
         // codes add noise. Unlike get_snapshot(), this does not include scrollback
         // and does not affect resize_pending state.
+        // Prefers broker RPC when available, falls back to local shadow screen.
         methods.add_method("get_screen", |lua, this, ()| {
+            if let Some((session_id, conn)) = this.broker_relay.get() {
+                if let Ok(mut guard) = conn.lock() {
+                    if let Some(conn) = guard.as_mut() {
+                        if let Ok(text) = conn.get_screen(*session_id) {
+                            return lua.create_string(text.as_bytes());
+                        }
+                    }
+                }
+            }
             let parser = this
                 .shadow_screen
                 .lock()
@@ -372,10 +438,10 @@ impl LuaUserData for PtySessionHandle {
 
         // session:feed_output(bytes) - Feed raw bytes into the shadow screen.
         //
-        // Processes `bytes` through the alacritty parser that backs `get_snapshot()`
-        // and `get_screen()`. Used by `Agent:replay_broker_scrollback()` to replay
-        // the broker's ANSI snapshot after a Hub restart so newly connecting
-        // clients see the current terminal state instead of a blank screen.
+        // Processes `bytes` through the local alacritty parser. For ghost
+        // sessions (zero-scrollback parser), this updates mode state but
+        // retains no scrollback — get_snapshot()/get_screen() route through
+        // broker RPCs instead.
         //
         // Does NOT write bytes to the PTY process — use `write()` for input.
         methods.add_method("feed_output", |_, this, data: LuaString| {
@@ -385,8 +451,17 @@ impl LuaUserData for PtySessionHandle {
             Ok(())
         });
 
-        // Backwards-compatible alias
+        // Backwards-compatible alias — same broker-first logic as get_snapshot.
         methods.add_method("get_scrollback", |lua, this, ()| {
+            if let Some((session_id, conn)) = this.broker_relay.get() {
+                if let Ok(mut guard) = conn.lock() {
+                    if let Some(conn) = guard.as_mut() {
+                        if let Ok(snapshot) = conn.get_snapshot(*session_id) {
+                            return lua.create_string(&snapshot);
+                        }
+                    }
+                }
+            }
             let parser = this
                 .shadow_screen
                 .lock()
@@ -426,12 +501,14 @@ impl LuaUserData for PtySessionHandle {
         //
         // Locks the PtySession and calls kill_child(). After this call,
         // is_alive() will return false and write() will be a no-op.
+        // No-op for ghost sessions (no child process).
         methods.add_method("kill", |_, this, ()| {
-            let mut session = this
-                ._session
-                .lock()
-                .expect("PtySessionHandle session lock poisoned");
-            session.kill_child();
+            if let Some(ref session_arc) = this._session {
+                let mut session = session_arc
+                    .lock()
+                    .expect("PtySessionHandle session lock poisoned");
+                session.kill_child();
+            }
             Ok(())
         });
     }
@@ -709,7 +786,7 @@ pub(crate) fn spawn_session_handle_from_opts(
         .map_err(|e| LuaError::runtime(format!("Failed to spawn PTY session: {e}")))?;
 
     // Extract direct access handles before wrapping in Arc
-    let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) =
+    let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
         session.get_direct_access();
     let session_port = session.port();
 
@@ -735,15 +812,17 @@ pub(crate) fn spawn_session_handle_from_opts(
     let session_arc = Arc::new(Mutex::new(session));
 
     Ok(PtySessionHandle {
-        _session: session_arc,
+        _session: Some(session_arc),
         shared_state,
         shadow_screen,
         event_tx,
         kitty_enabled,
+        cursor_visible,
         resize_pending,
         port: session_port,
         delivery: Arc::new(std::sync::OnceLock::new()),
         hub_event_tx,
+        broker_relay: Arc::new(std::sync::OnceLock::new()),
     })
 }
 
@@ -1376,20 +1455,22 @@ mod tests {
     /// manually.
     fn create_test_session_handle() -> PtySessionHandle {
         let session = PtySession::new(24, 80);
-        let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) =
+        let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
             session.get_direct_access();
         let session_arc = Arc::new(Mutex::new(session));
 
         PtySessionHandle {
-            _session: session_arc,
+            _session: Some(session_arc),
             shared_state,
             shadow_screen,
             event_tx,
             kitty_enabled,
+            cursor_visible,
             resize_pending,
             port: None,
             delivery: Arc::new(std::sync::OnceLock::new()),
             hub_event_tx: crate::lua::primitives::new_hub_event_sender(),
+            broker_relay: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -1453,12 +1534,10 @@ mod tests {
         let lua = Lua::new();
         let handle = create_test_session_handle();
 
-        // Send DECTCEM hide cursor sequence to shadow screen
+        // Set cursor_visible AtomicBool to false (simulates DECTCEM hide)
         handle
-            .shadow_screen
-            .lock()
-            .expect("shadow_screen lock")
-            .process(b"\x1b[?25l");
+            .cursor_visible
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         lua.globals()
             .set("session", handle)
@@ -1476,12 +1555,13 @@ mod tests {
         let lua = Lua::new();
         let handle = create_test_session_handle();
 
-        // Hide then show cursor
+        // Hide then show cursor via AtomicBool
         handle
-            .shadow_screen
-            .lock()
-            .expect("shadow_screen lock")
-            .process(b"\x1b[?25l\x1b[?25h");
+            .cursor_visible
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        handle
+            .cursor_visible
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         lua.globals()
             .set("session", handle)

@@ -1813,6 +1813,9 @@ impl LuaRuntime {
                     data.set("title", title.clone())?;
                     data.set("body", body.clone())?;
                 }
+                AgentNotification::Bell => {
+                    data.set("type", "bell")?;
+                }
             }
 
             let hooks: mlua::Table = self.lua.globals().get("hooks")?;
@@ -3564,13 +3567,13 @@ mod tests {
         .expect("write workspace manifest");
 
         let session_manifest = serde_json::json!({
-            "uuid": session_uuid,
+            "session_uuid": session_uuid,
             "workspace_id": workspace_id,
-            "agent_key": "owner-repo-empty-snapshot",
-            "type": "agent",
+            "id": "owner-repo-empty-snapshot",
+            "session_type": "agent",
             "role": "developer",
             "repo": "owner/repo",
-            "branch": "empty-snapshot",
+            "branch_name": "empty-snapshot",
             "worktree_path": tmp.path().join("wt-empty-snapshot").to_string_lossy(),
             "status": "orphaned",
             "broker_sessions": { "0": 123 },
@@ -3714,13 +3717,13 @@ mod tests {
         .expect("write workspace manifest");
 
         let session_manifest = serde_json::json!({
-            "uuid": session_uuid,
+            "session_uuid": session_uuid,
             "workspace_id": workspace_id,
-            "agent_key": "owner-repo-tee",
-            "type": "agent",
+            "id": "owner-repo-tee",
+            "session_type": "agent",
             "role": "developer",
             "repo": "owner/repo",
-            "branch": "tee",
+            "branch_name": "tee",
             "worktree_path": tmp.path().join("wt-tee").to_string_lossy(),
             "status": "active",
             "broker_sessions": { "0": 777 },
@@ -3808,9 +3811,10 @@ mod tests {
     }
 
     /// Regression test for unified session registry behavior:
-    /// ghost entries are stored in agent_registry and replaced in-place by real sessions.
+    /// Broker recovery produces first-class session instances (no ghost concept).
+    /// Session.get() returns the recovered instance, all_info() includes it as "running".
     #[test]
-    fn test_broker_recovery_ghost_entry_is_replaced_in_unified_registry() {
+    fn test_broker_recovery_produces_real_session_instances() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3875,13 +3879,14 @@ mod tests {
         .expect("write workspace manifest");
 
         let session_manifest = serde_json::json!({
-            "uuid": session_uuid,
+            "session_uuid": session_uuid,
             "workspace_id": workspace_id,
-            "agent_key": "owner-repo-unified-registry",
-            "type": "agent",
+            "id": "owner-repo-unified-registry",
+            "session_type": "agent",
+            "session_name": "agent",
             "role": "developer",
             "repo": "owner/repo",
-            "branch": "unified-registry",
+            "branch_name": "unified-registry",
             "worktree_path": tmp.path().join("wt-unified-registry").to_string_lossy(),
             "status": "active",
             "broker_sessions": { "0": 4242 },
@@ -3905,7 +3910,8 @@ mod tests {
 
                 hub.create_ghost_session = function(_session_uuid, _session_id, _rows, _cols)
                     return {
-                        feed_output = function(_self, _data) end
+                        feed_output = function(_self, _data) end,
+                        dimensions = function(_self) return _rows, _cols end,
                     }
                 end
 
@@ -3916,6 +3922,12 @@ mod tests {
             )
             .exec()
             .expect("install broker recovery test stubs");
+
+        runtime
+            .lua()
+            .globals()
+            .set("__test_session_uuid", session_uuid)
+            .expect("set __test_session_uuid");
 
         runtime
             .fire_json_event(
@@ -3931,99 +3943,8 @@ mod tests {
             )
             .expect("fire broker_sessions_recovered");
 
-        runtime
-            .lua()
-            .globals()
-            .set("__test_session_uuid", session_uuid)
-            .expect("set __test_session_uuid");
-
-        let ghost_count: i64 = runtime
-            .lua()
-            .load(
-                r#"
-                local Agent = require("lib.agent")
-                local count = 0
-                for _, info in ipairs(Agent.all_info()) do
-                    if info.session_uuid == __test_session_uuid and info.status == "ghost" then
-                        count = count + 1
-                    end
-                end
-                return count
-            "#,
-            )
-            .eval()
-            .expect("count ghost entries after recovery");
-        assert_eq!(ghost_count, 1, "recovery should register one ghost entry");
-
-        let ghost_get_is_nil: bool = runtime
-            .lua()
-            .load(
-                r#"
-                local Session = require("lib.session")
-                return Session.get(__test_session_uuid) == nil
-            "#,
-            )
-            .eval()
-            .expect("Session.get should hide ghost entries");
-        assert!(
-            ghost_get_is_nil,
-            "Session.get(session_uuid) must return nil while entry is ghost-only"
-        );
-
-        runtime
-            .lua()
-            .load(
-                r#"
-                local state = require("hub.state")
-                local reg = state.get("agent_registry", {})
-                reg[__test_session_uuid] = {
-                    created_at = os.time(),
-                    info = function(self)
-                        return {
-                            id = "owner-repo-unified-registry",
-                            session_uuid = __test_session_uuid,
-                            session_type = "agent",
-                            session_name = "agent",
-                            display_name = "unified-registry",
-                            status = "running",
-                            created_at = self.created_at,
-                        }
-                    end
-                }
-            "#,
-            )
-            .exec()
-            .expect("replace ghost entry with real session entry");
-
-        let (ghost_count_after, running_count_after): (i64, i64) = runtime
-            .lua()
-            .load(
-                r#"
-                local Agent = require("lib.agent")
-                local ghost = 0
-                local running = 0
-                for _, info in ipairs(Agent.all_info()) do
-                    if info.session_uuid == __test_session_uuid then
-                        if info.status == "ghost" then ghost = ghost + 1 end
-                        if info.status == "running" then running = running + 1 end
-                    end
-                end
-                return ghost, running
-            "#,
-            )
-            .eval()
-            .expect("count entries after replacement");
-
-        assert_eq!(
-            ghost_count_after, 0,
-            "ghost entry must be replaced in-place, not duplicated"
-        );
-        assert_eq!(
-            running_count_after, 1,
-            "exactly one real session entry should remain after replacement"
-        );
-
-        let real_get_exists: bool = runtime
+        // Recovery should produce a real session instance accessible via Session.get()
+        let get_exists: bool = runtime
             .lua()
             .load(
                 r#"
@@ -4032,10 +3953,46 @@ mod tests {
             "#,
             )
             .eval()
-            .expect("Session.get should return real session after replacement");
+            .expect("Session.get should return recovered session");
         assert!(
-            real_get_exists,
-            "Session.get should resolve replaced real entry"
+            get_exists,
+            "Session.get(session_uuid) must return the recovered session instance"
+        );
+
+        // The session should appear in all_info() as "running", not "ghost"
+        let running_count: i64 = runtime
+            .lua()
+            .load(
+                r#"
+                local Agent = require("lib.agent")
+                local count = 0
+                for _, info in ipairs(Agent.all_info()) do
+                    if info.session_uuid == __test_session_uuid and info.status == "running" then
+                        count = count + 1
+                    end
+                end
+                return count
+            "#,
+            )
+            .eval()
+            .expect("count running entries after recovery");
+        assert_eq!(running_count, 1, "recovery should produce exactly one running session");
+
+        // The recovered session should have real methods (not a plain table)
+        let has_info_method: bool = runtime
+            .lua()
+            .load(
+                r#"
+                local Session = require("lib.session")
+                local sess = Session.get(__test_session_uuid)
+                return type(sess.info) == "function"
+            "#,
+            )
+            .eval()
+            .expect("check recovered session has :info() method");
+        assert!(
+            has_info_method,
+            "recovered session must be a real instance with :info() method"
         );
     }
 

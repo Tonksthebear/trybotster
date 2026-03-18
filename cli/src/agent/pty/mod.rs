@@ -240,6 +240,13 @@ pub struct PtySession {
     /// mode on connect/reconnect.
     kitty_enabled: Arc<AtomicBool>,
 
+    /// Whether the terminal cursor is currently visible (DECTCEM).
+    ///
+    /// Updated by the reader thread from `parser.cursor_hidden()` after
+    /// processing each output chunk. Read by `PtySessionHandle::cursor_visible()`
+    /// and `PtyHandle` without requiring a broker RPC.
+    cursor_visible: Arc<AtomicBool>,
+
     /// Whether the shadow screen was resized without the application redrawing.
     ///
     /// Set by `do_resize()` when the shadow screen dimensions change. Checked
@@ -315,6 +322,7 @@ impl PtySession {
             command_rx: Some(command_rx),
             detect_notifications: false,
             kitty_enabled: Arc::new(AtomicBool::new(false)),
+            cursor_visible: Arc::new(AtomicBool::new(true)),
             resize_pending: Arc::new(AtomicBool::new(false)),
             port: None,
         }
@@ -535,12 +543,14 @@ impl PtySession {
         broadcast::Sender<PtyEvent>,
         Arc<AtomicBool>,
         Arc<AtomicBool>,
+        Arc<AtomicBool>,
     ) {
         (
             Arc::clone(&self.shared_state),
             Arc::clone(&self.shadow_screen),
             self.event_tx.clone(),
             Arc::clone(&self.kitty_enabled),
+            Arc::clone(&self.cursor_visible),
             Arc::clone(&self.resize_pending),
         )
     }

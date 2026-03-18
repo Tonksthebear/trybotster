@@ -40,12 +40,12 @@
 //!
 //! When the Hub reconnects after a restart it no longer holds the master PTY
 //! FDs. The broker continues reading the PTYs and forwards output via
-//! `PtyOutput` frames. The Hub feeds those bytes into an `AlacrittyParser`
-//! shadow screen to reconstruct terminal state, and routes PTY input back via `PtyInput`
-//! frames until the agent processes terminate.
+//! `PtyOutput` frames with sideband terminal state flags. The Hub broadcasts
+//! raw bytes to clients and routes PTY input back via `PtyInput` frames until
+//! the agent processes terminate.
 //!
-//! The initial reconnect always calls `get_snapshot()` per session to obtain
-//! the ring-buffer contents for immediate shadow-screen reconstruction.
+//! The initial reconnect calls `get_snapshot()` per session to obtain
+//! the ring-buffer contents for client display reconstruction.
 
 // Rust guideline compliant 2026-02
 
@@ -58,12 +58,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use super::protocol::{
     control_handshake_client, encode_data, encode_fd_transfer_with_capabilities,
-    encode_hub_control, frame_type, BrokerFrame, BrokerFrameDecoder, BrokerMessage,
-    BrokerSessionInventory, ControlNegotiated, FdTransferPayload, HubMessage,
+    encode_hub_control, encode_pty_output, frame_type, sideband, BrokerFrame, BrokerFrameDecoder,
+    BrokerMessage, BrokerSessionInventory, ControlNegotiated, FdTransferPayload, HubMessage,
 };
 
 /// Upper bound for synchronous Hub->Broker control response waits once the
@@ -212,13 +212,8 @@ impl BrokerConnection {
 
     /// Retrieve the raw ring-buffer snapshot for a session.
     ///
-    /// After a Hub restart, replay the returned bytes into a fresh
-    /// `vt100::Parser` to reconstruct the shadow screen:
-    ///
-    /// ```rust,ignore
-    /// let bytes = conn.get_snapshot(session_id)?;
-    /// shadow_screen.lock().unwrap().process(&bytes);
-    /// ```
+    /// After a Hub restart, the returned ANSI bytes are sent directly to
+    /// subscribed clients (TUI, browser) for display reconstruction.
     ///
     /// # Errors
     ///
@@ -237,6 +232,32 @@ impl BrokerConnection {
         }
     }
 
+    /// Request plain-text visible screen contents from the broker.
+    ///
+    /// Returns the current viewport as plain text with no ANSI escapes.
+    /// Intended for LLM/agent consumption where escape codes add noise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write or response read fails, or the broker
+    /// replies with an error frame (e.g., session not found).
+    pub fn get_screen(&mut self, session_id: u32) -> Result<String> {
+        let frame = encode_hub_control(&HubMessage::GetScreen { session_id });
+        self.stream.write_all(&frame).context("send GetScreen")?;
+
+        match self.read_response()? {
+            BrokerFrame::Screen(sid, data) if sid == session_id => {
+                String::from_utf8(data).map_err(|e| anyhow!("broker screen not UTF-8: {e}"))
+            }
+            BrokerFrame::BrokerControl(BrokerMessage::Error { message }) => {
+                bail!("broker get_screen error: {message}")
+            }
+            other => bail!("unexpected broker response to GetScreen: {other:?}"),
+        }
+    }
+
+    /// Request terminal state metadata from the broker.
+    ///
     /// Return broker inventory for all currently live PTY sessions.
     ///
     /// Used by Hub restart recovery as the liveness authority.
@@ -465,7 +486,7 @@ impl BrokerConnection {
         while let Some(frame) = self.frame_buffer.pop_front() {
             if !matches!(
                 frame,
-                BrokerFrame::PtyOutput(_, _)
+                BrokerFrame::PtyOutput(_, _, _)
                     | BrokerFrame::BrokerControl(BrokerMessage::PtyExited { .. })
             ) {
                 return Ok(frame);
@@ -480,7 +501,7 @@ impl BrokerConnection {
             for frame in self.decoder.feed(&buf[..n])? {
                 if matches!(
                     frame,
-                    BrokerFrame::PtyOutput(_, _)
+                    BrokerFrame::PtyOutput(_, _, _)
                         | BrokerFrame::BrokerControl(BrokerMessage::PtyExited { .. })
                 ) {
                     continue;
@@ -878,9 +899,12 @@ fn demux_reader(
         };
         for frame in frames {
             match frame {
-                BrokerFrame::PtyOutput(session_id, data) => {
-                    let _ = event_tx
-                        .send(crate::hub::events::HubEvent::BrokerPtyOutput { session_id, data });
+                BrokerFrame::PtyOutput(session_id, flags, data) => {
+                    let _ = event_tx.send(crate::hub::events::HubEvent::BrokerPtyOutput {
+                        session_id,
+                        flags,
+                        data,
+                    });
                 }
                 BrokerFrame::BrokerControl(BrokerMessage::PtyExited {
                     session_id,
@@ -891,6 +915,15 @@ fn demux_reader(
                         session_id,
                         session_uuid,
                         exit_code,
+                    });
+                }
+                BrokerFrame::BrokerControl(BrokerMessage::TermEvent {
+                    session_id,
+                    event,
+                }) => {
+                    let _ = event_tx.send(crate::hub::events::HubEvent::BrokerTermEvent {
+                        session_id,
+                        event,
                     });
                 }
                 other => {
@@ -1067,7 +1100,7 @@ mod integration_tests {
         // Mock broker: send a PtyOutput frame.
         std::thread::spawn(move || {
             use std::io::Write;
-            let frame = encode_data(frame_type::PTY_OUTPUT, 7, b"hello world");
+            let frame = encode_pty_output(7, sideband::CURSOR_VISIBLE, b"hello world");
             let mut bs = broker_stream;
             bs.write_all(&frame).unwrap();
             // Drop closes the socket, which will cause the demux reader to exit.
@@ -1080,7 +1113,11 @@ mod integration_tests {
         });
 
         match result {
-            Ok(Some(HubEvent::BrokerPtyOutput { session_id, data })) => {
+            Ok(Some(HubEvent::BrokerPtyOutput {
+                session_id,
+                data,
+                ..
+            })) => {
                 assert_eq!(session_id, 7);
                 assert_eq!(data, b"hello world");
             }

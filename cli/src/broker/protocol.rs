@@ -10,10 +10,11 @@
 //! - `0x10` `HubControl`   — JSON-encoded [`HubMessage`] (Hub → Broker)
 //! - `0x11` `BrokerControl`— JSON-encoded [`BrokerMessage`] (Broker → Hub)
 //! - `0x12` `PtyInput`     — `[u32 LE session_id][raw bytes]` (Hub → Broker)
-//! - `0x13` `PtyOutput`    — `[u32 LE session_id][raw bytes]` (Broker → Hub)
+//! - `0x13` `PtyOutput`    — `[u32 LE session_id][u8 flags][raw bytes]` (Broker → Hub)
 //! - `0x14` `Snapshot`     — `[u32 LE session_id][raw bytes]` (Broker → Hub, GetSnapshot response)
 //! - `0x15` `FdTransfer`   — registration payload (Hub → Broker); master PTY FD arrives in
 //!                           the same `sendmsg()` call via SCM_RIGHTS ancillary data.
+//! - `0x16` `Screen`       — `[u32 LE session_id][plain text]` (Broker → Hub, GetScreen response)
 //!
 //! ## Session lifecycle
 //!
@@ -45,7 +46,8 @@ pub const CONTROL_PROTOCOL_VERSION: u8 = 1;
 /// Capabilities supported by this binary for the control connection.
 ///
 /// Additional capabilities should be appended as independent bits.
-pub const CONTROL_SUPPORTED_CAPABILITIES: u32 = capability::FD_TRANSFER_V1;
+pub const CONTROL_SUPPORTED_CAPABILITIES: u32 =
+    capability::FD_TRANSFER_V1 | capability::TERM_EVENTS_V1;
 
 /// Fixed preamble for Hub -> Broker control handshake hello.
 pub const CONTROL_HELLO_MAGIC: [u8; 4] = *b"BCH1";
@@ -58,6 +60,9 @@ const CONTROL_HANDSHAKE_LEN: usize = 9;
 pub mod capability {
     /// Supports version-tagged `FdTransferPayload` encoding.
     pub const FD_TRANSFER_V1: u32 = 1 << 0;
+    /// Broker forwards alacritty terminal events (Title, ResetTitle, Bell)
+    /// via `BrokerMessage::TermEvent`.
+    pub const TERM_EVENTS_V1: u32 = 1 << 1;
 }
 
 // ─── Frame type constants ──────────────────────────────────────────────────
@@ -70,12 +75,27 @@ pub mod frame_type {
     pub const BROKER_CONTROL: u8 = 0x11;
     /// Raw PTY input: `[u32 LE session_id][bytes]` (Hub → Broker).
     pub const PTY_INPUT: u8 = 0x12;
-    /// Raw PTY output: `[u32 LE session_id][bytes]` (Broker → Hub).
+    /// Raw PTY output: `[u32 LE session_id][u8 flags][bytes]` (Broker → Hub).
+    ///
+    /// The flags byte carries terminal sideband state (see [`super::sideband`]).
     pub const PTY_OUTPUT: u8 = 0x13;
     /// Ring-buffer snapshot: `[u32 LE session_id][bytes]` (Broker → Hub).
     pub const SNAPSHOT: u8 = 0x14;
     /// FD transfer registration (Hub → Broker); master PTY FD in SCM_RIGHTS.
     pub const FD_TRANSFER: u8 = 0x15;
+    /// Plain-text screen contents: `[u32 LE session_id][bytes]` (Broker → Hub).
+    pub const SCREEN: u8 = 0x16;
+}
+
+/// Sideband flags packed into the `PtyOutput` frame alongside raw bytes.
+///
+/// The broker sets these after processing output through its `AlacrittyParser`,
+/// letting the hub track terminal mode state without its own shadow screen.
+pub mod sideband {
+    /// Terminal cursor is visible (DECTCEM show, `CSI ? 25 h`).
+    pub const CURSOR_VISIBLE: u8 = 1 << 0;
+    /// Kitty keyboard protocol is active.
+    pub const KITTY_ENABLED: u8 = 1 << 1;
 }
 
 // ─── Control message enums ─────────────────────────────────────────────────
@@ -146,6 +166,16 @@ pub enum HubMessage {
         cap_bytes: u64,
     },
 
+    /// Request plain-text visible screen contents for a session.
+    ///
+    /// Broker replies with a `Screen` binary frame (same `session_id`).
+    /// Unlike `GetSnapshot`, this returns only the visible viewport as
+    /// plain text with no ANSI escapes — intended for LLM/agent consumption.
+    GetScreen {
+        /// Opaque session identifier returned by `BrokerMessage::Registered`.
+        session_id: u32,
+    },
+
     /// Return the broker's currently live PTY session inventory.
     ///
     /// Used by Hub restart recovery to discover which sessions survived.
@@ -197,6 +227,34 @@ pub enum BrokerMessage {
         /// Human-readable error description.
         message: String,
     },
+
+    /// Forwarded alacritty terminal event from the broker's parser.
+    ///
+    /// Sent when the parser fires `Event::Title`, `Event::ResetTitle`, or
+    /// `Event::Bell` during `process()`. The hub uses these to update session
+    /// metadata (display name) and fire notifications without maintaining its
+    /// own shadow screen.
+    TermEvent {
+        /// Opaque session identifier.
+        session_id: u32,
+        /// The terminal event kind.
+        event: BrokerTermEvent,
+    },
+}
+
+/// Terminal events forwarded from the broker's alacritty parser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum BrokerTermEvent {
+    /// Window title set via OSC 0/2.
+    TitleChanged {
+        /// The new window title text.
+        title: String,
+    },
+    /// Window title reset to default.
+    ResetTitle,
+    /// Terminal bell (BEL, 0x07).
+    Bell,
 }
 
 /// One live session entry from a broker inventory response.
@@ -398,11 +456,28 @@ pub fn encode_broker_control(msg: &BrokerMessage) -> Vec<u8> {
 /// Encode a binary data frame with a `session_id` routing prefix.
 ///
 /// Layout: `[u32 LE session_id][raw bytes]`.
+///
+/// **Not for PtyOutput** — use [`encode_pty_output`] which includes the
+/// sideband flags byte.
 pub fn encode_data(frame_type: u8, session_id: u32, data: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(4 + data.len());
     payload.extend_from_slice(&session_id.to_le_bytes());
     payload.extend_from_slice(data);
     encode_raw(frame_type, &payload)
+}
+
+/// Encode a `PtyOutput` frame with sideband flags.
+///
+/// Layout: `[u32 LE session_id][u8 flags][raw bytes]`.
+///
+/// The flags byte carries terminal mode state from the broker's
+/// `AlacrittyParser` (see [`sideband`]).
+pub fn encode_pty_output(session_id: u32, flags: u8, data: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(5 + data.len());
+    payload.extend_from_slice(&session_id.to_le_bytes());
+    payload.push(flags);
+    payload.extend_from_slice(data);
+    encode_raw(frame_type::PTY_OUTPUT, &payload)
 }
 
 /// Encode an `FdTransfer` frame (without the ancillary FD — that is
@@ -519,12 +594,14 @@ pub enum BrokerFrame {
     BrokerControl(BrokerMessage),
     /// PTY input data: (session_id, bytes).
     PtyInput(u32, Vec<u8>),
-    /// PTY output data: (session_id, bytes).
-    PtyOutput(u32, Vec<u8>),
+    /// PTY output data: (session_id, sideband_flags, bytes).
+    PtyOutput(u32, u8, Vec<u8>),
     /// Snapshot data: (session_id, bytes).
     Snapshot(u32, Vec<u8>),
     /// FD transfer registration payload (FD arrives via SCM_RIGHTS separately).
     FdTransfer(FdTransferPayload),
+    /// Plain-text screen data: (session_id, text bytes).
+    Screen(u32, Vec<u8>),
 }
 
 /// Incremental frame decoder — same byte-accumulation design as
@@ -594,11 +671,12 @@ fn decode_frame(ft: u8, payload: &[u8]) -> Result<BrokerFrame> {
             Ok(BrokerFrame::PtyInput(session_id, payload[4..].to_vec()))
         }
         frame_type::PTY_OUTPUT => {
-            if payload.len() < 4 {
+            if payload.len() < 5 {
                 bail!("PtyOutput frame too short");
             }
             let session_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            Ok(BrokerFrame::PtyOutput(session_id, payload[4..].to_vec()))
+            let flags = payload[4];
+            Ok(BrokerFrame::PtyOutput(session_id, flags, payload[5..].to_vec()))
         }
         frame_type::SNAPSHOT => {
             if payload.len() < 4 {
@@ -610,6 +688,13 @@ fn decode_frame(ft: u8, payload: &[u8]) -> Result<BrokerFrame> {
         frame_type::FD_TRANSFER => {
             let reg = FdTransferPayload::decode(payload)?;
             Ok(BrokerFrame::FdTransfer(reg))
+        }
+        frame_type::SCREEN => {
+            if payload.len() < 4 {
+                bail!("Screen frame too short");
+            }
+            let session_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            Ok(BrokerFrame::Screen(session_id, payload[4..].to_vec()))
         }
         _ => bail!("unknown broker frame type: 0x{ft:02x}"),
     }
@@ -737,7 +822,7 @@ mod tests {
 
     #[test]
     fn partial_reassembly() {
-        let encoded = encode_data(frame_type::PTY_OUTPUT, 1, b"data");
+        let encoded = encode_pty_output(1, sideband::CURSOR_VISIBLE, b"data");
         let mid = encoded.len() / 2;
         let mut dec = BrokerFrameDecoder::new();
         assert!(dec.feed(&encoded[..mid]).unwrap().is_empty());
@@ -985,6 +1070,91 @@ mod tests {
         }
     }
 
+    // ── Screen frame ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn screen_frame_round_trip() {
+        let text = b"$ ls\nfile1.txt  file2.txt";
+        let encoded = encode_data(frame_type::SCREEN, 7, text);
+        let frames = BrokerFrameDecoder::new().feed(&encoded).unwrap();
+        assert_eq!(frames.len(), 1);
+        if let BrokerFrame::Screen(session_id, payload) = &frames[0] {
+            assert_eq!(*session_id, 7);
+            assert_eq!(payload.as_slice(), text);
+        } else {
+            panic!("expected Screen");
+        }
+    }
+
+    #[test]
+    fn screen_empty_payload() {
+        let encoded = encode_data(frame_type::SCREEN, 2, b"");
+        let frames = BrokerFrameDecoder::new().feed(&encoded).unwrap();
+        assert_eq!(frames.len(), 1);
+        if let BrokerFrame::Screen(sid, payload) = &frames[0] {
+            assert_eq!(*sid, 2);
+            assert!(payload.is_empty());
+        } else {
+            panic!("expected Screen");
+        }
+    }
+
+    // ── PtyOutput sideband flags ───────────────────────────────────────────
+
+    #[test]
+    fn pty_output_sideband_cursor_visible() {
+        let encoded = encode_pty_output(3, sideband::CURSOR_VISIBLE, b"hello");
+        let frames = BrokerFrameDecoder::new().feed(&encoded).unwrap();
+        assert_eq!(frames.len(), 1);
+        if let BrokerFrame::PtyOutput(sid, flags, data) = &frames[0] {
+            assert_eq!(*sid, 3);
+            assert_eq!(*flags, sideband::CURSOR_VISIBLE);
+            assert_eq!(data, b"hello");
+        } else {
+            panic!("expected PtyOutput");
+        }
+    }
+
+    #[test]
+    fn pty_output_sideband_kitty_enabled() {
+        let flags = sideband::CURSOR_VISIBLE | sideband::KITTY_ENABLED;
+        let encoded = encode_pty_output(5, flags, b"x");
+        let frames = BrokerFrameDecoder::new().feed(&encoded).unwrap();
+        if let BrokerFrame::PtyOutput(_, f, _) = &frames[0] {
+            assert!(*f & sideband::CURSOR_VISIBLE != 0);
+            assert!(*f & sideband::KITTY_ENABLED != 0);
+        } else {
+            panic!("expected PtyOutput");
+        }
+    }
+
+    #[test]
+    fn pty_output_sideband_cursor_hidden() {
+        let encoded = encode_pty_output(1, 0, b"y");
+        let frames = BrokerFrameDecoder::new().feed(&encoded).unwrap();
+        if let BrokerFrame::PtyOutput(_, flags, _) = &frames[0] {
+            assert_eq!(*flags & sideband::CURSOR_VISIBLE, 0, "cursor should be hidden");
+            assert_eq!(*flags & sideband::KITTY_ENABLED, 0, "kitty should be off");
+        } else {
+            panic!("expected PtyOutput");
+        }
+    }
+
+    // ── GetScreen hub control ─────────────────────────────────────────────
+
+    #[test]
+    fn hub_control_get_screen_round_trip() {
+        let msg = HubMessage::GetScreen { session_id: 11 };
+        let encoded = encode_hub_control(&msg);
+        let frames = BrokerFrameDecoder::new().feed(&encoded).unwrap();
+        assert_eq!(frames.len(), 1);
+        if let BrokerFrame::HubControl(HubMessage::GetScreen { session_id }) = &frames[0] {
+            assert_eq!(*session_id, 11);
+        } else {
+            panic!("expected HubControl(GetScreen)");
+        }
+    }
+
     // ── FdTransfer frame wrapping ─────────────────────────────────────────────
 
     #[test]
@@ -1099,7 +1269,7 @@ mod tests {
     fn multiple_frames_in_single_feed() {
         let f1 = encode_hub_control(&HubMessage::Ping);
         let f2 = encode_broker_control(&BrokerMessage::Pong);
-        let f3 = encode_data(frame_type::PTY_OUTPUT, 1, b"out");
+        let f3 = encode_pty_output(1, sideband::CURSOR_VISIBLE, b"out");
 
         let mut combined = Vec::new();
         combined.extend_from_slice(&f1);
@@ -1116,8 +1286,9 @@ mod tests {
             &frames[1],
             BrokerFrame::BrokerControl(BrokerMessage::Pong)
         ));
-        if let BrokerFrame::PtyOutput(sid, data) = &frames[2] {
+        if let BrokerFrame::PtyOutput(sid, flags, data) = &frames[2] {
             assert_eq!(*sid, 1);
+            assert_eq!(*flags, sideband::CURSOR_VISIBLE);
             assert_eq!(data, b"out");
         } else {
             panic!("expected PtyOutput");

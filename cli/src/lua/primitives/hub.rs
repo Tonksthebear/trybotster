@@ -182,6 +182,7 @@ pub(crate) fn register(
     //   }
     let cache2 = Arc::clone(&handle_cache);
     let register_broker_conn = Arc::clone(&broker_connection);
+    let register_event_tx = Arc::clone(&hub_event_tx);
     let register_session_fn = lua
         .create_function(
             move |_, (session_uuid, session_ud, metadata): (String, LuaAnyUserData, LuaTable)| {
@@ -202,6 +203,14 @@ pub(crate) fn register(
                     }
                     Ok(LuaValue::String(s)) => s.to_str().ok().and_then(|x| x.parse::<u32>().ok()),
                     _ => None,
+                };
+
+                // Grab event_tx + ghost flag before consuming the handle
+                let (event_tx_clone, is_ghost) = {
+                    let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
+                        LuaError::runtime(format!("register_session: not a PtySessionHandle: {e}"))
+                    })?;
+                    (handle.event_tx(), handle.is_ghost())
                 };
 
                 let pty_handle: PtyHandle = {
@@ -248,6 +257,28 @@ pub(crate) fn register(
                     broker_session_id,
                     index
                 );
+
+                // Ghost sessions skip the spawn path which normally creates a
+                // notification watcher. Spawn one now so title/CWD/bell events
+                // from the broker reach Lua hooks.
+                if is_ghost {
+                    let session_name: String = metadata
+                        .get("session_name")
+                        .unwrap_or_else(|_| session_type_str.clone());
+                    let watcher_key = format!("{}:{}", agent_key, session_name);
+                    let guard = register_event_tx.lock().expect("HubEventSender mutex poisoned");
+                    if let Some(ref sender) = *guard {
+                        let _ = sender.send(HubEvent::LuaPtyRequest(
+                            crate::lua::primitives::pty::PtyRequest::SpawnNotificationWatcher {
+                                watcher_key,
+                                agent_key: agent_key.clone(),
+                                session_name,
+                                event_tx: event_tx_clone,
+                            },
+                        ));
+                    }
+                }
+
                 Ok(index.unwrap_or(0))
             },
         )
@@ -322,6 +353,17 @@ pub(crate) fn register(
 
     hub.set("detect_repo", detect_repo_fn)
         .map_err(|e| anyhow!("Failed to set hub.detect_repo: {e}"))?;
+
+    // hub.is_offline() - Returns true if the hub was started with --offline.
+    //
+    // Plugins should check this before making any network calls (HTTP, ActionCable,
+    // WebSocket) to avoid connection errors in offline mode.
+    let is_offline_fn = lua
+        .create_function(move |_, ()| Ok(crate::env::is_offline()))
+        .map_err(|e| anyhow!("Failed to create hub.is_offline function: {e}"))?;
+
+    hub.set("is_offline", is_offline_fn)
+        .map_err(|e| anyhow!("Failed to set hub.is_offline: {e}"))?;
 
     // hub.api_token() - Returns the hub's API bearer token from the keyring.
     //
@@ -671,9 +713,10 @@ pub(crate) fn register(
     // hub.create_ghost_session(session_uuid, session_id, rows, cols)
     //   → PtySessionHandle userdata
     //
-    // Creates a shadow-screen-only PTY handle for Hub restart recovery.
-    // No real PTY process is spawned — only the AlacrittyParser shadow screen
-    // and broadcast channel are initialised with the given dimensions.
+    // Creates a lightweight PTY handle for Hub restart recovery.
+    // No real PTY process or PtySession is spawned — only a zero-scrollback
+    // parser, broadcast channel, and AtomicBools are created. Terminal state
+    // queries route through broker RPCs once registered.
     //
     // Also fires HubEvent::BrokerSessionRegistered so the Hub's
     // broker_sessions routing table maps session_id → session_uuid.
@@ -692,8 +735,8 @@ pub(crate) fn register(
                 move |_, (session_uuid, session_id, rows, cols): (String, u32, u16, u16)| {
                     use crate::lua::primitives::pty::PtySessionHandle;
 
-                    // Create a ghost handle — no real PTY, just shadow screen
-                    // and broadcast channel at the dimensions saved in context.json.
+                    // Create a lightweight ghost handle — no PtySession, zero-scrollback
+                    // parser. Broker RPCs serve all terminal state.
                     let handle = PtySessionHandle::new_ghost(rows, cols, Arc::clone(&tx_ghost));
 
                     // Register the broker session_id → session_uuid mapping

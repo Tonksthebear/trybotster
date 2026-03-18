@@ -45,6 +45,17 @@ function Agent.new(config)
     return self
 end
 
+--- Recover an Agent from a persisted manifest during broker recovery.
+-- @param config Table with manifest fields + handle/broker_session_id/dims
+-- @return Agent instance (first-class, identical to Agent.new())
+function Agent.from_recovery(config)
+    config.session_type = config.session_type or "agent"
+    local self = setmetatable({}, Agent)
+    Session._init_recovered(self, config)
+    self._inbox = {}
+    return self
+end
+
 -- =============================================================================
 -- Agent-Specific Methods
 -- =============================================================================

@@ -40,9 +40,9 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use alacritty_terminal::grid::Dimensions;
 use tokio::sync::broadcast;
 
+use crate::agent::notification::AgentNotification;
 use crate::agent::pty::{do_resize, HubEventListener, PtyEvent, SharedPtyState};
 use crate::broker::SharedBrokerConnection;
 use crate::terminal::{generate_ansi_snapshot, AlacrittyParser};
@@ -213,6 +213,12 @@ pub struct PtyHandle {
     /// Used by `get_snapshot()` to include the kitty push sequence.
     kitty_enabled: Arc<AtomicBool>,
 
+    /// Whether the terminal cursor is currently visible (DECTCEM).
+    ///
+    /// Updated by [`crate::agent::spawn::process_pty_bytes`] from the shadow
+    /// screen's cursor state. Readable without a broker RPC.
+    cursor_visible: Arc<AtomicBool>,
+
     /// Whether a resize happened without the application redrawing yet.
     ///
     /// Set by `resize_direct()`, checked by `get_snapshot()` to avoid
@@ -323,6 +329,7 @@ impl PtyHandle {
         shared_state: Arc<Mutex<SharedPtyState>>,
         shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
         kitty_enabled: Arc<AtomicBool>,
+        cursor_visible: Arc<AtomicBool>,
         resize_pending: Arc<AtomicBool>,
         detect_notifs: bool,
         port: Option<u16>,
@@ -332,6 +339,7 @@ impl PtyHandle {
             shared_state,
             shadow_screen,
             kitty_enabled,
+            cursor_visible,
             resize_pending,
             detect_notifs,
             port,
@@ -347,6 +355,7 @@ impl PtyHandle {
         shared_state: Arc<Mutex<SharedPtyState>>,
         shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
         kitty_enabled: Arc<AtomicBool>,
+        cursor_visible: Arc<AtomicBool>,
         resize_pending: Arc<AtomicBool>,
         detect_notifs: bool,
         port: Option<u16>,
@@ -358,6 +367,7 @@ impl PtyHandle {
             shared_state,
             shadow_screen,
             kitty_enabled,
+            cursor_visible,
             resize_pending,
             detect_notifs,
             // Start as Some(true): alacritty initializes with SHOW_CURSOR set, matching
@@ -389,57 +399,41 @@ impl PtyHandle {
         self.event_tx.subscribe()
     }
 
-    /// Atomically capture a cached snapshot and install an event subscription.
+    /// Subscribe and capture a snapshot for client attach.
     ///
-    /// This prevents reconnect races where output emitted during snapshot capture
-    /// is replayed twice (once in snapshot, once via buffered stream), or missed
-    /// between separate snapshot/subscribe calls.
+    /// Subscribes first, then fetches a snapshot from the broker via RPC.
+    /// This ordering guarantees no output gap: any bytes emitted during the
+    /// broker round-trip are captured by the subscription. Clients may see
+    /// brief overlap (bytes in both snapshot and first events), which terminal
+    /// emulators handle gracefully.
     ///
-    /// For broker-backed sessions this intentionally uses the local shadow-cache
-    /// snapshot (`get_snapshot_cached`) instead of issuing a fresh broker control
-    /// RPC in the attach path. Reconnect recovery already rehydrates shadow state
-    /// from the broker; avoiding a second synchronous control request here keeps
-    /// attach deterministic even when broker control response latency spikes.
+    /// Falls back to an empty snapshot if the broker RPC fails — the client
+    /// sees a blank screen that fills in from the live stream.
     #[must_use]
     pub fn snapshot_and_subscribe_cached(
         &self,
     ) -> (Vec<u8>, bool, u16, u16, broadcast::Receiver<PtyEvent>) {
-        // Broker-backed sessions use local shadow-cache snapshot bytes.
+        let kitty_enabled = self.kitty_enabled.load(Ordering::Relaxed);
+        let (rows, cols) = self.dims();
+
+        // Subscribe FIRST so no output is lost during broker RPC.
+        let rx = self.event_tx.subscribe();
+
+        // Broker-backed sessions fetch snapshot from the authoritative source.
         if self.broker_relay.is_some() {
-            let (kitty_enabled, rows, cols) = {
-                let parser = self
-                    .shadow_screen
-                    .lock()
-                    .expect("shadow_screen lock poisoned");
-                let kitty_enabled = parser.kitty_enabled();
-                let rows = parser.term().grid().screen_lines() as u16;
-                let cols = parser.term().grid().columns() as u16;
-                (kitty_enabled, rows, cols)
-            };
-            let snapshot = self.get_snapshot_cached();
-            let rx = self.event_tx.subscribe();
+            let snapshot = self.get_snapshot();
             return (snapshot, kitty_enabled, rows, cols, rx);
         }
 
-        let parser = self
-            .shadow_screen
-            .lock()
-            .expect("shadow_screen lock poisoned");
-        let kitty_enabled = parser.kitty_enabled();
-        let rows = parser.term().grid().screen_lines() as u16;
-        let cols = parser.term().grid().columns() as u16;
-        let rx = self.event_tx.subscribe();
-
         #[cfg(test)]
         {
-            let skip_visible = self.resize_pending.swap(false, Ordering::AcqRel);
-            let snapshot = generate_ansi_snapshot(&*parser, skip_visible);
+            let snapshot = self.get_snapshot_cached();
             return (snapshot, kitty_enabled, rows, cols, rx);
         }
 
         #[cfg(not(test))]
         {
-            log::error!("snapshot_and_subscribe_cached invariant violated: missing broker relay");
+            log::error!("snapshot_and_subscribe invariant violated: missing broker relay");
             return (Vec::new(), kitty_enabled, rows, cols, rx);
         }
     }
@@ -451,6 +445,26 @@ impl PtyHandle {
     /// watcher fires `process_exited` for live broker-owned sessions.
     pub fn notify_process_exited(&self, exit_code: Option<i32>) {
         let _ = self.event_tx.send(PtyEvent::process_exited(exit_code));
+    }
+
+    /// Broadcast a `TitleChanged` event on this handle's channel.
+    ///
+    /// Used by the `BrokerTermEvent` handler to bridge broker-side title
+    /// changes into the PtyHandle broadcast channel, so the notification
+    /// watcher fires `pty_title_changed` for broker-owned sessions.
+    pub fn notify_title_changed(&self, title: String) {
+        let _ = self.event_tx.send(PtyEvent::title_changed(title));
+    }
+
+    /// Broadcast a bell `Notification` event on this handle's channel.
+    ///
+    /// Used by the `BrokerTermEvent` handler to bridge broker-side BEL
+    /// detection into the PtyHandle broadcast channel, so the notification
+    /// watcher fires `pty_notification` for broker-owned sessions.
+    pub fn notify_bell(&self) {
+        let _ = self
+            .event_tx
+            .send(PtyEvent::notification(AgentNotification::Bell));
     }
 
     /// Get the HTTP forwarding port for this PTY.
@@ -602,17 +616,16 @@ impl PtyHandle {
         self.broker_relay.is_some()
     }
 
-    /// Current shadow-screen dimensions `(rows, cols)`.
+    /// Current PTY dimensions `(rows, cols)`.
+    ///
+    /// Reads from `SharedPtyState` which is the canonical write target for
+    /// resize operations. This avoids depending on the shadow screen.
     #[must_use]
     pub fn dims(&self) -> (u16, u16) {
-        let parser = self
-            .shadow_screen
+        self.shared_state
             .lock()
-            .expect("shadow_screen lock poisoned");
-        (
-            parser.term().grid().screen_lines() as u16,
-            parser.term().grid().columns() as u16,
-        )
+            .map(|s| s.dimensions)
+            .unwrap_or((24, 80))
     }
 
     /// Resize the PTY directly.
@@ -674,24 +687,23 @@ impl PtyHandle {
     /// Inject PTY output received from the broker into this handle.
     ///
     /// Called by `Hub::handle_hub_event` when a `HubEvent::BrokerPtyOutput`
-    /// arrives for this session. Delegates entirely to
-    /// [`crate::agent::spawn::process_pty_bytes`], the canonical byte
-    /// processor, guaranteeing identical events and shadow-screen state
-    /// regardless of the originating source.
-    pub fn feed_broker_output(&self, data: &[u8]) {
+    /// arrives for this session. Uses the broker's sideband flags for terminal
+    /// mode state (cursor visibility, kitty protocol) instead of a local
+    /// shadow screen.
+    pub fn feed_broker_output(&self, data: &[u8], flags: u8) {
         let mut lcv = self
             .last_cursor_visible
             .lock()
             .expect("last_cursor_visible lock poisoned");
-        crate::agent::spawn::process_pty_bytes(
+        crate::agent::spawn::process_broker_bytes(
             data,
-            &self.shadow_screen,
+            flags,
             &self.event_tx,
             &self.kitty_enabled,
+            &self.cursor_visible,
             &self.resize_pending,
             self.detect_notifs,
             &mut lcv,
-            "Broker",
         );
     }
 }
@@ -715,7 +727,7 @@ mod tests {
     /// Helper to create a PTY handle for testing with a specific port.
     fn create_test_pty_with_port(port: Option<u16>) -> PtyHandle {
         let pty_session = PtySession::new(24, 80);
-        let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) =
+        let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
             pty_session.get_direct_access();
         // Leak the session to keep the state alive for tests
         std::mem::forget(pty_session);
@@ -725,6 +737,7 @@ mod tests {
             shared_state,
             shadow_screen,
             kitty_enabled,
+            cursor_visible,
             resize_pending,
             true,
             port,
@@ -733,7 +746,7 @@ mod tests {
 
     fn create_broker_backed_test_pty() -> (PtyHandle, UnixStream) {
         let pty_session = PtySession::new(24, 80);
-        let (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) =
+        let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
             pty_session.get_direct_access();
         std::mem::forget(pty_session);
 
@@ -746,6 +759,7 @@ mod tests {
             shared_state,
             shadow_screen,
             kitty_enabled,
+            cursor_visible,
             resize_pending,
             true,
             None,
@@ -933,87 +947,74 @@ mod tests {
     }
 
     #[test]
-    fn test_get_snapshot_cached_uses_local_shadow_screen_for_broker_backed_sessions() {
-        let (pty, mut server_stream) = create_broker_backed_test_pty();
-        pty.feed_broker_output(b"cached-output\n");
+    fn test_feed_broker_output_does_not_populate_local_shadow_screen() {
+        let (pty, _server_stream) = create_broker_backed_test_pty();
+        pty.feed_broker_output(b"broker-bytes\n", 0);
 
+        // feed_broker_output uses process_broker_bytes which skips the shadow
+        // screen — the local cached snapshot should NOT contain the broker data.
+        // Production code uses get_snapshot() which routes through broker RPC.
         let snapshot = pty.get_snapshot_cached();
         assert!(
-            String::from_utf8_lossy(&snapshot).contains("cached-output"),
-            "cached snapshot should include locally fed broker output"
-        );
-
-        server_stream
-            .set_nonblocking(true)
-            .expect("set_nonblocking on fake broker");
-        let mut buf = [0u8; 16];
-        let read_err = std::io::Read::read(&mut server_stream, &mut buf)
-            .expect_err("cached snapshot should not issue broker request");
-        assert!(
-            matches!(
-                read_err.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ),
-            "unexpected fake broker read error: {read_err}"
+            !String::from_utf8_lossy(&snapshot).contains("broker-bytes"),
+            "broker output should not populate local shadow screen"
         );
     }
 
     #[test]
-    fn test_get_snapshot_cached_after_resize_keeps_output_for_broker_backed_sessions() {
-        let (pty, mut server_stream) = create_broker_backed_test_pty();
+    fn test_feed_broker_output_broadcasts_raw_bytes() {
+        let (pty, _server_stream) = create_broker_backed_test_pty();
+        let mut sub = pty.subscribe();
 
-        // Mark resize pending (attach path does this before snapshot).
-        pty.resize_direct(40, 120);
+        pty.feed_broker_output(b"event-test\n", 0);
 
-        // Drain the broker resize frame from the fake server so we can verify no
-        // additional control frames are emitted by cached snapshot generation.
-        let mut buf = [0u8; 128];
-        let n = std::io::Read::read(&mut server_stream, &mut buf).expect("read broker frame");
-        let frames = BrokerFrameDecoder::new()
-            .feed(&buf[..n])
-            .expect("decode broker frame");
-        assert_eq!(frames.len(), 1);
-        assert!(matches!(
-            &frames[0],
-            BrokerFrame::HubControl(HubMessage::ResizePty {
-                session_id: 42,
-                rows: 40,
-                cols: 120
-            })
-        ));
-
-        pty.feed_broker_output(b"after-resize\n");
-        let snapshot = pty.get_snapshot_cached();
-        assert!(
-            String::from_utf8_lossy(&snapshot).contains("after-resize"),
-            "broker-backed cached snapshot should preserve output after resize"
-        );
+        // Even without shadow screen, raw bytes are broadcast to subscribers.
+        // Drain events until we find Output.
+        loop {
+            match sub.try_recv() {
+                Ok(PtyEvent::Output(data)) => {
+                    assert_eq!(data, b"event-test\n");
+                    break;
+                }
+                Ok(_) => continue, // skip CWD/notification events
+                Err(_) => panic!("expected PtyEvent::Output"),
+            }
+        }
     }
 
     #[test]
-    fn test_snapshot_and_subscribe_cached_uses_local_shadow_for_broker_backed_sessions() {
+    fn test_snapshot_and_subscribe_fetches_from_broker_for_broker_backed_sessions() {
         let (pty, mut server_stream) = create_broker_backed_test_pty();
-        pty.feed_broker_output(b"local-shadow-output\n");
 
-        let (snapshot, _kitty, _rows, _cols, _rx) = pty.snapshot_and_subscribe_cached();
-        assert!(
-            String::from_utf8_lossy(&snapshot).contains("local-shadow-output"),
-            "attach snapshot should come from local shadow cache for broker-backed sessions"
-        );
+        let broker = std::thread::spawn(move || {
+            use std::io::{Read, Write};
 
-        server_stream
-            .set_nonblocking(true)
-            .expect("set_nonblocking on fake broker");
-        let mut buf = [0u8; 16];
-        let read_err = std::io::Read::read(&mut server_stream, &mut buf)
-            .expect_err("snapshot_and_subscribe_cached should not issue broker request");
-        assert!(
-            matches!(
-                read_err.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ),
-            "unexpected fake broker read error: {read_err}"
+            let mut buf = [0u8; 128];
+            let n = server_stream.read(&mut buf).expect("read broker frame");
+            let frames = BrokerFrameDecoder::new()
+                .feed(&buf[..n])
+                .expect("decode broker frame");
+            assert_eq!(frames.len(), 1);
+            assert!(matches!(
+                &frames[0],
+                BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id: 42 })
+            ));
+
+            let response = encode_data(frame_type::SNAPSHOT, 42, b"broker-snapshot-data");
+            server_stream
+                .write_all(&response)
+                .expect("write broker snapshot");
+        });
+
+        let (snapshot, _kitty, rows, cols, _rx) = pty.snapshot_and_subscribe_cached();
+        assert_eq!(
+            snapshot,
+            b"broker-snapshot-data",
+            "attach snapshot should come from broker RPC"
         );
+        assert_eq!((rows, cols), (24, 80), "dims should come from shared_state");
+
+        broker.join().expect("broker thread should finish");
     }
 
     #[test]

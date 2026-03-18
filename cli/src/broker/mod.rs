@@ -64,9 +64,9 @@ mod integration_test_full;
 
 pub(crate) use connection::{BrokerConnection, SharedBrokerConnection};
 
-use crate::terminal::{
-    generate_ansi_snapshot, AlacrittyParser, NoopListener, DEFAULT_SCROLLBACK_LINES,
-};
+use crate::terminal::{generate_ansi_snapshot, AlacrittyParser, DEFAULT_SCROLLBACK_LINES};
+
+use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener};
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -82,9 +82,61 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use protocol::{
-    control_handshake_server, encode_broker_control, encode_data, frame_type, BrokerFrameDecoder,
-    BrokerMessage, BrokerSessionInventory, FdTransferPayload, HubMessage,
+    control_handshake_server, encode_broker_control, encode_data, encode_pty_output, frame_type,
+    sideband, BrokerFrameDecoder, BrokerMessage, BrokerSessionInventory, BrokerTermEvent,
+    FdTransferPayload, HubMessage,
 };
+
+// ─── BrokerEventListener ──────────────────────────────────────────────────
+
+/// Collected terminal events from the broker's alacritty parser.
+type CollectedEvents = Arc<Mutex<Vec<BrokerTermEvent>>>;
+
+/// Event listener that captures alacritty terminal events for forwarding to the Hub.
+///
+/// Installed on the broker's parser so `Event::Title`, `Event::ResetTitle`, and
+/// `Event::Bell` are captured during `process()`. The reader thread drains the
+/// queue after each chunk and sends them as `BrokerMessage::TermEvent` frames.
+///
+/// `Event::PtyWrite` responses (DSR, DA) are written directly to the PTY master fd.
+#[derive(Clone)]
+struct BrokerEventListener {
+    collected: CollectedEvents,
+    /// Raw PTY master fd for writing PtyWrite responses.
+    pty_fd: RawFd,
+}
+
+impl EventListener for BrokerEventListener {
+    fn send_event(&self, event: AlacrittyEvent) {
+        match event {
+            AlacrittyEvent::Title(title) => {
+                if let Ok(mut events) = self.collected.lock() {
+                    events.push(BrokerTermEvent::TitleChanged { title });
+                }
+            }
+            AlacrittyEvent::ResetTitle => {
+                if let Ok(mut events) = self.collected.lock() {
+                    events.push(BrokerTermEvent::ResetTitle);
+                }
+            }
+            AlacrittyEvent::Bell => {
+                if let Ok(mut events) = self.collected.lock() {
+                    events.push(BrokerTermEvent::Bell);
+                }
+            }
+            AlacrittyEvent::PtyWrite(response) => {
+                // Write DSR/DA responses directly to the PTY master fd.
+                // Small writes to a PTY master are non-blocking.
+                let bytes = response.as_bytes();
+                unsafe {
+                    libc::write(self.pty_fd, bytes.as_ptr().cast(), bytes.len());
+                }
+            }
+            // Clipboard, color requests, cursor blink, wakeup, etc. — not relevant.
+            _ => {}
+        }
+    }
+}
 
 /// Maximum path length for a Unix domain socket (macOS kernel limit).
 const MAX_SOCK_PATH: usize = 104;
@@ -235,7 +287,7 @@ struct Session {
     /// The reader feeds raw PTY bytes in; on `GetSnapshot` the broker calls
     /// `generate_ansi_snapshot()` directly from parsed cell state instead of
     /// storing raw bytes in a separate ring buffer.
-    parser: Arc<Mutex<AlacrittyParser<NoopListener>>>,
+    parser: Arc<Mutex<AlacrittyParser<BrokerEventListener>>>,
     /// File tee shared with the reader thread.
     ///
     /// Set to `Some` when `HubMessage::ArmTee` is received.  The reader
@@ -285,7 +337,7 @@ fn apply_pty_resize(
     fd: RawFd,
     rows: u16,
     cols: u16,
-    parser: &Arc<Mutex<AlacrittyParser<NoopListener>>>,
+    parser: &Arc<Mutex<AlacrittyParser<BrokerEventListener>>>,
 ) {
     let ws = libc::winsize {
         ws_row: rows,
@@ -330,7 +382,7 @@ fn coalesce_resize_commands(
 /// read/write interleaving hazards in the broker main loop.
 fn pty_writer_loop(
     fd: RawFd,
-    parser: Arc<Mutex<AlacrittyParser<NoopListener>>>,
+    parser: Arc<Mutex<AlacrittyParser<BrokerEventListener>>>,
     rx: std::sync::mpsc::Receiver<PtyWriteCommand>,
 ) {
     // Borrow-only File wrapper — do not close the FD here.
@@ -422,10 +474,17 @@ impl Broker {
     /// reader threads to the current Hub connection on reconnect.
     fn register(&mut self, fd: OwnedFd, reg: FdTransferPayload) -> u32 {
         let session_id = self.alloc_session_id();
-        let parser = Arc::new(Mutex::new(AlacrittyParser::new_noop(
+        let raw: RawFd = std::os::unix::io::AsRawFd::as_raw_fd(&fd);
+        let collected: CollectedEvents = Arc::new(Mutex::new(Vec::new()));
+        let listener = BrokerEventListener {
+            collected: Arc::clone(&collected),
+            pty_fd: raw,
+        };
+        let parser = Arc::new(Mutex::new(AlacrittyParser::new_with_listener(
             reg.rows,
             reg.cols,
             DEFAULT_SCROLLBACK_LINES,
+            listener,
         )));
         let parser_clone = Arc::clone(&parser);
         let parser_for_writer = Arc::clone(&parser);
@@ -433,7 +492,6 @@ impl Broker {
         // Reader thread: blocking read loop on the master PTY FD.
         // Uses Arc::clone of shared_writer so a reconnect updates ALL reader
         // threads with a single mutex write rather than stopping and restarting them.
-        let raw: RawFd = std::os::unix::io::AsRawFd::as_raw_fd(&fd);
         let reader_sid = session_id;
         let shared = Arc::clone(&self.shared_writer);
         // Shared tee — None until ArmTee is received.  The reader thread
@@ -441,8 +499,9 @@ impl Broker {
         // re-arm without stopping the reader.
         let shared_tee: SharedTee = Arc::new(Mutex::new(None));
         let tee_clone = Arc::clone(&shared_tee);
+        let collected_clone = Arc::clone(&collected);
         let reader = thread::spawn(move || {
-            reader_loop(raw, reader_sid, parser_clone, shared, tee_clone);
+            reader_loop(raw, reader_sid, parser_clone, shared, tee_clone, collected_clone);
         });
         let (writer_tx, writer_rx) =
             std::sync::mpsc::sync_channel::<PtyWriteCommand>(PTY_WRITER_QUEUE_CAPACITY);
@@ -522,9 +581,10 @@ impl Broker {
 fn reader_loop(
     fd: RawFd,
     session_id: u32,
-    parser: Arc<Mutex<AlacrittyParser<NoopListener>>>,
+    parser: Arc<Mutex<AlacrittyParser<BrokerEventListener>>>,
     shared_writer: SharedWriter,
     shared_tee: SharedTee,
+    collected_events: CollectedEvents,
 ) {
     let mut buf = [0u8; 4096];
     // Borrow-only File — ManuallyDrop prevents close on drop.
@@ -551,9 +611,20 @@ fn reader_loop(
                 let data = &buf[..n];
 
                 // Feed into the parser so GetSnapshot can generate from cell state.
-                if let Ok(mut p) = parser.lock() {
+                // Extract sideband flags after processing.
+                let flags = if let Ok(mut p) = parser.lock() {
                     p.process(data);
-                }
+                    let mut f = 0u8;
+                    if !p.cursor_hidden() {
+                        f |= sideband::CURSOR_VISIBLE;
+                    }
+                    if p.kitty_enabled() {
+                        f |= sideband::KITTY_ENABLED;
+                    }
+                    f
+                } else {
+                    sideband::CURSOR_VISIBLE // safe default: cursor visible, kitty off
+                };
 
                 // Write to tee log (if armed).  Runs even during the Hub
                 // reconnect window so the log captures output while Hub is down.
@@ -563,9 +634,16 @@ fn reader_loop(
                     }
                 }
 
+                // Drain terminal events collected during parser.process().
+                let events: Vec<BrokerTermEvent> = if let Ok(mut q) = collected_events.lock() {
+                    q.drain(..).collect()
+                } else {
+                    Vec::new()
+                };
+
                 // Forward to Hub via the shared writer.  `None` during reconnect
                 // window — drop the frame (already captured in parser and tee above).
-                let frame = encode_data(frame_type::PTY_OUTPUT, session_id, data);
+                let frame = encode_pty_output(session_id, flags, data);
                 if let Ok(guard) = shared_writer.lock() {
                     if let Some(ref sink) = *guard {
                         match sink.tx.try_send(frame) {
@@ -576,6 +654,13 @@ fn reader_loop(
                                 }
                             }
                             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+                        }
+
+                        // Send terminal events as BrokerControl frames.
+                        for event in events {
+                            let msg = BrokerMessage::TermEvent { session_id, event };
+                            let event_frame = encode_broker_control(&msg);
+                            let _ = sink.tx.try_send(event_frame);
                         }
                     }
                 }
@@ -851,6 +936,24 @@ fn handle_connection(mut stream: UnixStream, broker: &mut Broker) -> Result<()> 
                     };
                     let _ = control_tx.send(frame);
                 }
+
+                BrokerFrame::HubControl(HubMessage::GetScreen { session_id }) => {
+                    let frame = if let Some(sess) = broker.sessions.get(&session_id) {
+                        let text = sess
+                            .parser
+                            .lock()
+                            .map(|p| p.contents())
+                            .unwrap_or_default();
+                        encode_data(frame_type::SCREEN, session_id, text.as_bytes())
+                    } else {
+                        log::warn!("[broker] GetScreen for unknown session {session_id}");
+                        encode_broker_control(&BrokerMessage::Error {
+                            message: format!("no session {session_id}"),
+                        })
+                    };
+                    let _ = control_tx.send(frame);
+                }
+
 
                 BrokerFrame::HubControl(HubMessage::ListSessions) => {
                     let mut sessions: Vec<BrokerSessionInventory> = broker

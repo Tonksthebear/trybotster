@@ -4,67 +4,49 @@
 -- (as opposed to spawning a fresh one). This happens when the Hub process
 -- restarts while the broker is still running and holding PTY file descriptors.
 --
--- Single-PTY model: each session has exactly one PTY. Ghost resurrection
--- reads a single broker_session_id per manifest (no pty_index loops).
+-- Single-PTY model: each session has exactly one PTY.
 --
 -- Flow:
 --   1. Receive broker inventory from Rust (liveness authority).
---   2. Enrich with session manifest metadata (workspace, labels, dimensions).
---   3. For each surviving session, call hub.create_ghost_session() to create
---      a shadow-screen-only handle.
---   4. Register ghost handle via hub.register_session() so BrokerPtyOutput
---      frames can be routed.
---   5. Replay broker snapshot bytes into ghost handle's shadow screen.
+--   2. Match each broker session to its persisted manifest.
+--   3. Construct a real Agent/Accessory instance from the manifest.
+--   4. The instance registers with HandleCache, replays broker scrollback,
+--      and enters the session registry as a first-class session.
 
 local Agent = require("lib.agent")
+local Accessory = require("lib.accessory")
 local workspace_store = require("lib.workspace_store")
 
-local function replay_broker_snapshot(session_id, agent_key, ghost_handle)
-    local ok_snapshot, snapshot = pcall(hub.get_pty_snapshot_from_broker, session_id)
-    if not ok_snapshot then
-        log.warn(string.format(
-            "[broker] get_pty_snapshot_from_broker failed for %s (session=%s): %s",
-            agent_key, tostring(session_id), tostring(snapshot)
-        ))
-        return false
+--- Parse ISO 8601 timestamp to epoch seconds.
+-- @param value string|number  ISO 8601 string or epoch number
+-- @return number epoch seconds (falls back to os.time())
+local function parse_timestamp(value)
+    if type(value) == "number" then return value end
+    if type(value) == "string" then
+        local y, mo, d, h, mi, s = value:match("(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+        if y then
+            return os.time({
+                year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+                hour = tonumber(h), min = tonumber(mi), sec = tonumber(s),
+            })
+        end
     end
-    if not snapshot or #snapshot == 0 then
-        log.debug(string.format(
-            "[broker] Empty broker snapshot for %s (session=%s)",
-            agent_key, tostring(session_id)
-        ))
-        return false
-    end
-
-    local ok_feed, feed_err = pcall(function() ghost_handle:feed_output(snapshot) end)
-    if ok_feed then
-        log.info(string.format(
-            "[broker] Replayed %d bytes from broker snapshot → %s",
-            #snapshot, agent_key
-        ))
-        return true
-    end
-
-    log.warn(string.format(
-        "[broker] feed_output failed for %s: %s",
-        agent_key, tostring(feed_err)
-    ))
-    return false
+    return os.time()
 end
 
---- Process a single Central Session Store session manifest.
+--- Recover a session from its manifest as a real Agent or Accessory instance.
+--
 -- @param record table  One entry from workspace_store.scan_recoverable_sessions()
 -- @param broker_session table  One entry from Rust broker inventory
--- @param ghost_infos table  Array to append results to
--- @param seen_keys table    Set of agent_keys already processed
-local function process_session_manifest(record, broker_session, ghost_infos, seen_keys)
+-- @param recovered table  Array to append recovered sessions to
+-- @param seen_keys table  Set of agent_keys already processed
+local function recover_session(record, broker_session, recovered, seen_keys)
     local sess         = record.manifest
-    local workspace_id = record.workspace_id
     local session_uuid = record.session_uuid
+    local agent_key    = sess.id
 
-    local agent_key = sess.agent_key
     if not agent_key or agent_key == "" or agent_key == "-" then
-        log.debug(string.format("[broker] Skipping session %s: missing agent_key", session_uuid))
+        log.debug(string.format("[broker] Skipping session %s: missing id", session_uuid))
         return
     end
     if seen_keys[agent_key] then
@@ -73,93 +55,75 @@ local function process_session_manifest(record, broker_session, ghost_infos, see
         return
     end
 
-    local pty_dimensions  = sess.pty_dimensions  or {}
     local session_id = tonumber(broker_session.session_id)
     if not session_id then
         log.debug(string.format("[broker] Invalid broker session id for %s", session_uuid))
         return
     end
 
-    local dims = pty_dimensions["0"] or {}
+    local dims = (sess.pty_dimensions or {})["0"] or {}
     local rows = dims.rows or 24
     local cols = dims.cols or 80
 
-    -- Use the session_uuid from the manifest as the ghost session UUID
-    local ghost_uuid = session_uuid
-
-    local ok3, ghost_handle = pcall(
-        hub.create_ghost_session, ghost_uuid, session_id, rows, cols
+    -- Create a lightweight PTY handle (no real process, broker owns the PTY)
+    local ok, handle = pcall(
+        hub.create_ghost_session, session_uuid, session_id, rows, cols
     )
-    if not ok3 or not ghost_handle then
-        log.warn(string.format(
-            "[broker] create_ghost_session failed for %s: %s",
-            agent_key, tostring(ghost_handle)
-        ))
+    if not ok or not handle then
+        log.warn(string.format("[broker] create_ghost_session failed for %s: %s",
+            agent_key, tostring(handle)))
         return
     end
 
-    -- Register ghost handle in HandleCache
-    local ok4, reg_index = pcall(hub.register_session, ghost_uuid, ghost_handle, {
-        session_type = sess.type or "agent",
-        agent_key = agent_key,
-        workspace_id = workspace_id,
+    -- Read workspace name if not in manifest
+    local ws_name = sess.workspace_name
+    if not ws_name then
+        local data_dir = record.data_dir
+        local ws_manifest = workspace_store.read_workspace(data_dir, sess.workspace_id)
+        ws_name = ws_manifest and ws_manifest.name or nil
+    end
+
+    -- Build recovery config from manifest
+    local recovery_config = {
+        session_uuid      = session_uuid,
+        session_type      = sess.session_type or "agent",
+        session_name      = sess.session_name,
+        agent_key         = agent_key,
+        repo              = sess.repo,
+        branch_name       = sess.branch_name,
+        worktree_path     = sess.worktree_path,
+        agent_name        = sess.agent_name,
+        profile_name      = sess.profile_name,
+        metadata          = sess.metadata,
+        workspace_id      = sess.workspace_id,
+        workspace_name    = ws_name,
+        created_at        = parse_timestamp(sess.created_at),
+        title             = sess.title,
+        cwd               = sess.cwd,
+        prompt            = sess.prompt,
+        in_worktree       = sess.in_worktree,
+        handle            = handle,
         broker_session_id = session_id,
-    })
-    if not ok4 then
-        log.warn(string.format(
-            "[broker] register_session failed for %s: %s", agent_key, tostring(reg_index)
-        ))
-        return
-    end
-    -- Claim the key slot only after successful session registration.
-    seen_keys[agent_key] = true
-
-    replay_broker_snapshot(session_id, agent_key, ghost_handle)
-
-    log.info(string.format(
-        "[broker] Ghost session from workspace store: %s (uuid=%s, index=%s, ws=%s)",
-        agent_key, ghost_uuid:sub(1, 16), tostring(reg_index), workspace_id
-    ))
-
-    -- Convert structured broker_sessions to flat metadata for session info.
-    local ghost_meta = {}
-    ghost_meta["broker_session_id"] = tostring(session_id)
-    if dims.rows then ghost_meta["broker_pty_rows"] = tostring(dims.rows) end
-    if dims.cols then ghost_meta["broker_pty_cols"] = tostring(dims.cols) end
-
-    -- Read workspace manifest for name
-    local data_dir = record.data_dir
-    local ws_manifest = workspace_store.read_workspace(data_dir, workspace_id)
-    local workspace_name = ws_manifest and ws_manifest.name or nil
-
-    local ghost_info = {
-        id             = agent_key,
-        session_uuid   = ghost_uuid,
-        session_type   = sess.type or "agent",
-        session_name   = "agent",
-        workspace_id   = workspace_id,
-        workspace_name = workspace_name,
-        display_name   = sess.branch or agent_key,
-        title          = nil,
-        cwd            = sess.worktree_path,
-        agent_name     = sess.agent_name or sess.profile_name,
-        profile_name   = sess.agent_name or sess.profile_name,  -- backward compat
-        repo           = sess.repo,
-        metadata       = ghost_meta,
-        branch_name    = sess.branch,
-        worktree_path  = sess.worktree_path,
-        in_worktree    = sess.worktree_path ~= nil,
-        status         = "ghost",
-        notification   = false,
-        port           = nil,
-        created_at     = os.time(),
+        dims              = { rows = rows, cols = cols },
     }
-    local registered = Agent.register_ghost(ghost_info)
-    if not registered then
-        log.warn(string.format("[broker] Failed to register ghost info for %s", agent_key))
+
+    -- Construct a real session instance
+    local ok2, session = pcall(function()
+        if recovery_config.session_type == "accessory" then
+            return Accessory.from_recovery(recovery_config)
+        else
+            return Agent.from_recovery(recovery_config)
+        end
+    end)
+
+    if not ok2 or not session then
+        log.warn(string.format("[broker] Failed to recover session %s: %s",
+            agent_key, tostring(session)))
         return
     end
-    ghost_infos[#ghost_infos + 1] = ghost_info
+
+    seen_keys[agent_key] = true
+    recovered[#recovered + 1] = session
 end
 
 local M = {}
@@ -174,12 +138,11 @@ _event_sub = events.on("broker_sessions_recovered", function(data)
         #sessions
     ))
 
-    local ghost_infos = {}
+    local recovered = {}
     local seen_keys = {}
     local manifest_by_uuid = {}
 
-    -- Build manifest index for metadata enrichment.
-    -- Liveness comes from broker inventory, not manifest status.
+    -- Build manifest index. Liveness comes from broker inventory, not manifest status.
     local data_dir = config.data_dir and config.data_dir() or nil
     if data_dir then
         local ws = require("lib.workspace_store")
@@ -199,33 +162,31 @@ _event_sub = events.on("broker_sessions_recovered", function(data)
         local session_uuid = broker_session.session_uuid
         local record = session_uuid and manifest_by_uuid[session_uuid] or nil
         if record then
-            process_session_manifest(record, broker_session, ghost_infos, seen_keys)
+            recover_session(record, broker_session, recovered, seen_keys)
         else
             log.debug(string.format(
-                "[broker] No manifest metadata for broker session id=%s uuid=%s",
+                "[broker] No manifest for broker session id=%s uuid=%s",
                 tostring(broker_session.session_id),
                 tostring(session_uuid)
             ))
         end
     end
 
-    -- Surface ghost agents in the TUI
-    if #ghost_infos > 0 then
+    -- Broadcast recovered sessions to clients
+    if #recovered > 0 then
         local connections = require("handlers.connections")
 
         local ok, err = pcall(function()
-            for _, ghost_info in ipairs(ghost_infos) do
-                hooks.notify("agent_created", ghost_info)
+            for _, session in ipairs(recovered) do
+                hooks.notify("agent_created", session:info())
             end
             connections.broadcast_hub_event("agent_list", { agents = Agent.all_info() })
         end)
 
         if not ok then
-            log.warn(string.format("[broker] Failed to broadcast ghost agents: %s", tostring(err)))
+            log.warn(string.format("[broker] Failed to broadcast recovered sessions: %s", tostring(err)))
         else
-            log.info(string.format(
-                "[broker] Broadcast %d ghost session(s) to TUI", #ghost_infos
-            ))
+            log.info(string.format("[broker] Recovered %d session(s)", #recovered))
         end
     end
 end)

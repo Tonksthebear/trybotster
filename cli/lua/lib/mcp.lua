@@ -421,6 +421,10 @@ function M.proxy(url, opts)
     if type(url) ~= "string" or url == "" then
         error("mcp.proxy: url must be a non-empty string")
     end
+    if hub.is_offline() then
+        log.warn("mcp.proxy: skipped — hub is in offline mode")
+        return
+    end
     opts = opts or {}
     local token        = opts.token
     local on_auth_error = opts.on_auth_error

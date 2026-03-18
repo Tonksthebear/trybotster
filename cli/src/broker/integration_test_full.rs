@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use crate::broker::broker_socket_path;
 use crate::broker::connection::BrokerConnection;
+use crate::broker::protocol::sideband;
 use crate::hub::events::HubEvent;
 
 /// Poll for the broker socket file to appear, up to `timeout`.
@@ -162,6 +163,7 @@ fn test_full_pipeline_pty_output_reaches_subscriber() {
                 Ok(Some(HubEvent::BrokerPtyOutput {
                     session_id: sid,
                     data,
+                    ..
                 })) => {
                     assert_eq!(
                         sid, session_id,
@@ -194,10 +196,10 @@ fn test_full_pipeline_pty_output_reaches_subscriber() {
     // injection path that Hub uses when it receives BrokerPtyOutput events.
     // This proves the full downstream pipeline works even without a running Hub.
     let pty_session = crate::agent::pty::PtySession::new(24, 80);
-    let (shared_state, shadow_screen, ev_tx, kitty_enabled, resize_pending) =
+    let (shared_state, shadow_screen, ev_tx, kitty_enabled, cursor_visible, resize_pending) =
         pty_session.get_direct_access();
     // Forget the session so the Arc-shared internals (shared_state, shadow_screen,
-    // kitty_enabled, resize_pending) remain alive for the PtyHandle lifetime.
+    // kitty_enabled, cursor_visible, resize_pending) remain alive for the PtyHandle lifetime.
     std::mem::forget(pty_session);
 
     let pty_handle = crate::hub::agent_handle::PtyHandle::new(
@@ -205,6 +207,7 @@ fn test_full_pipeline_pty_output_reaches_subscriber() {
         shared_state,
         shadow_screen,
         kitty_enabled,
+        cursor_visible,
         resize_pending,
         true, // broker agents are CLI sessions
         None, // no HTTP forwarding port
@@ -214,7 +217,7 @@ fn test_full_pipeline_pty_output_reaches_subscriber() {
 
     // Feed the broker bytes into the handle — replicates what Hub does in its
     // BrokerPtyOutput arm of handle_hub_event().
-    pty_handle.feed_broker_output(&received_data);
+    pty_handle.feed_broker_output(&received_data, sideband::CURSOR_VISIBLE);
 
     // Drain the broadcast channel until PtyEvent::Output(received_data) arrives.
     // feed_broker_output may emit earlier events (OSC scans for title/CWD/kitty
@@ -460,6 +463,7 @@ fn test_hub_reconnect_snapshot_and_output() {
                 Ok(Some(HubEvent::BrokerPtyOutput {
                     session_id: sid,
                     data,
+                    ..
                 })) => {
                     assert_eq!(sid, session_id2, "BrokerPtyOutput for wrong session_id");
                     accumulated.extend_from_slice(&data);
@@ -620,6 +624,7 @@ fn test_existing_session_routes_to_hub_b_after_reconnect() {
                 Ok(Some(HubEvent::BrokerPtyOutput {
                     session_id: sid,
                     data,
+                    ..
                 })) => {
                     assert_eq!(
                         sid, session_id1,

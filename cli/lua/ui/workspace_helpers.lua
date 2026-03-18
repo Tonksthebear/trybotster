@@ -13,7 +13,7 @@ local function classify_agent_status(status)
   if status == "active" or status == "running" or status == "spawning_ptys" or status == "creating_worktree" then
     return "active"
   end
-  if status == "orphaned" or status == "ghost" then
+  if status == "orphaned" then
     return "orphaned"
   end
   if status == "closed" or status == "deleted" or status == "exited" then
