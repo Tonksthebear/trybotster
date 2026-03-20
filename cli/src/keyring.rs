@@ -175,7 +175,10 @@ pub fn check_credential_storage() -> Result<()> {
         return Ok(());
     }
 
-    // On Linux, probe D-Bus Secret Service with a round-trip test
+    let wsl = is_wsl();
+
+    // On Linux (including WSL with systemd), probe D-Bus Secret Service.
+    // WSL with systemd enabled can run gnome-keyring normally.
     match probe_keyring() {
         Ok(()) => {
             log::info!("Secure credential storage available (D-Bus Secret Service)");
@@ -183,7 +186,11 @@ pub fn check_credential_storage() -> Result<()> {
         }
         Err(e) => {
             log::warn!("Secure credential storage unavailable: {e}");
-            prompt_file_storage_fallback()
+            if wsl {
+                prompt_wsl_storage_fallback()
+            } else {
+                prompt_file_storage_fallback()
+            }
         }
     }
 }
@@ -215,6 +222,87 @@ fn probe_keyring() -> Result<()> {
         anyhow::bail!("Keyring round-trip mismatch");
     }
 
+    Ok(())
+}
+
+/// Detect if running inside Windows Subsystem for Linux.
+///
+/// Checks `/proc/version` for Microsoft/WSL markers — the standard detection
+/// method used by most tools (systemd, VS Code, etc.).
+fn is_wsl() -> bool {
+    std::fs::read_to_string("/proc/version")
+        .map(|v| {
+            let lower = v.to_lowercase();
+            lower.contains("microsoft") || lower.contains("wsl")
+        })
+        .unwrap_or(false)
+}
+
+/// WSL-specific fallback: explain how to enable secure storage via systemd,
+/// or accept file-based storage. WSL users shouldn't see generic Linux
+/// distro instructions that won't help without systemd context.
+fn prompt_wsl_storage_fallback() -> Result<()> {
+    use std::io::{self, Write};
+
+    let path = credentials_file_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| format!("~/.config/{}/credentials.json", crate::env::APP_NAME));
+
+    let has_systemd = std::path::Path::new("/run/systemd/system").exists();
+
+    eprintln!();
+    eprintln!("  WSL detected — secure credential storage is not available.");
+    eprintln!();
+
+    if has_systemd {
+        // systemd is running but D-Bus probe still failed — missing gnome-keyring
+        eprintln!("  systemd is running. Install a keyring service to enable secure storage:");
+        eprintln!();
+        eprintln!("    sudo apt install gnome-keyring libsecret-1-0");
+        eprintln!("    # Then restart your WSL session");
+    } else {
+        // No systemd — need to enable it first
+        eprintln!("  To enable secure storage, turn on systemd in WSL:");
+        eprintln!();
+        eprintln!("    1. Add to /etc/wsl.conf:");
+        eprintln!("         [boot]");
+        eprintln!("         systemd=true");
+        eprintln!();
+        eprintln!("    2. Restart WSL (from PowerShell: wsl --shutdown)");
+        eprintln!();
+        eprintln!("    3. Install a keyring service:");
+        eprintln!("         sudo apt install gnome-keyring libsecret-1-0");
+    }
+
+    eprintln!();
+    eprintln!("  Without a keyring, credentials will be stored in:");
+    eprintln!("    {path}");
+    eprintln!("  Protected by file permissions (0600) only — NOT a secure enclave.");
+    eprintln!();
+
+    // Non-interactive: fall back automatically
+    if !atty::is(atty::Stream::Stdin) {
+        eprintln!("  Non-interactive session detected, using file storage.");
+        eprintln!();
+        FILE_STORAGE_ACCEPTED.store(true, Ordering::SeqCst);
+        return Ok(());
+    }
+
+    print!("  Continue without secure credential storage? [Y/n] ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_lowercase();
+
+    if input == "n" || input == "no" {
+        anyhow::bail!(
+            "Secure credential storage required. Enable systemd + gnome-keyring in WSL, \
+             or set BOTSTER_TOKEN env var to bypass credential storage entirely."
+        );
+    }
+
+    FILE_STORAGE_ACCEPTED.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -254,8 +342,6 @@ fn prompt_file_storage_fallback() -> Result<()> {
     eprintln!("    Then start the keyring:");
     eprintln!("      eval $(dbus-launch --sh-syntax) && \\");
     eprintln!("        echo \"\" | gnome-keyring-daemon --unlock --start --components=secrets");
-    eprintln!();
-    eprintln!("  Note: WSL2 keyring support is unreliable and not recommended.");
     eprintln!();
     eprintln!("  Without a keyring, credentials will be stored in:");
     eprintln!("    {path}");
