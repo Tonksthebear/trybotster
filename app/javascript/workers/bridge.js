@@ -314,6 +314,15 @@ class WorkerBridge {
   }
 
   /**
+   * Reset the outbound ratchet from the current in-memory bundle.
+   * @param {string} hubId - The hub ID
+   * @returns {Promise<{reset: boolean}>}
+   */
+  async resetSession(hubId) {
+    return this.sendCrypto("resetSession", { hubId })
+  }
+
+  /**
    * Check if a session exists for a hub
    * @param {string} hubId - The hub ID
    * @returns {Promise<{hasSession: boolean}>}
@@ -383,7 +392,7 @@ class WorkerBridge {
   }
 
   /**
-   * Clear all sessions (memory + IndexedDB).
+   * Clear all sessions.
    * @returns {Promise<{cleared: boolean, count: number}>}
    */
   async clearAllSessions() {

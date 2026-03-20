@@ -1,8 +1,8 @@
 /**
  * HubCrypto - thin crypto adapter over SharedWorker bridge.
  *
- * Important: this does NOT own key/session persistence. Existing Olm account
- * and ratchet/session storage remains in workers/olm_crypto.js.
+ * Important: this does NOT own key/session lifecycle. The SharedWorker keeps
+ * active Olm state in memory only.
  */
 
 import bridge from "workers/bridge"
