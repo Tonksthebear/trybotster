@@ -423,9 +423,13 @@ export default class extends Controller {
   #buildAgentItem(agent, hubId) {
     const clone = this.templateTarget.content.cloneNode(true);
     const root = clone.firstElementChild;
+    const isAccessory = agent.session_type === "accessory";
 
     // Stable ID for Idiomorph keying
     root.id = `agent-${agent.id}`;
+
+    // Mark session type for CSS targeting
+    root.dataset.sessionType = agent.session_type || "agent";
 
     // Set data attributes
     this.#setDataAttributes(root, agent);
@@ -435,11 +439,30 @@ export default class extends Controller {
       const field = el.dataset.field;
       if (field === "name") {
         el.textContent = agent.display_name || agent.id;
+        // Accessories get muted styling
+        if (isAccessory) {
+          el.classList.add("text-zinc-400");
+          el.classList.remove("text-zinc-100");
+        }
       } else if (field === "subtext") {
-        const parts = [];
-        if (agent.profile_name) parts.push(agent.profile_name);
-        if (agent.branch_name) parts.push(agent.branch_name);
-        el.textContent = parts.join(" · ");
+        if (isAccessory) {
+          el.textContent = "accessory";
+        } else {
+          const parts = [];
+          if (agent.profile_name) parts.push(agent.profile_name);
+          if (agent.branch_name) parts.push(agent.branch_name);
+          el.textContent = parts.join(" · ");
+        }
+      } else if (field === "label") {
+        if (agent.label) {
+          el.textContent = agent.label;
+          el.classList.remove("hidden");
+        }
+      } else if (field === "task") {
+        if (agent.task) {
+          el.textContent = agent.task;
+          el.classList.remove("hidden");
+        }
       } else if (field === "id") {
         el.textContent = agent.id;
       } else if (agent[field] !== undefined) {
@@ -455,6 +478,13 @@ export default class extends Controller {
         .replace("{sessionUuid}", sessionUuid);
       delete el.dataset.href;
     });
+
+    // Accessories: hide the move-to-workspace button (they belong to their workspace)
+    if (isAccessory) {
+      root
+        .querySelectorAll("[data-action*='moveAgentWorkspace']")
+        .forEach((el) => el.classList.add("hidden"));
+    }
 
     // Selection state
     if (agent.id === this.selectedIdValue) {

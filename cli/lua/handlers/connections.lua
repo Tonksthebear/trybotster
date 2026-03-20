@@ -303,6 +303,17 @@ hooks.on("pty_cwd_changed", "update_agent_cwd", function(info)
     end
 end)
 
+-- Track last PTY output time for idle detection.
+-- Fires on the Rust PTY output hot path (debounced by observer queue budget).
+-- Does NOT broadcast agent_list — that would be too noisy. Clients read
+-- last_output_at from the next agent_list broadcast triggered by other events.
+hooks.on("pty_output", "update_last_output_at", function(ctx, _data)
+    local agent = ctx.session_uuid and Agent.get(ctx.session_uuid)
+    if agent then
+        agent.last_output_at = os.time()
+    end
+end)
+
 -- Track shell integration prompt marks (OSC 133/633).
 hooks.on("pty_prompt", "update_agent_prompt", function(info)
     local agent = info.agent_key and Agent.find_by_agent_key(info.agent_key)
@@ -460,6 +471,7 @@ function M._before_reload()
     hooks.off("pty_notification", "push_notification")
     hooks.off("pty_title_changed", "update_agent_title")
     hooks.off("pty_cwd_changed", "update_agent_cwd")
+    hooks.off("pty_output", "update_last_output_at")
     hooks.off("pty_prompt", "update_agent_prompt")
     hooks.off("pty_cursor_visibility", "update_agent_cursor")
     _set_pty_focused = nil

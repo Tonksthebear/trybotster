@@ -321,7 +321,8 @@ pub struct Hub {
     ///
     /// Used to timeout connections stuck in "Connecting" state (e.g., ICE
     /// negotiation that never completes due to network issues).
-    /// Connections that don't reach "Connected" within 30 seconds are cleaned up.
+    /// Connections that don't reach "Connected" within the bounded cleanup
+    /// window are removed so retries do not require a manual refresh.
     webrtc_connection_started: std::collections::HashMap<String, Instant>,
 
     /// Per-peer async send tasks, keyed by browser identity.

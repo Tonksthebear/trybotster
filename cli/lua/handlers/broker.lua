@@ -101,6 +101,8 @@ local function recover_session(record, broker_session, recovered, seen_keys)
         title             = sess.title,
         cwd               = sess.cwd,
         prompt            = sess.prompt,
+        label             = sess.label,
+        task              = sess.task,
         in_worktree       = sess.in_worktree,
         handle            = handle,
         broker_session_id = session_id,

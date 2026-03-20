@@ -149,14 +149,14 @@
            data-agent-list-workspaces-value="[]"
            id="hub-agent-list">
         <div data-agent-list-target="header" class="flex items-center justify-between mb-4 hidden">
-          <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider">Agents</h2>
+          <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider">Workspaces</h2>
           <button type="button"
                   data-controller="requires-connection"
                   data-requires-connection-key-value="<%= Current.hub.id %>"
                   class="p-1.5 text-zinc-500 hover:text-primary-400 hover:bg-zinc-800/50 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-500"
-                  title="New Agent"
+                  title="New Session"
                   command="show-modal"
-                  commandfor="new-agent-modal"
+                  commandfor="new-session-chooser-modal"
                   disabled>
             <%= icon "plus", class: "size-5" %>
           </button>
@@ -193,7 +193,9 @@
               </div>
               <div class="flex-1 min-w-0">
                 <div data-field="name" class="text-sm font-medium text-zinc-100 truncate font-mono"></div>
+                <div data-field="label" class="text-xs text-primary-400/80 truncate hidden"></div>
                 <div data-field="subtext" class="text-xs text-zinc-400 truncate"></div>
+                <div data-field="task" class="text-xs text-zinc-500 italic truncate hidden"></div>
               </div>
               <%= icon "chevron-right", class: "size-5 text-zinc-600 shrink-0" %>
             </a>
@@ -220,17 +222,17 @@
         <%# Empty state %>
         <div data-agent-list-target="empty" class="hidden py-8 text-center">
           <%= icon "sparkles", class: "size-12 text-zinc-700 mx-auto mb-4" %>
-          <h3 class="text-lg font-medium text-zinc-300 mb-2">No agents running</h3>
-          <p class="text-sm text-zinc-500 mb-4">Start a new agent to begin working</p>
+          <h3 class="text-lg font-medium text-zinc-300 mb-2">No sessions running</h3>
+          <p class="text-sm text-zinc-500 mb-4">Start a new agent or accessory to begin working</p>
           <button type="button"
                   data-controller="requires-connection"
                   data-requires-connection-key-value="<%= Current.hub.id %>"
                   command="show-modal"
-                  commandfor="new-agent-modal"
+                  commandfor="new-session-chooser-modal"
                   class="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 hover:bg-primary-500 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   disabled>
             <%= icon "plus", class: "size-4" %>
-            New Agent
+            New Session
           </button>
         </div>
 
@@ -243,7 +245,7 @@
           </div>
           <h3 class="text-lg font-medium text-zinc-200 mb-2">Connecting to hub...</h3>
           <p class="text-sm text-zinc-500 max-w-xs mx-auto">
-            Establishing a secure connection. Agents will appear here once connected.
+            Establishing a secure connection. Sessions will appear here once connected.
           </p>
         </div>
       </div>

@@ -225,6 +225,20 @@ export class HubConnection extends HubRoute {
   }
 
   /**
+   * Create a standalone accessory session in a workspace.
+   * @param {string} accessoryName - Config name (e.g., "rails-server")
+   * @param {string|null} workspaceId - Existing workspace ID
+   * @param {string|null} workspaceName - Workspace name (for creation or display)
+   */
+  createAccessory(accessoryName, workspaceId = null, workspaceName = null) {
+    return this.send("create_accessory", {
+      accessory_name: accessoryName,
+      workspace_id: workspaceId,
+      workspace_name: workspaceName,
+    });
+  }
+
+  /**
    * Request agent/accessory/workspace config from CLI.
    */
   requestAgentConfig() {
