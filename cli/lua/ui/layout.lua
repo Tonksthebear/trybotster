@@ -148,9 +148,13 @@ local function build_list_items()
         end
 
         local item = { text = text }
-        -- Secondary: always show branch name
-        if agent.branch_name then
-          item.secondary = { { text = "  " .. agent.branch_name, style = "dim" } }
+        -- Secondary: branch + label + task
+        local parts = {}
+        if agent.branch_name then parts[#parts+1] = agent.branch_name end
+        if agent.label and agent.label ~= "" then parts[#parts+1] = agent.label end
+        if agent.task and agent.task ~= "" then parts[#parts+1] = agent.task end
+        if #parts > 0 then
+          item.secondary = { { text = "  " .. table.concat(parts, " · "), style = "dim" } }
         end
         items[#items+1] = item
       else

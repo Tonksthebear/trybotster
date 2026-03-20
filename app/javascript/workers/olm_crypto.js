@@ -9,10 +9,8 @@
  *   sessions  - VodozemacSession (encrypt/decrypt)
  *   bundles   - parsed CLI bundle (identity_key, one_time_key)
  *
- * Persistence:
- *   Sessions are pickled and stored in IndexedDB so they survive
- *   SharedWorker restarts (all tabs closed). A random 32-byte pickle
- *   key is generated once and stored alongside the pickled data.
+ * State is intentionally memory-only. When the SharedWorker exits,
+ * the ratchet exits with it.
  *
  * Wire format (OlmEnvelope):
  *   PreKey:  { t: 0, b: "<base64 ciphertext>", k: "<sender curve25519 key>" }
@@ -22,7 +20,7 @@
 // WASM module state
 let wasmModule = null
 
-// Per-hub crypto state (in-memory, restored from IndexedDB on demand)
+// Per-hub crypto state (memory only)
 const accounts = new Map()  // hubId -> VodozemacAccount
 const sessions = new Map()  // hubId -> VodozemacSession
 const bundles  = new Map()  // hubId -> parsed CLI bundle
@@ -39,313 +37,6 @@ function bytesToBase64(bytes) {
 function base64ToBytes(b64) {
   const binary = atob(b64)
   return Uint8Array.from(binary, c => c.charCodeAt(0))
-}
-
-// =============================================================================
-// IndexedDB Persistence
-// =============================================================================
-
-const DB_NAME = "vodozemac-crypto"
-const DB_VERSION = 1
-const STORE_NAME = "sessions"
-const PICKLE_KEY_ID = "__pickle_key__"
-const DB_TIMEOUT_MS = 3000
-
-let dbInstance = null
-
-function withTimeout(label, promise, timeoutMs = DB_TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timeout after ${timeoutMs}ms`)), timeoutMs)
-    promise.then(
-      (value) => {
-        clearTimeout(timer)
-        resolve(value)
-      },
-      (error) => {
-        clearTimeout(timer)
-        reject(error)
-      }
-    )
-  })
-}
-
-function openDB() {
-  if (dbInstance) return Promise.resolve(dbInstance)
-
-  return withTimeout("IndexedDB open", new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION)
-    req.onupgradeneeded = () => {
-      if (!req.result.objectStoreNames.contains(STORE_NAME)) {
-        req.result.createObjectStore(STORE_NAME)
-      }
-    }
-    req.onsuccess = () => {
-      dbInstance = req.result
-      dbInstance.onclose = () => {
-        console.warn("[VodozemacCrypto] IndexedDB connection closed")
-        dbInstance = null
-      }
-      resolve(dbInstance)
-    }
-    req.onerror = () => reject(req.error)
-    req.onblocked = () => reject(new Error("IndexedDB open blocked"))
-  }))
-}
-
-function dbGet(key) {
-  return openDB().then(db => withTimeout(`IndexedDB get ${key}`, new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readonly")
-    const req = tx.objectStore(STORE_NAME).get(key)
-    req.onsuccess = () => resolve(req.result)
-    req.onerror = () => reject(req.error)
-    tx.onabort = () => reject(tx.error || new Error(`IndexedDB get aborted: ${key}`))
-  })))
-}
-
-function dbPut(key, value) {
-  return openDB().then(db => withTimeout(`IndexedDB put ${key}`, new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readwrite")
-    const req = tx.objectStore(STORE_NAME).put(value, key)
-    req.onsuccess = () => resolve()
-    req.onerror = () => reject(req.error)
-    tx.onabort = () => reject(tx.error || new Error(`IndexedDB put aborted: ${key}`))
-  })))
-}
-
-function dbDelete(key) {
-  return openDB().then(db => withTimeout(`IndexedDB delete ${key}`, new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readwrite")
-    const req = tx.objectStore(STORE_NAME).delete(key)
-    req.onsuccess = () => resolve()
-    req.onerror = () => reject(req.error)
-    tx.onabort = () => reject(tx.error || new Error(`IndexedDB delete aborted: ${key}`))
-  })))
-}
-
-/** Delete all hub:* keys from IndexedDB, preserving __pickle_key__. */
-function dbDeleteAllHubs() {
-  return openDB().then(db => withTimeout("IndexedDB delete all hubs", new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, "readwrite")
-    const store = tx.objectStore(STORE_NAME)
-    const req = store.getAllKeys()
-    req.onsuccess = () => {
-      const hubKeys = req.result.filter(k => typeof k === "string" && k.startsWith("hub:"))
-      for (const key of hubKeys) store.delete(key)
-      tx.oncomplete = () => resolve(hubKeys.length)
-      tx.onerror = () => reject(tx.error)
-    }
-    req.onerror = () => reject(req.error)
-    tx.onabort = () => reject(tx.error || new Error("IndexedDB delete all aborted"))
-  })))
-}
-
-// =============================================================================
-// Storage Encryption (AES-GCM derived from pickle key)
-// =============================================================================
-
-/**
- * Derive an AES-GCM CryptoKey from raw pickle key bytes at runtime.
- *
- * Safari has known bugs with storing CryptoKey objects in IndexedDB
- * (WebKit #177350, #183167) — structured clone of non-extractable keys
- * fails silently, breaking session restore. Instead, we store only raw
- * bytes (the pickle key) and import as a CryptoKey on demand.
- */
-async function deriveStorageKey(pickleKeyBytes) {
-  if (!crypto.subtle) return null
-  return crypto.subtle.importKey(
-    "raw",
-    pickleKeyBytes,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"]
-  )
-}
-
-/**
- * Encrypt a JS object for IndexedDB storage.
- * Returns `{ iv: Uint8Array, ciphertext: ArrayBuffer }` on success, or the
- * plain data object if crypto.subtle is unavailable or fails.
- */
-async function encryptForStorage(data, pickleKeyBytes) {
-  try {
-    const key = await deriveStorageKey(pickleKeyBytes)
-    if (!key) return data
-    const iv = crypto.getRandomValues(new Uint8Array(12))
-    const encoded = new TextEncoder().encode(JSON.stringify(data))
-    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, encoded)
-    return { iv, ciphertext }
-  } catch (e) {
-    console.warn("[VodozemacCrypto] encryptForStorage failed, storing plain:", e.message)
-    return data
-  }
-}
-
-/**
- * Decrypt a `{ iv, ciphertext }` envelope from IndexedDB back to a JS object.
- * Returns `null` if decryption fails (caller should try plain format).
- */
-async function decryptFromStorage(encrypted, pickleKeyBytes) {
-  try {
-    const key = await deriveStorageKey(pickleKeyBytes)
-    if (!key) return null
-    const plaintext = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: new Uint8Array(encrypted.iv) },
-      key,
-      encrypted.ciphertext
-    )
-    return JSON.parse(new TextDecoder().decode(plaintext))
-  } catch (e) {
-    console.warn("[VodozemacCrypto] decryptFromStorage failed:", e.message)
-    return null
-  }
-}
-
-/**
- * Detect encrypted format ({ iv, ciphertext }) vs plain object.
- */
-function isEncryptedFormat(value) {
-  return value && value.iv && value.ciphertext
-}
-
-// =============================================================================
-// Pickle Key & State Persistence
-// =============================================================================
-
-/**
- * Get or create a 32-byte pickle key.
- *
- * Stored as raw bytes (Array) in IndexedDB — NOT as a CryptoKey, because
- * Safari SharedWorkers can't structured-clone CryptoKey objects (WebKit #183167).
- * The pickle key doubles as the AES-GCM storage encryption key (imported at
- * runtime via crypto.subtle.importKey).
- */
-let pickleKeyCache = null
-
-async function getPickleKey() {
-  if (pickleKeyCache) return pickleKeyCache
-
-  const stored = await dbGet(PICKLE_KEY_ID)
-  if (stored) {
-    // Handle both Array and Uint8Array (legacy) formats
-    pickleKeyCache = new Uint8Array(stored)
-    return pickleKeyCache
-  }
-
-  pickleKeyCache = new Uint8Array(32)
-  crypto.getRandomValues(pickleKeyCache)
-  await dbPut(PICKLE_KEY_ID, Array.from(pickleKeyCache))
-  return pickleKeyCache
-}
-
-/** Pickle account + session, encrypt, and write to IndexedDB. */
-async function persistState(hubId) {
-  try {
-    const pickleKey = await getPickleKey()
-    const account = accounts.get(hubId)
-    if (!account) return
-
-    const session = sessions.get(hubId)
-    const bundle = bundles.get(hubId)
-
-    // Strip raw byte fields before persisting — Uint8Arrays don't survive
-    // JSON round-tripping, and are only needed at session creation time for
-    // Ed25519 verification (fresh bundles always arrive with raw bytes).
-    let persistBundle = null
-    if (bundle) {
-      const { signedData, signingKeyRaw, signatureRaw, ...rest } = bundle
-      persistBundle = rest
-    }
-
-    const state = {
-      accountPickle: account.pickle(pickleKey),
-      sessionPickle: session ? session.pickle(pickleKey) : null,
-      bundle: persistBundle,
-    }
-
-    const encrypted = await encryptForStorage(state, pickleKey)
-    await dbPut(`hub:${hubId}`, encrypted)
-  } catch (e) {
-    console.warn("[VodozemacCrypto] Persist failed:", e)
-  }
-}
-
-/** Restore account + session from encrypted IndexedDB into memory. */
-async function restoreState(hubId) {
-  if (accounts.has(hubId)) return true
-
-  if (!wasmModule) return false
-
-  console.log(`[VodozemacCrypto] restoreState start for hub ${hubId.substring(0, 8)}...`)
-  const raw = await dbGet(`hub:${hubId}`)
-  if (!raw) return false
-
-  const pickleKey = await getPickleKey()
-
-  let state
-  if (isEncryptedFormat(raw)) {
-    state = await decryptFromStorage(raw, pickleKey)
-    // If decrypt failed (key mismatch, Safari bug, etc.), try as plain object
-    if (!state && raw.accountPickle) state = raw
-  } else if (raw.accountPickle) {
-    // Legacy unencrypted format — use directly, will be re-encrypted on next persist
-    state = raw
-  } else {
-    return false
-  }
-
-  if (!state || !state.accountPickle) return false
-
-  try {
-    const account = wasmModule.VodozemacAccount.fromPickle(state.accountPickle, pickleKey)
-    accounts.set(hubId, account)
-
-    if (state.sessionPickle) {
-      const session = wasmModule.VodozemacSession.fromPickle(state.sessionPickle, pickleKey)
-      sessions.set(hubId, session)
-    }
-
-    if (state.bundle) {
-      bundles.set(hubId, state.bundle)
-    }
-
-    // Re-encrypt legacy unencrypted data on next persist
-    console.log(`[VodozemacCrypto] Restored session for hub ${hubId.substring(0, 8)}...`)
-    return true
-  } catch (e) {
-    console.warn("[VodozemacCrypto] Failed to restore state, clearing:", e)
-    await dbDelete(`hub:${hubId}`)
-    accounts.delete(hubId)
-    sessions.delete(hubId)
-    bundles.delete(hubId)
-    return false
-  }
-}
-
-async function restoreStateSafely(hubId, reason) {
-  try {
-    return await restoreState(hubId)
-  } catch (e) {
-    console.warn(
-      `[VodozemacCrypto] restoreState failed during ${reason} for hub ${hubId.substring(0, 8)}...:`,
-      e
-    )
-
-    // Safari can wedge SharedWorker IndexedDB operations. Treat restore
-    // failures as "no persisted session" so crypto startup keeps moving.
-    accounts.delete(hubId)
-    sessions.delete(hubId)
-    bundles.delete(hubId)
-
-    if (dbInstance) {
-      try {
-        dbInstance.close()
-      } catch {}
-      dbInstance = null
-    }
-
-    return false
-  }
 }
 
 // =============================================================================
@@ -386,7 +77,6 @@ async function handleInit(wasmJsUrl, wasmBinaryUrl) {
  * 1. Create a VodozemacAccount (browser's identity)
  * 2. Parse CLI bundle for identity_key + one_time_key
  * 3. Create outbound session to CLI
- * 4. Persist to IndexedDB
  *
  * @param {string} hubId
  * @param {string|Object} bundleJson - CLI's PreKey bundle
@@ -440,9 +130,6 @@ async function handleCreateSession(hubId, bundleJson) {
   sessions.set(hubId, session)
   bundles.set(hubId, bundle)
 
-  // Persist to IndexedDB
-  await persistState(hubId)
-
   const identityKey = account.curve25519Key()
 
   console.log(`[VodozemacCrypto] Created session for hub ${hubId.substring(0, 8)}...`)
@@ -450,17 +137,32 @@ async function handleCreateSession(hubId, bundleJson) {
 }
 
 /**
+ * Start a fresh outbound ratchet from the latest in-memory bundle.
+ *
+ * Keeps the browser identity stable while ensuring each new offer starts from
+ * a fresh outbound session.
+ */
+async function handleResetSession(hubId) {
+  if (!wasmModule) throw new Error("WASM not initialized")
+
+  const account = accounts.get(hubId)
+  const bundle = bundles.get(hubId)
+  if (!account) throw new Error(`No account for hub ${hubId}`)
+  if (!bundle?.identityKey || !bundle?.oneTimeKey) {
+    throw new Error(`No bundle for hub ${hubId}`)
+  }
+
+  const session = account.createOutboundSession(bundle.identityKey, bundle.oneTimeKey)
+  sessions.set(hubId, session)
+
+  return { reset: true }
+}
+
+/**
  * Check if we have an active session for a hub.
- * Attempts to restore from IndexedDB if not in memory.
  */
 async function handleHasSession(hubId) {
-  console.log(`[VodozemacCrypto] hasSession start for hub ${hubId.substring(0, 8)}...`)
-  if (sessions.has(hubId)) return { hasSession: true }
-
-  // Try restoring from IndexedDB
-  const restored = await restoreStateSafely(hubId, "hasSession")
-  console.log(`[VodozemacCrypto] hasSession result for hub ${hubId.substring(0, 8)}... restored=${restored} inMemory=${sessions.has(hubId)}`)
-  return { hasSession: restored && sessions.has(hubId) }
+  return { hasSession: sessions.has(hubId) }
 }
 
 /**
@@ -472,9 +174,6 @@ async function handleHasSession(hubId) {
  * @returns {{ encrypted: Object }} - OlmEnvelope { t, b, k? }
  */
 async function handleEncrypt(hubId, message) {
-  // Try restore if not in memory
-  if (!sessions.has(hubId)) await restoreStateSafely(hubId, "encrypt")
-
   const session = sessions.get(hubId)
   const account = accounts.get(hubId)
   if (!session) throw new Error(`No session for hub ${hubId}`)
@@ -495,10 +194,6 @@ async function handleEncrypt(hubId, message) {
     envelope.k = account.curve25519Key()
   }
 
-  // Persist ratchet advancement before returning so page eviction
-  // (phone lock/unlock) cannot leave stale ratchet state in IndexedDB.
-  await persistState(hubId)
-
   return { encrypted: envelope }
 }
 
@@ -511,9 +206,6 @@ async function handleEncrypt(hubId, message) {
  * @returns {{ plaintext: any }}
  */
 async function handleDecrypt(hubId, encryptedData) {
-  // Try restore if not in memory
-  if (!accounts.has(hubId)) await restoreStateSafely(hubId, "decrypt")
-
   const envelope = typeof encryptedData === "string" ? JSON.parse(encryptedData) : encryptedData
   const ciphertext = base64ToBytes(envelope.b)
 
@@ -540,10 +232,6 @@ async function handleDecrypt(hubId, encryptedData) {
     plaintextBytes = session.decrypt(envelope.t, ciphertext)
   }
 
-  // Persist ratchet advancement before returning so page eviction
-  // cannot leave stale ratchet state in IndexedDB.
-  await persistState(hubId)
-
   // Decode UTF-8 and parse JSON
   const plaintextStr = new TextDecoder().decode(plaintextBytes)
   try {
@@ -568,8 +256,6 @@ async function handleDecrypt(hubId, encryptedData) {
  * @returns {{ data: Uint8Array }}
  */
 async function handleEncryptBinary(hubId, plaintext) {
-  if (!sessions.has(hubId)) await restoreStateSafely(hubId, "encryptBinary")
-
   const session = sessions.get(hubId)
   const account = accounts.get(hubId)
   if (!session) throw new Error(`No session for hub ${hubId}`)
@@ -594,7 +280,6 @@ async function handleEncryptBinary(hubId, plaintext) {
     frame.set(ciphertext, 1)
   }
 
-  await persistState(hubId)
   return { data: frame }
 }
 
@@ -609,8 +294,6 @@ async function handleEncryptBinary(hubId, plaintext) {
  * @returns {{ data: Uint8Array }}
  */
 async function handleDecryptBinary(hubId, data) {
-  if (!accounts.has(hubId)) await restoreStateSafely(hubId, "decryptBinary")
-
   const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
   if (bytes.length === 0) throw new Error("Empty binary frame")
 
@@ -629,7 +312,6 @@ async function handleDecryptBinary(hubId, data) {
     if (session) {
       try {
         plaintextBytes = session.decrypt(0, ciphertext)
-        await persistState(hubId)
         return { data: new Uint8Array(plaintextBytes) }
       } catch {
         // Session couldn't decrypt — new pairing, create inbound
@@ -649,65 +331,41 @@ async function handleDecryptBinary(hubId, data) {
     plaintextBytes = session.decrypt(1, ciphertext)
   }
 
-  await persistState(hubId)
   return { data: new Uint8Array(plaintextBytes) }
 }
 
 /**
  * Get the browser's identity key (Curve25519) for a hub.
- * Attempts to restore from IndexedDB if not in memory.
  */
 async function handleGetIdentityKey(hubId) {
-  if (!accounts.has(hubId)) await restoreStateSafely(hubId, "getIdentityKey")
-
   const account = accounts.get(hubId)
   if (!account) throw new Error(`No account for hub ${hubId}`)
   return { identityKey: account.curve25519Key() }
 }
 
 /**
- * Clear session state for a hub (memory + IndexedDB).
+ * Clear session state for a hub.
  */
 async function handleClearSession(hubId) {
   accounts.delete(hubId)
   sessions.delete(hubId)
   bundles.delete(hubId)
 
-  await dbDelete(`hub:${hubId}`)
-
   console.log(`[VodozemacCrypto] Cleared session for hub ${hubId.substring(0, 8)}...`)
   return { cleared: true }
 }
 
 /**
- * Clear ALL session state (memory + IndexedDB).
+ * Clear ALL session state.
  * Used by test teardown to prevent session leakage between tests.
- *
- * Nuclear cleanup: clears in-memory Maps, ALL hub:* IndexedDB entries,
- * pickle key cache, and closes the IDB connection to prevent stale handles.
  */
 async function handleClearAllSessions() {
   accounts.clear()
   sessions.clear()
   bundles.clear()
-  pickleKeyCache = null
 
-  // Clear all hub:* entries from IndexedDB (preserving __pickle_key__)
-  let deleted = 0
-  try {
-    deleted = await dbDeleteAllHubs()
-  } catch {
-    // IDB may have been deleted externally — that's fine
-  }
-
-  // Close IDB connection so it can be cleanly deleted/reopened
-  if (dbInstance) {
-    dbInstance.close()
-    dbInstance = null
-  }
-
-  console.log(`[VodozemacCrypto] Cleared all sessions (${deleted} IDB entries)`)
-  return { cleared: true, count: deleted }
+  console.log("[VodozemacCrypto] Cleared all sessions")
+  return { cleared: true, count: 0 }
 }
 
 // =============================================================================
@@ -735,6 +393,9 @@ async function handleMessage(event, portId, replyFn) {
         break
       case "createSession":
         result = await handleCreateSession(params.hubId, params.bundleJson)
+        break
+      case "resetSession":
+        result = await handleResetSession(params.hubId)
         break
       case "hasSession":
         result = await handleHasSession(params.hubId)

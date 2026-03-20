@@ -1013,6 +1013,20 @@ impl Hub {
                     return;
                 }
 
+                if encrypted_answer.is_none() {
+                    log::warn!(
+                        "[WebRTC] Offer handling failed for {} — discarding channel so the next retry can start cleanly",
+                        &browser_identity[..browser_identity.len().min(8)]
+                    );
+                    self.webrtc_connection_started.remove(&browser_identity);
+                    self.webrtc_offer_generation.remove(&browser_identity);
+                    self.webrtc_pending_ice_candidates.remove(&browser_identity);
+                    self.tokio_runtime.spawn(async move {
+                        channel.disconnect().await;
+                    });
+                    return;
+                }
+
                 if let Some(mut replaced) = self
                     .webrtc_channels
                     .insert(browser_identity.clone(), channel)
@@ -1078,16 +1092,16 @@ impl Hub {
                     }
                 }
 
-                if let Some(envelope_value) = encrypted_answer {
-                    let data = serde_json::json!({
-                        "browser_identity": browser_identity,
-                        "envelope": envelope_value,
-                    });
-                    if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
-                        log::error!("[WebRTC] Failed to fire outgoing_signal for answer: {e}");
-                    } else {
-                        log::info!("[WebRTC] Encrypted answer sent via Lua relay (async)");
-                    }
+                let envelope_value =
+                    encrypted_answer.expect("encrypted_answer checked above to be present");
+                let data = serde_json::json!({
+                    "browser_identity": browser_identity,
+                    "envelope": envelope_value,
+                });
+                if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
+                    log::error!("[WebRTC] Failed to fire outgoing_signal for answer: {e}");
+                } else {
+                    log::info!("[WebRTC] Encrypted answer sent via Lua relay (async)");
                 }
             }
         }
@@ -1673,8 +1687,10 @@ impl Hub {
         // Enter tokio runtime for channel state() calls
         let _guard = self.tokio_runtime.enter();
 
-        // Timeout for connections stuck in "Connecting" state (30 seconds)
-        const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+        // Timeout for connections stuck in "Connecting" state.
+        // Keep this comfortably above the offer/answer happy path, but short
+        // enough that failed negotiations do not force manual refreshes.
+        const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
         let now = Instant::now();
 
         // Collect IDs of channels that need cleanup:
@@ -4067,13 +4083,16 @@ impl Hub {
         };
 
         // Spawn async task for SDP negotiation + answer encryption.
-        // This is the slow path: fetch_ice_config can take 10+ seconds.
+        // This is the slow path: ICE config fetch + negotiation + envelope encryption.
         self.tokio_runtime.spawn(async move {
+            let started_at = Instant::now();
             let encrypted_answer = match channel.handle_sdp_offer(&sdp, &browser_id).await {
                 Ok(answer_sdp) => {
                     log::info!(
-                        "[WebRTC] Created answer for browser {} (async)",
+                        "[WebRTC] Created answer for browser {} in {}ms",
                         &browser_id[..browser_id.len().min(8)]
+                        ,
+                        started_at.elapsed().as_millis()
                     );
 
                     let answer_payload = serde_json::json!({
@@ -4094,18 +4113,27 @@ impl Hub {
                                 }
                             },
                             Err(e) => {
-                                log::error!("[WebRTC] Failed to encrypt answer: {e}");
+                                log::error!(
+                                    "[WebRTC] Failed to encrypt answer after {}ms: {e}",
+                                    started_at.elapsed().as_millis()
+                                );
                                 None
                             }
                         },
                         Err(e) => {
-                            log::error!("[WebRTC] Crypto mutex poisoned: {e}");
+                            log::error!(
+                                "[WebRTC] Crypto mutex poisoned after {}ms: {e}",
+                                started_at.elapsed().as_millis()
+                            );
                             None
                         }
                     }
                 }
                 Err(e) => {
-                    log::error!("[WebRTC] Failed to handle offer (async): {e}");
+                    log::error!(
+                        "[WebRTC] Failed to handle offer after {}ms: {e}",
+                        started_at.elapsed().as_millis()
+                    );
                     None
                 }
             };

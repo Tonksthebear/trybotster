@@ -64,6 +64,10 @@ class HubsController < ApplicationController
     if params[:device_id].present?
       device = current_hub_user.devices.find_by(id: params[:device_id])
       hub.device = device if device
+    elsif hub.device.nil?
+      # Auto-associate: if user has exactly one CLI device, link it
+      cli_devices = current_hub_user.devices.where(device_type: "cli")
+      hub.device = cli_devices.first if cli_devices.one?
     end
 
     if hub.save
@@ -88,6 +92,9 @@ class HubsController < ApplicationController
     if params[:device_id].present?
       device = current_hub_user.devices.find_by(id: params[:device_id])
       Current.hub.device = device if device
+    elsif Current.hub.device.nil?
+      cli_devices = current_hub_user.devices.where(device_type: "cli")
+      Current.hub.device = cli_devices.first if cli_devices.one?
     end
 
     if Current.hub.save

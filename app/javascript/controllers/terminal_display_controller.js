@@ -218,10 +218,19 @@ export default class extends Controller {
           // Nerd Font symbols — powerline, devicons, etc. (~2.5MB)
           { type: "local", matchers: ["symbols nerd font mono", "symbols nerd font"], label: "Symbols Nerd Font (Local)" },
           { type: "url", url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/NerdFontsSymbolsOnly/SymbolsNerdFontMono-Regular.ttf" },
-          // Symbol fallbacks (~3MB total) — misc Unicode symbols, arrows, box drawing, etc.
-          { type: "local", matchers: ["apple symbols", "applesymbols"], label: "Apple Symbols (Local)" },
+          // Symbol fallbacks — misc Unicode symbols, arrows, box drawing, etc.
+          { type: "local", matchers: ["apple symbols", "applesymbols", "apple symbols regular"], label: "Apple Symbols (Local)" },
           { type: "url", url: "https://cdn.jsdelivr.net/gh/notofonts/noto-fonts@main/unhinted/ttf/NotoSansSymbols2/NotoSansSymbols2-Regular.ttf" },
           { type: "url", url: "https://cdn.jsdelivr.net/gh/ChiefMikeK/ttf-symbola@master/Symbola.ttf" },
+          // Canadian Aboriginal syllabics
+          { type: "local", matchers: ["noto sans canadian aboriginal", "notosanscanadianaboriginal", "euphemia ucas", "euphemiaucas"], label: "Noto Sans Canadian Aboriginal / Euphemia UCAS" },
+          { type: "url", url: "https://cdn.jsdelivr.net/gh/notofonts/noto-fonts@main/unhinted/ttf/NotoSansCanadianAboriginal/NotoSansCanadianAboriginal-Regular.ttf", label: "Noto Sans Canadian Aboriginal" },
+          // Emoji
+          { type: "local", matchers: ["apple color emoji", "applecoloremoji"], label: "Apple Color Emoji" },
+          { type: "url", url: "https://cdn.jsdelivr.net/gh/googlefonts/noto-emoji@main/fonts/NotoColorEmoji.ttf" },
+          { type: "url", url: "https://cdn.jsdelivr.net/gh/hfg-gmuend/openmoji@master/font/OpenMoji-black-glyf/OpenMoji-black-glyf.ttf" },
+          // CJK
+          { type: "url", url: "https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf" },
         ],
         maxScrollbackBytes: 10_000_000, // 10MB — ~7,000 lines at 175 cols
         touchSelectionMode: "long-press",

@@ -564,6 +564,47 @@ function Hub:move_agent_workspace(agent_id, workspace_id, workspace_name)
     return result.result
 end
 
+--- Update a session's label or task on this hub.
+-- @param agent_id string Session UUID or agent key
+-- @param fields table { label = string|nil, task = string|nil }
+-- @return table Updated session info
+function Hub:update_session(agent_id, fields)
+    if self._is_local then
+        local session = Agent.get(agent_id) or Agent.find_by_agent_key(agent_id)
+        if not session then
+            error(string.format("Hub:update_session: session '%s' not found", tostring(agent_id)))
+        end
+
+        -- Whitelist: only label and task
+        local allowed = {}
+        if fields.label ~= nil then allowed.label = fields.label end
+        if fields.task ~= nil then allowed.task = fields.task end
+
+        if next(allowed) then
+            session:update(allowed)
+            local connections = require("handlers.connections")
+            connections.broadcast_hub_event("agent_list", {
+                agents = Agent.all_info(),
+            })
+        end
+
+        return session:info()
+    end
+
+    local result = hub_client.request(self._conn_id, {
+        type = "update_session",
+        agent_id = agent_id,
+        label = fields.label,
+        task = fields.task,
+    }, 10000)
+
+    if result.error then
+        error(string.format("Hub:update_session remote error: %s", result.error))
+    end
+
+    return result.result
+end
+
 --- Delete an agent on this hub.
 -- Local: calls handlers.agents directly. Remote: uses hub_client.request().
 -- @param agent_id string Agent key

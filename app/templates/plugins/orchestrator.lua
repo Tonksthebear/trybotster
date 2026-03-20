@@ -22,6 +22,7 @@
 --   list_workspaces — list workspace manifests on a hub
 --   rename_workspace — rename a workspace by ID
 --   move_agent_workspace — move a live session between workspaces
+--   update_session — update a session's label or task
 --   delete_agent   — delete an agent on any hub
 --   get_pty_snapshot — get terminal content from an agent session
 --
@@ -65,6 +66,8 @@ mcp.tool("whoami", {
             result.agent_name = info.agent_name
             result.workspace_name = info.workspace_name
             result.status = info.status
+            result.label = info.label
+            result.task = info.task
         end
     end
 
@@ -237,6 +240,57 @@ mcp.tool("move_agent_workspace", {
     end)
 end)
 
+mcp.tool("update_session", {
+    description = table.concat({
+        "Update metadata on a running session. Use this to keep the hub informed about what you are working on.",
+        "",
+        "Updatable fields:",
+        "  label — A short human-readable tag describing the session's purpose (e.g. 'auth bug fix', 'PR #42 review', 'deploy monitoring').",
+        "         Shown alongside the session name in the agent list. Set by the user or by an orchestrator assigning work.",
+        "         Pass an empty string to clear.",
+        "  task  — Your current activity, updated as your work progresses (e.g. 'running test suite', 'waiting for CI', 'rebasing after conflict').",
+        "         This is YOUR self-report — call update_session with a new task whenever your focus shifts.",
+        "         Pass an empty string to clear.",
+        "",
+        "Both fields are optional per call — pass only what changed. Updates are broadcast to all connected clients immediately.",
+        "To update your own session, call whoami first to get your agent_id.",
+    }, "\n"),
+    input_schema = {
+        type = "object",
+        properties = {
+            hub_id = {
+                type = "string",
+                description = "Hub ID where the session lives. Omit for local hub.",
+            },
+            agent_id = {
+                type = "string",
+                description = "Session UUID or agent key to update.",
+            },
+            label = {
+                type = "string",
+                description = "Short human-readable tag for the session's purpose (e.g. 'auth bug fix'). Pass empty string to clear.",
+            },
+            task = {
+                type = "string",
+                description = "Current activity self-report (e.g. 'running test suite'). Update whenever your focus shifts. Pass empty string to clear.",
+            },
+        },
+        required = { "agent_id" },
+    },
+}, function(params)
+    local fields = {}
+    if params.label ~= nil then fields.label = params.label end
+    if params.task ~= nil then fields.task = params.task end
+
+    if not next(fields) then
+        return { error = "No fields to update. Pass label and/or task." }
+    end
+
+    return Hub.call_safely(params.hub_id, function()
+        return Hub.get(params.hub_id):update_session(params.agent_id, fields)
+    end)
+end)
+
 mcp.tool("delete_agent", {
     description = "Delete an agent on a hub. Pass the agent_id (agent key) from list_hubs results. Optionally delete the git worktree too.",
     input_schema = {
@@ -344,6 +398,13 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
                 message.workspace_id,
                 message.workspace_name
             )
+        end)
+    elseif message.type == "update_session" then
+        respond(function()
+            local fields = {}
+            if message.label ~= nil then fields.label = message.label end
+            if message.task ~= nil then fields.task = message.task end
+            return local_hub:update_session(message.agent_id, fields)
         end)
     elseif message.type == "delete_agent" then
         respond(function()

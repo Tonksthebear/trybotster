@@ -21,10 +21,12 @@
 //! - Signaling (offer/answer/ICE) via ActionCable, E2E encrypted
 
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use rustrtc::transports::ice::IceCandidate;
@@ -38,6 +40,28 @@ use crate::relay::crypto_service::CryptoService;
 use crate::relay::olm_crypto::{
     CONTENT_FILE, CONTENT_FILE_CHUNK, CONTENT_MSG, CONTENT_PTY, CONTENT_STREAM,
 };
+
+/// Shared ICE config cache for all WebRTC channels in this process.
+///
+/// Keyed by `{server_url}|{hub_id}` so repeated offers for the same hub can
+/// reuse TURN/STUN config without waiting on another Rails request.
+fn ice_config_cache() -> &'static std::sync::Mutex<HashMap<String, CachedIceConfig>> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<String, CachedIceConfig>>> = OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone, Debug)]
+struct CachedIceServerConfig {
+    urls: String,
+    username: Option<String>,
+    credential: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedIceConfig {
+    fetched_at: Instant,
+    ice_servers: Vec<CachedIceServerConfig>,
+}
 
 /// Incoming PTY input from browser via binary DataChannel frame.
 ///
@@ -344,11 +368,69 @@ impl WebRtcChannel {
     /// Timeout for the ICE config HTTP request. Keeps the tick loop responsive
     /// even when the endpoint is slow or the runtime is under load from
     /// concurrent WebRTC teardown tasks.
-    const ICE_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const ICE_CONFIG_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Fresh-cache TTL for ICE config reuse across new offers.
+    ///
+    /// Short enough to avoid leaning on stale TURN credentials, but long enough
+    /// to skip repeated `/webrtc` requests during reconnect churn.
+    const ICE_CONFIG_CACHE_TTL: Duration = Duration::from_secs(60);
+
+    /// Maximum age for stale ICE config fallback when a refresh fails.
+    ///
+    /// Lets reconnects keep moving through transient Rails/TURN endpoint issues
+    /// instead of hanging until a manual refresh.
+    const ICE_CONFIG_STALE_FALLBACK_TTL: Duration = Duration::from_secs(5 * 60);
+
+    fn ice_cache_key(&self, hub_id: &str) -> String {
+        format!("{}|{hub_id}", self.server_url)
+    }
+
+    fn ice_servers_from_cached(ice_servers: &[CachedIceServerConfig]) -> Vec<IceServer> {
+        ice_servers
+            .iter()
+            .map(|server| IceServer {
+                urls: vec![server.urls.clone()],
+                username: server.username.clone(),
+                credential: server.credential.clone(),
+                credential_type: rustrtc::IceCredentialType::Password,
+            })
+            .collect()
+    }
+
+    fn cached_ice_servers(&self, cache_key: &str, max_age: Duration) -> Option<Vec<IceServer>> {
+        let cache = ice_config_cache().lock().expect("ICE config cache lock poisoned");
+        let cached = cache.get(cache_key)?;
+        if cached.fetched_at.elapsed() > max_age {
+            return None;
+        }
+        Some(Self::ice_servers_from_cached(&cached.ice_servers))
+    }
+
+    fn store_cached_ice_servers(&self, cache_key: String, ice_servers: Vec<CachedIceServerConfig>) {
+        let mut cache = ice_config_cache().lock().expect("ICE config cache lock poisoned");
+        cache.insert(
+            cache_key,
+            CachedIceConfig {
+                fetched_at: Instant::now(),
+                ice_servers,
+            },
+        );
+    }
 
     /// Fetch ICE server configuration from Rails.
     async fn fetch_ice_config(&self, hub_id: &str) -> Result<Vec<IceServer>, ChannelError> {
+        let cache_key = self.ice_cache_key(hub_id);
+        if let Some(cached) = self.cached_ice_servers(&cache_key, Self::ICE_CONFIG_CACHE_TTL) {
+            log::debug!(
+                "[WebRTC] Using cached ICE config for hub {}",
+                &hub_id[..hub_id.len().min(8)]
+            );
+            return Ok(cached);
+        }
+
         let url = format!("{}/hubs/{}/webrtc", self.server_url, hub_id);
+        let started_at = Instant::now();
 
         let client = reqwest::Client::builder()
             .timeout(Self::ICE_CONFIG_TIMEOUT)
@@ -363,10 +445,43 @@ impl WebRtcChannel {
             .send()
             .await
             .map_err(|e| {
+                if let Some(cached) =
+                    self.cached_ice_servers(&cache_key, Self::ICE_CONFIG_STALE_FALLBACK_TTL)
+                {
+                    log::warn!(
+                        "[WebRTC] ICE config fetch failed after {}ms, using stale cache: {e:#}",
+                        started_at.elapsed().as_millis()
+                    );
+                    return ChannelError::SendFailed("__use_stale_ice_cache__".to_string());
+                }
                 ChannelError::ConnectionFailed(format!("Failed to fetch ICE config: {e:#}"))
-            })?;
+            });
+
+        let response = match response {
+            Ok(response) => response,
+            Err(ChannelError::SendFailed(marker)) if marker == "__use_stale_ice_cache__" => {
+                return self
+                    .cached_ice_servers(&cache_key, Self::ICE_CONFIG_STALE_FALLBACK_TTL)
+                    .ok_or_else(|| {
+                        ChannelError::ConnectionFailed(
+                            "ICE config fetch failed and stale cache disappeared".to_string(),
+                        )
+                    });
+            }
+            Err(error) => return Err(error),
+        };
 
         if !response.status().is_success() {
+            if let Some(cached) =
+                self.cached_ice_servers(&cache_key, Self::ICE_CONFIG_STALE_FALLBACK_TTL)
+            {
+                log::warn!(
+                    "[WebRTC] ICE config request returned {} after {}ms, using stale cache",
+                    response.status(),
+                    started_at.elapsed().as_millis()
+                );
+                return Ok(cached);
+            }
             return Err(ChannelError::ConnectionFailed(format!(
                 "ICE config request failed: {}",
                 response.status()
@@ -386,19 +501,50 @@ impl WebRtcChannel {
         }
 
         let config: IceConfig = response.json().await.map_err(|e| {
+            if let Some(cached) =
+                self.cached_ice_servers(&cache_key, Self::ICE_CONFIG_STALE_FALLBACK_TTL)
+            {
+                log::warn!(
+                    "[WebRTC] ICE config parse failed after {}ms, using stale cache: {e:#}",
+                    started_at.elapsed().as_millis()
+                );
+                return ChannelError::SendFailed("__use_stale_ice_cache__".to_string());
+            }
             ChannelError::ConnectionFailed(format!("Failed to parse ICE config: {e:#}"))
-        })?;
+        });
 
-        Ok(config
+        let config = match config {
+            Ok(config) => config,
+            Err(ChannelError::SendFailed(marker)) if marker == "__use_stale_ice_cache__" => {
+                return self
+                    .cached_ice_servers(&cache_key, Self::ICE_CONFIG_STALE_FALLBACK_TTL)
+                    .ok_or_else(|| {
+                        ChannelError::ConnectionFailed(
+                            "ICE config parse failed and stale cache disappeared".to_string(),
+                        )
+                    });
+            }
+            Err(error) => return Err(error),
+        };
+
+        let cached_servers: Vec<CachedIceServerConfig> = config
             .ice_servers
             .into_iter()
-            .map(|s| IceServer {
-                urls: vec![s.urls],
+            .map(|s| CachedIceServerConfig {
+                urls: s.urls,
                 username: s.username,
                 credential: s.credential,
-                credential_type: rustrtc::IceCredentialType::Password,
             })
-            .collect())
+            .collect();
+
+        self.store_cached_ice_servers(cache_key, cached_servers.clone());
+        log::info!(
+            "[WebRTC] Fetched ICE config for hub {} in {}ms",
+            &hub_id[..hub_id.len().min(8)],
+            started_at.elapsed().as_millis()
+        );
+
+        Ok(Self::ice_servers_from_cached(&cached_servers))
     }
 
     /// Create the WebRTC peer connection.

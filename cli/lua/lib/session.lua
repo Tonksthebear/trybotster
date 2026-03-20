@@ -365,6 +365,8 @@ function Session._init_recovered(self, config)
     self.status          = "running"
     self.title           = config.title
     self.cwd             = config.cwd
+    self.label           = config.label
+    self.task            = config.task
     self.notification    = false
     self.session         = config.handle
     self._session_config = nil
@@ -541,8 +543,9 @@ function Session:_sync_session_manifest()
     manifest.metadata = plugin_metadata
 
     -- Strip runtime-only fields that shouldn't persist
-    manifest.port         = nil
-    manifest.notification = nil
+    manifest.port           = nil
+    manifest.notification   = nil
+    manifest.last_output_at = nil
 
     local ok, err = pcall(ws.write_session,
         self._data_dir, self._workspace_id, self.session_uuid, manifest)
@@ -844,7 +847,8 @@ function Session:info()
     local port = self._port
 
     -- Build display name: prefer OSC title (set by running script), fall back to
-    -- agent_name (from config), then branch_name + suffix
+    -- agent_name (from config), then branch_name + suffix.
+    -- Label is a separate field — it does NOT override display_name.
     local display_name
     if self.title and self.title ~= "" then
         display_name = self.title
@@ -882,6 +886,9 @@ function Session:info()
         notification = self.notification or false,
         port = port,
         created_at = self.created_at,
+        label = self.label,
+        task = self.task,
+        last_output_at = self.last_output_at,
     }
 end
 

@@ -86,6 +86,7 @@ const STALLED_EVENT_COOLDOWN_MS = 2000   // Throttle repeated stalled notificati
 const MAX_PENDING_REMOTE_ICE = 128        // Bound pre-answer/pre-peer candidate buffering
 const ICE_CONFIG_CACHE_TTL_MS = 60_000    // Reuse ICE config for fast reconnects
 const ICE_CONFIG_FETCH_TIMEOUT_MS = 3000  // Hard cap for /webrtc fetch latency
+const PEER_SETUP_TIMEOUT_MS = 15_000      // Bound unanswered-offer hangs
 
 class HubPeerConnection {
   #connections = new Map() // hubId -> { pc, dataChannel, state, subscriptions }
@@ -201,6 +202,9 @@ class HubPeerConnection {
       iceConfig: null,
       iceConfigFetchedAt: 0,
       iceConfigPromise: null,
+      peerSetupTimer: null,
+      peerSetupStartedAt: 0,
+      offerSentAt: 0,
       // Start true — ActionCable buffers messages until confirmed.
       // Set false by disconnected callback, true again by connected.
       signalingConnected: true,
@@ -266,8 +270,13 @@ class HubPeerConnection {
     if (!conn.signalingConnected) throw new Error(`Signaling not connected for hub ${hubId}`)
 
     console.debug(`[WebRTCTransport] Creating peer connection for hub ${hubId}`)
+    conn.peerSetupStartedAt = performance.now()
+    conn.offerSentAt = 0
 
     const iceConfig = await this.#getIceConfig(hubId, conn)
+    console.debug(
+      `[WebRTCTransport] ICE config ready for hub ${hubId} in ${Math.round(performance.now() - conn.peerSetupStartedAt)}ms`,
+    )
     const pc = new RTCPeerConnection({ iceServers: iceConfig.ice_servers })
     conn.pc = pc
     conn.state = TransportState.CONNECTING
@@ -375,6 +384,11 @@ class HubPeerConnection {
       sdp: offer.sdp,
     })
     subscription.perform("signal", { envelope })
+    conn.offerSentAt = performance.now()
+    console.debug(
+      `[WebRTCTransport] Offer sent for hub ${hubId} in ${Math.round(conn.offerSentAt - conn.peerSetupStartedAt)}ms`,
+    )
+    this.#startPeerSetupTimer(hubId, conn, pc)
 
     return { state: TransportState.CONNECTING }
   }
@@ -907,6 +921,7 @@ class HubPeerConnection {
    * Removes handlers before closing to prevent cascading cleanup.
    */
   #teardownPeer(conn) {
+    this.#clearPeerSetupTimer(conn)
     if (conn.iceRestartTimer) {
       clearTimeout(conn.iceRestartTimer)
       conn.iceRestartTimer = null
@@ -944,6 +959,8 @@ class HubPeerConnection {
     conn.activeFileTransferIds.clear()
     conn.nextFileTransferId = 0
     conn.lastStalledAt = 0
+    conn.peerSetupStartedAt = 0
+    conn.offerSentAt = 0
   }
 
   /**
@@ -953,6 +970,33 @@ class HubPeerConnection {
   #cleanupPeer(hubId, conn) {
     this.#teardownPeer(conn)
     this.#emit("connection:state", { hubId, state: "disconnected" })
+  }
+
+  #clearPeerSetupTimer(conn) {
+    if (conn?.peerSetupTimer) {
+      clearTimeout(conn.peerSetupTimer)
+      conn.peerSetupTimer = null
+    }
+  }
+
+  #startPeerSetupTimer(hubId, conn, pc) {
+    this.#clearPeerSetupTimer(conn)
+    conn.peerSetupTimer = setTimeout(() => {
+      conn.peerSetupTimer = null
+
+      const current = this.#connections.get(hubId)
+      if (!current || current !== conn || current.pc !== pc) return
+      if (current.dataChannel?.readyState === "open") return
+
+      const elapsed = current.peerSetupStartedAt
+        ? Math.round(performance.now() - current.peerSetupStartedAt)
+        : PEER_SETUP_TIMEOUT_MS
+
+      console.warn(
+        `[WebRTCTransport] Peer setup timed out for hub ${hubId} after ${elapsed}ms; cleaning up for retry`,
+      )
+      this.#cleanupPeer(hubId, current)
+    }, PEER_SETUP_TIMEOUT_MS)
   }
 
   #emit(eventName, data) {
@@ -1236,7 +1280,13 @@ class HubPeerConnection {
       console.debug(`[WebRTCTransport] DataChannel open for hub ${hubId}`)
       const conn = this.#connections.get(hubId)
       if (conn) {
+        this.#clearPeerSetupTimer(conn)
         conn.state = TransportState.CONNECTED
+        if (conn.peerSetupStartedAt) {
+          console.debug(
+            `[WebRTCTransport] Peer ready for hub ${hubId} in ${Math.round(performance.now() - conn.peerSetupStartedAt)}ms`,
+          )
+        }
       }
       const mode = conn?.mode
       this.#emit("connection:state", { hubId, state: "connected", mode })

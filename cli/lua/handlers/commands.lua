@@ -216,6 +216,40 @@ commands.register("move_agent_workspace", function(_client, _sub_id, command)
         session:agent_key(), moved.workspace_id, moved.workspace_name or "unnamed"))
 end, { description = "Move a live session to another workspace" })
 
+commands.register("update_session", function(_client, _sub_id, command)
+    local session_id = command.id or command.agent_id or command.session_uuid or command.session_key
+    if not session_id then
+        log.warn("update_session missing session identifier")
+        return
+    end
+
+    local Agent = require("lib.agent")
+    local session = Agent.get(session_id) or Agent.find_by_agent_key(session_id)
+    if not session then
+        log.warn(string.format("update_session: session '%s' not found", tostring(session_id)))
+        return
+    end
+
+    -- Only allow updating label and task (not arbitrary fields)
+    local fields = {}
+    if command.label ~= nil then fields.label = command.label end
+    if command.task ~= nil then fields.task = command.task end
+
+    if next(fields) then
+        session:update(fields)
+        local connections = require("handlers.connections")
+        connections.broadcast_hub_event("agent_list", {
+            agents = Agent.all_info(),
+        })
+        log.info(string.format("Session %s updated: %s", session:agent_key(),
+            table.concat((function()
+                local parts = {}
+                for k, v in pairs(fields) do parts[#parts + 1] = k .. "=" .. tostring(v) end
+                return parts
+            end)(), ", ")))
+    end
+end, { description = "Update session label or task" })
+
 commands.register("reopen_worktree", function(client, _sub_id, command)
     local path = command.path
     local branch = command.branch or ""
