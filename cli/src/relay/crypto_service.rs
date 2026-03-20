@@ -16,9 +16,10 @@ pub type CryptoService = Arc<Mutex<VodozemacCrypto>>;
 
 /// Create a new crypto service for the given hub.
 ///
-/// Loads existing state from disk if available, otherwise creates a fresh identity.
+/// Ratchet state is intentionally ephemeral; each hub process starts with a
+/// fresh in-memory identity and sessions.
 pub fn create_crypto_service(hub_id: &str) -> CryptoService {
-    let crypto = VodozemacCrypto::load_or_create(hub_id);
+    let crypto = VodozemacCrypto::new(hub_id);
     log::info!(
         "Created crypto service for hub {}",
         &hub_id[..hub_id.len().min(8)]

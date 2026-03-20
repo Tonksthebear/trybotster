@@ -379,6 +379,7 @@ class HubPeerConnection {
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
 
+    await bridge.resetSession(String(hubId))
     const envelope = await this.#encryptSignal(hubId, {
       type: "offer",
       sdp: offer.sdp,
