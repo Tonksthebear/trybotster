@@ -1,13 +1,4 @@
-//! Crypto session persistence for surviving CLI restarts.
-//!
-//! This module handles saving and loading Matrix crypto store state
-//! so that browser connections can survive CLI restarts.
-//!
-//! # Security
-//!
-//! All data is encrypted at rest using AES-256-GCM with a key stored in the
-//! consolidated keyring entry. This follows industry best practice
-//! (Matrix/Element) for protecting E2E encryption session state.
+//! Encrypted persistence helpers for device-scoped secrets.
 //!
 //! # Storage structure
 //!
@@ -15,9 +6,7 @@
 //! ~/.config/botster/
 //!     vapid_keys.enc                         # Device-level VAPID keys (AES-GCM)
 //!     push_subscriptions.enc                 # Device-level browser push subscriptions (AES-GCM)
-//!     hubs/{hub_id}/
-//!         vodozemac_store.enc                # AES-GCM encrypted Matrix crypto state
-//!
+//!     hubs/<hub_id>/vodozemac_account.enc    # Hub-level CLI long-term Olm identity (AES-GCM)
 //! OS Keyring (consolidated):
 //!     botster/credentials  # Contains crypto_keys[key_id] = base64 AES key
 //! ```
@@ -36,9 +25,7 @@ use crate::crypto::EncryptedData;
 use crate::keyring::Credentials;
 
 use std::sync::{OnceLock, RwLock};
-
-/// Vodozemac crypto format version.
-const CRYPTO_VERSION: u8 = 6;
+use vodozemac::olm::AccountPickle;
 
 /// Cache for encryption keys to avoid repeated keyring access.
 /// Maps hub_id -> encryption key.
@@ -164,67 +151,6 @@ fn get_or_create_encryption_key(hub_id: &str) -> Result<[u8; 32]> {
 }
 
 // ============================================================================
-// Matrix Crypto Persistence
-// ============================================================================
-
-use super::olm_crypto::VodozemacCryptoState;
-
-/// Load a vodozemac crypto store from encrypted storage.
-pub fn load_vodozemac_crypto_store(hub_id: &str) -> Result<VodozemacCryptoState> {
-    let state_dir = hub_state_dir(hub_id)?;
-    let store_path = state_dir.join("vodozemac_store.enc");
-
-    if !store_path.exists() {
-        anyhow::bail!(
-            "Matrix crypto store not found for hub {}",
-            &hub_id[..hub_id.len().min(8)]
-        );
-    }
-
-    let key = get_or_create_encryption_key(hub_id)?;
-
-    let content = fs::read_to_string(&store_path).context("Failed to read Matrix store file")?;
-    let encrypted: EncryptedData =
-        serde_json::from_str(&content).context("Failed to parse Matrix store file")?;
-
-    let plaintext = crate::crypto::decrypt(&key, &encrypted)?;
-    let state: VodozemacCryptoState =
-        serde_json::from_slice(&plaintext).context("Failed to deserialize Matrix store")?;
-
-    log::info!(
-        "Loaded Matrix crypto store (encrypted) for hub {}",
-        &hub_id[..hub_id.len().min(8)]
-    );
-    Ok(state)
-}
-
-/// Save a vodozemac crypto store to encrypted storage.
-pub fn save_vodozemac_crypto_store(hub_id: &str, state: &VodozemacCryptoState) -> Result<()> {
-    let key = get_or_create_encryption_key(hub_id)?;
-    let state_dir = hub_state_dir(hub_id)?;
-    let store_path = state_dir.join("vodozemac_store.enc");
-
-    let plaintext = serde_json::to_vec(state).context("Failed to serialize Matrix store")?;
-    let encrypted = crate::crypto::encrypt(&key, &plaintext, CRYPTO_VERSION)?;
-
-    let content =
-        serde_json::to_string_pretty(&encrypted).context("Failed to serialize encrypted store")?;
-
-    fs::write(&store_path, content).context("Failed to write Matrix store file")?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&store_path, perms)
-            .context("Failed to set Matrix store file permissions")?;
-    }
-
-    log::debug!("Saved encrypted Matrix store to {:?}", store_path);
-    Ok(())
-}
-
-// ============================================================================
 // VAPID Key Persistence
 // ============================================================================
 
@@ -236,6 +162,9 @@ const VAPID_VERSION: u8 = 1;
 
 /// Push subscription persistence format version.
 const PUSH_SUB_VERSION: u8 = 1;
+
+/// CLI long-term vodozemac account persistence format version.
+const ACCOUNT_VERSION: u8 = 1;
 
 /// Device-level config directory (same as `device.json` location).
 ///
@@ -380,25 +309,63 @@ pub fn save_push_subscriptions(store: &PushSubscriptionStore) -> Result<()> {
     Ok(())
 }
 
-/// Delete all vodozemac crypto state for a hub.
-pub fn delete_vodozemac_crypto_store(hub_id: &str) -> Result<()> {
+/// Load the CLI's persisted long-term vodozemac account for a hub.
+///
+/// Returns `None` if the hub has never been paired before and no identity
+/// exists yet. Only the long-term account is stored; sessions remain ephemeral.
+pub fn load_vodozemac_account(hub_id: &str) -> Result<Option<AccountPickle>> {
     let state_dir = hub_state_dir(hub_id)?;
-    let store_path = state_dir.join("vodozemac_store.enc");
+    let account_path = state_dir.join("vodozemac_account.enc");
 
-    if store_path.exists() {
-        fs::remove_file(&store_path).context("Failed to delete Matrix store file")?;
-        log::info!("Deleted Matrix crypto store file");
+    if !account_path.exists() {
+        return Ok(None);
     }
 
-    Ok(())
+    let key = get_or_create_encryption_key(hub_id)?;
+    let content =
+        fs::read_to_string(&account_path).context("Failed to read vodozemac account file")?;
+    let encrypted: EncryptedData =
+        serde_json::from_str(&content).context("Failed to parse vodozemac account file")?;
+    let plaintext = crate::crypto::decrypt(&key, &encrypted)?;
+    let account: AccountPickle =
+        serde_json::from_slice(&plaintext).context("Failed to deserialize vodozemac account")?;
+
+    log::info!(
+        "Loaded persisted vodozemac account for hub {}",
+        &hub_id[..hub_id.len().min(8)]
+    );
+    Ok(Some(account))
 }
 
-/// Check if a vodozemac crypto store exists for a hub.
-#[cfg(test)]
-pub(crate) fn vodozemac_crypto_store_exists(hub_id: &str) -> bool {
-    hub_state_dir(hub_id)
-        .map(|dir| dir.join("vodozemac_store.enc").exists())
-        .unwrap_or(false)
+/// Save the CLI's long-term vodozemac account for a hub.
+///
+/// This preserves the hub identity/signing keys across reboot while keeping
+/// per-peer sessions out of storage.
+pub fn save_vodozemac_account(hub_id: &str, account: &AccountPickle) -> Result<()> {
+    let key = get_or_create_encryption_key(hub_id)?;
+    let state_dir = hub_state_dir(hub_id)?;
+    let account_path = state_dir.join("vodozemac_account.enc");
+
+    let plaintext = serde_json::to_vec(account).context("Failed to serialize vodozemac account")?;
+    let encrypted = crate::crypto::encrypt(&key, &plaintext, ACCOUNT_VERSION)?;
+    let content = serde_json::to_string_pretty(&encrypted)
+        .context("Failed to serialize encrypted vodozemac account")?;
+    fs::write(&account_path, content).context("Failed to write vodozemac account file")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&account_path, perms)
+            .context("Failed to set vodozemac account file permissions")?;
+    }
+
+    log::debug!(
+        "Saved encrypted vodozemac account for hub {} to {:?}",
+        &hub_id[..hub_id.len().min(8)],
+        account_path
+    );
+    Ok(())
 }
 
 /// Write the connection URL to a file for external access.
@@ -441,7 +408,7 @@ pub fn delete_connection_url(hub_id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    const TEST_CRYPTO_VERSION: u8 = 1;
 
     #[test]
     fn test_hub_id_for_repo_is_stable() {
@@ -466,60 +433,10 @@ mod tests {
         let key = [0u8; 32];
         let plaintext = b"Hello, Matrix crypto!";
 
-        let encrypted = crate::crypto::encrypt(&key, plaintext, CRYPTO_VERSION).unwrap();
+        let encrypted = crate::crypto::encrypt(&key, plaintext, TEST_CRYPTO_VERSION).unwrap();
         let decrypted = crate::crypto::decrypt(&key, &encrypted).unwrap();
 
         assert_eq!(decrypted, plaintext);
-        assert_eq!(encrypted.version, CRYPTO_VERSION);
-    }
-
-    #[test]
-    fn test_olm_crypto_store_persistence_roundtrip() {
-        let hub_id = "test-hub-matrix-store";
-
-        // Create a test store state with multiple sessions
-        let mut state = VodozemacCryptoState::default();
-        state.pickled_account = "test_pickled_account".to_string();
-        state.hub_id = hub_id.to_string();
-        state
-            .pickled_sessions
-            .insert("peer_key_1".to_string(), "pickled_session_1".to_string());
-        state
-            .pickled_sessions
-            .insert("peer_key_2".to_string(), "pickled_session_2".to_string());
-
-        // Save
-        save_vodozemac_crypto_store(hub_id, &state).unwrap();
-
-        // Load
-        let loaded = load_vodozemac_crypto_store(hub_id).unwrap();
-        assert_eq!(loaded.hub_id, hub_id);
-        assert_eq!(loaded.pickled_account, "test_pickled_account");
-        assert_eq!(loaded.pickled_sessions.len(), 2);
-        assert_eq!(loaded.pickled_sessions["peer_key_1"], "pickled_session_1");
-        assert_eq!(loaded.pickled_sessions["peer_key_2"], "pickled_session_2");
-
-        // Cleanup
-        let state_dir = hub_state_dir(hub_id).unwrap();
-        let _ = fs::remove_dir_all(state_dir);
-    }
-
-    #[test]
-    fn test_vodozemac_crypto_store_exists() {
-        let hub_id = "test-hub-matrix-exists";
-
-        // Should not exist initially
-        assert!(!vodozemac_crypto_store_exists(hub_id));
-
-        // Create and save
-        let state = VodozemacCryptoState::default();
-        save_vodozemac_crypto_store(hub_id, &state).unwrap();
-
-        // Should exist now
-        assert!(vodozemac_crypto_store_exists(hub_id));
-
-        // Cleanup
-        let state_dir = hub_state_dir(hub_id).unwrap();
-        let _ = fs::remove_dir_all(state_dir);
+        assert_eq!(encrypted.version, TEST_CRYPTO_VERSION);
     }
 }

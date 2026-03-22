@@ -214,6 +214,10 @@ class WorkerBridge {
         return webrtcTransport.connectSignaling(params.hubId, params.browserIdentity)
       case "connectPeer":
         return webrtcTransport.connectPeer(params.hubId)
+      case "awaitFreshBundle":
+        return webrtcTransport.awaitFreshBundle(params.hubId, params.timeoutMs)
+      case "requestFreshBundle":
+        return webrtcTransport.requestFreshBundle(params.hubId)
       case "disconnectPeer":
         return webrtcTransport.disconnectPeer(params.hubId)
       case "probePeerHealth":
@@ -309,17 +313,8 @@ class WorkerBridge {
    * @param {Object|string} bundleJson - The device key bundle
    * @returns {Promise<{created: boolean, identityKey: string}>}
    */
-  async createSession(hubId, bundleJson) {
-    return this.sendCrypto("createSession", { hubId, bundleJson })
-  }
-
-  /**
-   * Reset the outbound ratchet from the current in-memory bundle.
-   * @param {string} hubId - The hub ID
-   * @returns {Promise<{reset: boolean}>}
-   */
-  async resetSession(hubId) {
-    return this.sendCrypto("resetSession", { hubId })
+  async createSession(hubId, bundleJson, sessionOwner = null) {
+    return this.sendCrypto("createSession", { hubId, bundleJson, sessionOwner })
   }
 
   /**
@@ -327,8 +322,17 @@ class WorkerBridge {
    * @param {string} hubId - The hub ID
    * @returns {Promise<{hasSession: boolean}>}
    */
-  async hasSession(hubId) {
-    return this.sendCrypto("hasSession", { hubId })
+  async hasSession(hubId, sessionOwner = null) {
+    return this.sendCrypto("hasSession", { hubId, sessionOwner })
+  }
+
+  /**
+   * Check if a trusted pairing exists for a hub, even if no live session exists.
+   * @param {string} hubId - The hub ID
+   * @returns {Promise<{hasPairing: boolean}>}
+   */
+  async hasPairing(hubId) {
+    return this.sendCrypto("hasPairing", { hubId })
   }
 
   /**
@@ -383,7 +387,17 @@ class WorkerBridge {
   }
 
   /**
-   * Clear a session
+   * Clear only the active in-memory session/ratchet.
+   * Preserves the persisted account + trust anchor.
+   * @param {string} hubId - The hub ID
+   * @returns {Promise<{cleared: boolean}>}
+   */
+  async clearActiveSession(hubId) {
+    return this.sendCrypto("clearActiveSession", { hubId })
+  }
+
+  /**
+   * Clear a full pairing
    * @param {string} hubId - The hub ID
    * @returns {Promise<{cleared: boolean}>}
    */

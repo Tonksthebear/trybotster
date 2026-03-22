@@ -1,8 +1,8 @@
 /**
  * HubCrypto - thin crypto adapter over SharedWorker bridge.
  *
- * Important: this does NOT own key/session lifecycle. The SharedWorker keeps
- * active Olm state in memory only.
+ * Important: this does NOT own key/session persistence. Existing Olm account
+ * and ratchet/session storage remains in workers/olm_crypto.js.
  */
 
 import bridge from "workers/bridge"
@@ -18,6 +18,10 @@ export class HubCrypto {
 
   static clearSession(hubId) {
     return bridge.clearSession(String(hubId))
+  }
+
+  static clearActiveSession(hubId) {
+    return bridge.clearActiveSession(String(hubId))
   }
 
   static createSession(hubId, bundle) {

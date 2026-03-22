@@ -52,6 +52,7 @@ export class HubRoute {
   #peerReconnectAttempts = 0  // Retry counter for peer reconnection
   #nuclearReconnectTimer = null // Fallback reconnect when normal attempts exhausted
   #reacquirePromise = null    // Serializes concurrent reacquire() calls
+  #sessionPreparationPromise = null // Serializes fresh-bundle session setup
   #handshake = null           // HandshakeManager instance
   #health = null              // HealthTracker instance
   #dcPingTimer = null         // DataChannel heartbeat timer
@@ -227,16 +228,16 @@ export class HubRoute {
 
     const hubId = this.getHubId()
 
-    // 1. Check for existing Olm session (created on /pairing page)
-    const { hasSession: hasOlmSession } = await bridge.hasSession(hubId)
-    if (!hasOlmSession) {
-      console.debug(`[${this.constructor.name}] No Olm session — WebRTC disabled until pairing`)
+    // 1. Check for an existing trusted pairing (created on /pairing page).
+    // The active Olm session itself may be absent because it is memory-only.
+    const { hasPairing } = await bridge.hasPairing(hubId)
+    if (!hasPairing) {
+      console.debug(`[${this.constructor.name}] No trusted pairing — WebRTC disabled until pairing`)
     }
 
-    // Get identity key only when a session exists. An account (keypair) can exist
-    // without a session due to cleanup race conditions — checking hasSession is
-    // the authoritative test for whether we can encrypt.
-    if (hasOlmSession) {
+    // Get the browser's long-term identity key whenever pairing exists. The
+    // live Olm session may be recreated later from a fresh signed bundle.
+    if (hasPairing) {
       try {
         const keyResult = await bridge.getIdentityKey(hubId)
         this.identityKey = keyResult.identityKey
@@ -273,9 +274,9 @@ export class HubRoute {
       this.cliStatus = CliStatus.ONLINE
     }
 
-    await this.#ensureConnected()  // continues to peer+subscribe if CLI online + session exists
+    await this.#ensureConnected()  // continues to peer+subscribe if CLI online + pairing exists
 
-    // No crypto session — WebRTC unavailable, user must scan connection code.
+    // No trusted pairing — WebRTC unavailable, user must scan connection code.
     // Use lightweight errorCode (not #setError) to keep browserStatus SUBSCRIBED —
     // signaling IS connected, only crypto is missing.
     if (!this.identityKey) {
@@ -296,12 +297,15 @@ export class HubRoute {
   async #ensureConnected() {
     if (this.state === ConnectionState.ERROR) return
     if (!this.#hubConnected) return  // signaling not ready, nothing to do yet
-    if (!this.identityKey) return    // no crypto session, WebRTC unavailable
+    if (!this.identityKey) return    // no trusted pairing/account, WebRTC unavailable
     if (this.browserStatus !== BrowserStatus.SUBSCRIBED) return  // browser not connected
+
+    const hubId = this.getHubId()
+    const hasActiveSession = await this.#ensureActiveSession()
+    if (!hasActiveSession) return
 
     // Step 1: Peer (only if CLI is reachable)
     if (this.#health.isCliReachable()) {
-      const hubId = this.getHubId()
       try {
         await bridge.send("connectPeer", { hubId })  // idempotent + deduped in transport
       } catch (e) {
@@ -352,6 +356,49 @@ export class HubRoute {
         throw e  // Re-throw non-transport errors (auth, crypto, etc.)
       }
     }
+  }
+
+  async #ensureActiveSession() {
+    if (this.#sessionPreparationPromise) {
+      return this.#sessionPreparationPromise
+    }
+
+    this.#sessionPreparationPromise = this.#doEnsureActiveSession()
+    try {
+      return await this.#sessionPreparationPromise
+    } finally {
+      this.#sessionPreparationPromise = null
+    }
+  }
+
+  async #doEnsureActiveSession() {
+    const hubId = this.getHubId()
+    const startedAt = performance.now()
+    const { hasSession } = await bridge.hasSession(hubId, this.browserIdentity)
+    if (hasSession) return true
+    if (!this.#health.isCliReachable()) return false
+
+    const bundleArrived = await bridge.send("awaitFreshBundle", { hubId, timeoutMs: 750 })
+    if (bundleArrived?.refreshed) {
+      const refreshed = await bridge.hasSession(hubId, this.browserIdentity)
+      if (refreshed.hasSession) {
+        console.debug(
+          `[${this.constructor.name}] Fresh session auto-prepared for hub ${hubId} in ${Math.round(performance.now() - startedAt)}ms`,
+        )
+      }
+      return refreshed.hasSession
+    }
+
+    console.debug(`[${this.constructor.name}] No active Olm session after subscribe — requesting fresh bundle`)
+    await bridge.send("requestFreshBundle", { hubId })
+
+    const refreshed = await bridge.hasSession(hubId, this.browserIdentity)
+    if (refreshed.hasSession) {
+      console.debug(
+        `[${this.constructor.name}] Fresh session ready for hub ${hubId} in ${Math.round(performance.now() - startedAt)}ms`,
+      )
+    }
+    return refreshed.hasSession
   }
 
   /**
@@ -964,20 +1011,37 @@ export class HubRoute {
     const hubId = this.getHubId()
     if (!hubId) return
 
+    const hadRecoverablePairingError =
+      this.state === ConnectionState.ERROR &&
+      (this.errorCode === "unpaired" || this.errorCode === "session_invalid")
+
     // Cancel grace period FIRST by touching signaling, before any async
     // SharedWorker calls. connectSignaling is idempotent — returns existing
     // state if connected, creates a new channel if the grace timer already
     // destroyed it. This prevents the 3s grace timer from racing with the
-    // hasSession() round-trip to the crypto SharedWorker.
+    // paired-state round-trip to the crypto SharedWorker.
     const result = await bridge.send("connectSignaling", {
       hubId,
       browserIdentity: this.browserIdentity
     })
     this.#hubConnected = true
 
-    const { hasSession } = await bridge.hasSession(hubId)
+    const { hasPairing } = await bridge.hasPairing(hubId)
 
-    if (!hasSession) {
+    if (!hasPairing) {
+      this.#hubConnected = false
+      this.#releaseSharedSubscription({ immediate: true, keepRemote: true }).catch(() => {})
+      this.subscriptionId = null
+      this.identityKey = null
+      this.#setError("unpaired", "Scan connection code")
+      return
+    }
+
+    try {
+      const keyResult = await bridge.getIdentityKey(hubId)
+      this.identityKey = keyResult.identityKey
+      this.browserIdentity = `${this.identityKey}:${HubRoute.tabId}`
+    } catch {
       this.#hubConnected = false
       this.#releaseSharedSubscription({ immediate: true, keepRemote: true }).catch(() => {})
       this.subscriptionId = null
@@ -989,6 +1053,11 @@ export class HubRoute {
     // Seed cliStatus from transport if no health event has updated it yet
     if (result?.state === "connected" && this.cliStatus === CliStatus.UNKNOWN) {
       this.cliStatus = CliStatus.ONLINE
+    }
+
+    if (hadRecoverablePairingError) {
+      this.#setState(ConnectionState.DISCONNECTED)
+      this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
     }
 
     // Keep subscription across quick reacquire cycles so Turbo navigation can

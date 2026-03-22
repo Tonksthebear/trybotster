@@ -16,10 +16,20 @@ pub type CryptoService = Arc<Mutex<VodozemacCrypto>>;
 
 /// Create a new crypto service for the given hub.
 ///
-/// Ratchet state is intentionally ephemeral; each hub process starts with a
-/// fresh in-memory identity and sessions.
+/// The CLI's long-term identity persists across reboot; live sessions remain
+/// ephemeral and in-memory only.
 pub fn create_crypto_service(hub_id: &str) -> CryptoService {
-    let crypto = VodozemacCrypto::new(hub_id);
+    let crypto = match super::persistence::load_vodozemac_account(hub_id) {
+        Ok(Some(account)) => VodozemacCrypto::from_account_pickle(hub_id, account),
+        Ok(None) => VodozemacCrypto::new(hub_id),
+        Err(e) => {
+            log::warn!(
+                "Failed to load persisted vodozemac account for hub {}: {e}; creating new identity",
+                &hub_id[..hub_id.len().min(8)]
+            );
+            VodozemacCrypto::new(hub_id)
+        }
+    };
     log::info!(
         "Created crypto service for hub {}",
         &hub_id[..hub_id.len().min(8)]
@@ -63,5 +73,27 @@ mod tests {
         let bundle = guard.build_device_key_bundle().unwrap();
         assert_eq!(bundle.version, 6);
         assert!(!bundle.curve25519_key.is_empty());
+    }
+
+    #[test]
+    fn test_crypto_service_persists_long_term_identity() {
+        let hub_id = "test-crypto-persist";
+
+        let cs1 = create_crypto_service(hub_id);
+        let id1 = {
+            let mut guard = cs1.lock().expect("mutex poisoned");
+            let id = guard.identity_key().to_string();
+            guard.build_device_key_bundle().unwrap();
+            id
+        };
+
+        let cs2 = create_crypto_service(hub_id);
+        let id2 = cs2
+            .lock()
+            .expect("mutex poisoned")
+            .identity_key()
+            .to_string();
+
+        assert_eq!(id1, id2);
     }
 }

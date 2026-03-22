@@ -51,10 +51,8 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use vodozemac::olm::SessionConfig;
-use vodozemac::olm::{Account, OlmMessage, Session};
+use vodozemac::olm::{Account, AccountPickle, OlmMessage, Session};
 use vodozemac::Curve25519PublicKey;
-
-use super::persistence;
 
 /// Extract the Olm identity key from a browser_identity string.
 ///
@@ -262,20 +260,6 @@ impl DeviceKeyBundle {
     }
 }
 
-/// Serializable vodozemac crypto state for persistence.
-///
-/// Supports multiple concurrent Olm sessions (one per browser device).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct VodozemacCryptoState {
-    /// Pickled Account (vodozemac's serialized format).
-    pub pickled_account: String,
-    /// Hub ID.
-    pub hub_id: String,
-    /// Pickled sessions keyed by peer identity key (Curve25519, base64).
-    #[serde(default)]
-    pub pickled_sessions: HashMap<String, String>,
-}
-
 /// Vodozemac crypto manager for CLI-side encryption.
 ///
 /// Manages a vodozemac `Account` and multiple `Session`s for secure
@@ -305,10 +289,20 @@ impl VodozemacCrypto {
     /// Create a new crypto manager with a fresh identity.
     pub fn new(hub_id: &str) -> Self {
         let account = Account::new();
+        Self::from_account(hub_id, account)
+    }
+
+    /// Restore a crypto manager from a persisted long-term account.
+    pub fn from_account_pickle(hub_id: &str, pickle: AccountPickle) -> Self {
+        let account = Account::from_pickle(pickle);
+        Self::from_account(hub_id, account)
+    }
+
+    fn from_account(hub_id: &str, account: Account) -> Self {
         let identity_key = account.curve25519_key().to_base64();
 
         log::info!(
-            "Created new VodozemacCrypto for hub {} (identity: {}...)",
+            "Initialized VodozemacCrypto for hub {} (identity: {}...)",
             &hub_id[..hub_id.len().min(8)],
             &identity_key[..identity_key.len().min(16)]
         );
@@ -321,46 +315,9 @@ impl VodozemacCrypto {
         }
     }
 
-    /// Load from persisted state, or create new if not found.
-    pub fn load_or_create(hub_id: &str) -> Self {
-        match Self::load(hub_id) {
-            Ok(crypto) => {
-                log::info!(
-                    "Loaded existing VodozemacCrypto for hub {}",
-                    &hub_id[..hub_id.len().min(8)]
-                );
-                crypto
-            }
-            Err(e) => {
-                log::debug!("Could not load existing state: {e}, creating new");
-                Self::new(hub_id)
-            }
-        }
-    }
-
-    /// Load from persisted state.
-    fn load(hub_id: &str) -> Result<Self> {
-        let state = persistence::load_vodozemac_crypto_store(hub_id)?;
-
-        let pickle: vodozemac::olm::AccountPickle = serde_json::from_str(&state.pickled_account)
-            .context("Failed to deserialize AccountPickle")?;
-        let account = Account::from(pickle);
-        let identity_key = account.curve25519_key().to_base64();
-
-        let mut sessions = HashMap::new();
-
-        for (peer_key, pickled) in &state.pickled_sessions {
-            let pickle: vodozemac::olm::SessionPickle =
-                serde_json::from_str(pickled).context("Failed to deserialize SessionPickle")?;
-            sessions.insert(peer_key.clone(), Session::from(pickle));
-        }
-
-        Ok(Self {
-            account,
-            sessions,
-            identity_key,
-            hub_id: hub_id.to_string(),
-        })
+    /// Persist only the long-term account state.
+    pub fn persist_account(&self) -> Result<()> {
+        crate::relay::persistence::save_vodozemac_account(&self.hub_id, &self.account.pickle())
     }
 
     /// Build a `DeviceKeyBundle` for QR code display.
@@ -396,6 +353,13 @@ impl VodozemacCrypto {
             "Built device key bundle, identity key {}...",
             &curve25519_key[..curve25519_key.len().min(16)]
         );
+
+        if let Err(e) = self.persist_account() {
+            log::warn!(
+                "Failed to persist vodozemac account after bundle build for hub {}: {e}",
+                &self.hub_id[..self.hub_id.len().min(8)]
+            );
+        }
 
         Ok(DeviceKeyBundle {
             version: PROTOCOL_VERSION,
@@ -666,35 +630,6 @@ impl VodozemacCrypto {
     }
 
     // ========== End Binary DataChannel API ==========
-
-    /// Persist crypto state to disk.
-    pub fn persist(&self) -> Result<()> {
-        let pickled_account = serde_json::to_string(&self.account.pickle())
-            .context("Failed to serialize AccountPickle")?;
-
-        let mut pickled_sessions = HashMap::new();
-        for (peer_key, session) in &self.sessions {
-            let pickled = serde_json::to_string(&session.pickle())
-                .context("Failed to serialize SessionPickle")?;
-            pickled_sessions.insert(peer_key.clone(), pickled);
-        }
-
-        let state = VodozemacCryptoState {
-            pickled_account,
-            hub_id: self.hub_id.clone(),
-            pickled_sessions,
-        };
-
-        persistence::save_vodozemac_crypto_store(&self.hub_id, &state)?;
-
-        log::debug!(
-            "Persisted vodozemac crypto state for hub {} ({} sessions)",
-            &self.hub_id[..self.hub_id.len().min(8)],
-            self.sessions.len()
-        );
-
-        Ok(())
-    }
 
     /// Remove the Olm session for a specific peer.
     ///

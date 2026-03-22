@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "digest"
+require "json"
 require_relative "wait_helper"
 
 # Helper module for spawning and managing CLI instances in system tests.
@@ -64,7 +65,7 @@ module CliTestHelper
       false
     end
 
-    def stop
+    def stop(preserve_temp_dir: false)
       return unless @pid
 
       begin
@@ -81,7 +82,7 @@ module CliTestHelper
       @log_thread&.kill
       @stdout_r&.close
       @stderr_r&.close
-      FileUtils.rm_rf(@temp_dir) if @temp_dir && File.directory?(@temp_dir)
+      FileUtils.rm_rf(@temp_dir) if !preserve_temp_dir && @temp_dir && File.directory?(@temp_dir)
 
       # Clean up socket file (lives in /tmp/botster-{uid}/, not temp_dir).
       # SIGKILL may bypass the Rust shutdown path that normally removes this.
@@ -100,7 +101,9 @@ module CliTestHelper
       # CLI is ready when it has sent at least one heartbeat
       # Heartbeat updates hub.last_seen_at - more reliable than file-based detection
       @hub.reload
-      @hub.last_seen_at.present? && @hub.last_seen_at > @started_at
+      heartbeat_ready = @hub.last_seen_at.present? && @hub.last_seen_at > @started_at
+      output_ready = recent_output(lines: 20).include?("Hub ready. Waiting for connections...")
+      heartbeat_ready || output_ready
     rescue ActiveRecord::RecordNotFound
       false
     end
@@ -178,6 +181,24 @@ module CliTestHelper
     Rails.logger.info "[CliTestHelper] CLI build complete"
   end
 
+  def admit_spawn_target!(path)
+    now = Time.current.iso8601
+    payload = {
+      targets: [
+        {
+          id: "tgt_system_test",
+          name: File.basename(path),
+          path: path,
+          enabled: true,
+          created_at: now,
+          updated_at: now,
+        },
+      ],
+    }
+
+    File.write(File.join(path, "spawn_targets.json"), JSON.pretty_generate(payload))
+  end
+
   # Start a CLI instance for the given hub
   #
   # @param hub [Hub] The hub to connect to
@@ -189,7 +210,7 @@ module CliTestHelper
     build_cli unless skip_build?
 
     # Create temp directory for CLI data
-    temp_dir = Dir.mktmpdir("cli_test_")
+    temp_dir = options[:temp_dir] || Dir.mktmpdir("cli_test_")
     # Match CLI local hub identity (repo/cwd hash) without env overrides.
     # This keeps tests aligned with production behavior.
     local_hub_identifier = local_hub_id_for_path(temp_dir)
@@ -228,6 +249,11 @@ module CliTestHelper
     # real repo root. Init a bare git repo so the CLI can detect a repo for
     # heartbeat purposes. Config files go to temp_dir via BOTSTER_CONFIG_DIR.
     system("git", "init", "--quiet", temp_dir) unless File.exist?(File.join(temp_dir, ".git"))
+    admit_spawn_target!(temp_dir)
+    # Capture startup reference BEFORE spawn so a fast ActionCable subscribe /
+    # initial heartbeat cannot race ahead of the readiness timestamp.
+    started_at = Time.current
+
     pid = spawn(
       env,
       CLI_BINARY.to_s,
@@ -247,9 +273,6 @@ module CliTestHelper
     # Store log file path for debugging
     log_file_path = File.join(temp_dir, "botster.log")
     Rails.logger.info "[CliTestHelper] CLI log file: #{log_file_path}"
-
-    # Capture start time for heartbeat-based readiness detection
-    started_at = Time.current
 
     cli = CliProcess.new(
       pid: pid,
@@ -298,11 +321,11 @@ module CliTestHelper
   end
 
   # Stop a CLI instance
-  def stop_cli(cli)
+  def stop_cli(cli, preserve_temp_dir: false)
     return unless cli
 
     Rails.logger.info "[CliTestHelper] Stopping CLI for hub #{cli.hub.identifier}"
-    cli.stop
+    cli.stop(preserve_temp_dir: preserve_temp_dir)
   end
 
   # Create a test hub with proper fixtures
