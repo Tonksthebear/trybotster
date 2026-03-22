@@ -64,11 +64,13 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
 
     # Wait for full connection
     assert_webrtc_connected
+    paired_hub_url = current_url
 
-    # Refresh the page (Olm session should be cached in IndexedDB)
-    visit current_url
+    # Refresh the page. The reconnect path should recover without manual
+    # intervention while the browser session remains alive.
+    visit paired_hub_url
 
-    # Connection should re-establish from cached session (no pairing needed)
+    # Connection should re-establish without manual intervention.
     assert_selector(
       "[data-connection-status-target='browserSection'][data-status='connected']",
       wait: 30
@@ -88,12 +90,13 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
 
     # Wait for full WebRTC connection
     assert_webrtc_connected
+    paired_hub_url = current_url
 
     # Navigate away (Turbo soft navigation — releases connections, starts grace period)
     visit settings_path
 
     # Navigate back to hub (reacquires connections, must not storm)
-    visit hub_path(@hub)
+    visit paired_hub_url
 
     # Connection should re-establish cleanly within a reasonable timeout.
     # Before the fix, this would never stabilize — the browser would loop
@@ -103,6 +106,38 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     assert_selector(
       "[data-connection-status-target='hubSection'][data-status='online']",
       wait: 15
+    )
+  end
+
+  test "paired browser reconnects after hub reboot without rescanning" do
+    @cli = start_cli(@hub)
+    pair_browser_with_cli(@cli)
+
+    assert_webrtc_connected
+
+    preserved_temp_dir = @cli.temp_dir
+    stop_cli(@cli, preserve_temp_dir: true)
+    @cli = nil
+
+    assert_selector(
+      "[data-connection-status-target='connectionSection'][data-state='disconnected'], " \
+      "[data-connection-status-target='connectionSection'][data-state='expired'], " \
+      "[data-connection-status-target='connectionSection'][data-state='unpaired']",
+      wait: 20
+    )
+
+    @cli = start_cli(@hub, temp_dir: preserved_temp_dir)
+
+    visit current_url
+
+    assert_selector(
+      "[data-connection-status-target='browserSection'][data-status='connected']",
+      wait: 30
+    )
+    assert_webrtc_connected(wait: 30)
+    assert_selector(
+      "[data-connection-status-target='hubSection'][data-status='online']",
+      wait: 30
     )
   end
 

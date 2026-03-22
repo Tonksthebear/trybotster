@@ -152,7 +152,7 @@ function handleSessionInvalid(event, hubId, bridge, cb) {
   if (cb.getErrorCode() === "session_invalid") return
   cb.log(`Session invalid: ${event.message}`)
   cb.disconnectPeer()
-  bridge.clearSession(hubId).catch(() => {})
+  bridge.clearActiveSession(hubId).catch(() => {})
   cb.clearIdentity()
   cb.setError("session_invalid", event.message)
 }
