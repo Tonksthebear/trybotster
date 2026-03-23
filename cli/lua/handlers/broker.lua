@@ -39,19 +39,17 @@ end
 -- @param record table  One entry from workspace_store.scan_recoverable_sessions()
 -- @param broker_session table  One entry from Rust broker inventory
 -- @param recovered table  Array to append recovered sessions to
--- @param seen_keys table  Set of agent_keys already processed
+-- @param seen_keys table  Set of session_uuids already processed
 local function recover_session(record, broker_session, recovered, seen_keys)
     local sess         = record.manifest
     local session_uuid = record.session_uuid
-    local agent_key    = sess.id
 
-    if not agent_key or agent_key == "" or agent_key == "-" then
-        log.debug(string.format("[broker] Skipping session %s: missing id", session_uuid))
+    if not session_uuid or session_uuid == "" then
+        log.debug(string.format("[broker] Skipping session: missing session_uuid"))
         return
     end
-    if seen_keys[agent_key] then
-        log.debug(string.format("[broker] Skipping session %s: %s already processed",
-            session_uuid, agent_key))
+    if seen_keys[session_uuid] then
+        log.debug(string.format("[broker] Skipping session %s: already processed", session_uuid))
         return
     end
 
@@ -71,7 +69,7 @@ local function recover_session(record, broker_session, recovered, seen_keys)
     )
     if not ok or not handle then
         log.warn(string.format("[broker] create_ghost_session failed for %s: %s",
-            agent_key, tostring(handle)))
+            session_uuid, tostring(handle)))
         return
     end
 
@@ -88,7 +86,7 @@ local function recover_session(record, broker_session, recovered, seen_keys)
         session_uuid      = session_uuid,
         session_type      = sess.session_type or "agent",
         session_name      = sess.session_name,
-        agent_key         = agent_key,
+        agent_key         = sess.id,  -- backward compat for _init_recovered
         repo              = sess.repo,
         target_id         = sess.target_id,
         target_path       = sess.target_path,
@@ -123,11 +121,11 @@ local function recover_session(record, broker_session, recovered, seen_keys)
 
     if not ok2 or not session then
         log.warn(string.format("[broker] Failed to recover session %s: %s",
-            agent_key, tostring(session)))
+            session_uuid, tostring(session)))
         return
     end
 
-    seen_keys[agent_key] = true
+    seen_keys[session_uuid] = true
     recovered[#recovered + 1] = session
 end
 

@@ -230,9 +230,9 @@ end
 local function notify_agent(agent, payload)
     if agent.session then
         agent.session:send_message(format_notification(payload))
-        log.info(string.format("GitHub: notified existing agent %s", agent:agent_key()))
+        log.info(string.format("GitHub: notified existing agent %s", agent.session_uuid))
     else
-        log.warn(string.format("GitHub: cannot notify agent %s (no session)", agent:agent_key()))
+        log.warn(string.format("GitHub: cannot notify agent %s (no session)", agent.session_uuid))
     end
 end
 
@@ -247,10 +247,10 @@ hooks.on("pty_notification", "github_question_notify", function(data)
     -- Skip if agent already has a pending notification (avoid duplicate comments)
     if data.already_notified then return end
 
-    local agent_key = data.agent_key
-    if not agent_key then return end
+    local session_uuid = data.session_uuid
+    if not session_uuid then return end
 
-    local agent = Agent.find_by_agent_key(agent_key)
+    local agent = Agent.get(session_uuid)
     if not agent then return end
 
     -- Only post if we have issue context
@@ -265,7 +265,7 @@ hooks.on("pty_notification", "github_question_notify", function(data)
 
     local notification_type = "question_asked"
 
-    log.info(string.format("GitHub: posting %s notification for agent %s", notification_type, agent_key))
+    log.info(string.format("GitHub: posting %s notification for agent %s", notification_type, session_uuid))
 
     http.request({
         method  = "POST",
@@ -311,7 +311,7 @@ action_cable.subscribe(conn, "Github::EventsChannel",
                 for _, agent in ipairs(matches) do
                     events.emit("command_message", {
                         type = "delete_agent",
-                        agent_id = agent:agent_key(),
+                        agent_id = agent.session_uuid,
                         delete_worktree = false,
                     })
                 end

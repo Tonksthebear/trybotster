@@ -189,7 +189,7 @@ function Hub:get_pty_snapshot(agent_id, session)
     session = session or "agent"
 
     if self._is_local then
-        local agent = Agent.get(agent_id) or Agent.find_by_agent_key(agent_id)
+        local agent = Agent.get(agent_id)
         if not agent then
             error(string.format("Hub:get_pty_snapshot: agent '%s' not found", agent_id))
         end
@@ -222,7 +222,7 @@ function Hub:send_message(agent_id, text, session)
     session = session or "agent"
 
     if self._is_local then
-        local agent = Agent.get(agent_id) or Agent.find_by_agent_key(agent_id)
+        local agent = Agent.get(agent_id)
         if not agent then
             error(string.format("Hub:send_message: agent '%s' not found", agent_id))
         end
@@ -260,7 +260,7 @@ function Hub:post(agent_id, opts)
     local msg_type = opts.type or "message"
 
     if self._is_local then
-        local agent = Agent.get(agent_id) or Agent.find_by_agent_key(agent_id)
+        local agent = Agent.get(agent_id)
         if not agent then
             error(string.format("Hub:post: agent '%s' not found", agent_id))
         end
@@ -331,14 +331,7 @@ end
 -- @return array of envelope tables (may be empty)
 function Hub:receive_messages(agent_id)
     if self._is_local then
-        -- Agent.receive_messages expects session_uuid; resolve from agent_key if needed
         local messages = Agent.receive_messages(agent_id)
-        if messages == nil then
-            local agent = Agent.find_by_agent_key(agent_id)
-            if agent then
-                messages = Agent.receive_messages(agent.session_uuid)
-            end
-        end
         if messages == nil then
             error(string.format("Hub:receive_messages: agent '%s' not found", agent_id))
         end
@@ -532,7 +525,7 @@ end
 -- @return table
 function Hub:move_agent_workspace(agent_id, workspace_id, workspace_name)
     if self._is_local then
-        local session = Agent.get(agent_id) or Agent.find_by_agent_key(agent_id)
+        local session = Agent.get(agent_id)
         if not session then
             error(string.format("Hub:move_agent_workspace: session '%s' not found", tostring(agent_id)))
         end
@@ -552,7 +545,7 @@ function Hub:move_agent_workspace(agent_id, workspace_id, workspace_name)
         connections.broadcast_workspace_list()
 
         return {
-            agent_id = session:agent_key(),
+            agent_id = session.session_uuid,
             session_uuid = session.session_uuid,
             workspace_id = moved.workspace_id,
             workspace_name = moved.workspace_name,
@@ -581,7 +574,7 @@ end
 -- @return table Updated session info
 function Hub:update_session(agent_id, fields)
     if self._is_local then
-        local session = Agent.get(agent_id) or Agent.find_by_agent_key(agent_id)
+        local session = Agent.get(agent_id)
         if not session then
             error(string.format("Hub:update_session: session '%s' not found", tostring(agent_id)))
         end
@@ -625,12 +618,12 @@ function Hub:delete_agent(agent_id, delete_worktree)
     if self._is_local then
         -- Resolve agent_label if agent_id looks like a label (no match by key)
         local resolved_id = agent_id
-        local agent = Agent.get(agent_id) or Agent.find_by_agent_key(agent_id)
+        local agent = Agent.get(agent_id)
         if not agent then
             -- Try label lookup
             for _, a in ipairs(Agent.list()) do
                 if a.label == agent_id then
-                    resolved_id = a:agent_key()
+                    resolved_id = a.session_uuid
                     break
                 end
             end

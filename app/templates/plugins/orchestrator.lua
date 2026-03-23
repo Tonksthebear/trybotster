@@ -57,7 +57,7 @@ local function resolve_agent_id(params)
     if Hub.is_local(params.hub_id) then
         for _, agent in ipairs(Agent.list()) do
             if agent.label == params.agent_label then
-                return agent:agent_key()
+                return agent.session_uuid
             end
         end
     else
@@ -87,14 +87,15 @@ mcp.tool("whoami", {
         properties = {},
     },
 }, function(params, context)
+    local caller_id = context.session_uuid or context.agent_key
     local result = {
-        agent_key = context.agent_key,
+        session_uuid = caller_id,
         hub_id = context.hub_id,
         self_hub_id = self_id,
     }
 
-    if context.agent_key and context.agent_key ~= "" then
-        local agent = Agent.find_by_agent_key(context.agent_key)
+    if caller_id and caller_id ~= "" then
+        local agent = Agent.get(caller_id)
         if agent then
             local info = agent:info()
             result.session_uuid = agent.session_uuid
@@ -119,7 +120,7 @@ mcp.tool("list_hubs", {
         properties = {},
     },
 }, function(params, context)
-    local caller_key = context.agent_key
+    local caller_key = context.session_uuid or context.agent_key
     local caller_hub = context.hub_id
     local result = {}
 
@@ -518,7 +519,7 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
         if not msg.agent_label then return nil end
         for _, agent in ipairs(Agent.list()) do
             if agent.label == msg.agent_label then
-                return agent:agent_key()
+                return agent.session_uuid
             end
         end
         return nil

@@ -14,7 +14,7 @@ local hooks = require("hub.hooks")
 -- json, fs, config, worktree, log are Rust-provided globals (not requireable)
 
 --- Called when a new worktree is created.
--- ctx fields: path, branch, repo, agent_key, metadata
+-- ctx fields: path, branch, repo, metadata
 local function on_worktree_created(ctx)
     local repo_root = ctx.repo or worktree.repo_root()
     if not repo_root then return end
@@ -43,7 +43,7 @@ local function on_worktree_created(ctx)
 end
 
 --- Called when a worktree is about to be deleted.
--- ctx fields: path, branch, agent_key, session_uuid
+-- ctx fields: path, branch, session_uuid
 local function on_worktree_deleted(ctx)
     -- Example: remove worktree from Claude's trusted projects
     -- json.file_delete("~/.claude.json", "projects." .. ctx.path)
