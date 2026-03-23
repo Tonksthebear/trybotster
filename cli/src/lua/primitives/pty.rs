@@ -702,10 +702,10 @@ pub enum PtyRequest {
     /// Spawn a notification watcher task that subscribes to PTY events
     /// and queues `PtyEvent::Notification` events for the Hub tick loop.
     SpawnNotificationWatcher {
-        /// Unique key: "{agent_key}:{session_name}".
+        /// Unique key: "{session_uuid}:{session_name}".
         watcher_key: String,
-        /// Agent key for the Lua hook context.
-        agent_key: String,
+        /// Session UUID for routing and Lua hook context.
+        session_uuid: String,
         /// Session name (e.g., "cli", "server").
         session_name: String,
         /// Event sender to subscribe to PTY events.
@@ -738,12 +738,12 @@ impl Clone for PtyRequest {
             },
             Self::SpawnNotificationWatcher {
                 watcher_key,
-                agent_key,
+                session_uuid,
                 session_name,
                 event_tx,
             } => Self::SpawnNotificationWatcher {
                 watcher_key: watcher_key.clone(),
-                agent_key: agent_key.clone(),
+                session_uuid: session_uuid.clone(),
                 session_name: session_name.clone(),
                 event_tx: event_tx.clone(),
             },
@@ -784,7 +784,7 @@ pub(crate) fn spawn_session_handle_from_opts(
     let detect_notifications: bool = opts.get("detect_notifications").unwrap_or(false);
     let port: Option<u16> = opts.get("port").ok();
     let context: String = opts.get("context").unwrap_or_default();
-    let agent_key: Option<String> = opts.get("agent_key").ok();
+    let session_uuid_opt: Option<String> = opts.get("session_uuid").ok();
     let session_name: Option<String> = opts.get("session_name").ok();
 
     // Parse env table
@@ -834,13 +834,13 @@ pub(crate) fn spawn_session_handle_from_opts(
     // prompt marks) to Lua hooks. Notification detection in the reader
     // thread is still gated by `detect_notifications`, but OSC metadata
     // events (title/CWD/prompt) are emitted unconditionally.
-    if let (Some(ak), Some(sn)) = (&agent_key, &session_name) {
-        let watcher_key = format!("{ak}:{sn}");
+    if let (Some(uuid), Some(sn)) = (&session_uuid_opt, &session_name) {
+        let watcher_key = format!("{uuid}:{sn}");
         send_pty_event(
             &hub_event_tx,
             PtyRequest::SpawnNotificationWatcher {
                 watcher_key,
-                agent_key: ak.clone(),
+                session_uuid: uuid.clone(),
                 session_name: sn.clone(),
                 event_tx: event_tx.clone(),
             },
@@ -1938,7 +1938,7 @@ mod tests {
                     worktree_path = temp_path,
                     command = "echo hello",
                     detect_notifications = true,
-                    agent_key = "agent-1",
+                    session_uuid = "agent-1",
                     session_name = "cli",
                 })
             "#,
@@ -1951,12 +1951,12 @@ mod tests {
         match event {
             HubEvent::LuaPtyRequest(PtyRequest::SpawnNotificationWatcher {
                 watcher_key,
-                agent_key,
+                session_uuid,
                 session_name,
                 ..
             }) => {
                 assert_eq!(watcher_key, "agent-1:cli");
-                assert_eq!(agent_key, "agent-1");
+                assert_eq!(session_uuid, "agent-1");
                 assert_eq!(session_name, "cli");
             }
             other => panic!(
@@ -1980,7 +1980,7 @@ mod tests {
             .set("temp_path", temp_path)
             .expect("Failed to set temp_path");
 
-        // detect_notifications=true but no agent_key/session_name -> no event sent
+        // detect_notifications=true but no session_uuid/session_name -> no event sent
         lua.load(
             r#"
                 session = pty.spawn({
@@ -2021,7 +2021,7 @@ mod tests {
                     worktree_path = temp_path,
                     command = "echo hello",
                     detect_notifications = false,
-                    agent_key = "agent-1",
+                    session_uuid = "agent-1",
                     session_name = "server",
                 })
             "#,
@@ -2034,12 +2034,12 @@ mod tests {
         match event {
             HubEvent::LuaPtyRequest(PtyRequest::SpawnNotificationWatcher {
                 watcher_key,
-                agent_key,
+                session_uuid,
                 session_name,
                 ..
             }) => {
                 assert_eq!(watcher_key, "agent-1:server");
-                assert_eq!(agent_key, "agent-1");
+                assert_eq!(session_uuid, "agent-1");
                 assert_eq!(session_name, "server");
             }
             other => panic!("Expected SpawnNotificationWatcher, got {:?}", other),

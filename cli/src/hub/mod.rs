@@ -157,8 +157,8 @@ pub struct PtyObserverNotification {
 /// A PTY notification event queued by a watcher task for the Hub tick loop.
 #[derive(Debug)]
 pub struct PtyNotificationEvent {
-    /// Agent key for the Lua hook context.
-    pub agent_key: String,
+    /// Session UUID for routing and Lua hook context.
+    pub session_uuid: String,
     /// Session name (e.g., "cli", "server").
     pub session_name: String,
     /// The notification detected in PTY output.
@@ -537,7 +537,7 @@ pub struct Hub {
     #[cfg(test)]
     pub(crate) pty_output_messages_drained: usize,
 
-    /// Handles for notification watcher tasks, keyed by "{agent_key}:{session_name}".
+    /// Handles for notification watcher tasks, keyed by "{session_uuid}:{session_name}".
     notification_watcher_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
 
     /// Tracks peers that received a ratchet restart during the current cleanup window.

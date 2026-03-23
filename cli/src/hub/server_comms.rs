@@ -201,32 +201,32 @@ impl Hub {
             }
             HubEvent::PtyNotification(notif) => {
                 self.lua.notify_pty_notification(
-                    &notif.agent_key,
+                    &notif.session_uuid,
                     &notif.session_name,
                     &notif.notification,
                 );
             }
             HubEvent::PtyOscEvent {
-                agent_key,
+                session_uuid,
                 session_name,
                 event,
             } => {
                 self.lua
-                    .notify_pty_osc_event(&agent_key, &session_name, &event);
+                    .notify_pty_osc_event(&session_uuid, &session_name, &event);
             }
             HubEvent::PtyProcessExited {
-                agent_key,
+                session_uuid,
                 session_name,
                 exit_code,
             } => {
                 log::info!(
                     "[Hub] PTY process exited for {}:{} (code={:?})",
-                    agent_key,
+                    session_uuid,
                     session_name,
                     exit_code
                 );
                 let data = serde_json::json!({
-                    "agent_key": agent_key,
+                    "session_uuid": session_uuid,
                     "session_name": session_name,
                     "exit_code": exit_code,
                 });
@@ -624,13 +624,13 @@ impl Hub {
                     }
                     PtyRequest::SpawnNotificationWatcher {
                         watcher_key,
-                        agent_key,
+                        session_uuid,
                         session_name,
                         event_tx,
                     } => {
                         self.spawn_notification_watcher(
                             watcher_key,
-                            agent_key,
+                            session_uuid,
                             session_name,
                             event_tx,
                         );
@@ -872,7 +872,7 @@ impl Hub {
 
                 match request {
                     WorktreeRequest::Create {
-                        agent_key,
+                        label,
                         branch,
                         metadata,
                         prompt,
@@ -881,14 +881,14 @@ impl Hub {
                         client_cols,
                     } => {
                         log::info!(
-                            "[Lua] Dispatching async worktree.create({}) for agent {}",
+                            "[Lua] Dispatching async worktree.create({}) for {}",
                             branch,
-                            agent_key
+                            label
                         );
                         let worktree_base = self.config.worktree_base.clone();
                         let result_tx = self.worktree_result_tx.clone();
                         let branch_clone = branch.clone();
-                        let agent_key_clone = agent_key.clone();
+                        let label_clone = label.clone();
 
                         self.tokio_runtime.spawn(async move {
                             let result = tokio::task::spawn_blocking(move || {
@@ -905,7 +905,7 @@ impl Hub {
 
                             if result_tx
                                 .try_send(WorktreeCreateResult {
-                                    agent_key: agent_key_clone,
+                                    label: label_clone,
                                     branch,
                                     result: outcome,
                                     metadata,
@@ -1322,7 +1322,7 @@ impl Hub {
         if let Some(session_handle) = self.handle_cache.get_session(&file.session_uuid) {
             let agent_handle = session_handle;
             self.paste_files
-                .entry(agent_handle.agent_key().to_string())
+                .entry(agent_handle.label().to_string())
                 .or_default()
                 .push(path.clone());
 
@@ -1336,9 +1336,9 @@ impl Hub {
         }
     }
 
-    /// Clean up paste files for a closed agent.
-    pub fn cleanup_paste_files(&mut self, agent_key: &str) {
-        if let Some(files) = self.paste_files.remove(agent_key) {
+    /// Clean up paste files for a closed session.
+    pub fn cleanup_paste_files(&mut self, label: &str) {
+        if let Some(files) = self.paste_files.remove(label) {
             for path in &files {
                 if let Err(e) = std::fs::remove_file(path) {
                     log::warn!(
@@ -1349,7 +1349,7 @@ impl Hub {
             }
             if !files.is_empty() {
                 log::info!(
-                    "[FILE-INPUT] Cleaned up {} paste file(s) for agent {agent_key}",
+                    "[FILE-INPUT] Cleaned up {} paste file(s) for {label}",
                     files.len()
                 );
             }
@@ -1407,7 +1407,7 @@ impl Hub {
                 self.handle_cache.set_worktrees(worktrees);
 
                 let event_data = serde_json::json!({
-                    "agent_key": result.agent_key,
+                    "label": result.label,
                     "branch": result.branch,
                     "path": path_str,
                     "metadata": result.metadata,
@@ -1428,7 +1428,7 @@ impl Hub {
                 );
 
                 let event_data = serde_json::json!({
-                    "agent_key": result.agent_key,
+                    "label": result.label,
                     "branch": result.branch,
                     "error": error,
                 });
@@ -1512,7 +1512,7 @@ impl Hub {
     fn spawn_notification_watcher(
         &mut self,
         watcher_key: String,
-        agent_key: String,
+        session_uuid: String,
         session_name: String,
         event_tx: tokio::sync::broadcast::Sender<crate::agent::pty::PtyEvent>,
     ) {
@@ -1540,7 +1540,7 @@ impl Hub {
                     Ok(PtyEvent::Notification(notif)) => {
                         log::debug!("[NotifWatcher] Notification for {}: {:?}", key, notif);
                         let event = super::PtyNotificationEvent {
-                            agent_key: agent_key.clone(),
+                            session_uuid: session_uuid.clone(),
                             session_name: session_name.clone(),
                             notification: notif,
                         };
@@ -1559,7 +1559,7 @@ impl Hub {
                             key
                         );
                         let event = super::events::HubEvent::PtyProcessExited {
-                            agent_key: agent_key.clone(),
+                            session_uuid: session_uuid.clone(),
                             session_name: session_name.clone(),
                             exit_code,
                         };
@@ -1572,7 +1572,7 @@ impl Hub {
                     | Ok(event @ PtyEvent::CursorVisibilityChanged(_)) => {
                         if hub_tx
                             .send(super::events::HubEvent::PtyOscEvent {
-                                agent_key: agent_key.clone(),
+                                session_uuid: session_uuid.clone(),
                                 session_name: session_name.clone(),
                                 event,
                             })
@@ -1621,7 +1621,7 @@ impl Hub {
 
         for event in events {
             self.lua.notify_pty_notification(
-                &event.agent_key,
+                &event.session_uuid,
                 &event.session_name,
                 &event.notification,
             );
@@ -2504,7 +2504,7 @@ impl Hub {
 
                     // Fire Lua event with all context for agent spawning
                     let event_data = serde_json::json!({
-                        "agent_key": result.agent_key,
+                        "label": result.label,
                         "branch": result.branch,
                         "path": path_str,
                         "metadata": result.metadata,
@@ -2525,7 +2525,7 @@ impl Hub {
                     );
 
                     let event_data = serde_json::json!({
-                        "agent_key": result.agent_key,
+                        "label": result.label,
                         "branch": result.branch,
                         "error": error,
                     });

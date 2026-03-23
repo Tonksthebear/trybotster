@@ -20,7 +20,7 @@
 //!
 //! -- Register session PTY handle
 //! local index = hub.register_session("sess-abc123", handle, {
-//!   agent_key = "owner-repo-42",
+//!   label = "owner-repo-42",
 //!   broker_session_id = 123,
 //! })
 //!
@@ -181,7 +181,7 @@ pub(crate) fn register(
     //   pty_handle:   PtySessionHandle userdata - Single PTY handle
     //   metadata:     table - {
     //     session_type = "agent"|"accessory",
-    //     agent_key = "owner-repo-42",
+    //     label = "owner-repo-42",
     //     workspace_id = nil,
     //     broker_session_id = 123, -- required for all runtime sessions
     //   }
@@ -230,8 +230,8 @@ pub(crate) fn register(
                     handle.to_pty_handle_with_broker_relay((sid, Arc::clone(&register_broker_conn)))
                 };
 
-                let agent_key: String = metadata
-                    .get("agent_key")
+                let label: String = metadata
+                    .get("label")
                     .unwrap_or_else(|_| session_uuid.clone());
 
                 let session_type_str: String = metadata
@@ -246,7 +246,7 @@ pub(crate) fn register(
 
                 let handle = SessionHandle::new(
                     session_uuid.clone(),
-                    agent_key.clone(),
+                    label.clone(),
                     session_type,
                     workspace_id,
                     pty_handle,
@@ -255,9 +255,9 @@ pub(crate) fn register(
                 cache2.add_session(handle);
                 let index = cache2.index_of(&session_uuid);
                 log::info!(
-                    "[Lua] Registered session '{}' (key='{}', type={}, broker_session_id={:?}) at index {:?}",
+                    "[Lua] Registered session '{}' (label='{}', type={}, broker_session_id={:?}) at index {:?}",
                     session_uuid,
-                    agent_key,
+                    label,
                     session_type,
                     broker_session_id,
                     index
@@ -270,13 +270,13 @@ pub(crate) fn register(
                     let session_name: String = metadata
                         .get("session_name")
                         .unwrap_or_else(|_| session_type_str.clone());
-                    let watcher_key = format!("{}:{}", agent_key, session_name);
+                    let watcher_key = format!("{}:{}", session_uuid, session_name);
                     let guard = register_event_tx.lock().expect("HubEventSender mutex poisoned");
                     if let Some(ref sender) = *guard {
                         let _ = sender.send(HubEvent::LuaPtyRequest(
                             crate::lua::primitives::pty::PtyRequest::SpawnNotificationWatcher {
                                 watcher_key,
-                                agent_key: agent_key.clone(),
+                                session_uuid: session_uuid.clone(),
                                 session_name,
                                 event_tx: event_tx_clone,
                             },
@@ -959,7 +959,7 @@ mod tests {
             local h = hub.create_ghost_session("sess-relay", 77, 24, 80)
             hub.register_session("sess-relay", h, {
                 session_type = "agent",
-                agent_key = "relay-agent",
+                label = "relay-agent",
                 broker_session_id = 77,
             })
         "#,
@@ -993,7 +993,7 @@ mod tests {
             local h = hub.create_ghost_session("sess-no-relay", 88, 24, 80)
             hub.register_session("sess-no-relay", h, {
                 session_type = "agent",
-                agent_key = "plain-ghost",
+                label = "plain-ghost",
             })
         "#,
             )
