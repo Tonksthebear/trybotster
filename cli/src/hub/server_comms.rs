@@ -5502,6 +5502,7 @@ mod tests {
             true,
             None,
             (1, shared),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         );
         // Seed shadow state so cached snapshot is non-empty.
         pty.feed_broker_output(seed_output, 0);

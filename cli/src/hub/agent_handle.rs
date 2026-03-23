@@ -36,9 +36,10 @@
 #[cfg(test)]
 use std::io::Write;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 
@@ -243,6 +244,12 @@ pub struct PtyHandle {
     /// share the same state.
     last_cursor_visible: Arc<Mutex<Option<bool>>>,
 
+    /// Epoch milliseconds of the last PTY output chunk.
+    ///
+    /// Updated by `feed_broker_output()` on each BrokerPtyOutput delivery.
+    /// Read by Lua's `session:last_output_at()` for idle detection.
+    last_output_at: Arc<AtomicU64>,
+
     /// HTTP forwarding port for preview proxying.
     ///
     /// Used by accessory sessions running dev servers to expose the port
@@ -342,6 +349,7 @@ impl PtyHandle {
             cursor_visible,
             resize_pending,
             detect_notifs,
+            last_output_at: Arc::new(AtomicU64::new(0)),
             port,
             last_cursor_visible: Arc::new(Mutex::new(Some(true))),
             broker_relay: None,
@@ -360,6 +368,7 @@ impl PtyHandle {
         detect_notifs: bool,
         port: Option<u16>,
         broker_relay: (u32, SharedBrokerConnection),
+        last_output_at: Arc<AtomicU64>,
     ) -> Self {
         let (session_id, connection) = broker_relay;
         Self {
@@ -370,6 +379,7 @@ impl PtyHandle {
             cursor_visible,
             resize_pending,
             detect_notifs,
+            last_output_at,
             // Start as Some(true): alacritty initializes with SHOW_CURSOR set, matching
             // spawn_reader_thread initialization to avoid a spurious
             // CursorVisibilityChanged(true) on the very first broker output delivery.
@@ -691,6 +701,15 @@ impl PtyHandle {
     /// mode state (cursor visibility, kitty protocol) instead of a local
     /// shadow screen.
     pub fn feed_broker_output(&self, data: &[u8], flags: u8) {
+        // Track last output time for idle detection (epoch ms).
+        self.last_output_at.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            Ordering::Relaxed,
+        );
+
         let mut lcv = self
             .last_cursor_visible
             .lock()
@@ -705,6 +724,20 @@ impl PtyHandle {
             self.detect_notifs,
             &mut lcv,
         );
+    }
+
+    /// Epoch milliseconds of the last PTY output, or 0 if no output yet.
+    #[must_use]
+    pub fn last_output_at(&self) -> u64 {
+        self.last_output_at.load(Ordering::Relaxed)
+    }
+
+    /// Shared atomic for last output timestamp.
+    ///
+    /// Used by `PtySessionHandle` to share the same atomic with Lua.
+    #[must_use]
+    pub fn last_output_at_atomic(&self) -> &Arc<AtomicU64> {
+        &self.last_output_at
     }
 }
 
@@ -764,6 +797,7 @@ mod tests {
             true,
             None,
             (42, shared),
+            Arc::new(AtomicU64::new(0)),
         );
 
         (handle, server_stream)

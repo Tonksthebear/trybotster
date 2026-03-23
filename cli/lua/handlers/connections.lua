@@ -199,6 +199,10 @@ end)
 hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
     log.info(string.format("Broadcasting agent_deleted: %s", agent_id or "?"))
 
+    -- Clean up idle tracking state for the deleted session.
+    local idle_st = state.get("connections._idle_state", {})
+    idle_st[agent_id] = nil
+
     broadcast_hub_event("agent_deleted", { agent_id = agent_id })
     broadcast_hub_event("agent_list", { agents = Agent.all_info() })
     broadcast_workspace_list()
@@ -341,10 +345,16 @@ end)
 -- Fires on the Rust PTY output hot path (debounced by observer queue budget).
 -- Does NOT broadcast agent_list — that would be too noisy. Clients read
 -- last_output_at from the next agent_list broadcast triggered by other events.
+--
+-- Reads the ms-precision timestamp from the Rust AtomicU64 (set by
+-- PtyHandle::feed_broker_output) rather than using os.time() seconds.
 hooks.on("pty_output", "update_last_output_at", function(ctx, _data)
-    local agent = ctx.session_uuid and Agent.get(ctx.session_uuid)
-    if agent then
-        agent.last_output_at = os.time()
+    local session = ctx.session_uuid and Agent.get(ctx.session_uuid)
+    if session and session.session then
+        local ms = session.session:last_output_at()
+        if ms then
+            session.last_output_at = ms
+        end
     end
 end)
 
@@ -363,6 +373,50 @@ hooks.on("pty_cursor_visibility", "update_agent_cursor", function(info)
         agent.cursor_visible = info.visible
     end
 end)
+
+-- ============================================================================
+-- Idle / Active Detection
+-- ============================================================================
+--
+-- Polls every 2 seconds, comparing each session's last_output_at (epoch ms)
+-- against the current time.  Fires "session_idle" when a session has no output
+-- for >= IDLE_THRESHOLD_MS, and "session_active" when output resumes.
+--
+-- State is stored per-session in `_idle_state` (true = idle).  The timer
+-- handle is stored in hub.state so it survives hot-reloads.
+
+local IDLE_THRESHOLD_MS = 5000
+local _idle_state = state.get("connections._idle_state", {})
+
+local function check_idle_active()
+    local now_ms = math.floor(os.clock() * 1000) -- monotonic-ish fallback
+    -- Use wall-clock ms for comparison with Rust epoch timestamps.
+    -- os.time() is seconds; multiply by 1000 for ms-resolution comparison.
+    local now_wall_ms = os.time() * 1000
+
+    for uuid, session in pairs(Agent.all()) do
+        local last = session.last_output_at
+        if last and last > 0 then
+            local idle = (now_wall_ms - last) >= IDLE_THRESHOLD_MS
+            local was_idle = _idle_state[uuid]
+
+            if idle and not was_idle then
+                _idle_state[uuid] = true
+                hooks.call("session_idle", { session_uuid = uuid })
+            elseif not idle and was_idle then
+                _idle_state[uuid] = false
+                hooks.call("session_active", { session_uuid = uuid })
+            end
+        end
+    end
+end
+
+-- Cancel previous timer on hot-reload, then start fresh.
+local prev_timer = state.get("connections._idle_timer")
+if prev_timer then
+    timer.cancel(prev_timer)
+end
+state.set("connections._idle_timer", timer.every(2, check_idle_active))
 
 hooks.on("agent_lifecycle", "broadcast_lifecycle", function(info)
     log.debug(string.format("Broadcasting agent_lifecycle: %s -> %s",
@@ -510,6 +564,8 @@ function M._before_reload()
     hooks.off("pty_output", "update_last_output_at")
     hooks.off("pty_prompt", "update_agent_prompt")
     hooks.off("pty_cursor_visibility", "update_agent_cursor")
+    local idle_timer = state.get("connections._idle_timer")
+    if idle_timer then timer.cancel(idle_timer) end
     _set_pty_focused = nil
     _on_pty_input = nil
     _clear_session_notification = nil
