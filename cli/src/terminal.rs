@@ -429,6 +429,13 @@ pub fn generate_ansi_snapshot<L: EventListener>(
     // Without this, if vim/less/htop is running when a browser reconnects, the
     // alt-screen cells would be written to the *normal* screen — corrupting it
     // when the app later exits and restores the normal buffer.
+    //
+    // Limitation: `inactive_grid` is private in alacritty_terminal, so we cannot
+    // serialize the normal buffer before entering alt screen. When the app exits
+    // alt screen (`\x1b[?1049l`), the receiving terminal restores a blank normal
+    // buffer rather than the pre-alt content. This is acceptable because:
+    // 1. Alt-screen apps (vim, less, htop) immediately redraw on exit
+    // 2. The alt-screen content itself (the important part) round-trips correctly
     if term.mode().contains(TermMode::ALT_SCREEN) {
         out.extend_from_slice(b"\x1b[?1049h");
     }
@@ -480,20 +487,41 @@ pub fn generate_ansi_snapshot<L: EventListener>(
     for line_idx in 0..screen_lines {
         lines.push(Line(line_idx as i32));
     }
+    let mut sgr = SgrState::reset();
+    let mut active_hyperlink: Option<String> = None;
     for (idx, line) in lines.iter().enumerate() {
         let wrapped = line_wraps(grid, *line, cols);
         // Non-wrapped lines should avoid serializing default trailing cells.
         // Writing up to the last column can trigger implicit autowrap in some
         // terminals and shift subsequent rendered rows.
-        emit_grid_line(&mut out, grid, *line, cols, !wrapped);
+        emit_grid_line(
+            &mut out,
+            grid,
+            *line,
+            cols,
+            !wrapped,
+            &mut sgr,
+            &mut active_hyperlink,
+        );
         let has_next = idx + 1 < lines.len();
         if has_next && !wrapped {
-            // `emit_grid_line` starts each row assuming SGR has been reset.
-            // Emit a real reset before the CRLF so color/attribute state
+            // Close any open hyperlink before the line break.
+            if active_hyperlink.is_some() {
+                out.extend_from_slice(b"\x1b]8;;\x1b\\");
+                active_hyperlink = None;
+            }
+            // Reset SGR at non-wrapped line boundaries so color/attribute state
             // cannot leak into the next non-wrapped row when trailing default
             // cells were trimmed from the current line.
             out.extend_from_slice(b"\x1b[0m\r\n");
+            sgr = SgrState::reset();
         }
+        // Wrapped lines: sgr and hyperlink state carry over naturally.
+    }
+
+    // Close any hyperlink still open at the end of the grid.
+    if active_hyperlink.is_some() {
+        out.extend_from_slice(b"\x1b]8;;\x1b\\");
     }
 
     // Reset SGR before restoring terminal modes/cursor state.
@@ -596,6 +624,28 @@ fn restore_core_modes(out: &mut Vec<u8>, mode: &TermMode) {
     } else {
         out.extend_from_slice(b"\x1b[?1004l");
     }
+
+    // Mouse reporting modes — only emit the active set/reset.
+    // ?1000 = click reporting, ?1002 = button-event (drag), ?1003 = any-event (motion).
+    if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+        out.extend_from_slice(b"\x1b[?1000h");
+    }
+    if mode.contains(TermMode::MOUSE_DRAG) {
+        out.extend_from_slice(b"\x1b[?1002h");
+    }
+    if mode.contains(TermMode::MOUSE_MOTION) {
+        out.extend_from_slice(b"\x1b[?1003h");
+    }
+
+    // ?1006 = SGR mouse coordinate format (extended coordinates beyond 223).
+    if mode.contains(TermMode::SGR_MOUSE) {
+        out.extend_from_slice(b"\x1b[?1006h");
+    }
+
+    // ?1007 = alternate screen scroll (mouse scroll in alt screen sends arrows).
+    if mode.contains(TermMode::ALTERNATE_SCROLL) {
+        out.extend_from_slice(b"\x1b[?1007h");
+    }
 }
 
 /// Whether a rendered grid line is soft-wrapped into the following line.
@@ -640,14 +690,20 @@ fn cursor_shape_decscusr(style: CursorStyle) -> &'static [u8] {
 /// wide character was already emitted by the preceding cell. Zero-width
 /// combining characters stored in [`alacritty_terminal::term::cell::CellExtra`]
 /// are appended immediately after their base character.
+///
+/// `sgr` is the live SGR state carried across lines. For wrapped lines, the
+/// caller passes the state from the end of the previous row so attributes
+/// flow naturally without a spurious reset. For non-wrapped lines, the caller
+/// resets SGR and passes a fresh `SgrState::reset()`.
 fn emit_grid_line(
     out: &mut Vec<u8>,
     grid: &Grid<Cell>,
     line: Line,
     cols: usize,
     trim_trailing: bool,
+    sgr: &mut SgrState,
+    active_hyperlink: &mut Option<String>,
 ) {
-    let mut sgr = SgrState::reset();
     let mut char_buf = [0u8; 4];
     let mut end_col = cols;
 
@@ -665,16 +721,44 @@ fn emit_grid_line(
     for col in 0..end_col {
         let cell = &grid[Point::new(line, Column(col))];
 
-        // Skip wide-char continuation spacer — rendered as part of the wide char.
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+        // Skip wide-char spacers — rendered as part of the wide char.
+        // WIDE_CHAR_SPACER: trailing spacer after a width-2 glyph.
+        // LEADING_WIDE_CHAR_SPACER: placeholder at last column when a width-2
+        // glyph doesn't fit and wraps to the next row.
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
             continue;
         }
 
         // Emit only the SGR attributes that differ from the previous cell.
         let new_sgr = SgrState::from_cell(cell);
-        if new_sgr != sgr {
-            new_sgr.emit_diff(out, &sgr);
-            sgr = new_sgr;
+        if new_sgr != *sgr {
+            new_sgr.emit_diff(out, sgr);
+            *sgr = new_sgr;
+        }
+
+        // Handle hyperlink transitions (OSC 8).
+        let cell_link = cell.hyperlink();
+        let cell_uri = cell_link.as_ref().map(|h| h.uri().to_string());
+        if cell_uri != *active_hyperlink {
+            if active_hyperlink.is_some() {
+                // Close the previous hyperlink.
+                out.extend_from_slice(b"\x1b]8;;\x1b\\");
+            }
+            if let Some(ref link) = cell_link {
+                // Open a new hyperlink.
+                let id = link.id();
+                if id.is_empty() {
+                    out.extend_from_slice(format!("\x1b]8;;{}\x1b\\", link.uri()).as_bytes());
+                } else {
+                    out.extend_from_slice(
+                        format!("\x1b]8;id={};{}\x1b\\", id, link.uri()).as_bytes(),
+                    );
+                }
+            }
+            *active_hyperlink = cell_uri;
         }
 
         // Emit base character.
@@ -694,7 +778,7 @@ fn emit_grid_line(
 fn is_trimmable_trailing_blank(cell: &Cell) -> bool {
     const VISUAL_FLAGS: Flags = Flags::BOLD
         .union(Flags::ITALIC)
-        .union(Flags::UNDERLINE)
+        .union(Flags::ALL_UNDERLINES)
         .union(Flags::DIM)
         .union(Flags::INVERSE)
         .union(Flags::HIDDEN)
@@ -703,11 +787,31 @@ fn is_trimmable_trailing_blank(cell: &Cell) -> bool {
     let default_fg = cell.fg == Color::Named(NamedColor::Foreground);
     let default_bg = cell.bg == Color::Named(NamedColor::Background);
     let visual_default = cell.flags.intersection(VISUAL_FLAGS).is_empty();
+    let no_underline_color = cell.underline_color().is_none();
 
-    cell.c == ' ' && cell.zerowidth().is_none() && default_fg && default_bg && visual_default
+    cell.c == ' '
+        && cell.zerowidth().is_none()
+        && default_fg
+        && default_bg
+        && visual_default
+        && no_underline_color
 }
 
 // ── SGR state ─────────────────────────────────────────────────────────────────
+
+/// Underline style variants supported by modern terminals.
+///
+/// Maps to SGR 4 sub-parameters: `4` (single), `4:2` (double), `4:3` (curly),
+/// `4:4` (dotted), `4:5` (dashed). `None` means no underline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnderlineStyle {
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
 
 /// Accumulated SGR (Select Graphic Rendition) state for a single cell.
 ///
@@ -718,7 +822,10 @@ fn is_trimmable_trailing_blank(cell: &Cell) -> bool {
 struct SgrState {
     fg: Color,
     bg: Color,
-    /// Visual-only flags; structural flags (WIDE_CHAR, WRAPLINE) excluded.
+    underline_color: Option<Color>,
+    underline_style: UnderlineStyle,
+    /// Visual-only flags; structural flags (WIDE_CHAR, WRAPLINE) and underline
+    /// flags (handled by `underline_style`) excluded.
     flags: Flags,
 }
 
@@ -728,6 +835,8 @@ impl SgrState {
         Self {
             fg: Color::Named(NamedColor::Foreground),
             bg: Color::Named(NamedColor::Background),
+            underline_color: None,
+            underline_style: UnderlineStyle::None,
             flags: Flags::empty(),
         }
     }
@@ -737,17 +846,33 @@ impl SgrState {
         // Mask to only the visual flags we can express as SGR codes.
         // Structural flags (WIDE_CHAR, WIDE_CHAR_SPACER, WRAPLINE,
         // LEADING_WIDE_CHAR_SPACER) are not SGR attributes.
+        // Underline variants are tracked via `underline_style` enum, not flags.
         const VISUAL_FLAGS: Flags = Flags::BOLD
             .union(Flags::ITALIC)
-            .union(Flags::UNDERLINE)
             .union(Flags::DIM)
             .union(Flags::INVERSE)
             .union(Flags::HIDDEN)
             .union(Flags::STRIKEOUT);
 
+        let underline_style = if cell.flags.contains(Flags::UNDERCURL) {
+            UnderlineStyle::Curly
+        } else if cell.flags.contains(Flags::DOTTED_UNDERLINE) {
+            UnderlineStyle::Dotted
+        } else if cell.flags.contains(Flags::DASHED_UNDERLINE) {
+            UnderlineStyle::Dashed
+        } else if cell.flags.contains(Flags::DOUBLE_UNDERLINE) {
+            UnderlineStyle::Double
+        } else if cell.flags.contains(Flags::UNDERLINE) {
+            UnderlineStyle::Single
+        } else {
+            UnderlineStyle::None
+        };
+
         Self {
             fg: cell.fg,
             bg: cell.bg,
+            underline_color: cell.underline_color(),
+            underline_style,
             flags: cell.flags.intersection(VISUAL_FLAGS),
         }
     }
@@ -771,8 +896,13 @@ impl SgrState {
         if self.flags.contains(Flags::ITALIC) {
             out.extend_from_slice(b";3");
         }
-        if self.flags.contains(Flags::UNDERLINE) {
-            out.extend_from_slice(b";4");
+        match self.underline_style {
+            UnderlineStyle::None => {}
+            UnderlineStyle::Single => out.extend_from_slice(b";4"),
+            UnderlineStyle::Double => out.extend_from_slice(b";4:2"),
+            UnderlineStyle::Curly => out.extend_from_slice(b";4:3"),
+            UnderlineStyle::Dotted => out.extend_from_slice(b";4:4"),
+            UnderlineStyle::Dashed => out.extend_from_slice(b";4:5"),
         }
         if self.flags.contains(Flags::INVERSE) {
             out.extend_from_slice(b";7");
@@ -817,6 +947,49 @@ impl SgrState {
         }
 
         out.push(b'm');
+
+        // Underline color uses SGR 58 (set) / 59 (reset) — separate from the
+        // main SGR sequence because these are not universally colon-separated
+        // sub-params but standalone sequences.
+        if let Some(color) = self.underline_color {
+            match color {
+                Color::Indexed(idx) => {
+                    out.extend_from_slice(format!("\x1b[58;5;{idx}m").as_bytes());
+                }
+                Color::Spec(rgb) => {
+                    out.extend_from_slice(
+                        format!("\x1b[58;2;{};{};{}m", rgb.r, rgb.g, rgb.b).as_bytes(),
+                    );
+                }
+                Color::Named(name) => {
+                    // Named underline colors are unusual but possible.
+                    if let Some(code) = named_fg_sgr(name) {
+                        // Map fg color codes (30-37, 90-97) to underline color
+                        // via SGR 58;5;N indexed form.
+                        let idx = match code {
+                            "30" => 0,
+                            "31" => 1,
+                            "32" => 2,
+                            "33" => 3,
+                            "34" => 4,
+                            "35" => 5,
+                            "36" => 6,
+                            "37" => 7,
+                            "90" => 8,
+                            "91" => 9,
+                            "92" => 10,
+                            "93" => 11,
+                            "94" => 12,
+                            "95" => 13,
+                            "96" => 14,
+                            "97" => 15,
+                            _ => return,
+                        };
+                        out.extend_from_slice(format!("\x1b[58;5;{idx}m").as_bytes());
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1209,6 +1382,249 @@ mod tests {
         assert_eq!(
             src_second.fg, dst_second.fg,
             "second row should not inherit color from the prior line"
+        );
+    }
+
+    #[test]
+    fn snapshot_skips_leading_wide_char_spacer() {
+        // Regression: width-2 glyph written at last column of wrapping row.
+        // Alacritty places LEADING_WIDE_CHAR_SPACER at col 4, wide char at row 1 col 0.
+        let mut src = AlacrittyParser::new_noop(3, 5, 100);
+        // Fill 4 cols then write a wide char that doesn't fit on this row.
+        src.process("ABCD\u{4e16}".as_bytes()); // 世 is width-2
+
+        let snap = generate_ansi_snapshot(&src, false);
+        let snap_str = String::from_utf8_lossy(&snap);
+
+        // The snapshot should NOT contain a space for the leading spacer at col 4.
+        // The wide char should appear in the output.
+        assert!(
+            snap_str.contains('\u{4e16}'),
+            "wide char should be present in snapshot"
+        );
+
+        let mut dst = AlacrittyParser::new_noop(3, 5, 100);
+        dst.process(&snap);
+
+        // Row 1 col 0 should contain the wide char in both.
+        let src_cell = &src.term().grid()[Point::new(Line(1), Column(0))];
+        let dst_cell = &dst.term().grid()[Point::new(Line(1), Column(0))];
+        assert_eq!(src_cell.c, dst_cell.c, "wide char should round-trip across wrap");
+    }
+
+    #[test]
+    fn snapshot_sgr_carries_across_wrapped_lines() {
+        // Regression: wrapped row where previous row ends colored, continuation
+        // starts with default — SGR must carry across the wrap boundary without
+        // a spurious reset, then correctly transition for the new cell.
+        let mut src = AlacrittyParser::new_noop(3, 5, 100);
+        // Fill 5 cols with red text (wraps), then default text continues on row 2.
+        src.process(b"\x1b[31mABCDE\x1b[0mF");
+
+        let snap = generate_ansi_snapshot(&src, false);
+
+        let mut dst = AlacrittyParser::new_noop(3, 5, 100);
+        dst.process(&snap);
+
+        // Row 0 col 0 should be red in both.
+        let src_cell = &src.term().grid()[Point::new(Line(0), Column(0))];
+        let dst_cell = &dst.term().grid()[Point::new(Line(0), Column(0))];
+        assert_eq!(src_cell.fg, dst_cell.fg, "wrapped row color should round-trip");
+
+        // Row 1 col 0 ('F') should be default fg in both.
+        let src_cell = &src.term().grid()[Point::new(Line(1), Column(0))];
+        let dst_cell = &dst.term().grid()[Point::new(Line(1), Column(0))];
+        assert_eq!(
+            src_cell.fg, dst_cell.fg,
+            "continuation after wrap should have correct (default) color"
+        );
+        assert_eq!(src_cell.c, dst_cell.c, "continuation char should round-trip");
+    }
+
+    #[test]
+    fn snapshot_restores_mouse_modes() {
+        // Regression: mouse reporting modes must be restored after snapshot replay.
+        let mut src = AlacrittyParser::new_noop(4, 20, 100);
+        // Enable: ?1000 (click), ?1006 (SGR mouse), ?1007 (alternate scroll)
+        src.process(b"\x1b[?1000h\x1b[?1006h\x1b[?1007h");
+
+        assert!(
+            src.term().mode().contains(TermMode::MOUSE_REPORT_CLICK),
+            "source should have MOUSE_REPORT_CLICK"
+        );
+        assert!(
+            src.term().mode().contains(TermMode::SGR_MOUSE),
+            "source should have SGR_MOUSE"
+        );
+        assert!(
+            src.term().mode().contains(TermMode::ALTERNATE_SCROLL),
+            "source should have ALTERNATE_SCROLL"
+        );
+
+        let snap = generate_ansi_snapshot(&src, false);
+
+        let mut dst = AlacrittyParser::new_noop(4, 20, 100);
+        dst.process(&snap);
+
+        assert!(
+            dst.term().mode().contains(TermMode::MOUSE_REPORT_CLICK),
+            "MOUSE_REPORT_CLICK should be restored"
+        );
+        assert!(
+            dst.term().mode().contains(TermMode::SGR_MOUSE),
+            "SGR_MOUSE should be restored"
+        );
+        assert!(
+            dst.term().mode().contains(TermMode::ALTERNATE_SCROLL),
+            "ALTERNATE_SCROLL should be restored"
+        );
+    }
+
+    #[test]
+    fn snapshot_alt_screen_round_trips_and_exit_works() {
+        // Regression: alt-screen reconnect — content should round-trip, and
+        // exiting alt screen (?1049l) should work after snapshot replay.
+        let mut src = AlacrittyParser::new_noop(4, 20, 100);
+        // Write normal screen content, enter alt screen, write alt content.
+        src.process(b"NORMAL\x1b[?1049h\x1b[HALT_CONTENT");
+
+        assert!(
+            src.term().mode().contains(TermMode::ALT_SCREEN),
+            "source should be in alt screen"
+        );
+
+        let snap = generate_ansi_snapshot(&src, false);
+        let snap_str = String::from_utf8_lossy(&snap);
+
+        // Snapshot must contain the alt screen entry sequence.
+        assert!(
+            snap_str.contains("\x1b[?1049h"),
+            "snapshot should enter alt screen"
+        );
+
+        let mut dst = AlacrittyParser::new_noop(4, 20, 100);
+        dst.process(&snap);
+
+        // Destination should be in alt screen.
+        assert!(
+            dst.term().mode().contains(TermMode::ALT_SCREEN),
+            "destination should be in alt screen after snapshot"
+        );
+
+        // Alt screen content should round-trip.
+        let src_cell = &src.term().grid()[Point::new(Line(0), Column(0))];
+        let dst_cell = &dst.term().grid()[Point::new(Line(0), Column(0))];
+        assert_eq!(
+            src_cell.c, dst_cell.c,
+            "alt screen content should round-trip"
+        );
+
+        // Exiting alt screen should work without panic.
+        dst.process(b"\x1b[?1049l");
+        assert!(
+            !dst.term().mode().contains(TermMode::ALT_SCREEN),
+            "destination should exit alt screen cleanly"
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_hyperlinks() {
+        // Regression: OSC 8 hyperlinks must open/close around linked text
+        // and close before snapshot end.
+        let mut src = AlacrittyParser::new_noop(2, 30, 100);
+        // OSC 8 ; params ; URI BEL  text  OSC 8 ;; BEL
+        // Using BEL (\x07) as string terminator (widely supported).
+        src.process(b"\x1b]8;;https://example.com\x07LINK\x1b]8;;\x07 plain");
+
+        // Verify the source cell has a hyperlink set by alacritty.
+        let src_cell = &src.term().grid()[Point::new(Line(0), Column(0))];
+        assert!(
+            src_cell.hyperlink().is_some(),
+            "alacritty should set hyperlink on cell via OSC 8 — got None. \
+             Cell char: {:?}, cell flags: {:?}",
+            src_cell.c,
+            src_cell.flags
+        );
+
+        let snap = generate_ansi_snapshot(&src, false);
+        let snap_str = String::from_utf8_lossy(&snap);
+
+        // Snapshot should contain a hyperlink open with the URI.
+        // Alacritty auto-assigns an internal id (e.g. "id=0_alacritty"), so
+        // we check for the URI portion rather than an exact sequence.
+        assert!(
+            snap_str.contains("https://example.com"),
+            "snapshot should contain hyperlink URI. Snapshot: {:?}",
+            snap_str
+        );
+        assert!(
+            snap_str.contains("\x1b]8;"),
+            "snapshot should contain OSC 8 opener"
+        );
+        // Snapshot should contain the hyperlink close sequence.
+        assert!(
+            snap_str.contains("\x1b]8;;\x1b\\"),
+            "snapshot should contain hyperlink close"
+        );
+
+        let mut dst = AlacrittyParser::new_noop(2, 30, 100);
+        dst.process(&snap);
+
+        let dst_cell = &dst.term().grid()[Point::new(Line(0), Column(0))];
+        assert!(
+            dst_cell.hyperlink().is_some(),
+            "destination cell should have hyperlink after snapshot replay"
+        );
+        assert_eq!(
+            src_cell.hyperlink().unwrap().uri(),
+            dst_cell.hyperlink().unwrap().uri(),
+            "hyperlink URI should round-trip"
+        );
+
+        // Plain text after the link should NOT have a hyperlink.
+        let dst_plain = &dst.term().grid()[Point::new(Line(0), Column(5))];
+        assert!(dst_plain.hyperlink().is_none(), "dest plain cell should have no link");
+    }
+
+    #[test]
+    fn snapshot_preserves_underline_variants() {
+        // Regression: underline styles (curly, double, dotted, dashed) and
+        // underline color must round-trip through snapshot.
+        let mut src = AlacrittyParser::new_noop(4, 20, 100);
+        // SGR 4:3 = curly underline, SGR 58;2;r;g;b = underline color red
+        src.process(b"\x1b[4:3m\x1b[58;2;255;0;0mCURLY\x1b[0m ");
+        // SGR 4:2 = double underline
+        src.process(b"\x1b[4:2mDBL\x1b[0m");
+
+        let snap = generate_ansi_snapshot(&src, false);
+
+        let mut dst = AlacrittyParser::new_noop(4, 20, 100);
+        dst.process(&snap);
+
+        // Check curly underline on first char.
+        let src_cell = &src.term().grid()[Point::new(Line(0), Column(0))];
+        let dst_cell = &dst.term().grid()[Point::new(Line(0), Column(0))];
+        assert!(
+            src_cell.flags.contains(Flags::UNDERCURL),
+            "source should have UNDERCURL"
+        );
+        assert_eq!(
+            src_cell.flags.intersection(Flags::ALL_UNDERLINES),
+            dst_cell.flags.intersection(Flags::ALL_UNDERLINES),
+            "underline style flags should round-trip"
+        );
+
+        // Check double underline.
+        let src_dbl = &src.term().grid()[Point::new(Line(0), Column(6))];
+        let dst_dbl = &dst.term().grid()[Point::new(Line(0), Column(6))];
+        assert!(
+            src_dbl.flags.contains(Flags::DOUBLE_UNDERLINE),
+            "source should have DOUBLE_UNDERLINE"
+        );
+        assert_eq!(
+            src_dbl.flags.intersection(Flags::ALL_UNDERLINES),
+            dst_dbl.flags.intersection(Flags::ALL_UNDERLINES),
+            "double underline should round-trip"
         );
     }
 
