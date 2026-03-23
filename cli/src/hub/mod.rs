@@ -48,8 +48,8 @@ pub mod handle_cache;
 pub mod registration;
 pub mod run;
 mod server_comms;
-mod terminal_profile;
 pub mod state;
+mod terminal_profile;
 
 pub use actions::HubAction;
 pub use agent_handle::{SessionHandle, SessionType};
@@ -438,8 +438,7 @@ pub struct Hub {
     /// we record the affected session here. After a cooldown, `tick_periodic`
     /// sends a fresh snapshot to resync the browser's terminal parser.
     /// Key: `{browser_identity}:{session_uuid}`.
-    webrtc_backpressure_recovery:
-        std::collections::HashMap<String, BackpressureRecoveryEntry>,
+    webrtc_backpressure_recovery: std::collections::HashMap<String, BackpressureRecoveryEntry>,
     /// Pending terminal attach intents waiting for session registration.
     ///
     /// Keyed by forwarder ID (`{peer_id}:{session_uuid}` / `tui:{session_uuid}` /

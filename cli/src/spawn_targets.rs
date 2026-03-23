@@ -537,7 +537,9 @@ mod tests {
 
         let registry = registry_for(&temp);
         let first = registry.add(&target_dir, Some("Project"), None).unwrap();
-        let second = registry.add(target_dir.join("."), Some("Renamed"), None).unwrap();
+        let second = registry
+            .add(target_dir.join("."), Some("Renamed"), None)
+            .unwrap();
 
         assert_eq!(first.id, second.id);
         assert_eq!(second.name, "Renamed");
@@ -757,7 +759,11 @@ mod tests {
 
         let registry = registry_for(&temp);
         let added = registry
-            .add(&target_dir, Some("Project"), Some(vec!["github".to_string()]))
+            .add(
+                &target_dir,
+                Some("Project"),
+                Some(vec!["github".to_string()]),
+            )
             .unwrap();
 
         let updated = registry

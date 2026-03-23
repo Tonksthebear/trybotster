@@ -951,8 +951,7 @@ fn handle_connection(mut stream: UnixStream, broker: &mut Broker) -> Result<()> 
 
                 BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) => {
                     let frame = if let Some(sess) = broker.sessions.get(&session_id) {
-                        let skip_visible =
-                            sess.resize_pending.swap(false, Ordering::AcqRel);
+                        let skip_visible = sess.resize_pending.swap(false, Ordering::AcqRel);
                         let snapshot = sess
                             .parser
                             .lock()
