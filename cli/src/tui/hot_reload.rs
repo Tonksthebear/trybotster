@@ -56,7 +56,9 @@ fn load_lua_ui_source(name: &str) -> Option<LayoutSource> {
     }
 
     // 2. Local source tree (debug builds where embedded is stubbed out).
-    let local = PathBuf::from("lua").join(&rel_path);
+    let local = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("lua")
+        .join(&rel_path);
     if let Ok(source) = std::fs::read_to_string(&local) {
         let fs_path = local.canonicalize().unwrap_or(local);
         log::info!("Loaded {name} from source tree: {}", fs_path.display());

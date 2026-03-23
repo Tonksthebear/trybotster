@@ -24,7 +24,7 @@
 // Rust guideline compliant 2026-02
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -215,7 +215,10 @@ pub(crate) fn run_event_loop(
                     let kind = event.kind();
                     let bytes = event.approx_size_bytes();
                     hub.hub_event_metrics.record_dequeue(kind, bytes);
+                    let started_at = Instant::now();
                     hub.handle_hub_event(event);
+                    hub.hub_event_metrics
+                        .record_handler_time(kind, started_at.elapsed());
                 }
             }
 

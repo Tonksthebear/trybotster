@@ -19,6 +19,7 @@
 //! - `timer` - One-shot and repeating timers
 //! - `config` - Hub configuration and environment access
 //! - `secrets` - Plugin-scoped encrypted secret storage (AES-GCM files, no keyring access)
+//! - `spawn_targets` - Device-scoped spawn target admission and inspection
 //! - `action_cable` - ActionCable WebSocket connections (subscribe, perform, callbacks)
 //! - `hub_client` - Outgoing hub-to-hub Unix socket connections (connect, send, callbacks)
 //! - `websocket` - WebSocket client (persistent connections with callbacks)
@@ -45,6 +46,7 @@ pub mod pty;
 pub mod push;
 pub mod secrets;
 pub mod socket;
+pub mod spawn_targets;
 pub mod timer;
 pub mod tui;
 pub mod update;
@@ -92,7 +94,7 @@ pub use hub_client::{
 };
 pub use pty::{
     CreateForwarderRequest, CreateSocketForwarderRequest, CreateTuiForwarderRequest, PtyForwarder,
-    PtyOutputContext, PtyRequest, PtySessionHandle,
+    PtyOutputContext, PtyRequest, PtySessionHandle, RefreshSnapshotRequest,
 };
 pub use socket::SocketSendRequest;
 pub use timer::{new_timer_registry, TimerRegistry};
@@ -120,6 +122,7 @@ pub fn register_all(lua: &Lua) -> Result<()> {
     config::register(lua)?;
     hub_discovery::register(lua)?;
     secrets::register(lua)?;
+    spawn_targets::register(lua)?;
     Ok(())
 }
 

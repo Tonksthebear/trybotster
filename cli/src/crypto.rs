@@ -1,7 +1,7 @@
 //! Shared AES-256-GCM encryption primitives.
 //!
 //! Provides encrypt/decrypt operations and the on-disk encrypted data
-//! format used by both `relay::persistence` (crypto session state) and
+//! format used by both `relay::persistence` (relay secrets/metadata) and
 //! `lua::primitives::secrets` (plugin secrets).
 //!
 //! # Wire Format
@@ -11,7 +11,7 @@
 //! { "nonce": "<base64>", "ciphertext": "<base64>", "version": <u8> }
 //! ```
 //!
-//! The version field is caller-defined (e.g., 6 for vodozemac state, 1 for secrets).
+//! The version field is caller-defined (for example `1` for secrets).
 
 use aes_gcm::{
     aead::{Aead, KeyInit},

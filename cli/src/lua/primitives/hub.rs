@@ -93,6 +93,11 @@ pub enum HubRequest {
         /// Browser identity key (e.g., `identityKey:tabId`).
         browser_identity: String,
     },
+    /// Send a fresh signed bundle to a browser without ratchet-restart dedupe.
+    SendFreshBundle {
+        /// Browser identity key (e.g., `identityKey:tabId`).
+        browser_identity: String,
+    },
 }
 
 /// Server-assigned hub ID, shared between Hub and Lua primitives.
@@ -452,6 +457,27 @@ pub(crate) fn register(
 
     hub.set("request_ratchet_restart", request_ratchet_restart_fn)
         .map_err(|e| anyhow!("Failed to set hub.request_ratchet_restart: {e}"))?;
+
+    // hub.send_fresh_bundle(browser_identity) - Push a fresh signed bundle for a new session.
+    let tx = hub_event_tx.clone();
+    let send_fresh_bundle_fn = lua
+        .create_function(move |_, browser_identity: String| {
+            let guard = tx.lock().expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::SendFreshBundle {
+                    browser_identity,
+                }));
+            } else {
+                ::log::warn!(
+                    "[Hub] send_fresh_bundle called before hub_event_tx set — event dropped"
+                );
+            }
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create hub.send_fresh_bundle function: {e}"))?;
+
+    hub.set("send_fresh_bundle", send_fresh_bundle_fn)
+        .map_err(|e| anyhow!("Failed to set hub.send_fresh_bundle: {e}"))?;
 
     // hub.spawn_pty_with_broker(spawn_opts, session_uuid)
     //   → (session_handle, session_id)

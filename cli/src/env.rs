@@ -238,7 +238,10 @@ mod tests {
     fn test_is_offline_with_env_var() {
         let _lock = ENV_LOCK.lock().unwrap();
         std::env::set_var("BOTSTER_OFFLINE", "1");
-        assert!(is_offline(), "is_offline should be true when BOTSTER_OFFLINE=1");
+        assert!(
+            is_offline(),
+            "is_offline should be true when BOTSTER_OFFLINE=1"
+        );
         std::env::remove_var("BOTSTER_OFFLINE");
     }
 

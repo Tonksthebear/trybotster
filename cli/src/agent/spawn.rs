@@ -439,7 +439,6 @@ pub fn scan_cwd(data: &[u8]) -> Option<String> {
     last_cwd
 }
 
-
 /// Simple percent-decoding for file URIs.
 ///
 /// Decodes `%XX` sequences to their byte values. Used for OSC 7 paths

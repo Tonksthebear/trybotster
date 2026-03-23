@@ -48,6 +48,7 @@ pub mod keyring;
 pub mod notifications;
 pub mod process;
 pub mod server;
+pub mod spawn_targets;
 pub mod terminal;
 pub mod terminal_widget;
 
@@ -56,6 +57,7 @@ pub use agent::Agent;
 pub use config::{Config, HubRegistry};
 pub use git::WorktreeManager;
 pub use relay::{AgentInfo, TerminalMessage, WorktreeInfo};
+pub use spawn_targets::{SpawnTarget, SpawnTargetInspection, SpawnTargetRegistry};
 pub use terminal_widget::TerminalWidget;
 
 // Re-export Hub

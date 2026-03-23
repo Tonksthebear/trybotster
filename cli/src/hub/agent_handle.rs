@@ -1008,8 +1008,7 @@ mod tests {
 
         let (snapshot, _kitty, rows, cols, _rx) = pty.snapshot_and_subscribe_cached();
         assert_eq!(
-            snapshot,
-            b"broker-snapshot-data",
+            snapshot, b"broker-snapshot-data",
             "attach snapshot should come from broker RPC"
         );
         assert_eq!((rows, cols), (24, 80), "dims should come from shared_state");

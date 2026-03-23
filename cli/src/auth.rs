@@ -238,9 +238,10 @@ pub fn prompt_device_name() -> Result<String> {
     Ok(name)
 }
 
-/// Prompt the user to name a hub for the current directory.
+/// Prompt the user to name the local device hub.
 ///
-/// Detects the current git repo name as a default. Returns the chosen name.
+/// Uses repo/directory context only as a naming hint when available.
+/// Returns the chosen name.
 pub fn prompt_hub_name() -> Result<String> {
     // Priority: BOTSTER_REPO env > git repo name > directory basename > "my-hub"
     let default_name = std::env::var("BOTSTER_REPO")

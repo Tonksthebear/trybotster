@@ -283,21 +283,35 @@ impl Hub {
                         .iter()
                         .filter(|(_, s)| s.enqueue_ok > 0 || s.pending > 0)
                         .map(|(kind, s)| {
+                            let avg_us = if s.dequeue > 0 {
+                                s.handler_time_total_ns / s.dequeue / 1_000
+                            } else {
+                                0
+                            };
+                            let max_us = s.handler_time_max_ns / 1_000;
                             format!(
-                                "{kind}:ok={} fail={} deq={} pend={} hwm={} bytes={} bytes_hwm={}",
+                                "{kind}:ok={} fail={} deq={} pend={} hwm={} bytes={} bytes_hwm={} avg_us={} max_us={}",
                                 s.enqueue_ok,
                                 s.enqueue_failed,
                                 s.dequeue,
                                 s.pending,
                                 s.pending_high_water,
                                 s.bytes_pending,
-                                s.bytes_high_water
+                                s.bytes_high_water,
+                                avg_us,
+                                max_us
                             )
                         })
                         .collect::<Vec<_>>()
                         .join("; ");
+                    let avg_us = if m.dequeue_total > 0 {
+                        m.handler_time_total_ns / m.dequeue_total / 1_000
+                    } else {
+                        0
+                    };
+                    let max_us = m.handler_time_max_ns / 1_000;
                     log::info!(
-                        "[HubEventMetrics] enqueue_ok={} dequeue={} failed={} pending={} pending_hwm={} bytes_pending={} bytes_hwm={} by_type=[{}]",
+                        "[HubEventMetrics] enqueue_ok={} dequeue={} failed={} pending={} pending_hwm={} bytes_pending={} bytes_hwm={} avg_us={} max_us={} by_type=[{}]",
                         m.enqueue_ok_total,
                         m.dequeue_total,
                         m.enqueue_failed_total,
@@ -305,6 +319,8 @@ impl Hub {
                         m.pending_high_water_total,
                         m.bytes_pending_total,
                         m.bytes_high_water_total,
+                        avg_us,
+                        max_us,
                         by_type
                     );
                     self.hub_event_metrics_last_log = std::time::Instant::now();
@@ -495,6 +511,9 @@ impl Hub {
                 match request {
                     PtyRequest::CreateForwarder(req) => {
                         self.create_lua_pty_forwarder(req);
+                    }
+                    PtyRequest::RefreshSnapshot(req) => {
+                        self.refresh_lua_terminal_snapshot(req);
                     }
                     PtyRequest::CreateTuiForwarder(req) => {
                         self.create_lua_tui_pty_forwarder(req);
@@ -732,6 +751,9 @@ impl Hub {
                     }
                     HubRequest::RatchetRestart { browser_identity } => {
                         self.try_ratchet_restart(&browser_identity);
+                    }
+                    HubRequest::SendFreshBundle { browser_identity } => {
+                        self.send_ratchet_restart(&browser_identity);
                     }
                 }
             }
@@ -1624,12 +1646,7 @@ impl Hub {
 
         let bundle_bytes = match cs.lock() {
             Ok(mut guard) => match guard.refresh_bundle_for_peer(&peer_olm_key) {
-                Ok(bytes) => {
-                    if let Err(e) = guard.persist() {
-                        log::warn!("[RatchetRestart] Failed to persist after refresh: {e}");
-                    }
-                    bytes
-                }
+                Ok(bytes) => bytes,
                 Err(e) => {
                     log::error!("[RatchetRestart] Failed to generate refresh bundle: {e}");
                     return;
@@ -2542,62 +2559,15 @@ impl Hub {
                 snapshot.len()
             );
 
-            // Send terminal snapshot first (if any), chunked to fit within
-            // SCTP max message size (DataChannel limit ~256KB, we use 64KB chunks
-            // to leave room for encryption overhead and OlmEnvelope framing).
-            //
-            // Snapshot chunks use prefix 0x02 with an 8-byte header:
-            //   [0x02][snapshot_id:4 LE][chunk_idx:2 LE][total_chunks:2 LE][data]
-            // The browser buffers chunks and only feeds data to the terminal
-            // when all chunks arrive, preventing garbled output from partial
-            // delivery if the connection drops mid-snapshot.
-            if !snapshot.is_empty() {
-                const CHUNK_SIZE: usize = 64 * 1024;
-                let num_chunks = (snapshot.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-                let snapshot_id: u32 = rand::random();
-                log::debug!(
-                    "[Lua] Sending {} bytes of snapshot in {} chunks (id={:#010x}) for session {}",
-                    snapshot.len(),
-                    num_chunks,
-                    snapshot_id,
-                    session_uuid
-                );
-
-                for (i, chunk) in snapshot.chunks(CHUNK_SIZE).enumerate() {
-                    // 9-byte header: prefix + snapshot_id + chunk_idx + total_chunks
-                    let mut raw_message = Vec::with_capacity(9 + chunk.len());
-                    raw_message.push(0x02); // snapshot chunk prefix
-                    raw_message.extend_from_slice(&snapshot_id.to_le_bytes());
-                    raw_message.extend_from_slice(&(i as u16).to_le_bytes());
-                    raw_message.extend_from_slice(&(num_chunks as u16).to_le_bytes());
-                    raw_message.extend(chunk);
-
-                    match output_tx.try_send(WebRtcPtyOutput {
-                        subscription_id: subscription_id.clone(),
-                        browser_identity: peer_id.clone(),
-                        data: raw_message,
-                        session_uuid: session_uuid.clone(),
-                    }) {
-                        Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            log::warn!(
-                                "[Lua] WebRTC PTY output queue full during snapshot send for {}",
-                                &peer_id[..peer_id.len().min(8)]
-                            );
-                            let _ = hub_event_tx.send(
-                                super::events::HubEvent::WebRtcIngressBackpressure {
-                                    browser_identity: peer_id.clone(),
-                                    source: "pty_output_snapshot_queue_full",
-                                },
-                            );
-                            return;
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            log::trace!("[Lua] PTY output queue closed during snapshot send");
-                            return;
-                        }
-                    }
-                }
+            if !Self::queue_webrtc_terminal_snapshot(
+                &output_tx,
+                &hub_event_tx,
+                &peer_id,
+                &subscription_id,
+                &session_uuid,
+                snapshot,
+            ) {
+                return;
             }
 
             loop {
@@ -2683,6 +2653,122 @@ impl Hub {
         });
 
         self.pty_forwarders.insert(forwarder_key, task);
+        true
+    }
+
+    fn refresh_lua_terminal_snapshot(&mut self, req: crate::lua::RefreshSnapshotRequest) {
+        let Some(session_handle) = self.handle_cache.get_session(&req.session_uuid) else {
+            log::debug!(
+                "[Lua] Snapshot refresh ignored for missing session {}",
+                req.session_uuid
+            );
+            return;
+        };
+
+        let pty_handle = session_handle.pty().clone();
+        let output_tx = self.webrtc_pty_output_tx.clone();
+        let hub_event_tx = self.hub_event_tx.clone();
+        let peer_id = req.peer_id.clone();
+        let subscription_id = req.subscription_id.clone();
+        let session_uuid = req.session_uuid.clone();
+        let target_rows = req.rows;
+        let target_cols = req.cols;
+
+        let _guard = self.tokio_runtime.enter();
+        tokio::spawn(async move {
+            let snapshot = match tokio::task::spawn_blocking(move || {
+                if pty_handle.is_broker_backed() {
+                    let (current_rows, current_cols) = pty_handle.dims();
+                    if (current_rows, current_cols) == (target_rows, target_cols) {
+                        let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
+                        pty_handle.resize_direct(target_rows, bounce_cols);
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    pty_handle.resize_direct(target_rows, target_cols);
+                    std::thread::sleep(std::time::Duration::from_millis(125));
+                }
+                pty_handle.get_snapshot()
+            })
+            .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    log::warn!(
+                        "[Lua] Snapshot refresh task failed for session {}: {}",
+                        session_uuid,
+                        e
+                    );
+                    Vec::new()
+                }
+            };
+
+            Self::queue_webrtc_terminal_snapshot(
+                &output_tx,
+                &hub_event_tx,
+                &peer_id,
+                &subscription_id,
+                &session_uuid,
+                snapshot,
+            );
+        });
+    }
+
+    fn queue_webrtc_terminal_snapshot(
+        output_tx: &tokio::sync::mpsc::Sender<WebRtcPtyOutput>,
+        hub_event_tx: &super::events::HubEventTx,
+        peer_id: &str,
+        subscription_id: &str,
+        session_uuid: &str,
+        snapshot: Vec<u8>,
+    ) -> bool {
+        if snapshot.is_empty() {
+            return true;
+        }
+
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let num_chunks = (snapshot.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let snapshot_id: u32 = rand::random();
+        log::debug!(
+            "[Lua] Sending {} bytes of snapshot in {} chunks (id={:#010x}) for session {}",
+            snapshot.len(),
+            num_chunks,
+            snapshot_id,
+            session_uuid
+        );
+
+        for (i, chunk) in snapshot.chunks(CHUNK_SIZE).enumerate() {
+            let mut raw_message = Vec::with_capacity(9 + chunk.len());
+            raw_message.push(0x02);
+            raw_message.extend_from_slice(&snapshot_id.to_le_bytes());
+            raw_message.extend_from_slice(&(i as u16).to_le_bytes());
+            raw_message.extend_from_slice(&(num_chunks as u16).to_le_bytes());
+            raw_message.extend(chunk);
+
+            match output_tx.try_send(WebRtcPtyOutput {
+                subscription_id: subscription_id.to_string(),
+                browser_identity: peer_id.to_string(),
+                data: raw_message,
+                session_uuid: session_uuid.to_string(),
+            }) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    log::warn!(
+                        "[Lua] WebRTC PTY output queue full during snapshot send for {}",
+                        &peer_id[..peer_id.len().min(8)]
+                    );
+                    let _ = hub_event_tx.send(super::events::HubEvent::WebRtcIngressBackpressure {
+                        browser_identity: peer_id.to_string(),
+                        source: "pty_output_snapshot_queue_full",
+                    });
+                    return false;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    log::trace!("[Lua] PTY output queue closed during snapshot send");
+                    return false;
+                }
+            }
+        }
+
         true
     }
 
@@ -4090,8 +4176,7 @@ impl Hub {
                 Ok(answer_sdp) => {
                     log::info!(
                         "[WebRTC] Created answer for browser {} in {}ms",
-                        &browser_id[..browser_id.len().min(8)]
-                        ,
+                        &browser_id[..browser_id.len().min(8)],
                         started_at.elapsed().as_millis()
                     );
 
@@ -5759,9 +5844,8 @@ mod tests {
                     Ok(n) => {
                         let frames = decoder.feed(&buf[..n]).expect("decode broker frame");
                         for frame in frames {
-                            if let BrokerFrame::HubControl(HubMessage::GetSnapshot {
-                                session_id,
-                            }) = frame
+                            if let BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) =
+                                frame
                             {
                                 let response = encode_data(
                                     frame_type::SNAPSHOT,
@@ -5868,9 +5952,8 @@ mod tests {
                     Ok(n) => {
                         let frames = decoder.feed(&buf[..n]).expect("decode broker frame");
                         for frame in frames {
-                            if let BrokerFrame::HubControl(HubMessage::GetSnapshot {
-                                session_id,
-                            }) = frame
+                            if let BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) =
+                                frame
                             {
                                 let response = encode_data(
                                     frame_type::SNAPSHOT,
@@ -6012,9 +6095,7 @@ mod tests {
                                         saw_target_resize = true;
                                     }
                                 }
-                                BrokerFrame::HubControl(HubMessage::GetSnapshot {
-                                    session_id,
-                                }) => {
+                                BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) => {
                                     let response = encode_data(
                                         frame_type::SNAPSHOT,
                                         session_id,
@@ -6074,8 +6155,7 @@ mod tests {
         }
 
         assert!(saw_scrollback, "expected a scrollback frame");
-        let (saw_bounce, saw_target) =
-            broker.join().expect("broker thread should finish");
+        let (saw_bounce, saw_target) = broker.join().expect("broker thread should finish");
         assert!(
             saw_bounce,
             "expected same-dims attach to issue bounce resize before snapshot"

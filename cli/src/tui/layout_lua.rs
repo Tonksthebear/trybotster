@@ -2258,13 +2258,34 @@ mod tests {
         // list_selected defaults to 0 (first item = new_agent)
         let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
         assert_eq!(ops[0]["op"], "set_mode");
+        assert_eq!(ops[0]["mode"], "new_agent_select_target");
+        // Should send list_spawn_targets message
+        assert_eq!(ops[1]["op"], "send_msg");
+        let msg_data = &ops[1]["data"]["data"];
+        assert_eq!(msg_data["type"], "list_spawn_targets");
+
+        // Step 3: Simulate spawn target list and select the first target.
+        let target_event = serde_json::json!({
+            "targets": [
+                { "id": "tgt_trybotster", "name": "trybotster", "path": "/tmp/trybotster", "current_branch": "main" }
+            ]
+        });
+        let event_ops = lua
+            .call_on_hub_event("spawn_target_list", &target_event, &ctx)
+            .unwrap()
+            .unwrap();
+        assert!(event_ops.is_empty());
+
+        let ctx = ActionContext::default();
+        let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
+        assert_eq!(ops[0]["op"], "set_mode");
         assert_eq!(ops[0]["mode"], "new_agent_select_agent");
-        // Should send list_agent_config message
         assert_eq!(ops[1]["op"], "send_msg");
         let msg_data = &ops[1]["data"]["data"];
         assert_eq!(msg_data["type"], "list_agent_config");
+        assert_eq!(msg_data["target_id"], "tgt_trybotster");
 
-        // Step 3: Simulate agent_config event with single agent (auto-skips to workspace selection)
+        // Step 4: Simulate agent_config event with single agent (auto-skips to workspace selection)
         let event_data = serde_json::json!({ "agents": ["claude"] });
         let event_ops = lua
             .call_on_hub_event("agent_config", &event_data, &ctx)
@@ -2273,13 +2294,13 @@ mod tests {
         assert_eq!(event_ops[0]["op"], "set_mode");
         assert_eq!(event_ops[0]["mode"], "new_agent_select_workspace");
 
-        // Step 4: Select "Create New Workspace" (index 0) → workspace name input
+        // Step 5: Select "Create New Workspace" (index 0) → workspace name input
         let ctx = ActionContext::default();
         let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
         assert_eq!(ops[0]["op"], "set_mode");
         assert_eq!(ops[0]["mode"], "new_workspace_name_input");
 
-        // Step 5: Submit empty workspace name → transitions to worktree selection
+        // Step 6: Submit empty workspace name → transitions to worktree selection
         lua.exec("_tui_state.input_buffer = ''").unwrap();
         let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
         assert_eq!(ops[0]["op"], "set_mode");
@@ -2287,13 +2308,14 @@ mod tests {
         assert_eq!(ops[1]["op"], "send_msg");
         let msg_data = &ops[1]["data"]["data"];
         assert_eq!(msg_data["type"], "list_worktrees");
+        assert_eq!(msg_data["target_id"], "tgt_trybotster");
 
         ops
     }
 
     /// Helper: Enter new-agent flow with multiple agent configs (requires manual selection).
     fn enter_new_agent_flow_multi_agent(lua: &LayoutLua) -> Vec<serde_json::Value> {
-        // Steps 1-2: Open menu → select new_agent → enters agent config selection
+        // Steps 1-2: Open menu → select new_agent → enters target selection
         let ctx = ActionContext::default();
         lua.call_on_action("open_menu", &ctx).unwrap().unwrap();
 
@@ -2303,7 +2325,20 @@ mod tests {
         };
         lua.call_on_action("list_select", &ctx).unwrap();
 
-        // Step 3: Multi-agent response — stays in agent config selection
+        // Step 3: Spawn target list response, then select the first target.
+        let target_event = serde_json::json!({
+            "targets": [
+                { "id": "tgt_trybotster", "name": "trybotster", "path": "/tmp/trybotster", "current_branch": "main" }
+            ]
+        });
+        lua.call_on_hub_event("spawn_target_list", &target_event, &ctx)
+            .unwrap()
+            .unwrap();
+
+        let ctx = ActionContext::default();
+        lua.call_on_action("list_select", &ctx).unwrap().unwrap();
+
+        // Step 4: Multi-agent response — stays in agent config selection
         let event_data = serde_json::json!({ "agents": ["claude", "web"] });
         let event_ops = lua
             .call_on_hub_event("agent_config", &event_data, &ctx)
@@ -2730,11 +2765,21 @@ mod tests {
             .unwrap();
         assert_eq!(action.action, "list_select");
 
-        // Dispatch list_select with new_agent → mode becomes "new_agent_select_agent"
+        // Dispatch list_select with new_agent → mode becomes "new_agent_select_target"
         let ctx = ActionContext {
             overlay_actions: vec!["new_agent".to_string()],
             ..Default::default()
         };
+        lua.call_on_action("list_select", &ctx).unwrap();
+
+        let target_event = serde_json::json!({
+            "targets": [
+                { "id": "tgt_trybotster", "name": "trybotster", "path": "/tmp/trybotster", "current_branch": "main" }
+            ]
+        });
+        lua.call_on_hub_event("spawn_target_list", &target_event, &ctx)
+            .unwrap();
+        let ctx = ActionContext::default();
         lua.call_on_action("list_select", &ctx).unwrap();
 
         // Simulate single agent config response (auto-skips to workspace selection)
@@ -2796,5 +2841,6 @@ mod tests {
         let data = &send_op["data"]["data"];
         assert_eq!(data["type"], "create_agent");
         assert_eq!(data["prompt"], "Hi");
+        assert_eq!(data["target_id"], "tgt_trybotster");
     }
 }

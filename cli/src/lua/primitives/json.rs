@@ -176,7 +176,9 @@ pub fn register(lua: &Lua) -> Result<()> {
 
             let content = match std::fs::read_to_string(path) {
                 Ok(c) => c,
-                Err(e) => return Ok((Value::Nil, Some(format!("Failed to read {file_path}: {e}")))),
+                Err(e) => {
+                    return Ok((Value::Nil, Some(format!("Failed to read {file_path}: {e}"))))
+                }
             };
 
             let root: serde_json::Value = match serde_json::from_str(&content) {
@@ -218,63 +220,76 @@ pub fn register(lua: &Lua) -> Result<()> {
     // Creates intermediate objects as needed. Expands `~` in file paths.
     // The value can be any Lua type (string, number, boolean, table).
     let file_set_fn = lua
-        .create_function(|lua, (file_path, key_path, value): (String, String, Value)| {
-            let expanded = shellexpand::tilde(&file_path);
-            let path = Path::new(expanded.as_ref());
+        .create_function(
+            |lua, (file_path, key_path, value): (String, String, Value)| {
+                let expanded = shellexpand::tilde(&file_path);
+                let path = Path::new(expanded.as_ref());
 
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),
-                Err(e) => return Ok((None::<bool>, Some(format!("Failed to read {file_path}: {e}")))),
-            };
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),
+                    Err(e) => {
+                        return Ok((
+                            None::<bool>,
+                            Some(format!("Failed to read {file_path}: {e}")),
+                        ))
+                    }
+                };
 
-            let mut root: serde_json::Value = match serde_json::from_str(&content) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Ok((
-                        None::<bool>,
-                        Some(format!("Failed to parse {file_path}: {e}")),
-                    ))
-                }
-            };
+                let mut root: serde_json::Value = match serde_json::from_str(&content) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Ok((
+                            None::<bool>,
+                            Some(format!("Failed to parse {file_path}: {e}")),
+                        ))
+                    }
+                };
 
-            let new_value: serde_json::Value = lua
-                .from_value(value)
-                .map_err(|e| mlua::Error::external(format!("Failed to convert value: {e}")))?;
+                let new_value: serde_json::Value = lua
+                    .from_value(value)
+                    .map_err(|e| mlua::Error::external(format!("Failed to convert value: {e}")))?;
 
-            let keys: Vec<&str> = key_path.split('.').collect();
-            let mut current = &mut root;
+                let keys: Vec<&str> = key_path.split('.').collect();
+                let mut current = &mut root;
 
-            for (i, key) in keys.iter().enumerate() {
-                if i == keys.len() - 1 {
-                    if let Some(obj) = current.as_object_mut() {
-                        obj.insert(key.to_string(), new_value.clone());
+                for (i, key) in keys.iter().enumerate() {
+                    if i == keys.len() - 1 {
+                        if let Some(obj) = current.as_object_mut() {
+                            obj.insert(key.to_string(), new_value.clone());
+                        } else {
+                            return Ok((
+                                None::<bool>,
+                                Some(format!("Cannot set key '{key}' — parent is not an object")),
+                            ));
+                        }
                     } else {
-                        return Ok((
-                            None::<bool>,
-                            Some(format!("Cannot set key '{key}' — parent is not an object")),
-                        ));
+                        if !current.is_object() {
+                            return Ok((
+                                None::<bool>,
+                                Some(format!("Cannot navigate through '{key}' — not an object")),
+                            ));
+                        }
+                        let obj = current.as_object_mut().expect("checked is_object() above");
+                        if !obj.contains_key(*key) || !obj[*key].is_object() {
+                            obj.insert(key.to_string(), serde_json::json!({}));
+                        }
+                        current = obj.get_mut(*key).expect("key was just inserted if missing");
                     }
-                } else {
-                    if !current.is_object() {
-                        return Ok((
-                            None::<bool>,
-                            Some(format!("Cannot navigate through '{key}' — not an object")),
-                        ));
-                    }
-                    let obj = current.as_object_mut().expect("checked is_object() above");
-                    if !obj.contains_key(*key) || !obj[*key].is_object() {
-                        obj.insert(key.to_string(), serde_json::json!({}));
-                    }
-                    current = obj.get_mut(*key).expect("key was just inserted if missing");
                 }
-            }
 
-            match std::fs::write(path, serde_json::to_string_pretty(&root).unwrap_or_default()) {
-                Ok(()) => Ok((Some(true), None::<String>)),
-                Err(e) => Ok((None::<bool>, Some(format!("Failed to write {file_path}: {e}")))),
-            }
-        })
+                match std::fs::write(
+                    path,
+                    serde_json::to_string_pretty(&root).unwrap_or_default(),
+                ) {
+                    Ok(()) => Ok((Some(true), None::<String>)),
+                    Err(e) => Ok((
+                        None::<bool>,
+                        Some(format!("Failed to write {file_path}: {e}")),
+                    )),
+                }
+            },
+        )
         .map_err(|e| anyhow!("Failed to create json.file_set function: {e}"))?;
 
     json_table
@@ -292,8 +307,15 @@ pub fn register(lua: &Lua) -> Result<()> {
 
             let content = match std::fs::read_to_string(path) {
                 Ok(c) => c,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Some(true), None::<String>)),
-                Err(e) => return Ok((None::<bool>, Some(format!("Failed to read {file_path}: {e}")))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok((Some(true), None::<String>))
+                }
+                Err(e) => {
+                    return Ok((
+                        None::<bool>,
+                        Some(format!("Failed to read {file_path}: {e}")),
+                    ))
+                }
             };
 
             let mut root: serde_json::Value = match serde_json::from_str(&content) {
@@ -329,9 +351,15 @@ pub fn register(lua: &Lua) -> Result<()> {
                 }
             }
 
-            match std::fs::write(path, serde_json::to_string_pretty(&root).unwrap_or_default()) {
+            match std::fs::write(
+                path,
+                serde_json::to_string_pretty(&root).unwrap_or_default(),
+            ) {
                 Ok(()) => Ok((Some(true), None::<String>)),
-                Err(e) => Ok((None::<bool>, Some(format!("Failed to write {file_path}: {e}")))),
+                Err(e) => Ok((
+                    None::<bool>,
+                    Some(format!("Failed to write {file_path}: {e}")),
+                )),
             }
         })
         .map_err(|e| anyhow!("Failed to create json.file_delete function: {e}"))?;

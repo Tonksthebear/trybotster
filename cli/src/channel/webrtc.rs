@@ -399,7 +399,9 @@ impl WebRtcChannel {
     }
 
     fn cached_ice_servers(&self, cache_key: &str, max_age: Duration) -> Option<Vec<IceServer>> {
-        let cache = ice_config_cache().lock().expect("ICE config cache lock poisoned");
+        let cache = ice_config_cache()
+            .lock()
+            .expect("ICE config cache lock poisoned");
         let cached = cache.get(cache_key)?;
         if cached.fetched_at.elapsed() > max_age {
             return None;
@@ -408,7 +410,9 @@ impl WebRtcChannel {
     }
 
     fn store_cached_ice_servers(&self, cache_key: String, ice_servers: Vec<CachedIceServerConfig>) {
-        let mut cache = ice_config_cache().lock().expect("ICE config cache lock poisoned");
+        let mut cache = ice_config_cache()
+            .lock()
+            .expect("ICE config cache lock poisoned");
         cache.insert(
             cache_key,
             CachedIceConfig {
@@ -445,8 +449,9 @@ impl WebRtcChannel {
             .send()
             .await
             .map_err(|e| {
-                if let Some(cached) =
-                    self.cached_ice_servers(&cache_key, Self::ICE_CONFIG_STALE_FALLBACK_TTL)
+                if self
+                    .cached_ice_servers(&cache_key, Self::ICE_CONFIG_STALE_FALLBACK_TTL)
+                    .is_some()
                 {
                     log::warn!(
                         "[WebRTC] ICE config fetch failed after {}ms, using stale cache: {e:#}",
@@ -500,9 +505,10 @@ impl WebRtcChannel {
             credential: Option<String>,
         }
 
-        let config: IceConfig = response.json().await.map_err(|e| {
-            if let Some(cached) =
-                self.cached_ice_servers(&cache_key, Self::ICE_CONFIG_STALE_FALLBACK_TTL)
+        let config_result = response.json::<IceConfig>().await.map_err(|e| {
+            if self
+                .cached_ice_servers(&cache_key, Self::ICE_CONFIG_STALE_FALLBACK_TTL)
+                .is_some()
             {
                 log::warn!(
                     "[WebRTC] ICE config parse failed after {}ms, using stale cache: {e:#}",
@@ -513,7 +519,7 @@ impl WebRtcChannel {
             ChannelError::ConnectionFailed(format!("Failed to parse ICE config: {e:#}"))
         });
 
-        let config = match config {
+        let config = match config_result {
             Ok(config) => config,
             Err(ChannelError::SendFailed(marker)) if marker == "__use_stale_ice_cache__" => {
                 return self
