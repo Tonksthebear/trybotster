@@ -18,7 +18,7 @@
 //! ```text
 //! SessionHandle
 //!   ├── session_uuid() → &str     (primary key)
-//!   ├── agent_key() → &str        (display label)
+//!   ├── label() → &str             (display label)
 //!   ├── session_type() → SessionType
 //!   └── pty() → &PtyHandle        (single PTY)
 //!
@@ -83,15 +83,15 @@ impl std::fmt::Display for SessionType {
 /// # Session UUID
 ///
 /// The `session_uuid` (format: "sess-{timestamp}-{hex}") is the primary key
-/// for addressing this session throughout the system. The `agent_key` is
-/// retained as a human-readable display label.
+/// for addressing this session throughout the system. The `label` is
+/// a human-readable display name (e.g., "owner-repo-42").
 #[derive(Debug, Clone)]
 pub struct SessionHandle {
     /// Session UUID — primary key for all addressing.
     session_uuid: String,
 
     /// Human-readable display label (e.g., "owner-repo-42").
-    agent_key: String,
+    label: String,
 
     /// Whether this is an agent or accessory session.
     session_type: SessionType,
@@ -109,21 +109,21 @@ impl SessionHandle {
     /// # Arguments
     ///
     /// * `session_uuid` - Stable UUID (e.g., "sess-1234567890-abcdef")
-    /// * `agent_key` - Human-readable display label
+    /// * `label` - Human-readable display label
     /// * `session_type` - Agent or Accessory
     /// * `workspace_id` - Optional workspace for grouping
     /// * `pty` - Single PTY handle
     #[must_use]
     pub fn new(
         session_uuid: impl Into<String>,
-        agent_key: impl Into<String>,
+        label: impl Into<String>,
         session_type: SessionType,
         workspace_id: Option<String>,
         pty: PtyHandle,
     ) -> Self {
         Self {
             session_uuid: session_uuid.into(),
-            agent_key: agent_key.into(),
+            label: label.into(),
             session_type,
             workspace_id,
             pty,
@@ -138,8 +138,8 @@ impl SessionHandle {
 
     /// Get the human-readable display label.
     #[must_use]
-    pub fn agent_key(&self) -> &str {
-        &self.agent_key
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Get the session type.
@@ -825,7 +825,7 @@ mod tests {
             SessionHandle::new("sess-1234-abcd", "agent-123", SessionType::Agent, None, pty);
 
         assert_eq!(handle.session_uuid(), "sess-1234-abcd");
-        assert_eq!(handle.agent_key(), "agent-123");
+        assert_eq!(handle.label(), "agent-123");
         assert_eq!(handle.session_type(), SessionType::Agent);
         assert!(handle.workspace_id().is_none());
     }

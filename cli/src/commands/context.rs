@@ -7,7 +7,7 @@
 //! # Examples
 //!
 //! ```bash
-//! botster context agent_key       # prints agent key
+//! botster context session_uuid     # prints session UUID
 //! botster context hub_id          # prints hub ID
 //! botster context                 # dumps all context as JSON
 //! ```
@@ -84,7 +84,6 @@ pub fn build() -> BTreeMap<String, String> {
     // Extract well-known fields from the session manifest
     let fields = [
         ("session_uuid", "session_uuid"),
-        ("agent_key", "id"),
         ("hub_id", "hub_id"),
         ("hub_manifest_path", "hub_manifest_path"),
         ("repo", "repo"),
@@ -195,7 +194,7 @@ mod tests {
             ctx.get("session_uuid").map(String::as_str),
             Some("sess-test-0001-deadbeef")
         );
-        assert_eq!(ctx.get("agent_key").map(String::as_str), Some("my-agent"));
+        assert!(ctx.get("agent_key").is_none(), "agent_key mapping removed");
         assert_eq!(ctx.get("hub_id").map(String::as_str), Some("hub-abc"));
         assert_eq!(ctx.get("repo").map(String::as_str), Some("owner/repo"));
         assert_eq!(
@@ -217,8 +216,8 @@ mod tests {
         }"#,
         );
 
-        // Present field should be extracted.
-        assert_eq!(ctx.get("agent_key").map(String::as_str), Some("old-agent"));
+        // "id" field no longer mapped to agent_key.
+        assert!(ctx.get("agent_key").is_none());
         // Missing fields should just be absent, not error.
         assert!(ctx.get("hub_id").is_none());
         assert!(ctx.get("repo").is_none());
@@ -241,10 +240,7 @@ mod tests {
         }"#,
         );
 
-        assert_eq!(
-            ctx.get("agent_key").map(String::as_str),
-            Some("future-agent")
-        );
+        assert!(ctx.get("agent_key").is_none(), "agent_key mapping removed");
         assert_eq!(ctx.get("hub_id").map(String::as_str), Some("hub-xyz"));
     }
 
@@ -282,7 +278,7 @@ mod tests {
 
         assert!(
             ctx.get("agent_key").is_none(),
-            "empty string should be skipped"
+            "agent_key mapping removed"
         );
         assert_eq!(ctx.get("hub_id").map(String::as_str), Some("hub-ok"));
         assert!(ctx.get("repo").is_none(), "empty string should be skipped");

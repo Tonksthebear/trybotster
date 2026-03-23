@@ -46,8 +46,8 @@ pub(crate) enum HubEvent {
     /// The Lua bridge method discriminates the event type and fires
     /// the appropriate hook (e.g., `pty_title_changed`, `pty_cwd_changed`).
     PtyOscEvent {
-        /// Agent key for the Lua hook context.
-        agent_key: String,
+        /// Session UUID for routing and Lua hook context.
+        session_uuid: String,
         /// Session name (e.g., "agent", "server").
         session_name: String,
         /// The PtyEvent variant (TitleChanged, CwdChanged, PromptMark).
@@ -60,8 +60,8 @@ pub(crate) enum HubEvent {
     /// `PtyEvent::ProcessExited`. Triggers Lua `process_exited` event
     /// which updates agent status and broadcasts to all clients.
     PtyProcessExited {
-        /// Agent key identifying which agent's PTY exited.
-        agent_key: String,
+        /// Session UUID identifying which session's PTY exited.
+        session_uuid: String,
         /// Session name (e.g., "agent", "server").
         session_name: String,
         /// Exit code if available (None if killed by signal or unknown).
@@ -660,14 +660,14 @@ mod tests {
     #[test]
     fn kind_splits_pty_osc_subtypes() {
         let title = HubEvent::PtyOscEvent {
-            agent_key: "a".to_string(),
+            session_uuid: "a".to_string(),
             session_name: "s".to_string(),
             event: crate::agent::pty::PtyEvent::title_changed("hello"),
         };
         assert_eq!(title.kind(), "pty_osc_title");
 
         let cwd = HubEvent::PtyOscEvent {
-            agent_key: "a".to_string(),
+            session_uuid: "a".to_string(),
             session_name: "s".to_string(),
             event: crate::agent::pty::PtyEvent::cwd_changed("/tmp"),
         };

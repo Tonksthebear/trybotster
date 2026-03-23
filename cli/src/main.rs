@@ -512,7 +512,7 @@ enum Commands {
     /// Get agent context values (identity, worktree metadata, plugin data).
     /// Omit key to dump all context as JSON.
     Context {
-        /// Context key (e.g., agent_key, repo, prompt, issue_number)
+        /// Context key (e.g., session_uuid, repo, prompt, issue_number)
         key: Option<String>,
     },
     /// Run the PTY broker process (internal — spawned by the hub)

@@ -38,7 +38,7 @@
 //! local path = worktree.create("feature-branch")
 //!
 //! -- Create worktree asynchronously (returns immediately, fires event on completion)
-//! worktree.create_async({ agent_key = "key", branch = "feature-branch", prompt = "..." })
+//! worktree.create_async({ label = "key", branch = "feature-branch", prompt = "..." })
 //!
 //! -- Delete worktree (sends event for async processing)
 //! worktree.delete("/path/to/worktree", "feature-branch")
@@ -69,8 +69,8 @@ pub enum WorktreeRequest {
     /// `worktree_created` or `worktree_create_failed` Lua events on completion.
     /// All context fields are carried through so Lua can resume agent spawning.
     Create {
-        /// Agent key for lifecycle broadcasts.
-        agent_key: String,
+        /// Display label for lifecycle broadcasts.
+        label: String,
         /// Git branch name for the worktree.
         branch: String,
         /// Opaque plugin metadata (carried through for Lua agent spawning).
@@ -99,8 +99,8 @@ pub enum WorktreeRequest {
 /// after the blocking git operation completes.
 #[derive(Debug)]
 pub struct WorktreeCreateResult {
-    /// Agent key for lifecycle broadcasts.
-    pub agent_key: String,
+    /// Display label for lifecycle broadcasts.
+    pub label: String,
     /// Git branch name.
     pub branch: String,
     /// `Ok(path)` on success, `Err(message)` on failure.
@@ -361,13 +361,13 @@ pub(crate) fn register(
     // threadpool. Returns immediately. Hub fires `worktree_created` or
     // `worktree_create_failed` Lua events on completion.
     //
-    // params is a table with: agent_key, branch, metadata, prompt,
+    // params is a table with: label, branch, metadata, prompt,
     // profile_name, client_rows, client_cols
     let tx = hub_event_tx.clone();
     let create_async_fn = lua
         .create_function(move |lua_inner, params: LuaTable| {
-            let agent_key: String = params.get("agent_key").map_err(|e| {
-                mlua::Error::runtime(format!("create_async: missing agent_key: {e}"))
+            let label: String = params.get("label").map_err(|e| {
+                mlua::Error::runtime(format!("create_async: missing label: {e}"))
             })?;
             let branch: String = params
                 .get("branch")
@@ -387,7 +387,7 @@ pub(crate) fn register(
             let guard = tx.lock().expect("HubEventSender mutex poisoned");
             if let Some(ref sender) = *guard {
                 let _ = sender.send(HubEvent::LuaWorktreeRequest(WorktreeRequest::Create {
-                    agent_key,
+                    label,
                     branch,
                     metadata: metadata_json,
                     prompt,
@@ -751,7 +751,7 @@ mod tests {
 
         lua.load(
             r#"worktree.create_async({
-                agent_key = "test-repo-42",
+                label = "test-repo-42",
                 branch = "feature-branch",
                 metadata = { issue_number = 42, invocation_url = "https://github.com/test/repo/issues/42" },
                 prompt = "Fix the bug",
@@ -766,7 +766,7 @@ mod tests {
         let event = rx.try_recv().expect("Should have received event");
         match event {
             HubEvent::LuaWorktreeRequest(WorktreeRequest::Create {
-                agent_key,
+                label,
                 branch,
                 metadata,
                 prompt,
@@ -774,7 +774,7 @@ mod tests {
                 client_rows,
                 client_cols,
             }) => {
-                assert_eq!(agent_key, "test-repo-42");
+                assert_eq!(label, "test-repo-42");
                 assert_eq!(branch, "feature-branch");
                 assert_eq!(metadata["issue_number"], 42);
                 assert_eq!(

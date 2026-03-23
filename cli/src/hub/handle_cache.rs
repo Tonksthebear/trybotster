@@ -108,20 +108,6 @@ impl HandleCache {
         self.sessions.read().ok()?.get(uuid).cloned()
     }
 
-    /// Get a session handle by its agent_key (display label).
-    ///
-    /// Performs a scan of the cache — suitable for low-frequency lookups.
-    /// Returns `None` if no session with that key is registered.
-    #[must_use]
-    pub fn get_session_by_key(&self, key: &str) -> Option<SessionHandle> {
-        self.sessions
-            .read()
-            .ok()?
-            .values()
-            .find(|s| s.agent_key() == key)
-            .cloned()
-    }
-
     /// Get all session handles in display order.
     ///
     /// Returns empty vec if lock is poisoned.

@@ -1785,14 +1785,14 @@ impl LuaRuntime {
     /// - `type`: "osc9" or "osc777"
     /// - `message`: notification message (osc9)
     /// - `title`/`body`: notification fields (osc777)
-    /// - `agent_key`: agent identifier
+    /// - `session_uuid`: session identifier
     /// - `session_name`: PTY session name
     ///
     /// Lua enriches this with `already_notified` (from the Agent model)
     /// and re-dispatches as the public `pty_notification` event.
     pub fn notify_pty_notification(
         &mut self,
-        agent_key: &str,
+        session_uuid: &str,
         session_name: &str,
         notification: &crate::agent::AgentNotification,
     ) {
@@ -1800,7 +1800,7 @@ impl LuaRuntime {
 
         let result: mlua::Result<()> = (|| {
             let data = self.lua.create_table()?;
-            data.set("agent_key", agent_key)?;
+            data.set("session_uuid", session_uuid)?;
             data.set("session_name", session_name)?;
 
             match notification {
@@ -1881,14 +1881,14 @@ impl LuaRuntime {
     /// Dispatch a PTY OSC metadata event to the appropriate Lua hook.
     ///
     /// Maps `PtyEvent` variants to distinct hook names:
-    /// - `TitleChanged` → `"pty_title_changed"` with `{ agent_key, session_name, title }`
-    /// - `CwdChanged` → `"pty_cwd_changed"` with `{ agent_key, session_name, cwd }`
-    /// - `PromptMark` → `"pty_prompt"` with `{ agent_key, session_name, mark, exit_code?, command? }`
+    /// - `TitleChanged` → `"pty_title_changed"` with `{ session_uuid, session_name, title }`
+    /// - `CwdChanged` → `"pty_cwd_changed"` with `{ session_uuid, session_name, cwd }`
+    /// - `PromptMark` → `"pty_prompt"` with `{ session_uuid, session_name, mark, exit_code?, command? }`
     ///
     /// Other PtyEvent variants are ignored (they use different dispatch paths).
     pub fn notify_pty_osc_event(
         &self,
-        agent_key: &str,
+        session_uuid: &str,
         session_name: &str,
         event: &crate::agent::pty::PtyEvent,
     ) {
@@ -1896,7 +1896,7 @@ impl LuaRuntime {
 
         let result: mlua::Result<()> = (|| {
             let data = self.lua.create_table()?;
-            data.set("agent_key", agent_key)?;
+            data.set("session_uuid", session_uuid)?;
             data.set("session_name", session_name)?;
 
             let hook_name = match event {
@@ -4041,10 +4041,10 @@ mod tests {
                 return nil
             end
 
-            -- Agent.find_by_agent_key (mirrors lib/agent.lua)
-            Agent.find_by_agent_key = function(key)
+            -- Agent.find_by_session_uuid (mirrors lib/agent.lua)
+            Agent.find_by_session_uuid = function(uuid)
                 for _, a in ipairs(_test_agents) do
-                    if a._agent_key == key then return a end
+                    if a._session_uuid == uuid then return a end
                 end
                 return nil
             end
@@ -4092,7 +4092,6 @@ mod tests {
                 if cleared and agent then
                     hooks.notify("pty_input", {
                         session_uuid = session_uuid,
-                        agent_key = agent._agent_key,
                     })
                 end
                 return any_remaining
@@ -4118,7 +4117,7 @@ mod tests {
             .eval::<i64>()
             .unwrap();
         runtime.lua().load(&format!(
-            r#"table.insert(_test_agents, {{ _agent_key = "{key}", _session_uuid = "sess-{idx}", notification = {notif} }})"#,
+            r#"table.insert(_test_agents, {{ _session_uuid = "sess-{idx}", _label = "{key}", notification = {notif} }})"#,
             key = key,
             idx = idx,
             notif = notification,
@@ -4297,12 +4296,12 @@ mod tests {
             .unwrap();
         assert_eq!(hook_call_count, 1, "Should fire pty_input hook for plugins");
 
-        let hook_agent_key: String = runtime
+        let hook_session_uuid: String = runtime
             .lua()
-            .load("return _pty_input_hook_calls[1].agent_key")
+            .load("return _pty_input_hook_calls[1].session_uuid")
             .eval()
             .unwrap();
-        assert_eq!(hook_agent_key, "my-agent");
+        assert_eq!(hook_session_uuid, "sess-0");
     }
 
     #[test]
@@ -4481,7 +4480,7 @@ mod tests {
 
             -- Register the bridge
             hooks.on("_pty_notification_raw", "enrich_and_dispatch", function(info)
-                local agent = info.agent_key and Agent.find_by_agent_key(info.agent_key)
+                local agent = info.session_uuid and Agent.get(info.session_uuid)
                 info.already_notified = agent and agent.notification or false
                 hooks.notify("pty_notification", info)
             end)
@@ -4499,7 +4498,7 @@ mod tests {
         add_test_agent(&runtime, "agent-0", false); // no prior notification
 
         runtime.notify_pty_notification(
-            "agent-0",
+            "sess-0",
             "agent",
             &crate::agent::AgentNotification::Osc9(Some("bell".to_string())),
         );
@@ -4523,7 +4522,7 @@ mod tests {
         add_test_agent(&runtime, "agent-0", true); // already has notification
 
         runtime.notify_pty_notification(
-            "agent-0",
+            "sess-0",
             "agent",
             &crate::agent::AgentNotification::Osc9(Some("bell".to_string())),
         );
@@ -4547,7 +4546,7 @@ mod tests {
         add_test_agent(&runtime, "agent-0", false);
 
         runtime.notify_pty_notification(
-            "agent-0",
+            "sess-0",
             "cli",
             &crate::agent::AgentNotification::Osc777 {
                 title: "Build Done".to_string(),
@@ -4555,9 +4554,9 @@ mod tests {
             },
         );
 
-        let agent_key: String = runtime
+        let session_uuid: String = runtime
             .lua()
-            .load("return _pty_notification_calls[1].agent_key")
+            .load("return _pty_notification_calls[1].session_uuid")
             .eval()
             .unwrap();
         let session: String = runtime
@@ -4581,7 +4580,7 @@ mod tests {
             .eval()
             .unwrap();
 
-        assert_eq!(agent_key, "agent-0");
+        assert_eq!(session_uuid, "sess-0");
         assert_eq!(session, "cli");
         assert_eq!(ntype, "osc777");
         assert_eq!(title, "Build Done");
