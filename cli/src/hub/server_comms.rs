@@ -516,7 +516,10 @@ impl Hub {
                 // whether the child PTY requested focus reporting.
                 if msg.get("type").and_then(|v| v.as_str()) == Some("focus_changed") {
                     if let Some(session_uuid) = msg.get("session_uuid").and_then(|v| v.as_str()) {
-                        let focused = msg.get("focused").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let focused = msg
+                            .get("focused")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         self.lua.set_pty_focused(session_uuid, &client_id, focused);
                     }
                 } else if let Err(e) = self.lua.call_socket_message(&client_id, msg) {
@@ -2918,11 +2921,7 @@ impl Hub {
                         &session_uuid[..session_uuid.len().min(8)]
                     );
 
-                    Self::send_snapshot_to_peer(
-                        &peer_tx,
-                        &subscription_id,
-                        &snapshot,
-                    );
+                    Self::send_snapshot_to_peer(&peer_tx, &subscription_id, &snapshot);
                 });
                 continue;
             }
@@ -2942,11 +2941,7 @@ impl Hub {
             // Chunk and send directly through the per-peer channel,
             // bypassing the output queue to avoid re-triggering backpressure.
             let peer_tx = peer_state.unwrap().tx.clone();
-            Self::send_snapshot_to_peer(
-                &peer_tx,
-                &entry.subscription_id,
-                &snapshot,
-            );
+            Self::send_snapshot_to_peer(&peer_tx, &entry.subscription_id, &snapshot);
         }
     }
 
@@ -5522,6 +5517,81 @@ mod tests {
     }
 
     #[test]
+    fn test_headless_broker_probe_replays_cached_osc_color_reply() {
+        use std::io::Read;
+
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-headless-probe";
+        let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
+        hub.handle_cache.add_session(session);
+        hub.broker_sessions.insert(1, session_uuid.to_string());
+        hub.learn_terminal_probe_replies("browser-a", b"\x1b]11;rgb:1111/2222/3333\x07");
+
+        broker_peer
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set read timeout");
+
+        hub.handle_hub_event(crate::hub::events::HubEvent::BrokerPtyOutput {
+            session_id: 1,
+            flags: 0,
+            data: b"\x1b]11;?\x07".to_vec(),
+        });
+
+        let mut buf = [0u8; 256];
+        let n = broker_peer.read(&mut buf).expect("read broker probe reply");
+        let frames = BrokerFrameDecoder::new()
+            .feed(&buf[..n])
+            .expect("decode broker frame");
+
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            BrokerFrame::PtyInput(session_id, data) => {
+                assert_eq!(*session_id, 1);
+                assert_eq!(data, b"\x1b]11;rgb:1111/2222/3333\x07");
+            }
+            other => panic!("expected cached PtyInput reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_live_terminal_client_suppresses_cached_probe_reply() {
+        use std::io::Read;
+
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-live-probe";
+        let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
+        hub.handle_cache.add_session(session);
+        hub.broker_sessions.insert(1, session_uuid.to_string());
+        hub.learn_terminal_probe_replies("browser-a", b"\x1b]11;rgb:aaaa/bbbb/cccc\x07");
+
+        let _guard = hub.tokio_runtime.enter();
+        hub.pty_forwarders
+            .insert(format!("tui:{session_uuid}"), tokio::spawn(async {}));
+
+        broker_peer
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read timeout");
+
+        hub.handle_hub_event(crate::hub::events::HubEvent::BrokerPtyOutput {
+            session_id: 1,
+            flags: 0,
+            data: b"\x1b]11;?\x07".to_vec(),
+        });
+
+        let mut buf = [0u8; 256];
+        let err = broker_peer
+            .read(&mut buf)
+            .expect_err("live client should suppress cached reply injection");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "expected timeout/empty read, got {err:?}"
+        );
+    }
+
+    #[test]
     fn test_backpressure_recovery_fetches_broker_snapshot() {
         let (mut hub, _request_tx, _output_rx) = e2e_hub();
         let session_uuid = "sess-broker-recovery";
@@ -5569,9 +5639,8 @@ mod tests {
                     Ok(n) => {
                         let frames = decoder.feed(&buf[..n]).expect("decode broker frame");
                         for frame in frames {
-                            if let BrokerFrame::HubControl(HubMessage::GetSnapshot {
-                                session_id,
-                            }) = frame
+                            if let BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) =
+                                frame
                             {
                                 let response = encode_data(
                                     frame_type::SNAPSHOT,
