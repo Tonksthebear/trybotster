@@ -385,6 +385,7 @@ end
 function M.list_accessories(device_root, repo_root)
     local seen = {}
     local result = {}
+    -- Scan config-defined accessories first
     if device_root then
         for _, name in ipairs(list_subdirs(device_root .. "/accessories")) do
             if fs.exists(device_root .. "/accessories/" .. name .. "/initialization") then
@@ -406,7 +407,17 @@ function M.list_accessories(device_root, repo_root)
             end
         end
     end
-    table.sort(result)
+    -- Built-in "terminal" always available: raw shell, no config needed.
+    -- Custom accessories/terminal/ overrides win if they exist.
+    if not seen["terminal"] then
+        result[#result + 1] = "terminal"
+    end
+    table.sort(result, function(a, b)
+        -- Keep "terminal" first, sort the rest alphabetically
+        if a == "terminal" then return true end
+        if b == "terminal" then return false end
+        return a < b
+    end)
     return result
 end
 
