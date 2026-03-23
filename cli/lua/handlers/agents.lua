@@ -327,11 +327,6 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, agen
     -- Notify via hooks (connections.lua observes and broadcasts to clients)
     hooks.notify("agent_created", agent:info())
 
-    -- Deliver initial prompt to the agent PTY
-    if prompt and prompt ~= "" and agent.session then
-        agent.session:send_message(prompt)
-    end
-
     -- Auto-spawn accessories from workspace manifest
     if workspace_manifest and workspace_manifest.accessories then
         for _, acc_name in ipairs(workspace_manifest.accessories) do

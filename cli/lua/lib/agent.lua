@@ -7,7 +7,7 @@
 --
 -- Agent adds:
 -- - Inter-agent message inbox
--- - AI-specific lifecycle (prompt delivery is handled by the handler)
+-- - AI-specific lifecycle hooks on top of the shared Session PTY model
 --
 -- Single-PTY model: Agent = 1 PTY with AI autonomy.
 -- Session UUID is the primary key for everything.

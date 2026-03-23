@@ -79,14 +79,29 @@ impl Hub {
         format!("{truncated}...<truncated,len={char_count}>")
     }
 
-    fn session_has_live_terminal_clients(&self, session_uuid: &str) -> bool {
-        self.pty_forwarders.keys().any(|key| {
-            key == &format!("tui:{session_uuid}") || key.ends_with(&format!(":{session_uuid}"))
-        })
+    fn session_live_terminal_client_count(&self, session_uuid: &str) -> usize {
+        self.pty_forwarders
+            .keys()
+            .filter(|key| {
+                key.strip_prefix("tui:") == Some(session_uuid)
+                    || key
+                        .rsplit_once(':')
+                        .map(|(_, candidate)| candidate == session_uuid)
+                        .unwrap_or(false)
+            })
+            .count()
     }
 
-    fn learn_terminal_probe_replies(&mut self, peer_id: &str, data: &[u8]) {
-        self.terminal_profiles.observe_input(peer_id, data);
+    fn should_learn_terminal_probe_replies(&self, session_uuid: &str) -> bool {
+        self.session_live_terminal_client_count(session_uuid) <= 1
+    }
+
+    fn learn_terminal_probe_replies(&mut self, session_uuid: &str, peer_id: &str, data: &[u8]) {
+        if !self.should_learn_terminal_probe_replies(session_uuid) {
+            return;
+        }
+        self.terminal_profiles
+            .observe_input(session_uuid, peer_id, data);
     }
 
     fn reply_to_headless_terminal_probes(
@@ -95,15 +110,18 @@ impl Hub {
         pty: &crate::hub::agent_handle::PtyHandle,
         data: &[u8],
     ) {
-        let probes = self.terminal_profiles.observe_output(session_uuid, data);
-        if probes.is_empty() || self.session_has_live_terminal_clients(session_uuid) {
+        let live_clients = self.session_live_terminal_client_count(session_uuid);
+        let probes = self
+            .terminal_profiles
+            .observe_output(session_uuid, data, live_clients == 1);
+        if probes.is_empty() || live_clients > 0 {
             return;
         }
 
         for probe in probes {
             let Some(reply) = self
                 .terminal_profiles
-                .headless_reply(probe)
+                .headless_reply(session_uuid, probe)
                 .map(std::borrow::ToOwned::to_owned)
             else {
                 continue;
@@ -1068,6 +1086,7 @@ impl Hub {
             HubEvent::SessionUnregistered { session_uuid } => {
                 let before = self.broker_sessions.len();
                 self.broker_sessions.retain(|_, uuid| uuid != &session_uuid);
+                self.terminal_profiles.clear_session(&session_uuid);
                 let removed = before - self.broker_sessions.len();
                 if removed > 0 {
                     log::debug!(
@@ -1215,7 +1234,7 @@ impl Hub {
                 self.lua.set_pty_focused(&session_uuid, "tui", focused);
             }
             TuiRequest::PtyInput { session_uuid, data } => {
-                self.learn_terminal_probe_replies("tui", &data);
+                self.learn_terminal_probe_replies(&session_uuid, "tui", &data);
                 self.lua.notify_pty_input(&session_uuid);
                 if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
                     if let Err(e) = session_handle.pty().write_input_direct(&data) {
@@ -1241,7 +1260,11 @@ impl Hub {
             self.lua
                 .set_pty_focused(&input.session_uuid, &input.browser_identity, false);
         }
-        self.learn_terminal_probe_replies(&input.browser_identity, &input.data);
+        self.learn_terminal_probe_replies(
+            &input.session_uuid,
+            &input.browser_identity,
+            &input.data,
+        );
         self.lua.notify_pty_input(&input.session_uuid);
 
         if let Some(session_handle) = self.handle_cache.get_session(&input.session_uuid) {
@@ -5526,7 +5549,13 @@ mod tests {
         let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
         hub.handle_cache.add_session(session);
         hub.broker_sessions.insert(1, session_uuid.to_string());
-        hub.learn_terminal_probe_replies("browser-a", b"\x1b]11;rgb:1111/2222/3333\x07");
+        hub.terminal_profiles
+            .observe_output(session_uuid, b"\x1b]11;?\x07", true);
+        hub.learn_terminal_probe_replies(
+            session_uuid,
+            "browser-a",
+            b"\x1b]11;rgb:1111/2222/3333\x07",
+        );
 
         broker_peer
             .set_read_timeout(Some(Duration::from_millis(200)))
@@ -5563,7 +5592,13 @@ mod tests {
         let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
         hub.handle_cache.add_session(session);
         hub.broker_sessions.insert(1, session_uuid.to_string());
-        hub.learn_terminal_probe_replies("browser-a", b"\x1b]11;rgb:aaaa/bbbb/cccc\x07");
+        hub.terminal_profiles
+            .observe_output(session_uuid, b"\x1b]11;?\x07", true);
+        hub.learn_terminal_probe_replies(
+            session_uuid,
+            "browser-a",
+            b"\x1b]11;rgb:aaaa/bbbb/cccc\x07",
+        );
 
         let _guard = hub.tokio_runtime.enter();
         hub.pty_forwarders
@@ -5589,6 +5624,68 @@ mod tests {
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
             ),
             "expected timeout/empty read, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_session_unregistered_clears_terminal_profile_state() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-clear-profile";
+
+        hub.terminal_profiles
+            .observe_output(session_uuid, b"\x1b]11;?\x07", true);
+        hub.learn_terminal_probe_replies(
+            session_uuid,
+            "browser-a",
+            b"\x1b]11;rgb:1234/5678/9abc\x07",
+        );
+
+        assert!(hub
+            .terminal_profiles
+            .headless_reply(
+                session_uuid,
+                crate::hub::terminal_profile::TerminalProbe::DefaultBackground
+            )
+            .is_some());
+
+        hub.handle_hub_event(crate::hub::events::HubEvent::SessionUnregistered {
+            session_uuid: session_uuid.to_string(),
+        });
+
+        assert_eq!(
+            hub.terminal_profiles.headless_reply(
+                session_uuid,
+                crate::hub::terminal_profile::TerminalProbe::DefaultBackground
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_multiple_live_clients_do_not_update_terminal_profile_cache() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-multi-client";
+
+        let _guard = hub.tokio_runtime.enter();
+        hub.pty_forwarders
+            .insert(format!("tui:{session_uuid}"), tokio::spawn(async {}));
+        hub.pty_forwarders
+            .insert(format!("browser-a:{session_uuid}"), tokio::spawn(async {}));
+
+        hub.terminal_profiles
+            .observe_output(session_uuid, b"\x1b]11;?\x07", true);
+        hub.learn_terminal_probe_replies(
+            session_uuid,
+            "browser-a",
+            b"\x1b]11;rgb:1234/5678/9abc\x07",
+        );
+
+        assert_eq!(
+            hub.terminal_profiles.headless_reply(
+                session_uuid,
+                crate::hub::terminal_profile::TerminalProbe::DefaultBackground
+            ),
+            None
         );
     }
 
