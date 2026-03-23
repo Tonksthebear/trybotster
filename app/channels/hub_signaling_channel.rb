@@ -12,8 +12,9 @@ require_relative "concerns/health_status"
 # - hub:{hub_id}:signal:{browser_identity} — scoped signals from CLI (opaque envelopes)
 # - hub:{hub_id}:health — shared CLI online/offline status
 #
-# Single action:
+# Actions:
 # - signal(envelope) — relays opaque envelope to CLI via hub_command broadcast
+# - request_bundle() — asks CLI for a fresh signed public bundle
 #
 # Auth: Browser session (Warden) — NOT for CLI use
 class HubSignalingChannel < ApplicationCable::Channel
@@ -35,6 +36,16 @@ class HubSignalingChannel < ApplicationCable::Channel
     # Immediately tell browser current CLI status
     transmit(HealthStatus.message(@hub.alive? ? HealthStatus::ONLINE : HealthStatus::OFFLINE))
 
+    # Paired browsers connect signaling with their long-term identity key.
+    # Ask the CLI for a fresh signed bundle right away so the first offer can
+    # use a new session without an extra browser-request round trip.
+    unless @browser_identity.start_with?("anon:")
+      ActionCable.server.broadcast(
+        "hub_command:#{@hub.id}",
+        { type: "bundle_request", browser_identity: @browser_identity }
+      )
+    end
+
     Rails.logger.info "[HubSignalingChannel] Browser subscribed: hub=#{@hub.id}, identity=#{@browser_identity}"
   end
 
@@ -49,6 +60,15 @@ class HubSignalingChannel < ApplicationCable::Channel
     ActionCable.server.broadcast(
       "hub_command:#{@hub.id}",
       { type: "signal", browser_identity: @browser_identity, envelope: data["envelope"] }
+    )
+  end
+
+  def request_bundle(_data = nil)
+    return unless @hub
+
+    ActionCable.server.broadcast(
+      "hub_command:#{@hub.id}",
+      { type: "bundle_request", browser_identity: @browser_identity }
     )
   end
 end

@@ -1,7 +1,8 @@
 <%# New Session Chooser Modal %>
-<%# First step: choose between Agent or Accessory, then delegates to the appropriate modal %>
 <%= render Elements::DialogComponent.new(id: "new-session-chooser-modal") do %>
-  <div class="flex flex-col">
+  <div data-controller="new-session-chooser"
+       data-new-session-chooser-hub-id-value="<%= Current.hub.id %>"
+       class="flex flex-col">
     <%# Header %>
     <div class="px-5 py-4 border-b border-zinc-800 bg-zinc-950/50">
       <div class="flex items-center gap-3">
@@ -10,18 +11,30 @@
         </span>
         <div>
           <h3 class="text-base font-semibold text-zinc-100">New Session</h3>
-          <p class="text-xs text-zinc-500 mt-0.5">Add an agent or accessory</p>
+          <p class="text-xs text-zinc-500 mt-0.5">Choose spawn location first, then session type</p>
         </div>
       </div>
     </div>
 
     <%# Content %>
-    <div class="p-5 space-y-2">
+    <div class="p-5 space-y-4">
+      <div data-new-session-chooser-target="targetSection" class="hidden">
+        <div class="flex items-center gap-2 mb-2">
+          <%= icon "folder", class: "size-4 text-zinc-500" %>
+          <label class="text-xs font-medium text-zinc-400 uppercase tracking-wider">Spawn Target</label>
+        </div>
+        <select data-new-session-chooser-target="targetSelect"
+                data-action="change->new-session-chooser#selectTarget"
+                class="w-full px-3 py-2.5 bg-zinc-950 border border-zinc-700 rounded text-zinc-100 text-sm focus:outline-hidden focus:border-primary-500 focus:ring-1 focus:ring-primary-500/50 transition-colors">
+        </select>
+        <p data-new-session-chooser-target="targetPrompt" class="text-xs text-zinc-600 mt-1">Choose a spawn target first.</p>
+      </div>
+
       <button type="button"
-              class="w-full text-left px-4 py-3 rounded-lg bg-zinc-800/50 hover:bg-zinc-700/50 border border-zinc-700/50 hover:border-zinc-600/50 transition-colors"
-              command="close"
-              commandfor="new-session-chooser-modal"
-              onclick="document.getElementById('new-agent-modal')?.showModal()">
+              data-new-session-chooser-target="agentButton"
+              data-action="new-session-chooser#chooseAgent"
+              class="w-full text-left px-4 py-3 rounded-lg bg-zinc-800/50 hover:bg-zinc-700/50 border border-zinc-700/50 hover:border-zinc-600/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled>
         <div class="flex items-center gap-3">
           <span class="size-8 rounded-md bg-primary-500/10 text-primary-400 flex items-center justify-center border border-primary-500/20 shrink-0">
             <%= icon "cpu-chip", class: "size-4" %>
@@ -35,10 +48,10 @@
       </button>
 
       <button type="button"
-              class="w-full text-left px-4 py-3 rounded-lg bg-zinc-800/50 hover:bg-zinc-700/50 border border-zinc-700/50 hover:border-zinc-600/50 transition-colors"
-              command="close"
-              commandfor="new-session-chooser-modal"
-              onclick="document.getElementById('new-accessory-modal')?.showModal()">
+              data-new-session-chooser-target="accessoryButton"
+              data-action="new-session-chooser#chooseAccessory"
+              class="w-full text-left px-4 py-3 rounded-lg bg-zinc-800/50 hover:bg-zinc-700/50 border border-zinc-700/50 hover:border-zinc-600/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled>
         <div class="flex items-center gap-3">
           <span class="size-8 rounded-md bg-zinc-700/50 text-zinc-400 flex items-center justify-center border border-zinc-600/30 shrink-0">
             <%= icon "command-line", class: "size-4" %>
