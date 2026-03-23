@@ -362,6 +362,14 @@ fn tui_request_to_frame(request: &TuiRequest) -> Frame {
             session_uuid: session_uuid.clone(),
             data: data.clone(),
         },
+        TuiRequest::FocusChanged {
+            session_uuid,
+            focused,
+        } => Frame::Json(serde_json::json!({
+            "type": "focus_changed",
+            "session_uuid": session_uuid,
+            "focused": focused,
+        })),
     }
 }
 
