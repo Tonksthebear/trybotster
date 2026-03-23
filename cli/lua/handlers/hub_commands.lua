@@ -16,6 +16,25 @@
 
 local state = require("hub.state")
 local Agent = require("lib.agent")
+local TargetContext = require("lib.target_context")
+
+local function resolve_webhook_target(payload)
+    payload = payload or {}
+
+    if payload.target_id then
+        return TargetContext.resolve({
+            explicit = {
+                target_id = payload.target_id,
+                target_path = payload.target_path,
+                target_repo = payload.target_repo,
+            },
+            require_target_id = true,
+            require_target_path = true,
+        })
+    end
+
+    return TargetContext.find_by_repo(payload.target_repo)
+end
 
 -- Persistent handles across hot-reloads
 local handles = state.get("hub_commands.handles", {})
@@ -78,12 +97,22 @@ handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
                 log.warn("Unknown signal type: " .. tostring(signal_type))
             end
 
+        elseif msg_type == "bundle_request" then
+            if message.browser_identity then
+                hub.send_fresh_bundle(message.browser_identity)
+            end
+
         elseif msg_type == "message" then
             local event_type = message.event_type or ""
 
             if event_type == "create_agent" then
                 local payload = message.payload or {}
-                local cmd_repo = config.env("BOTSTER_REPO") or hub.detect_repo()
+                local resolved_target, target_err = resolve_webhook_target(payload)
+                if not resolved_target then
+                    log.warn(string.format("Ignoring webhook create_agent without admitted target: %s", tostring(target_err)))
+                    goto ack_message
+                end
+                local cmd_repo = resolved_target.target_repo or resolved_target.repo
                 local issue_num = payload.issue_number
                 -- Build workspace name inline
                 local ws_name = nil
@@ -95,24 +124,33 @@ handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
                     issue_or_branch = issue_num and tostring(issue_num),
                     prompt = payload.prompt or payload.context or payload.comment_body,
                     repo = cmd_repo,
+                    target_id = resolved_target.target_id,
+                    target_path = resolved_target.target_path,
+                    target_repo = resolved_target.target_repo,
                     metadata = {
                         issue_number = issue_num,
                         invocation_url = payload.issue_url,
                         workspace = ws_name,
                         workspace_metadata = cmd_repo and { repo = cmd_repo, issue_number = issue_num } or nil,
+                        target_id = resolved_target.target_id,
+                        target_path = resolved_target.target_path,
+                        target_repo = resolved_target.target_repo,
                     },
                 })
             elseif event_type == "agent_cleanup" then
                 local payload = message.payload or {}
-                local cmd_repo = config.env("BOTSTER_REPO") or hub.detect_repo() or ""
+                local resolved_target, target_err = resolve_webhook_target(payload)
+                if not resolved_target then
+                    log.warn(string.format("Ignoring webhook agent_cleanup without admitted target: %s", tostring(target_err)))
+                    goto ack_message
+                end
+                local cmd_repo = resolved_target.target_repo or resolved_target.repo or ""
                 if payload.issue_number then
-                    -- Find matching agents by workspace name
                     local ws_name = cmd_repo .. "#" .. tostring(payload.issue_number)
-                    local matches = Agent.find_by_workspace(ws_name)
+                    local matches = Agent.find_by_workspace(ws_name, resolved_target)
                     if #matches == 0 then
-                        -- Fallback for agents created before workspace migration
                         for _, agent in ipairs(Agent.find_by_meta("issue_number", payload.issue_number)) do
-                            if agent.repo == cmd_repo then
+                            if TargetContext.matches(agent, resolved_target) then
                                 matches[#matches + 1] = agent
                             end
                         end
@@ -130,6 +168,7 @@ handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
             end
 
             -- Ack by sequence
+            ::ack_message::
             if message.sequence then
                 action_cable.perform(channel_id, "ack", { sequence = message.sequence })
             end

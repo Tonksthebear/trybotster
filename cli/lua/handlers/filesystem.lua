@@ -5,6 +5,7 @@
 -- Data flows browser <-> CLI over E2E encrypted DataChannel. Nothing through Rails.
 
 local commands = require("lib.commands")
+local TargetContext = require("lib.target_context")
 
 -- ============================================================================
 -- Helpers
@@ -17,20 +18,65 @@ local commands = require("lib.commands")
 -- @param scope string|nil "device" or nil/repo
 -- @return string|nil absolute_path
 -- @return string|nil error
-local function safe_path(relative, scope)
-    local root
+local function resolve_scope_root(scope, command)
     if scope == "device" then
-        root = config.data_dir and config.data_dir() or nil
+        local root = config.data_dir and config.data_dir() or nil
         if not root then return nil, "No device data_dir configured" end
-        -- Ensure device root exists (may not yet for first-time initialization)
         if not fs.exists(root) then
             fs.mkdir(root)
         end
-    else
-        root = worktree.repo_root()
-        if not root then return nil, "No repo root" end
+        return root, nil
     end
+
+    local target, target_err = TargetContext.resolve({
+        command = command,
+        metadata = command and command.metadata or nil,
+        require_target_id = true,
+        require_target_path = true,
+    })
+    if not target then
+        return nil, tostring(target_err)
+    end
+    return target.target_path, nil
+end
+
+local function safe_path(relative, scope, command)
+    local root
+    local root_err
+    root, root_err = resolve_scope_root(scope, command)
+    if not root then return nil, root_err end
     return fs.resolve_safe(root, relative)
+end
+
+local function normalize_host_directory(path)
+    path = tostring(path or "")
+    if path == "" then
+        path = os.getenv("HOME") or "/"
+    end
+
+    if path:find("\0", 1, true) then
+        return nil, "Path contains null byte"
+    end
+
+    if not path:match("^/") then
+        return nil, "Absolute path required"
+    end
+
+    local normalized = path:gsub("/+", "/")
+    if normalized ~= "/" then
+        normalized = normalized:gsub("/+$", "")
+    end
+
+    local stat_result, stat_err = fs.stat(normalized)
+    if not stat_result then
+        return nil, stat_err or "Path does not exist"
+    end
+
+    if stat_result.type ~= "directory" then
+        return nil, "Path is not a directory"
+    end
+
+    return normalized, nil
 end
 
 --- Send a response back to the browser client.
@@ -51,7 +97,7 @@ end
 -- ============================================================================
 
 commands.register("fs:read", function(client, sub_id, command)
-    local path, err = safe_path(command.path or "", command.scope)
+    local path, err = safe_path(command.path or "", command.scope, command)
     if not path then
         respond(client, sub_id, command.request_id, "fs:read", { ok = false, error = err })
         return
@@ -70,7 +116,7 @@ commands.register("fs:read", function(client, sub_id, command)
 end, { description = "Read a file from the repo" })
 
 commands.register("fs:write", function(client, sub_id, command)
-    local path, err = safe_path(command.path or "", command.scope)
+    local path, err = safe_path(command.path or "", command.scope, command)
     if not path then
         respond(client, sub_id, command.request_id, "fs:write", { ok = false, error = err })
         return
@@ -85,7 +131,7 @@ commands.register("fs:write", function(client, sub_id, command)
 end, { description = "Write a file to the repo" })
 
 commands.register("fs:list", function(client, sub_id, command)
-    local path, err = safe_path(command.path or ".", command.scope)
+    local path, err = safe_path(command.path or ".", command.scope, command)
     if not path then
         respond(client, sub_id, command.request_id, "fs:list", { ok = false, error = err })
         return
@@ -112,8 +158,43 @@ commands.register("fs:list", function(client, sub_id, command)
     respond(client, sub_id, command.request_id, "fs:list", { ok = true, entries = entries })
 end, { description = "List directory entries in the repo" })
 
+commands.register("fs:browse", function(client, sub_id, command)
+    local path, err = normalize_host_directory(command.path)
+    if not path then
+        respond(client, sub_id, command.request_id, "fs:browse", { ok = false, error = err })
+        return
+    end
+
+    local entries_raw, list_err = fs.listdir(path)
+    if not entries_raw then
+        respond(client, sub_id, command.request_id, "fs:browse", { ok = false, error = list_err })
+        return
+    end
+
+    local directories_only = command.directories_only ~= false
+    local entries = {}
+    for _, name in ipairs(entries_raw) do
+        local entry_path = path == "/" and ("/" .. name) or (path .. "/" .. name)
+        local stat_result = fs.stat(entry_path)
+        local entry_type = stat_result and stat_result.type or "file"
+        if (not directories_only) or entry_type == "directory" then
+            table.insert(entries, {
+                name = name,
+                type = entry_type,
+                size = stat_result and stat_result.size or 0,
+            })
+        end
+    end
+
+    respond(client, sub_id, command.request_id, "fs:browse", {
+        ok = true,
+        path = path,
+        entries = entries,
+    })
+end, { description = "Browse host filesystem directories for spawn target discovery" })
+
 commands.register("fs:stat", function(client, sub_id, command)
-    local path, err = safe_path(command.path or "", command.scope)
+    local path, err = safe_path(command.path or "", command.scope, command)
     if not path then
         respond(client, sub_id, command.request_id, "fs:stat", { ok = false, error = err })
         return
@@ -133,7 +214,7 @@ commands.register("fs:stat", function(client, sub_id, command)
 end, { description = "Get file/directory metadata" })
 
 commands.register("fs:delete", function(client, sub_id, command)
-    local path, err = safe_path(command.path or "", command.scope)
+    local path, err = safe_path(command.path or "", command.scope, command)
     if not path then
         respond(client, sub_id, command.request_id, "fs:delete", { ok = false, error = err })
         return
@@ -148,7 +229,7 @@ commands.register("fs:delete", function(client, sub_id, command)
 end, { description = "Delete a file from the repo" })
 
 commands.register("fs:mkdir", function(client, sub_id, command)
-    local path, err = safe_path(command.path or "", command.scope)
+    local path, err = safe_path(command.path or "", command.scope, command)
     if not path then
         respond(client, sub_id, command.request_id, "fs:mkdir", { ok = false, error = err })
         return
@@ -163,7 +244,7 @@ commands.register("fs:mkdir", function(client, sub_id, command)
 end, { description = "Create a directory in the repo" })
 
 commands.register("fs:rmdir", function(client, sub_id, command)
-    local path, err = safe_path(command.path or "", command.scope)
+    local path, err = safe_path(command.path or "", command.scope, command)
     if not path then
         respond(client, sub_id, command.request_id, "fs:rmdir", { ok = false, error = err })
         return
@@ -178,13 +259,13 @@ commands.register("fs:rmdir", function(client, sub_id, command)
 end, { description = "Recursively remove a directory from the repo" })
 
 commands.register("fs:rename", function(client, sub_id, command)
-    local from_path, from_err = safe_path(command.from_path or "", command.scope)
+    local from_path, from_err = safe_path(command.from_path or "", command.scope, command)
     if not from_path then
         respond(client, sub_id, command.request_id, "fs:rename", { ok = false, error = from_err })
         return
     end
 
-    local to_path, to_err = safe_path(command.to_path or "", command.scope)
+    local to_path, to_err = safe_path(command.to_path or "", command.scope, command)
     if not to_path then
         respond(client, sub_id, command.request_id, "fs:rename", { ok = false, error = to_err })
         return

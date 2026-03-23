@@ -21,6 +21,7 @@
 
 local state = require("hub.state")
 local hooks = require("hub.hooks")
+local TargetContext = require("lib.target_context")
 
 local Session = state.class("Session")
 
@@ -78,6 +79,9 @@ end
 --   repo            string   (required)  "owner/repo"
 --   branch_name     string   (required)
 --   worktree_path   string   (required)
+--   target_id       string   (optional)  admitted spawn target ID
+--   target_path     string   (required)  admitted spawn target root
+--   target_repo     string   (optional)  live repo identity for the target
 --   session_type    string   (optional)  "agent" (default) or "accessory"
 --   session         table    (required)  single session config:
 --                              { name, command, init_script, notifications, forward_port }
@@ -96,7 +100,6 @@ end
 -- @param self The instance (metatable already set by subclass)
 -- @param config Table of session configuration
 function Session._init(self, config)
-    assert(config.repo, "Session._init requires config.repo")
     assert(config.branch_name, "Session._init requires config.branch_name")
     assert(config.worktree_path, "Session._init requires config.worktree_path")
     assert(config.session, "Session._init requires config.session")
@@ -121,6 +124,21 @@ function Session._init(self, config)
         metadata.invocation_url = config.invocation_url
     end
 
+    local target = TargetContext.resolve({
+        explicit = {
+            target_id = config.target_id,
+            target_path = config.target_path,
+            target_repo = config.target_repo,
+        },
+        metadata = metadata,
+        require_target_id = true,
+        require_target_path = true,
+        default_target_repo = config.repo,
+    })
+    assert(target, "Session._init requires config.target_id and config.target_path")
+    metadata = TargetContext.with_metadata(metadata, target)
+    config.repo = config.repo or target.repo
+
     -- Workspace name can be explicitly provided, or inferred from a supplied workspace_id.
     local workspace_name = config.workspace
     local pre_resolved_workspace_id = config.workspace_id
@@ -132,6 +150,9 @@ function Session._init(self, config)
     self.session_name = session_name
     self._agent_key = config.agent_key
     self.repo = config.repo
+    self.target_id = target.target_id
+    self.target_path = target.target_path
+    self.target_repo = target.target_repo
     self.branch_name = config.branch_name
     self.worktree_path = config.worktree_path
     self.prompt = config.prompt
@@ -175,6 +196,10 @@ function Session._init(self, config)
             local existing = ws.read_workspace(data_dir, workspace_id)
             if existing then
                 workspace_name = workspace_name or existing.name
+                self.target_id = self.target_id or existing.target_id
+                self.target_path = self.target_path or existing.target_path
+                self.target_repo = self.target_repo or existing.target_repo
+                self.metadata = TargetContext.with_metadata(self.metadata, TargetContext.from_session(self))
             else
                 log.warn(string.format("Workspace %s not found; creating standalone workspace", tostring(workspace_id)))
                 workspace_id = nil
@@ -185,6 +210,9 @@ function Session._init(self, config)
             local ok_ws, ws_id, ws_err = pcall(function()
                 local id, _, _, err = ws.ensure_workspace(data_dir, {
                     name = workspace_name,
+                    target_id = self.target_id,
+                    target_path = self.target_path,
+                    target_repo = self.target_repo,
                     metadata = self._workspace_metadata,
                     created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
                     expect_new = workspace_expect_new,
@@ -208,6 +236,9 @@ function Session._init(self, config)
             local anon_manifest = {
                 id         = workspace_id,
                 name       = workspace_name,
+                target_id  = self.target_id,
+                target_path = self.target_path,
+                target_repo = self.target_repo,
                 status     = "active",
                 created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
                 updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
@@ -284,6 +315,9 @@ function Session._init(self, config)
         session_type = session_type,
         session_name = session_name,
         repo = config.repo,
+        target_id = self.target_id,
+        target_path = self.target_path,
+        target_repo = self.target_repo,
         workspace_id = self._workspace_id,
         workspace_name = self._workspace_name,
         metadata = metadata,
@@ -351,11 +385,28 @@ end
 -- @param config Table with manifest fields plus recovery-specific keys:
 --   handle (PtySessionHandle); broker_session_id (integer); dims ({ rows, cols })
 function Session._init_recovered(self, config)
+    local recovered_target = TargetContext.resolve({
+        explicit = {
+            target_id = config.target_id,
+            target_path = config.target_path,
+            target_repo = config.target_repo,
+        },
+        metadata = config.metadata,
+        default_target_repo = config.repo,
+    }) or {
+        target_id = config.target_id,
+        target_path = config.target_path,
+        target_repo = config.target_repo or config.repo,
+    }
+
     self.session_uuid    = config.session_uuid
     self.session_type    = config.session_type or "agent"
     self.session_name    = config.session_name or self.session_type
     self._agent_key      = config.agent_key
-    self.repo            = config.repo
+    self.repo            = config.repo or TargetContext.default_repo_label(recovered_target)
+    self.target_id       = recovered_target.target_id
+    self.target_path     = recovered_target.target_path
+    self.target_repo     = recovered_target.target_repo
     self.branch_name     = config.branch_name
     self.worktree_path   = config.worktree_path
     self.prompt          = config.prompt
@@ -380,6 +431,7 @@ function Session._init_recovered(self, config)
     if config.metadata then
         for k, v in pairs(config.metadata) do metadata[k] = v end
     end
+    metadata = TargetContext.with_metadata(metadata, recovered_target)
     metadata["broker_session_id"] = tostring(config.broker_session_id)
     if config.dims then
         metadata["broker_pty_rows"] = tostring(config.dims.rows or 24)
@@ -572,6 +624,9 @@ function Session:_sync_workspace_manifest()
     local manifest = {
         id         = self._workspace_id,
         name       = self._workspace_name or current.name or default_workspace_name(self.branch_name),
+        target_id  = self.target_id or current.target_id,
+        target_path = self.target_path or current.target_path,
+        target_repo = self.target_repo or current.target_repo,
         status     = current.status or "active",
         created_at = current.created_at or os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
         updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
@@ -615,11 +670,15 @@ function Session:move_to_workspace(opts)
     local old_workspace_name = self._workspace_name
     local workspace_id = target_workspace_id
     local workspace_name = target_workspace_name
+    local session_target = TargetContext.from_session(self)
 
     if workspace_id then
         local target_manifest = ws.read_workspace(self._data_dir, workspace_id)
         if not target_manifest then
             return nil, string.format("Workspace '%s' not found", tostring(workspace_id))
+        end
+        if not TargetContext.matches(target_manifest, session_target) then
+            return nil, string.format("Workspace '%s' belongs to a different target", tostring(workspace_id))
         end
 
         if workspace_name and workspace_name ~= target_manifest.name then
@@ -634,6 +693,9 @@ function Session:move_to_workspace(opts)
     else
         local created_id, created_manifest, _, ensure_err = ws.ensure_workspace(self._data_dir, {
             name = workspace_name,
+            target_id = self.target_id,
+            target_path = self.target_path,
+            target_repo = self.target_repo,
             metadata = target_workspace_metadata,
             created_at = now,
             expect_new = expect_new,
@@ -814,6 +876,9 @@ function Session:build_env(base_env)
     end
     env.TERM = env.TERM or os.getenv("TERM") or "xterm-256color"
     env.BOTSTER_WORKTREE_PATH = self.worktree_path
+    if self.target_id then env.BOTSTER_TARGET_ID = self.target_id end
+    if self.target_path then env.BOTSTER_TARGET_PATH = self.target_path end
+    if self.target_repo then env.BOTSTER_TARGET_REPO = self.target_repo end
     env.BOTSTER_AGENT_KEY = self:agent_key()
     env.BOTSTER_SESSION_UUID = self.session_uuid
     env.BOTSTER_HUB_ID = hub.server_id() or ""
@@ -876,6 +941,9 @@ function Session:info()
         agent_name = self.agent_name,
         profile_name = self.profile_name,  -- backward compat
         repo = self.repo,
+        target_id = self.target_id,
+        target_path = self.target_path,
+        target_repo = self.target_repo,
         metadata = self.metadata,
         workspace_name = self._workspace_name,
         workspace_id = self._workspace_id,
@@ -963,11 +1031,12 @@ end
 
 --- Find all running sessions matching a workspace name.
 -- @param name string  Workspace name (e.g. "owner/repo#42")
+-- @param target table|nil Optional target context to scope the lookup
 -- @return array of Session subclass instances
-function Session.find_by_workspace(name)
+function Session.find_by_workspace(name, target)
     local result = {}
     for _, sess in ipairs(Session.list()) do
-        if sess._workspace_name == name then
+        if sess._workspace_name == name and (not target or TargetContext.matches(sess, target)) then
             result[#result + 1] = sess
         end
     end
