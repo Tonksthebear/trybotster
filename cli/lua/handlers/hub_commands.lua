@@ -158,7 +158,7 @@ handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
                     for _, agent in ipairs(matches) do
                         events.emit("command_message", {
                             type = "delete_agent",
-                            agent_id = agent:agent_key(),
+                            agent_id = agent.session_uuid,
                             delete_worktree = false,
                         })
                     end

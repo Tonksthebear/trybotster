@@ -229,14 +229,14 @@ first, restart once, then subsequent file changes hot-reload without restarting.
 
   hooks.on("after_agent_create", "my.hook", function(agent)
     -- agent is a live Agent instance
-    log.info("Agent started: " .. agent:agent_key())
+    log.info("Agent started: " .. agent.session_uuid)
     local branch = agent:info().branch_name
     -- store custom metadata:
     agent:set_meta("started_at", os.time())
   end)
 
   hooks.on("after_agent_close", "my.hook_close", function(agent)
-    log.info("Agent closed: " .. agent:agent_key())
+    log.info("Agent closed: " .. agent.session_uuid)
   end)
 
 Available agent observer events:
@@ -326,7 +326,7 @@ hub.state is an in-memory key-value store that survives require() reloads:
   local found  = Agent.find_by_meta("env", "production")  -- array
 
   -- On an instance:
-  agent:agent_key()          agent:info()
+  agent.session_uuid         agent:info()
   agent:get_meta("key")      agent:set_meta("key", value)
   agent:close(delete_worktree)
 
@@ -555,7 +555,7 @@ Use the state guard pattern:
   end)
 
   hooks.on("after_agent_close", "my-plugin.agent-stop", function(agent)
-    log.info("my-plugin: agent closed: " .. agent:agent_key())
+    log.info("my-plugin: agent closed: " .. agent.session_uuid)
   end)
 
 Other useful agent events:
@@ -573,7 +573,7 @@ Other useful agent events:
       required = { "text" },
     },
   }, function(params, context)
-    -- context.agent_key identifies the calling agent
+    -- context.session_uuid identifies the calling agent
     local ok = send_to_service(params.text)
     return ok and "Sent." or "Failed to send."
   end)
@@ -637,11 +637,11 @@ The user can invoke this with Ctrl+P → "my-plugin-action".
   -- Notify on agent start/stop
   hooks.on("after_agent_create", "telegram.agent-start", function(agent)
     local info = agent:info()
-    send("Agent started: " .. (info.display_name or info.branch_name or agent:agent_key()))
+    send("Agent started: " .. (info.display_name or info.branch_name or agent.session_uuid))
   end)
 
   hooks.on("after_agent_close", "telegram.agent-stop", function(agent)
-    send("Agent closed: " .. agent:agent_key())
+    send("Agent closed: " .. agent.session_uuid)
   end)
 
   -- MCP tool so Claude can send messages directly
@@ -728,7 +728,7 @@ A tool lets Claude call into the hub and get a result.
     },
   }, function(params, context)
     -- params.file, params.limit, params.verbose — values from Claude
-    -- context.agent_key   — key of the agent Claude is running in
+    -- context.session_uuid — session UUID of the agent Claude is running in
     -- context.hub_id      — hub UUID
     -- context.caller_cwd  — working directory of the calling process
 
@@ -762,7 +762,7 @@ Anything available in Lua is available in the handler:
       required = { "path" },
     },
   }, function(params, context)
-    local agent = Agent.get(context.agent_key)
+    local agent = Agent.get(context.session_uuid or context.agent_key)
     if not agent then return "No agent context." end
     local wt_path = agent:info().worktree_path
     if not wt_path then return "Agent has no worktree." end

@@ -200,7 +200,6 @@ hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
     log.info(string.format("Broadcasting agent_deleted: %s", agent_id or "?"))
 
     -- Clean up idle tracking state for the deleted session.
-    -- agent_id is agent_key; idle state is keyed by session_uuid.
     -- Prune any UUIDs that no longer have live sessions.
     local idle_st = state.get("connections._idle_state", {})
     for uuid in pairs(idle_st) do
@@ -227,7 +226,8 @@ end
 
 -- Enrich raw PTY notifications from Rust with agent state, then re-dispatch.
 hooks.on("_pty_notification_raw", "enrich_and_dispatch", function(info)
-    local agent = info.agent_key and Agent.find_by_agent_key(info.agent_key)
+    local agent = (info.session_uuid and Agent.get(info.session_uuid))
+        or (info.agent_key and Agent.find_by_agent_key(info.agent_key))
     info.already_notified = agent and agent.notification or false
 
     -- Check if any client is actively viewing this session
@@ -246,7 +246,8 @@ hooks.on("pty_notification", "push_notification", function(info)
     if info.already_notified then return end
 
     local hub_id = hub.server_id()
-    local agent = info.agent_key and Agent.find_by_agent_key(info.agent_key)
+    local agent = (info.session_uuid and Agent.get(info.session_uuid))
+        or (info.agent_key and Agent.find_by_agent_key(info.agent_key))
 
     -- Build deep link using session_uuid
     local url = nil
@@ -314,7 +315,7 @@ function _on_pty_input(session_uuid)
 
     local cleared, any_remaining = clear_session_notification(session_uuid)
     if cleared and agent then
-        hooks.notify("pty_input", { session_uuid = session_uuid, agent_key = agent:agent_key() })
+        hooks.notify("pty_input", { session_uuid = session_uuid })
     end
     return any_remaining
 end
@@ -327,7 +328,8 @@ end
 
 -- Update agent title when the running program sets the terminal title (OSC 0/2).
 hooks.on("pty_title_changed", "update_agent_title", function(info)
-    local agent = info.agent_key and Agent.find_by_agent_key(info.agent_key)
+    local agent = (info.session_uuid and Agent.get(info.session_uuid))
+        or (info.agent_key and Agent.find_by_agent_key(info.agent_key))
     if agent then
         if agent.title ~= info.title then
             agent:update({ title = info.title })
@@ -338,7 +340,8 @@ end)
 
 -- Update agent CWD when the shell reports a directory change (OSC 7).
 hooks.on("pty_cwd_changed", "update_agent_cwd", function(info)
-    local agent = info.agent_key and Agent.find_by_agent_key(info.agent_key)
+    local agent = (info.session_uuid and Agent.get(info.session_uuid))
+        or (info.agent_key and Agent.find_by_agent_key(info.agent_key))
     if agent then
         if agent.cwd ~= info.cwd then
             agent:update({ cwd = info.cwd })
@@ -366,7 +369,8 @@ end)
 
 -- Track shell integration prompt marks (OSC 133/633).
 hooks.on("pty_prompt", "update_agent_prompt", function(info)
-    local agent = info.agent_key and Agent.find_by_agent_key(info.agent_key)
+    local agent = (info.session_uuid and Agent.get(info.session_uuid))
+        or (info.agent_key and Agent.find_by_agent_key(info.agent_key))
     if agent then
         agent.last_prompt_mark = info
     end
@@ -374,7 +378,8 @@ end)
 
 -- Track cursor visibility changes (DECTCEM CSI ? 25 h/l).
 hooks.on("pty_cursor_visibility", "update_agent_cursor", function(info)
-    local agent = info.agent_key and Agent.find_by_agent_key(info.agent_key)
+    local agent = (info.session_uuid and Agent.get(info.session_uuid))
+        or (info.agent_key and Agent.find_by_agent_key(info.agent_key))
     if agent then
         agent.cursor_visible = info.visible
     end
@@ -483,16 +488,17 @@ _event_subs[#_event_subs + 1] = events.on("agent_status_changed", function(info)
 end)
 
 _event_subs[#_event_subs + 1] = events.on("process_exited", function(data)
-    local agent_key = data.agent_key
+    local session_uuid = data.session_uuid
     local exit_code = data.exit_code
     log.info(string.format("Process exited for %s (code=%s)",
-        agent_key or "?", tostring(exit_code)))
+        session_uuid or data.agent_key or "?", tostring(exit_code)))
 
-    local agent = Agent.find_by_agent_key(agent_key)
+    local agent = (session_uuid and Agent.get(session_uuid))
+        or (data.agent_key and Agent.find_by_agent_key(data.agent_key))
     if agent then
         agent:update({ status = "exited" })
         broadcast_hub_event("agent_status_changed", {
-            agent_id = agent_key,
+            agent_id = agent.session_uuid,
             status = "exited",
         })
     end

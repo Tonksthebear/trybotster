@@ -353,7 +353,7 @@ commands.register("move_agent_workspace", function(_client, _sub_id, command)
     end
 
     local Agent = require("lib.agent")
-    local session = Agent.get(session_id) or Agent.find_by_agent_key(session_id)
+    local session = Agent.get(session_id)
     if not session then
         log.warn(string.format("move_agent_workspace: session '%s' not found", tostring(session_id)))
         return
@@ -376,7 +376,7 @@ commands.register("move_agent_workspace", function(_client, _sub_id, command)
     connections.broadcast_workspace_list()
 
     log.info(string.format("Moved session %s to workspace %s (%s)",
-        session:agent_key(), moved.workspace_id, moved.workspace_name or "unnamed"))
+        session.session_uuid, moved.workspace_id, moved.workspace_name or "unnamed"))
 end, { description = "Move a live session to another workspace" })
 
 commands.register("update_session", function(_client, _sub_id, command)
@@ -387,7 +387,7 @@ commands.register("update_session", function(_client, _sub_id, command)
     end
 
     local Agent = require("lib.agent")
-    local session = Agent.get(session_id) or Agent.find_by_agent_key(session_id)
+    local session = Agent.get(session_id)
     if not session then
         log.warn(string.format("update_session: session '%s' not found", tostring(session_id)))
         return
@@ -404,7 +404,7 @@ commands.register("update_session", function(_client, _sub_id, command)
         connections.broadcast_hub_event("agent_list", {
             agents = Agent.all_info(),
         })
-        log.info(string.format("Session %s updated: %s", session:agent_key(),
+        log.info(string.format("Session %s updated: %s", session.session_uuid,
             table.concat((function()
                 local parts = {}
                 for k, v in pairs(fields) do parts[#parts + 1] = k .. "=" .. tostring(v) end

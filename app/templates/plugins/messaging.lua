@@ -61,7 +61,7 @@ mcp.tool("post_message", {
     if not target_agent_id and params.agent_label then
         for _, agent in ipairs(Agent.list()) do
             if agent.label == params.agent_label then
-                target_agent_id = agent:agent_key()
+                target_agent_id = agent.session_uuid
                 break
             end
         end
@@ -74,10 +74,10 @@ mcp.tool("post_message", {
     end
 
     -- Resolve sender display name: use label if available, else agent key
-    local sender_key = context.agent_key or "unknown"
+    local sender_key = context.session_uuid or context.agent_key or "unknown"
     local sender_display = sender_key
     if sender_key ~= "unknown" then
-        local sender = Agent.find_by_agent_key(sender_key)
+        local sender = Agent.get(sender_key)
         if sender and sender.label and sender.label ~= "" then
             sender_display = sender.label
         end
@@ -112,7 +112,7 @@ mcp.tool("receive_messages", {
         error("receive_messages: agent_id is not allowed; only the caller inbox can be drained")
     end
 
-    local caller_agent_id = context.agent_key
+    local caller_agent_id = context.session_uuid or context.agent_key
     if not caller_agent_id or caller_agent_id == "" then
         error("receive_messages: caller agent context is required")
     end

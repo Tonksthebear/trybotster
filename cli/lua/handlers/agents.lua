@@ -36,30 +36,6 @@ local function parse_issue_or_branch(issue_or_branch)
     end
 end
 
---- Build the agent key for duplicate checking.
--- @param repo string  "owner/repo"
--- @param branch_name string
--- @return string
-local function build_agent_key(repo, branch_name)
-    local repo_safe = repo:gsub("/", "-")
-    local branch_safe = branch_name:gsub("/", "-")
-    return repo_safe .. "-" .. branch_safe
-end
-
---- Find the next available agent key by appending a suffix if needed.
--- Uses Agent.find_by_agent_key to check for existing agents by key.
--- @param base_key string  The base agent key
--- @return string          An unused agent key
-local function next_available_key(base_key)
-    if not Agent.find_by_agent_key(base_key) then
-        return base_key
-    end
-    local i = 2
-    while Agent.find_by_agent_key(base_key .. "-" .. i) do
-        i = i + 1
-    end
-    return base_key .. "-" .. i
-end
 
 local function resolve_target(target, metadata)
     return TargetContext.resolve({
@@ -215,17 +191,16 @@ local spawn_accessory
 -- @param wt_path string        Worktree filesystem path
 -- @param prompt string          Task description
 -- @param client table|nil       Requesting client (for dimensions)
--- @param agent_key string       Pre-computed agent key for status broadcasts
 -- @param agent_name string      Agent name from config (e.g., "claude")
 -- @param metadata table|nil     Plugin metadata
 -- @param workspace_manifest table|nil  Workspace manifest { agents[], accessories[] }
 -- @param target table           Explicit target context
 -- @return Agent|nil             The created agent, or nil on error
 -- @return string|nil            Error message (nil on success)
-local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, agent_name, metadata, workspace_manifest, target)
+local function spawn_agent(branch_name, wt_path, prompt, client, agent_name, metadata, workspace_manifest, target)
     local resolved_target, target_err = resolve_target(target, metadata)
     if not resolved_target then
-        notify_lifecycle(agent_key, "failed", { error = tostring(target_err) })
+        notify_lifecycle(branch_name, "failed", { error = tostring(target_err) })
         return nil, tostring(target_err)
     end
 
@@ -233,7 +208,7 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, agen
     local repo_root = resolved_target.target_path
 
     -- Broadcast: spawning PTYs
-    notify_lifecycle(agent_key, "spawning_ptys")
+    notify_lifecycle(branch_name, "spawning_ptys")
 
     -- Resolve config across device + repo layers
     local device_root = config.data_dir and config.data_dir() or nil
@@ -245,7 +220,7 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, agen
         local msg = string.format("Config resolution failed for agent '%s': %s",
             tostring(agent_name), tostring(err))
         log.error(msg)
-        notify_lifecycle(agent_key, "failed", { error = tostring(err) })
+        notify_lifecycle(branch_name, "failed", { error = tostring(err) })
         return nil, msg
     end
 
@@ -312,7 +287,6 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, agen
         session_type = "agent",
         session = session_config,
         dims = dims,
-        agent_key = agent_key,
         agent_name = agent_name,
     })
 
@@ -320,7 +294,7 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, agen
         local msg = string.format("Failed to spawn agent for %s: %s",
             branch_name, tostring(agent))
         log.error(msg)
-        notify_lifecycle(agent_key, "failed", { error = tostring(agent) })
+        notify_lifecycle(branch_name, "failed", { error = tostring(agent) })
         return nil, msg
     end
 
@@ -332,15 +306,13 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_key, agen
         for _, acc_name in ipairs(workspace_manifest.accessories) do
             local acc_config = pick_accessory_config(resolved, acc_name)
             if acc_config then
-                local acc_base_key = build_agent_key(repo, branch_name) .. "-" .. acc_name
-                local acc_key = next_available_key(acc_base_key)
                 local acc_metadata = {
                     workspace = workspace_name,
                     workspace_id = workspace_id,
                 }
                 acc_metadata = TargetContext.with_metadata(acc_metadata, resolved_target)
                 spawn_accessory(
-                    branch_name, wt_path, acc_name, acc_key, agent_name, acc_metadata, resolved, resolved_target
+                    branch_name, wt_path, acc_name, agent_name, acc_metadata, resolved, resolved_target
                 )
             else
                 log.warn(string.format("Workspace accessory '%s' not found in config, skipping", acc_name))
@@ -356,14 +328,13 @@ end
 -- @param branch_name string
 -- @param wt_path string        Worktree filesystem path
 -- @param accessory_name string Accessory name from config (e.g., "rails-server")
--- @param agent_key string       Pre-computed agent key
 -- @param agent_name string      Agent name for config resolution
 -- @param metadata table|nil     Plugin metadata
 -- @param pre_resolved table|nil Already-resolved config (avoids re-resolving)
 -- @param target table           Explicit target context
 -- @return Accessory|nil
 -- @return string|nil
-spawn_accessory = function(branch_name, wt_path, accessory_name, agent_key, agent_name, metadata, pre_resolved, target)
+spawn_accessory = function(branch_name, wt_path, accessory_name, agent_name, metadata, pre_resolved, target)
     local resolved_target, target_err = resolve_target(target, metadata)
     if not resolved_target then
         return nil, tostring(target_err)
@@ -419,7 +390,6 @@ spawn_accessory = function(branch_name, wt_path, accessory_name, agent_key, agen
         workspace_id = workspace_id,
         workspace_expect_new = workspace_expect_new,
         dims = { rows = 24, cols = 80 },
-        agent_key = agent_key,
         agent_name = agent_name,
     })
 
@@ -497,12 +467,8 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
 
     -- Main repo mode: no issue_or_branch AND no from_worktree
     if not issue_or_branch and not from_worktree then
-        local repo = resolved_target.target_repo or repo_label_for_target(resolved_target)
-        local base_key = build_agent_key(repo, "main")
-        local suffix = Agent.next_instance_suffix(base_key)
-        local agent_key = base_key .. (suffix or "")
         return spawn_agent(
-            "main", resolved_target.target_path, prompt, client, agent_key, agent_name, metadata, workspace_manifest,
+            "main", resolved_target.target_path, prompt, client, agent_name, metadata, workspace_manifest,
             resolved_target
         )
     end
@@ -513,10 +479,6 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         prompt = nil
     end
 
-    local repo = resolved_target.target_repo or repo_label_for_target(resolved_target)
-    local agent_key = build_agent_key(repo, branch_name)
-    agent_key = next_available_key(agent_key)
-
     local target_inspection = inspect_target(resolved_target)
     local worktree_root = (target_inspection and target_inspection.repo_root) or resolved_target.target_path
 
@@ -524,7 +486,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     if not (target_inspection and target_inspection.is_git_repo) then
         log.info(string.format("No git repo — spawning %s directly in %s", branch_name, resolved_target.target_path))
         return spawn_agent(
-            branch_name, resolved_target.target_path, prompt, client, agent_key, agent_name, metadata,
+            branch_name, resolved_target.target_path, prompt, client, agent_name, metadata,
             workspace_manifest, resolved_target
         )
     end
@@ -556,7 +518,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     end
 
     if not wt_path then
-        notify_lifecycle(agent_key, "creating_worktree")
+        notify_lifecycle(branch_name, "creating_worktree")
         log.info(string.format("No worktree found for %s, queueing async creation...", branch_name))
 
         -- Stash workspace_manifest and agent_name in metadata so they survive
@@ -568,7 +530,6 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
 
         if target_uses_current_runtime(resolved_target) then
             worktree.create_async({
-                agent_key = agent_key,
                 branch = branch_name,
                 prompt = prompt,
                 metadata = async_metadata,
@@ -581,7 +542,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
 
         local ok, created_or_err = pcall(worktree.create_for_root, worktree_root, branch_name)
         if not ok then
-            notify_lifecycle(agent_key, "failed", { error = tostring(created_or_err) })
+            notify_lifecycle(branch_name, "failed", { error = tostring(created_or_err) })
             return nil, tostring(created_or_err)
         end
         wt_path = created_or_err
@@ -590,7 +551,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     end
 
     return spawn_agent(
-        branch_name, wt_path, prompt, client, agent_key, agent_name, metadata, workspace_manifest, resolved_target
+        branch_name, wt_path, prompt, client, agent_name, metadata, workspace_manifest, resolved_target
     )
 end
 
@@ -645,16 +606,12 @@ local function handle_create_accessory(workspace_id, workspace_name, accessory_n
         return nil, "target_path is required"
     end
 
-    local repo = resolved_target.target_repo or repo_label_for_target(resolved_target)
-    local base_key = build_agent_key(repo, branch_name) .. "-" .. accessory_name
-    local agent_key = next_available_key(base_key)
-
     metadata = TargetContext.with_metadata(metadata, resolved_target)
     metadata.workspace = workspace_name
     metadata.workspace_id = workspace_id
 
     return spawn_accessory(
-        branch_name, wt_path, accessory_name, agent_key, agent_name, metadata, nil, resolved_target
+        branch_name, wt_path, accessory_name, agent_name, metadata, nil, resolved_target
     )
 end
 
@@ -677,18 +634,14 @@ local function handle_delete_session(session_uuid, delete_worktree)
 
     local agent = Agent.get(session_uuid)
     if not agent then
-        -- Try lookup by agent_key for backward compat
-        agent = Agent.find_by_agent_key(session_uuid)
-        if not agent then
-            log.warn("Cannot delete unknown session: " .. tostring(session_uuid))
-            return false
-        end
+        log.warn("Cannot delete unknown session: " .. tostring(session_uuid))
+        return false
     end
 
-    local agent_key = agent:agent_key()
+    local uuid = agent.session_uuid
 
     -- Broadcast: stopping
-    notify_lifecycle(agent_key, "stopping")
+    notify_lifecycle(uuid, "stopping")
 
     -- Guard: skip worktree deletion if other agents are still running in it
     if delete_worktree then
@@ -696,7 +649,7 @@ local function handle_delete_session(session_uuid, delete_worktree)
         local still_running = {}
         for _, other in ipairs(Agent.list()) do
             if other.session_uuid ~= agent.session_uuid and other.worktree_path == wt_path then
-                still_running[#still_running + 1] = other:agent_key()
+                still_running[#still_running + 1] = other.session_uuid
             end
         end
         if #still_running > 0 then
@@ -711,11 +664,11 @@ local function handle_delete_session(session_uuid, delete_worktree)
     agent:close(delete_worktree)
 
     if delete_worktree then
-        notify_lifecycle(agent_key, "removing_worktree")
+        notify_lifecycle(uuid, "removing_worktree")
     end
 
     -- Notify via hooks
-    hooks.notify("agent_deleted", agent_key)
+    hooks.notify("agent_deleted", uuid)
 
     return true
 end
@@ -744,9 +697,9 @@ end
 local function notify_existing_agent(agent, text)
     if agent.session then
         agent.session:send_message(text)
-        log.info("Sent notification to existing agent: " .. agent:agent_key())
+        log.info("Sent notification to existing agent: " .. agent.session_uuid)
     else
-        log.warn("Cannot notify agent (no session): " .. agent:agent_key())
+        log.warn("Cannot notify agent (no session): " .. agent.session_uuid)
     end
 end
 
@@ -803,7 +756,7 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
             if #existing > 0 then
                 local notification = format_notification(message)
                 for _, agent in ipairs(existing) do
-                    log.info("Agent exists for " .. agent:agent_key() .. ", sending notification")
+                    log.info("Agent exists for " .. agent.session_uuid .. ", sending notification")
                     notify_existing_agent(agent, notification)
                 end
                 return
@@ -869,7 +822,6 @@ _event_subs[#_event_subs + 1] = events.on("worktree_created", function(info)
         path = info.path,
         branch = info.branch,
         repo = target and target.target_repo or nil,
-        agent_key = info.agent_key,
         metadata = info.metadata or {},
     })
 
@@ -887,7 +839,6 @@ _event_subs[#_event_subs + 1] = events.on("worktree_created", function(info)
         info.path,
         info.prompt,
         client,
-        info.agent_key,
         agent_name,
         metadata,
         workspace_manifest,
@@ -898,7 +849,7 @@ end)
 _event_subs[#_event_subs + 1] = events.on("worktree_create_failed", function(info)
     log.error(string.format("Async worktree creation failed for %s: %s",
         info.branch, info.error))
-    notify_lifecycle(info.agent_key, "failed", { error = info.error })
+    notify_lifecycle(info.branch or "unknown", "failed", { error = info.error })
 end)
 
 -- ============================================================================

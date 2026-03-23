@@ -93,7 +93,7 @@ end
 --   workspace_metadata table (optional)  plugin data stored on workspace manifest
 --   env             table    (optional)  base environment variables
 --   dims            table    (optional)  { rows = 24, cols = 80 }
---   agent_key       string   (optional)  display key (derived from repo+branch if not set)
+--   agent_key       string   (optional)  DEPRECATED — ignored, agent_key() now returns session_uuid
 --   agent_name      string   (optional)  config agent name (e.g., "claude")
 --   profile_name    string   (optional)  DEPRECATED alias for agent_name
 --
@@ -148,7 +148,6 @@ function Session._init(self, config)
     self.session_uuid = session_uuid
     self.session_type = session_type
     self.session_name = session_name
-    self._agent_key = config.agent_key
     self.repo = config.repo
     self.target_id = target.target_id
     self.target_path = target.target_path
@@ -402,7 +401,6 @@ function Session._init_recovered(self, config)
     self.session_uuid    = config.session_uuid
     self.session_type    = config.session_type or "agent"
     self.session_name    = config.session_name or self.session_type
-    self._agent_key      = config.agent_key
     self.repo            = config.repo or TargetContext.default_repo_label(recovered_target)
     self.target_id       = recovered_target.target_id
     self.target_path     = recovered_target.target_path
@@ -497,17 +495,12 @@ end
 -- Instance Methods
 -- =============================================================================
 
---- Generate the agent key (display label).
--- Format: repo-name-branch_name[-N] (slashes replaced with dashes)
--- @return string agent key
+--- DEPRECATED: Returns session_uuid.
+-- Kept as a transitional alias so callers that haven't migrated yet
+-- continue to compile. All new code should use session_uuid directly.
+-- @return string session_uuid
 function Session:agent_key()
-    if self._agent_key then
-        return self._agent_key
-    end
-    -- Fallback: derive from repo + branch_name
-    local repo_safe = self.repo:gsub("/", "-")
-    local branch_safe = self.branch_name:gsub("/", "-")
-    return repo_safe .. "-" .. branch_safe
+    return self.session_uuid
 end
 
 --- Update one or more session fields and sync the manifest.
@@ -899,7 +892,6 @@ function Session:build_env(base_env)
     if self.target_id then env.BOTSTER_TARGET_ID = self.target_id end
     if self.target_path then env.BOTSTER_TARGET_PATH = self.target_path end
     if self.target_repo then env.BOTSTER_TARGET_REPO = self.target_repo end
-    env.BOTSTER_AGENT_KEY = self:agent_key()
     env.BOTSTER_SESSION_UUID = self.session_uuid
     env.BOTSTER_HUB_ID = hub.server_id() or ""
     local local_hub_id = hub.hub_id and hub.hub_id() or nil
@@ -938,12 +930,10 @@ end
 -- Returns a serializable table of session info.
 -- @return table Session info
 function Session:info()
-    local key = self:agent_key()
-
     local port = self._port
 
     -- Build display name: prefer OSC title (set by running script), fall back to
-    -- agent_name (from config), then branch_name + suffix.
+    -- agent_name (from config), then branch_name.
     -- Label is a separate field — it does NOT override display_name.
     local display_name
     if self.title and self.title ~= "" then
@@ -952,17 +942,10 @@ function Session:info()
         display_name = self.agent_name
     else
         display_name = self.branch_name
-        local base_key = (function()
-            local repo_safe = self.repo:gsub("/", "-")
-            return repo_safe .. "-" .. self.branch_name:gsub("/", "-")
-        end)()
-        if #key > #base_key and key:sub(1, #base_key) == base_key then
-            display_name = self.branch_name .. key:sub(#base_key + 1)
-        end
     end
 
     return {
-        id = key,
+        id = self.session_uuid,
         session_uuid = self.session_uuid,
         session_type = self.session_type,
         session_name = self.session_name,
@@ -1003,12 +986,22 @@ function Session.get(session_uuid)
     return sessions[session_uuid]
 end
 
---- Find a session by its agent_key (display label).
--- @param key string Agent key
+--- DEPRECATED: Find a session by agent_key or session_uuid.
+-- Bridge: matches both session_uuid and derived repo-branch keys
+-- for backward compat during the agent_key→session_uuid migration.
+-- Will be deleted once all callers use Agent.get(session_uuid).
+-- @param key string Agent key or session UUID
 -- @return Session subclass instance or nil
 function Session.find_by_agent_key(key)
+    -- Fast path: direct session_uuid lookup
+    local direct = sessions[key]
+    if direct then return direct end
+    -- Slow path: match by derived repo-branch key (Rust events may still send these)
     for _, sess in ipairs(Session.list()) do
-        if sess:agent_key() == key then
+        local repo_safe = sess.repo:gsub("/", "-")
+        local branch_safe = sess.branch_name:gsub("/", "-")
+        local derived = repo_safe .. "-" .. branch_safe
+        if derived == key then
             return sess
         end
     end
@@ -1028,24 +1021,6 @@ function Session.list()
     return result
 end
 
---- Find all sessions matching a base key (ignoring instance suffix).
--- @param base_key string The base agent key (without instance suffix)
--- @return array of Session subclass instances
-function Session.find_by_base_key(base_key)
-    local result = {}
-    for _, sess in ipairs(Session.list()) do
-        local key = sess:agent_key()
-        if key == base_key then
-            result[#result + 1] = sess
-        elseif key:sub(1, #base_key + 1) == base_key .. "-" then
-            local suffix = key:sub(#base_key + 1)
-            if suffix:match("^%-(%d+)$") then
-                result[#result + 1] = sess
-            end
-        end
-    end
-    return result
-end
 
 --- Find sessions by metadata key-value pair.
 -- @param key string Metadata key to match
@@ -1075,26 +1050,6 @@ function Session.find_by_workspace(name, target)
     return result
 end
 
---- Compute the next available instance suffix for a base key.
--- @param base_key string The base agent key
--- @return string|nil The instance suffix (nil, "-2", "-3", ...)
-function Session.next_instance_suffix(base_key)
-    local existing = Session.find_by_base_key(base_key)
-    if #existing == 0 then
-        return nil
-    end
-    local max_n = 1
-    for _, sess in ipairs(existing) do
-        local agent_key = sess:agent_key()
-        if agent_key ~= base_key then
-            local n = tonumber(agent_key:sub(#base_key + 2))
-            if n and n > max_n then
-                max_n = n
-            end
-        end
-    end
-    return "-" .. tostring(max_n + 1)
-end
 
 --- Count active sessions.
 -- @return number

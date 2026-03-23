@@ -862,14 +862,9 @@ function M.migrate(data_dir)
             idx = idx + 1
         end
 
-        local repo_safe   = (ctx.repo or ""):gsub("/", "-")
-        local branch_safe = (ctx.branch_name or ""):gsub("/", "-")
-        local agent_key   = repo_safe .. "-" .. branch_safe
-
         local session_manifest = {
             uuid          = session_uuid,
             workspace_id  = workspace_id,
-            agent_key     = agent_key,
             type          = "agent",
             role          = "developer",
             repo          = ctx.repo,
