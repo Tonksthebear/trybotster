@@ -61,12 +61,22 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_select "[data-controller='agent-list']"
   end
 
-  test "show displays new agent button" do
+  test "show displays new session button" do
     sign_in @user
     get hub_path(@active_hub)
     assert_response :success
 
-    assert_select "[commandfor='new-agent-modal']"
+    assert_select "[commandfor='new-session-chooser-modal']"
+  end
+
+  test "show renders target-first new session chooser" do
+    sign_in @user
+    get hub_path(@active_hub)
+    assert_response :success
+
+    assert_select "[data-controller='new-session-chooser']"
+    assert_match "Choose spawn location first, then session type", response.body
+    assert_match "Spawn Target", response.body
   end
 
   test "show displays settings link" do

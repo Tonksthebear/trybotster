@@ -35,7 +35,7 @@ class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
   def clear_browser_storage
     return unless page.driver.browser.respond_to?(:execute_script)
 
-    # Clear crypto SharedWorker in-memory sessions + IndexedDB + localStorage.
+    # Clear crypto SharedWorker in-memory sessions + browser storage.
     # The SharedWorker persists across page navigations in the same browser.
     # Without clearing its in-memory sessions Map, hasSession() returns true
     # for hubs from previous tests, preventing "unpaired" state transitions.
@@ -45,8 +45,7 @@ class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
       localStorage.clear();
       sessionStorage.clear();
 
-      // Step 1: Tell SharedWorker to clear all sessions + close its IDB connection.
-      // Must complete BEFORE deleting IDB, otherwise deleteDatabase gets blocked.
+      // Step 1: Tell the SharedWorker to clear all in-memory sessions.
       function clearWorker() {
         return new Promise(function(resolve) {
           try {
@@ -61,7 +60,7 @@ class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
         });
       }
 
-      // Step 2: Delete IndexedDB databases (SharedWorker closed its connection in step 1).
+      // Step 2: Best-effort delete IndexedDB databases left by older builds.
       function clearIDB() {
         return new Promise(function(resolve) {
           try {

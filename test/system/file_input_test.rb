@@ -43,7 +43,7 @@ class FileInputTest < ApplicationSystemTestCase
     page.execute_script("document.body.insertAdjacentHTML('beforeend', '<input type=\"file\" id=\"test-file-input\">')")
     attach_file("test-file-input", fixture_path.to_s, make_visible: true)
 
-    # Send via TerminalConnection (not HubConnection — correct sub_id routing).
+    # Send via TerminalConnection (not HubTransport — correct sub_id routing).
     # Capybara's .drop() doesn't work here because Chrome's synthetic DragEvent
     # doesn't populate dataTransfer.files. We use attach_file + sendFile instead.
     result = page.driver.browser.execute_async_script(<<~JS, @hub.id.to_s, session_uuid)
