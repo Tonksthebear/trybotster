@@ -343,7 +343,7 @@ function Session._init(self, config)
     -- Register with HandleCache via hub.register_session()
     local reg_ok, reg_index = pcall(hub.register_session, session_uuid, handle, {
         session_type = session_type,
-        agent_key = key,
+        label = self.label or "",
         workspace_id = self._workspace_id,
         broker_session_id = broker_session_id,
     })
@@ -471,7 +471,7 @@ function Session._init_recovered(self, config)
     local reg_ok, reg_index = pcall(hub.register_session, self.session_uuid, config.handle, {
         session_type      = self.session_type,
         session_name      = self.session_name,
-        agent_key         = key,
+        label             = self.label or "",
         workspace_id      = self._workspace_id,
         broker_session_id = config.broker_session_id,
     })
@@ -730,7 +730,7 @@ function Session:move_to_workspace(opts)
         if sid then
             local ok_reg, reg_err = pcall(hub.register_session, self.session_uuid, self.session, {
                 session_type = self.session_type,
-                agent_key = self:agent_key(),
+                label = self.label or "",
                 workspace_id = workspace_id,
                 broker_session_id = sid,
             })

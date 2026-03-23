@@ -227,7 +227,6 @@ end
 -- Enrich raw PTY notifications from Rust with agent state, then re-dispatch.
 hooks.on("_pty_notification_raw", "enrich_and_dispatch", function(info)
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
-        or (info.agent_key and Agent.find_by_agent_key(info.agent_key))
     info.already_notified = agent and agent.notification or false
 
     -- Check if any client is actively viewing this session
@@ -247,7 +246,6 @@ hooks.on("pty_notification", "push_notification", function(info)
 
     local hub_id = hub.server_id()
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
-        or (info.agent_key and Agent.find_by_agent_key(info.agent_key))
 
     -- Build deep link using session_uuid
     local url = nil
@@ -329,7 +327,6 @@ end
 -- Update agent title when the running program sets the terminal title (OSC 0/2).
 hooks.on("pty_title_changed", "update_agent_title", function(info)
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
-        or (info.agent_key and Agent.find_by_agent_key(info.agent_key))
     if agent then
         if agent.title ~= info.title then
             agent:update({ title = info.title })
@@ -341,7 +338,6 @@ end)
 -- Update agent CWD when the shell reports a directory change (OSC 7).
 hooks.on("pty_cwd_changed", "update_agent_cwd", function(info)
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
-        or (info.agent_key and Agent.find_by_agent_key(info.agent_key))
     if agent then
         if agent.cwd ~= info.cwd then
             agent:update({ cwd = info.cwd })
@@ -370,7 +366,6 @@ end)
 -- Track shell integration prompt marks (OSC 133/633).
 hooks.on("pty_prompt", "update_agent_prompt", function(info)
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
-        or (info.agent_key and Agent.find_by_agent_key(info.agent_key))
     if agent then
         agent.last_prompt_mark = info
     end
@@ -379,7 +374,6 @@ end)
 -- Track cursor visibility changes (DECTCEM CSI ? 25 h/l).
 hooks.on("pty_cursor_visibility", "update_agent_cursor", function(info)
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
-        or (info.agent_key and Agent.find_by_agent_key(info.agent_key))
     if agent then
         agent.cursor_visible = info.visible
     end
@@ -494,7 +488,6 @@ _event_subs[#_event_subs + 1] = events.on("process_exited", function(data)
         session_uuid or data.agent_key or "?", tostring(exit_code)))
 
     local agent = (session_uuid and Agent.get(session_uuid))
-        or (data.agent_key and Agent.find_by_agent_key(data.agent_key))
     if agent then
         agent:update({ status = "exited" })
         broadcast_hub_event("agent_status_changed", {
