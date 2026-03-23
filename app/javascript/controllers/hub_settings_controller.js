@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { HubConnectionManager, HubConnection } from "connections";
+import { HubManager } from "connections";
 
 /**
  * Hub Settings Controller
@@ -23,6 +23,9 @@ export default class extends Controller {
 
   static targets = [
     "tabPanel",
+    "repoTargetPanel",
+    "repoTargetSelect",
+    "repoTargetHint",
     "treePanel",
     "treeContainer",
     "treeFeedback",
@@ -65,15 +68,25 @@ export default class extends Controller {
     this.configScope = "repo";       // "repo" or "device"
     this.deviceTree = null;           // cached device tree
     this.repoTree = null;             // cached repo tree
+    this.spawnTargets = [];
+    this.selectedTargetId = null;
 
-    HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
-      hubId: this.hubIdValue,
-    }).then((hub) => {
+    HubManager.acquire(this.hubIdValue).then((hub) => {
       this.hub = hub;
+      this.spawnTargets = Array.isArray(hub.spawnTargets) ? hub.spawnTargets : [];
+      if (!this.spawnTargets.some((target) => target.id === this.selectedTargetId)) {
+        this.selectedTargetId = this.spawnTargets.length === 1 ? this.spawnTargets[0].id : null;
+      }
+      this.#renderRepoTargetOptions();
 
       this.unsubscribers.push(
-        this.hub.onConnected(() => {
-          this.scanTree();
+        this.hub.onSpawnTargetList((targets) => {
+          this.spawnTargets = Array.isArray(targets) ? targets : [];
+          if (!this.spawnTargets.some((target) => target.id === this.selectedTargetId)) {
+            this.selectedTargetId = this.spawnTargets.length === 1 ? this.spawnTargets[0].id : null;
+          }
+          this.#renderRepoTargetOptions();
+          if (this.configScope === "repo") this.scanTree();
         }),
       );
 
@@ -83,6 +96,7 @@ export default class extends Controller {
           this.treePanelTarget.dataset.view = "disconnected";
         }),
       );
+      this.scanTree();
     });
   }
 
@@ -122,6 +136,7 @@ export default class extends Controller {
     if (!scope || scope === this.configScope) return;
 
     this.configScope = scope;
+    this.#renderRepoTargetOptions();
 
     // Toggle scope button active state
     this.element.querySelectorAll("[data-config-scope]").forEach((btn) => {
@@ -144,6 +159,17 @@ export default class extends Controller {
     }
   }
 
+  selectRepoTarget(event) {
+    this.selectedTargetId = event.currentTarget.value || null;
+    this.repoTree = null;
+    this.currentFilePath = null;
+    this.originalContent = null;
+    this.editorPanelTarget.dataset.editor = "empty";
+    this.editorTitleTarget.textContent = "Select a file";
+    this.#renderRepoTargetOptions();
+    if (this.configScope === "repo") this.scanTree();
+  }
+
   async selectFile(event) {
     const filePath = event.currentTarget.dataset.filePath;
     if (!filePath || !this.hub) return;
@@ -153,7 +179,7 @@ export default class extends Controller {
 
     const fsScope = this.#fsScope();
     try {
-      const stat = await this.hub.statFile(filePath, fsScope);
+      const stat = await this.hub.statFile(filePath, fsScope, this.#targetId());
       if (!this.hub) return;
       if (stat.exists) {
         await this.#loadFileContent(filePath);
@@ -174,7 +200,7 @@ export default class extends Controller {
     this.saveBtnTarget.textContent = "Saving...";
 
     try {
-      await this.hub.writeFile(this.currentFilePath, content, this.#fsScope());
+      await this.hub.writeFile(this.currentFilePath, content, this.#fsScope(), this.#targetId());
       this.originalContent = content;
       this.#updateDirtyState();
       this.saveBtnTarget.textContent = "Saved";
@@ -207,9 +233,9 @@ export default class extends Controller {
 
     try {
       const parentDir = this.currentFilePath.replace(/\/[^/]+$/, "");
-      await this.hub.mkDir(parentDir, fsScope).catch(() => {});
+      await this.hub.mkDir(parentDir, fsScope, this.#targetId()).catch(() => {});
 
-      await this.hub.writeFile(this.currentFilePath, content, fsScope);
+      await this.hub.writeFile(this.currentFilePath, content, fsScope, this.#targetId());
       this.originalContent = content;
       this.editorPanelTarget.dataset.editor = "editing";
       this.scanTree();
@@ -232,7 +258,7 @@ export default class extends Controller {
     this.deleteBtnTarget.textContent = "Deleting...";
 
     try {
-      await this.hub.deleteFile(this.currentFilePath, this.#fsScope());
+      await this.hub.deleteFile(this.currentFilePath, this.#fsScope(), this.#targetId());
       this.#showCreateState(this.currentFilePath);
       this.scanTree();
     } catch (error) {
@@ -260,7 +286,7 @@ export default class extends Controller {
     this.renameBtnTarget.textContent = "Renaming...";
 
     try {
-      await this.hub.renameFile(this.currentFilePath, newPath, this.#fsScope());
+      await this.hub.renameFile(this.currentFilePath, newPath, this.#fsScope(), this.#targetId());
       this.currentFilePath = newPath;
       this.editorTitleTarget.textContent = newPath;
       await this.scanTree();
@@ -287,10 +313,10 @@ export default class extends Controller {
     try {
       if (checked) {
         const parentDir = filePath.replace(/\/[^/]+$/, "");
-        await this.hub.mkDir(parentDir, fsScope).catch(() => {});
-        await this.hub.writeFile(filePath, "", fsScope);
+        await this.hub.mkDir(parentDir, fsScope, this.#targetId()).catch(() => {});
+        await this.hub.writeFile(filePath, "", fsScope, this.#targetId());
       } else {
-        await this.hub.deleteFile(filePath, fsScope);
+        await this.hub.deleteFile(filePath, fsScope, this.#targetId());
       }
       this.scanTree();
     } catch (error) {
@@ -312,9 +338,9 @@ export default class extends Controller {
     if (!name) return;
 
     try {
-      await this.hub.mkDir(`${prefix}agents/${name}`, fsScope);
+      await this.hub.mkDir(`${prefix}agents/${name}`, fsScope, this.#targetId());
       const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
-      await this.hub.writeFile(`${prefix}agents/${name}/initialization`, defaultInit, fsScope);
+      await this.hub.writeFile(`${prefix}agents/${name}/initialization`, defaultInit, fsScope, this.#targetId());
       await this.scanTree();
       this.#scrollToSection(`agents-${name}`);
     } catch (error) {
@@ -336,7 +362,7 @@ export default class extends Controller {
     const prefix = this.#configPrefix();
 
     try {
-      await this.hub.rmDir(`${prefix}agents/${agentName}`, fsScope);
+      await this.hub.rmDir(`${prefix}agents/${agentName}`, fsScope, this.#targetId());
       if (this.currentFilePath?.includes(`/agents/${agentName}/`)) {
         this.currentFilePath = null;
         this.originalContent = null;
@@ -362,9 +388,9 @@ export default class extends Controller {
     if (!name) return;
 
     try {
-      await this.hub.mkDir(`${prefix}accessories/${name}`, fsScope);
+      await this.hub.mkDir(`${prefix}accessories/${name}`, fsScope, this.#targetId());
       const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
-      await this.hub.writeFile(`${prefix}accessories/${name}/initialization`, defaultInit, fsScope);
+      await this.hub.writeFile(`${prefix}accessories/${name}/initialization`, defaultInit, fsScope, this.#targetId());
       await this.scanTree();
       this.#scrollToSection(`accessories-${name}`);
     } catch (error) {
@@ -386,7 +412,7 @@ export default class extends Controller {
     const prefix = this.#configPrefix();
 
     try {
-      await this.hub.rmDir(`${prefix}accessories/${accessoryName}`, fsScope);
+      await this.hub.rmDir(`${prefix}accessories/${accessoryName}`, fsScope, this.#targetId());
       if (this.currentFilePath?.includes(`/accessories/${accessoryName}/`)) {
         this.currentFilePath = null;
         this.originalContent = null;
@@ -416,8 +442,8 @@ export default class extends Controller {
         await this.hub.mkDir(parentDir, "device");
         await this.hub.writeFile(dest, content, "device");
       } else {
-        await this.hub.mkDir(`.botster/${parentDir}`);
-        await this.hub.writeFile(`.botster/${dest}`, content);
+        await this.hub.mkDir(`.botster/${parentDir}`, "repo", this.#targetId());
+        await this.hub.writeFile(`.botster/${dest}`, content, "repo", this.#targetId());
       }
 
       this.scanTree();
@@ -442,7 +468,15 @@ export default class extends Controller {
     }
 
     const scope = this.configScope;
-    const fsScope = scope === "device" ? "device" : undefined;
+    const fsScope = scope === "device" ? "device" : "repo";
+
+    if (scope === "repo" && !this.#targetId()) {
+      this.treeFeedbackTarget.textContent = this.spawnTargets.length === 0
+        ? "Add a spawn target first to edit target-local configuration."
+        : "Select a spawn target to edit target-local configuration.";
+      this.treePanelTarget.dataset.view = "loading";
+      return;
+    }
 
     try {
       const tree = { agents: {}, accessories: {}, workspaces: {}, plugins: {} };
@@ -452,10 +486,10 @@ export default class extends Controller {
       if (scope === "device") {
         // Device scope: check if agents/ or any config dir exists
         const [agentsStat, accessoriesStat, pluginsStat, workspacesStat] = await Promise.all([
-          this.hub.statFile("agents", fsScope).catch(() => ({ exists: false })),
-          this.hub.statFile("accessories", fsScope).catch(() => ({ exists: false })),
-          this.hub.statFile("plugins", fsScope).catch(() => ({ exists: false })),
-          this.hub.statFile("workspaces", fsScope).catch(() => ({ exists: false })),
+          this.hub.statFile("agents", fsScope, this.#targetId()).catch(() => ({ exists: false })),
+          this.hub.statFile("accessories", fsScope, this.#targetId()).catch(() => ({ exists: false })),
+          this.hub.statFile("plugins", fsScope, this.#targetId()).catch(() => ({ exists: false })),
+          this.hub.statFile("workspaces", fsScope, this.#targetId()).catch(() => ({ exists: false })),
         ]);
         if (!agentsStat.exists && !accessoriesStat.exists && !pluginsStat.exists && !workspacesStat.exists) {
           this.treePanelTarget.dataset.view = "empty";
@@ -463,7 +497,7 @@ export default class extends Controller {
         }
       } else {
         // Repo scope: check .botster/ exists
-        const botsterStat = await this.hub.statFile(".botster").catch(() => ({ exists: false }));
+        const botsterStat = await this.hub.statFile(".botster", fsScope, this.#targetId()).catch(() => ({ exists: false }));
         if (!botsterStat.exists) {
           this.treePanelTarget.dataset.view = "empty";
           return;
@@ -482,7 +516,7 @@ export default class extends Controller {
       await Promise.all(
         agentNames.map(async (name) => {
           const agentPath = `${prefix}agents/${name}`;
-          const initStat = await this.hub.statFile(`${agentPath}/initialization`, fsScope).catch(() => ({ exists: false }));
+          const initStat = await this.hub.statFile(`${agentPath}/initialization`, fsScope, this.#targetId()).catch(() => ({ exists: false }));
           tree.agents[name] = { initialization: initStat.exists };
         }),
       );
@@ -492,8 +526,8 @@ export default class extends Controller {
         accessoryNames.map(async (name) => {
           const accPath = `${prefix}accessories/${name}`;
           const [initStat, pfStat] = await Promise.all([
-            this.hub.statFile(`${accPath}/initialization`, fsScope).catch(() => ({ exists: false })),
-            this.hub.statFile(`${accPath}/port_forward`, fsScope).catch(() => ({ exists: false })),
+            this.hub.statFile(`${accPath}/initialization`, fsScope, this.#targetId()).catch(() => ({ exists: false })),
+            this.hub.statFile(`${accPath}/port_forward`, fsScope, this.#targetId()).catch(() => ({ exists: false })),
           ]);
           tree.accessories[name] = { initialization: initStat.exists, port_forward: pfStat.exists };
         }),
@@ -507,7 +541,7 @@ export default class extends Controller {
       // Scan plugins (only include plugins that have init.lua)
       await Promise.all(
         pluginNames.map(async (name) => {
-          const initStat = await this.hub.statFile(`${prefix}plugins/${name}/init.lua`, fsScope).catch(() => ({ exists: false }));
+          const initStat = await this.hub.statFile(`${prefix}plugins/${name}/init.lua`, fsScope, this.#targetId()).catch(() => ({ exists: false }));
           if (initStat.exists) {
             tree.plugins[name] = { init: true };
           }
@@ -532,7 +566,7 @@ export default class extends Controller {
 
   async #listDirs(path, fsScope) {
     try {
-      const result = await this.hub.listDir(path, fsScope);
+      const result = await this.hub.listDir(path, fsScope, this.#targetId());
       return (result.entries || [])
         .filter((e) => e.type === "dir")
         .map((e) => e.name)
@@ -544,7 +578,7 @@ export default class extends Controller {
 
   async #listFiles(path, fsScope, ext) {
     try {
-      const result = await this.hub.listDir(path, fsScope);
+      const result = await this.hub.listDir(path, fsScope, this.#targetId());
       return (result.entries || [])
         .filter((e) => e.type === "file" && (!ext || e.name.endsWith(ext)))
         .map((e) => e.name)
@@ -568,10 +602,9 @@ export default class extends Controller {
         const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
         await this.hub.writeFile("agents/claude/initialization", defaultInit, fsScope);
       } else {
-        // Repo: create .botster/agents/claude/
-        await this.hub.mkDir(".botster/agents/claude");
+        await this.hub.mkDir(".botster/agents/claude", "repo", this.#targetId());
         const defaultInit = this.configMetadataValue?.session_files?.initialization?.default || "#!/bin/bash\n";
-        await this.hub.writeFile(".botster/agents/claude/initialization", defaultInit);
+        await this.hub.writeFile(".botster/agents/claude/initialization", defaultInit, "repo", this.#targetId());
       }
       this.scanTree();
     } catch (error) {
@@ -727,7 +760,7 @@ export default class extends Controller {
     this.editorPanelTarget.dataset.editor = "loading";
 
     try {
-      const result = await this.hub.readFile(filePath, this.#fsScope());
+      const result = await this.hub.readFile(filePath, this.#fsScope(), this.#targetId());
       if (!this.hub) return;
       this.originalContent = result.content;
       this.editorTarget.value = result.content;
@@ -892,7 +925,46 @@ export default class extends Controller {
 
   /** Return the fs scope string to pass to hub methods. */
   #fsScope() {
-    return this.configScope === "device" ? "device" : undefined;
+    return this.configScope === "device" ? "device" : "repo";
+  }
+
+  #targetId() {
+    return this.configScope === "repo" ? this.selectedTargetId : undefined;
+  }
+
+  #renderRepoTargetOptions() {
+    if (!this.hasRepoTargetPanelTarget || !this.hasRepoTargetSelectTarget) return;
+
+    const repoScope = this.configScope === "repo";
+    this.repoTargetPanelTarget.classList.toggle("hidden", !repoScope);
+
+    const select = this.repoTargetSelectTarget;
+    select.innerHTML = "";
+
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = this.spawnTargets.length === 0
+      ? "No admitted spawn targets"
+      : "Choose a spawn target";
+    select.appendChild(placeholder);
+
+    this.spawnTargets.forEach((target) => {
+      const option = document.createElement("option");
+      option.value = target.id;
+      option.textContent = target.name || target.path || target.id;
+      select.appendChild(option);
+    });
+
+    select.value = this.selectedTargetId || "";
+    select.disabled = this.spawnTargets.length === 0;
+
+    if (this.hasRepoTargetHintTarget) {
+      this.repoTargetHintTarget.textContent = this.selectedTargetId
+        ? this.spawnTargets.find((target) => target.id === this.selectedTargetId)?.path || ""
+        : (this.spawnTargets.length === 0
+          ? "Add a spawn target from the device page before editing target-local .botster files."
+          : "Target-local .botster editing is locked to the selected admitted spawn target.");
+    }
   }
 
   #capitalize(str) {

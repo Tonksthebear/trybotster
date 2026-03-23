@@ -1,5 +1,5 @@
 /**
- * HubConnection - Typed wrapper for hub control plane.
+ * HubTransport - Typed wrapper for hub control plane.
  *
  * Manages:
  *   - Agent lifecycle (list, create, select, delete)
@@ -24,15 +24,30 @@
  *   - agentConfig - { agents, accessories, workspaces }
  *
  * Usage:
- *   const hub = await HubConnectionManager.acquire(HubConnection, hubId, { hubId });
- *   hub.on("agentList", (agents) => render(agents));
- *   hub.on("connected", () => hub.requestAgents());
- *   hub.requestAgents();
+ *   const transport = await HubConnectionManager.acquire(HubTransport, hubId, { hubId });
+ *   transport.on("agentList", (agents) => render(agents));
+ *   transport.on("connected", () => transport.requestAgents());
+ *   transport.requestAgents();
  */
 
 import { HubRoute } from "connections/hub_route";
 
-export class HubConnection extends HubRoute {
+export class HubTransport extends HubRoute {
+  constructor(key, options, manager) {
+    super(key, options, manager);
+    this._agents = [];
+    this._hubWorkspaces = [];
+    this._openWorkspaces = [];
+    this._spawnTargets = [];
+    this._hubRecoveryState = null;
+
+    this._hasAgentListSnapshot = false;
+    this._hasHubWorkspaceListSnapshot = false;
+    this._hasOpenWorkspaceListSnapshot = false;
+    this._hasSpawnTargetListSnapshot = false;
+    this._hasHubRecoveryStateSnapshot = false;
+  }
+
   // ========== Connection overrides ==========
 
   channelName() {
@@ -69,7 +84,12 @@ export class HubConnection extends HubRoute {
         // Handle Lua's empty table {} serializing as object instead of array
         const agents = Array.isArray(message.agents) ? message.agents : [];
         const workspaces = Array.isArray(message.workspaces) ? message.workspaces : [];
+        this._agents = agents;
+        this._openWorkspaces = workspaces;
+        this._hasAgentListSnapshot = true;
+        this._hasOpenWorkspaceListSnapshot = true;
         this.emit("agentList", agents);
+        this.emit("openWorkspaceList", workspaces);
         this.emit("workspaceList", workspaces);
         // Sync app badge with notification count from agent list
         this.#updateAppBadge(agents);
@@ -79,11 +99,36 @@ export class HubConnection extends HubRoute {
       case "worktrees":
       case "worktree_list":
         // Handle Lua's empty table {} serializing as object instead of array
-        this.emit("worktreeList", Array.isArray(message.worktrees) ? message.worktrees : []);
+        this.emit("worktreeList", {
+          targetId: message.target_id || null,
+          worktrees: Array.isArray(message.worktrees) ? message.worktrees : [],
+        });
         break;
 
       case "workspace_list":
-        this.emit("workspaceList", Array.isArray(message.workspaces) ? message.workspaces : []);
+        this._hubWorkspaces = Array.isArray(message.workspaces) ? message.workspaces : [];
+        this._hasHubWorkspaceListSnapshot = true;
+        this.emit("hubWorkspaceList", this._hubWorkspaces);
+        this.emit("workspaceList", this._hubWorkspaces);
+        break;
+
+      case "open_workspace_list":
+        this._openWorkspaces = Array.isArray(message.workspaces) ? message.workspaces : [];
+        this._hasOpenWorkspaceListSnapshot = true;
+        this.emit("openWorkspaceList", this._openWorkspaces);
+        break;
+
+      case "spawn_target_list":
+        this._spawnTargets = Array.isArray(message.targets) ? message.targets : [];
+        this._hasSpawnTargetListSnapshot = true;
+        this.emit("spawnTargetList", this._spawnTargets);
+        break;
+
+      case "spawn_target_feedback":
+        this.emit("spawnTargetFeedback", {
+          tone: message.tone || "neutral",
+          message: message.message || "",
+        });
         break;
 
       case "agent_created":
@@ -99,6 +144,8 @@ export class HubConnection extends HubRoute {
         break;
 
       case "hub_recovery_state":
+        this._hubRecoveryState = message;
+        this._hasHubRecoveryStateSnapshot = true;
         this.emit("hubRecoveryState", message);
         if (message.state === "ready") this.emit("hubReady", message);
         break;
@@ -109,6 +156,7 @@ export class HubConnection extends HubRoute {
 
       case "agent_config":
         this.emit("agentConfig", {
+          targetId: message.target_id || null,
           agents: Array.isArray(message.agents) ? message.agents : [],
           accessories: Array.isArray(message.accessories) ? message.accessories : [],
           workspaces: Array.isArray(message.workspaces) ? message.workspaces : [],
@@ -141,6 +189,46 @@ export class HubConnection extends HubRoute {
 
   // ========== Hub Commands ==========
 
+  hasAgentListSnapshot() {
+    return this._hasAgentListSnapshot;
+  }
+
+  hasHubWorkspaceListSnapshot() {
+    return this._hasHubWorkspaceListSnapshot;
+  }
+
+  hasOpenWorkspaceListSnapshot() {
+    return this._hasOpenWorkspaceListSnapshot;
+  }
+
+  hasSpawnTargetListSnapshot() {
+    return this._hasSpawnTargetListSnapshot;
+  }
+
+  hasHubRecoveryStateSnapshot() {
+    return this._hasHubRecoveryStateSnapshot;
+  }
+
+  getAgents() {
+    return this._agents;
+  }
+
+  getHubWorkspaces() {
+    return this._hubWorkspaces;
+  }
+
+  getOpenWorkspaces() {
+    return this._openWorkspaces;
+  }
+
+  getSpawnTargets() {
+    return this._spawnTargets;
+  }
+
+  getHubRecoveryState() {
+    return this._hubRecoveryState;
+  }
+
   /**
    * Request list of agents from CLI.
    */
@@ -151,8 +239,8 @@ export class HubConnection extends HubRoute {
   /**
    * Request list of worktrees from CLI.
    */
-  requestWorktrees() {
-    return this.send("list_worktrees");
+  requestWorktrees(targetId) {
+    return this.send("list_worktrees", { target_id: targetId });
   }
 
   /**
@@ -160,6 +248,13 @@ export class HubConnection extends HubRoute {
    */
   requestWorkspaces() {
     return this.send("list_workspaces");
+  }
+
+  /**
+   * Request currently open workspaces from CLI.
+   */
+  requestOpenWorkspaces() {
+    return this.send("list_open_workspaces");
   }
 
   /**
@@ -230,19 +325,49 @@ export class HubConnection extends HubRoute {
    * @param {string|null} workspaceId - Existing workspace ID
    * @param {string|null} workspaceName - Workspace name (for creation or display)
    */
-  createAccessory(accessoryName, workspaceId = null, workspaceName = null) {
+  createAccessory(
+    accessoryName,
+    workspaceId = null,
+    workspaceName = null,
+    targetId = null,
+  ) {
     return this.send("create_accessory", {
       accessory_name: accessoryName,
       workspace_id: workspaceId,
       workspace_name: workspaceName,
+      target_id: targetId,
     });
   }
 
   /**
    * Request agent/accessory/workspace config from CLI.
    */
-  requestAgentConfig() {
-    return this.send("list_configs");
+  requestAgentConfig(targetId) {
+    return this.send("list_configs", { target_id: targetId });
+  }
+
+  /**
+   * Request admitted spawn targets from CLI.
+   */
+  requestSpawnTargets() {
+    return this.send("list_spawn_targets");
+  }
+
+  /**
+   * Admit a directory as a spawn target.
+   * @param {string} path
+   * @param {string|null} name
+   */
+  addSpawnTarget(path, name = null) {
+    return this.send("add_spawn_target", { path, name });
+  }
+
+  /**
+   * Remove an admitted spawn target.
+   * @param {string} targetId
+   */
+  removeSpawnTarget(targetId) {
+    return this.send("remove_spawn_target", { target_id: targetId });
   }
 
   /**
@@ -319,36 +444,43 @@ export class HubConnection extends HubRoute {
     });
   }
 
-  readFile(path, scope) {
-    return this.fsRequest("fs:read", { path, scope });
+  readFile(path, scope, targetId) {
+    return this.fsRequest("fs:read", { path, scope, target_id: targetId });
   }
 
-  writeFile(path, content, scope) {
-    return this.fsRequest("fs:write", { path, content, scope });
+  writeFile(path, content, scope, targetId) {
+    return this.fsRequest("fs:write", { path, content, scope, target_id: targetId });
   }
 
-  listDir(path = ".", scope) {
-    return this.fsRequest("fs:list", { path, scope });
+  listDir(path = ".", scope, targetId) {
+    return this.fsRequest("fs:list", { path, scope, target_id: targetId });
   }
 
-  statFile(path, scope) {
-    return this.fsRequest("fs:stat", { path, scope });
+  browseHostDir(path = "", directoriesOnly = true) {
+    return this.fsRequest("fs:browse", {
+      path,
+      directories_only: directoriesOnly,
+    });
   }
 
-  deleteFile(path, scope) {
-    return this.fsRequest("fs:delete", { path, scope });
+  statFile(path, scope, targetId) {
+    return this.fsRequest("fs:stat", { path, scope, target_id: targetId });
   }
 
-  mkDir(path, scope) {
-    return this.fsRequest("fs:mkdir", { path, scope });
+  deleteFile(path, scope, targetId) {
+    return this.fsRequest("fs:delete", { path, scope, target_id: targetId });
   }
 
-  rmDir(path, scope) {
-    return this.fsRequest("fs:rmdir", { path, scope });
+  mkDir(path, scope, targetId) {
+    return this.fsRequest("fs:mkdir", { path, scope, target_id: targetId });
   }
 
-  renameFile(fromPath, toPath, scope) {
-    return this.fsRequest("fs:rename", { from_path: fromPath, to_path: toPath, scope });
+  rmDir(path, scope, targetId) {
+    return this.fsRequest("fs:rmdir", { path, scope, target_id: targetId });
+  }
+
+  renameFile(fromPath, toPath, scope, targetId) {
+    return this.fsRequest("fs:rename", { from_path: fromPath, to_path: toPath, scope, target_id: targetId });
   }
 
   // ========== Template API ==========
@@ -373,24 +505,24 @@ export class HubConnection extends HubRoute {
     });
   }
 
-  installTemplate(dest, content, scope) {
-    return this.templateRequest("template:install", { dest, content, scope });
+  installTemplate(dest, content, scope, targetId) {
+    return this.templateRequest("template:install", { dest, content, scope, target_id: targetId });
   }
 
-  uninstallTemplate(dest, scope) {
-    return this.templateRequest("template:uninstall", { dest, scope });
+  uninstallTemplate(dest, scope, targetId) {
+    return this.templateRequest("template:uninstall", { dest, scope, target_id: targetId });
   }
 
-  listInstalledTemplates() {
-    return this.templateRequest("template:list");
+  listInstalledTemplates(targetId) {
+    return this.templateRequest("template:list", { target_id: targetId, scope: targetId ? "repo" : undefined });
   }
 
-  reloadPlugin(pluginName) {
-    return this.templateRequest("plugin:reload", { plugin_name: pluginName });
+  reloadPlugin(pluginName, targetId) {
+    return this.templateRequest("plugin:reload", { plugin_name: pluginName, target_id: targetId });
   }
 
-  loadPlugin(pluginName) {
-    return this.templateRequest("plugin:load", { plugin_name: pluginName });
+  loadPlugin(pluginName, targetId) {
+    return this.templateRequest("plugin:load", { plugin_name: pluginName, target_id: targetId });
   }
 
   // ========== Convenience event helpers ==========
@@ -408,6 +540,13 @@ export class HubConnection extends HubRoute {
    */
   onWorkspaceList(callback) {
     return this.on("workspaceList", callback);
+  }
+
+  /**
+   * Subscribe to open workspace list updates.
+   */
+  onOpenWorkspaceList(callback) {
+    return this.on("openWorkspaceList", callback);
   }
 
   /**

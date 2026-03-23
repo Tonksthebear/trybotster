@@ -1,10 +1,10 @@
 import { Controller } from "@hotwired/stimulus";
-import { HubConnectionManager, HubConnection } from "connections";
+import { HubManager } from "connections";
 
 /**
  * Delete Agent Modal Controller
  *
- * Minimal controller that acquires HubConnection to send delete commands.
+ * Minimal controller that acquires Hub to send delete commands.
  * Agent ID is stored on the modal element via data-agent-id (set by opener).
  * When in_worktree is false, the "delete worktree" option is hidden.
  */
@@ -17,9 +17,7 @@ export default class extends Controller {
   connect() {
     if (!this.hubIdValue) return;
 
-    this.#hubReady = HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
-      hubId: this.hubIdValue,
-    }).then((hub) => {
+    this.#hubReady = HubManager.acquire(this.hubIdValue).then((hub) => {
       this.hub = hub;
       return hub;
     });

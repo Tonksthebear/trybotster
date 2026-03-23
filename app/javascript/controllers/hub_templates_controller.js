@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { HubConnectionManager, HubConnection } from "connections";
+import { HubManager } from "connections";
 
 /**
  * Hub Templates Controller
@@ -20,6 +20,9 @@ export default class extends Controller {
     "catalog",
     "card",
     "badge",
+    "repoTargetPanel",
+    "repoTargetSelect",
+    "repoTargetHint",
     "previewPanel",
     "installBtn",
     "scopeBtn",
@@ -36,14 +39,31 @@ export default class extends Controller {
     this.unsubscribers = [];
     this.installedDevice = new Set();  // plugin names installed at device scope
     this.installedRepo = new Set();    // plugin names installed at repo scope
+    this.spawnTargets = [];
+    this.selectedTargetId = null;
+    this.targetsLoaded = false;
+    this.installedStateLoaded = false;
+    this.installStateToken = 0;
 
-    HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
-      hubId: this.hubIdValue,
-    }).then((hub) => {
+    HubManager.acquire(this.hubIdValue).then((hub) => {
       this.hub = hub;
+      this.spawnTargets = Array.isArray(hub.spawnTargets) ? hub.spawnTargets : [];
+      if (!this.spawnTargets.some((target) => target.id === this.selectedTargetId)) {
+        this.selectedTargetId = this.spawnTargets.length === 1 ? this.spawnTargets[0].id : null;
+      }
+      this.targetsLoaded = this.spawnTargets.length > 0;
+      this.#renderRepoTargetOptions();
 
       this.unsubscribers.push(
-        this.hub.onConnected(() => this.#checkInstalled()),
+        this.hub.onSpawnTargetList((targets) => {
+          this.spawnTargets = Array.isArray(targets) ? targets : [];
+          if (!this.spawnTargets.some((target) => target.id === this.selectedTargetId)) {
+            this.selectedTargetId = this.spawnTargets.length === 1 ? this.spawnTargets[0].id : null;
+          }
+          this.targetsLoaded = true;
+          this.#renderRepoTargetOptions();
+          this.#checkInstalled();
+        }),
       );
 
       this.unsubscribers.push(
@@ -51,6 +71,7 @@ export default class extends Controller {
           this.feedbackTarget.textContent = "Hub disconnected";
         }),
       );
+      this.#checkInstalled();
     });
   }
 
@@ -92,19 +113,28 @@ export default class extends Controller {
     const scope = this.#installScope(slug);
     const scopeSet = scope === "repo" ? this.installedRepo : this.installedDevice;
     const isInstalled = scopeSet.has(name);
+    const targetId = scope === "repo" ? this.selectedTargetId : undefined;
+
+    if (scope === "repo" && !targetId) {
+      this.feedbackTarget.textContent = this.spawnTargets.length === 0
+        ? "Add a spawn target first to install repo-scoped templates."
+        : "Select a spawn target before installing repo-scoped templates.";
+      return;
+    }
 
     btn.disabled = true;
     btn.textContent = isInstalled ? "Uninstalling..." : "Installing...";
+    this.installStateToken += 1;
 
     try {
       if (isInstalled) {
-        await this.hub.uninstallTemplate(dest, scope);
+        await this.hub.uninstallTemplate(dest, scope, targetId);
         scopeSet.delete(name);
       } else {
-        await this.hub.installTemplate(dest, panel.dataset.content, scope);
+        await this.hub.installTemplate(dest, panel.dataset.content, scope, targetId);
         scopeSet.add(name);
         // Auto-load the plugin so it runs without a hub reboot
-        await this.hub.loadPlugin(name).catch(() => {});
+        await this.hub.loadPlugin(name, targetId).catch(() => {});
       }
       this.#syncState(slug, dest);
       this.dispatch("templateChanged");
@@ -131,6 +161,12 @@ export default class extends Controller {
     if (dest) this.#syncState(slug, dest);
   }
 
+  selectRepoTarget(event) {
+    this.selectedTargetId = event.currentTarget.value || null;
+    this.#renderRepoTargetOptions();
+    this.#checkInstalled();
+  }
+
   async reloadPlugin(event) {
     const btn = event.currentTarget;
     const slug = btn.dataset.slug;
@@ -142,7 +178,7 @@ export default class extends Controller {
     btn.textContent = "Reloading...";
 
     try {
-      await this.hub.reloadPlugin(name);
+      await this.hub.reloadPlugin(name, this.selectedTargetId);
       btn.textContent = "Reloaded";
       setTimeout(() => { btn.textContent = "Reload"; btn.disabled = false; }, 1500);
     } catch (error) {
@@ -158,11 +194,12 @@ export default class extends Controller {
   // ========== DataChannel ==========
 
   async #checkInstalled() {
+    const token = ++this.installStateToken;
     this.feedbackTarget.textContent = "Checking installed templates...";
 
     try {
-      const result = await this.hub.listInstalledTemplates();
-      if (!this.hub) return;
+      const result = await this.hub.listInstalledTemplates(this.selectedTargetId);
+      if (!this.hub || token !== this.installStateToken) return;
 
       this.installedDevice = new Set();
       this.installedRepo = new Set();
@@ -179,10 +216,13 @@ export default class extends Controller {
 
       this.#syncAllStates();
       this.feedbackTarget.textContent = "";
-      this.element.dataset.hubTemplatesReady = "true";
+      this.installedStateLoaded = true;
+      this.#markReady();
     } catch {
+      if (token !== this.installStateToken) return;
       this.feedbackTarget.textContent = "";
-      this.element.dataset.hubTemplatesReady = "true";
+      this.installedStateLoaded = true;
+      this.#markReady();
     }
   }
 
@@ -223,10 +263,14 @@ export default class extends Controller {
     // Update install button for the active scope
     const scope = this.#installScope(slug);
     const scopeInstalled = scope === "repo" ? repoInstalled : deviceInstalled;
+    const repoSelectable = scope !== "repo" || Boolean(this.selectedTargetId);
 
     const btn = this.installBtnTargets.find((b) => b.dataset.slug === slug);
     if (btn) {
-      btn.textContent = scopeInstalled ? "Uninstall" : "Install";
+      btn.textContent = scope === "repo" && !repoSelectable
+        ? "Select Target"
+        : (scopeInstalled ? "Uninstall" : "Install");
+      btn.disabled = scope === "repo" && !repoSelectable;
       btn.className = scopeInstalled
         ? "shrink-0 px-4 py-2 text-sm font-medium rounded transition-colors disabled:opacity-50 text-red-400 hover:text-red-300 bg-red-500/10 hover:bg-red-500/20 border border-red-500/30"
         : "shrink-0 px-4 py-2 text-sm font-medium rounded transition-colors disabled:opacity-50 text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30";
@@ -252,5 +296,43 @@ export default class extends Controller {
     // Fall back to template default scope from data attribute
     const panel = this.previewPanelTargets.find((p) => p.dataset.slug === slug);
     return panel?.dataset.defaultScope || "device";
+  }
+
+  #renderRepoTargetOptions() {
+    if (!this.hasRepoTargetPanelTarget || !this.hasRepoTargetSelectTarget) return;
+
+    const select = this.repoTargetSelectTarget;
+    select.innerHTML = "";
+
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = this.spawnTargets.length === 0
+      ? "No admitted spawn targets"
+      : "Choose a spawn target";
+    select.appendChild(placeholder);
+
+    this.spawnTargets.forEach((target) => {
+      const option = document.createElement("option");
+      option.value = target.id;
+      option.textContent = target.name || target.path || target.id;
+      select.appendChild(option);
+    });
+
+    select.value = this.selectedTargetId || "";
+    select.disabled = this.spawnTargets.length === 0;
+
+    if (this.hasRepoTargetHintTarget) {
+      this.repoTargetHintTarget.textContent = this.selectedTargetId
+        ? this.spawnTargets.find((target) => target.id === this.selectedTargetId)?.path || ""
+        : (this.spawnTargets.length === 0
+          ? "Repo installs are unavailable until the device has an admitted spawn target."
+          : "Repo installs and repo template status are scoped to the selected spawn target.");
+    }
+  }
+
+  #markReady() {
+    if (this.targetsLoaded && this.installedStateLoaded) {
+      this.element.dataset.hubTemplatesReady = "true";
+    }
   }
 }

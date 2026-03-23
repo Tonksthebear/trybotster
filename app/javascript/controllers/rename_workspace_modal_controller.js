@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { HubConnectionManager, HubConnection } from "connections";
+import { HubManager } from "connections";
 
 /**
  * Rename Workspace Modal Controller
@@ -16,9 +16,7 @@ export default class extends Controller {
   connect() {
     if (!this.hubIdValue) return;
 
-    this.#hubReady = HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
-      hubId: this.hubIdValue,
-    }).then((hub) => {
+    this.#hubReady = HubManager.acquire(this.hubIdValue).then((hub) => {
       this.hub = hub;
       return hub;
     });

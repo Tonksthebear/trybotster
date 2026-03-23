@@ -92,6 +92,7 @@ class HubPeerConnection {
   #connections = new Map() // hubId -> { pc, dataChannel, state, subscriptions }
   #connectPromises = new Map() // hubId -> Promise (pending connect())
   #peerConnectPromises = new Map() // hubId -> Promise (pending connectPeer())
+  #bundleRefreshPromises = new Map() // hubId -> Promise (pending requestFreshBundle())
   #eventListeners = new Map() // eventName -> Set<callback>
   #subscriptionListeners = new Map() // subscriptionId -> Set<callback>
   #pendingSubscriptions = new Map() // subscriptionId -> { resolve, reject, timeout }
@@ -264,6 +265,115 @@ class HubPeerConnection {
     }
   }
 
+  /**
+   * Request a fresh signed CLI bundle over signaling and wait for the crypto
+   * worker to install a new outbound session from it.
+   */
+  async requestFreshBundle(hubId, timeoutMs = 5000) {
+    const conn = this.#connections.get(hubId)
+    if (!conn) throw new Error(`No signaling connection for hub ${hubId}`)
+    if (!conn.signalingConnected) throw new Error(`Signaling not connected for hub ${hubId}`)
+
+    const subscription = this.#cableSubscriptions.get(hubId)
+    if (!subscription) throw new Error(`No signaling subscription for hub ${hubId}`)
+
+    const pending = this.#bundleRefreshPromises.get(hubId)
+    if (pending) return pending
+
+    const requestedAt = performance.now()
+    const promise = new Promise((resolve, reject) => {
+      let settled = false
+
+      const cleanup = () => {
+        clearTimeout(timer)
+        offRefreshed()
+        offInvalid()
+        this.#bundleRefreshPromises.delete(hubId)
+      }
+
+      const offRefreshed = this.on("session:refreshed", (event) => {
+        if (settled || event.hubId !== hubId) return
+        settled = true
+        cleanup()
+        console.debug(
+          `[WebRTCTransport] Fresh bundle request completed for hub ${hubId} in ${Math.round(performance.now() - requestedAt)}ms`,
+        )
+        resolve({ refreshed: true })
+      })
+
+      const offInvalid = this.on("session:invalid", (event) => {
+        if (settled || event.hubId !== hubId) return
+        settled = true
+        cleanup()
+        reject(new Error(event.message || `Fresh bundle request failed for hub ${hubId}`))
+      })
+
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(new Error(`Fresh bundle request timed out for hub ${hubId}`))
+      }, timeoutMs)
+
+      try {
+        subscription.perform("request_bundle", {})
+      } catch (error) {
+        settled = true
+        cleanup()
+        reject(error)
+      }
+    })
+
+    this.#bundleRefreshPromises.set(hubId, promise)
+    return promise
+  }
+
+  /**
+   * Wait briefly for an already-triggered fresh bundle to arrive.
+   * Used after signaling subscribe, where the CLI proactively pushes one.
+   */
+  async awaitFreshBundle(hubId, timeoutMs = 750) {
+    const conn = this.#connections.get(hubId)
+    if (!conn || !conn.signalingConnected) {
+      return { refreshed: false }
+    }
+
+    const waitStartedAt = performance.now()
+    return new Promise((resolve) => {
+      let settled = false
+
+      const cleanup = () => {
+        clearTimeout(timer)
+        offRefreshed()
+        offInvalid()
+      }
+
+      const offRefreshed = this.on("session:refreshed", (event) => {
+        if (settled || event.hubId !== hubId) return
+        settled = true
+        cleanup()
+        console.debug(
+          `[WebRTCTransport] Auto fresh bundle arrived for hub ${hubId} in ${Math.round(performance.now() - waitStartedAt)}ms`,
+        )
+        resolve({ refreshed: true })
+      })
+
+      const offInvalid = this.on("session:invalid", (event) => {
+        if (settled || event.hubId !== hubId) return
+        settled = true
+        cleanup()
+        resolve({ refreshed: false, invalid: true, message: event.message })
+      })
+
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve({ refreshed: false })
+      }, timeoutMs)
+    })
+  }
+
   async #doConnectPeer(hubId, conn) {
     const subscription = this.#cableSubscriptions.get(hubId)
     if (!subscription) throw new Error(`No signaling subscription for hub ${hubId}`)
@@ -379,7 +489,6 @@ class HubPeerConnection {
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
 
-    await bridge.resetSession(String(hubId))
     const envelope = await this.#encryptSignal(hubId, {
       type: "offer",
       sdp: offer.sdp,
@@ -1178,8 +1287,8 @@ class HubPeerConnection {
         try {
           const bundleBytes = base64ToBytes(data.envelope.b)
           const bundle = parseBinaryBundle(bundleBytes)
-          await bridge.createSession(String(hubId), bundle)
           const conn = this.#connections.get(hubId)
+          await bridge.createSession(String(hubId), bundle, conn?.browserIdentity || null)
           if (conn) conn.decryptFailures = 0
           this.#emit("session:refreshed", { hubId })
         } catch (err) {
@@ -1322,8 +1431,8 @@ class HubPeerConnection {
         console.debug("[WebRTCTransport] Received bundle refresh from CLI via DataChannel")
         try {
           const bundle = parseBinaryBundle(bundleBytes)
-          await bridge.createSession(String(hubId), bundle)
           const conn = this.#connections.get(hubId)
+          await bridge.createSession(String(hubId), bundle, conn?.browserIdentity || null)
           if (conn) conn.decryptFailures = 0
           this.#emit("session:refreshed", { hubId })
         } catch (err) {

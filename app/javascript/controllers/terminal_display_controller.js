@@ -1,6 +1,6 @@
 import { Controller } from "@hotwired/stimulus";
 import { Restty } from "restty";
-import { HubConnectionManager, HubConnection } from "connections";
+import { HubConnectionManager, HubTransport } from "connections";
 import { WebRtcPtyTransport } from "transport/webrtc_pty_transport";
 import { usePresence } from "lib/use_presence";
 
@@ -12,7 +12,7 @@ import { usePresence } from "lib/use_presence";
  * Restty's native transport layer for SSH-like terminal integration.
  *
  * Init sequence:
- *   1. Acquire HubConnection (establishes WebRTC peer)
+ *   1. Acquire HubTransport (establishes WebRTC peer)
  *   2. Create Restty with transport (loads WASM, renders canvas)
  *   3. onBackend fires (WASM ready)
  *   4. onTermSize (debounced) → connectPty()
@@ -34,7 +34,7 @@ export default class extends Controller {
 
   #restty = null;
   #transport = null;
-  #hubConn = null;
+  #hubTransport = null;
   #imeInput = null;
   #touchStart = null;
   #viewportHandler = null;
@@ -75,8 +75,8 @@ export default class extends Controller {
       clearTimeout(this.#toastTimeout);
       this.#toastTimeout = null;
     }
-    this.#hubConn?.release();
-    this.#hubConn = null;
+    this.#hubTransport?.release();
+    this.#hubTransport = null;
 
     this.#restty?.destroy();
     this.#restty = null;
@@ -143,17 +143,17 @@ export default class extends Controller {
       ? this.containerTarget
       : this.element;
 
-    // 1. Acquire hub connection (establishes WebRTC peer)
-    this.#hubConn = await HubConnectionManager.acquire(
-      HubConnection,
+    // 1. Acquire hub transport (establishes WebRTC peer)
+    this.#hubTransport = await HubConnectionManager.acquire(
+      HubTransport,
       this.hubIdValue,
       { hubId: this.hubIdValue },
     );
 
     // Guard: if disconnected during async acquire, release and bail
     if (this.#disconnected) {
-      this.#hubConn.release();
-      this.#hubConn = null;
+      this.#hubTransport.release();
+      this.#hubTransport = null;
       return;
     }
 
@@ -173,7 +173,7 @@ export default class extends Controller {
       this.#restty?.setMouseMode("auto");
       this.#hideOverlay();
       // Viewing the terminal clears any pending notification badge
-      this.#hubConn?.clearNotification(this.sessionUuidValue);
+      this.#hubTransport?.clearNotification(this.sessionUuidValue);
       this.#connected = true;
       this.#updateFocus();
     };

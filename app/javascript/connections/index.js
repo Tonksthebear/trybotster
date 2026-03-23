@@ -2,11 +2,15 @@
  * Connections module - Global connection management for Turbo-aware lifecycle.
  *
  * Usage:
- *   import { HubConnectionManager, HubConnection, TerminalConnection, PreviewConnection } from "connections";
+ *   import { HubConnectionManager, HubManager, HubTransport, TerminalConnection, PreviewConnection } from "connections";
  *
- *   // Hub connection (control plane)
- *   const hub = await HubConnectionManager.acquire(HubConnection, hubId, { hubId });
+ *   // Hub state object (mirrored read model)
+ *   const hub = await HubManager.acquire(hubId);
  *   hub.onAgentList((agents) => render(agents));
+ *
+ *   // Low-level hub transport (control plane)
+ *   const transport = await HubConnectionManager.acquire(HubTransport, hubId, { hubId });
+ *   transport.on("connected", () => transport.requestAgents());
  *
  *   // Terminal connection (data plane)
  *   const key = TerminalConnection.key(hubId, sessionUuid);
@@ -29,7 +33,9 @@
  */
 
 export { HubConnectionManager } from "connections/hub_connection_manager";
+export { HubManager } from "connections/hub_manager";
+export { Hub } from "connections/hub";
 export { HubRoute, ConnectionState, BrowserStatus, CliStatus, ConnectionMode } from "connections/hub_route";
-export { HubConnection } from "connections/hub_connection";
+export { HubTransport } from "connections/hub_connection";
 export { TerminalConnection } from "connections/terminal_connection";
 export { PreviewConnection } from "connections/preview_connection";

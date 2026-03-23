@@ -1,18 +1,18 @@
 import { Controller } from "@hotwired/stimulus";
-import { HubConnectionManager } from "connections/hub_connection_manager";
-import { HubConnection } from "connections/hub_connection";
+import { HubManager } from "connections";
 
 /**
  * NewAgentFormController - Handles the two-step new agent form.
  *
- * Step 1: Select existing worktree or enter new branch/issue
+ * Step 1: Select target and choose main/existing/new branch
  * Step 2: Select agent, optional workspace, optional initial prompt, submit
- *
- * Uses HubConnectionManager to acquire connection for sending commands
- * and receiving worktree list and agent config updates.
  */
 export default class extends Controller {
   static targets = [
+    "targetSection",
+    "targetSelect",
+    "targetPrompt",
+    "worktreeOptions",
     "worktreeList",
     "newBranchInput",
     "step1",
@@ -39,64 +39,100 @@ export default class extends Controller {
     this.worktrees = [];
     this.agents = [];
     this.workspaces = [];
+    this.spawnTargets = [];
+    this.selectedTargetId = null;
     this.pendingSelection = null;
     this.unsubscribers = [];
+    this._onExternalTargetSelection = (event) => {
+      this.#applySelectedTarget(event.detail?.targetId || null);
+    };
 
-    // Acquire connection to get worktree list and send commands
-    HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
-      hubId: this.hubIdValue,
-    }).then(async (hub) => {
+    document.addEventListener(
+      "botster:new-session-target",
+      this._onExternalTargetSelection,
+    );
+
+    HubManager.acquire(this.hubIdValue).then((hub) => {
       this.hub = hub;
+      this.spawnTargets = Array.isArray(hub.spawnTargets) ? hub.spawnTargets : [];
+      this.workspaces = Array.isArray(hub.openWorkspaces) ? hub.openWorkspaces : [];
+      this.#renderTargetSelect();
+      this.#renderWorkspaceSelect();
+      this.#updateStep1Visibility();
+
+      if (this.selectedTargetId) {
+        this.worktrees = Array.isArray(hub.getWorktrees(this.selectedTargetId))
+          ? hub.getWorktrees(this.selectedTargetId)
+          : [];
+        const config = hub.getAgentConfig(this.selectedTargetId);
+        this.agents = Array.isArray(config.agents) ? config.agents : [];
+        this.#renderWorktreeList();
+        this.#renderAgentSelect();
+        if (!this.hub.hasWorktrees(this.selectedTargetId)) {
+          this.hub.ensureWorktrees(this.selectedTargetId);
+        }
+        if (!this.hub.hasAgentConfig(this.selectedTargetId)) {
+          this.hub.ensureAgentConfig(this.selectedTargetId);
+        }
+      }
 
       this.unsubscribers.push(
-        this.hub.on("worktreeList", (worktrees) => {
-          this.worktrees = worktrees;
+        this.hub.onSpawnTargetList((targets) => {
+          this.spawnTargets = Array.isArray(targets) ? targets : [];
+          this.#renderTargetSelect();
+          this.#updateStep1Visibility();
+        }),
+      );
+
+      this.unsubscribers.push(
+        this.hub.on("worktreeList", ({ targetId, worktrees }) => {
+          if (targetId && this.selectedTargetId && targetId !== this.selectedTargetId) return;
+          this.worktrees = Array.isArray(worktrees) ? worktrees : [];
           this.#renderWorktreeList();
         }),
       );
 
       this.unsubscribers.push(
-        this.hub.on("agentConfig", ({ agents }) => {
-          this.agents = agents;
+        this.hub.on("agentConfig", ({ targetId, agents }) => {
+          if (targetId && this.selectedTargetId && targetId !== this.selectedTargetId) return;
+          this.agents = Array.isArray(agents) ? agents : [];
           this.#renderAgentSelect();
         }),
       );
 
       this.unsubscribers.push(
-        this.hub.on("workspaceList", (workspaces) => {
+        this.hub.onOpenWorkspaceList((workspaces) => {
           this.workspaces = Array.isArray(workspaces) ? workspaces : [];
           this.#renderWorkspaceSelect();
         }),
       );
-
-      // Handle connection ready (initial or reconnection)
-      // Use onConnected which fires immediately if already connected
-      this.unsubscribers.push(
-        this.hub.onConnected(() => {
-          this.hub.requestAgents();
-          this.hub.requestWorktrees();
-          this.hub.requestWorkspaces();
-          this.hub.requestAgentConfig();
-        }),
-      );
-
-      // No explicit subscribe() — health events drive the WebRTC lifecycle.
-      // onConnected above fires when handshake completes.
     });
   }
 
   disconnect() {
-    // Clean up event subscriptions
     this.unsubscribers?.forEach((unsub) => unsub());
     this.unsubscribers = null;
+
+    if (this._onExternalTargetSelection) {
+      document.removeEventListener(
+        "botster:new-session-target",
+        this._onExternalTargetSelection,
+      );
+      this._onExternalTargetSelection = null;
+    }
 
     const hub = this.hub;
     this.hub = null;
     hub?.release();
   }
 
-  // Action: Select an existing worktree
+  selectTarget() {
+    if (!this.hasTargetSelectTarget) return;
+    this.#applySelectedTarget(this.targetSelectTarget.value || null);
+  }
+
   selectWorktree(event) {
+    if (!this.selectedTargetId) return;
     const path = event.currentTarget.dataset.path;
     const branch = event.currentTarget.dataset.branch;
 
@@ -106,14 +142,14 @@ export default class extends Controller {
     this.#goToStep2(branch);
   }
 
-  // Action: Spawn agent on main branch (no worktree)
   selectMainBranch() {
+    if (!this.selectedTargetId) return;
     this.pendingSelection = { type: "main" };
     this.#goToStep2("main branch");
   }
 
-  // Action: Create new branch/issue
   selectNewBranch(event) {
+    if (!this.selectedTargetId) return;
     if (event.type === "keydown") {
       event.preventDefault();
     }
@@ -127,7 +163,6 @@ export default class extends Controller {
     this.#goToStep2(value);
   }
 
-  // Action: Go back to step 1
   goBackToStep1() {
     if (this.hasStep1Target && this.hasStep2Target) {
       this.step2Target.classList.add("hidden");
@@ -139,10 +174,9 @@ export default class extends Controller {
     }
   }
 
-  // Action: Submit the form
   submit() {
-    if (!this.pendingSelection || !this.hub) {
-      console.warn("[new-agent-form] Cannot submit - no selection or connection");
+    if (!this.pendingSelection || !this.hub || !this.selectedTargetId) {
+      console.warn("[new-agent-form] Cannot submit - no selection, target, or connection");
       return;
     }
 
@@ -159,6 +193,7 @@ export default class extends Controller {
         branch: this.pendingSelection.branch,
         prompt: prompt || null,
         agent_name: agentName,
+        target_id: this.selectedTargetId,
         workspace_id: workspace?.id || null,
         workspace_name: workspace?.name || null,
       });
@@ -166,6 +201,7 @@ export default class extends Controller {
       this.hub.send("create_agent", {
         prompt: prompt || null,
         agent_name: agentName,
+        target_id: this.selectedTargetId,
         workspace_id: workspace?.id || null,
         workspace_name: workspace?.name || null,
       });
@@ -174,6 +210,7 @@ export default class extends Controller {
         issue_or_branch: this.pendingSelection.issueOrBranch,
         prompt: prompt || null,
         agent_name: agentName,
+        target_id: this.selectedTargetId,
         workspace_id: workspace?.id || null,
         workspace_name: workspace?.name || null,
       });
@@ -182,9 +219,10 @@ export default class extends Controller {
     this.#resetForm();
   }
 
-  // Action: Refresh worktree list
   refresh() {
-    this.hub?.requestWorktrees();
+    if (this.selectedTargetId) {
+      this.hub?.ensureWorktrees(this.selectedTargetId, { force: true });
+    }
   }
 
   #selectedAgent() {
@@ -205,6 +243,8 @@ export default class extends Controller {
   }
 
   #goToStep2(label) {
+    if (!this.selectedTargetId) return;
+
     if (this.hasStep1Target && this.hasStep2Target) {
       this.step1Target.classList.add("hidden");
       this.step2Target.classList.remove("hidden");
@@ -226,6 +266,12 @@ export default class extends Controller {
       this.newBranchInputTarget.value = "";
     }
 
+    this.selectedTargetId = null;
+    if (this.hasTargetSelectTarget) {
+      this.targetSelectTarget.value = "";
+    }
+    this.#updateStep1Visibility();
+
     if (this.hasPromptInputTarget) {
       this.promptInputTarget.value = "";
     }
@@ -236,6 +282,88 @@ export default class extends Controller {
     }
   }
 
+  #applySelectedTarget(targetId) {
+    this.selectedTargetId = targetId;
+    this.pendingSelection = null;
+    this.worktrees = targetId && this.hub
+      ? this.hub.getWorktrees(targetId)
+      : [];
+    this.agents = targetId && this.hub
+      ? this.hub.getAgentConfig(targetId).agents
+      : [];
+
+    if (this.hasTargetSelectTarget) {
+      this.targetSelectTarget.value = targetId || "";
+    }
+
+    this.#renderWorktreeList();
+    this.#renderAgentSelect();
+    this.#updateStep1Visibility();
+
+    if (!targetId || !this.hub) return;
+    if (!this.hub.hasWorktrees(targetId)) {
+      this.hub.ensureWorktrees(targetId);
+    }
+    if (!this.hub.hasAgentConfig(targetId)) {
+      this.hub.ensureAgentConfig(targetId);
+    }
+  }
+
+  #renderTargetSelect() {
+    if (!this.hasTargetSelectTarget || !this.hasTargetSectionTarget) return;
+
+    const select = this.targetSelectTarget;
+    select.innerHTML = "";
+
+    const emptyOption = document.createElement("option");
+    emptyOption.value = "";
+    emptyOption.textContent = this.spawnTargets.length
+      ? "Select a spawn target"
+      : "No admitted spawn targets";
+    select.appendChild(emptyOption);
+
+    this.spawnTargets.forEach((target) => {
+      const option = document.createElement("option");
+      option.value = target.id;
+      const branchSuffix = target.current_branch ? ` (${target.current_branch})` : "";
+      option.textContent = `${target.name || target.path}${branchSuffix}`;
+      select.appendChild(option);
+    });
+
+    if (
+      this.selectedTargetId &&
+      !this.spawnTargets.some((target) => target.id === this.selectedTargetId)
+    ) {
+      this.selectedTargetId = null;
+    }
+
+    this.targetSectionTarget.classList.remove("hidden");
+    select.value = this.selectedTargetId || "";
+    this.#updateTargetPrompt();
+  }
+
+  #updateStep1Visibility() {
+    if (this.hasWorktreeOptionsTarget) {
+      this.worktreeOptionsTarget.classList.toggle("hidden", !this.selectedTargetId);
+    }
+    this.#updateTargetPrompt();
+  }
+
+  #updateTargetPrompt() {
+    if (!this.hasTargetPromptTarget) return;
+
+    if (this.selectedTargetId) {
+      this.targetPromptTarget.textContent =
+        "Spawn target selected. Now choose main, an existing worktree, or a new branch.";
+    } else if (this.spawnTargets.length === 0) {
+      this.targetPromptTarget.textContent =
+        "Add a spawn target in Device Settings before creating an agent.";
+    } else {
+      this.targetPromptTarget.textContent =
+        "Choose a spawn target to unlock worktree and branch selection.";
+    }
+  }
+
   #renderAgentSelect() {
     if (!this.hasAgentSelectTarget) return;
 
@@ -243,23 +371,19 @@ export default class extends Controller {
     select.innerHTML = "";
 
     if (this.agents.length === 0) {
-      // No agents configured — hide the section
       if (this.hasAgentSectionTarget) {
         this.agentSectionTarget.classList.add("hidden");
       }
-      // Show warning that no agent config exists
       if (this.hasNoConfigWarningTarget) {
         this.noConfigWarningTarget.classList.remove("hidden");
       }
       return;
     }
 
-    // Has agents — hide warning
     if (this.hasNoConfigWarningTarget) {
       this.noConfigWarningTarget.classList.add("hidden");
     }
 
-    // Show the section
     if (this.hasAgentSectionTarget) {
       this.agentSectionTarget.classList.remove("hidden");
     }
@@ -289,7 +413,6 @@ export default class extends Controller {
 
     this.workspaceSectionTarget.classList.remove("hidden");
 
-    // Add empty option for "no workspace"
     const emptyOption = document.createElement("option");
     emptyOption.value = "";
     emptyOption.textContent = "None";

@@ -26,6 +26,7 @@ export class WebRtcPtyTransport {
   #unsubscribers = [];
   #decoder = new TextDecoder();
   #wasConnected = false;
+  #awaitingReconnectSnapshot = false;
   #onReconnect = null;
   #onConnect = null;
   #onDisconnect = null;
@@ -42,6 +43,7 @@ export class WebRtcPtyTransport {
    * (subscribing to the CLI's terminal channel) and wires up events.
    */
   async connect(options) {
+    this.disconnect();
     this.#callbacks = options.callbacks;
     console.debug(
       `[WebRtcPtyTransport] connect start hub=${this.#hubId} session=${this.#sessionUuid} size=${options.cols}x${options.rows}`,
@@ -60,11 +62,13 @@ export class WebRtcPtyTransport {
       },
     );
 
-    // Restty is reconstructed on view teardown/navigation. Force a fresh
-    // terminal subscribe so CLI replays snapshot/scrollback for this mount.
-    await this.#terminalConn.subscribe({ force: true });
-
+    const hadSubscription = this.#terminalConn.hasSubscription();
+    this.#awaitingReconnectSnapshot = hadSubscription;
+    await this.#terminalConn.subscribe();
     this.#wireEvents();
+    if (hadSubscription) {
+      await this.#terminalConn.requestSnapshot();
+    }
     console.debug(
       `[WebRtcPtyTransport] connect ready hub=${this.#hubId} session=${this.#sessionUuid}`,
     );
@@ -76,6 +80,7 @@ export class WebRtcPtyTransport {
       this.#pendingResizeTimer = null;
       this.#pendingResize = null;
     }
+    this.#awaitingReconnectSnapshot = false;
     this.#unsubscribers.forEach((unsub) => unsub());
     this.#unsubscribers = [];
     this.#callbacks = null;
@@ -149,8 +154,21 @@ export class WebRtcPtyTransport {
     );
 
     this.#unsubscribers.push(
+      this.#terminalConn.onSnapshotStart(() => {
+        if (!this.#awaitingReconnectSnapshot) return;
+        this.#awaitingReconnectSnapshot = false;
+        this.#onReconnect?.();
+      }),
+    );
+
+    this.#unsubscribers.push(
+      this.#terminalConn.onSnapshotComplete(() => {
+        this.#awaitingReconnectSnapshot = false;
+      }),
+    );
+
+    this.#unsubscribers.push(
       this.#terminalConn.onConnected(() => {
-        if (this.#wasConnected) this.#onReconnect?.();
         this.#wasConnected = true;
         this.#onConnect?.();
         this.#callbacks?.onConnect?.();
@@ -159,6 +177,7 @@ export class WebRtcPtyTransport {
 
     this.#unsubscribers.push(
       this.#terminalConn.onDisconnected(() => {
+        this.#awaitingReconnectSnapshot = false;
         this.#onDisconnect?.();
         this.#callbacks?.onDisconnect?.();
       }),
