@@ -14,6 +14,8 @@
 -- second from colliding. It resets to 0 on hot-reload, which is safe because
 -- the timestamp component still guarantees cross-reload uniqueness.
 
+local TargetContext = require("lib.target_context")
+
 local M = {}
 
 -- Monotonically incrementing counter used to differentiate IDs generated in
@@ -29,6 +31,45 @@ local function normalize_workspace_name(name)
     local normalized = tostring(name):match("^%s*(.-)%s*$")
     if normalized == "" then return nil end
     return normalized
+end
+
+local function extract_target_identity(record)
+    record = record or {}
+    local target = TargetContext.from_manifest(record)
+    if not target.target_repo and record.metadata and record.metadata.repo then
+        target.target_repo = record.metadata.repo
+        target.repo = TargetContext.default_repo_label(target)
+    end
+    return target
+end
+
+local function normalize_workspace_manifest(manifest, workspace_id)
+    if not manifest then return nil end
+    manifest.id = manifest.id or workspace_id
+    local target = extract_target_identity(manifest)
+    manifest.target_id = manifest.target_id or target.target_id
+    manifest.target_path = manifest.target_path or target.target_path
+    manifest.target_repo = manifest.target_repo or target.target_repo
+    manifest.metadata = manifest.metadata or {}
+    return manifest
+end
+
+local function normalize_session_manifest(manifest, workspace_id, session_uuid)
+    if not manifest then return nil end
+    manifest.uuid = manifest.uuid or session_uuid
+    manifest.session_uuid = manifest.session_uuid or manifest.uuid or session_uuid
+    manifest.workspace_id = manifest.workspace_id or workspace_id
+    local target = extract_target_identity(manifest)
+    manifest.target_id = manifest.target_id or target.target_id
+    manifest.target_path = manifest.target_path or target.target_path
+    manifest.target_repo = manifest.target_repo or target.target_repo
+    manifest.metadata = manifest.metadata or {}
+    return manifest
+end
+
+local function workspace_matches_target(manifest, target)
+    if not target then return true end
+    return TargetContext.matches(normalize_workspace_manifest(manifest), target)
 end
 
 -- =============================================================================
@@ -195,6 +236,7 @@ end
 function M.write_workspace(data_dir, workspace_id, manifest)
     local dir = M.workspace_dir(data_dir, workspace_id)
     if not ensure_dir(dir) then return false end
+    manifest = normalize_workspace_manifest(manifest, workspace_id)
     local ok, content = pcall(json.encode, manifest)
     if not ok then
         log.warn(string.format("[workspace_store] write_workspace: json.encode failed: %s",
@@ -215,6 +257,7 @@ end
 function M.write_session(data_dir, workspace_id, session_uuid, manifest)
     local dir = M.session_dir(data_dir, workspace_id, session_uuid)
     if not ensure_dir(dir) then return false end
+    manifest = normalize_session_manifest(manifest, workspace_id, session_uuid)
     local ok, content = pcall(json.encode, manifest)
     if not ok then
         log.warn(string.format("[workspace_store] write_session: json.encode failed: %s",
@@ -252,7 +295,7 @@ function M.read_session(data_dir, workspace_id, session_uuid)
     if not ok or not content then return nil end
     local ok2, manifest = pcall(json.decode, content)
     if not ok2 or not manifest then return nil end
-    return manifest
+    return normalize_session_manifest(manifest, workspace_id, session_uuid)
 end
 
 --- Read and decode a workspace manifest.
@@ -265,7 +308,7 @@ function M.read_workspace(data_dir, workspace_id)
     if not ok or not content then return nil end
     local ok2, manifest = pcall(json.decode, content)
     if not ok2 or not manifest then return nil end
-    return manifest
+    return normalize_workspace_manifest(manifest, workspace_id)
 end
 
 --- Read the effective status for a workspace without mutating it.
@@ -286,9 +329,10 @@ end
 --- Find an existing workspace manifest matching a name.
 -- @param data_dir string
 -- @param name string  Workspace display name (e.g. "owner/repo#42")
+-- @param target table|nil Optional target identity to scope the lookup
 -- @return string|nil workspace_id
 -- @return table|nil manifest
-function M.find_workspace(data_dir, name)
+function M.find_workspace(data_dir, name, target)
     local normalized_name = normalize_workspace_name(name)
     if not normalized_name then return nil, nil end
 
@@ -304,7 +348,7 @@ function M.find_workspace(data_dir, name)
 
     for _, workspace_id in ipairs(entries) do
         local manifest = M.read_workspace(data_dir, workspace_id)
-        if manifest and manifest.name == normalized_name then
+        if manifest and manifest.name == normalized_name and workspace_matches_target(manifest, target) then
             return workspace_id, manifest
         end
     end
@@ -316,10 +360,11 @@ end
 -- Closed workspaces do not block reuse of the same name.
 -- @param data_dir string
 -- @param name string
+-- @param target table|nil Optional target identity to scope the lookup
 -- @param exclude_workspace_id string|nil
 -- @return string|nil workspace_id
 -- @return table|nil manifest
-function M.find_active_workspace(data_dir, name, exclude_workspace_id)
+function M.find_active_workspace(data_dir, name, target, exclude_workspace_id)
     local normalized_name = normalize_workspace_name(name)
     if not normalized_name then return nil, nil end
 
@@ -337,7 +382,8 @@ function M.find_active_workspace(data_dir, name, exclude_workspace_id)
         if workspace_id ~= exclude_workspace_id then
             local manifest = M.read_workspace(data_dir, workspace_id)
             local status = effective_workspace_status(data_dir, workspace_id, manifest)
-            if manifest and manifest.name == normalized_name and status == "active" then
+            if manifest and manifest.name == normalized_name and status == "active"
+                    and workspace_matches_target(manifest, target) then
                 return workspace_id, manifest
             end
         end
@@ -361,7 +407,7 @@ function M.ensure_workspace(data_dir, opts)
     end
 
     local expect_new = opts and opts.expect_new or false
-    local existing_id, existing_manifest = M.find_active_workspace(data_dir, name)
+    local existing_id, existing_manifest = M.find_active_workspace(data_dir, name, opts)
     if existing_id then
         if expect_new then
             return nil, nil, false, string.format("Active workspace '%s' already exists", name)
@@ -374,6 +420,9 @@ function M.ensure_workspace(data_dir, opts)
     local manifest = {
         id         = workspace_id,
         name       = name,
+        target_id  = opts.target_id,
+        target_path = opts.target_path,
+        target_repo = opts.target_repo,
         status     = "active",
         created_at = opts.created_at or now,
         updated_at = now,
@@ -407,15 +456,17 @@ function M.rename_workspace(data_dir, workspace_id, new_name)
         return false, "Workspace name is required"
     end
 
-    local conflict_id = M.find_active_workspace(data_dir, normalized_name, workspace_id)
-    if conflict_id then
-        return false, string.format("Active workspace '%s' already exists", normalized_name)
-    end
-
     local manifest = M.read_workspace(data_dir, workspace_id)
     if not manifest then
         log.warn(string.format("[workspace_store] rename_workspace: workspace %s not found", workspace_id))
         return false, string.format("Workspace '%s' not found", tostring(workspace_id))
+    end
+
+    local conflict_id = M.find_active_workspace(
+        data_dir, normalized_name, extract_target_identity(manifest), workspace_id
+    )
+    if conflict_id then
+        return false, string.format("Active workspace '%s' already exists", normalized_name)
     end
     manifest.name = normalized_name
     manifest.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
@@ -577,6 +628,9 @@ function M.build_workspace_groups(data_dir, agents)
                 local manifest = M.read_workspace(data_dir, workspace_id) or {
                     id = workspace_id,
                     name = agent.workspace_name or (agent.repo or "unknown/repo") .. " — " .. (agent.branch_name or "main"),
+                    target_id = agent.target_id,
+                    target_path = agent.target_path,
+                    target_repo = agent.target_repo,
                     status = "active",
                     created_at = nil,
                     updated_at = nil,
@@ -596,6 +650,9 @@ function M.build_workspace_groups(data_dir, agents)
                 by_id[workspace_id] = {
                     id = workspace_id,
                     name = display_name,
+                    target_id = manifest.target_id,
+                    target_path = manifest.target_path,
+                    target_repo = manifest.target_repo,
                     status = manifest.status,
                     created_at = manifest.created_at,
                     updated_at = manifest.updated_at,

@@ -9,6 +9,35 @@
 --   end)
 
 local commands = require("lib.commands")
+local TargetContext = require("lib.target_context")
+
+local function send_command_error(client, sub_id, error_type, message)
+    if not client then return end
+    client:send({
+        subscriptionId = sub_id,
+        type = error_type or "error",
+        error = message,
+    })
+end
+
+local function send_spawn_target_feedback(client, sub_id, tone, message)
+    if not client then return end
+    client:send({
+        subscriptionId = sub_id,
+        type = "spawn_target_feedback",
+        tone = tone or "neutral",
+        message = message,
+    })
+end
+
+local function resolve_command_target(command)
+    return TargetContext.resolve({
+        command = command,
+        metadata = command and command.metadata or nil,
+        require_target_id = true,
+        require_target_path = true,
+    })
+end
 
 -- ============================================================================
 -- Query Commands
@@ -19,8 +48,74 @@ commands.register("list_agents", function(client, sub_id, _command)
 end, { description = "Send agent list to client" })
 
 commands.register("list_worktrees", function(client, sub_id, _command)
-    client:send_worktree_list(sub_id)
+    local target, target_err = resolve_command_target(_command)
+    if not target then
+        send_command_error(client, sub_id, "worktree_list_error", target_err)
+        log.warn(string.format("list_worktrees failed: %s", tostring(target_err)))
+        return
+    end
+    client:send_worktree_list(sub_id, target)
 end, { description = "Send worktree list to client" })
+
+commands.register("list_spawn_targets", function(client, sub_id, _command)
+    client:send_spawn_target_list(sub_id)
+end, { description = "Send admitted spawn target list to client" })
+
+commands.register("add_spawn_target", function(client, sub_id, command)
+    local registry = rawget(_G, "spawn_targets")
+    if not registry or type(registry.add) ~= "function" then
+        send_spawn_target_feedback(client, sub_id, "error", "Spawn target registry is unavailable.")
+        return
+    end
+
+    local path = command.path or command.target_path
+    local name = command.name or command.target_name
+    if not path or path == "" then
+        send_spawn_target_feedback(client, sub_id, "error", "Path is required to admit a spawn target.")
+        return
+    end
+
+    local ok, target = pcall(registry.add, path, name)
+    if not ok or type(target) ~= "table" then
+        send_spawn_target_feedback(client, sub_id, "error", tostring(target))
+        log.warn(string.format("add_spawn_target failed: %s", tostring(target)))
+        return
+    end
+
+    local connections = require("handlers.connections")
+    send_spawn_target_feedback(
+        client,
+        sub_id,
+        "success",
+        string.format("Admitted spawn target %s", target.path or target.name or target.id or path)
+    )
+    connections.broadcast_spawn_target_list()
+end, { description = "Admit a directory as a spawn target" })
+
+commands.register("remove_spawn_target", function(client, sub_id, command)
+    local registry = rawget(_G, "spawn_targets")
+    if not registry or type(registry.remove) ~= "function" then
+        send_spawn_target_feedback(client, sub_id, "error", "Spawn target registry is unavailable.")
+        return
+    end
+
+    local target_id = command.target_id
+    if not target_id or target_id == "" then
+        send_spawn_target_feedback(client, sub_id, "error", "Target ID is required to remove a spawn target.")
+        return
+    end
+
+    local ok, removed = pcall(registry.remove, target_id)
+    if not ok or not removed then
+        send_spawn_target_feedback(client, sub_id, "error", tostring(removed or "Failed to remove spawn target."))
+        log.warn(string.format("remove_spawn_target failed: %s", tostring(removed)))
+        return
+    end
+
+    local connections = require("handlers.connections")
+    send_spawn_target_feedback(client, sub_id, "success", "Removed spawn target.")
+    connections.broadcast_spawn_target_list()
+end, { description = "Remove an admitted spawn target" })
 
 commands.register("list_workspaces", function(client, sub_id, _command)
     local Hub = require("lib.hub")
@@ -38,41 +133,63 @@ commands.register("list_workspaces", function(client, sub_id, _command)
     })
 end, { description = "Send workspace list to client" })
 
-local function send_agent_config(client, sub_id)
+commands.register("list_open_workspaces", function(client, sub_id, _command)
+    client:send_open_workspace_list(sub_id)
+end, { description = "Send currently open workspaces to client" })
+
+local function send_agent_config(client, sub_id, command)
     local ConfigResolver = require("lib.config_resolver")
+    local target, target_err = resolve_command_target(command)
+    if not target then
+        send_command_error(client, sub_id, "agent_config_error", target_err)
+        log.warn(string.format("list_configs failed: %s", tostring(target_err)))
+        return
+    end
     local device_root = config.data_dir and config.data_dir() or nil
-    local repo_root = worktree.repo_root()
+    local repo_root = target.target_path
     local agents = ConfigResolver.list_agents(device_root, repo_root)
     local accessories = ConfigResolver.list_accessories(device_root, repo_root)
     local workspaces = ConfigResolver.list_workspaces(device_root, repo_root)
     client:send({
         subscriptionId = sub_id,
         type = "agent_config",
+        target_id = target.target_id,
+        target_path = target.target_path,
+        target_repo = target.target_repo,
         agents = agents,
         accessories = accessories,
         workspaces = workspaces,
     })
 end
 
-commands.register("list_configs", function(client, sub_id, _command)
-    send_agent_config(client, sub_id)
+commands.register("list_configs", function(client, sub_id, command)
+    send_agent_config(client, sub_id, command)
 end, { description = "List available agents, accessories, and workspaces" })
 
-commands.register("list_agent_config", function(client, sub_id, _command)
-    send_agent_config(client, sub_id)
+commands.register("list_agent_config", function(client, sub_id, command)
+    send_agent_config(client, sub_id, command)
 end, { description = "List available agent config (alias for list_configs)" })
 
 -- Backward compat: list_profiles → list_configs
-commands.register("list_profiles", function(client, sub_id, _command)
+commands.register("list_profiles", function(client, sub_id, command)
     local ConfigResolver = require("lib.config_resolver")
+    local target, target_err = resolve_command_target(command)
+    if not target then
+        send_command_error(client, sub_id, "profiles_error", target_err)
+        log.warn(string.format("list_profiles failed: %s", tostring(target_err)))
+        return
+    end
     local device_root = config.data_dir and config.data_dir() or nil
-    local repo_root = worktree.repo_root()
+    local repo_root = target.target_path
     local agents = ConfigResolver.list_agents(device_root, repo_root)
     client:send({
         subscriptionId = sub_id,
         type = "profiles",
         profiles = agents,
         shared_agent = #agents > 0,
+        target_id = target.target_id,
+        target_path = target.target_path,
+        target_repo = target.target_repo,
     })
 end, { description = "List available config profiles (deprecated, use list_configs)" })
 
@@ -80,7 +197,7 @@ end, { description = "List available config profiles (deprecated, use list_confi
 -- Agent Lifecycle Commands
 -- ============================================================================
 
-commands.register("create_agent", function(client, _sub_id, command)
+commands.register("create_agent", function(client, sub_id, command)
     local issue_or_branch = command.issue_or_branch or command.branch
     local prompt = command.prompt
     local from_worktree = command.from_worktree
@@ -89,21 +206,25 @@ commands.register("create_agent", function(client, _sub_id, command)
     local workspace_id = command.workspace_id
     local workspace_name = command.workspace_name
 
-    local metadata = nil
+    local target, target_err = resolve_command_target(command)
+    if not target then
+        send_command_error(client, sub_id, "error", target_err)
+        log.warn(string.format("create_agent failed: %s", tostring(target_err)))
+        return
+    end
+
+    local metadata = TargetContext.with_metadata(nil, target)
     if workspace_id or workspace_name then
-        metadata = {
-            workspace_id = workspace_id,
-            workspace = workspace_name,
-        }
+        metadata.workspace_id = workspace_id
+        metadata.workspace = workspace_name
     end
 
     -- Optional workspace template for auto-spawning accessory bundles.
     local workspace_config_name = command.workspace_template
     if workspace_config_name then
-        metadata = metadata or {}
         local ConfigResolver = require("lib.config_resolver")
         local device_root = config.data_dir and config.data_dir() or nil
-        local repo_root = worktree.repo_root()
+        local repo_root = target.target_path
         local resolved = ConfigResolver.resolve_all({
             device_root = device_root,
             repo_root = repo_root,
@@ -116,19 +237,28 @@ commands.register("create_agent", function(client, _sub_id, command)
         end
     end
 
-    require("handlers.agents").handle_create_agent(issue_or_branch, prompt, from_worktree, client, agent_name, metadata)
-    log.info(string.format("Create agent request: %s (agent: %s, workspace: %s)",
+    require("handlers.agents").handle_create_agent(
+        issue_or_branch, prompt, from_worktree, client, agent_name, metadata, target
+    )
+    log.info(string.format("Create agent request: %s (agent: %s, workspace: %s, target: %s)",
         tostring(issue_or_branch or "main"), tostring(agent_name or "auto"),
-        tostring(workspace_id or workspace_name or "none")))
+        tostring(workspace_id or workspace_name or "none"),
+        tostring(target.target_id)))
 end, { description = "Create a new agent (with optional worktree, agent name, and workspace)" })
 
-commands.register("create_accessory", function(client, _sub_id, command)
+commands.register("create_accessory", function(client, sub_id, command)
     -- Accept both "accessory_name" (new) and "session_name" (legacy)
     local accessory_name = command.accessory_name or command.session_name or command.name
     local workspace_id = command.workspace_id
     local workspace_name = command.workspace_name
     local agent_name = command.agent_name or command.profile
-    local metadata = command.metadata
+    local target, target_err = resolve_command_target(command)
+    if not target then
+        send_command_error(client, sub_id, "error", target_err)
+        log.warn(string.format("create_accessory failed: %s", tostring(target_err)))
+        return
+    end
+    local metadata = TargetContext.with_metadata(command.metadata, target)
 
     if not accessory_name then
         log.warn("create_accessory missing accessory_name")
@@ -136,10 +266,10 @@ commands.register("create_accessory", function(client, _sub_id, command)
     end
 
     require("handlers.agents").handle_create_accessory(
-        workspace_id, workspace_name, accessory_name, agent_name, metadata
+        workspace_id, workspace_name, accessory_name, agent_name, metadata, target
     )
-    log.info(string.format("Create accessory request: %s (workspace: %s)",
-        accessory_name, tostring(workspace_id or workspace_name or "none")))
+    log.info(string.format("Create accessory request: %s (workspace: %s, target: %s)",
+        accessory_name, tostring(workspace_id or workspace_name or "none"), tostring(target.target_id)))
 end, { description = "Create an accessory session (no AI autonomy)" })
 
 commands.register("rename_workspace", function(client, sub_id, command)
@@ -172,6 +302,7 @@ commands.register("rename_workspace", function(client, sub_id, command)
         connections.broadcast_hub_event("agent_list", {
             agents = Agent.all_info(),
         })
+        connections.broadcast_workspace_list()
         log.info(string.format("Workspace %s renamed to '%s'", workspace_id, new_name))
     end
 end, { description = "Rename a workspace" })
@@ -211,6 +342,7 @@ commands.register("move_agent_workspace", function(_client, _sub_id, command)
     connections.broadcast_hub_event("agent_list", {
         agents = Agent.all_info(),
     })
+    connections.broadcast_workspace_list()
 
     log.info(string.format("Moved session %s to workspace %s (%s)",
         session:agent_key(), moved.workspace_id, moved.workspace_name or "unnamed"))
@@ -256,15 +388,21 @@ commands.register("reopen_worktree", function(client, _sub_id, command)
     local prompt = command.prompt
 
     if path then
-        local agent_name = command.agent_name or command.profile
-        local metadata = nil
-        if command.workspace_id or command.workspace_name then
-            metadata = {
-                workspace_id = command.workspace_id,
-                workspace = command.workspace_name,
-            }
+        local target, target_err = resolve_command_target(command)
+        if not target then
+            send_command_error(client, _sub_id, "error", target_err)
+            log.warn(string.format("reopen_worktree failed: %s", tostring(target_err)))
+            return
         end
-        require("handlers.agents").handle_create_agent(branch, prompt, path, client, agent_name, metadata)
+        local agent_name = command.agent_name or command.profile
+        local metadata = TargetContext.with_metadata(nil, target)
+        if command.workspace_id or command.workspace_name then
+            metadata.workspace_id = command.workspace_id
+            metadata.workspace = command.workspace_name
+        end
+        require("handlers.agents").handle_create_agent(
+            branch, prompt, path, client, agent_name, metadata, target
+        )
         log.info(string.format("Reopen worktree request: %s", path))
     else
         log.warn("reopen_worktree missing path")

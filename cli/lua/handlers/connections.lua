@@ -148,6 +148,38 @@ local function broadcast_hub_event(event_name, event_data)
     end
 end
 
+local function broadcast_workspace_list()
+    local Hub = require("lib.hub")
+    local ok, workspaces = pcall(function()
+        return Hub.get():list_workspaces()
+    end)
+    if not ok then
+        log.warn(string.format("Failed to broadcast workspace_list: %s", tostring(workspaces)))
+        workspaces = {}
+    end
+
+    broadcast_hub_event("workspace_list", {
+        workspaces = workspaces,
+    })
+end
+
+local function broadcast_spawn_target_list()
+    local broadcast_count = 0
+
+    for _, client in pairs(clients) do
+        for sub_id, sub in pairs(client.subscriptions) do
+            if sub.channel == "hub" then
+                client:send_spawn_target_list(sub_id)
+                broadcast_count = broadcast_count + 1
+            end
+        end
+    end
+
+    if broadcast_count > 0 then
+        log.debug(string.format("Broadcast spawn_target_list to %d subscription(s)", broadcast_count))
+    end
+end
+
 -- ============================================================================
 -- Hook Observers (Lua → Lua)
 -- ============================================================================
@@ -158,6 +190,7 @@ hooks.on("agent_created", "broadcast_agent_created", function(info)
 
     broadcast_hub_event("agent_created", { agent = info })
     broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+    broadcast_workspace_list()
 
     local worktrees = hub.get_worktrees()
     broadcast_hub_event("worktree_list", { worktrees = worktrees })
@@ -168,6 +201,7 @@ hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
 
     broadcast_hub_event("agent_deleted", { agent_id = agent_id })
     broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+    broadcast_workspace_list()
 
     local worktrees = hub.get_worktrees()
     broadcast_hub_event("worktree_list", { worktrees = worktrees })
@@ -456,6 +490,8 @@ local M = {
     get_client_count = get_client_count,
     get_stats = get_stats,
     broadcast_hub_event = broadcast_hub_event,
+    broadcast_workspace_list = broadcast_workspace_list,
+    broadcast_spawn_target_list = broadcast_spawn_target_list,
 }
 
 -- Lifecycle hooks for hot-reload

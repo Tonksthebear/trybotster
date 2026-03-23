@@ -22,6 +22,10 @@ local function make_webrtc_transport(peer_id)
             opts.peer_id = peer_id
             return webrtc.create_pty_forwarder(opts)
         end,
+        request_pty_snapshot = function(opts)
+            opts.peer_id = peer_id
+            return webrtc.request_pty_snapshot(opts)
+        end,
     }
 end
 

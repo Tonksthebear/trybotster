@@ -5,6 +5,7 @@
 -- Data flows browser <-> CLI over E2E encrypted DataChannel. Nothing through Rails.
 
 local commands = require("lib.commands")
+local TargetContext = require("lib.target_context")
 
 -- ============================================================================
 -- Helpers
@@ -17,11 +18,20 @@ local commands = require("lib.commands")
 -- @param scope string|nil "repo" or nil/device
 -- @return string|nil absolute_path
 -- @return string|nil error
-local function safe_path(relative, scope)
+local function resolve_repo_target(command)
+    return TargetContext.resolve({
+        command = command,
+        metadata = command and command.metadata or nil,
+        require_target_id = true,
+        require_target_path = true,
+    })
+end
+
+local function safe_path(relative, scope, command)
     if scope == "repo" then
-        local repo_root = worktree.repo_root()
-        if not repo_root then return nil, "No repo root" end
-        return fs.resolve_safe(repo_root .. "/.botster", relative)
+        local target, target_err = resolve_repo_target(command)
+        if not target then return nil, tostring(target_err) end
+        return fs.resolve_safe(target.target_path .. "/.botster", relative)
     else
         local root = config.data_dir and config.data_dir() or nil
         if not root then return nil, "No data_dir configured" end
@@ -73,7 +83,7 @@ commands.register("template:install", function(client, sub_id, command)
         return
     end
 
-    local path, err = safe_path(dest, scope)
+    local path, err = safe_path(dest, scope, command)
     if not path then
         respond(client, sub_id, command.request_id, { ok = false, error = err })
         return
@@ -103,7 +113,7 @@ commands.register("template:uninstall", function(client, sub_id, command)
         return
     end
 
-    local path, err = safe_path(dest, scope)
+    local path, err = safe_path(dest, scope, command)
     if not path then
         respond(client, sub_id, command.request_id, { ok = false, error = err })
         return
@@ -132,7 +142,17 @@ commands.register("template:list", function(client, sub_id, command)
 
     -- Scan device and repo roots for installed plugins and agents
     local device_root = config.data_dir and config.data_dir() or nil
-    local repo_root = worktree.repo_root()
+    local repo_root = nil
+    local target = nil
+    if command.scope == "repo" or command.target_id then
+        local target_err = nil
+        target, target_err = resolve_repo_target(command)
+        if not target then
+            respond(client, sub_id, command.request_id, { ok = false, error = tostring(target_err) })
+            return
+        end
+        repo_root = target.target_path
+    end
 
     local function scan_plugins(base_path, scope_label, path_prefix)
         local plugins = ConfigResolver.read_plugins(base_path)
@@ -193,9 +213,18 @@ commands.register("plugin:load", function(client, sub_id, command)
     -- Discover from disk
     local ConfigResolver = require("lib.config_resolver")
     local opts = state.get("plugin_resolver_opts", {})
+    local repo_root = nil
+    if command.target_id then
+        local target, target_err = resolve_repo_target(command)
+        if not target then
+            respond(client, sub_id, command.request_id, { ok = false, error = tostring(target_err) })
+            return
+        end
+        repo_root = target.target_path
+    end
     local unified = ConfigResolver.resolve_all({
         device_root = opts.device_root,
-        repo_root = opts.repo_root,
+        repo_root = repo_root,
         require_agent = false,
     })
 
