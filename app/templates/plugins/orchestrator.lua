@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/orchestrator/init.lua
 -- @scope device
--- @version 2.1.0
+-- @version 2.2.0
 
 -- Orchestrator plugin
 --
@@ -18,7 +18,8 @@
 -- Tools:
 --   whoami         — returns the calling agent's identity and hub info
 --   list_hubs      — list all running hubs and their agents
---   create_agent   — create an agent on any hub
+--   list_spawn_targets — list admitted spawn targets with capabilities
+--   create_agent   — create an agent on any hub (supports target_name + label)
 --   list_workspaces — list workspace manifests on a hub
 --   rename_workspace — rename a workspace by ID
 --   move_agent_workspace — move a live session between workspaces
@@ -119,8 +120,37 @@ mcp.tool("list_hubs", {
     return result
 end)
 
+mcp.tool("list_spawn_targets", {
+    description = "List all admitted spawn targets on the local hub. Returns path, name, enabled status, and git capabilities for each target. Use target IDs from this list when calling create_agent.",
+    input_schema = {
+        type = "object",
+        properties = {},
+    },
+}, function(params)
+    local targets = spawn_targets.list()
+    local result = {}
+    for _, t in ipairs(targets) do
+        local entry = {
+            id = t.id,
+            name = t.name,
+            path = t.path,
+            enabled = t.enabled,
+        }
+        -- Add live git capabilities
+        local inspection = spawn_targets.inspect(t.path)
+        if inspection then
+            entry.is_git_repo = inspection.is_git_repo
+            entry.repo_name = inspection.repo_name
+            entry.current_branch = inspection.current_branch
+            entry.has_botster_dir = inspection.has_botster_dir
+        end
+        table.insert(result, entry)
+    end
+    return result
+end)
+
 mcp.tool("create_agent", {
-    description = "Create a new agent on a hub. For the local hub, omit hub_id or pass the local hub's ID. For remote hubs, pass their hub_id (from list_hubs). Returns the created agent's info.",
+    description = "Create a new agent on a hub. For the local hub, omit hub_id or pass the local hub's ID. For remote hubs, pass their hub_id (from list_hubs). Returns the created agent's info. Use list_spawn_targets to get valid target_id values.",
     input_schema = {
         type = "object",
         properties = {
@@ -148,18 +178,74 @@ mcp.tool("create_agent", {
                 type = "string",
                 description = "Target workspace name for the new agent (used if workspace_id is omitted).",
             },
+            target_id = {
+                type = "string",
+                description = "Spawn target ID. Use list_spawn_targets to get valid values.",
+            },
+            target_name = {
+                type = "string",
+                description = "Spawn target name (e.g. 'trybotster'). Alternative to target_id — resolved by name lookup.",
+            },
+            label = {
+                type = "string",
+                description = "Human-readable label for the agent (e.g. 'rust-plugins-field'). Set on the session after creation.",
+            },
         },
         required = { "issue_or_branch" },
     },
 }, function(params)
+    local target = nil
+
+    -- Resolve target: prefer target_id, fall back to target_name lookup
+    local resolved_id = params.target_id
+    if not resolved_id and params.target_name then
+        local all = spawn_targets.list()
+        for _, t in ipairs(all) do
+            if t.name == params.target_name then
+                resolved_id = t.id
+                break
+            end
+        end
+        if not resolved_id then
+            return { error = string.format("No spawn target found with name '%s'", params.target_name) }
+        end
+    end
+
+    if resolved_id then
+        local info = spawn_targets.get(resolved_id)
+        if info then
+            target = {
+                target_id = info.id,
+                target_path = info.path,
+            }
+            -- Derive repo name if git-backed
+            local inspection = spawn_targets.inspect(info.path)
+            if inspection and inspection.repo_name then
+                target.target_repo = inspection.repo_name
+            end
+        end
+    end
+
     return Hub.call_safely(params.hub_id, function()
-        return Hub.get(params.hub_id):create_agent(
+        local h = Hub.get(params.hub_id)
+        local result = h:create_agent(
             params.issue_or_branch,
             params.prompt,
             params.profile,
             params.workspace_id,
-            params.workspace_name
+            params.workspace_name,
+            target
         )
+
+        -- Set label on the newly created session if provided
+        if params.label and result and result.id then
+            pcall(function()
+                h:update_session(result.id, { label = params.label })
+            end)
+            result.label = params.label
+        end
+
+        return result
     end)
 end)
 
@@ -375,12 +461,21 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
         end)
     elseif message.type == "create_agent" then
         respond(function()
+            local target = nil
+            if message.target_id then
+                target = {
+                    target_id = message.target_id,
+                    target_path = message.target_path,
+                    target_repo = message.target_repo,
+                }
+            end
             return local_hub:create_agent(
                 message.issue_or_branch,
                 message.prompt,
                 message.profile,
                 message.workspace_id,
-                message.workspace_name
+                message.workspace_name,
+                target
             )
         end)
     elseif message.type == "list_workspaces" then

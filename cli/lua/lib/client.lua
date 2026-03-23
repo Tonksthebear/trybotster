@@ -197,6 +197,8 @@ function Client:handle_subscribe(msg)
     self.subscriptions[sub_id] = {
         channel = channel,
         session_uuid = session_uuid,
+        rows = params.rows or 24,
+        cols = params.cols or 80,
     }
 
     -- Send subscription confirmation immediately
@@ -243,7 +245,7 @@ function Client:handle_subscribe(msg)
         log.info(string.format("Hub subscription from %s...", self.peer_id:sub(1, 8)))
         self:send_agent_list(sub_id)
         self:send_workspace_list(sub_id)
-        self:send_worktree_list(sub_id)
+        self:send_spawn_target_list(sub_id)
         self:send_hub_recovery_state(sub_id)
     elseif channel == "mcp" then
         -- MCP is pull-based: the client sends tools/list when ready.
@@ -254,6 +256,37 @@ function Client:handle_subscribe(msg)
     elseif channel == "preview" then
         log.debug(string.format("Preview subscription: %s", sub_id:sub(1, 16)))
     end
+end
+
+--- Send admitted spawn targets to a HubChannel subscription.
+-- Includes live inspection metadata such as git status and current branch.
+-- @param sub_id The subscription ID to send to
+function Client:send_spawn_target_list(sub_id)
+    local targets = {}
+    local registry = rawget(_G, "spawn_targets")
+    if registry and type(registry.list) == "function" then
+        local ok, listed = pcall(registry.list)
+        if ok and type(listed) == "table" then
+            for _, target in ipairs(listed) do
+                local merged = target
+                if type(registry.inspect) == "function" and target.path then
+                    local inspect_ok, inspection = pcall(registry.inspect, target.path)
+                    if inspect_ok and type(inspection) == "table" then
+                        merged = {}
+                        for k, v in pairs(target) do merged[k] = v end
+                        for k, v in pairs(inspection) do merged[k] = v end
+                    end
+                end
+                targets[#targets + 1] = merged
+            end
+        end
+    end
+
+    self:send({
+        subscriptionId = sub_id,
+        type = "spawn_target_list",
+        targets = targets,
+    })
 end
 
 --- Set up terminal subscription with PTY forwarder.
@@ -315,10 +348,44 @@ function Client:send_workspace_list(sub_id)
     })
 end
 
+--- Send open workspace list to a HubChannel subscription.
+-- Includes only workspaces that currently have running sessions.
+-- @param sub_id The subscription ID to send to
+function Client:send_open_workspace_list(sub_id)
+    local payload = require("lib.agent_list_payload").build(Agent.all_info())
+    self:send({
+        subscriptionId = sub_id,
+        type = "open_workspace_list",
+        workspaces = payload.workspaces,
+    })
+end
+
 --- Send worktree list to a HubChannel subscription.
 -- @param sub_id The subscription ID to send to
-function Client:send_worktree_list(sub_id)
-    local worktrees = hub.get_worktrees()
+function Client:send_worktree_list(sub_id, target)
+    local worktrees = {}
+    local registry = rawget(_G, "spawn_targets")
+    local inspection = nil
+    if registry and target and target.target_path and type(registry.inspect) == "function" then
+        local ok, result = pcall(registry.inspect, target.target_path)
+        if ok then
+            inspection = result
+        end
+    end
+
+    if inspection and inspection.supports_worktrees then
+        local repo_root = inspection.repo_root or target.target_path
+        local ok, listed = pcall(worktree.list_for_root, repo_root)
+        if ok and type(listed) == "table" then
+            worktrees = listed
+        else
+            log.warn(string.format(
+                "Failed to list worktrees for target %s: %s",
+                tostring(target and target.target_id),
+                tostring(listed)
+            ))
+        end
+    end
     log.info(string.format("Sending worktree list: %d worktrees", #worktrees))
     for i, wt in ipairs(worktrees) do
         log.debug(string.format("  Worktree %d: %s (%s)", i, wt.path or "?", wt.branch or "?"))
@@ -326,6 +393,9 @@ function Client:send_worktree_list(sub_id)
     self:send({
         subscriptionId = sub_id,
         type = "worktree_list",
+        target_id = target and target.target_id or nil,
+        target_path = target and target.target_path or nil,
+        target_repo = target and target.target_repo or nil,
         worktrees = worktrees,
     })
 end
@@ -407,7 +477,7 @@ function Client:handle_data(msg)
     end
 
     if sub.channel == "terminal" then
-        self:handle_terminal_data(sub, command)
+        self:handle_terminal_data(sub_id, sub, command)
     elseif sub.channel == "hub" then
         self:handle_hub_data(sub_id, command)
     elseif sub.channel == "mcp" then
@@ -417,9 +487,10 @@ end
 
 --- Handle terminal control messages (resize).
 --- Input is handled via binary CONTENT_PTY frames directly in Rust (poll_pty_input).
+-- @param sub_id The subscription id
 -- @param sub The subscription info
 -- @param command The terminal command
-function Client:handle_terminal_data(sub, command)
+function Client:handle_terminal_data(sub_id, sub, command)
     local session_uuid = sub.session_uuid
     local cmd_type = command.type
 
@@ -429,10 +500,29 @@ function Client:handle_terminal_data(sub, command)
     if cmd_type == "resize" or command.command == "resize" then
         local rows = command.rows or 24
         local cols = command.cols or 80
+        sub.rows = rows
+        sub.cols = cols
         if session_uuid then
             log.info(string.format("Resize: peer=%s, session=%s, %dx%d",
                 self.peer_id:sub(1, 8), session_uuid:sub(1, 16), cols, rows))
             pty_clients.update(session_uuid, self.peer_id, rows, cols)
+        end
+    elseif cmd_type == "request_snapshot" then
+        if session_uuid and self.transport.request_pty_snapshot then
+            local rows = command.rows or sub.rows or 24
+            local cols = command.cols or sub.cols or 80
+            sub.rows = rows
+            sub.cols = cols
+            log.info(string.format("Snapshot refresh: peer=%s, session=%s, %dx%d",
+                self.peer_id:sub(1, 8), session_uuid:sub(1, 16), cols, rows))
+            self.transport.request_pty_snapshot({
+                session_uuid = session_uuid,
+                subscription_id = sub_id,
+                rows = rows,
+                cols = cols,
+            })
+        else
+            log.warn(string.format("Snapshot refresh unavailable for %s", tostring(sub_id)))
         end
     else
         log.debug(string.format("Unknown terminal command: %s", tostring(cmd_type)))
@@ -462,10 +552,11 @@ function Client:handle_mcp_data(sub_id, command)
     local cmd_type = command.type
 
     if cmd_type == "tools_list" then
+        local ctx = sub and sub.caller_context or {}
         self:send({
             subscriptionId = sub_id,
             type = "tools_list",
-            tools = mcp.list_tools(),
+            tools = mcp.list_tools(ctx.session_uuid),
         })
 
     elseif cmd_type == "tool_call" then

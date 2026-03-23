@@ -287,9 +287,10 @@ function Hub:post(agent_id, opts)
 
         -- PTY doorbell — minimal trigger line only, payload stays in inbox
         if agent.session then
+            local sender_name = opts.from_label or envelope.from.agent_id
             agent.session:send_message(string.format(
                 "\n\xe2\xac\xa1 [botster-mcp] new message from %s \xe2\x80\x94 use receive_messages() via botster MCP\n",
-                envelope.from.agent_id
+                sender_name
             ))
             return { msg_id = envelope.msg_id, status = "delivered" }
         end
@@ -363,19 +364,19 @@ end
 -- @param profile string|nil Config profile name
 -- @param workspace_id string|nil Workspace ID
 -- @param workspace_name string|nil Workspace display name
+-- @param target table|nil Optional target context { target_id, target_path, target_repo }
 -- @return table Result payload
-function Hub:create_agent(issue_or_branch, prompt, profile, workspace_id, workspace_name)
+function Hub:create_agent(issue_or_branch, prompt, profile, workspace_id, workspace_name, target)
     if self._is_local then
         local agents_handler = require("handlers.agents")
-        local metadata = nil
+        local metadata = target and require("lib.target_context").with_metadata(nil, target) or nil
         if workspace_id or workspace_name then
-            metadata = {
-                workspace_id = workspace_id,
-                workspace = workspace_name,
-            }
+            metadata = metadata or {}
+            metadata.workspace_id = workspace_id
+            metadata.workspace = workspace_name
         end
         local agent, err = agents_handler.handle_create_agent(
-            issue_or_branch, prompt, nil, nil, profile, metadata
+            issue_or_branch, prompt, nil, nil, profile, metadata, target
         )
         if agent then
             return agent:info()
@@ -396,6 +397,9 @@ function Hub:create_agent(issue_or_branch, prompt, profile, workspace_id, worksp
         profile = profile,
         workspace_id = workspace_id,
         workspace_name = workspace_name,
+        target_id = target and target.target_id or nil,
+        target_path = target and target.target_path or nil,
+        target_repo = target and target.target_repo or nil,
     }, 60000)
 
     if result.error then
@@ -440,6 +444,7 @@ function Hub:list_workspaces()
             end
         end
 
+        local result = {}
         for _, workspace in ipairs(workspaces) do
             local counts = counts_by_id[workspace.id]
             workspace.agents = counts and counts.agents or {}
@@ -448,9 +453,13 @@ function Hub:list_workspaces()
                 accessory = 0,
                 other = 0,
             }
+            -- Only return workspaces with running sessions
+            if counts then
+                table.insert(result, workspace)
+            end
         end
 
-        return workspaces
+        return result
     end
 
     local result = hub_client.request(self._conn_id, {
@@ -495,6 +504,7 @@ function Hub:rename_workspace(workspace_id, new_name)
         connections.broadcast_hub_event("agent_list", {
             agents = Agent.all_info(),
         })
+        connections.broadcast_workspace_list()
 
         return {
             workspace_id = workspace_id,
@@ -539,6 +549,7 @@ function Hub:move_agent_workspace(agent_id, workspace_id, workspace_name)
         connections.broadcast_hub_event("agent_list", {
             agents = Agent.all_info(),
         })
+        connections.broadcast_workspace_list()
 
         return {
             agent_id = session:agent_key(),
