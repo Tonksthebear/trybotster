@@ -32,14 +32,6 @@
 import { HubRoute } from "connections/hub_route";
 
 export class TerminalConnection extends HubRoute {
-  // Snapshot buffering: chunks are held until all arrive, preventing garbled
-  // output from partial delivery if the connection drops mid-snapshot.
-  #snapshotBuffer = null; // { id, total, chunks: Map<index, Uint8Array>, timer }
-  // Live output buffered while a snapshot is being assembled — prevents the
-  // race where live PTY data feeds the parser mid-snapshot, causing
-  // doubled/garbled rendering when the completed snapshot replays state the
-  // parser already advanced past.
-  #liveOutputBuffer = [];
   // Backlog output that can arrive before transport wires onOutput().
   #earlyOutputBuffer = [];
   #earlyOutputBytes = 0;
@@ -77,26 +69,18 @@ export class TerminalConnection extends HubRoute {
       return;
     }
 
-    // console.log(`[TerminalConnection] handleMessage:`, message.type, message.data?.length || message);
-
     switch (message.type) {
       case "raw_output":
         // Raw bytes from CLI with prefix byte routing:
         //   0x00 = JSON control message
         //   0x01 = live PTY output (immediate passthrough)
-        //   0x02 = snapshot chunk (buffered until complete)
+        //   0x02 = complete snapshot (atomic replacement)
         if (message.data && message.data.length > 0) {
           const prefix = message.data[0];
           if (prefix === 0x01) {
-            const terminalData = message.data.slice(1);
-            if (this.#snapshotBuffer) {
-              // Snapshot in progress — hold live output until snapshot completes
-              this.#liveOutputBuffer.push(terminalData);
-            } else {
-              this.#emitOutput(terminalData);
-            }
+            this.#emitOutput(message.data.slice(1));
           } else if (prefix === 0x02) {
-            this.#handleSnapshotChunk(message.data);
+            this.#handleSnapshot(message.data.slice(1));
           } else {
             // JSON control message (0x00 prefix)
             const jsonData = new TextDecoder().decode(message.data.slice(1));
@@ -167,113 +151,27 @@ export class TerminalConnection extends HubRoute {
   }
 
   destroy() {
-    if (this.#snapshotBuffer) {
-      clearTimeout(this.#snapshotBuffer.timer);
-      this.#snapshotBuffer = null;
-    }
-    this.#liveOutputBuffer = [];
     this.#earlyOutputBuffer = [];
     this.#earlyOutputBytes = 0;
     super.destroy();
   }
 
-  // ========== Snapshot buffering ==========
+  // ========== Snapshot handling ==========
 
   /**
-   * Handle a snapshot chunk (prefix 0x02).
-   * Header: [0x02][snapshot_id:4 LE][chunk_idx:2 LE][total_chunks:2 LE][data]
+   * Handle a complete snapshot (prefix 0x02).
    *
-   * Chunks are buffered until the complete set arrives, then concatenated
-   * and emitted as a single output. If a new snapshot_id arrives, any
-   * partial buffer from the previous snapshot is discarded.
+   * The snapshot is a single atomic message — no chunking, no reassembly.
+   * WebRTC SCTP handles message fragmentation at the transport layer.
    */
-  #handleSnapshotChunk(data) {
-    if (data.length < 9) return; // too short for header
+  #handleSnapshot(data) {
+    if (data.length === 0) return;
 
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const snapshotId = view.getUint32(1, true);
-    const chunkIdx = view.getUint16(5, true);
-    const totalChunks = view.getUint16(7, true);
-    const chunkData = data.slice(9);
-
-    // New snapshot supersedes any in-progress buffer
-    if (this.#snapshotBuffer && this.#snapshotBuffer.id !== snapshotId) {
-      clearTimeout(this.#snapshotBuffer.timer);
-      this.#snapshotBuffer = null;
-      // Discard buffered live output — the new snapshot will contain
-      // a more recent point-in-time capture that supersedes it
-      this.#liveOutputBuffer = [];
-    }
-
-    // Initialize buffer for this snapshot
-    if (!this.#snapshotBuffer) {
-      this.emit("snapshotStart", {
-        snapshotId,
-        totalChunks,
-      });
-      this.#snapshotBuffer = {
-        id: snapshotId,
-        total: totalChunks,
-        chunks: new Map(),
-        timer: setTimeout(() => {
-          // Discard incomplete snapshot after 10s
-          console.debug(`[TerminalConnection] Snapshot ${snapshotId.toString(16)} timed out (${this.#snapshotBuffer?.chunks.size}/${totalChunks} chunks)`);
-          this.#snapshotBuffer = null;
-          // Flush any live output that was held during the failed snapshot
-          this.#flushLiveOutputBuffer();
-        }, 10000),
-      };
-    }
-
-    this.#snapshotBuffer.chunks.set(chunkIdx, chunkData);
-
-    // All chunks received — concatenate and emit
-    if (this.#snapshotBuffer.chunks.size === totalChunks) {
-      clearTimeout(this.#snapshotBuffer.timer);
-
-      let totalLen = 0;
-      for (let i = 0; i < totalChunks; i++) {
-        totalLen += this.#snapshotBuffer.chunks.get(i).length;
-      }
-
-      const combined = new Uint8Array(totalLen);
-      let offset = 0;
-      for (let i = 0; i < totalChunks; i++) {
-        const chunk = this.#snapshotBuffer.chunks.get(i);
-        combined.set(chunk, offset);
-        offset += chunk.length;
-      }
-
-      this.#snapshotBuffer = null;
-      console.debug(`[TerminalConnection] Snapshot ${snapshotId.toString(16)} complete: ${totalChunks} chunks, ${totalLen} bytes`);
-      const validated = this.#validateSnapshotCursor(combined);
-      this.#emitOutput(validated);
-
-      // Discard live output that arrived during snapshot assembly.
-      // The snapshot is a point-in-time grid capture that already includes
-      // all output processed before it was generated. Flushing the buffer
-      // would replay that same output, causing duplicate scrollback/messages.
-      // Note: output arriving between snapshot generation and chunk delivery
-      // (microseconds) is lost here, but self-heals on the next live frame.
-      this.#liveOutputBuffer = [];
-
-      this.emit("snapshotComplete", {
-        snapshotId,
-        totalChunks,
-        byteLength: validated.byteLength,
-      });
-    }
-  }
-
-  // ========== Live output buffer ==========
-
-  #flushLiveOutputBuffer() {
-    if (this.#liveOutputBuffer.length === 0) return;
-    const buffered = this.#liveOutputBuffer;
-    this.#liveOutputBuffer = [];
-    for (const chunk of buffered) {
-      this.#emitOutput(chunk);
-    }
+    console.debug(`[TerminalConnection] Snapshot complete: ${data.byteLength} bytes`);
+    this.emit("snapshotStart", { byteLength: data.byteLength });
+    const validated = this.#validateSnapshotCursor(data);
+    this.#emitOutput(validated);
+    this.emit("snapshotComplete", { byteLength: validated.byteLength });
   }
 
   // ========== Private helpers ==========

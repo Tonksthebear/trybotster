@@ -24,6 +24,7 @@ use crate::hub::actions::{self, HubAction};
 use crate::hub::{
     registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest, WebRtcPtyOutput,
 };
+use crate::hub::terminal_profile::TerminalProbe;
 use crate::notifications::push::send_push_direct;
 use base64::Engine;
 
@@ -77,6 +78,53 @@ impl Hub {
         }
         let truncated: String = single_line.chars().take(MAX).collect();
         format!("{truncated}...<truncated,len={char_count}>")
+    }
+
+    fn session_has_live_terminal_clients(&self, session_uuid: &str) -> bool {
+        self.pty_forwarders.keys().any(|key| {
+            key == &format!("tui:{session_uuid}") || key.ends_with(&format!(":{session_uuid}"))
+        })
+    }
+
+    fn learn_terminal_probe_replies(&mut self, peer_id: &str, data: &[u8]) {
+        self.terminal_profiles.observe_input(peer_id, data);
+    }
+
+    fn reply_to_headless_terminal_probes(
+        &mut self,
+        session_uuid: &str,
+        pty: &crate::hub::agent_handle::PtyHandle,
+        data: &[u8],
+    ) {
+        let probes = self.terminal_profiles.observe_output(session_uuid, data);
+        if probes.is_empty() || self.session_has_live_terminal_clients(session_uuid) {
+            return;
+        }
+
+        for probe in probes {
+            let Some(reply) = self
+                .terminal_profiles
+                .headless_reply(probe)
+                .map(std::borrow::ToOwned::to_owned)
+            else {
+                continue;
+            };
+
+            if let Err(e) = pty.write_input_direct(&reply) {
+                log::debug!(
+                    "[PTY-PROBE] Failed to answer {:?} for headless session {}: {}",
+                    probe,
+                    session_uuid,
+                    e
+                );
+            } else {
+                log::debug!(
+                    "[PTY-PROBE] Answered {:?} from cache for headless session {}",
+                    probe,
+                    session_uuid
+                );
+            }
+        }
     }
 
     /// Legacy polling entrypoint — calls all poll functions + flush.
@@ -464,7 +512,15 @@ impl Hub {
                 }
             }
             HubEvent::SocketMessage { client_id, msg } => {
-                if let Err(e) = self.lua.call_socket_message(&client_id, msg) {
+                // Intercept focus_changed before Lua — it updates pty_clients
+                // focus state for notification suppression, independent of
+                // whether the child PTY requested focus reporting.
+                if msg.get("type").and_then(|v| v.as_str()) == Some("focus_changed") {
+                    if let Some(session_uuid) = msg.get("session_uuid").and_then(|v| v.as_str()) {
+                        let focused = msg.get("focused").and_then(|v| v.as_bool()).unwrap_or(false);
+                        self.lua.set_pty_focused(session_uuid, &client_id, focused);
+                    }
+                } else if let Err(e) = self.lua.call_socket_message(&client_id, msg) {
                     log::error!("[Socket] Lua message handling error for {}: {e}", client_id);
                 }
             }
@@ -635,7 +691,8 @@ impl Hub {
                                 cmd.arg("build")
                                     .arg("--manifest-path")
                                     .arg(format!("{manifest_dir}/Cargo.toml"))
-                                    .current_dir(manifest_dir);
+                                    .current_dir(manifest_dir)
+                                    .stdin(std::process::Stdio::null());
                                 if let Some(target_dir) = target_dir_for_build {
                                     cmd.arg("--target-dir").arg(target_dir);
                                 }
@@ -921,6 +978,11 @@ impl Hub {
             } => {
                 if let Some(session_uuid) = self.broker_sessions.get(&session_id) {
                     if let Some(session_handle) = self.handle_cache.get_session(session_uuid) {
+                        self.reply_to_headless_terminal_probes(
+                            session_uuid,
+                            session_handle.pty(),
+                            &data,
+                        );
                         session_handle.pty().feed_broker_output(&data, flags);
                     } else {
                         log::debug!(
@@ -1144,14 +1206,14 @@ impl Hub {
                     log::error!("[TUI] Lua message handling error: {}", e);
                 }
             }
+            TuiRequest::FocusChanged {
+                session_uuid,
+                focused,
+            } => {
+                self.lua.set_pty_focused(&session_uuid, "tui", focused);
+            }
             TuiRequest::PtyInput { session_uuid, data } => {
-                // Track per-client focus state in Lua pty_clients
-                // (before notify_pty_input so focus is current).
-                if data == b"\x1b[I" {
-                    self.lua.set_pty_focused(&session_uuid, "tui", true);
-                } else if data == b"\x1b[O" {
-                    self.lua.set_pty_focused(&session_uuid, "tui", false);
-                }
+                self.learn_terminal_probe_replies("tui", &data);
                 self.lua.notify_pty_input(&session_uuid);
                 if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
                     if let Err(e) = session_handle.pty().write_input_direct(&data) {
@@ -1177,6 +1239,7 @@ impl Hub {
             self.lua
                 .set_pty_focused(&input.session_uuid, &input.browser_identity, false);
         }
+        self.learn_terminal_probe_replies(&input.browser_identity, &input.data);
         self.lua.notify_pty_input(&input.session_uuid);
 
         if let Some(session_handle) = self.handle_cache.get_session(&input.session_uuid) {
@@ -2731,51 +2794,41 @@ impl Hub {
             return true;
         }
 
-        const CHUNK_SIZE: usize = 64 * 1024;
-        let num_chunks = (snapshot.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let snapshot_id: u32 = rand::random();
         log::debug!(
-            "[Lua] Sending {} bytes of snapshot in {} chunks (id={:#010x}) for session {}",
+            "[Lua] Sending {} bytes of snapshot for session {}",
             snapshot.len(),
-            num_chunks,
-            snapshot_id,
             session_uuid
         );
 
-        for (i, chunk) in snapshot.chunks(CHUNK_SIZE).enumerate() {
-            let mut raw_message = Vec::with_capacity(9 + chunk.len());
-            raw_message.push(0x02);
-            raw_message.extend_from_slice(&snapshot_id.to_le_bytes());
-            raw_message.extend_from_slice(&(i as u16).to_le_bytes());
-            raw_message.extend_from_slice(&(num_chunks as u16).to_le_bytes());
-            raw_message.extend(chunk);
+        // Single message: [0x02 prefix][snapshot bytes]
+        // WebRTC SCTP handles message fragmentation automatically.
+        let mut raw_message = Vec::with_capacity(1 + snapshot.len());
+        raw_message.push(0x02);
+        raw_message.extend(snapshot);
 
-            match output_tx.try_send(WebRtcPtyOutput {
-                subscription_id: subscription_id.to_string(),
-                browser_identity: peer_id.to_string(),
-                data: raw_message,
-                session_uuid: session_uuid.to_string(),
-            }) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    log::warn!(
-                        "[Lua] WebRTC PTY output queue full during snapshot send for {}",
-                        &peer_id[..peer_id.len().min(8)]
-                    );
-                    let _ = hub_event_tx.send(super::events::HubEvent::WebRtcIngressBackpressure {
-                        browser_identity: peer_id.to_string(),
-                        source: "pty_output_snapshot_queue_full",
-                    });
-                    return false;
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    log::trace!("[Lua] PTY output queue closed during snapshot send");
-                    return false;
-                }
+        match output_tx.try_send(WebRtcPtyOutput {
+            subscription_id: subscription_id.to_string(),
+            browser_identity: peer_id.to_string(),
+            data: raw_message,
+            session_uuid: session_uuid.to_string(),
+        }) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                log::warn!(
+                    "[Lua] WebRTC PTY output queue full during snapshot send for {}",
+                    &peer_id[..peer_id.len().min(8)]
+                );
+                let _ = hub_event_tx.send(super::events::HubEvent::WebRtcIngressBackpressure {
+                    browser_identity: peer_id.to_string(),
+                    source: "pty_output_snapshot_queue_full",
+                });
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                log::trace!("[Lua] PTY output queue closed during snapshot send");
+                false
             }
         }
-
-        true
     }
 
     /// Send recovery snapshots for peers that experienced backpressure drops.
@@ -2866,7 +2919,7 @@ impl Hub {
                         &session_uuid[..session_uuid.len().min(8)]
                     );
 
-                    Self::send_snapshot_chunks_to_peer(
+                    Self::send_snapshot_to_peer(
                         &peer_tx,
                         &subscription_id,
                         &snapshot,
@@ -2890,7 +2943,7 @@ impl Hub {
             // Chunk and send directly through the per-peer channel,
             // bypassing the output queue to avoid re-triggering backpressure.
             let peer_tx = peer_state.unwrap().tx.clone();
-            Self::send_snapshot_chunks_to_peer(
+            Self::send_snapshot_to_peer(
                 &peer_tx,
                 &entry.subscription_id,
                 &snapshot,
@@ -2898,34 +2951,27 @@ impl Hub {
         }
     }
 
-    /// Chunk a snapshot and send directly through a per-peer channel.
+    /// Send a snapshot directly through a per-peer channel.
     ///
     /// Bypasses the output queue to avoid re-triggering backpressure.
     /// Used by both sync (cached) and async (broker) recovery paths.
-    fn send_snapshot_chunks_to_peer(
+    fn send_snapshot_to_peer(
         peer_tx: &tokio::sync::mpsc::Sender<super::WebRtcSendItem>,
         subscription_id: &str,
         snapshot: &[u8],
     ) {
-        const CHUNK_SIZE: usize = 64 * 1024;
-        let num_chunks = (snapshot.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        let snapshot_id: u32 = rand::random();
+        // Single message: [0x02 prefix][snapshot bytes]
+        // WebRTC SCTP handles message fragmentation automatically.
+        let mut raw_message = Vec::with_capacity(1 + snapshot.len());
+        raw_message.push(0x02);
+        raw_message.extend(snapshot);
 
-        for (i, chunk) in snapshot.chunks(CHUNK_SIZE).enumerate() {
-            let mut raw_message = Vec::with_capacity(9 + chunk.len());
-            raw_message.push(0x02); // snapshot chunk prefix
-            raw_message.extend_from_slice(&snapshot_id.to_le_bytes());
-            raw_message.extend_from_slice(&(i as u16).to_le_bytes());
-            raw_message.extend_from_slice(&(num_chunks as u16).to_le_bytes());
-            raw_message.extend(chunk);
-
-            // try_send to avoid blocking; if still full, the snapshot
-            // is best-effort — live stream will eventually resync.
-            let _ = peer_tx.try_send(super::WebRtcSendItem::Pty {
-                subscription_id: subscription_id.to_string(),
-                data: raw_message,
-            });
-        }
+        // try_send to avoid blocking; if still full, the snapshot
+        // is best-effort — live stream will eventually resync.
+        let _ = peer_tx.try_send(super::WebRtcSendItem::Pty {
+            subscription_id: subscription_id.to_string(),
+            data: raw_message,
+        });
     }
 
     /// Process pending terminal attach intents.
@@ -4172,6 +4218,12 @@ impl Hub {
                     if let Err(e) = self.lua.call_tui_message(msg) {
                         log::error!("[TUI] Lua message handling error: {}", e);
                     }
+                }
+                TuiRequest::FocusChanged {
+                    session_uuid,
+                    focused,
+                } => {
+                    self.lua.set_pty_focused(&session_uuid, "tui", focused);
                 }
                 TuiRequest::PtyInput { session_uuid, data } => {
                     if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
@@ -5559,7 +5611,7 @@ mod tests {
         // Wait for broker thread to complete (it handles the GetSnapshot RPC).
         broker.join().expect("broker thread panicked");
 
-        // Wait for the async task to deliver snapshot chunks to the peer channel.
+        // Wait for the async task to deliver snapshot to the peer channel.
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut received = Vec::new();
         while Instant::now() < deadline {
@@ -5574,17 +5626,17 @@ mod tests {
 
         assert!(
             !received.is_empty(),
-            "broker-backed recovery should deliver snapshot chunks to peer channel"
+            "broker-backed recovery should deliver snapshot to peer channel"
         );
 
-        // Verify the snapshot chunk has the expected prefix and data.
+        // Verify the snapshot has the expected prefix and data.
         if let super::super::WebRtcSendItem::Pty { data, .. } = &received[0] {
-            assert_eq!(data[0], 0x02, "snapshot chunk should have 0x02 prefix");
-            let payload = &data[9..]; // skip prefix (1) + snapshot_id (4) + chunk_idx (2) + num_chunks (2)
+            assert_eq!(data[0], 0x02, "snapshot should have 0x02 prefix");
+            let payload = &data[1..]; // skip prefix byte only
             let text = String::from_utf8_lossy(payload);
             assert!(
                 text.contains("broker-snapshot-recovery"),
-                "snapshot chunk should contain broker snapshot data, got: {text:?}"
+                "snapshot should contain broker snapshot data, got: {text:?}"
             );
         } else {
             panic!("Expected Pty send item");
