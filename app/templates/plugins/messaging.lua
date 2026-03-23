@@ -60,7 +60,7 @@ mcp.tool("post_message", {
     local target_agent_id = params.agent_id
     if not target_agent_id and params.agent_label then
         for _, agent in ipairs(Agent.list()) do
-            if agent._label == params.agent_label then
+            if agent.label == params.agent_label then
                 target_agent_id = agent:agent_key()
                 break
             end
@@ -78,8 +78,8 @@ mcp.tool("post_message", {
     local sender_display = sender_key
     if sender_key ~= "unknown" then
         local sender = Agent.find_by_agent_key(sender_key)
-        if sender and sender._label and sender._label ~= "" then
-            sender_display = sender._label
+        if sender and sender.label and sender.label ~= "" then
+            sender_display = sender.label
         end
     end
 
