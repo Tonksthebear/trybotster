@@ -2279,7 +2279,7 @@ mod tests {
 
         assert_eq!(
             runner.mode(),
-            "new_agent_select_agent",
+            "new_agent_select_target",
             "Should enter agent config selection"
         );
 
@@ -2448,7 +2448,7 @@ mod tests {
             .list_state("spawn_target_list")
             .set_selectable_count(1);
         process_key_with_lua(&mut runner, make_key_enter(), &lua);
-        assert_eq!(runner.mode(), "new_agent_select_agent");
+        assert_eq!(runner.mode(), "new_agent_select_target");
 
         // Simulate single agent config response (auto-skips to workspace selection)
         {
@@ -3799,7 +3799,7 @@ mod tests {
 
         assert_eq!(
             runner.mode(),
-            "new_agent_select_agent",
+            "new_agent_select_target",
             "Selecting New Agent should enter agent config selection"
         );
 
@@ -3980,7 +3980,7 @@ mod tests {
             .list_state("spawn_target_list")
             .set_selectable_count(1);
         press_key_and_render(&mut runner, make_key_enter(), &lua);
-        assert_eq!(runner.mode(), "new_agent_select_agent");
+        assert_eq!(runner.mode(), "new_agent_select_target");
 
         // Simulate single agent config response (auto-skips to workspace selection)
         {
@@ -4104,7 +4104,7 @@ mod tests {
         }
         press_key_and_render(&mut runner, make_key_enter(), &lua);
         thread::sleep(Duration::from_millis(10));
-        assert_eq!(runner.mode(), "new_agent_select_agent");
+        assert_eq!(runner.mode(), "new_agent_select_target");
         press_key_and_render(&mut runner, make_key_escape(), &lua);
         assert_eq!(
             runner.mode(),
