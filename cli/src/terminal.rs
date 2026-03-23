@@ -1409,7 +1409,10 @@ mod tests {
         // Row 1 col 0 should contain the wide char in both.
         let src_cell = &src.term().grid()[Point::new(Line(1), Column(0))];
         let dst_cell = &dst.term().grid()[Point::new(Line(1), Column(0))];
-        assert_eq!(src_cell.c, dst_cell.c, "wide char should round-trip across wrap");
+        assert_eq!(
+            src_cell.c, dst_cell.c,
+            "wide char should round-trip across wrap"
+        );
     }
 
     #[test]
@@ -1429,7 +1432,10 @@ mod tests {
         // Row 0 col 0 should be red in both.
         let src_cell = &src.term().grid()[Point::new(Line(0), Column(0))];
         let dst_cell = &dst.term().grid()[Point::new(Line(0), Column(0))];
-        assert_eq!(src_cell.fg, dst_cell.fg, "wrapped row color should round-trip");
+        assert_eq!(
+            src_cell.fg, dst_cell.fg,
+            "wrapped row color should round-trip"
+        );
 
         // Row 1 col 0 ('F') should be default fg in both.
         let src_cell = &src.term().grid()[Point::new(Line(1), Column(0))];
@@ -1438,7 +1444,10 @@ mod tests {
             src_cell.fg, dst_cell.fg,
             "continuation after wrap should have correct (default) color"
         );
-        assert_eq!(src_cell.c, dst_cell.c, "continuation char should round-trip");
+        assert_eq!(
+            src_cell.c, dst_cell.c,
+            "continuation char should round-trip"
+        );
     }
 
     #[test]
@@ -1583,7 +1592,10 @@ mod tests {
 
         // Plain text after the link should NOT have a hyperlink.
         let dst_plain = &dst.term().grid()[Point::new(Line(0), Column(5))];
-        assert!(dst_plain.hyperlink().is_none(), "dest plain cell should have no link");
+        assert!(
+            dst_plain.hyperlink().is_none(),
+            "dest plain cell should have no link"
+        );
     }
 
     #[test]

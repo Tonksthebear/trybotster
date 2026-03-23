@@ -1295,7 +1295,9 @@ where
                                 log::debug!("[FOCUS] synthetic focus-in on mode change to insert");
                                 self.handle_pty_input(b"\x1b[I");
                             } else {
-                                log::debug!("[FOCUS] synthetic focus-out on mode change from insert");
+                                log::debug!(
+                                    "[FOCUS] synthetic focus-out on mode change from insert"
+                                );
                                 self.handle_pty_input(b"\x1b[O");
                             }
                         }
