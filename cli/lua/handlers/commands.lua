@@ -117,6 +117,37 @@ commands.register("remove_spawn_target", function(client, sub_id, command)
     connections.broadcast_spawn_target_list()
 end, { description = "Remove an admitted spawn target" })
 
+commands.register("rename_spawn_target", function(client, sub_id, command)
+    local registry = rawget(_G, "spawn_targets")
+    if not registry or type(registry.update) ~= "function" then
+        send_spawn_target_feedback(client, sub_id, "error", "Spawn target registry is unavailable.")
+        return
+    end
+
+    local target_id = command.target_id
+    if not target_id or target_id == "" then
+        send_spawn_target_feedback(client, sub_id, "error", "Target ID is required to rename a spawn target.")
+        return
+    end
+
+    local new_name = command.new_name
+    if not new_name or new_name == "" then
+        send_spawn_target_feedback(client, sub_id, "error", "New name is required to rename a spawn target.")
+        return
+    end
+
+    local ok, updated = pcall(registry.update, target_id, new_name)
+    if not ok or type(updated) ~= "table" then
+        send_spawn_target_feedback(client, sub_id, "error", tostring(updated or "Failed to rename spawn target."))
+        log.warn(string.format("rename_spawn_target failed: %s", tostring(updated)))
+        return
+    end
+
+    local connections = require("handlers.connections")
+    send_spawn_target_feedback(client, sub_id, "success", string.format("Renamed spawn target to %s.", new_name))
+    connections.broadcast_spawn_target_list()
+end, { description = "Rename an admitted spawn target" })
+
 commands.register("list_workspaces", function(client, sub_id, _command)
     local Hub = require("lib.hub")
     local ok, workspaces = pcall(function()

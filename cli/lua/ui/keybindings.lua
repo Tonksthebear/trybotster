@@ -93,6 +93,9 @@ M.new_agent_select_workspace = list_nav
 M.new_agent_select_worktree = list_nav
 M.new_agent_select_agent = list_nav
 M.new_agent_select_target = list_nav
+M.new_accessory_select_target = list_nav
+M.new_accessory_select = list_nav
+M.new_accessory_select_workspace = list_nav
 M.new_workspace_name_input = text_input
 M.new_agent_create_worktree = text_input
 M.new_agent_prompt = text_input
@@ -126,8 +129,10 @@ M.spawn_targets_info = {
   ["j"]      = "list_down",
   ["a"]      = "spawn_target_add",
   ["d"]      = "spawn_target_remove",
+  ["n"]      = "spawn_target_rename",
   ["r"]      = "refresh_spawn_targets",
 }
+M.rename_spawn_target_input = text_input
 
 M.error = {
   ["escape"] = "close_modal",
@@ -157,7 +162,7 @@ function M.handle_key(key, mode, context)
   end
 
   -- Mode-specific fallback logic
-  if mode == "new_workspace_name_input" or mode == "new_agent_create_worktree" or mode == "new_agent_prompt" or mode == "spawn_target_path_input" then
+  if mode == "new_workspace_name_input" or mode == "new_agent_create_worktree" or mode == "new_agent_prompt" or mode == "spawn_target_path_input" or mode == "rename_spawn_target_input" then
     if key == "backspace" then
       return { action = "input_backspace" }
     end
@@ -173,7 +178,7 @@ function M.handle_key(key, mode, context)
     return nil
   end
 
-  if mode == "menu" or mode == "new_agent_select_workspace" or mode == "new_agent_select_worktree" or mode == "new_agent_select_agent" or mode == "new_agent_select_target" then
+  if mode == "menu" or mode == "new_agent_select_workspace" or mode == "new_agent_select_worktree" or mode == "new_agent_select_agent" or mode == "new_agent_select_target" or mode == "new_accessory_select_target" or mode == "new_accessory_select" or mode == "new_accessory_select_workspace" then
     -- Number shortcuts 1-9 for list selection
     if mode == "menu" and #key == 1 and key:match("%d") then
       local idx = tonumber(key) - 1

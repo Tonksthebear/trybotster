@@ -185,6 +185,27 @@ export default class extends Controller {
     this.hub.removeSpawnTarget(targetId);
   }
 
+  renameTarget(event) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const { targetId, targetName } = event.currentTarget.dataset;
+    if (!targetId) return;
+
+    const input = window.prompt("Rename spawn target:", targetName || "");
+    if (input === null) return;
+
+    const newName = input.trim();
+    if (!newName || newName === targetName) return;
+
+    if (!this.hub) {
+      this.#setFeedback("Hub is not ready yet.", "error");
+      return;
+    }
+
+    this.hub.renameSpawnTarget(targetId, newName);
+  }
+
   #render() {
     if (!this.hasListTarget) return;
 
@@ -265,13 +286,27 @@ export default class extends Controller {
     note.textContent = target.enabled === false ? "Disabled target" : "Admitted target";
     footer.appendChild(note);
 
+    const actions = document.createElement("div");
+    actions.className = "flex items-center gap-3";
+
+    const rename = document.createElement("button");
+    rename.type = "button";
+    rename.dataset.action = "spawn-target-browser#renameTarget";
+    rename.dataset.targetId = target.id;
+    rename.dataset.targetName = target.name;
+    rename.className = "text-xs text-zinc-500 hover:text-zinc-200 transition-colors";
+    rename.textContent = "Rename";
+    actions.appendChild(rename);
+
     const remove = document.createElement("button");
     remove.type = "button";
     remove.dataset.action = "spawn-target-browser#removeTarget";
     remove.dataset.targetId = target.id;
     remove.className = "text-xs text-zinc-500 hover:text-red-300 transition-colors";
     remove.textContent = "Remove";
-    footer.appendChild(remove);
+    actions.appendChild(remove);
+
+    footer.appendChild(actions);
 
     wrapper.appendChild(footer);
 

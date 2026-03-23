@@ -366,6 +366,7 @@ const TRANSPORT_METHODS = [
   "requestSpawnTargets",
   "addSpawnTarget",
   "removeSpawnTarget",
+  "renameSpawnTarget",
   "addSession",
   "removeSession",
   "requestSessionTypes",
