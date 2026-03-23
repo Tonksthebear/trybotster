@@ -216,7 +216,7 @@ export default class extends Controller {
 
     const agentId = event.currentTarget.dataset.agentId;
     const agent = this.agentsValue.find((a) => a.id === agentId);
-    const name = agent?.display_name || agent?.id || "this agent";
+    const name = agent?.label || agent?.display_name || agent?.id || "this agent";
     const inWorktree = agent?.in_worktree ?? true; // default to showing option
 
     // Set pending info on modal controller element and open dialog
@@ -410,28 +410,33 @@ export default class extends Controller {
     this.#setDataAttributes(root, agent);
 
     // Fill fields
+    const hasLabel = agent.label && agent.label.trim() !== "";
+
     root.querySelectorAll("[data-field]").forEach((el) => {
       const field = el.dataset.field;
       if (field === "name") {
-        el.textContent = agent.display_name || agent.id;
+        // Label is primary display name when present
+        el.textContent = hasLabel
+          ? agent.label
+          : agent.display_name || agent.id;
         // Accessories get muted styling
         if (isAccessory) {
           el.classList.add("text-zinc-400");
           el.classList.remove("text-zinc-100");
         }
       } else if (field === "subtext") {
-        if (isAccessory) {
-          el.textContent = "accessory";
-        } else {
-          const parts = [];
-          if (agent.profile_name) parts.push(agent.profile_name);
-          if (agent.branch_name) parts.push(agent.branch_name);
-          el.textContent = parts.join(" · ");
-        }
+        // Secondary: spawn target · branch · config name (matches TUI)
+        const parts = [];
+        if (agent.target_name) parts.push(agent.target_name);
+        if (agent.branch_name) parts.push(agent.branch_name);
+        const configName = agent.agent_name || agent.profile_name;
+        if (configName) parts.push(configName);
+        if (isAccessory && parts.length === 0) parts.push("accessory");
+        el.textContent = parts.join(" · ");
       } else if (field === "label") {
-        if (agent.label) {
-          el.textContent = agent.label;
-          el.classList.remove("hidden");
+        // Label already shown as primary name — hide this field
+        if (hasLabel) {
+          // Don't show label again; keep hidden
         }
       } else if (field === "task") {
         if (agent.task) {

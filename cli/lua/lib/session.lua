@@ -874,6 +874,26 @@ function Session:build_env(base_env)
             env[k] = v
         end
     end
+
+    -- Preserve terminal identity/capability hints from the Botster process so
+    -- child CLIs can make the same color/UI decisions they would outside Botster.
+    local passthrough_env = {
+        "COLORTERM",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+        "LC_TERMINAL",
+        "LC_TERMINAL_VERSION",
+        "COLORFGBG",
+    }
+    for _, key in ipairs(passthrough_env) do
+        if env[key] == nil then
+            local value = os.getenv(key)
+            if value and value ~= "" then
+                env[key] = value
+            end
+        end
+    end
+
     env.TERM = env.TERM or os.getenv("TERM") or "xterm-256color"
     env.BOTSTER_WORKTREE_PATH = self.worktree_path
     if self.target_id then env.BOTSTER_TARGET_ID = self.target_id end
@@ -901,6 +921,17 @@ function Session:build_env(base_env)
     -- Fire filter hook for customization
     env = hooks.call("filter_agent_env", env, self) or env
     return env
+end
+
+--- Resolve spawn target name from registry (hub runtime only).
+-- @return string|nil Target name or nil if unavailable
+function Session:_resolve_target_name()
+    local registry = rawget(_G, "spawn_targets")
+    if registry and type(registry.get) == "function" and self.target_id then
+        local ok, tgt = pcall(registry.get, self.target_id)
+        if ok and tgt then return tgt.name end
+    end
+    return nil
 end
 
 --- Get session metadata for clients.
@@ -942,6 +973,7 @@ function Session:info()
         profile_name = self.profile_name,  -- backward compat
         repo = self.repo,
         target_id = self.target_id,
+        target_name = self:_resolve_target_name(),
         target_path = self.target_path,
         target_repo = self.target_repo,
         metadata = self.metadata,
