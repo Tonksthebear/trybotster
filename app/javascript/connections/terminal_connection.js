@@ -35,6 +35,11 @@ export class TerminalConnection extends HubRoute {
   // Snapshot buffering: chunks are held until all arrive, preventing garbled
   // output from partial delivery if the connection drops mid-snapshot.
   #snapshotBuffer = null; // { id, total, chunks: Map<index, Uint8Array>, timer }
+  // Live output buffered while a snapshot is being assembled — prevents the
+  // race where live PTY data feeds the parser mid-snapshot, causing
+  // doubled/garbled rendering when the completed snapshot replays state the
+  // parser already advanced past.
+  #liveOutputBuffer = [];
   // Backlog output that can arrive before transport wires onOutput().
   #earlyOutputBuffer = [];
   #earlyOutputBytes = 0;
@@ -84,7 +89,12 @@ export class TerminalConnection extends HubRoute {
           const prefix = message.data[0];
           if (prefix === 0x01) {
             const terminalData = message.data.slice(1);
-            this.#emitOutput(terminalData);
+            if (this.#snapshotBuffer) {
+              // Snapshot in progress — hold live output until snapshot completes
+              this.#liveOutputBuffer.push(terminalData);
+            } else {
+              this.#emitOutput(terminalData);
+            }
           } else if (prefix === 0x02) {
             this.#handleSnapshotChunk(message.data);
           } else {
@@ -161,6 +171,7 @@ export class TerminalConnection extends HubRoute {
       clearTimeout(this.#snapshotBuffer.timer);
       this.#snapshotBuffer = null;
     }
+    this.#liveOutputBuffer = [];
     this.#earlyOutputBuffer = [];
     this.#earlyOutputBytes = 0;
     super.destroy();
@@ -189,6 +200,9 @@ export class TerminalConnection extends HubRoute {
     if (this.#snapshotBuffer && this.#snapshotBuffer.id !== snapshotId) {
       clearTimeout(this.#snapshotBuffer.timer);
       this.#snapshotBuffer = null;
+      // Discard buffered live output — the new snapshot will contain
+      // a more recent point-in-time capture that supersedes it
+      this.#liveOutputBuffer = [];
     }
 
     // Initialize buffer for this snapshot
@@ -205,6 +219,8 @@ export class TerminalConnection extends HubRoute {
           // Discard incomplete snapshot after 10s
           console.debug(`[TerminalConnection] Snapshot ${snapshotId.toString(16)} timed out (${this.#snapshotBuffer?.chunks.size}/${totalChunks} chunks)`);
           this.#snapshotBuffer = null;
+          // Flush any live output that was held during the failed snapshot
+          this.#flushLiveOutputBuffer();
         }, 10000),
       };
     }
@@ -232,11 +248,28 @@ export class TerminalConnection extends HubRoute {
       console.debug(`[TerminalConnection] Snapshot ${snapshotId.toString(16)} complete: ${totalChunks} chunks, ${totalLen} bytes`);
       const validated = this.#validateSnapshotCursor(combined);
       this.#emitOutput(validated);
+
+      // Flush live output that arrived while the snapshot was being assembled.
+      // This output post-dates the snapshot's point-in-time capture, so it
+      // must be applied after the snapshot to maintain correct ordering.
+      this.#flushLiveOutputBuffer();
+
       this.emit("snapshotComplete", {
         snapshotId,
         totalChunks,
         byteLength: validated.byteLength,
       });
+    }
+  }
+
+  // ========== Live output buffer ==========
+
+  #flushLiveOutputBuffer() {
+    if (this.#liveOutputBuffer.length === 0) return;
+    const buffered = this.#liveOutputBuffer;
+    this.#liveOutputBuffer = [];
+    for (const chunk of buffered) {
+      this.#emitOutput(chunk);
     }
   }
 

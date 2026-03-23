@@ -251,6 +251,33 @@ const PEER_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 /// the Lua callback is slow. At ~4KB per PTY chunk this caps at ~4MB.
 const PTY_OBSERVER_QUEUE_CAPACITY: usize = 1024;
 
+/// Cooldown before sending a backpressure-recovery snapshot.
+///
+/// After the per-peer send channel drops PTY frames, we wait this long
+/// for the burst to subside before sending a fresh snapshot. This avoids
+/// sending large snapshots into a still-congested channel.
+const BACKPRESSURE_SNAPSHOT_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Result of attempting to queue a PTY frame for WebRTC delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebRtcSendOutcome {
+    /// Frame queued successfully.
+    Sent,
+    /// Per-peer channel full — frame was dropped (peer is slow).
+    Backpressure,
+    /// Peer is dead or disconnected — no send task available.
+    Dead,
+}
+
+/// Entry tracking a peer+session that needs a backpressure-recovery snapshot.
+#[derive(Debug, Clone)]
+struct BackpressureRecoveryEntry {
+    browser_identity: String,
+    session_uuid: String,
+    subscription_id: String,
+    last_drop: Instant,
+}
+
 /// Generate a stable hub_identifier from a repo path.
 ///
 /// Uses SHA256 hash of the absolute path to ensure the same repo
@@ -403,6 +430,15 @@ pub struct Hub {
     ///
     /// Maps subscriptionId -> JoinHandle for the forwarder task.
     pty_forwarders: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+
+    /// Pending backpressure-recovery snapshots.
+    ///
+    /// When PTY frames are dropped due to per-peer channel backpressure,
+    /// we record the affected session here. After a cooldown, `tick_periodic`
+    /// sends a fresh snapshot to resync the browser's terminal parser.
+    /// Key: `{browser_identity}:{session_uuid}`.
+    webrtc_backpressure_recovery:
+        std::collections::HashMap<String, BackpressureRecoveryEntry>,
     /// Pending terminal attach intents waiting for session registration.
     ///
     /// Keyed by forwarder ID (`{peer_id}:{session_uuid}` / `tui:{session_uuid}` /
@@ -673,6 +709,7 @@ impl Hub {
             webrtc_pty_output_tx,
             webrtc_pty_output_rx: Some(webrtc_pty_output_rx),
             pty_forwarders: std::collections::HashMap::new(),
+            webrtc_backpressure_recovery: std::collections::HashMap::new(),
             pending_terminal_attaches: std::collections::HashMap::new(),
             webrtc_outgoing_signal_tx,
             webrtc_outgoing_signal_rx: Some(webrtc_outgoing_signal_rx),
