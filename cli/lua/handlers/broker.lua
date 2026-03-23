@@ -86,7 +86,6 @@ local function recover_session(record, broker_session, recovered, seen_keys)
         session_uuid      = session_uuid,
         session_type      = sess.session_type or "agent",
         session_name      = sess.session_name,
-        agent_key         = sess.id,  -- backward compat for _init_recovered
         repo              = sess.repo,
         target_id         = sess.target_id,
         target_path       = sess.target_path,

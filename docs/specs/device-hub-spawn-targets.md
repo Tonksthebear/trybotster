@@ -422,9 +422,9 @@ Agent manifests optionally declare which plugins the agent wants (see Agent Mani
 When a session connects to MCP, tools are loaded — not filtered from a global list, but constructed for that session:
 
 ```
-session_uuid → session manifest → agent_key + target_id
+session_uuid → session manifest → agent_name + target_id
 target_id    → target's available plugins (ceiling)
-agent_key    → agent manifest's requested plugins (optional)
+agent_name   → agent manifest's requested plugins (optional)
 result       → if both declare plugins: intersection
                if only target declares: target ceiling
                if only agent declares: agent's list

@@ -252,7 +252,7 @@ function Client:handle_subscribe(msg)
         self.subscriptions[sub_id].caller_context = params.context or {}
         local ctx = params.context or {}
         log.info(string.format("MCP subscription from %s... (agent=%s, hub=%s)",
-            self.peer_id:sub(1, 8), tostring(ctx.session_uuid or ctx.agent_key), tostring(ctx.hub_id)))
+            self.peer_id:sub(1, 8), tostring(ctx.session_uuid), tostring(ctx.hub_id)))
     elseif channel == "preview" then
         log.debug(string.format("Preview subscription: %s", sub_id:sub(1, 16)))
     end

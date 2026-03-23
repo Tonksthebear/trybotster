@@ -62,12 +62,12 @@ The `events` primitive provides a separate pub-sub layer from hooks. Rust emits 
 | Event | Source | Payload |
 |-------|--------|---------|
 | `command_message` | `hub_commands.lua` via ActionCable | create_agent / delete_agent commands |
-| `worktree_created` | Rust async worktree create | `{branch, path, issue_number, prompt, agent_key, profile_name, client_rows, client_cols}` |
+| `worktree_created` | Rust async worktree create | `{branch, path, issue_number, prompt, session_uuid, profile_name, client_rows, client_cols}` |
 | `worktree_create_failed` | Rust async worktree create | `{branch, error}` |
 | `connection_code_ready` | Rust connection generation | `{url, qr_ascii}` |
 | `connection_code_error` | Rust connection generation | error string |
 | `agent_status_changed` | Rust/Lua | `{agent_id, status}` |
-| `process_exited` | Rust PTY watcher | `{agent_key, exit_code}` |
+| `process_exited` | Rust PTY watcher | `{session_uuid, exit_code}` |
 | `outgoing_signal` | Rust WebRTC | Pre-encrypted signal data for ActionCable relay |
 
 ## Rust -> Lua Bridge Methods

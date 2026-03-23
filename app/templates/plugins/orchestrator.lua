@@ -87,7 +87,7 @@ mcp.tool("whoami", {
         properties = {},
     },
 }, function(params, context)
-    local caller_id = context.session_uuid or context.agent_key
+    local caller_id = context.session_uuid
     local result = {
         session_uuid = caller_id,
         hub_id = context.hub_id,
@@ -120,7 +120,7 @@ mcp.tool("list_hubs", {
         properties = {},
     },
 }, function(params, context)
-    local caller_key = context.session_uuid or context.agent_key
+    local caller_key = context.session_uuid
     local caller_hub = context.hub_id
     local result = {}
 

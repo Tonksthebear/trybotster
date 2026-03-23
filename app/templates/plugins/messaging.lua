@@ -73,8 +73,8 @@ mcp.tool("post_message", {
         return json.encode({ error = "Either agent_id or agent_label is required" })
     end
 
-    -- Resolve sender display name: use label if available, else agent key
-    local sender_key = context.session_uuid or context.agent_key or "unknown"
+    -- Resolve sender display name: use label if available, else session uuid
+    local sender_key = context.session_uuid or "unknown"
     local sender_display = sender_key
     if sender_key ~= "unknown" then
         local sender = Agent.get(sender_key)
@@ -112,7 +112,7 @@ mcp.tool("receive_messages", {
         error("receive_messages: agent_id is not allowed; only the caller inbox can be drained")
     end
 
-    local caller_agent_id = context.session_uuid or context.agent_key
+    local caller_agent_id = context.session_uuid
     if not caller_agent_id or caller_agent_id == "" then
         error("receive_messages: caller agent context is required")
     end
