@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/orchestrator/init.lua
 -- @scope device
--- @version 2.2.0
+-- @version 2.3.0
 
 -- Orchestrator plugin
 --
@@ -38,6 +38,43 @@ local self_id = hub.hub_id()
 
 -- Timer handle — stored so _before_reload can cancel it.
 local _timer_state = state.get("orchestrator.timer_state", { id = nil })
+
+-- ============================================================================
+-- Shared Helpers
+-- ============================================================================
+
+--- Resolve agent_label to agent_id. Returns agent_id or nil + error string.
+-- For local hubs, iterates Agent.list() directly.
+-- For remote hubs, queries the remote agent list via RPC.
+local function resolve_agent_id(params)
+    if params.agent_id then
+        return params.agent_id
+    end
+    if not params.agent_label then
+        return nil, "Either agent_id or agent_label is required"
+    end
+
+    if Hub.is_local(params.hub_id) then
+        for _, agent in ipairs(Agent.list()) do
+            if agent.label == params.agent_label then
+                return agent:agent_key()
+            end
+        end
+    else
+        local ok, agents = pcall(function()
+            return Hub.get(params.hub_id):agent_list()
+        end)
+        if ok and agents then
+            for _, agent in ipairs(agents) do
+                if agent.label == params.agent_label then
+                    return agent.id
+                end
+            end
+        end
+    end
+
+    return nil, string.format("No agent found with label '%s'", params.agent_label)
+end
 
 -- ============================================================================
 -- MCP Tools
@@ -305,6 +342,10 @@ mcp.tool("move_agent_workspace", {
                 type = "string",
                 description = "Session UUID or agent key to move.",
             },
+            agent_label = {
+                type = "string",
+                description = "Agent label to resolve. Alternative to agent_id.",
+            },
             workspace_id = {
                 type = "string",
                 description = "Target workspace ID.",
@@ -314,12 +355,14 @@ mcp.tool("move_agent_workspace", {
                 description = "Target workspace name (used when workspace_id is omitted).",
             },
         },
-        required = { "agent_id" },
     },
 }, function(params)
+    local target_agent_id, err = resolve_agent_id(params)
+    if not target_agent_id then return { error = err } end
+
     return Hub.call_safely(params.hub_id, function()
         return Hub.get(params.hub_id):move_agent_workspace(
-            params.agent_id,
+            target_agent_id,
             params.workspace_id,
             params.workspace_name
         )
@@ -352,6 +395,10 @@ mcp.tool("update_session", {
                 type = "string",
                 description = "Session UUID or agent key to update.",
             },
+            agent_label = {
+                type = "string",
+                description = "Agent label to resolve. Alternative to agent_id.",
+            },
             label = {
                 type = "string",
                 description = "Short human-readable tag for the session's purpose (e.g. 'auth bug fix'). Pass empty string to clear.",
@@ -361,9 +408,11 @@ mcp.tool("update_session", {
                 description = "Current activity self-report (e.g. 'running test suite'). Update whenever your focus shifts. Pass empty string to clear.",
             },
         },
-        required = { "agent_id" },
     },
 }, function(params)
+    local target_agent_id, err = resolve_agent_id(params)
+    if not target_agent_id then return { error = err } end
+
     local fields = {}
     if params.label ~= nil then fields.label = params.label end
     if params.task ~= nil then fields.task = params.task end
@@ -373,12 +422,12 @@ mcp.tool("update_session", {
     end
 
     return Hub.call_safely(params.hub_id, function()
-        return Hub.get(params.hub_id):update_session(params.agent_id, fields)
+        return Hub.get(params.hub_id):update_session(target_agent_id, fields)
     end)
 end)
 
 mcp.tool("delete_agent", {
-    description = "Delete an agent on a hub. Pass the agent_id (agent key) from list_hubs results. Optionally delete the git worktree too.",
+    description = "Delete an agent on a hub. Pass agent_id (agent key) or agent_label from list_hubs results. Optionally delete the git worktree too.",
     input_schema = {
         type = "object",
         properties = {
@@ -390,24 +439,30 @@ mcp.tool("delete_agent", {
                 type = "string",
                 description = "Agent key/ID to delete.",
             },
+            agent_label = {
+                type = "string",
+                description = "Agent label to resolve. Alternative to agent_id.",
+            },
             delete_worktree = {
                 type = "boolean",
                 description = "Also delete the git worktree. Default false.",
             },
         },
-        required = { "agent_id" },
     },
 }, function(params)
+    local target_agent_id, err = resolve_agent_id(params)
+    if not target_agent_id then return { error = err } end
+
     return Hub.call_safely(params.hub_id, function()
         return Hub.get(params.hub_id):delete_agent(
-            params.agent_id,
+            target_agent_id,
             params.delete_worktree
         )
     end)
 end)
 
 mcp.tool("get_pty_snapshot", {
-    description = "Get a PTY snapshot from an agent session on any hub. Returns the current terminal content as text. Use the agent_id (agent key) from list_hubs results. Omit hub_id for the local hub.",
+    description = "Get a PTY snapshot from an agent session on any hub. Returns the current terminal content as text. Use agent_id (agent key) or agent_label from list_hubs results. Omit hub_id for the local hub.",
     input_schema = {
         type = "object",
         properties = {
@@ -419,16 +474,22 @@ mcp.tool("get_pty_snapshot", {
                 type = "string",
                 description = "Agent key/ID.",
             },
+            agent_label = {
+                type = "string",
+                description = "Agent label to resolve. Alternative to agent_id.",
+            },
             session = {
                 type = "string",
                 description = "Session name (default: 'agent').",
             },
         },
-        required = { "agent_id" },
     },
 }, function(params)
+    local target_agent_id, err = resolve_agent_id(params)
+    if not target_agent_id then return { error = err } end
+
     return Hub.call_safely(params.hub_id, function()
-        return Hub.get(params.hub_id):get_pty_snapshot(params.agent_id, params.session)
+        return Hub.get(params.hub_id):get_pty_snapshot(target_agent_id, params.session)
     end)
 end)
 
@@ -451,13 +512,27 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
         end
     end
 
+    -- Resolve agent_label to agent_id for incoming RPCs
+    local function resolve_rpc_agent_id(msg)
+        if msg.agent_id then return msg.agent_id end
+        if not msg.agent_label then return nil end
+        for _, agent in ipairs(Agent.list()) do
+            if agent.label == msg.agent_label then
+                return agent:agent_key()
+            end
+        end
+        return nil
+    end
+
     if message.type == "send_message" then
         respond(function()
             return local_hub:send_message(message.agent_id, message.text, message.session)
         end)
     elseif message.type == "get_pty_snapshot" then
         respond(function()
-            return local_hub:get_pty_snapshot(message.agent_id, message.session)
+            local aid = resolve_rpc_agent_id(message)
+            if not aid then error(string.format("No agent found with label '%s'", message.agent_label or "nil")) end
+            return local_hub:get_pty_snapshot(aid, message.session)
         end)
     elseif message.type == "create_agent" then
         respond(function()
@@ -488,22 +563,28 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
         end)
     elseif message.type == "move_agent_workspace" then
         respond(function()
+            local aid = resolve_rpc_agent_id(message)
+            if not aid then error(string.format("No agent found with label '%s'", message.agent_label or "nil")) end
             return local_hub:move_agent_workspace(
-                message.agent_id,
+                aid,
                 message.workspace_id,
                 message.workspace_name
             )
         end)
     elseif message.type == "update_session" then
         respond(function()
+            local aid = resolve_rpc_agent_id(message)
+            if not aid then error(string.format("No agent found with label '%s'", message.agent_label or "nil")) end
             local fields = {}
             if message.label ~= nil then fields.label = message.label end
             if message.task ~= nil then fields.task = message.task end
-            return local_hub:update_session(message.agent_id, fields)
+            return local_hub:update_session(aid, fields)
         end)
     elseif message.type == "delete_agent" then
         respond(function()
-            return local_hub:delete_agent(message.agent_id, message.delete_worktree)
+            local aid = resolve_rpc_agent_id(message)
+            if not aid then error(string.format("No agent found with label '%s'", message.agent_label or "nil")) end
+            return local_hub:delete_agent(aid, message.delete_worktree)
         end)
     elseif message.type == "post_message" then
         respond(function()
