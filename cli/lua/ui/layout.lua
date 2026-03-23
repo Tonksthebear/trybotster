@@ -131,7 +131,10 @@ local function build_list_items()
       -- Agent row: indented under workspace header
       local agent = agents_by_id[entry.agent_id]
       if agent then
-        local name         = agent.display_name or agent.branch_name or entry.agent_id
+        -- Label is primary display name when present
+        local has_label    = agent.label and agent.label:match("%S")
+        local name         = has_label and agent.label
+                             or (agent.display_name or agent.branch_name or entry.agent_id)
         local notification = agent.notification
         local text
         if notification then
@@ -148,10 +151,12 @@ local function build_list_items()
         end
 
         local item = { text = text }
-        -- Secondary: branch + label + task
+        -- Secondary: spawn target name · branch · config name, plus task
         local parts = {}
+        if agent.target_name then parts[#parts+1] = agent.target_name end
         if agent.branch_name then parts[#parts+1] = agent.branch_name end
-        if agent.label and agent.label ~= "" then parts[#parts+1] = agent.label end
+        local config_name = agent.agent_name or agent.profile_name
+        if config_name then parts[#parts+1] = config_name end
         if agent.task and agent.task ~= "" then parts[#parts+1] = agent.task end
         if #parts > 0 then
           item.secondary = { { text = "  " .. table.concat(parts, " · "), style = "dim" } }
@@ -194,7 +199,10 @@ local function build_agent_items(state)
 
   -- Existing agents from client-side cache
   for _, agent in ipairs(_tui_state and _tui_state.agents or {}) do
-    local name = agent.display_name or agent.branch_name
+    -- Label is primary display name when present
+    local has_label = agent.label and agent.label:match("%S")
+    local name = has_label and agent.label
+                 or (agent.display_name or agent.branch_name)
     local item
     if agent.notification then
       item = { text = {
@@ -204,8 +212,14 @@ local function build_agent_items(state)
     else
       item = { text = name }
     end
-    if agent.branch_name then
-      item.secondary = { { text = agent.branch_name, style = "dim" } }
+    -- Secondary: spawn target name · branch · config name
+    local secondary_parts = {}
+    if agent.target_name then secondary_parts[#secondary_parts+1] = agent.target_name end
+    if agent.branch_name then secondary_parts[#secondary_parts+1] = agent.branch_name end
+    local config_name = agent.agent_name or agent.profile_name
+    if config_name then secondary_parts[#secondary_parts+1] = config_name end
+    if #secondary_parts > 0 then
+      item.secondary = { { text = table.concat(secondary_parts, " · "), style = "dim" } }
     end
     table.insert(items, item)
   end
@@ -229,6 +243,7 @@ local function build_menu_items(state)
   -- Hub section (always shown)
   table.insert(items, { text = "── Hub ──", header = true })
   table.insert(items, { text = "New Agent", action = "new_agent" })
+  table.insert(items, { text = "New Accessory", action = "new_accessory" })
   table.insert(items, { text = "Spawn Targets", action = "spawn_targets_info" })
   table.insert(items, { text = "Show Connection Code", action = "show_connection_code" })
   table.insert(items, { text = "Restart Hub", action = "restart_hub" })
@@ -302,8 +317,9 @@ function render(state)
     if state.is_scrolled then
       scroll = string.format(" [SCROLLBACK +%d | Shift+End: live]", state.scroll_offset)
     end
+    local term_name = (sa.label and sa.label ~= "") and sa.label or (sa.branch_name or "main")
     term_title = {
-      { text = string.format(" %s [%s]%s ", sa.branch_name or "main", session_label, scroll) },
+      { text = string.format(" %s [%s]%s ", term_name, session_label, scroll) },
     }
   end
 
@@ -409,6 +425,75 @@ function render_overlay(state)
         block = { title = " Select Agent [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
         props = {
           items = agent_items,
+        },
+      },
+    }
+  elseif _tui_state.mode == "new_accessory_select_target" then
+    local target_items = {}
+    for _, target in ipairs(_tui_state.available_targets or {}) do
+      local branch = target.current_branch and string.format(" (%s)", target.current_branch) or ""
+      table.insert(target_items, {
+        text = {
+          { text = target.name or target.path or target.id or "target" },
+          { text = branch, style = "dim" },
+        },
+      })
+    end
+    if #target_items == 0 then
+      target_items = { { text = "No admitted spawn targets", style = "dim" } }
+    end
+    return {
+      type = "centered", width = 64, height = 30,
+      child = {
+        type = "list",
+        id = "accessory_spawn_target_list",
+        block = { title = " Select Spawn Target [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
+        props = {
+          items = target_items,
+        },
+      },
+    }
+  elseif _tui_state.mode == "new_accessory_select" then
+    local acc_items = {}
+    for _, a in ipairs(_tui_state.available_accessories or {}) do
+      table.insert(acc_items, { text = a })
+    end
+    if #acc_items == 0 then
+      acc_items = { { text = "Loading accessories...", style = "dim" } }
+    end
+    return {
+      type = "centered", width = 50, height = 30,
+      child = {
+        type = "list",
+        id = "accessory_config_list",
+        block = { title = " Select Accessory [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
+        props = {
+          items = acc_items,
+        },
+      },
+    }
+  elseif _tui_state.mode == "new_accessory_select_workspace" then
+    local ws_items = {
+      { text = "[No Workspace]" },
+    }
+    for _, ws in ipairs(_tui_state.available_workspaces or {}) do
+      local count_label = string.format(" (%d session%s)",
+        ws.agent_count, ws.agent_count == 1 and "" or "s")
+      ws_items[#ws_items + 1] = {
+        text = {
+          { text = ws.name or ws.id },
+          { text = count_label, style = "dim" },
+        },
+      }
+    end
+    return {
+      type = "centered", width = 55, height = 30,
+      child = {
+        type = "list",
+        id = "accessory_workspace_list",
+        block = { title = " Select Workspace [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
+        props = {
+          items = ws_items,
         },
       },
     }
@@ -604,9 +689,25 @@ function render_overlay(state)
       child = {
         type = "list",
         id = "spawn_target_manage_list",
-        block = { title = " Spawn Targets [Up/Down navigate | a add | d remove | r refresh | Esc close] ", borders = "all" },
+        block = { title = " Spawn Targets [Up/Down navigate | a add | d remove | n rename | r refresh | Esc close] ", borders = "all" },
         props = {
           items = target_items,
+        },
+      },
+    }
+  elseif _tui_state.mode == "rename_spawn_target_input" then
+    local current_name = _tui_state.pending_fields and _tui_state.pending_fields.rename_target_id or ""
+    return {
+      type = "centered", width = 62, height = 24,
+      child = {
+        type = "input",
+        id = "rename_spawn_target_input",
+        block = { title = " Rename Spawn Target [Enter confirm | Esc cancel] ", borders = "all" },
+        props = {
+          lines = {
+            "Enter a new name for the spawn target:",
+          },
+          placeholder = "Enter new name",
         },
       },
     }

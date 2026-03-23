@@ -196,6 +196,18 @@ function M.on_action(action, context)
           data = { type = "list_spawn_targets" },
         }},
       }
+    elseif selected == "new_accessory" then
+      _tui_state.pending_fields.accessory_name = nil
+      _tui_state.pending_fields.target_id = nil
+      _tui_state.pending_fields.target_path = nil
+      _tui_state.pending_fields.target_repo = nil
+      return {
+        set_mode_ops("new_accessory_select_target"),
+        { op = "send_msg", data = {
+          subscriptionId = "tui_hub",
+          data = { type = "list_spawn_targets" },
+        }},
+      }
     elseif selected == "spawn_targets_info" then
       return {
         set_mode_ops("spawn_targets_info"),
@@ -280,6 +292,96 @@ function M.on_action(action, context)
             target_id = selected.id,
           },
         }},
+      }
+    end
+    return { set_mode_ops(base_mode(context)) }
+  end
+
+  -- === Accessory target selection ===
+  if action == "list_select" and _tui_state.mode == "new_accessory_select_target" then
+    local targets = _tui_state.available_targets or {}
+    local selected = targets[_tui_state.list_selected + 1]
+    if selected then
+      _tui_state.pending_fields.target_id = selected.id
+      _tui_state.pending_fields.target_path = selected.path
+      _tui_state.pending_fields.target_repo = selected.repo_name or selected.target_repo
+      -- Clear stale accessories from previous target
+      _tui_state.available_accessories = nil
+      return {
+        set_mode_ops("new_accessory_select"),
+        { op = "send_msg", data = {
+          subscriptionId = "tui_hub",
+          data = {
+            type = "list_agent_config",
+            target_id = selected.id,
+          },
+        }},
+      }
+    end
+    return { set_mode_ops(base_mode(context)) }
+  end
+
+  -- === Accessory selection ===
+  if action == "list_select" and _tui_state.mode == "new_accessory_select" then
+    local accessories = _tui_state.available_accessories or {}
+    local selected = accessories[_tui_state.list_selected + 1]
+    if selected then
+      _tui_state.pending_fields.accessory_name = selected
+      -- Build workspace choices from current state
+      _tui_state.available_workspaces = {}
+      for _, ws in ipairs(_tui_state.workspaces or {}) do
+        _tui_state.available_workspaces[#_tui_state.available_workspaces + 1] = {
+          id = ws.id,
+          name = ws.name or ws.id,
+          agent_count = ws.agents and #ws.agents or 0,
+        }
+      end
+      return { set_mode_ops("new_accessory_select_workspace") }
+    end
+    return { set_mode_ops(base_mode(context)) }
+  end
+
+  -- === Accessory workspace selection ===
+  -- List is 0-based: 0 = "No Workspace", 1+ = existing workspaces
+  if action == "list_select" and _tui_state.mode == "new_accessory_select_workspace" then
+    local ls = _tui_state.list_selected
+    local pf = _tui_state.pending_fields
+    local accessory_name = pf.accessory_name
+    local target_id = pf.target_id
+    local target_path = pf.target_path
+    local target_repo = pf.target_repo
+    local workspace_id = nil
+    local workspace_name = nil
+    if ls > 0 then
+      local workspaces = _tui_state.available_workspaces or {}
+      local ws = workspaces[ls]
+      if ws then
+        workspace_id = ws.id
+        workspace_name = ws.name
+      end
+    end
+
+    -- Clean up pending fields
+    pf.accessory_name = nil
+    pf.target_id = nil
+    pf.target_path = nil
+    pf.target_repo = nil
+
+    if accessory_name then
+      return {
+        { op = "send_msg", data = {
+          subscriptionId = "tui_hub",
+          data = {
+            type = "create_accessory",
+            accessory_name = accessory_name,
+            target_id = target_id,
+            target_path = target_path,
+            target_repo = target_repo,
+            workspace_id = workspace_id,
+            workspace_name = workspace_name,
+          },
+        }},
+        set_mode_ops(base_mode(context)),
       }
     end
     return { set_mode_ops(base_mode(context)) }
@@ -372,6 +474,18 @@ function M.on_action(action, context)
     }
   end
 
+  if action == "spawn_target_rename" and _tui_state.mode == "spawn_targets_info" then
+    local targets = _tui_state.available_targets or {}
+    local selected = targets[_tui_state.list_selected + 1]
+    if not selected or not selected.id then
+      return {}
+    end
+    _tui_state.pending_fields.rename_target_id = selected.id
+    local ops = { set_mode_ops("rename_spawn_target_input") }
+    _tui_state.input_buffer = selected.name or ""
+    return ops
+  end
+
   if action == "spawn_target_remove" and _tui_state.mode == "spawn_targets_info" then
     local targets = _tui_state.available_targets or {}
     local selected = targets[_tui_state.list_selected + 1]
@@ -404,6 +518,28 @@ function M.on_action(action, context)
             },
           }},
           set_mode_ops("spawn_targets_info"),
+        }
+      end
+      return { set_mode_ops("spawn_targets_info") }
+    elseif _tui_state.mode == "rename_spawn_target_input" then
+      local target_id = _tui_state.pending_fields.rename_target_id
+      local new_name = input:match("^%s*(.-)%s*$") or ""
+      _tui_state.pending_fields.rename_target_id = nil
+      if target_id and new_name ~= "" then
+        return {
+          { op = "send_msg", data = {
+            subscriptionId = "tui_hub",
+            data = {
+              type = "rename_spawn_target",
+              target_id = target_id,
+              new_name = new_name,
+            },
+          }},
+          set_mode_ops("spawn_targets_info"),
+          { op = "send_msg", data = {
+            subscriptionId = "tui_hub",
+            data = { type = "list_spawn_targets" },
+          }},
         }
       end
       return { set_mode_ops("spawn_targets_info") }
@@ -579,9 +715,11 @@ function M.on_action(action, context)
     _tui_state.pending_fields.pending_issue_or_branch = nil
     _tui_state.pending_fields.use_main_branch = nil
     _tui_state.pending_fields.agent_name = nil
+    _tui_state.pending_fields.accessory_name = nil
     _tui_state.pending_fields.target_id = nil
     _tui_state.pending_fields.target_path = nil
     _tui_state.pending_fields.target_repo = nil
+    _tui_state.pending_fields.rename_target_id = nil
     return { set_mode_ops(base_mode(context)) }
   end
 

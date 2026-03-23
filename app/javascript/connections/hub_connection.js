@@ -371,6 +371,15 @@ export class HubTransport extends HubRoute {
   }
 
   /**
+   * Rename an admitted spawn target.
+   * @param {string} targetId
+   * @param {string} newName
+   */
+  renameSpawnTarget(targetId, newName) {
+    return this.send("rename_spawn_target", { target_id: targetId, new_name: newName });
+  }
+
+  /**
    * Add a PTY session to a running agent.
    * @param {string} agentId - Agent key
    * @param {string} sessionType - Session type name (e.g., "shell", "server")
