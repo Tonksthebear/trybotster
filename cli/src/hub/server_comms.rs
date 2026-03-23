@@ -24,7 +24,6 @@ use crate::hub::actions::{self, HubAction};
 use crate::hub::{
     registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest, WebRtcPtyOutput,
 };
-use crate::hub::terminal_profile::TerminalProbe;
 use crate::notifications::push::send_push_direct;
 use base64::Engine;
 
@@ -976,10 +975,10 @@ impl Hub {
                 flags,
                 data,
             } => {
-                if let Some(session_uuid) = self.broker_sessions.get(&session_id) {
-                    if let Some(session_handle) = self.handle_cache.get_session(session_uuid) {
+                if let Some(session_uuid) = self.broker_sessions.get(&session_id).cloned() {
+                    if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
                         self.reply_to_headless_terminal_probes(
-                            session_uuid,
+                            &session_uuid,
                             session_handle.pty(),
                             &data,
                         );

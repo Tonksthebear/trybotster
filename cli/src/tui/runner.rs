@@ -516,15 +516,16 @@ where
                         self.mode,
                         self.has_overlay
                     );
-                    if self.mode == "insert"
-                        && !self.has_overlay
-                        && self.focus_reporting_enabled_for_current_session()
-                    {
-                        log::debug!(
-                            "[FOCUS] forwarding \\x1b[I to PTY session={:?}",
-                            self.panel_pool.current_session_uuid()
-                        );
-                        self.handle_pty_input(b"\x1b[I");
+                    if self.mode == "insert" && !self.has_overlay {
+                        // Always notify hub of focus state for notification suppression
+                        self.send_focus_changed(true);
+                        if self.focus_reporting_enabled_for_current_session() {
+                            log::debug!(
+                                "[FOCUS] forwarding \\x1b[I to PTY session={:?}",
+                                self.panel_pool.current_session_uuid()
+                            );
+                            self.handle_pty_input(b"\x1b[I");
+                        }
                     }
                 }
                 InputEvent::FocusLost => {
@@ -534,15 +535,16 @@ where
                         self.mode,
                         self.has_overlay
                     );
-                    if self.mode == "insert"
-                        && !self.has_overlay
-                        && self.focus_reporting_enabled_for_current_session()
-                    {
-                        log::debug!(
-                            "[FOCUS] forwarding \\x1b[O to PTY session={:?}",
-                            self.panel_pool.current_session_uuid()
-                        );
-                        self.handle_pty_input(b"\x1b[O");
+                    if self.mode == "insert" && !self.has_overlay {
+                        // Always notify hub of focus state for notification suppression
+                        self.send_focus_changed(false);
+                        if self.focus_reporting_enabled_for_current_session() {
+                            log::debug!(
+                                "[FOCUS] forwarding \\x1b[O to PTY session={:?}",
+                                self.panel_pool.current_session_uuid()
+                            );
+                            self.handle_pty_input(b"\x1b[O");
+                        }
                     }
                 }
                 InputEvent::Paste { ref raw_bytes } => {
@@ -895,6 +897,21 @@ where
         }
     }
 
+    /// Notify the hub of focus state change for the current session.
+    ///
+    /// Always sent regardless of whether the child PTY requested focus
+    /// reporting. This ensures `pty_clients.focused` stays accurate for
+    /// notification suppression even when the child app doesn't enable
+    /// `CSI ? 1004 h`.
+    fn send_focus_changed(&self, focused: bool) {
+        if let Some(uuid) = self.panel_pool.current_session_uuid.clone() {
+            let _ = self.request_tx.send(TuiRequest::FocusChanged {
+                session_uuid: uuid,
+                focused,
+            });
+        }
+    }
+
     /// Mirror terminal modes from PTY to the outer terminal.
     ///
     /// Handle resize event.
@@ -1004,10 +1021,11 @@ where
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     log::debug!("PTY output channel disconnected");
-                    if self.terminal_modes.terminal_focused()
-                        && self.focus_reporting_enabled_for_current_session()
-                    {
-                        self.handle_pty_input(b"\x1b[O");
+                    if self.terminal_modes.terminal_focused() {
+                        self.send_focus_changed(false);
+                        if self.focus_reporting_enabled_for_current_session() {
+                            self.handle_pty_input(b"\x1b[O");
+                        }
                     }
                     let msgs = self.panel_pool.disconnect_all();
                     for msg in msgs {
@@ -1269,16 +1287,17 @@ where
                     let now_insert = self.mode == "insert" && !self.has_overlay;
                     // Synthetic focus events on mode transition so the viewed
                     // PTY tracks whether it's "active" even across overlays.
-                    if self.terminal_modes.terminal_focused()
-                        && was_insert != now_insert
-                        && self.focus_reporting_enabled_for_current_session()
-                    {
-                        if now_insert {
-                            log::debug!("[FOCUS] synthetic focus-in on mode change to insert");
-                            self.handle_pty_input(b"\x1b[I");
-                        } else {
-                            log::debug!("[FOCUS] synthetic focus-out on mode change from insert");
-                            self.handle_pty_input(b"\x1b[O");
+                    if self.terminal_modes.terminal_focused() && was_insert != now_insert {
+                        // Always notify hub for notification suppression
+                        self.send_focus_changed(now_insert);
+                        if self.focus_reporting_enabled_for_current_session() {
+                            if now_insert {
+                                log::debug!("[FOCUS] synthetic focus-in on mode change to insert");
+                                self.handle_pty_input(b"\x1b[I");
+                            } else {
+                                log::debug!("[FOCUS] synthetic focus-out on mode change from insert");
+                                self.handle_pty_input(b"\x1b[O");
+                            }
                         }
                     }
                     // Reset Rust-side widget state on mode transition
@@ -1362,6 +1381,13 @@ where
             self.send_msg(msg);
         }
         for input in effects.pty_inputs {
+            // Always notify hub of focus state for notification suppression,
+            // regardless of whether the child app requested focus reporting.
+            let focused = input.data == b"\x1b[I";
+            let _ = self.request_tx.send(TuiRequest::FocusChanged {
+                session_uuid: input.session_uuid.clone(),
+                focused,
+            });
             if !self.focus_reporting_enabled_for(&input.session_uuid) {
                 log::trace!(
                     "[FOCUS] skipping synthetic focus sequence for {} (focus reporting not requested)",
@@ -2448,7 +2474,7 @@ mod tests {
             .list_state("spawn_target_list")
             .set_selectable_count(1);
         process_key_with_lua(&mut runner, make_key_enter(), &lua);
-        assert_eq!(runner.mode(), "new_agent_select_target");
+        assert_eq!(runner.mode(), "new_agent_select_agent");
 
         // Simulate single agent config response (auto-skips to workspace selection)
         {
@@ -3980,7 +4006,7 @@ mod tests {
             .list_state("spawn_target_list")
             .set_selectable_count(1);
         press_key_and_render(&mut runner, make_key_enter(), &lua);
-        assert_eq!(runner.mode(), "new_agent_select_target");
+        assert_eq!(runner.mode(), "new_agent_select_agent");
 
         // Simulate single agent config response (auto-skips to workspace selection)
         {

@@ -234,8 +234,9 @@ function M.on_hub_event(event_type, event_data, context)
     upsert_agent(agent)
     rebuild_workspaces()
 
-    -- Focus the new agent's terminal and enter insert mode
-    if agent.id then
+    -- Only auto-focus the new agent if nothing is currently focused (empty state).
+    -- If the user is already viewing another agent, don't yank their focus away.
+    if agent.id and not _tui_state.selected_session_uuid then
       _tui_state.selected_session_uuid = agent.session_uuid
       _tui_state.list_cursor_pos = find_agent_cursor_pos(agent.id)
       return {
@@ -371,6 +372,13 @@ function M.on_hub_event(event_type, event_data, context)
     local agents = event_data.agents
     if not agents then return nil end
     _tui_state.available_agents = agents
+    _tui_state.available_accessories = event_data.accessories or {}
+
+    -- Accessory creation flow: skip agent selection, go straight to accessory list
+    if _tui_state.mode == "new_accessory_select" then
+      return {}
+    end
+
     if #agents <= 1 then
       -- Single or no agent config: auto-select and skip to workspace selection
       _tui_state.pending_fields.agent_name = agents[1]

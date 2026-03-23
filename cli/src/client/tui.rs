@@ -44,6 +44,17 @@ pub enum TuiRequest {
         /// Raw input bytes to write to the PTY.
         data: Vec<u8>,
     },
+
+    /// Focus state change — always sent regardless of whether the child
+    /// PTY requested focus reporting. Updates `pty_clients.focused` in
+    /// Lua so notification suppression works even when the child app
+    /// doesn't enable `CSI ? 1004 h`.
+    FocusChanged {
+        /// Session UUID whose focus state changed.
+        session_uuid: String,
+        /// Whether the session is now focused.
+        focused: bool,
+    },
 }
 
 /// Output messages sent from Hub to TuiRunner.
