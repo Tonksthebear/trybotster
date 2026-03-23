@@ -122,7 +122,6 @@ local function build_list_items()
           { text = entry.name or entry.workspace_id },
         },
         secondary = {
-          icon,
           { text = count, style = "dim" },
         },
       }
@@ -136,11 +135,25 @@ local function build_list_items()
         local name         = has_label and agent.label
                              or (agent.display_name or agent.branch_name or entry.agent_id)
         local notification = agent.notification
+
+        -- Activity indicator for agent sessions: "Working..." when PTY output recent
+        local is_active = false
+        if agent.session_type == "agent" and agent.last_output_at then
+          local now_ms = os.time() * 1000
+          is_active = (now_ms - agent.last_output_at) < 5000
+        end
+
         local text
         if notification then
           text = {
             { text = "  " },
             { text = "● ", style = { fg = "yellow" } },
+            { text = name },
+          }
+        elseif is_active then
+          text = {
+            { text = "  " },
+            { text = "✦ ", style = { fg = "green" } },
             { text = name },
           }
         else
@@ -203,10 +216,22 @@ local function build_agent_items(state)
     local has_label = agent.label and agent.label:match("%S")
     local name = has_label and agent.label
                  or (agent.display_name or agent.branch_name)
+    -- Activity indicator for agent sessions
+    local is_active = false
+    if agent.session_type == "agent" and agent.last_output_at then
+      local now_ms = os.time() * 1000
+      is_active = (now_ms - agent.last_output_at) < 5000
+    end
+
     local item
     if agent.notification then
       item = { text = {
         { text = "● ", style = { fg = "yellow" } },
+        { text = name },
+      } }
+    elseif is_active then
+      item = { text = {
+        { text = "✦ ", style = { fg = "green" } },
         { text = name },
       } }
     else
