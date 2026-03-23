@@ -962,7 +962,7 @@ function Session:info()
         created_at = self.created_at,
         label = self.label,
         task = self.task,
-        last_output_at = self.last_output_at,
+        last_output_at = (self.session and self.session.last_output_at and self.session:last_output_at()) or self.last_output_at,
     }
 end
 
