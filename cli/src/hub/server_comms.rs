@@ -114,6 +114,7 @@ impl Hub {
         self.poll_stream_frames_outgoing();
         self.poll_pty_observers();
         self.process_pending_terminal_attaches();
+        self.send_backpressure_recovery_snapshots();
     }
 
     // === Per-Event Handlers for select! Loop ===
@@ -274,6 +275,7 @@ impl Hub {
                 self.cleanup_disconnected_webrtc_channels();
                 self.poll_stream_frames_outgoing();
                 self.poll_pty_observers();
+                self.send_backpressure_recovery_snapshots();
                 self.ratchet_restarted_peers.clear();
                 self.check_broker_demux_health();
                 if self.hub_event_metrics_last_log.elapsed() >= std::time::Duration::from_secs(30) {
@@ -1814,6 +1816,10 @@ impl Hub {
             );
         }
 
+        // Remove any pending backpressure recovery snapshots for this peer.
+        self.webrtc_backpressure_recovery
+            .retain(|_, entry| entry.browser_identity != browser_identity);
+
         // Stop DC ping task for this peer
         if let Some(task) = self.dc_ping_tasks.remove(browser_identity) {
             task.abort();
@@ -2772,6 +2778,93 @@ impl Hub {
         true
     }
 
+    /// Send recovery snapshots for peers that experienced backpressure drops.
+    ///
+    /// When PTY frames are dropped because the per-peer send channel is full,
+    /// the browser's terminal parser loses VTE state (a dropped frame containing
+    /// the start of an ANSI escape corrupts parsing of all subsequent frames).
+    ///
+    /// After a cooldown period (letting the burst subside), this method fetches
+    /// a fresh snapshot from the shadow screen and sends it directly through
+    /// the per-peer channel, bypassing the output queue to avoid re-triggering
+    /// the same backpressure.
+    fn send_backpressure_recovery_snapshots(&mut self) {
+        if self.webrtc_backpressure_recovery.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+
+        // Collect entries that have cooled down.
+        let ready: Vec<(String, super::BackpressureRecoveryEntry)> = self
+            .webrtc_backpressure_recovery
+            .iter()
+            .filter(|(_, entry)| {
+                now.duration_since(entry.last_drop) >= super::BACKPRESSURE_SNAPSHOT_COOLDOWN
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (key, entry) in ready {
+            // Check if peer send channel has capacity before attempting snapshot.
+            let has_capacity = self
+                .webrtc_send_tasks
+                .get(&entry.browser_identity)
+                .map(|state| {
+                    !state.dead.load(std::sync::atomic::Ordering::Relaxed)
+                        && state.tx.capacity() > 0
+                })
+                .unwrap_or(false);
+
+            if !has_capacity {
+                // Still congested or peer gone — leave entry for next tick.
+                continue;
+            }
+
+            self.webrtc_backpressure_recovery.remove(&key);
+
+            let Some(session_handle) = self.handle_cache.get_session(&entry.session_uuid) else {
+                continue;
+            };
+
+            let snapshot = session_handle.pty().get_snapshot_cached();
+            if snapshot.is_empty() {
+                continue;
+            }
+
+            log::info!(
+                "[WebRTC] Sending backpressure recovery snapshot ({} bytes) to {} for session {}",
+                snapshot.len(),
+                &entry.browser_identity[..entry.browser_identity.len().min(8)],
+                &entry.session_uuid[..entry.session_uuid.len().min(8)]
+            );
+
+            // Chunk and send directly through the per-peer channel,
+            // bypassing the output queue to avoid re-triggering backpressure.
+            const CHUNK_SIZE: usize = 64 * 1024;
+            let num_chunks = (snapshot.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            let snapshot_id: u32 = rand::random();
+
+            for (i, chunk) in snapshot.chunks(CHUNK_SIZE).enumerate() {
+                let mut raw_message = Vec::with_capacity(9 + chunk.len());
+                raw_message.push(0x02); // snapshot chunk prefix
+                raw_message.extend_from_slice(&snapshot_id.to_le_bytes());
+                raw_message.extend_from_slice(&(i as u16).to_le_bytes());
+                raw_message.extend_from_slice(&(num_chunks as u16).to_le_bytes());
+                raw_message.extend(chunk);
+
+                // Send directly through the per-peer channel (not output queue).
+                self.try_send_to_peer(
+                    &entry.browser_identity,
+                    super::WebRtcSendItem::Pty {
+                        subscription_id: entry.subscription_id.clone(),
+                        data: raw_message,
+                    },
+                );
+            }
+        }
+    }
+
     /// Process pending terminal attach intents.
     ///
     /// Attach intents are created when a terminal subscription arrives before
@@ -3556,35 +3649,36 @@ impl Hub {
         subscription_id: &str,
         browser_identity: &str,
         data: Vec<u8>,
-    ) -> bool {
+    ) -> super::WebRtcSendOutcome {
         let Some(state) = self.webrtc_send_tasks.get(browser_identity) else {
-            return false;
+            return super::WebRtcSendOutcome::Dead;
         };
 
         // Circuit breaker: send task detected dead peer
         if state.dead.load(std::sync::atomic::Ordering::Relaxed) {
-            return false;
+            return super::WebRtcSendOutcome::Dead;
         }
 
         match state.tx.try_send(super::WebRtcSendItem::Pty {
             subscription_id: subscription_id.to_string(),
             data,
         }) {
-            Ok(()) => true,
+            Ok(()) => super::WebRtcSendOutcome::Sent,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 // Per-peer channel full — peer is slow, drop this frame.
-                // PTY output is a continuous stream; dropping is acceptable.
+                // PTY output is a continuous stream; dropping is acceptable
+                // but a recovery snapshot will be scheduled to resync state.
                 log::debug!(
                     "[WebRTC] Send channel full for {}, dropping PTY frame",
                     &browser_identity[..browser_identity.len().min(8)]
                 );
-                true // Not dead, just slow — keep trying future frames
+                super::WebRtcSendOutcome::Backpressure
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 // Send task exited — mark dead for fast circuit-breaker on
                 // subsequent sends before the cleanup tick runs.
                 state.dead.store(true, std::sync::atomic::Ordering::Relaxed);
-                false
+                super::WebRtcSendOutcome::Dead
             }
         }
     }
@@ -3821,18 +3915,33 @@ impl Hub {
             msg.data
         };
 
-        if !self.send_webrtc_raw(
+        match self.send_webrtc_raw(
             &msg.subscription_id,
             &msg.browser_identity,
             final_data.clone(),
         ) {
-            log::warn!(
-                "[WebRTC] DataChannel not open for {}, cleaning up dead channel",
-                &msg.browser_identity[..msg.browser_identity.len().min(8)]
-            );
-            // Immediate cleanup instead of waiting for CleanupTick.
-            self.cleanup_webrtc_channel(&msg.browser_identity, "send_failed");
-            return;
+            super::WebRtcSendOutcome::Sent => {}
+            super::WebRtcSendOutcome::Backpressure => {
+                let key = format!("{}:{}", msg.browser_identity, msg.session_uuid);
+                self.webrtc_backpressure_recovery.insert(
+                    key,
+                    super::BackpressureRecoveryEntry {
+                        browser_identity: msg.browser_identity.clone(),
+                        session_uuid: msg.session_uuid.clone(),
+                        subscription_id: msg.subscription_id.clone(),
+                        last_drop: Instant::now(),
+                    },
+                );
+            }
+            super::WebRtcSendOutcome::Dead => {
+                log::warn!(
+                    "[WebRTC] DataChannel not open for {}, cleaning up dead channel",
+                    &msg.browser_identity[..msg.browser_identity.len().min(8)]
+                );
+                // Immediate cleanup instead of waiting for CleanupTick.
+                self.cleanup_webrtc_channel(&msg.browser_identity, "send_failed");
+                return;
+            }
         }
 
         if self.lua.has_observers("pty_output") {
@@ -3902,17 +4011,32 @@ impl Hub {
             };
 
             // Fast path: send to browser immediately
-            if !self.send_webrtc_raw(
+            match self.send_webrtc_raw(
                 &msg.subscription_id,
                 &msg.browser_identity,
                 final_data.clone(),
             ) {
-                log::warn!(
-                    "[WebRTC] DataChannel not open for {}, skipping remaining PTY output this tick",
-                    &msg.browser_identity[..msg.browser_identity.len().min(8)]
-                );
-                dead_peers.insert(msg.browser_identity.clone());
-                continue;
+                super::WebRtcSendOutcome::Sent => {}
+                super::WebRtcSendOutcome::Backpressure => {
+                    let key = format!("{}:{}", msg.browser_identity, msg.session_uuid);
+                    self.webrtc_backpressure_recovery.insert(
+                        key,
+                        super::BackpressureRecoveryEntry {
+                            browser_identity: msg.browser_identity.clone(),
+                            session_uuid: msg.session_uuid.clone(),
+                            subscription_id: msg.subscription_id.clone(),
+                            last_drop: Instant::now(),
+                        },
+                    );
+                }
+                super::WebRtcSendOutcome::Dead => {
+                    log::warn!(
+                        "[WebRTC] DataChannel not open for {}, skipping remaining PTY output this tick",
+                        &msg.browser_identity[..msg.browser_identity.len().min(8)]
+                    );
+                    dead_peers.insert(msg.browser_identity.clone());
+                    continue;
+                }
             }
 
             // Observers: queue for async processing, never block here

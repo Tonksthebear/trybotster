@@ -74,7 +74,7 @@ use std::mem::ManuallyDrop;
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -300,6 +300,10 @@ struct Session {
     writer_tx: std::sync::mpsc::SyncSender<PtyWriteCommand>,
     /// Writer thread handle — joined on shutdown.
     writer: Option<thread::JoinHandle<()>>,
+    /// True after a resize is applied but before the PTY produces output at the
+    /// new dimensions.  Mirrors `PtySession::resize_pending` — checked by
+    /// `GetSnapshot` to avoid capturing stale visible-screen content.
+    resize_pending: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -333,11 +337,15 @@ impl Session {
 }
 
 /// Apply a PTY resize ioctl and keep the shadow parser dimensions in sync.
+///
+/// Sets `resize_pending` so `GetSnapshot` knows the visible screen may be
+/// stale until the application redraws at the new dimensions.
 fn apply_pty_resize(
     fd: RawFd,
     rows: u16,
     cols: u16,
     parser: &Arc<Mutex<AlacrittyParser<BrokerEventListener>>>,
+    resize_pending: &AtomicBool,
 ) {
     let ws = libc::winsize {
         ws_row: rows,
@@ -349,6 +357,7 @@ fn apply_pty_resize(
     if let Ok(mut p) = parser.lock() {
         p.resize(rows, cols);
     }
+    resize_pending.store(true, Ordering::Release);
 }
 
 /// Drain queued resize commands and keep only the final dimensions.
@@ -383,6 +392,7 @@ fn coalesce_resize_commands(
 fn pty_writer_loop(
     fd: RawFd,
     parser: Arc<Mutex<AlacrittyParser<BrokerEventListener>>>,
+    resize_pending: Arc<AtomicBool>,
     rx: std::sync::mpsc::Receiver<PtyWriteCommand>,
 ) {
     // Borrow-only File wrapper — do not close the FD here.
@@ -408,7 +418,7 @@ fn pty_writer_loop(
             }
             PtyWriteCommand::Resize { rows, cols } => {
                 let (rows, cols, next) = coalesce_resize_commands(rows, cols, &rx);
-                apply_pty_resize(fd, rows, cols, &parser);
+                apply_pty_resize(fd, rows, cols, &parser, &resize_pending);
                 deferred = next;
             }
             PtyWriteCommand::Shutdown => break,
@@ -500,6 +510,9 @@ impl Broker {
         let shared_tee: SharedTee = Arc::new(Mutex::new(None));
         let tee_clone = Arc::clone(&shared_tee);
         let collected_clone = Arc::clone(&collected);
+        let resize_pending = Arc::new(AtomicBool::new(false));
+        let resize_pending_reader = Arc::clone(&resize_pending);
+        let resize_pending_writer = Arc::clone(&resize_pending);
         let reader = thread::spawn(move || {
             reader_loop(
                 raw,
@@ -508,11 +521,14 @@ impl Broker {
                 shared,
                 tee_clone,
                 collected_clone,
+                resize_pending_reader,
             );
         });
         let (writer_tx, writer_rx) =
             std::sync::mpsc::sync_channel::<PtyWriteCommand>(PTY_WRITER_QUEUE_CAPACITY);
-        let writer = thread::spawn(move || pty_writer_loop(raw, parser_for_writer, writer_rx));
+        let writer = thread::spawn(move || {
+            pty_writer_loop(raw, parser_for_writer, resize_pending_writer, writer_rx)
+        });
 
         self.key_map.insert(reg.session_uuid.clone(), session_id);
         self.sessions.insert(
@@ -527,6 +543,7 @@ impl Broker {
                 reader: Some(reader),
                 writer_tx,
                 writer: Some(writer),
+                resize_pending,
             },
         );
 
@@ -592,6 +609,7 @@ fn reader_loop(
     shared_writer: SharedWriter,
     shared_tee: SharedTee,
     collected_events: CollectedEvents,
+    resize_pending: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 4096];
     // Borrow-only File — ManuallyDrop prevents close on drop.
@@ -632,6 +650,10 @@ fn reader_loop(
                 } else {
                     sideband::CURSOR_VISIBLE // safe default: cursor visible, kitty off
                 };
+
+                // App produced output — parser state is no longer stale from
+                // a prior resize.  Mirrors PtySession / spawn.rs pattern.
+                resize_pending.store(false, Ordering::Release);
 
                 // Write to tee log (if armed).  Runs even during the Hub
                 // reconnect window so the log captures output while Hub is down.
@@ -929,10 +951,12 @@ fn handle_connection(mut stream: UnixStream, broker: &mut Broker) -> Result<()> 
 
                 BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) => {
                     let frame = if let Some(sess) = broker.sessions.get(&session_id) {
+                        let skip_visible =
+                            sess.resize_pending.swap(false, Ordering::AcqRel);
                         let snapshot = sess
                             .parser
                             .lock()
-                            .map(|p| generate_ansi_snapshot(&p, false))
+                            .map(|p| generate_ansi_snapshot(&p, skip_visible))
                             .unwrap_or_default();
                         encode_data(frame_type::SNAPSHOT, session_id, &snapshot)
                     } else {
