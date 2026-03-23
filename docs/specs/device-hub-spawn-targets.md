@@ -411,7 +411,7 @@ Spawn targets declare which plugins are available for sessions in that target:
 }
 ```
 
-A target with no `plugins` field gets no plugins. Deny-by-default, consistent with spawn target security posture.
+A target with no `plugins` field imposes no plugin restrictions — all device plugins are available. The target is the security boundary via admission, not via plugin scoping. Plugin scoping is opt-in restriction: set the field to limit which plugins are available, or omit it to allow all.
 
 ### Agent Level — Selection Within Ceiling
 
@@ -425,9 +425,10 @@ When a session connects to MCP, tools are loaded — not filtered from a global 
 session_uuid → session manifest → agent_key + target_id
 target_id    → target's available plugins (ceiling)
 agent_key    → agent manifest's requested plugins (optional)
-result       → if agent declares plugins: intersection
-               if agent has no plugins field: target ceiling
-               if target has no plugins field: nothing (deny-by-default)
+result       → if both declare plugins: intersection
+               if only target declares: target ceiling
+               if only agent declares: agent's list
+               if neither declares: unrestricted (all plugins)
 ```
 
 Tools that don't belong to the session's resolved plugin set are never registered. They don't exist for that session.

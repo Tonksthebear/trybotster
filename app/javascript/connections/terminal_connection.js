@@ -249,10 +249,13 @@ export class TerminalConnection extends HubRoute {
       const validated = this.#validateSnapshotCursor(combined);
       this.#emitOutput(validated);
 
-      // Flush live output that arrived while the snapshot was being assembled.
-      // This output post-dates the snapshot's point-in-time capture, so it
-      // must be applied after the snapshot to maintain correct ordering.
-      this.#flushLiveOutputBuffer();
+      // Discard live output that arrived during snapshot assembly.
+      // The snapshot is a point-in-time grid capture that already includes
+      // all output processed before it was generated. Flushing the buffer
+      // would replay that same output, causing duplicate scrollback/messages.
+      // Note: output arriving between snapshot generation and chunk delivery
+      // (microseconds) is lost here, but self-heals on the next live frame.
+      this.#liveOutputBuffer = [];
 
       this.emit("snapshotComplete", {
         snapshotId,
