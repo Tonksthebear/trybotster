@@ -488,7 +488,11 @@ pub fn generate_ansi_snapshot<L: EventListener>(
         emit_grid_line(&mut out, grid, *line, cols, !wrapped);
         let has_next = idx + 1 < lines.len();
         if has_next && !wrapped {
-            out.extend_from_slice(b"\r\n");
+            // `emit_grid_line` starts each row assuming SGR has been reset.
+            // Emit a real reset before the CRLF so color/attribute state
+            // cannot leak into the next non-wrapped row when trailing default
+            // cells were trimmed from the current line.
+            out.extend_from_slice(b"\x1b[0m\r\n");
         }
     }
 
@@ -1176,6 +1180,35 @@ mod tests {
             src.term().renderable_content().cursor.point,
             dst.term().renderable_content().cursor.point,
             "post-snapshot origin-relative cursor addressing must stay aligned"
+        );
+    }
+
+    #[test]
+    fn snapshot_replay_resets_sgr_between_non_wrapped_lines() {
+        let mut src = AlacrittyParser::new_noop(2, 8, 100);
+        src.process(b"\x1b[31mA\x1b[0m\r\nB");
+
+        let snap = generate_ansi_snapshot(&src, false);
+        assert!(
+            snap.contains_slice(b"\x1b[0m\r\n"),
+            "snapshot should reset SGR before a non-wrapped line break"
+        );
+
+        let mut dst = AlacrittyParser::new_noop(2, 8, 100);
+        dst.process(&snap);
+
+        let src_first = &src.term().grid()[Point::new(Line(0), Column(0))];
+        let dst_first = &dst.term().grid()[Point::new(Line(0), Column(0))];
+        assert_eq!(
+            src_first.fg, dst_first.fg,
+            "first row color should round-trip"
+        );
+
+        let src_second = &src.term().grid()[Point::new(Line(1), Column(0))];
+        let dst_second = &dst.term().grid()[Point::new(Line(1), Column(0))];
+        assert_eq!(
+            src_second.fg, dst_second.fg,
+            "second row should not inherit color from the prior line"
         );
     }
 
