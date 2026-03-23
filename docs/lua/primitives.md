@@ -254,7 +254,7 @@ mcp.tool("my_tool", {
     },
 }, function(params, context)
     -- params: the arguments from the MCP client
-    -- context: { agent_key, hub_id } injected by the hub
+    -- context: { session_uuid, hub_id } injected by the hub
     return "result string"           -- or return a table (auto JSON-encoded)
 end)
 

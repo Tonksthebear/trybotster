@@ -93,7 +93,6 @@ end
 --   workspace_metadata table (optional)  plugin data stored on workspace manifest
 --   env             table    (optional)  base environment variables
 --   dims            table    (optional)  { rows = 24, cols = 80 }
---   agent_key       string   (optional)  DEPRECATED — ignored, agent_key() now returns session_uuid
 --   agent_name      string   (optional)  config agent name (e.g., "claude")
 --   profile_name    string   (optional)  DEPRECATED alias for agent_name
 --
@@ -168,7 +167,7 @@ function Session._init(self, config)
     self.session = nil        -- single PtySessionHandle
     self._session_config = session_config  -- original session config from creation
 
-    local key = self:agent_key()
+    local key = self.session_uuid
 
     local git_path = config.worktree_path .. "/.git"
     local is_worktree = fs.exists(git_path) and not fs.is_dir(git_path)
@@ -281,7 +280,7 @@ function Session._init(self, config)
         command = session_config.command or "bash",
         env = session_env,
         detect_notifications = session_config.notifications or false,
-        agent_key = key,
+        session_uuid = key,
         session_name = session_name,
         rows = rows,
         cols = cols,
@@ -309,7 +308,7 @@ function Session._init(self, config)
     local spawn_ctx = {
         worktree_path = config.worktree_path,
         branch = config.branch_name,
-        agent_key = key,
+        session_uuid = key,
         session_uuid = session_uuid,
         session_type = session_type,
         session_name = session_name,
@@ -465,7 +464,7 @@ function Session._init_recovered(self, config)
         end
     end
 
-    local key = self:agent_key()
+    local key = self.session_uuid
 
     -- Register with HandleCache
     local reg_ok, reg_index = pcall(hub.register_session, self.session_uuid, config.handle, {
@@ -494,14 +493,6 @@ end
 -- =============================================================================
 -- Instance Methods
 -- =============================================================================
-
---- DEPRECATED: Returns session_uuid.
--- Kept as a transitional alias so callers that haven't migrated yet
--- continue to compile. All new code should use session_uuid directly.
--- @return string session_uuid
-function Session:agent_key()
-    return self.session_uuid
-end
 
 --- Update one or more session fields and sync the manifest.
 -- This is the only way external code should mutate session state.
@@ -736,7 +727,7 @@ function Session:move_to_workspace(opts)
             })
             if not ok_reg then
                 log.warn(string.format("Session %s: failed to refresh HandleCache workspace: %s",
-                    self:agent_key(), tostring(reg_err)))
+                    self.session_uuid, tostring(reg_err)))
             end
         end
     end
@@ -771,7 +762,7 @@ end
 --- Close the session and clean up resources.
 -- @param delete_worktree boolean Whether to queue worktree deletion
 function Session:close(delete_worktree)
-    local key = self:agent_key()
+    local key = self.session_uuid
 
     -- Notify observers
     hooks.notify("before_agent_close", self)
@@ -826,7 +817,7 @@ function Session:close(delete_worktree)
         hooks.notify("worktree_deleted", {
             path = self.worktree_path,
             branch = self.branch_name,
-            agent_key = key,
+            session_uuid = key,
             session_uuid = self.session_uuid,
         })
     end
@@ -840,7 +831,7 @@ end
 
 --- Replay broker ring-buffer scrollback into the session's shadow screen.
 function Session:replay_broker_scrollback()
-    local key = self:agent_key()
+    local key = self.session_uuid
     local session_id = tonumber(self:get_meta("broker_session_id"))
     if not session_id then return end
 
@@ -986,27 +977,6 @@ function Session.get(session_uuid)
     return sessions[session_uuid]
 end
 
---- DEPRECATED: Find a session by agent_key or session_uuid.
--- Bridge: matches both session_uuid and derived repo-branch keys
--- for backward compat during the agent_key→session_uuid migration.
--- Will be deleted once all callers use Agent.get(session_uuid).
--- @param key string Agent key or session UUID
--- @return Session subclass instance or nil
-function Session.find_by_agent_key(key)
-    -- Fast path: direct session_uuid lookup
-    local direct = sessions[key]
-    if direct then return direct end
-    -- Slow path: match by derived repo-branch key (Rust events may still send these)
-    for _, sess in ipairs(Session.list()) do
-        local repo_safe = sess.repo:gsub("/", "-")
-        local branch_safe = sess.branch_name:gsub("/", "-")
-        local derived = repo_safe .. "-" .. branch_safe
-        if derived == key then
-            return sess
-        end
-    end
-    return nil
-end
 
 --- List all sessions in creation order.
 -- @return array of Session subclass instances

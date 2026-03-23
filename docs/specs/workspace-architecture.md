@@ -33,7 +33,7 @@ If a workspace needs a web server alongside a Claude agent, the Claude session i
 ### Session = Persistent Record of One Agent Run
 
 A session captures everything about one agent's execution:
-- Identity (uuid, agent_key, type, role)
+- Identity (uuid, label, type, role)
 - Context (workspace, repo, branch, worktree path if any)
 - State machine (pending → active → suspended → closed | orphaned)
 - PTY output (append-only log file — survives broker and hub restarts)
@@ -90,7 +90,7 @@ For dev: `~/.botster-dev/workspaces/` (follows existing `data_dir` config).
 {
   "uuid": "sess-xyz789",
   "workspace_id": "ws-abc123",
-  "agent_key": "owner-repo-botster-issue-42",
+  "label": "Fix auth bug",
   "type": "ai",
   "role": "developer",
   "repo": "owner/repo",

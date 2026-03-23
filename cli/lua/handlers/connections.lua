@@ -485,7 +485,7 @@ _event_subs[#_event_subs + 1] = events.on("process_exited", function(data)
     local session_uuid = data.session_uuid
     local exit_code = data.exit_code
     log.info(string.format("Process exited for %s (code=%s)",
-        session_uuid or data.agent_key or "?", tostring(exit_code)))
+        session_uuid or "?", tostring(exit_code)))
 
     local agent = (session_uuid and Agent.get(session_uuid))
     if agent then

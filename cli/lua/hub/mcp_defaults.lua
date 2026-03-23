@@ -762,7 +762,7 @@ Anything available in Lua is available in the handler:
       required = { "path" },
     },
   }, function(params, context)
-    local agent = Agent.get(context.session_uuid or context.agent_key)
+    local agent = Agent.get(context.session_uuid)
     if not agent then return "No agent context." end
     local wt_path = agent:info().worktree_path
     if not wt_path then return "Agent has no worktree." end
