@@ -283,8 +283,9 @@ function M.tools_for_session(session_uuid)
 
     local result = {}
     for _, tool in pairs(tools) do
-        -- Builtin tools (plugin_name == nil) are always included
-        if not tool.plugin_name or (allowed_plugins and allowed_plugins[tool.plugin_name]) then
+        -- Builtin tools (plugin_name == nil) are always included.
+        -- allowed_plugins == nil means unrestricted (all plugins available).
+        if not tool.plugin_name or not allowed_plugins or allowed_plugins[tool.plugin_name] then
             result[#result + 1] = {
                 name = tool.name,
                 description = tool.description,
@@ -296,14 +297,13 @@ function M.tools_for_session(session_uuid)
 end
 
 --- Resolve which plugins a session is allowed to use.
--- Returns a set (table with plugin names as keys) representing the intersection
--- of the target's available plugins and the agent manifest's requested plugins.
--- Returns nil if scoping cannot be determined (all tools allowed as fallback).
+-- Returns a set (table with plugin names as keys) if either target or agent
+-- restricts plugins. Returns nil when neither side restricts (all plugins available).
 -- @param session_uuid string Session UUID
 -- @return table|nil Set of allowed plugin names, or nil for unrestricted
 function M.resolve_session_plugins(session_uuid)
     local data_dir = config.data_dir and config.data_dir() or nil
-    if not data_dir then return {} end
+    if not data_dir then return nil end
 
     -- Look up live session object first (O(1), no filesystem I/O).
     -- Falls back to manifest scan only if session isn't in memory.
@@ -335,9 +335,9 @@ function M.resolve_session_plugins(session_uuid)
         end
     end
 
-    -- Deny-by-default: if we can't determine the session's identity,
-    -- no plugin tools are allowed (builtins still pass through).
-    if not target_id and not agent_name then return {} end
+    -- If we can't determine the session's identity, allow all plugins.
+    -- This covers testing, debugging, and MCP connections without session context.
+    if not target_id and not agent_name then return nil end
 
     -- Get target plugins (availability ceiling)
     local target_plugins = nil
@@ -372,7 +372,15 @@ function M.resolve_session_plugins(session_uuid)
         end
     end
 
-    -- Compute intersection
+    -- Compute result:
+    -- Both set → intersection
+    -- Only target set → target ceiling (agent doesn't restrict)
+    -- Only agent set → agent's list (target doesn't restrict)
+    -- Neither set → nil (unrestricted — all plugins available)
+    --
+    -- No-plugins-field = "no restriction", not "deny all".
+    -- The target is the security boundary via admission, not via plugin scoping.
+    -- Plugin scoping is opt-in restriction on both sides.
     if target_plugins and agent_plugins then
         local intersection = {}
         for p in pairs(agent_plugins) do
@@ -384,12 +392,11 @@ function M.resolve_session_plugins(session_uuid)
     elseif target_plugins then
         return target_plugins
     elseif agent_plugins then
-        -- Target has no plugins field — deny-by-default. Target is the security boundary.
-        return {}
+        return agent_plugins
     end
 
-    -- Deny-by-default: no plugins field means no plugins.
-    return {}
+    -- Neither side restricts — all plugins available
+    return nil
 end
 
 --- Normalize a tool result to MCP content array format.
