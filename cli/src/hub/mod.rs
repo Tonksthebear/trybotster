@@ -48,6 +48,7 @@ pub mod handle_cache;
 pub mod registration;
 pub mod run;
 mod server_comms;
+mod terminal_profile;
 pub mod state;
 
 pub use actions::HubAction;
@@ -446,6 +447,12 @@ pub struct Hub {
     /// atomically (idempotent reattach) across all transport clients.
     pending_terminal_attaches: std::collections::HashMap<String, PendingTerminalAttach>,
 
+    /// Cached terminal theme replies learned from live attached clients.
+    ///
+    /// Used only as a headless fallback when a PTY emits startup probes before
+    /// any terminal client is attached to answer them live.
+    terminal_profiles: terminal_profile::TerminalProfileStore,
+
     /// Sender for outgoing WebRTC signals (ICE candidates) from async callbacks.
     ///
     /// Cloned for each new WebRTC channel. The async `on_ice_candidate` callback
@@ -711,6 +718,7 @@ impl Hub {
             pty_forwarders: std::collections::HashMap::new(),
             webrtc_backpressure_recovery: std::collections::HashMap::new(),
             pending_terminal_attaches: std::collections::HashMap::new(),
+            terminal_profiles: terminal_profile::TerminalProfileStore::default(),
             webrtc_outgoing_signal_tx,
             webrtc_outgoing_signal_rx: Some(webrtc_outgoing_signal_rx),
             stream_muxes: std::collections::HashMap::new(),
