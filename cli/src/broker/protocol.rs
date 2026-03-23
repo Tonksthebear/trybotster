@@ -676,7 +676,11 @@ fn decode_frame(ft: u8, payload: &[u8]) -> Result<BrokerFrame> {
             }
             let session_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
             let flags = payload[4];
-            Ok(BrokerFrame::PtyOutput(session_id, flags, payload[5..].to_vec()))
+            Ok(BrokerFrame::PtyOutput(
+                session_id,
+                flags,
+                payload[5..].to_vec(),
+            ))
         }
         frame_type::SNAPSHOT => {
             if payload.len() < 4 {
@@ -1133,7 +1137,11 @@ mod tests {
         let encoded = encode_pty_output(1, 0, b"y");
         let frames = BrokerFrameDecoder::new().feed(&encoded).unwrap();
         if let BrokerFrame::PtyOutput(_, flags, _) = &frames[0] {
-            assert_eq!(*flags & sideband::CURSOR_VISIBLE, 0, "cursor should be hidden");
+            assert_eq!(
+                *flags & sideband::CURSOR_VISIBLE,
+                0,
+                "cursor should be hidden"
+            );
             assert_eq!(*flags & sideband::KITTY_ENABLED, 0, "kitty should be off");
         } else {
             panic!("expected PtyOutput");

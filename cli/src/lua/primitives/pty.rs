@@ -586,6 +586,21 @@ pub struct CreateForwarderRequest {
     pub active_flag: Arc<Mutex<bool>>,
 }
 
+/// Request to replay a PTY snapshot over an existing WebRTC subscription.
+#[derive(Debug, Clone)]
+pub struct RefreshSnapshotRequest {
+    /// Browser peer that will receive the PTY snapshot.
+    pub peer_id: String,
+    /// Session UUID identifying the target PTY.
+    pub session_uuid: String,
+    /// Existing browser-generated subscription ID for message routing.
+    pub subscription_id: String,
+    /// Target terminal rows requested by the subscriber.
+    pub rows: u16,
+    /// Target terminal columns requested by the subscriber.
+    pub cols: u16,
+}
+
 /// Request to create a TUI PTY forwarder (queued for Hub to process).
 ///
 /// Unlike `CreateForwarderRequest`, this doesn't need a peer_id (single TUI)
@@ -630,6 +645,9 @@ pub struct CreateSocketForwarderRequest {
 pub enum PtyRequest {
     /// Create a new PTY forwarder for streaming to WebRTC.
     CreateForwarder(CreateForwarderRequest),
+
+    /// Replay a fresh PTY snapshot over an existing WebRTC subscription.
+    RefreshSnapshot(RefreshSnapshotRequest),
 
     /// Create a new PTY forwarder for streaming to TUI (index-based).
     CreateTuiForwarder(CreateTuiForwarderRequest),
@@ -680,6 +698,7 @@ impl Clone for PtyRequest {
     fn clone(&self) -> Self {
         match self {
             Self::CreateForwarder(req) => Self::CreateForwarder(req.clone()),
+            Self::RefreshSnapshot(req) => Self::RefreshSnapshot(req.clone()),
             Self::CreateTuiForwarder(req) => Self::CreateTuiForwarder(req.clone()),
             Self::StopForwarder { forwarder_id } => Self::StopForwarder {
                 forwarder_id: forwarder_id.clone(),
@@ -899,6 +918,40 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
     webrtc
         .set("create_pty_forwarder", create_forwarder_fn)
         .map_err(|e| anyhow!("Failed to set webrtc.create_pty_forwarder: {e}"))?;
+
+    // webrtc.request_pty_snapshot({ peer_id, session_uuid, subscription_id, rows?, cols? })
+    let tx_refresh = hub_event_tx.clone();
+    let request_snapshot_fn = lua
+        .create_function(move |_lua, opts: LuaTable| {
+            let peer_id: String = opts
+                .get("peer_id")
+                .map_err(|_| LuaError::runtime("peer_id is required"))?;
+            let session_uuid: String = opts
+                .get("session_uuid")
+                .map_err(|_| LuaError::runtime("session_uuid is required"))?;
+            let subscription_id: String = opts
+                .get("subscription_id")
+                .map_err(|_| LuaError::runtime("subscription_id is required"))?;
+            let rows: u16 = opts.get("rows").unwrap_or(24);
+            let cols: u16 = opts.get("cols").unwrap_or(80);
+
+            send_pty_event(
+                &tx_refresh,
+                PtyRequest::RefreshSnapshot(RefreshSnapshotRequest {
+                    peer_id,
+                    session_uuid,
+                    subscription_id,
+                    rows,
+                    cols,
+                }),
+            );
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create webrtc.request_pty_snapshot function: {e}"))?;
+
+    webrtc
+        .set("request_pty_snapshot", request_snapshot_fn)
+        .map_err(|e| anyhow!("Failed to set webrtc.request_pty_snapshot: {e}"))?;
 
     // Ensure webrtc table is globally registered
     lua.globals()

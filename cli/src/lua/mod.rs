@@ -58,6 +58,7 @@ pub use primitives::{
     PtyForwarder,
     PtyOutputContext,
     PtyRequest,
+    RefreshSnapshotRequest,
     SharedEventCallbacks,
     // WebRTC primitives
     WebRtcSendRequest,

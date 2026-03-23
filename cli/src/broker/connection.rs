@@ -917,14 +917,9 @@ fn demux_reader(
                         exit_code,
                     });
                 }
-                BrokerFrame::BrokerControl(BrokerMessage::TermEvent {
-                    session_id,
-                    event,
-                }) => {
-                    let _ = event_tx.send(crate::hub::events::HubEvent::BrokerTermEvent {
-                        session_id,
-                        event,
-                    });
+                BrokerFrame::BrokerControl(BrokerMessage::TermEvent { session_id, event }) => {
+                    let _ = event_tx
+                        .send(crate::hub::events::HubEvent::BrokerTermEvent { session_id, event });
                 }
                 other => {
                     // Control response: Registered, Snapshot, Ack, Pong, Error, etc.
@@ -1114,9 +1109,7 @@ mod integration_tests {
 
         match result {
             Ok(Some(HubEvent::BrokerPtyOutput {
-                session_id,
-                data,
-                ..
+                session_id, data, ..
             })) => {
                 assert_eq!(session_id, 7);
                 assert_eq!(data, b"hello world");

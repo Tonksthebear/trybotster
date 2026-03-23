@@ -362,7 +362,13 @@ impl HubEvent {
             Self::HttpResponse(_) => "http_response",
             Self::WebSocketEvent(_) => "websocket_event",
             Self::PtyNotification(_) => "pty_notification",
-            Self::PtyOscEvent { .. } => "pty_osc_event",
+            Self::PtyOscEvent { event, .. } => match event {
+                crate::agent::pty::PtyEvent::TitleChanged(_) => "pty_osc_title",
+                crate::agent::pty::PtyEvent::CwdChanged(_) => "pty_osc_cwd",
+                crate::agent::pty::PtyEvent::PromptMark(_) => "pty_osc_prompt",
+                crate::agent::pty::PtyEvent::CursorVisibilityChanged(_) => "pty_osc_cursor",
+                _ => "pty_osc_event",
+            },
             Self::PtyProcessExited { .. } => "pty_process_exited",
             Self::DcOpened { .. } => "dc_opened",
             Self::WebRtcIngressBackpressure { .. } => "webrtc_ingress_backpressure",
@@ -391,7 +397,13 @@ impl HubEvent {
             Self::MessageDelivered { .. } => "message_delivered",
             Self::BrokerPtyOutput { .. } => "broker_pty_output",
             Self::BrokerPtyExited { .. } => "broker_pty_exited",
-            Self::BrokerTermEvent { .. } => "broker_term_event",
+            Self::BrokerTermEvent { event, .. } => match event {
+                crate::broker::protocol::BrokerTermEvent::TitleChanged { .. } => {
+                    "broker_term_title_changed"
+                }
+                crate::broker::protocol::BrokerTermEvent::ResetTitle => "broker_term_reset_title",
+                crate::broker::protocol::BrokerTermEvent::Bell => "broker_term_bell",
+            },
             Self::BrokerSessionRegistered { .. } => "broker_session_registered",
             Self::SessionUnregistered { .. } => "session_unregistered",
             Self::WorktreeDeleteCompleted { .. } => "worktree_delete_completed",
@@ -444,6 +456,8 @@ pub(crate) struct HubEventTypeSnapshot {
     pub pending_high_water: usize,
     pub bytes_pending: usize,
     pub bytes_high_water: usize,
+    pub handler_time_total_ns: u64,
+    pub handler_time_max_ns: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -455,6 +469,8 @@ pub(crate) struct HubEventMetricsSnapshot {
     pub pending_high_water_total: usize,
     pub bytes_pending_total: usize,
     pub bytes_high_water_total: usize,
+    pub handler_time_total_ns: u64,
+    pub handler_time_max_ns: u64,
     pub by_type: BTreeMap<&'static str, HubEventTypeSnapshot>,
 }
 
@@ -467,6 +483,8 @@ struct HubEventTypeMetrics {
     pending_high_water: usize,
     bytes_pending: usize,
     bytes_high_water: usize,
+    handler_time_total_ns: u64,
+    handler_time_max_ns: u64,
 }
 
 #[derive(Debug, Default)]
@@ -478,11 +496,23 @@ pub(crate) struct HubEventMetrics {
     pending_high_water_total: AtomicUsize,
     bytes_pending_total: AtomicUsize,
     bytes_high_water_total: AtomicUsize,
+    handler_time_total_ns: AtomicU64,
+    handler_time_max_ns: AtomicU64,
     by_type: Mutex<BTreeMap<&'static str, HubEventTypeMetrics>>,
 }
 
 impl HubEventMetrics {
     fn bump_high_water(atom: &AtomicUsize, value: usize) {
+        let mut current = atom.load(Ordering::Relaxed);
+        while value > current {
+            match atom.compare_exchange(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(updated) => current = updated,
+            }
+        }
+    }
+
+    fn bump_high_water_u64(atom: &AtomicU64, value: u64) {
         let mut current = atom.load(Ordering::Relaxed);
         while value > current {
             match atom.compare_exchange(current, value, Ordering::Relaxed, Ordering::Relaxed) {
@@ -536,6 +566,19 @@ impl HubEventMetrics {
         }
     }
 
+    pub(crate) fn record_handler_time(&self, kind: &'static str, elapsed: std::time::Duration) {
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        self.handler_time_total_ns
+            .fetch_add(nanos, Ordering::Relaxed);
+        Self::bump_high_water_u64(&self.handler_time_max_ns, nanos);
+
+        if let Ok(mut map) = self.by_type.lock() {
+            let entry = map.entry(kind).or_default();
+            entry.handler_time_total_ns = entry.handler_time_total_ns.saturating_add(nanos);
+            entry.handler_time_max_ns = entry.handler_time_max_ns.max(nanos);
+        }
+    }
+
     #[must_use]
     pub(crate) fn snapshot(&self) -> HubEventMetricsSnapshot {
         let by_type = if let Ok(map) = self.by_type.lock() {
@@ -551,6 +594,8 @@ impl HubEventMetrics {
                             pending_high_water: v.pending_high_water,
                             bytes_pending: v.bytes_pending,
                             bytes_high_water: v.bytes_high_water,
+                            handler_time_total_ns: v.handler_time_total_ns,
+                            handler_time_max_ns: v.handler_time_max_ns,
                         },
                     )
                 })
@@ -567,6 +612,8 @@ impl HubEventMetrics {
             pending_high_water_total: self.pending_high_water_total.load(Ordering::Relaxed),
             bytes_pending_total: self.bytes_pending_total.load(Ordering::Relaxed),
             bytes_high_water_total: self.bytes_high_water_total.load(Ordering::Relaxed),
+            handler_time_total_ns: self.handler_time_total_ns.load(Ordering::Relaxed),
+            handler_time_max_ns: self.handler_time_max_ns.load(Ordering::Relaxed),
             by_type,
         }
     }
@@ -602,5 +649,44 @@ impl HubEventTx {
 impl From<mpsc::UnboundedSender<HubEvent>> for HubEventTx {
     fn from(inner: mpsc::UnboundedSender<HubEvent>) -> Self {
         Self::new(inner, Arc::new(HubEventMetrics::default()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn kind_splits_pty_osc_subtypes() {
+        let title = HubEvent::PtyOscEvent {
+            agent_key: "a".to_string(),
+            session_name: "s".to_string(),
+            event: crate::agent::pty::PtyEvent::title_changed("hello"),
+        };
+        assert_eq!(title.kind(), "pty_osc_title");
+
+        let cwd = HubEvent::PtyOscEvent {
+            agent_key: "a".to_string(),
+            session_name: "s".to_string(),
+            event: crate::agent::pty::PtyEvent::cwd_changed("/tmp"),
+        };
+        assert_eq!(cwd.kind(), "pty_osc_cwd");
+    }
+
+    #[test]
+    fn metrics_snapshot_includes_handler_timing() {
+        let metrics = HubEventMetrics::default();
+        metrics.record_enqueue("pty_osc_title", 32);
+        metrics.record_dequeue("pty_osc_title", 32);
+        metrics.record_handler_time("pty_osc_title", Duration::from_micros(250));
+
+        let snapshot = metrics.snapshot();
+        let kind = snapshot.by_type.get("pty_osc_title").unwrap();
+        assert_eq!(kind.dequeue, 1);
+        assert_eq!(kind.handler_time_total_ns, 250_000);
+        assert_eq!(kind.handler_time_max_ns, 250_000);
+        assert_eq!(snapshot.handler_time_total_ns, 250_000);
+        assert_eq!(snapshot.handler_time_max_ns, 250_000);
     }
 }

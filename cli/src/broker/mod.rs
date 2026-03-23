@@ -501,7 +501,14 @@ impl Broker {
         let tee_clone = Arc::clone(&shared_tee);
         let collected_clone = Arc::clone(&collected);
         let reader = thread::spawn(move || {
-            reader_loop(raw, reader_sid, parser_clone, shared, tee_clone, collected_clone);
+            reader_loop(
+                raw,
+                reader_sid,
+                parser_clone,
+                shared,
+                tee_clone,
+                collected_clone,
+            );
         });
         let (writer_tx, writer_rx) =
             std::sync::mpsc::sync_channel::<PtyWriteCommand>(PTY_WRITER_QUEUE_CAPACITY);
@@ -939,11 +946,7 @@ fn handle_connection(mut stream: UnixStream, broker: &mut Broker) -> Result<()> 
 
                 BrokerFrame::HubControl(HubMessage::GetScreen { session_id }) => {
                     let frame = if let Some(sess) = broker.sessions.get(&session_id) {
-                        let text = sess
-                            .parser
-                            .lock()
-                            .map(|p| p.contents())
-                            .unwrap_or_default();
+                        let text = sess.parser.lock().map(|p| p.contents()).unwrap_or_default();
                         encode_data(frame_type::SCREEN, session_id, text.as_bytes())
                     } else {
                         log::warn!("[broker] GetScreen for unknown session {session_id}");
@@ -953,7 +956,6 @@ fn handle_connection(mut stream: UnixStream, broker: &mut Broker) -> Result<()> 
                     };
                     let _ = control_tx.send(frame);
                 }
-
 
                 BrokerFrame::HubControl(HubMessage::ListSessions) => {
                     let mut sessions: Vec<BrokerSessionInventory> = broker

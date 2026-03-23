@@ -38,7 +38,7 @@
 //!
 //! - [`crypto_service`] - Thread-safe crypto wrapper (`Arc<Mutex<VodozemacCrypto>>`)
 //! - [`olm_crypto`] - Vodozemac Olm E2E encryption
-//! - [`persistence`] - Encrypted storage for crypto state
+//! - [`persistence`] - Encrypted storage for relay-side secrets and metadata
 //! - [`state`] - Browser connection state management
 //! - [`types`] - Protocol message types
 //! - [`stream_mux`] - TCP stream multiplexer for preview tunneling
@@ -56,8 +56,7 @@ pub use types::{AgentInfo, BrowserCommand, BrowserResize, TerminalMessage, Workt
 
 pub use olm_crypto::{
     binary_format, extract_olm_key, DeviceKeyBundle, OlmEnvelope, VodozemacCrypto,
-    VodozemacCryptoState, MSG_TYPE_BUNDLE_REFRESH, MSG_TYPE_NORMAL, MSG_TYPE_PREKEY,
-    PROTOCOL_VERSION,
+    MSG_TYPE_BUNDLE_REFRESH, MSG_TYPE_NORMAL, MSG_TYPE_PREKEY, PROTOCOL_VERSION,
 };
 
 pub use persistence::{delete_connection_url, read_connection_url, write_connection_url};

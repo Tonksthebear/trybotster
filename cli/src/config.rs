@@ -222,15 +222,15 @@ impl Config {
 pub struct HubEntry {
     /// User-chosen display name for this hub.
     pub name: String,
-    /// Canonical repo/directory path (for debugging, not used for lookups).
+    /// Legacy canonical repo/directory path retained for debugging only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_path: Option<String>,
 }
 
-/// Per-directory hub name registry.
+/// Local hub name registry.
 ///
-/// Maps `hub_identifier` (SHA256 of repo/cwd path) to a `HubEntry` containing
-/// the user-chosen display name. Stored at `{config_dir}/hub_registry.json`.
+/// Maps local `hub_identifier` values to a `HubEntry` containing the
+/// user-chosen display name. Stored at `{config_dir}/hub_registry.json`.
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct HubRegistry {
     hubs: HashMap<String, HubEntry>,

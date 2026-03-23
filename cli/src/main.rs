@@ -80,33 +80,16 @@ fn ensure_authenticated() -> Result<()> {
             }
         }
 
-        // Also prompt for hub name now (while we're still in the setup flow)
-        // so the user doesn't get asked again after returning from the browser.
+        // Also prompt for the device hub name now (while we're still in the
+        // setup flow) so the user doesn't get asked again after returning
+        // from the browser.
         if atty::is(atty::Stream::Stdin) && !botster::env::is_test_mode() {
-            use botster::hub::hub_id_for_repo;
-
-            let (hub_id, repo_path) = if let Ok(id) = std::env::var("BOTSTER_HUB_ID") {
-                (id, None)
-            } else {
-                match botster::WorktreeManager::detect_current_repo() {
-                    Ok((path, _)) => {
-                        let id = hub_id_for_repo(&path);
-                        let canonical = path.canonicalize().unwrap_or(path);
-                        (id, Some(canonical.to_string_lossy().to_string()))
-                    }
-                    Err(_) => {
-                        let cwd = std::env::current_dir()?;
-                        let id = hub_id_for_repo(&cwd);
-                        let canonical = cwd.canonicalize().unwrap_or(cwd);
-                        (id, Some(canonical.to_string_lossy().to_string()))
-                    }
-                }
-            };
+            let hub_id = botster::hub::local_device_hub_id()?;
 
             let mut registry = HubRegistry::load();
             if registry.get_hub_name(&hub_id).is_none() {
                 let name = auth::prompt_hub_name()?;
-                registry.set_hub_name(&hub_id, name.clone(), repo_path);
+                registry.set_hub_name(&hub_id, name.clone(), None);
                 registry.save()?;
                 config.hub_name = Some(name);
             }
@@ -202,71 +185,50 @@ fn save_tokens(config: &mut Config, token_response: &botster::auth::TokenRespons
     Ok(())
 }
 
-/// Ensure the current directory has a hub name in the registry.
+/// Ensure the local device hub has a display name in the registry.
 ///
-/// Computes the hub_identifier for the current directory, checks the registry,
-/// and prompts the user if this is a new directory. Sets `config.hub_name` to
-/// the looked-up or newly-chosen name so `Hub::new()` can pass it to the server.
+/// Computes the device-scoped local `hub_identifier`, checks the registry, and
+/// prompts the user if this is the first startup on the device. Sets
+/// `config.hub_name` to the looked-up or newly-chosen name so `Hub::new()` can
+/// pass it to the server.
 fn ensure_hub_named(config: &mut Config) -> Result<()> {
     use botster::auth;
-    use botster::hub::hub_id_for_repo;
 
     if botster::env::is_test_mode() {
         return Ok(());
     }
 
-    // Compute local hub_identifier using repo/cwd hash (must match Hub::new()).
-    // Do not source from BOTSTER_HUB_ID: that env value may be server-assigned.
-    let (hub_id, repo_path) = match botster::WorktreeManager::detect_current_repo() {
-        Ok((path, _)) => {
-            let id = hub_id_for_repo(&path);
-            let canonical = path.canonicalize().unwrap_or(path);
-            (id, Some(canonical.to_string_lossy().to_string()))
-        }
-        Err(_) => {
-            let cwd = std::env::current_dir()?;
-            let id = hub_id_for_repo(&cwd);
-            let canonical = cwd.canonicalize().unwrap_or(cwd);
-            (id, Some(canonical.to_string_lossy().to_string()))
-        }
-    };
+    let hub_id = botster::hub::local_device_hub_id()?;
 
     let mut registry = HubRegistry::load();
 
     if let Some(name) = registry.get_hub_name(&hub_id) {
-        // Already registered — use cached name
+        // Already registered — use cached name.
         config.hub_name = Some(name.to_string());
     } else if registry.is_empty() && config.hub_name.is_some() {
-        // Migrate from old global hub_name to per-directory registry.
-        // Only if registry is empty (first migration) — otherwise the legacy
-        // name was for a different directory and should not be reused.
+        // Migrate from the old global hub_name to the device-hub registry.
         let legacy_name = config.hub_name.as_ref().unwrap();
         log::info!("Migrating legacy hub_name '{}' to registry", legacy_name);
-        registry.set_hub_name(&hub_id, legacy_name.clone(), repo_path);
+        registry.set_hub_name(&hub_id, legacy_name.clone(), None);
         registry.save()?;
     } else if atty::is(atty::Stream::Stdin) {
-        // New directory, interactive — prompt for hub name
+        // First startup on this device, interactive — prompt for hub name.
         let name = auth::prompt_hub_name()?;
-        registry.set_hub_name(&hub_id, name.clone(), repo_path);
+        registry.set_hub_name(&hub_id, name.clone(), None);
         registry.save()?;
         config.hub_name = Some(name);
     } else {
-        // New directory, non-interactive — auto-name from repo or dir basename
+        // First startup on this device, non-interactive — auto-name.
         let name = std::env::var("BOTSTER_REPO")
             .ok()
             .or_else(|| {
-                botster::WorktreeManager::detect_current_repo()
-                    .map(|(_, name)| name)
+                botster::device::Device::load_or_create()
                     .ok()
-            })
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .map(|d| d.name)
             })
             .unwrap_or_else(|| "my-hub".to_string());
         log::info!("Auto-naming hub: {name} (non-interactive)");
-        registry.set_hub_name(&hub_id, name.clone(), repo_path);
+        registry.set_hub_name(&hub_id, name.clone(), None);
         registry.save()?;
         config.hub_name = Some(name);
     }
@@ -290,6 +252,7 @@ fn run_headless() -> Result<()> {
 
     // Ensure we have a valid authentication token
     ensure_authenticated()?;
+    normalize_process_cwd_to_home()?;
 
     // Set up signal handlers
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
@@ -382,6 +345,7 @@ fn run_with_tui() -> Result<()> {
 
     // Ensure we have a valid authentication token
     ensure_authenticated()?;
+    normalize_process_cwd_to_home()?;
 
     // Set up signal handlers
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
@@ -539,7 +503,7 @@ enum Commands {
     },
     /// Attach a TUI to a running headless hub (like tmux attach)
     Attach {
-        /// Hub identifier or name (defaults to current directory)
+        /// Hub identifier or name (defaults to the local device hub)
         #[arg(long)]
         hub: Option<String>,
     },
@@ -636,16 +600,21 @@ impl Drop for WakePipe {
     }
 }
 
-/// Attach a TUI to a running headless hub via Unix domain socket.
-/// Derive the hub_id for the current working directory.
+/// Normalize the hub process cwd to the user's home directory.
 ///
-/// Returns `None` only if both repo detection and `current_dir()` fail.
-fn resolve_hub_id_for_cwd() -> Option<String> {
-    let repo_path = match botster::WorktreeManager::detect_current_repo() {
-        Ok((path, _)) => path,
-        Err(_) => std::env::current_dir().ok()?,
-    };
-    Some(botster::hub::hub_id_for_repo(&repo_path))
+/// Device-scoped startup must not inherit repo trust or identity from the
+/// shell location that launched the process.
+fn normalize_process_cwd_to_home() -> Result<()> {
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    std::env::set_current_dir(&home)
+        .with_context(|| format!("Failed to change working directory to {}", home.display()))?;
+    log::info!("Normalized process cwd to home: {}", home.display());
+    Ok(())
+}
+
+/// Resolve the stable local hub ID for this device.
+fn resolve_local_hub_id() -> Option<String> {
+    botster::hub::local_device_hub_id().ok()
 }
 
 /// Resolve a socket path for `mcp-serve`.
@@ -705,7 +674,7 @@ fn resolve_mcp_serve_socket() -> Result<String> {
 }
 
 ///
-/// Discovers a running hub (by directory or explicit `--hub` arg),
+/// Discovers a running hub (by device-local default or explicit `--hub` arg),
 /// connects to its socket, and runs the TUI with a bridge adapter.
 fn run_attach(hub_arg: Option<String>) -> Result<()> {
     use botster::hub::daemon;
@@ -721,12 +690,7 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
     let hub_id = if let Some(ref arg) = hub_arg {
         arg.clone()
     } else {
-        // Derive from current directory (same logic as Hub::new)
-        let repo_path = match botster::WorktreeManager::detect_current_repo() {
-            Ok((path, _)) => path,
-            Err(_) => std::env::current_dir()?,
-        };
-        botster::hub::hub_id_for_repo(&repo_path)
+        botster::hub::local_device_hub_id()?
     };
 
     let socket_path = if let Some(path) = daemon::resolve_socket_for_hub_id(&hub_id) {
@@ -735,11 +699,11 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
         let running = daemon::discover_running_hubs();
         if running.is_empty() {
             anyhow::bail!(
-                "No running hub manifest found for this directory.\n\
+                "No running local device hub manifest found.\n\
                  Start one with: botster start --headless"
             );
         } else {
-            eprintln!("No running hub manifest found for this directory.");
+            eprintln!("No running local device hub manifest found.");
             eprintln!("Running hubs:");
             for (id, pid) in &running {
                 eprintln!("  {} (pid={})", &id[..id.len().min(8)], pid);
@@ -1061,12 +1025,12 @@ fn main() -> Result<()> {
                 std::env::set_var("BOTSTER_OFFLINE", "1");
                 log::info!("Offline mode enabled — all network primitives disabled");
             }
-            // Strict singleton policy: one live hub per directory-local hub ID.
+            // Strict singleton policy: one live hub per device-local hub ID.
             //
             // A missing socket does not imply no live hub: startup races or an
             // unsafe unlink can leave a live PID without a socket path. Treat a
             // live PID as authoritative to avoid spawning duplicates.
-            let existing_hub = resolve_hub_id_for_cwd().map(|id| {
+            let existing_hub = resolve_local_hub_id().map(|id| {
                 let socket = botster::hub::daemon::resolve_socket_for_hub_id(&id);
                 let pid_alive = botster::hub::daemon::is_hub_running(&id);
                 (id, socket, pid_alive)
@@ -1075,7 +1039,7 @@ fn main() -> Result<()> {
             if headless {
                 if let Some((hub_id, Some(socket), _)) = existing_hub.as_ref() {
                     anyhow::bail!(
-                        "Hub already running for this directory (hub_id={}, socket={}). \
+                        "Hub already running on this device (hub_id={}, socket={}). \
                          Use `botster attach --hub {}` or stop the existing hub first.",
                         hub_id,
                         socket.display(),
@@ -1087,7 +1051,7 @@ fn main() -> Result<()> {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| "<unknown>".to_string());
                     anyhow::bail!(
-                        "Hub process already running for this directory (hub_id={hub_id}) \
+                        "Hub process already running on this device (hub_id={hub_id}) \
                          but socket is unavailable ({expected_socket}). Refusing to start a \
                          duplicate hub. Stop the existing hub first."
                     );
@@ -1102,7 +1066,7 @@ fn main() -> Result<()> {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| "<unknown>".to_string());
                     anyhow::bail!(
-                        "Hub process already running for this directory (hub_id={hub_id}) \
+                        "Hub process already running on this device (hub_id={hub_id}) \
                          but socket is unavailable ({expected_socket}). Refusing to start a \
                          duplicate hub."
                     );

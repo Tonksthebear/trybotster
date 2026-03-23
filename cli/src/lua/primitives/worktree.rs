@@ -45,6 +45,7 @@
 //! ```
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -122,6 +123,36 @@ pub type WorktreeResultReceiver = tokio::sync::mpsc::Receiver<WorktreeCreateResu
 /// Channel type for sending async worktree creation results.
 pub type WorktreeResultSender = tokio::sync::mpsc::Sender<WorktreeCreateResult>;
 
+fn parse_porcelain_worktrees(output: &str) -> Vec<serde_json::Value> {
+    let mut worktrees = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_branch: Option<String> = None;
+
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = Some(path.to_string());
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            current_branch = Some(branch.to_string());
+        } else if line.is_empty() {
+            if let Some(path) = current_path.take() {
+                worktrees.push(serde_json::json!({
+                    "path": path,
+                    "branch": current_branch.take().unwrap_or_default(),
+                }));
+            }
+        }
+    }
+
+    if let Some(path) = current_path {
+        worktrees.push(serde_json::json!({
+            "path": path,
+            "branch": current_branch.unwrap_or_default(),
+        }));
+    }
+
+    worktrees
+}
+
 /// Register worktree primitives with the Lua state.
 ///
 /// Adds the following functions to the `worktree` table:
@@ -131,6 +162,9 @@ pub type WorktreeResultSender = tokio::sync::mpsc::Sender<WorktreeCreateResult>;
 /// - `worktree.create(branch)` - Synchronously create worktree, returns path
 /// - `worktree.delete(path, branch)` - Request worktree deletion (async)
 /// - `worktree.repo_root()` - Get the main repository root path (nil if not in repo)
+/// - `worktree.list_for_root(path)` - List git worktrees for an explicit repo root
+/// - `worktree.find_for_root(path, branch)` - Find a worktree path for an explicit repo root
+/// - `worktree.create_for_root(path, branch)` - Create a worktree for an explicit repo root
 ///
 /// # Arguments
 ///
@@ -180,6 +214,56 @@ pub(crate) fn register(
     worktree
         .set("list", list_fn)
         .map_err(|e| anyhow!("Failed to set worktree.list: {e}"))?;
+
+    let list_for_root_fn = lua
+        .create_function(move |lua, repo_root: String| {
+            let output = Command::new("git")
+                .args(["worktree", "list", "--porcelain"])
+                .current_dir(&repo_root)
+                .output()
+                .map_err(|e| {
+                    mlua::Error::runtime(format!(
+                        "Failed to list worktrees for {}: {}",
+                        repo_root, e
+                    ))
+                })?;
+
+            if !output.status.success() {
+                return Err(mlua::Error::runtime(format!(
+                    "Failed to list worktrees for {}: {}",
+                    repo_root,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+
+            let worktrees = parse_porcelain_worktrees(&String::from_utf8_lossy(&output.stdout));
+            super::json::json_to_lua(lua, &serde_json::Value::Array(worktrees))
+        })
+        .map_err(|e| anyhow!("Failed to create worktree.list_for_root function: {e}"))?;
+
+    worktree
+        .set("list_for_root", list_for_root_fn)
+        .map_err(|e| anyhow!("Failed to set worktree.list_for_root: {e}"))?;
+
+    let find_for_root_base = worktree_base.clone();
+    let find_for_root_fn = lua
+        .create_function(move |_, (repo_root, branch): (String, String)| {
+            let manager = WorktreeManager::new(find_for_root_base.clone());
+            let found = manager
+                .find_worktree_for_branch(std::path::Path::new(&repo_root), &branch)
+                .map_err(|e| {
+                    mlua::Error::runtime(format!(
+                        "Failed to find worktree for {} in {}: {}",
+                        branch, repo_root, e
+                    ))
+                })?;
+            Ok(found.map(|path| path.to_string_lossy().to_string()))
+        })
+        .map_err(|e| anyhow!("Failed to create worktree.find_for_root function: {e}"))?;
+
+    worktree
+        .set("find_for_root", find_for_root_fn)
+        .map_err(|e| anyhow!("Failed to set worktree.find_for_root: {e}"))?;
 
     // worktree.exists(branch) -> boolean
     //
@@ -250,6 +334,26 @@ pub(crate) fn register(
     worktree
         .set("create", create_fn)
         .map_err(|e| anyhow!("Failed to set worktree.create: {e}"))?;
+
+    let create_for_root_base = worktree_base.clone();
+    let create_for_root_fn = lua
+        .create_function(move |_, (repo_root, branch): (String, String)| {
+            let manager = WorktreeManager::new(create_for_root_base.clone());
+            let path = manager
+                .create_worktree_for_repo_root(std::path::Path::new(&repo_root), &branch)
+                .map_err(|e| {
+                    mlua::Error::runtime(format!(
+                        "Failed to create worktree for {} in {}: {}",
+                        branch, repo_root, e
+                    ))
+                })?;
+            Ok(path.to_string_lossy().to_string())
+        })
+        .map_err(|e| anyhow!("Failed to create worktree.create_for_root function: {e}"))?;
+
+    worktree
+        .set("create_for_root", create_for_root_fn)
+        .map_err(|e| anyhow!("Failed to set worktree.create_for_root: {e}"))?;
 
     // worktree.create_async(params) - Queue async worktree creation
     //

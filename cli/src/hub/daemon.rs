@@ -58,7 +58,7 @@ pub fn try_lock_hub(hub_id: &str) -> Result<HubLock> {
         let err = std::io::Error::last_os_error();
         if err.kind() == std::io::ErrorKind::WouldBlock {
             anyhow::bail!(
-                "Another hub is already running for this directory.\n\
+                "Another hub is already running on this device.\n\
                  Lock file: {}\n\
                  Use `botster attach` to connect to the existing hub, \
                  or stop it first.",

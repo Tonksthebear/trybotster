@@ -3976,7 +3976,10 @@ mod tests {
             )
             .eval()
             .expect("count running entries after recovery");
-        assert_eq!(running_count, 1, "recovery should produce exactly one running session");
+        assert_eq!(
+            running_count, 1,
+            "recovery should produce exactly one running session"
+        );
 
         // The recovered session should have real methods (not a plain table)
         let has_info_method: bool = runtime

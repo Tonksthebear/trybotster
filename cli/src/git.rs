@@ -149,20 +149,32 @@ impl WorktreeManager {
 
     /// Creates a worktree from the current repository with a custom branch name
     pub fn create_worktree_with_branch(&self, branch_name: &str) -> Result<PathBuf> {
-        let (repo_path, repo_name) = Self::detect_current_repo()?;
+        let (repo_path, _) = Self::detect_current_repo()?;
+        self.create_worktree_for_repo_root(&repo_path, branch_name)
+    }
 
+    /// Creates a worktree from the current repository
+    pub fn create_worktree_from_current(&self, issue_number: u32) -> Result<PathBuf> {
+        let branch_name = format!("botster-issue-{}", issue_number);
+        self.create_worktree_with_branch(&branch_name)
+    }
+
+    /// Creates a worktree for an explicit repository root.
+    pub fn create_worktree_for_repo_root(
+        &self,
+        repo_path: &Path,
+        branch_name: &str,
+    ) -> Result<PathBuf> {
+        let repo_name = repo_name_for_root(repo_path)?;
         let repo_safe = repo_name.replace('/', "-");
         let sanitized_branch = branch_name.replace('/', "-");
         let worktree_path = self
             .base_dir
             .join(format!("{}-{}", repo_safe, sanitized_branch));
 
-        // Remove existing worktree if present
-        self.cleanup_worktree(&repo_path, &worktree_path)?;
+        self.cleanup_worktree(&repo_path.to_path_buf(), &worktree_path)?;
 
-        let branch_exists = git_branch_exists(&repo_path, branch_name);
-
-        // Create worktree using git command
+        let branch_exists = git_branch_exists(repo_path, branch_name);
         let output = if branch_exists {
             log::info!("Using existing branch: {}", branch_name);
             std::process::Command::new("git")
@@ -172,7 +184,7 @@ impl WorktreeManager {
                     worktree_path.to_str().expect("path is valid UTF-8"),
                     branch_name,
                 ])
-                .current_dir(&repo_path)
+                .current_dir(repo_path)
                 .output()?
         } else {
             log::info!("Creating new branch: {}", branch_name);
@@ -184,7 +196,7 @@ impl WorktreeManager {
                     branch_name,
                     worktree_path.to_str().expect("path is valid UTF-8"),
                 ])
-                .current_dir(&repo_path)
+                .current_dir(repo_path)
                 .output()?
         };
 
@@ -196,10 +208,44 @@ impl WorktreeManager {
         Ok(worktree_path)
     }
 
-    /// Creates a worktree from the current repository
-    pub fn create_worktree_from_current(&self, issue_number: u32) -> Result<PathBuf> {
-        let branch_name = format!("botster-issue-{}", issue_number);
-        self.create_worktree_with_branch(&branch_name)
+    /// Finds an existing worktree path for a branch under an explicit repository root.
+    pub fn find_worktree_for_branch(
+        &self,
+        repo_path: &Path,
+        branch_name: &str,
+    ) -> Result<Option<PathBuf>> {
+        let output = std::process::Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(repo_path)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Failed to list worktrees: {}", stderr);
+        }
+
+        let mut current_path: Option<PathBuf> = None;
+        let mut current_branch: Option<String> = None;
+
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                current_path = Some(PathBuf::from(path));
+            } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+                current_branch = Some(branch.to_string());
+            } else if line.is_empty() {
+                if current_branch.as_deref() == Some(branch_name) {
+                    return Ok(current_path.take());
+                }
+                current_path = None;
+                current_branch = None;
+            }
+        }
+
+        if current_branch.as_deref() == Some(branch_name) {
+            return Ok(current_path);
+        }
+
+        Ok(None)
     }
 
     /// Creates or reuses a git worktree for the given repo and issue (clone from GitHub)
@@ -771,6 +817,30 @@ fn git_remote_url(path: &Path) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn repo_name_for_root(repo_path: &Path) -> Result<String> {
+    if let Ok(url) = git_remote_url(repo_path) {
+        let trimmed = url.trim_end_matches(".git");
+        let repo_name = trimmed
+            .split('/')
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("/");
+        if !repo_name.is_empty() {
+            return Ok(repo_name);
+        }
+    }
+
+    Ok(repo_path
+        .file_name()
+        .context("No repo name")?
+        .to_string_lossy()
+        .to_string())
 }
 
 /// Checks whether a local branch exists in the repo at `path`.

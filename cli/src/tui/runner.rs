@@ -2427,6 +2427,27 @@ mod tests {
         process_key_with_lua(&mut runner, make_key_enter(), &lua);
 
         thread::sleep(Duration::from_millis(10));
+        assert_eq!(runner.mode(), "new_agent_select_target");
+
+        {
+            let target_event = serde_json::json!({
+                "targets": [
+                    { "id": "tgt_trybotster", "name": "trybotster", "path": "/tmp/trybotster", "current_branch": "main" }
+                ]
+            });
+            let ctx = crate::tui::layout_lua::ActionContext::default();
+            let ops = lua
+                .call_on_hub_event("spawn_target_list", &target_event, &ctx)
+                .unwrap()
+                .unwrap();
+            runner.execute_lua_ops(ops);
+        }
+        runner.focused_list_id = Some("spawn_target_list".to_string());
+        runner
+            .widget_states
+            .list_state("spawn_target_list")
+            .set_selectable_count(1);
+        process_key_with_lua(&mut runner, make_key_enter(), &lua);
         assert_eq!(runner.mode(), "new_agent_select_agent");
 
         // Simulate single agent config response (auto-skips to workspace selection)
@@ -3935,6 +3956,30 @@ mod tests {
         }
         press_key_and_render(&mut runner, make_key_enter(), &lua);
         thread::sleep(Duration::from_millis(10));
+        assert_eq!(runner.mode(), "new_agent_select_target");
+
+        {
+            let target_event = serde_json::json!({
+                "targets": [
+                    { "id": "tgt_trybotster", "name": "trybotster", "path": "/tmp/trybotster", "current_branch": "main" }
+                ]
+            });
+            let ctx = crate::tui::layout_lua::ActionContext::default();
+            let ops = lua
+                .call_on_hub_event("spawn_target_list", &target_event, &ctx)
+                .unwrap()
+                .unwrap();
+            runner.execute_lua_ops(ops);
+        }
+        runner
+            .render(Some(&lua), None)
+            .expect("render after spawn target list");
+        runner.focused_list_id = Some("spawn_target_list".to_string());
+        runner
+            .widget_states
+            .list_state("spawn_target_list")
+            .set_selectable_count(1);
+        press_key_and_render(&mut runner, make_key_enter(), &lua);
         assert_eq!(runner.mode(), "new_agent_select_agent");
 
         // Simulate single agent config response (auto-skips to workspace selection)

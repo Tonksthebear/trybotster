@@ -64,7 +64,6 @@ use sha2::{Digest, Sha256};
 use crate::channel::Channel;
 use crate::config::Config;
 use crate::device::Device;
-use crate::git::WorktreeManager;
 use crate::lua::primitives::SharedServerId;
 use crate::lua::LuaRuntime;
 
@@ -266,6 +265,32 @@ pub fn hub_id_for_repo(repo_path: &std::path::Path) -> String {
 
     // Use first 16 bytes as hex (32 chars) - enough uniqueness, shorter than UUID
     hash[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Generate the stable local hub identifier for a device identity.
+///
+/// This is device-scoped, not repo-scoped. The fingerprint is already a stable
+/// hash of the device verifying key, so we normalize it into a socket-safe ID.
+#[must_use]
+pub fn hub_id_for_device_fingerprint(fingerprint: &str) -> String {
+    let normalized: String = fingerprint
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    format!("device-{normalized}")
+}
+
+/// Generate the stable local hub identifier for a loaded device.
+#[must_use]
+pub fn hub_id_for_device(device: &Device) -> String {
+    hub_id_for_device_fingerprint(&device.fingerprint)
+}
+
+/// Resolve the stable local hub identifier for the current device.
+pub fn local_device_hub_id() -> anyhow::Result<String> {
+    let device = Device::load_or_create()?;
+    Ok(hub_id_for_device(&device))
 }
 
 /// Central orchestrator for the botster application.
@@ -582,29 +607,14 @@ impl Hub {
         let state = Arc::new(RwLock::new(HubState::new(config.worktree_base.clone())));
         let tokio_runtime = tokio::runtime::Runtime::new()?;
 
-        // Generate stable local hub_identifier from repo path (or cwd fallback).
-        // Never source this from BOTSTER_HUB_ID: that env value may be a server
-        // ID and must not influence local socket naming.
-        let hub_identifier = match WorktreeManager::detect_current_repo() {
-            Ok((repo_path, _)) => {
-                let id = hub_id_for_repo(&repo_path);
-                log::info!("Hub identifier (from repo): {}...", &id[..8]);
-                id
-            }
-            Err(_) => {
-                // Not in a git repo — derive hub ID from current working directory
-                let cwd = std::env::current_dir()?;
-                let id = hub_id_for_repo(&cwd);
-                log::info!("Hub identifier (from cwd): {}...", &id[..8]);
-                id
-            }
-        };
-
-        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
-
-        // Load or create device identity for E2E encryption
+        // Load or create device identity before computing the local hub ID.
+        // Device-scoped startup must never derive trust or identity from cwd.
         let device = Device::load_or_create()?;
         log::info!("Device fingerprint: {}", device.fingerprint);
+        let hub_identifier = hub_id_for_device(&device);
+        log::info!("Hub identifier (from device): {}...", &hub_identifier[..8]);
+
+        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
         // Create handle cache for thread-safe agent handle access
         let handle_cache = Arc::new(handle_cache::HandleCache::new());
@@ -970,7 +980,9 @@ impl Hub {
         let mut guard = match self.broker_connection.lock() {
             Ok(g) => g,
             Err(_) => {
-                log::warn!("[broker] failed to install demux reader: broker_connection mutex poisoned");
+                log::warn!(
+                    "[broker] failed to install demux reader: broker_connection mutex poisoned"
+                );
                 return;
             }
         };
@@ -993,7 +1005,9 @@ impl Hub {
         // trigger a reconnect instead of waiting on a dead channel path.
         std::thread::sleep(std::time::Duration::from_millis(10));
         if !conn.is_demux_alive() {
-            log::warn!("[broker] demux reader died immediately after install; dropping broker connection");
+            log::warn!(
+                "[broker] demux reader died immediately after install; dropping broker connection"
+            );
             *guard = None;
         }
     }
@@ -1281,20 +1295,6 @@ impl Hub {
         self.webrtc_connection_started.clear();
         self.webrtc_pending_ice_candidates.clear();
 
-        // Persist crypto session state to disk on shutdown
-        if let Some(ref cs) = self.browser.crypto_service {
-            match cs.lock() {
-                Ok(guard) => {
-                    if let Err(e) = guard.persist() {
-                        log::warn!("CryptoService persist failed: {e}");
-                    }
-                }
-                Err(e) => {
-                    log::warn!("CryptoService mutex poisoned on shutdown: {e}");
-                }
-            }
-        }
-
         // Notify server of shutdown (skip in offline mode)
         if !crate::env::is_offline() {
             registration::shutdown(
@@ -1402,6 +1402,14 @@ impl Drop for Hub {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_hub_id_for_device_fingerprint_normalizes_to_device_scoped_id() {
+        assert_eq!(
+            hub_id_for_device_fingerprint("AA:bb:11:22:CC:dd:33:44"),
+            "device-aabb1122ccdd3344"
+        );
+    }
 
     fn test_config() -> Config {
         Config {
@@ -1735,8 +1743,14 @@ mod tests {
                 })
                 .expect("spawn bash");
 
-            let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
-                pty_session.get_direct_access();
+            let (
+                shared_state,
+                shadow_screen,
+                event_tx,
+                kitty_enabled,
+                cursor_visible,
+                resize_pending,
+            ) = pty_session.get_direct_access();
 
             let pty = PtyHandle::new(
                 event_tx,
