@@ -60,6 +60,23 @@ class HubSignalingChannelTest < ActionCable::Channel::TestCase
     assert_equal "offline", health["cli"]
   end
 
+  test "subscribe requests a fresh bundle for paired browsers" do
+    assert_broadcast_on("hub_command:#{@hub.id}", {
+      type: "bundle_request",
+      browser_identity: @browser_identity
+    }) do
+      subscribe hub_id: @hub.id, browser_identity: @browser_identity
+    end
+  end
+
+  test "subscribe does not request a bundle for anonymous browsers" do
+    assert_broadcasts("hub_command:#{@hub.id}", 0) do
+      subscribe hub_id: @hub.id, browser_identity: "anon:test-tab"
+    end
+
+    assert subscription.confirmed?
+  end
+
   test "rejects subscription without hub_id" do
     subscribe browser_identity: @browser_identity
 
@@ -102,6 +119,17 @@ class HubSignalingChannelTest < ActionCable::Channel::TestCase
       envelope: { "ciphertext" => "encrypted_offer" }
     }) do
       perform :signal, envelope: { ciphertext: "encrypted_offer" }
+    end
+  end
+
+  test "request_bundle relays a fresh bundle request to hub_command stream for CLI" do
+    subscribe hub_id: @hub.id, browser_identity: @browser_identity
+
+    assert_broadcast_on("hub_command:#{@hub.id}", {
+      type: "bundle_request",
+      browser_identity: @browser_identity
+    }) do
+      perform :request_bundle
     end
   end
 
