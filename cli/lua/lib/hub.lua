@@ -623,12 +623,25 @@ end
 -- @return string Result message
 function Hub:delete_agent(agent_id, delete_worktree)
     if self._is_local then
+        -- Resolve agent_label if agent_id looks like a label (no match by key)
+        local resolved_id = agent_id
+        local agent = Agent.get(agent_id) or Agent.find_by_agent_key(agent_id)
+        if not agent then
+            -- Try label lookup
+            for _, a in ipairs(Agent.list()) do
+                if a.label == agent_id then
+                    resolved_id = a:agent_key()
+                    break
+                end
+            end
+        end
+
         local agents_handler = require("handlers.agents")
-        local deleted = agents_handler.handle_delete_agent(agent_id, delete_worktree or false)
+        local deleted = agents_handler.handle_delete_agent(resolved_id, delete_worktree or false)
         if deleted then
-            return "Agent deleted: " .. agent_id
+            return "Agent deleted: " .. resolved_id
         else
-            return "Agent not found: " .. agent_id
+            return "Agent not found: " .. resolved_id
         end
     end
 
