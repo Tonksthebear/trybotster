@@ -2807,9 +2807,8 @@ impl Hub {
 
         for (key, entry) in ready {
             // Check if peer send channel has capacity before attempting snapshot.
-            let has_capacity = self
-                .webrtc_send_tasks
-                .get(&entry.browser_identity)
+            let peer_state = self.webrtc_send_tasks.get(&entry.browser_identity);
+            let has_capacity = peer_state
                 .map(|state| {
                     !state.dead.load(std::sync::atomic::Ordering::Relaxed)
                         && state.tx.capacity() > 0
@@ -2827,11 +2826,52 @@ impl Hub {
                 continue;
             };
 
-            if session_handle.pty().is_broker_backed() {
-                log::debug!(
-                    "[WebRTC] Skipping cached backpressure recovery snapshot for broker-backed session {}",
-                    &entry.session_uuid[..entry.session_uuid.len().min(8)]
-                );
+            let pty_handle = session_handle.pty().clone();
+
+            if pty_handle.is_broker_backed() {
+                // Broker snapshot requires blocking I/O — spawn off the tick loop.
+                // Clone the per-peer sender so the task can deliver chunks directly,
+                // bypassing the output queue to avoid re-triggering backpressure.
+                let peer_tx = peer_state.unwrap().tx.clone();
+                let session_uuid = entry.session_uuid.clone();
+                let subscription_id = entry.subscription_id.clone();
+                let browser_identity = entry.browser_identity.clone();
+
+                let _guard = self.tokio_runtime.enter();
+                tokio::spawn(async move {
+                    let snapshot = match tokio::task::spawn_blocking(move || {
+                        pty_handle.get_snapshot()
+                    })
+                    .await
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(e) => {
+                            log::warn!(
+                                "[WebRTC] Backpressure recovery snapshot task failed for session {}: {}",
+                                &session_uuid[..session_uuid.len().min(8)],
+                                e
+                            );
+                            return;
+                        }
+                    };
+
+                    if snapshot.is_empty() {
+                        return;
+                    }
+
+                    log::info!(
+                        "[WebRTC] Sending broker backpressure recovery snapshot ({} bytes) to {} for session {}",
+                        snapshot.len(),
+                        &browser_identity[..browser_identity.len().min(8)],
+                        &session_uuid[..session_uuid.len().min(8)]
+                    );
+
+                    Self::send_snapshot_chunks_to_peer(
+                        &peer_tx,
+                        &subscription_id,
+                        &snapshot,
+                    );
+                });
                 continue;
             }
 
@@ -2849,27 +2889,42 @@ impl Hub {
 
             // Chunk and send directly through the per-peer channel,
             // bypassing the output queue to avoid re-triggering backpressure.
-            const CHUNK_SIZE: usize = 64 * 1024;
-            let num_chunks = (snapshot.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-            let snapshot_id: u32 = rand::random();
+            let peer_tx = peer_state.unwrap().tx.clone();
+            Self::send_snapshot_chunks_to_peer(
+                &peer_tx,
+                &entry.subscription_id,
+                &snapshot,
+            );
+        }
+    }
 
-            for (i, chunk) in snapshot.chunks(CHUNK_SIZE).enumerate() {
-                let mut raw_message = Vec::with_capacity(9 + chunk.len());
-                raw_message.push(0x02); // snapshot chunk prefix
-                raw_message.extend_from_slice(&snapshot_id.to_le_bytes());
-                raw_message.extend_from_slice(&(i as u16).to_le_bytes());
-                raw_message.extend_from_slice(&(num_chunks as u16).to_le_bytes());
-                raw_message.extend(chunk);
+    /// Chunk a snapshot and send directly through a per-peer channel.
+    ///
+    /// Bypasses the output queue to avoid re-triggering backpressure.
+    /// Used by both sync (cached) and async (broker) recovery paths.
+    fn send_snapshot_chunks_to_peer(
+        peer_tx: &tokio::sync::mpsc::Sender<super::WebRtcSendItem>,
+        subscription_id: &str,
+        snapshot: &[u8],
+    ) {
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let num_chunks = (snapshot.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        let snapshot_id: u32 = rand::random();
 
-                // Send directly through the per-peer channel (not output queue).
-                self.try_send_to_peer(
-                    &entry.browser_identity,
-                    super::WebRtcSendItem::Pty {
-                        subscription_id: entry.subscription_id.clone(),
-                        data: raw_message,
-                    },
-                );
-            }
+        for (i, chunk) in snapshot.chunks(CHUNK_SIZE).enumerate() {
+            let mut raw_message = Vec::with_capacity(9 + chunk.len());
+            raw_message.push(0x02); // snapshot chunk prefix
+            raw_message.extend_from_slice(&snapshot_id.to_le_bytes());
+            raw_message.extend_from_slice(&(i as u16).to_le_bytes());
+            raw_message.extend_from_slice(&(num_chunks as u16).to_le_bytes());
+            raw_message.extend(chunk);
+
+            // try_send to avoid blocking; if still full, the snapshot
+            // is best-effort — live stream will eventually resync.
+            let _ = peer_tx.try_send(super::WebRtcSendItem::Pty {
+                subscription_id: subscription_id.to_string(),
+                data: raw_message,
+            });
         }
     }
 
@@ -3676,9 +3731,10 @@ impl Hub {
                 // Per-peer channel full — peer is slow, drop this frame.
                 // PTY output is a continuous stream; dropping is acceptable
                 // but a recovery snapshot will be scheduled to resync state.
-                log::debug!(
-                    "[WebRTC] Send channel full for {}, dropping PTY frame",
-                    &browser_identity[..browser_identity.len().min(8)]
+                log::warn!(
+                    "[WebRTC] Backpressure: send channel full for peer {}, dropping PTY frame for subscription {}",
+                    &browser_identity[..browser_identity.len().min(8)],
+                    &subscription_id[..subscription_id.len().min(20)]
                 );
                 super::WebRtcSendOutcome::Backpressure
             }
@@ -5415,13 +5471,14 @@ mod tests {
     }
 
     #[test]
-    fn test_backpressure_recovery_skips_broker_backed_sessions() {
+    fn test_backpressure_recovery_fetches_broker_snapshot() {
         let (mut hub, _request_tx, _output_rx) = e2e_hub();
-        let session_uuid = "sess-broker-recovery-skip";
-        let (session, _broker_peer) = test_broker_backed_session_handle(session_uuid);
+        let session_uuid = "sess-broker-recovery";
+        let (session, mut broker_peer) =
+            test_broker_backed_session_handle_with_seed(session_uuid, b"broker-recovery-data\n");
         hub.handle_cache.add_session(session);
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<super::super::WebRtcSendItem>(4);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<super::super::WebRtcSendItem>(16);
         let task = hub.tokio_runtime.spawn(async {});
         hub.webrtc_send_tasks.insert(
             "peer-recovery".to_string(),
@@ -5443,16 +5500,95 @@ mod tests {
             },
         );
 
+        // Spawn a thread to act as the broker: read GetSnapshot RPC, respond with snapshot.
+        broker_peer
+            .set_read_timeout(Some(Duration::from_millis(2000)))
+            .expect("set fake broker read timeout");
+
+        let broker = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            let mut decoder = BrokerFrameDecoder::new();
+            let mut buf = [0u8; 512];
+            let deadline = Instant::now() + Duration::from_millis(2000);
+
+            while Instant::now() < deadline {
+                match broker_peer.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let frames = decoder.feed(&buf[..n]).expect("decode broker frame");
+                        for frame in frames {
+                            if let BrokerFrame::HubControl(HubMessage::GetSnapshot {
+                                session_id,
+                            }) = frame
+                            {
+                                let response = encode_data(
+                                    frame_type::SNAPSHOT,
+                                    session_id,
+                                    b"\x1b[Hbroker-snapshot-recovery",
+                                );
+                                broker_peer
+                                    .write_all(&response)
+                                    .expect("write broker snapshot");
+                                return;
+                            }
+                        }
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(err) => panic!("fake broker read failed: {err}"),
+                }
+            }
+
+            panic!("broker thread did not receive GetSnapshot request");
+        });
+
         hub.send_backpressure_recovery_snapshots();
 
         assert!(
-            rx.try_recv().is_err(),
-            "broker-backed recovery should not enqueue cached snapshot chunks"
-        );
-        assert!(
             !hub.webrtc_backpressure_recovery.contains_key(&key),
-            "recovery entry should be cleared after broker-backed skip"
+            "recovery entry should be cleared for broker-backed session"
         );
+
+        // Wait for broker thread to complete (it handles the GetSnapshot RPC).
+        broker.join().expect("broker thread panicked");
+
+        // Wait for the async task to deliver snapshot chunks to the peer channel.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut received = Vec::new();
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(item) => {
+                    received.push(item);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+
+        assert!(
+            !received.is_empty(),
+            "broker-backed recovery should deliver snapshot chunks to peer channel"
+        );
+
+        // Verify the snapshot chunk has the expected prefix and data.
+        if let super::super::WebRtcSendItem::Pty { data, .. } = &received[0] {
+            assert_eq!(data[0], 0x02, "snapshot chunk should have 0x02 prefix");
+            let payload = &data[9..]; // skip prefix (1) + snapshot_id (4) + chunk_idx (2) + num_chunks (2)
+            let text = String::from_utf8_lossy(payload);
+            assert!(
+                text.contains("broker-snapshot-recovery"),
+                "snapshot chunk should contain broker snapshot data, got: {text:?}"
+            );
+        } else {
+            panic!("Expected Pty send item");
+        }
     }
 
     fn test_forwarder_request(
