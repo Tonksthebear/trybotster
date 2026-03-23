@@ -62,7 +62,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -129,6 +129,12 @@ pub struct PtySessionHandle {
 
     /// Hub event sender for delivery task notifications.
     hub_event_tx: HubEventSender,
+
+    /// Epoch milliseconds of the last PTY output chunk.
+    ///
+    /// Shared with the corresponding `PtyHandle` so both Lua and Rust see the
+    /// same value.  Updated by `PtyHandle::feed_broker_output()`.
+    last_output_at: Arc<AtomicU64>,
 
     /// Broker relay for RPC-based terminal state queries.
     ///
@@ -206,6 +212,7 @@ impl PtySessionHandle {
             port: None,
             delivery: Arc::new(std::sync::OnceLock::new()),
             hub_event_tx,
+            last_output_at: Arc::new(AtomicU64::new(0)),
             broker_relay: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -242,6 +249,7 @@ impl PtySessionHandle {
             true, // Ghost PTYs are always CLI sessions (broker agents)
             self.port,
             broker_relay,
+            Arc::clone(&self.last_output_at),
         )
     }
 
@@ -349,6 +357,18 @@ impl LuaUserData for PtySessionHandle {
         // Reads from a shared AtomicBool updated by process_pty_bytes().
         methods.add_method("cursor_visible", |_, this, ()| {
             Ok(this.cursor_visible.load(Ordering::Relaxed))
+        });
+
+        // session:last_output_at() -> integer or nil
+        // Epoch milliseconds of the last PTY output chunk.
+        // Returns nil if no output has been received yet (value is 0).
+        methods.add_method("last_output_at", |_, this, ()| {
+            let ms = this.last_output_at.load(Ordering::Relaxed);
+            if ms == 0 {
+                Ok(LuaValue::Nil)
+            } else {
+                Ok(LuaValue::Integer(ms as i64))
+            }
         });
 
         // session:send_message(text) - Queue a message for probe-based delivery.
@@ -841,6 +861,7 @@ pub(crate) fn spawn_session_handle_from_opts(
         port: session_port,
         delivery: Arc::new(std::sync::OnceLock::new()),
         hub_event_tx,
+        last_output_at: Arc::new(AtomicU64::new(0)),
         broker_relay: Arc::new(std::sync::OnceLock::new()),
     })
 }
@@ -1523,6 +1544,7 @@ mod tests {
             port: None,
             delivery: Arc::new(std::sync::OnceLock::new()),
             hub_event_tx: crate::lua::primitives::new_hub_event_sender(),
+            last_output_at: Arc::new(AtomicU64::new(0)),
             broker_relay: Arc::new(std::sync::OnceLock::new()),
         }
     }

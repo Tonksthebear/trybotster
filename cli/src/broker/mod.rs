@@ -74,10 +74,10 @@ use std::mem::ManuallyDrop;
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -300,6 +300,9 @@ struct Session {
     writer_tx: std::sync::mpsc::SyncSender<PtyWriteCommand>,
     /// Writer thread handle — joined on shutdown.
     writer: Option<thread::JoinHandle<()>>,
+    /// Epoch milliseconds of the last PTY output chunk.  Updated by the reader
+    /// thread with `Relaxed` ordering (single writer, infrequent polling reads).
+    last_output_at: Arc<AtomicU64>,
     /// True after a resize is applied but before the PTY produces output at the
     /// new dimensions.  Mirrors `PtySession::resize_pending` — checked by
     /// `GetSnapshot` to avoid capturing stale visible-screen content.
@@ -513,6 +516,8 @@ impl Broker {
         let resize_pending = Arc::new(AtomicBool::new(false));
         let resize_pending_reader = Arc::clone(&resize_pending);
         let resize_pending_writer = Arc::clone(&resize_pending);
+        let last_output_at = Arc::new(AtomicU64::new(0));
+        let last_output_at_reader = Arc::clone(&last_output_at);
         let reader = thread::spawn(move || {
             reader_loop(
                 raw,
@@ -522,6 +527,7 @@ impl Broker {
                 tee_clone,
                 collected_clone,
                 resize_pending_reader,
+                last_output_at_reader,
             );
         });
         let (writer_tx, writer_rx) =
@@ -544,6 +550,7 @@ impl Broker {
                 writer_tx,
                 writer: Some(writer),
                 resize_pending,
+                last_output_at,
             },
         );
 
@@ -610,6 +617,7 @@ fn reader_loop(
     shared_tee: SharedTee,
     collected_events: CollectedEvents,
     resize_pending: Arc<AtomicBool>,
+    last_output_at: Arc<AtomicU64>,
 ) {
     let mut buf = [0u8; 4096];
     // Borrow-only File — ManuallyDrop prevents close on drop.
@@ -654,6 +662,16 @@ fn reader_loop(
                 // App produced output — parser state is no longer stale from
                 // a prior resize.  Mirrors PtySession / spawn.rs pattern.
                 resize_pending.store(false, Ordering::Release);
+
+                // Track last output time for idle detection (epoch ms).
+                // Single writer (this thread), infrequent polling reads — Relaxed is fine.
+                last_output_at.store(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    Ordering::Relaxed,
+                );
 
                 // Write to tee log (if armed).  Runs even during the Hub
                 // reconnect window so the log captures output while Hub is down.
