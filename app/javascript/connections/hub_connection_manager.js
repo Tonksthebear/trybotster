@@ -1,20 +1,20 @@
 /**
  * HubConnectionManager - Generic connection pool with Turbo-aware lifecycle.
  *
- * Manages typed connection wrappers (HubConnection, TerminalConnection) keyed
+ * Manages typed connection wrappers (HubTransport, TerminalConnection) keyed
  * by URL/identifier. Handles reference counting via subscribers and deferred
  * cleanup after Turbo navigations.
  *
  * Usage:
  *   import { HubConnectionManager } from "connections/hub_connection_manager";
- *   import { HubConnection } from "connections/hub_connection";
+ *   import { HubTransport } from "connections/hub_connection";
  *
  *   // In Stimulus controller connect():
- *   this.hub = await HubConnectionManager.acquire(HubConnection, hubId, { hubId });
- *   this.hub.onAgentList((agents) => this.#render(agents));
+ *   this.transport = await HubConnectionManager.acquire(HubTransport, hubId, { hubId });
+ *   this.transport.on("connected", () => this.transport.requestAgents());
  *
  *   // In Stimulus controller disconnect():
- *   this.hub?.release();
+ *   this.transport?.release();
  *
  * Lifecycle:
  *   1. acquire() - Returns existing or creates new typed connection
@@ -35,7 +35,7 @@ class HubConnectionManagerSingleton {
   /**
    * Acquire a typed connection wrapper.
    *
-   * @param {Function} ConnectionClass - HubConnection or TerminalConnection class
+   * @param {Function} ConnectionClass - HubTransport or TerminalConnection class
    * @param {string} key - Unique identifier (e.g., hubId or "terminal:hubId:sessionUuid")
    * @param {Object} options - Options passed to ConnectionClass constructor
    * @returns {Promise<Connection>} - The typed connection wrapper
@@ -231,7 +231,7 @@ class HubConnectionManagerSingleton {
   /**
    * Check if any connection sharing a hubId still has active references.
    * Used by notifyIdle() to avoid starting a grace period on the shared
-   * transport when another connection type (e.g., HubConnection) is still
+   * transport when another connection type (e.g., HubTransport) is still
    * alive for the same hub.
    *
    * @param {string} hubId - Hub identifier
@@ -253,7 +253,7 @@ class HubConnectionManagerSingleton {
    * @param {string} hubId - Hub identifier
    * @returns {Connection|null}
    */
-  findHubConnection(hubId) {
+  findHubConnectedSibling(hubId) {
     for (const [key, entry] of this.connections) {
       if (entry.wrapper.getHubId() === hubId && entry.wrapper.isHubConnected()) {
         return entry.wrapper;

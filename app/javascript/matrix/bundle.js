@@ -108,6 +108,7 @@ export function parseBinaryBundle(bytes) {
   return {
     version,
     identityKey: bytesToBase64(identityKey),   // base64 — needed by createOutboundSession
+    signingKey: bytesToBase64(signingKey),     // base64 — persisted as trust anchor
     oneTimeKey: bytesToBase64(oneTimeKey),      // base64 — needed by createOutboundSession
     signedData: bytes.slice(0, 97),            // raw bytes [version][identity][signing][otk]
     signingKeyRaw: signingKey,                 // raw 32 bytes for Ed25519 verify

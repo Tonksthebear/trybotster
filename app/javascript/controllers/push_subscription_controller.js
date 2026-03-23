@@ -2,7 +2,7 @@ import { Controller } from "@hotwired/stimulus";
 import { Turbo } from "@hotwired/turbo-rails";
 import bridge from "workers/bridge";
 import { HubConnectionManager } from "connections/hub_connection_manager";
-import { HubConnection } from "connections/hub_connection";
+import { HubTransport } from "connections/hub_connection";
 
 /**
  * Push Subscription Controller
@@ -10,7 +10,7 @@ import { HubConnection } from "connections/hub_connection";
  * Manages browser push notification subscriptions per device.
  * Mounts on hub device settings page — one instance per device.
  *
- * On connect, acquires HubConnection and sends push_status_req to CLI
+ * On connect, acquires HubTransport and sends push_status_req to CLI
  * with this browser's stable ID. CLI responds with push:status containing
  * has_keys and browser_subscribed booleans. Three states:
  *
@@ -39,9 +39,9 @@ export default class extends Controller {
   ];
 
   #unsubscribers = [];
-  #connUnsubscribers = [];  // onConnected/onError callbacks on HubConnection
-  #hubConn = null;
-  #sourceHubConn = null;
+  #connUnsubscribers = [];  // onConnected/onError callbacks on HubTransport
+  #hubTransport = null;
+  #sourceHubTransport = null;
 
   connect() {
     this.#unsubscribers.push(
@@ -82,12 +82,12 @@ export default class extends Controller {
     this.#setStatus("checking");
 
     try {
-      this.#hubConn = await HubConnectionManager.acquire(
-        HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
+      this.#hubTransport = await HubConnectionManager.acquire(
+        HubTransport, this.hubIdValue, { hubId: this.hubIdValue }
       );
 
       this.#connUnsubscribers.push(
-        this.#hubConn.onConnected(async () => {
+        this.#hubTransport.onConnected(async () => {
           await bridge.send("sendControlMessage", {
             hubId: this.hubIdValue,
             message: {
@@ -98,7 +98,7 @@ export default class extends Controller {
         })
       );
       this.#connUnsubscribers.push(
-        this.#hubConn.onError(({ reason }) => {
+        this.#hubTransport.onError(({ reason }) => {
           if (reason === "unpaired") {
             this.#setStatus("unpaired");
           } else {
@@ -171,23 +171,23 @@ export default class extends Controller {
     try {
       // Connection is already acquired from #queryPushStatus — reuse it.
       // If not connected yet, acquire fresh.
-      if (!this.#hubConn) {
-        this.#hubConn = await HubConnectionManager.acquire(
-          HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
+      if (!this.#hubTransport) {
+        this.#hubTransport = await HubConnectionManager.acquire(
+          HubTransport, this.hubIdValue, { hubId: this.hubIdValue }
         );
       }
 
       if (this.hasSourceHubIdValue && this.sourceHubIdValue) {
-        this.#sourceHubConn = await HubConnectionManager.acquire(
-          HubConnection, this.sourceHubIdValue, { hubId: this.sourceHubIdValue }
+        this.#sourceHubTransport = await HubConnectionManager.acquire(
+          HubTransport, this.sourceHubIdValue, { hubId: this.sourceHubIdValue }
         );
       }
 
       this.#connUnsubscribers.push(
-        this.#hubConn.onConnected(() => this.#startFlow())
+        this.#hubTransport.onConnected(() => this.#startFlow())
       );
       this.#connUnsubscribers.push(
-        this.#hubConn.onError(({ reason }) => {
+        this.#hubTransport.onError(({ reason }) => {
           if (reason === "unpaired") {
             this.#setStatus("unpaired");
           } else {
@@ -222,14 +222,14 @@ export default class extends Controller {
     this.#setStatus("connecting");
 
     try {
-      if (!this.#hubConn) {
-        this.#hubConn = await HubConnectionManager.acquire(
-          HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
+      if (!this.#hubTransport) {
+        this.#hubTransport = await HubConnectionManager.acquire(
+          HubTransport, this.hubIdValue, { hubId: this.hubIdValue }
         );
       }
 
       this.#connUnsubscribers.push(
-        this.#hubConn.onConnected(async () => {
+        this.#hubTransport.onConnected(async () => {
           this.#setStatus("enabling");
           // Ask CLI for its existing VAPID public key
           await bridge.send("sendControlMessage", {
@@ -240,7 +240,7 @@ export default class extends Controller {
         })
       );
       this.#connUnsubscribers.push(
-        this.#hubConn.onError(({ reason }) => {
+        this.#hubTransport.onError(({ reason }) => {
           if (reason === "unpaired") {
             this.#setStatus("unpaired");
           } else {
@@ -259,13 +259,13 @@ export default class extends Controller {
     if (!this.hubIdValue) return;
     this.#setStatus("disabling");
     try {
-      if (!this.#hubConn) {
-        this.#hubConn = await HubConnectionManager.acquire(
-          HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
+      if (!this.#hubTransport) {
+        this.#hubTransport = await HubConnectionManager.acquire(
+          HubTransport, this.hubIdValue, { hubId: this.hubIdValue }
         );
       }
       this.#connUnsubscribers.push(
-        this.#hubConn.onConnected(async () => {
+        this.#hubTransport.onConnected(async () => {
           await bridge.send("sendControlMessage", {
             hubId: this.hubIdValue,
             message: { type: "push_disable" },
@@ -273,7 +273,7 @@ export default class extends Controller {
         })
       );
       this.#connUnsubscribers.push(
-        this.#hubConn.onError(() => this.#setStatus("error"))
+        this.#hubTransport.onError(() => this.#setStatus("error"))
       );
     } catch (e) {
       console.error("[PushSubscription] Failed to disable:", e);
@@ -285,13 +285,13 @@ export default class extends Controller {
     if (!this.hubIdValue) return;
     this.#setStatus("testing");
     try {
-      if (!this.#hubConn) {
-        this.#hubConn = await HubConnectionManager.acquire(
-          HubConnection, this.hubIdValue, { hubId: this.hubIdValue }
+      if (!this.#hubTransport) {
+        this.#hubTransport = await HubConnectionManager.acquire(
+          HubTransport, this.hubIdValue, { hubId: this.hubIdValue }
         );
       }
       this.#connUnsubscribers.push(
-        this.#hubConn.onConnected(async () => {
+        this.#hubTransport.onConnected(async () => {
           await bridge.send("sendControlMessage", {
             hubId: this.hubIdValue,
             message: { type: "push_test" },
@@ -299,7 +299,7 @@ export default class extends Controller {
         })
       );
       this.#connUnsubscribers.push(
-        this.#hubConn.onError(() => this.#setStatus("error"))
+        this.#hubTransport.onError(() => this.#setStatus("error"))
       );
     } catch (e) {
       console.error("[PushSubscription] Test failed:", e);
@@ -312,7 +312,7 @@ export default class extends Controller {
   async #startFlow() {
     this.#setStatus("enabling");
     try {
-      if (this.#sourceHubConn) {
+      if (this.#sourceHubTransport) {
         await this.#copyFlow();
       } else {
         await this.#generateFlow();
@@ -461,10 +461,10 @@ export default class extends Controller {
       unsub();
     }
     this.#connUnsubscribers = [];
-    this.#hubConn?.release();
-    this.#hubConn = null;
-    this.#sourceHubConn?.release();
-    this.#sourceHubConn = null;
+    this.#hubTransport?.release();
+    this.#hubTransport = null;
+    this.#sourceHubTransport?.release();
+    this.#sourceHubTransport = null;
   }
 
   #urlBase64ToUint8Array(base64String) {

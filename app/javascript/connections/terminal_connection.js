@@ -139,10 +139,21 @@ export class TerminalConnection extends HubRoute {
     return this.send("resize", { cols, rows });
   }
 
+  requestSnapshot() {
+    return this.send("request_snapshot", {
+      rows: this.options.rows,
+      cols: this.options.cols,
+    });
+  }
+
   // ========== Getters ==========
 
   getSessionUuid() {
     return this.sessionUuid;
+  }
+
+  hasSubscription() {
+    return !!this.subscriptionId;
   }
 
   destroy() {
@@ -182,6 +193,10 @@ export class TerminalConnection extends HubRoute {
 
     // Initialize buffer for this snapshot
     if (!this.#snapshotBuffer) {
+      this.emit("snapshotStart", {
+        snapshotId,
+        totalChunks,
+      });
       this.#snapshotBuffer = {
         id: snapshotId,
         total: totalChunks,
@@ -215,7 +230,13 @@ export class TerminalConnection extends HubRoute {
 
       this.#snapshotBuffer = null;
       console.debug(`[TerminalConnection] Snapshot ${snapshotId.toString(16)} complete: ${totalChunks} chunks, ${totalLen} bytes`);
-      this.#emitOutput(this.#validateSnapshotCursor(combined));
+      const validated = this.#validateSnapshotCursor(combined);
+      this.#emitOutput(validated);
+      this.emit("snapshotComplete", {
+        snapshotId,
+        totalChunks,
+        byteLength: validated.byteLength,
+      });
     }
   }
 
@@ -301,6 +322,14 @@ export class TerminalConnection extends HubRoute {
 
   onError(callback) {
     return this.on("error", callback);
+  }
+
+  onSnapshotStart(callback) {
+    return this.on("snapshotStart", callback);
+  }
+
+  onSnapshotComplete(callback) {
+    return this.on("snapshotComplete", callback);
   }
 
   // ========== Static helper ==========

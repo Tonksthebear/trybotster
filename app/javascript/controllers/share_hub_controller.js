@@ -1,11 +1,17 @@
 import { Controller } from "@hotwired/stimulus"
-import { HubConnectionManager, HubConnection } from "connections"
+import { HubManager } from "connections"
 
 export default class extends Controller {
   static values = { hubId: String }
 
   connect() {
     this.modal = document.getElementById("share-hub-modal")
+    if (this.hubIdValue) {
+      this.hubReady = HubManager.acquire(this.hubIdValue).then((hub) => {
+        this.hub = hub
+        return hub
+      })
+    }
 
     // Listen for events from modal buttons
     this.handleRetry = () => this.open()
@@ -19,6 +25,10 @@ export default class extends Controller {
       this.unsubscribe()
       this.unsubscribe = null
     }
+    this.hubReady = null
+    const hub = this.hub
+    this.hub = null
+    hub?.release()
     this.element.removeEventListener("share-hub:retry", this.handleRetry)
     this.element.removeEventListener("share-hub:copy", this.handleCopy)
   }
@@ -33,9 +43,15 @@ export default class extends Controller {
     this.showLoading()
 
     try {
-      const hub = await HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
-        hubId: this.hubIdValue
-      })
+      const hub = this.hub ?? (await this.hubReady)
+      if (!hub) {
+        this.showError("Connection unavailable")
+        return
+      }
+
+      if (this.unsubscribe) {
+        this.unsubscribe()
+      }
 
       // Listen for connection code response
       this.unsubscribe = hub.on("connectionCode", (message) => {

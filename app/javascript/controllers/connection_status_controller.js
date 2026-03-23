@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { HubConnectionManager, HubConnection, BrowserStatus, CliStatus, ConnectionMode } from "connections";
+import { HubConnectionManager, HubTransport, BrowserStatus, CliStatus, ConnectionMode } from "connections";
 
 /**
  * Connection Status Controller
@@ -145,7 +145,7 @@ export default class extends Controller {
   }
 
   #getConnectionClass() {
-    return HubConnection;
+    return HubTransport;
   }
 
   #getConnectionKey() {

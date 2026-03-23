@@ -1,17 +1,18 @@
 import { Controller } from "@hotwired/stimulus";
-import { HubConnectionManager } from "connections/hub_connection_manager";
-import { HubConnection } from "connections/hub_connection";
+import { HubManager } from "connections";
 
 /**
  * NewAccessoryModalController - Handles accessory creation.
  *
  * Fetches available accessory configs from CLI, lets user select one
  * and a workspace, then sends create_accessory command.
- *
- * No prompt step needed — accessories are plain terminals.
  */
 export default class extends Controller {
   static targets = [
+    "targetSection",
+    "targetSelect",
+    "targetPrompt",
+    "configSection",
     "accessoryList",
     "workspaceSelect",
     "workspaceSection",
@@ -28,37 +29,60 @@ export default class extends Controller {
 
     this.accessories = [];
     this.workspaces = [];
+    this.spawnTargets = [];
+    this.selectedTargetId = null;
     this.selectedAccessory = null;
     this.unsubscribers = [];
+    this._onExternalTargetSelection = (event) => {
+      this.#applySelectedTarget(event.detail?.targetId || null);
+    };
 
-    HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
-      hubId: this.hubIdValue,
-    }).then(async (hub) => {
+    document.addEventListener(
+      "botster:new-session-target",
+      this._onExternalTargetSelection,
+    );
+
+    HubManager.acquire(this.hubIdValue).then((hub) => {
       this.hub = hub;
+      this.spawnTargets = Array.isArray(hub.spawnTargets) ? hub.spawnTargets : [];
+      this.workspaces = Array.isArray(hub.openWorkspaces) ? hub.openWorkspaces : [];
+      this.#renderTargetSelect();
+      this.#renderWorkspaceSelect();
+      this.#updateFlowVisibility();
+
+      if (this.selectedTargetId) {
+        const config = hub.getAgentConfig(this.selectedTargetId);
+        this.accessories = Array.isArray(config.accessories) ? config.accessories : [];
+        this.#renderAccessoryList();
+        if (!this.hub.hasAgentConfig(this.selectedTargetId)) {
+          this.hub.ensureAgentConfig(this.selectedTargetId);
+        }
+      }
 
       this.unsubscribers.push(
-        this.hub.on("agentConfig", ({ accessories }) => {
+        this.hub.onSpawnTargetList((targets) => {
+          this.spawnTargets = Array.isArray(targets) ? targets : [];
+          this.#renderTargetSelect();
+          this.#updateFlowVisibility();
+        }),
+      );
+
+      this.unsubscribers.push(
+        this.hub.on("agentConfig", ({ targetId, accessories }) => {
+          if (targetId && this.selectedTargetId && targetId !== this.selectedTargetId) return;
           this.accessories = Array.isArray(accessories) ? accessories : [];
           this.#renderAccessoryList();
         }),
       );
 
       this.unsubscribers.push(
-        this.hub.on("workspaceList", (workspaces) => {
+        this.hub.onOpenWorkspaceList((workspaces) => {
           this.workspaces = Array.isArray(workspaces) ? workspaces : [];
           this.#renderWorkspaceSelect();
         }),
       );
-
-      this.unsubscribers.push(
-        this.hub.onConnected(() => {
-          this.hub.requestAgentConfig();
-          this.hub.requestWorkspaces();
-        }),
-      );
     });
 
-    // Refresh data when modal opens
     const dialog = this.element.closest("dialog");
     if (dialog) {
       this._onToggle = () => {
@@ -72,6 +96,14 @@ export default class extends Controller {
     this.unsubscribers?.forEach((unsub) => unsub());
     this.unsubscribers = null;
 
+    if (this._onExternalTargetSelection) {
+      document.removeEventListener(
+        "botster:new-session-target",
+        this._onExternalTargetSelection,
+      );
+      this._onExternalTargetSelection = null;
+    }
+
     const dialog = this.element.closest("dialog");
     if (dialog && this._onToggle) {
       dialog.removeEventListener("toggle", this._onToggle);
@@ -82,14 +114,12 @@ export default class extends Controller {
     hub?.release();
   }
 
-  // Action: select an accessory config
   selectAccessory(event) {
     const name = event.currentTarget.dataset.accessoryName;
     if (!name) return;
 
     this.selectedAccessory = name;
 
-    // Update visual selection
     this.accessoryListTarget
       .querySelectorAll("[data-accessory-name]")
       .forEach((el) => {
@@ -103,9 +133,13 @@ export default class extends Controller {
     this.#updateSubmitState();
   }
 
-  // Action: submit and create accessory
+  selectTarget() {
+    if (!this.hasTargetSelectTarget) return;
+    this.#applySelectedTarget(this.targetSelectTarget.value || null);
+  }
+
   submit() {
-    if (!this.selectedAccessory || !this.hub) return;
+    if (!this.selectedAccessory || !this.hub || !this.selectedTargetId) return;
 
     const workspace = this.#selectedWorkspace();
 
@@ -113,21 +147,25 @@ export default class extends Controller {
       this.selectedAccessory,
       workspace?.id || null,
       workspace?.name || null,
+      this.selectedTargetId,
     );
 
     this.#reset();
-
-    const dialog = this.element.closest("dialog");
-    dialog?.close();
+    this.element.closest("dialog")?.close();
   }
 
   #onOpen() {
-    // Re-fetch fresh data
     if (this.hub) {
-      this.hub.requestAgentConfig();
-      this.hub.requestWorkspaces();
+      if (this.selectedTargetId) {
+        const config = this.hub.getAgentConfig(this.selectedTargetId);
+        this.accessories = Array.isArray(config.accessories) ? config.accessories : [];
+        this.#renderAccessoryList();
+        if (!this.hub.hasAgentConfig(this.selectedTargetId)) {
+          this.hub.ensureAgentConfig(this.selectedTargetId);
+        }
+      }
     }
-    // Reset selection state
+
     this.selectedAccessory = null;
     this.#updateSubmitState();
   }
@@ -146,13 +184,56 @@ export default class extends Controller {
 
   #updateSubmitState() {
     if (!this.hasSubmitButtonTarget) return;
-    this.submitButtonTarget.disabled = !this.selectedAccessory;
+    this.submitButtonTarget.disabled = !this.selectedAccessory || !this.selectedTargetId;
+  }
+
+  #renderTargetSelect() {
+    if (!this.hasTargetSelectTarget || !this.hasTargetSectionTarget) return;
+
+    const select = this.targetSelectTarget;
+    select.innerHTML = "";
+
+    const emptyOption = document.createElement("option");
+    emptyOption.value = "";
+    emptyOption.textContent = this.spawnTargets.length
+      ? "Select a spawn target"
+      : "No admitted spawn targets";
+    select.appendChild(emptyOption);
+
+    this.spawnTargets.forEach((target) => {
+      const option = document.createElement("option");
+      option.value = target.id;
+      const branchSuffix = target.current_branch ? ` (${target.current_branch})` : "";
+      option.textContent = `${target.name || target.path}${branchSuffix}`;
+      select.appendChild(option);
+    });
+
+    if (
+      this.selectedTargetId &&
+      !this.spawnTargets.some((target) => target.id === this.selectedTargetId)
+    ) {
+      this.selectedTargetId = null;
+    }
+
+    this.targetSectionTarget.classList.remove("hidden");
+    select.value = this.selectedTargetId || "";
+    this.#updateFlowVisibility();
   }
 
   #renderAccessoryList() {
     if (!this.hasAccessoryListTarget) return;
 
     this.accessoryListTarget.innerHTML = "";
+
+    if (!this.selectedTargetId) {
+      this.accessoryListTarget.innerHTML = `
+        <p class="text-sm text-zinc-500 text-center py-4">Choose a spawn target first</p>
+      `;
+      if (this.hasNoConfigWarningTarget) {
+        this.noConfigWarningTarget.classList.add("hidden");
+      }
+      return;
+    }
 
     if (this.accessories.length === 0) {
       if (this.hasNoConfigWarningTarget) {
@@ -200,8 +281,7 @@ export default class extends Controller {
   }
 
   #renderWorkspaceSelect() {
-    if (!this.hasWorkspaceSelectTarget || !this.hasWorkspaceSectionTarget)
-      return;
+    if (!this.hasWorkspaceSelectTarget || !this.hasWorkspaceSectionTarget) return;
 
     const select = this.workspaceSelectTarget;
     select.innerHTML = "";
@@ -232,12 +312,61 @@ export default class extends Controller {
 
   #reset() {
     this.selectedAccessory = null;
+    this.selectedTargetId = null;
+    this.accessories = [];
     this.#updateSubmitState();
-    // Clear visual selection
+
+    if (this.hasTargetSelectTarget) {
+      this.targetSelectTarget.value = "";
+    }
+
+    this.#renderAccessoryList();
+    this.#updateFlowVisibility();
+
     if (this.hasAccessoryListTarget) {
       this.accessoryListTarget
         .querySelectorAll("[data-selected]")
         .forEach((el) => delete el.dataset.selected);
+    }
+  }
+
+  #applySelectedTarget(targetId) {
+    this.selectedTargetId = targetId;
+    this.selectedAccessory = null;
+    this.accessories = targetId && this.hub
+      ? this.hub.getAgentConfig(targetId).accessories
+      : [];
+
+    if (this.hasTargetSelectTarget) {
+      this.targetSelectTarget.value = targetId || "";
+    }
+
+    this.#renderAccessoryList();
+    this.#updateFlowVisibility();
+    this.#updateSubmitState();
+
+    if (!targetId || !this.hub) return;
+    if (!this.hub.hasAgentConfig(targetId)) {
+      this.hub.ensureAgentConfig(targetId);
+    }
+  }
+
+  #updateFlowVisibility() {
+    if (this.hasConfigSectionTarget) {
+      this.configSectionTarget.classList.toggle("hidden", !this.selectedTargetId);
+    }
+
+    if (!this.hasTargetPromptTarget) return;
+
+    if (this.selectedTargetId) {
+      this.targetPromptTarget.textContent =
+        "Spawn target selected. Now choose an accessory configuration.";
+    } else if (this.spawnTargets.length === 0) {
+      this.targetPromptTarget.textContent =
+        "Add a spawn target in Device Settings before starting an accessory.";
+    } else {
+      this.targetPromptTarget.textContent =
+        "Choose a spawn target to unlock accessory configuration.";
     }
   }
 }

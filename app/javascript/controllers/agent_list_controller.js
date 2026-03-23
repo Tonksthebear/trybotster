@@ -1,5 +1,5 @@
 import { Controller } from "@hotwired/stimulus";
-import { HubConnectionManager, HubConnection } from "connections";
+import { HubManager } from "connections";
 
 /**
  * Agent List Controller
@@ -75,14 +75,14 @@ export default class extends Controller {
     // agentsValueChanged fires automatically on connect if value differs from default,
     // so persisted data from turbo-permanent renders without explicit call
 
-    HubConnectionManager.acquire(HubConnection, this.hubIdValue, {
-      hubId: this.hubIdValue,
-    }).then(async (hub) => {
+    HubManager.acquire(this.hubIdValue).then(async (hub) => {
       if (this.#disconnected) {
         hub.release();
         return;
       }
       this.hub = hub;
+      this.agentsValue = Array.isArray(hub.agents) ? hub.agents : [];
+      this.workspacesValue = Array.isArray(hub.openWorkspaces) ? hub.openWorkspaces : [];
 
       this.unsubscribers.push(
         this.hub.onAgentList((agents) => {
@@ -91,35 +91,10 @@ export default class extends Controller {
       );
 
       this.unsubscribers.push(
-        this.hub.onWorkspaceList((workspaces) => {
+        this.hub.onOpenWorkspaceList((workspaces) => {
           this.workspacesValue = workspaces;
         }),
       );
-
-      // Refresh list when agents are created or deleted
-      this.unsubscribers.push(
-        this.hub.on("agentCreated", () => {
-          this.hub.requestAgents();
-        }),
-      );
-
-      this.unsubscribers.push(
-        this.hub.on("agentDeleted", () => {
-          this.hub.requestAgents();
-        }),
-      );
-
-      // Handle connection ready (initial or reconnection)
-      // Use onConnected which fires immediately if already connected
-      this.unsubscribers.push(
-        this.hub.onConnected(() => {
-          this.hub.requestAgents();
-          this.hub.requestWorkspaces();
-        }),
-      );
-
-      // No explicit subscribe() — health events drive the WebRTC lifecycle.
-      // onConnected above fires when handshake completes (or immediately if already connected).
     });
   }
 
@@ -132,7 +107,7 @@ export default class extends Controller {
     this.unsubscribers?.forEach((unsub) => unsub());
     this.unsubscribers = null;
 
-    // Just release - don't unsubscribe. HubConnection is shared and
+    // Just release - don't unsubscribe. Hub state is shared and
     // the subscription can be reused by other controllers after navigation.
     const hub = this.hub;
     this.hub = null;

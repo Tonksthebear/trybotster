@@ -200,7 +200,7 @@ export class HubRoute {
     // Fast path: sibling Connection already has signaling for this hub.
     // Inherit hub state, set up listeners, proceed to peer + subscribe.
     // No BrowserStatus.CONNECTING → no status flicker during Turbo navigation.
-    const sibling = this.manager.findHubConnection(this.getHubId())
+    const sibling = this.manager.findHubConnectedSibling(this.getHubId())
     if (sibling && sibling !== this) {
       this.identityKey = sibling.identityKey
       this.browserIdentity = sibling.browserIdentity
@@ -538,7 +538,7 @@ export class HubRoute {
   }
 
   /**
-   * Unsubscribe from the channel. Keeps hub connection alive.
+   * Unsubscribe from the channel. Keeps the shared hub transport alive.
    * Call this when controller disconnects during navigation.
    */
   async unsubscribe() {
@@ -948,7 +948,7 @@ export class HubRoute {
 
     if (hubId && wasHubConnected) {
       // Only disconnect shared transport if no other active connection for
-      // this hub remains. HubConnection/TerminalConnection/PreviewConnection
+      // this hub remains. HubTransport/TerminalConnection/PreviewConnection
       // all share one transport-level WebRTC connection.
       if (!this.manager.hasActiveConnectionForHub(hubId)) {
         bridge.send("disconnect", { hubId }).catch(() => {})
@@ -973,14 +973,14 @@ export class HubRoute {
     const hubId = this.getHubId()
     if (hubId && this.#hubConnected) {
       // Don't start a grace period if another connection sharing this hubId
-      // is still active. Multiple connection types (HubConnection,
+      // is still active. Multiple connection types (HubTransport,
       // TerminalConnection) share the same transport-level WebRTC connection.
       // Without this check, a stale TerminalConnection's notifyIdle can start
-      // a NEW grace period after a HubConnection's reacquire already cancelled
+      // a NEW grace period after a HubTransport reacquire already cancelled
       // the previous one, causing the shared connection to close.
       if (this.manager.hasActiveConnectionForHub(hubId)) return
 
-      // Tell transport to start grace period for this hub connection.
+      // Tell transport to start the grace period for this shared hub transport.
       // If reacquired before grace period expires, connection is reused.
       bridge.send("disconnect", { hubId }).catch(() => {})
     }
