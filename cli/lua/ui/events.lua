@@ -352,6 +352,21 @@ function M.on_hub_event(event_type, event_data, context)
     return {}
   end
 
+  if event_type == "spawn_target_list" then
+    local targets = event_data.targets
+    if not targets then return nil end
+    _tui_state.available_targets = targets
+    return {}
+  end
+
+  if event_type == "spawn_target_feedback" then
+    if event_data.tone == "error" then
+      _tui_state.error_message = event_data.message or "Spawn target operation failed"
+      return { set_mode_ops("error") }
+    end
+    return {}
+  end
+
   if event_type == "agent_config" then
     local agents = event_data.agents
     if not agents then return nil end

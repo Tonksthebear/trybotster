@@ -92,11 +92,13 @@ local text_input = {
 M.new_agent_select_workspace = list_nav
 M.new_agent_select_worktree = list_nav
 M.new_agent_select_agent = list_nav
+M.new_agent_select_target = list_nav
 M.new_workspace_name_input = text_input
 M.new_agent_create_worktree = text_input
 M.new_agent_prompt = text_input
 M.rename_workspace_input = text_input
 M.move_workspace_input = text_input
+M.spawn_target_path_input = text_input
 
 M.close_agent_confirm = {
   ["escape"] = "close_modal",
@@ -113,6 +115,18 @@ M.connection_code = {
   ["enter"]  = "close_modal",
   ["c"]      = "copy_connection_url",
   ["r"]      = "regenerate_connection_code",
+}
+
+M.spawn_targets_info = {
+  ["escape"] = "close_modal",
+  ["q"]      = "close_modal",
+  ["up"]     = "list_up",
+  ["k"]      = "list_up",
+  ["down"]   = "list_down",
+  ["j"]      = "list_down",
+  ["a"]      = "spawn_target_add",
+  ["d"]      = "spawn_target_remove",
+  ["r"]      = "refresh_spawn_targets",
 }
 
 M.error = {
@@ -143,7 +157,7 @@ function M.handle_key(key, mode, context)
   end
 
   -- Mode-specific fallback logic
-  if mode == "new_workspace_name_input" or mode == "new_agent_create_worktree" or mode == "new_agent_prompt" then
+  if mode == "new_workspace_name_input" or mode == "new_agent_create_worktree" or mode == "new_agent_prompt" or mode == "spawn_target_path_input" then
     if key == "backspace" then
       return { action = "input_backspace" }
     end
@@ -159,7 +173,7 @@ function M.handle_key(key, mode, context)
     return nil
   end
 
-  if mode == "menu" or mode == "new_agent_select_workspace" or mode == "new_agent_select_worktree" or mode == "new_agent_select_agent" then
+  if mode == "menu" or mode == "new_agent_select_workspace" or mode == "new_agent_select_worktree" or mode == "new_agent_select_agent" or mode == "new_agent_select_target" then
     -- Number shortcuts 1-9 for list selection
     if mode == "menu" and #key == 1 and key:match("%d") then
       local idx = tonumber(key) - 1
