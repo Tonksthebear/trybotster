@@ -57,7 +57,10 @@ local function transition_to_worktree_selection()
     set_mode_ops("new_agent_select_worktree"),
     { op = "send_msg", data = {
       subscriptionId = "tui_hub",
-      data = { type = "list_worktrees" },
+      data = {
+        type = "list_worktrees",
+        target_id = _tui_state.pending_fields.target_id,
+      },
     }},
   }
 end
@@ -183,11 +186,22 @@ function M.on_action(action, context)
 
     if selected == "new_agent" then
       _tui_state.pending_fields.agent_name = nil
+      _tui_state.pending_fields.target_id = nil
+      _tui_state.pending_fields.target_path = nil
+      _tui_state.pending_fields.target_repo = nil
       return {
-        set_mode_ops("new_agent_select_agent"),
+        set_mode_ops("new_agent_select_target"),
         { op = "send_msg", data = {
           subscriptionId = "tui_hub",
-          data = { type = "list_agent_config" },
+          data = { type = "list_spawn_targets" },
+        }},
+      }
+    elseif selected == "spawn_targets_info" then
+      return {
+        set_mode_ops("spawn_targets_info"),
+        { op = "send_msg", data = {
+          subscriptionId = "tui_hub",
+          data = { type = "list_spawn_targets" },
         }},
       }
     elseif selected == "close_agent" then
@@ -250,6 +264,27 @@ function M.on_action(action, context)
     return nil
   end
 
+  if action == "list_select" and _tui_state.mode == "new_agent_select_target" then
+    local targets = _tui_state.available_targets or {}
+    local selected = targets[_tui_state.list_selected + 1]
+    if selected then
+      _tui_state.pending_fields.target_id = selected.id
+      _tui_state.pending_fields.target_path = selected.path
+      _tui_state.pending_fields.target_repo = selected.repo_name or selected.target_repo
+      return {
+        set_mode_ops("new_agent_select_agent"),
+        { op = "send_msg", data = {
+          subscriptionId = "tui_hub",
+          data = {
+            type = "list_agent_config",
+            target_id = selected.id,
+          },
+        }},
+      }
+    end
+    return { set_mode_ops(base_mode(context)) }
+  end
+
   -- === Workspace selection ===
   -- List is 0-based: 0 = "Create New Workspace", 1+ = existing workspaces
   if action == "list_select" and _tui_state.mode == "new_agent_select_workspace" then
@@ -300,6 +335,7 @@ function M.on_action(action, context)
               type = "reopen_worktree",
               path = wt.path,
               branch = wt.branch,
+              target_id = _tui_state.pending_fields.target_id,
               agent_name = _tui_state.pending_fields.agent_name,
               workspace_id = _tui_state.pending_fields.workspace_id,
               workspace_name = _tui_state.pending_fields.workspace_name,
@@ -323,10 +359,55 @@ function M.on_action(action, context)
     return transition_to_workspace_selection()
   end
 
+  if action == "spawn_target_add" and _tui_state.mode == "spawn_targets_info" then
+    return { set_mode_ops("spawn_target_path_input") }
+  end
+
+  if action == "refresh_spawn_targets" and _tui_state.mode == "spawn_targets_info" then
+    return {
+      { op = "send_msg", data = {
+        subscriptionId = "tui_hub",
+        data = { type = "list_spawn_targets" },
+      }},
+    }
+  end
+
+  if action == "spawn_target_remove" and _tui_state.mode == "spawn_targets_info" then
+    local targets = _tui_state.available_targets or {}
+    local selected = targets[_tui_state.list_selected + 1]
+    if not selected or not selected.id then
+      return {}
+    end
+    return {
+      { op = "send_msg", data = {
+        subscriptionId = "tui_hub",
+        data = {
+          type = "remove_spawn_target",
+          target_id = selected.id,
+        },
+      }},
+    }
+  end
+
   -- === Text input submit ===
   if action == "input_submit" then
     local input = _tui_state.input_buffer or ""
-    if _tui_state.mode == "new_workspace_name_input" then
+    if _tui_state.mode == "spawn_target_path_input" then
+      local path = input:match("^%s*(.-)%s*$") or ""
+      if path ~= "" then
+        return {
+          { op = "send_msg", data = {
+            subscriptionId = "tui_hub",
+            data = {
+              type = "add_spawn_target",
+              path = path,
+            },
+          }},
+          set_mode_ops("spawn_targets_info"),
+        }
+      end
+      return { set_mode_ops("spawn_targets_info") }
+    elseif _tui_state.mode == "new_workspace_name_input" then
       local name = input:match("^%s*(.-)%s*$") or ""
       if name ~= "" then
         _tui_state.pending_fields.workspace_name = name
@@ -339,6 +420,9 @@ function M.on_action(action, context)
       local pf = _tui_state.pending_fields
       local issue = pf.pending_issue_or_branch
       local use_main = pf.use_main_branch
+      local target_id = pf.target_id
+      local target_path = pf.target_path
+      local target_repo = pf.target_repo
 
       -- Main branch mode: issue is nil, handler spawns in repo root
       -- Worktree mode: issue is set, handler creates/finds worktree
@@ -355,6 +439,9 @@ function M.on_action(action, context)
         _tui_state.pending_fields.pending_issue_or_branch = nil
         _tui_state.pending_fields.use_main_branch = nil
         _tui_state.pending_fields.agent_name = nil
+        _tui_state.pending_fields.target_id = nil
+        _tui_state.pending_fields.target_path = nil
+        _tui_state.pending_fields.target_repo = nil
         _tui_state.pending_fields.workspace_id = nil
         _tui_state.pending_fields.workspace_name = nil
         return {
@@ -364,6 +451,9 @@ function M.on_action(action, context)
               type = "create_agent",
               issue_or_branch = issue,
               prompt = prompt,
+              target_id = target_id,
+              target_path = target_path,
+              target_repo = target_repo,
               agent_name = agent_name,
               workspace_id = workspace_id,
               workspace_name = workspace_name,
@@ -489,6 +579,9 @@ function M.on_action(action, context)
     _tui_state.pending_fields.pending_issue_or_branch = nil
     _tui_state.pending_fields.use_main_branch = nil
     _tui_state.pending_fields.agent_name = nil
+    _tui_state.pending_fields.target_id = nil
+    _tui_state.pending_fields.target_path = nil
+    _tui_state.pending_fields.target_repo = nil
     return { set_mode_ops(base_mode(context)) }
   end
 

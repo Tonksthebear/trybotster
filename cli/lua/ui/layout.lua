@@ -229,6 +229,7 @@ local function build_menu_items(state)
   -- Hub section (always shown)
   table.insert(items, { text = "── Hub ──", header = true })
   table.insert(items, { text = "New Agent", action = "new_agent" })
+  table.insert(items, { text = "Spawn Targets", action = "spawn_targets_info" })
   table.insert(items, { text = "Show Connection Code", action = "show_connection_code" })
   table.insert(items, { text = "Restart Hub", action = "restart_hub" })
   table.insert(items, { text = "Dev Rebuild & Restart", action = "dev_rebuild" })
@@ -345,6 +346,50 @@ function render_overlay(state)
         block = { title = " Menu [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
         props = {
           items = build_menu_items(state),
+        },
+      },
+    }
+  elseif _tui_state.mode == "new_agent_select_target" then
+    local target_items = {}
+    for _, target in ipairs(_tui_state.available_targets or {}) do
+      local branch = target.current_branch and string.format(" (%s)", target.current_branch) or ""
+      table.insert(target_items, {
+        text = {
+          { text = target.name or target.path or target.id or "target" },
+          { text = branch, style = "dim" },
+        },
+      })
+    end
+    if #target_items == 0 then
+      target_items = { { text = "No admitted spawn targets", style = "dim" } }
+    end
+    return {
+      type = "centered", width = 64, height = 30,
+      child = {
+        type = "list",
+        id = "spawn_target_list",
+        block = { title = " Select Spawn Target [Up/Down navigate | Enter select | Esc cancel] ", borders = "all" },
+        props = {
+          items = target_items,
+        },
+      },
+    }
+  elseif _tui_state.mode == "spawn_target_path_input" then
+    return {
+      type = "centered", width = 68, height = 24,
+      child = {
+        type = "input",
+        id = "spawn_target_path_input",
+        block = { title = " Admit Spawn Target [Enter confirm | Esc cancel] ", borders = "all" },
+        props = {
+          lines = {
+            "Enter an absolute path to admit as a spawn target:",
+            "",
+            "Examples:",
+            "/Users/exampleuser/Rails/trybotster",
+            "/Users/exampleuser/projects/scratch",
+          },
+          placeholder = "/absolute/path",
         },
       },
     }
@@ -534,6 +579,34 @@ function render_overlay(state)
           "Scan QR to connect securely",
           "Link used - [r] to pair new device",
           "[r] new link  [c] copy  [Esc] close",
+        },
+      },
+    }
+  elseif _tui_state.mode == "spawn_targets_info" then
+    local target_items = {}
+    for _, target in ipairs(_tui_state.available_targets or {}) do
+      local branch = target.current_branch and (" [" .. target.current_branch .. "]") or ""
+      local status = target.enabled == false and " disabled" or ""
+      table.insert(target_items, {
+        text = {
+          { text = (target.name or target.path or target.id or "target") .. branch .. status },
+          { text = target.path or "", style = "dim" },
+        },
+      })
+    end
+    if #target_items == 0 then
+      target_items = {
+        { text = "No admitted spawn targets", style = "dim" },
+      }
+    end
+    return {
+      type = "centered", width = 76, height = 28,
+      child = {
+        type = "list",
+        id = "spawn_target_manage_list",
+        block = { title = " Spawn Targets [Up/Down navigate | a add | d remove | r refresh | Esc close] ", borders = "all" },
+        props = {
+          items = target_items,
         },
       },
     }
