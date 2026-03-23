@@ -200,8 +200,14 @@ hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
     log.info(string.format("Broadcasting agent_deleted: %s", agent_id or "?"))
 
     -- Clean up idle tracking state for the deleted session.
+    -- agent_id is agent_key; idle state is keyed by session_uuid.
+    -- Prune any UUIDs that no longer have live sessions.
     local idle_st = state.get("connections._idle_state", {})
-    idle_st[agent_id] = nil
+    for uuid in pairs(idle_st) do
+        if not Agent.get(uuid) then
+            idle_st[uuid] = nil
+        end
+    end
 
     broadcast_hub_event("agent_deleted", { agent_id = agent_id })
     broadcast_hub_event("agent_list", { agents = Agent.all_info() })
@@ -394,8 +400,10 @@ local function check_idle_active()
     -- os.time() is seconds; multiply by 1000 for ms-resolution comparison.
     local now_wall_ms = os.time() * 1000
 
-    for uuid, session in pairs(Agent.all()) do
-        local last = session.last_output_at
+    for _, session in ipairs(Agent.list()) do
+        local uuid = session.session_uuid
+        -- Read directly from Rust AtomicU64 via the PTY handle
+        local last = session.session and session.session:last_output_at() or nil
         if last and last > 0 then
             local idle = (now_wall_ms - last) >= IDLE_THRESHOLD_MS
             local was_idle = _idle_state[uuid]
