@@ -421,7 +421,7 @@ end
 
 -- Cancel previous timer on hot-reload, then start fresh.
 local prev_timer = state.get("connections._idle_timer")
-if prev_timer then
+if prev_timer and type(prev_timer) ~= "table" then
     timer.cancel(prev_timer)
 end
 state.set("connections._idle_timer", timer.every(2, check_idle_active))
