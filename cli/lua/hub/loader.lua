@@ -160,8 +160,10 @@ function M.load_plugin(path, name)
 
     -- Set source context so mcp.tool() can track which plugin registered each tool
     _G._loading_plugin_source = "@" .. path
+    _G._loading_plugin_name = name
     local ok, result = pcall(chunk)
     _G._loading_plugin_source = nil
+    _G._loading_plugin_name = nil
 
     if mcp then mcp.end_batch() end
 

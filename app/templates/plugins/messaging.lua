@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/messaging/init.lua
 -- @scope device
--- @version 1.0.0
+-- @version 1.1.0
 
 -- Messaging plugin
 --
@@ -14,10 +14,11 @@
 -- hub_discovery - no manual hub registration or discovery needed.
 --
 -- Tools:
---   post_message     - post structured message to an agent's inbox
+--   post_message     - post structured message to an agent's inbox (supports agent_label)
 --   receive_messages - drain your inbox of pending messages
 
 local Hub = require("lib.hub")
+local Agent = require("lib.agent")
 
 mcp.tool("post_message", {
     description = "Post a structured message to an agent's inbox. The agent receives a PTY doorbell and calls receive_messages() to get the envelope.",
@@ -31,6 +32,10 @@ mcp.tool("post_message", {
             agent_id = {
                 type = "string",
                 description = "Agent key/ID.",
+            },
+            agent_label = {
+                type = "string",
+                description = "Agent label (alternative to agent_id). Resolved by label lookup on the local hub.",
             },
             payload = {
                 description = "Message payload. Any JSON value.",
@@ -51,14 +56,41 @@ mcp.tool("post_message", {
         required = { "agent_id", "payload" },
     },
 }, function(params, context)
+    -- Resolve target agent: prefer agent_id, fall back to label lookup
+    local target_agent_id = params.agent_id
+    if not target_agent_id and params.agent_label then
+        for _, agent in ipairs(Agent.list()) do
+            if agent._label == params.agent_label then
+                target_agent_id = agent:agent_key()
+                break
+            end
+        end
+        if not target_agent_id then
+            return json.encode({ error = string.format("No agent found with label '%s'", params.agent_label) })
+        end
+    end
+    if not target_agent_id then
+        return json.encode({ error = "Either agent_id or agent_label is required" })
+    end
+
+    -- Resolve sender display name: use label if available, else agent key
     local sender_key = context.agent_key or "unknown"
+    local sender_display = sender_key
+    if sender_key ~= "unknown" then
+        local sender = Agent.find_by_agent_key(sender_key)
+        if sender and sender._label and sender._label ~= "" then
+            sender_display = sender._label
+        end
+    end
+
     local result = Hub.call_safely(params.hub_id, function()
-        return Hub.get(params.hub_id):post(params.agent_id, {
+        return Hub.get(params.hub_id):post(target_agent_id, {
             type          = params.msg_type,
             payload       = params.payload,
             reply_to      = params.reply_to,
             expires_in    = params.expires_in,
             from_agent_id = sender_key,
+            from_label    = sender_display,
         })
     end)
     return json.encode(result)

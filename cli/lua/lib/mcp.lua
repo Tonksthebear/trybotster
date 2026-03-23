@@ -138,6 +138,14 @@ local function caller_source()
     return _G._loading_plugin_source or "unknown"
 end
 
+--- Get the current plugin name.
+-- Reads _G._loading_plugin_name set by loader.lua during plugin load/reload.
+-- Tools registered outside any plugin load get nil (treated as "builtin").
+-- @return string|nil Plugin name, or nil if not inside a plugin load
+local function caller_plugin_name()
+    return _G._loading_plugin_name
+end
+
 --- Build HTTP headers for a remote MCP server request.
 -- @param token string|nil Bearer token for Authorization header
 -- @param session_id string|nil MCP session ID (required after initialize handshake)
@@ -219,6 +227,7 @@ function M.tool(name, schema, handler)
         input_schema = schema.input_schema or { type = "object", properties = {} },
         handler = handler,
         source = caller_source(),
+        plugin_name = caller_plugin_name(),  -- nil = builtin (always available)
     }
 
     if not _batch then
@@ -244,8 +253,14 @@ function M.remove_tool(name)
 end
 
 --- List all registered tools (metadata only, no handlers).
+-- When session_uuid is provided, returns only tools scoped to that session
+-- (intersection of target plugins and agent manifest plugins, plus builtins).
+-- @param session_uuid string|nil Optional session UUID for scoped tool list
 -- @return array of { name, description, input_schema }
-function M.list_tools()
+function M.list_tools(session_uuid)
+    if session_uuid then
+        return M.tools_for_session(session_uuid)
+    end
     local result = {}
     for _, tool in pairs(tools) do
         result[#result + 1] = {
@@ -255,6 +270,126 @@ function M.list_tools()
         }
     end
     return result
+end
+
+--- Get tools scoped to a specific session.
+-- Resolves the session's agent manifest plugins and target plugins,
+-- computes the intersection, and returns only tools from those plugins
+-- plus any builtin tools (registered outside a plugin context).
+-- @param session_uuid string Session UUID
+-- @return array of { name, description, input_schema }
+function M.tools_for_session(session_uuid)
+    local allowed_plugins = M.resolve_session_plugins(session_uuid)
+
+    local result = {}
+    for _, tool in pairs(tools) do
+        -- Builtin tools (plugin_name == nil) are always included
+        if not tool.plugin_name or (allowed_plugins and allowed_plugins[tool.plugin_name]) then
+            result[#result + 1] = {
+                name = tool.name,
+                description = tool.description,
+                input_schema = tool.input_schema,
+            }
+        end
+    end
+    return result
+end
+
+--- Resolve which plugins a session is allowed to use.
+-- Returns a set (table with plugin names as keys) representing the intersection
+-- of the target's available plugins and the agent manifest's requested plugins.
+-- Returns nil if scoping cannot be determined (all tools allowed as fallback).
+-- @param session_uuid string Session UUID
+-- @return table|nil Set of allowed plugin names, or nil for unrestricted
+function M.resolve_session_plugins(session_uuid)
+    local data_dir = config.data_dir and config.data_dir() or nil
+    if not data_dir then return {} end
+
+    -- Look up live session object first (O(1), no filesystem I/O).
+    -- Falls back to manifest scan only if session isn't in memory.
+    local Session = require("lib.session")
+    local session = Session.get(session_uuid)
+
+    local target_id, agent_name, target_path
+    if session then
+        target_id = session.target_id
+        agent_name = session.agent_name or session.profile_name
+        target_path = session.target_path
+    else
+        -- Session not in memory — read manifest from workspace store
+        local WorkspaceStore = require("lib.workspace_store")
+        local ws_dir = data_dir .. "/workspaces"
+        if fs.exists(ws_dir) and fs.is_dir(ws_dir) then
+            local ws_entries = fs.listdir(ws_dir) or {}
+            for _, ws_id in ipairs(ws_entries) do
+                if fs.is_dir(ws_dir .. "/" .. ws_id) then
+                    local m = WorkspaceStore.read_session(data_dir, ws_id, session_uuid)
+                    if m then
+                        target_id = m.target_id
+                        agent_name = m.agent_name or m.profile_name
+                        target_path = m.target_path
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    -- Deny-by-default: if we can't determine the session's identity,
+    -- no plugin tools are allowed (builtins still pass through).
+    if not target_id and not agent_name then return {} end
+
+    -- Get target plugins (availability ceiling)
+    local target_plugins = nil
+    local registry = rawget(_G, "spawn_targets")
+    if registry and type(registry.get) == "function" and target_id then
+        local ok, target = pcall(registry.get, target_id)
+        if ok and target and target.plugins then
+            target_plugins = {}
+            for _, p in ipairs(target.plugins) do
+                target_plugins[p] = true
+            end
+        end
+    end
+
+    -- Get agent manifest plugins (agent's requested set)
+    local agent_plugins = nil
+    if agent_name then
+        local ConfigResolver = require("lib.config_resolver")
+        local resolved = ConfigResolver.resolve_all({
+            device_root = data_dir,
+            repo_root = target_path,
+            require_agent = false,
+        })
+        if resolved and resolved.agents[agent_name] then
+            local agent_manifest = resolved.agents[agent_name].manifest
+            if agent_manifest and agent_manifest.plugins then
+                agent_plugins = {}
+                for _, p in ipairs(agent_manifest.plugins) do
+                    agent_plugins[p] = true
+                end
+            end
+        end
+    end
+
+    -- Compute intersection
+    if target_plugins and agent_plugins then
+        local intersection = {}
+        for p in pairs(agent_plugins) do
+            if target_plugins[p] then
+                intersection[p] = true
+            end
+        end
+        return intersection
+    elseif target_plugins then
+        return target_plugins
+    elseif agent_plugins then
+        -- Target has no plugins field — deny-by-default. Target is the security boundary.
+        return {}
+    end
+
+    -- Deny-by-default: no plugins field means no plugins.
+    return {}
 end
 
 --- Normalize a tool result to MCP content array format.
@@ -294,6 +429,17 @@ function M.call_tool(name, params, context, callback)
         local err = "Unknown tool: " .. name
         if callback then callback(nil, err) return end
         return nil, err
+    end
+
+    -- Enforce session-scoped plugin access: if the tool belongs to a plugin
+    -- and the caller has a session context, verify the tool is allowed.
+    if tool.plugin_name and context and context.session_uuid then
+        local allowed = M.resolve_session_plugins(context.session_uuid)
+        if allowed and not allowed[tool.plugin_name] then
+            local err = "Tool not available for this session: " .. name
+            if callback then callback(nil, err) return end
+            return nil, err
+        end
     end
 
     -- Proxied tool: forward the call to the remote MCP server via HTTP.
@@ -429,6 +575,7 @@ function M.proxy(url, opts)
     local token        = opts.token
     local on_auth_error = opts.on_auth_error
     local source       = caller_source()
+    local plugin_name  = caller_plugin_name()  -- capture now; nil in async callbacks
     local proxy_id     = url
 
     local init_body = json.encode({
@@ -529,6 +676,7 @@ function M.proxy(url, opts)
                     handler      = nil,               -- nil = proxied
                     source       = registered_source,
                     proxy_id     = proxy_id,
+                    plugin_name  = plugin_name,  -- captured at mcp.proxy() call time
                 }
                 table.insert(tool_names, tname)
                 _batch_tools_dirty = true

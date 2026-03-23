@@ -86,26 +86,60 @@ end
 -- Scan Functions (operate on a single .botster/ root)
 -- =============================================================================
 
---- Scan agents/ directory: agents/*/initialization
+--- Read and parse a JSON manifest file.
+-- @param path string Path to manifest.json
+-- @return table|nil Parsed manifest, or nil on error
+local function read_manifest(path)
+    if not fs.exists(path) then return nil end
+    local content = fs.read(path)
+    if not content then return nil end
+    local ok, parsed = pcall(json.decode, content)
+    if ok and type(parsed) == "table" then
+        return parsed
+    end
+    log.warn(string.format("ConfigResolver: invalid JSON in %s", path))
+    return nil
+end
+
+--- Read a system prompt file.
+-- @param path string Path to system_prompt.md
+-- @return string|nil Contents, or nil if not found
+local function read_system_prompt(path)
+    if not fs.exists(path) then return nil end
+    return fs.read(path)
+end
+
+--- Scan agents/ directory: agents/*/initialization + manifest.json + system_prompt.md
 -- @param botster_root string Path to a .botster/ directory
 -- @param source string Source label ("device" or "repo")
--- @return table Map of agent_name -> { name, initialization, source }
+-- @return table Map of agent_name -> { name, initialization, manifest, system_prompt, source }
 local function read_agents(botster_root, source)
     local agents_dir = botster_root .. "/agents"
     local result = {}
     local names = list_subdirs(agents_dir)
     for _, name in ipairs(names) do
-        local init_path = agents_dir .. "/" .. name .. "/initialization"
+        local agent_dir = agents_dir .. "/" .. name
+        local init_path = agent_dir .. "/initialization"
         if fs.exists(init_path) then
+            local manifest = read_manifest(agent_dir .. "/manifest.json")
+            -- system_prompt.md wins over manifest.system_prompt
+            local system_prompt = read_system_prompt(agent_dir .. "/system_prompt.md")
+            if not system_prompt and manifest and manifest.system_prompt then
+                system_prompt = manifest.system_prompt
+            end
+            -- Remove system_prompt from manifest to avoid confusion during merge
+            if manifest then manifest.system_prompt = nil end
             result[name] = {
                 name = name,
                 initialization = init_path,
+                manifest = manifest,
+                system_prompt = system_prompt,
                 source = source,
             }
         else
             log.warn(string.format(
                 "ConfigResolver: agent '%s' at %s has no initialization file, skipping",
-                name, agents_dir .. "/" .. name))
+                name, agent_dir))
         end
     end
     return result
@@ -245,9 +279,27 @@ function M.resolve_all(opts)
     end
 
     -- Layer 2: repo ({repo}/.botster/) — wins on collision
+    -- For agents, manifest fields are merged (repo overrides device per field)
+    -- so a target-local manifest.json can override specific fields while
+    -- inheriting others from the device-level manifest.
     if repo_root then
         local rr = repo_root .. "/.botster"
         for name, agent in pairs(read_agents(rr, "repo")) do
+            local existing = acc.agents[name]
+            if existing and existing.manifest and agent.manifest then
+                -- Merge: start with device manifest, overlay repo manifest fields
+                local merged = {}
+                for k, v in pairs(existing.manifest) do merged[k] = v end
+                for k, v in pairs(agent.manifest) do merged[k] = v end
+                agent.manifest = merged
+            elseif existing and existing.manifest and not agent.manifest then
+                -- Repo has no manifest — inherit device manifest
+                agent.manifest = existing.manifest
+            end
+            -- system_prompt: repo wins outright if present, else inherit device
+            if not agent.system_prompt and existing and existing.system_prompt then
+                agent.system_prompt = existing.system_prompt
+            end
             acc.agents[name] = agent
         end
         for name, accessory in pairs(read_accessories(rr, "repo")) do
