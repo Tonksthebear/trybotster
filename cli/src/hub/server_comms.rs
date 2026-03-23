@@ -2827,6 +2827,14 @@ impl Hub {
                 continue;
             };
 
+            if session_handle.pty().is_broker_backed() {
+                log::debug!(
+                    "[WebRTC] Skipping cached backpressure recovery snapshot for broker-backed session {}",
+                    &entry.session_uuid[..entry.session_uuid.len().min(8)]
+                );
+                continue;
+            }
+
             let snapshot = session_handle.pty().get_snapshot_cached();
             if snapshot.is_empty() {
                 continue;
@@ -5404,6 +5412,47 @@ mod tests {
 
     fn test_broker_backed_session_handle(session_uuid: &str) -> (SessionHandle, UnixStream) {
         test_broker_backed_session_handle_with_seed(session_uuid, b"cached-broker-output\n")
+    }
+
+    #[test]
+    fn test_backpressure_recovery_skips_broker_backed_sessions() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-broker-recovery-skip";
+        let (session, _broker_peer) = test_broker_backed_session_handle(session_uuid);
+        hub.handle_cache.add_session(session);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<super::super::WebRtcSendItem>(4);
+        let task = hub.tokio_runtime.spawn(async {});
+        hub.webrtc_send_tasks.insert(
+            "peer-recovery".to_string(),
+            super::super::PeerSendState {
+                tx,
+                dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                task,
+            },
+        );
+
+        let key = format!("peer-recovery:{session_uuid}");
+        hub.webrtc_backpressure_recovery.insert(
+            key.clone(),
+            super::super::BackpressureRecoveryEntry {
+                browser_identity: "peer-recovery".to_string(),
+                session_uuid: session_uuid.to_string(),
+                subscription_id: format!("terminal_{session_uuid}"),
+                last_drop: Instant::now() - super::super::BACKPRESSURE_SNAPSHOT_COOLDOWN,
+            },
+        );
+
+        hub.send_backpressure_recovery_snapshots();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "broker-backed recovery should not enqueue cached snapshot chunks"
+        );
+        assert!(
+            !hub.webrtc_backpressure_recovery.contains_key(&key),
+            "recovery entry should be cleared after broker-backed skip"
+        );
     }
 
     fn test_forwarder_request(
