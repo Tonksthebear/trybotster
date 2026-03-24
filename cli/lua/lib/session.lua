@@ -553,7 +553,13 @@ end
 --- Sync the Central Session Store session manifest.
 -- Writes self:info() shape so broker recovery can load it directly.
 function Session:_sync_session_manifest()
-    if not self._data_dir or not self._workspace_id then return end
+    if not self._data_dir or not self._workspace_id then
+        log.debug(string.format("Session %s: skip manifest sync (data_dir=%s, workspace_id=%s)",
+            tostring(self.session_uuid),
+            tostring(self._data_dir),
+            tostring(self._workspace_id)))
+        return
+    end
     local ws = require("lib.workspace_store")
 
     -- Start from the canonical info() shape — this is the contract.

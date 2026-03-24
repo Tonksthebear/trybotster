@@ -904,51 +904,33 @@ impl Hub {
 
         log::info!("[session] found {} session socket(s)", sockets.len());
 
-        let mut live_sessions = Vec::new();
+        // Don't connect during scan — just list socket files and extract
+        // session_uuid from filenames. Lua connects once via hub.connect_session.
+        // Connecting here and dropping would force the session process into
+        // reconnect mode, racing with Lua's subsequent connect.
+        let mut discovered = Vec::new();
 
         for socket_path in &sockets {
-            // Extract session_uuid from filename (e.g., "sess-xxx.sock" → "sess-xxx")
             let session_uuid = match socket_path.file_stem().and_then(|s| s.to_str()) {
                 Some(name) => name.to_string(),
                 None => continue,
             };
 
-            // Try connect + handshake to verify liveness
-            match crate::session::connection::SessionConnection::connect(socket_path) {
-                Ok(conn) => {
-                    log::info!(
-                        "[session] live session: {} (pid={}, {}x{})",
-                        &session_uuid[..session_uuid.len().min(16)],
-                        conn.metadata.pid,
-                        conn.metadata.cols,
-                        conn.metadata.rows,
-                    );
-                    live_sessions.push(serde_json::json!({
-                        "session_uuid": session_uuid,
-                        "socket_path": socket_path.display().to_string(),
-                        "pid": conn.metadata.pid,
-                        "rows": conn.metadata.rows,
-                        "cols": conn.metadata.cols,
-                        "last_output_at": conn.metadata.last_output_at,
-                    }));
-                    // Drop the connection — Lua will reconnect via hub.connect_session
-                    drop(conn);
-                }
-                Err(e) => {
-                    log::debug!(
-                        "[session] stale socket {}: {e} — removing",
-                        socket_path.display()
-                    );
-                    std::fs::remove_file(socket_path).ok();
-                }
-            }
+            log::info!(
+                "[session] discovered socket: {}",
+                &session_uuid[..session_uuid.len().min(16)]
+            );
+            discovered.push(serde_json::json!({
+                "session_uuid": session_uuid,
+                "socket_path": socket_path.display().to_string(),
+            }));
         }
 
-        let count = live_sessions.len();
+        let count = discovered.len();
 
         if let Err(e) = self.lua.fire_json_event(
             "sessions_discovered",
-            &serde_json::json!({ "sockets": live_sessions }),
+            &serde_json::json!({ "sockets": discovered }),
         ) {
             log::warn!("[session] sessions_discovered event error: {e}");
         }
