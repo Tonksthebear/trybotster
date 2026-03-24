@@ -402,7 +402,6 @@ impl Hub {
                 self.poll_pty_observers();
                 self.send_backpressure_recovery_snapshots();
                 self.ratchet_restarted_peers.clear();
-                self.check_broker_demux_health();
                 if self.hub_event_metrics_last_log.elapsed() >= std::time::Duration::from_secs(30) {
                     let m = self.hub_event_metrics.snapshot();
                     let by_type = m
@@ -1035,132 +1034,6 @@ impl Hub {
             HubEvent::MessageDelivered { message_len } => {
                 log::info!("[MessageDelivery] Delivered message ({message_len} bytes)");
             }
-            // =========================================================
-            // Broker relay events
-            // =========================================================
-
-            // Store the session → agent mapping so BrokerPtyOutput can
-            // be routed to the correct PtyHandle.
-            HubEvent::BrokerSessionRegistered {
-                session_id,
-                session_uuid,
-            } => {
-                log::debug!("[Broker] Session {} → '{}'", session_id, session_uuid);
-                self.broker_sessions.insert(session_id, session_uuid);
-            }
-
-            // Route broker PTY output to the session's event broadcast channel
-            // and all subscribed forwarders (TUI, WebRTC, socket clients).
-            HubEvent::BrokerPtyOutput {
-                session_id,
-                flags,
-                data,
-            } => {
-                if let Some(session_uuid) = self.broker_sessions.get(&session_id).cloned() {
-                    if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
-                        self.reply_to_headless_terminal_probes(
-                            &session_uuid,
-                            session_handle.pty(),
-                            &data,
-                        );
-                        session_handle.pty().feed_broker_output(&data, flags);
-
-                        // Queue pty_output observer notification so Lua hooks
-                        // (idle detection, etc.) fire regardless of which
-                        // client is connected.
-                        if self.lua.has_observers("pty_output") {
-                            if self.pty_observer_queue.len()
-                                >= super::PTY_OBSERVER_QUEUE_CAPACITY
-                            {
-                                self.pty_observer_queue.pop_front();
-                            }
-                            self.pty_observer_queue.push_back(PtyObserverNotification {
-                                ctx: crate::lua::primitives::PtyOutputContext {
-                                    session_uuid: session_uuid.clone(),
-                                    peer_id: String::new(),
-                                },
-                                data: data.clone(),
-                            });
-                        }
-                    } else {
-                        log::debug!(
-                            "[Broker] BrokerPtyOutput session={}: session '{}' not in cache",
-                            session_id,
-                            session_uuid
-                        );
-                    }
-                } else {
-                    log::warn!(
-                        "[Broker] BrokerPtyOutput for unknown session {}",
-                        session_id
-                    );
-                }
-            }
-
-            // Route broker terminal events (title, bell) to the session's
-            // PtyEvent broadcast channel so the notification watcher fires
-            // the appropriate Lua hooks (pty_title_changed, etc.).
-            HubEvent::BrokerTermEvent { session_id, event } => {
-                use crate::broker::protocol::BrokerTermEvent;
-                if let Some(session_uuid) = self.broker_sessions.get(&session_id) {
-                    if let Some(session_handle) = self.handle_cache.get_session(session_uuid) {
-                        match event {
-                            BrokerTermEvent::TitleChanged { title } => {
-                                session_handle.pty().notify_title_changed(title);
-                            }
-                            BrokerTermEvent::ResetTitle => {
-                                session_handle.pty().notify_title_changed(String::new());
-                            }
-                            BrokerTermEvent::Bell => {
-                                session_handle.pty().notify_bell();
-                            }
-                        }
-                    } else {
-                        log::debug!(
-                            "[Broker] BrokerTermEvent session={}: session '{}' not in cache",
-                            session_id,
-                            session_uuid
-                        );
-                    }
-                } else {
-                    log::warn!(
-                        "[Broker] BrokerTermEvent for unknown session {}",
-                        session_id
-                    );
-                }
-            }
-
-            HubEvent::BrokerPtyExited {
-                session_id,
-                session_uuid,
-                exit_code,
-            } => {
-                log::info!(
-                    "[Broker] PtyExited session={} uuid='{}' exit={:?}",
-                    session_id,
-                    session_uuid,
-                    exit_code
-                );
-                self.broker_sessions.remove(&session_id);
-
-                // Bridge broker-side exit into the PtyHandle broadcast channel.
-                // This makes the notification watcher fire `process_exited` for
-                // live broker-owned sessions (without this, the Lua handler
-                // early-returns and no cleanup happens).
-                if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
-                    session_handle.pty().notify_process_exited(exit_code);
-                }
-
-                let data = serde_json::json!({
-                    "session_id": session_id,
-                    "session_uuid": session_uuid,
-                    "exit_code": exit_code,
-                });
-                if let Err(e) = self.lua.fire_json_event("broker_pty_exited", &data) {
-                    log::error!("[Broker] Failed to fire broker_pty_exited event: {e}");
-                }
-            }
-
             // Per-session process exited or disconnected.
             // The reader thread already broadcasts PtyEvent directly, so we
             // just need to notify Lua for cleanup (same as broker_pty_exited).
@@ -1186,17 +1059,8 @@ impl Hub {
             }
 
             HubEvent::SessionUnregistered { session_uuid } => {
-                let before = self.broker_sessions.len();
-                self.broker_sessions.retain(|_, uuid| uuid != &session_uuid);
                 self.terminal_profiles.clear_session(&session_uuid);
-                let removed = before - self.broker_sessions.len();
-                if removed > 0 {
-                    log::debug!(
-                        "[Broker] Removed {} session(s) for unregistered session '{}'",
-                        removed,
-                        session_uuid
-                    );
-                }
+                log::debug!("[Session] Unregistered '{}'", session_uuid);
             }
             HubEvent::WebRtcOfferCompleted {
                 browser_identity,
@@ -2752,7 +2616,7 @@ impl Hub {
             );
 
             let (snapshot, mut pty_rx) = match tokio::task::spawn_blocking(move || {
-                if pty_for_snapshot.is_broker_backed() {
+                if pty_for_snapshot.is_session_backed() {
                     let (current_rows, current_cols) = pty_for_snapshot.dims();
                     if (current_rows, current_cols) == (target_rows, target_cols) {
                         // Force a redraw pulse for full-screen TUIs. Resizing to the
@@ -2924,7 +2788,7 @@ impl Hub {
         let _guard = self.tokio_runtime.enter();
         tokio::spawn(async move {
             let snapshot = match tokio::task::spawn_blocking(move || {
-                if pty_handle.is_broker_backed() {
+                if pty_handle.is_session_backed() {
                     let (current_rows, current_cols) = pty_handle.dims();
                     if (current_rows, current_cols) == (target_rows, target_cols) {
                         let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
@@ -3059,7 +2923,7 @@ impl Hub {
 
             let pty_handle = session_handle.pty().clone();
 
-            if pty_handle.is_broker_backed() {
+            if pty_handle.is_session_backed() {
                 // Broker snapshot requires blocking I/O — spawn off the tick loop.
                 // Clone the per-peer sender so the task can deliver chunks directly,
                 // bypassing the output queue to avoid re-triggering backpressure.
@@ -3356,7 +3220,7 @@ impl Hub {
 
             let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, mut pty_rx) =
                 match tokio::task::spawn_blocking(move || {
-                    if pty_for_snapshot.is_broker_backed() {
+                    if pty_for_snapshot.is_session_backed() {
                         let (current_rows, current_cols) = pty_for_snapshot.dims();
                         if (current_rows, current_cols) == (target_rows, target_cols) {
                             // Force a redraw pulse for full-screen TUIs. Resizing to the
@@ -3680,7 +3544,7 @@ impl Hub {
 
             let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, mut pty_rx) =
                 match tokio::task::spawn_blocking(move || {
-                    if pty_for_snapshot.is_broker_backed() {
+                    if pty_for_snapshot.is_session_backed() {
                         let (current_rows, current_cols) = pty_for_snapshot.dims();
                         if (current_rows, current_cols) == (target_rows, target_cols) {
                             // Force a redraw pulse for full-screen TUIs. Resizing to the
@@ -5428,38 +5292,6 @@ impl Hub {
         )
     }
 
-    // === Broker Demux Health Check ===
-
-    /// Check if the broker demux reader thread is still alive.
-    ///
-    /// Called every `CleanupTick` (5s). If the demux thread has exited
-    /// (socket EOF, decode error, or dropped channel), fires a Lua event
-    /// so the plugin layer can decide whether to reconnect the broker.
-    fn check_broker_demux_health(&mut self) {
-        let guard = match self.broker_connection.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let Some(ref conn) = *guard else { return };
-
-        // Skip if forwarder was never installed — demux_alive starts false
-        // and would false-positive on every tick before install_forwarder().
-        if !conn.has_forwarder() {
-            return;
-        }
-
-        // Forwarder was installed; check if the demux thread is still running.
-        if conn.is_demux_alive() {
-            return;
-        }
-        drop(guard);
-
-        log::error!("[Broker] Demux reader thread died — broker output forwarding stopped");
-        let data = serde_json::json!({ "reason": "demux_thread_exited" });
-        if let Err(e) = self.lua.fire_json_event("broker_connection_lost", &data) {
-            log::error!("[Broker] Failed to fire broker_connection_lost: {e}");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -5602,10 +5434,6 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
 
-    use crate::broker::connection::BrokerConnection;
-    use crate::broker::protocol::{
-        encode_data, frame_type, BrokerFrame, BrokerFrameDecoder, HubMessage,
-    };
     use crate::client::{TuiOutput, TuiRequest};
     use crate::config::Config;
     use crate::hub::agent_handle::{PtyHandle, SessionHandle, SessionType};
@@ -5650,7 +5478,6 @@ mod tests {
                 hub.hub_identifier.clone(),
                 std::sync::Arc::clone(&hub.shared_server_id),
                 std::sync::Arc::clone(&hub.state),
-                std::sync::Arc::clone(&hub.broker_connection),
             )
             .expect("Should register hub primitives");
 
@@ -5706,201 +5533,43 @@ mod tests {
         client_stream
     }
 
-    fn test_broker_backed_session_handle_with_seed(
+    /// Create a local-PTY-backed test session handle with seeded shadow screen output.
+    fn test_local_session_handle_with_seed(
         session_uuid: &str,
         seed_output: &[u8],
-    ) -> (SessionHandle, UnixStream) {
+    ) -> SessionHandle {
         let pty_session = PtySession::new(24, 80);
         let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
             pty_session.get_direct_access();
         std::mem::forget(pty_session);
 
-        let (client_stream, server_stream) = UnixStream::pair().expect("UnixStream::pair");
-        client_stream
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .expect("set read timeout");
-        let conn = BrokerConnection::from_stream(client_stream);
-        let shared = Arc::new(Mutex::new(Some(conn)));
-
-        let pty = PtyHandle::new_with_broker_relay(
+        let pty = PtyHandle::new(
             event_tx,
             shared_state,
-            shadow_screen,
+            shadow_screen.clone(),
             kitty_enabled,
             cursor_visible,
             resize_pending,
             true,
             None,
-            (1, shared),
-            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         );
         // Seed shadow state so cached snapshot is non-empty.
-        pty.feed_broker_output(seed_output, 0);
-
-        (
-            SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty),
-            server_stream,
-        )
-    }
-
-    fn test_broker_backed_session_handle(session_uuid: &str) -> (SessionHandle, UnixStream) {
-        test_broker_backed_session_handle_with_seed(session_uuid, b"cached-broker-output\n")
-    }
-
-    #[test]
-    fn test_headless_broker_probe_replays_cached_osc_color_reply() {
-        use std::io::Read;
-
-        let (mut hub, _request_tx, _output_rx) = e2e_hub();
-        let session_uuid = "sess-headless-probe";
-        let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
-        hub.handle_cache.add_session(session);
-        hub.broker_sessions.insert(1, session_uuid.to_string());
-        hub.terminal_profiles
-            .observe_output(session_uuid, b"\x1b]11;?\x07", true);
-        hub.learn_terminal_probe_replies(
-            session_uuid,
-            "browser-a",
-            b"\x1b]11;rgb:1111/2222/3333\x07",
-        );
-
-        broker_peer
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .expect("set read timeout");
-
-        hub.handle_hub_event(crate::hub::events::HubEvent::BrokerPtyOutput {
-            session_id: 1,
-            flags: 0,
-            data: b"\x1b]11;?\x07".to_vec(),
-        });
-
-        let mut buf = [0u8; 256];
-        let n = broker_peer.read(&mut buf).expect("read broker probe reply");
-        let frames = BrokerFrameDecoder::new()
-            .feed(&buf[..n])
-            .expect("decode broker frame");
-
-        assert_eq!(frames.len(), 1);
-        match &frames[0] {
-            BrokerFrame::PtyInput(session_id, data) => {
-                assert_eq!(*session_id, 1);
-                assert_eq!(data, b"\x1b]11;rgb:1111/2222/3333\x07");
-            }
-            other => panic!("expected cached PtyInput reply, got {other:?}"),
+        if let Ok(mut screen) = shadow_screen.lock() {
+            screen.process(seed_output);
         }
+        let _ = pty.event_tx_clone().send(
+            crate::agent::pty::events::PtyEvent::output(seed_output.to_vec()),
+        );
+
+        SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
     }
 
-    /// When a TUI client is attached, OSC queries from PTY output are forwarded
-    /// to the TUI for passthrough to the outer terminal — NOT answered from cache.
-    /// The TUI's terminal responds, and the response is routed back to the PTY
-    /// via TerminalProbeResponse.
-    #[test]
-    fn test_tui_client_forwards_probe_instead_of_cache_reply() {
-        use std::io::Read;
-
-        let (mut hub, _request_tx, output_rx) = e2e_hub();
-        let session_uuid = "sess-tui-probe";
-        let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
-        hub.handle_cache.add_session(session);
-        hub.broker_sessions.insert(1, session_uuid.to_string());
-        // Pre-populate cache (should NOT be used when TUI is attached)
-        hub.terminal_profiles
-            .observe_output(session_uuid, b"\x1b]11;?\x07", true);
-        hub.learn_terminal_probe_replies(
-            session_uuid,
-            "browser-a",
-            b"\x1b]11;rgb:aaaa/bbbb/cccc\x07",
-        );
-
-        // Register TUI output channel so forward_probe_to_tui can send
-        let (tui_tx, mut tui_rx) = tokio::sync::mpsc::unbounded_channel();
-        hub.tui_output_tx = Some(tui_tx);
-
-        let _guard = hub.tokio_runtime.enter();
-        hub.pty_forwarders
-            .insert(format!("tui:{session_uuid}"), tokio::spawn(async {}));
-
-        broker_peer
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .expect("set read timeout");
-
-        hub.handle_hub_event(crate::hub::events::HubEvent::BrokerPtyOutput {
-            session_id: 1,
-            flags: 0,
-            data: b"\x1b]11;?\x07".to_vec(),
-        });
-
-        // Should NOT write cached reply to the PTY (passthrough instead)
-        let mut buf = [0u8; 256];
-        let err = broker_peer
-            .read(&mut buf)
-            .expect_err("TUI client should passthrough, not answer from cache");
-        assert!(
-            matches!(
-                err.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ),
-            "expected timeout/empty read, got {err:?}"
-        );
-
-        // Should have forwarded the query to TUI output channel
-        match tui_rx.try_recv() {
-            Ok(crate::client::TuiOutput::TerminalQuery { data }) => {
-                assert!(
-                    data.windows(7).any(|w| w == b"\x1b]11;?\x07"),
-                    "forwarded query should contain OSC 11 probe"
-                );
-            }
-            other => panic!("expected TerminalQuery on TUI channel, got {other:?}"),
-        }
+    fn test_local_session_handle(session_uuid: &str) -> SessionHandle {
+        test_local_session_handle_with_seed(session_uuid, b"cached-local-output\n")
     }
 
-    /// Browser/WebRTC clients can respond to OSC queries via their terminal
-    /// emulator, so the hub should let them answer rather than injecting cached replies.
-    #[test]
-    fn test_browser_client_suppresses_cached_probe_reply() {
-        use std::io::Read;
-
-        let (mut hub, _request_tx, _output_rx) = e2e_hub();
-        let session_uuid = "sess-browser-probe";
-        let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
-        hub.handle_cache.add_session(session);
-        hub.broker_sessions.insert(1, session_uuid.to_string());
-        hub.terminal_profiles
-            .observe_output(session_uuid, b"\x1b]11;?\x07", true);
-        hub.learn_terminal_probe_replies(
-            session_uuid,
-            "browser-a",
-            b"\x1b]11;rgb:aaaa/bbbb/cccc\x07",
-        );
-
-        // Simulate a browser client (forwarder key is "browser-identity:session_uuid")
-        let _guard = hub.tokio_runtime.enter();
-        hub.pty_forwarders
-            .insert(format!("browser-a:{session_uuid}"), tokio::spawn(async {}));
-
-        broker_peer
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .expect("set read timeout");
-
-        hub.handle_hub_event(crate::hub::events::HubEvent::BrokerPtyOutput {
-            session_id: 1,
-            flags: 0,
-            data: b"\x1b]11;?\x07".to_vec(),
-        });
-
-        let mut buf = [0u8; 256];
-        let err = broker_peer
-            .read(&mut buf)
-            .expect_err("browser client should suppress cached reply injection");
-        assert!(
-            matches!(
-                err.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ),
-            "expected timeout/empty read, got {err:?}"
-        );
-    }
+    // Broker-specific probe tests removed — broker module deleted.
+    // Terminal probe caching is now exercised via session-process paths.
 
     #[test]
     fn test_session_unregistered_clears_terminal_profile_state() {
@@ -5964,125 +5633,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_backpressure_recovery_fetches_broker_snapshot() {
-        let (mut hub, _request_tx, _output_rx) = e2e_hub();
-        let session_uuid = "sess-broker-recovery";
-        let (session, mut broker_peer) =
-            test_broker_backed_session_handle_with_seed(session_uuid, b"broker-recovery-data\n");
-        hub.handle_cache.add_session(session);
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<super::super::WebRtcSendItem>(16);
-        let task = hub.tokio_runtime.spawn(async {});
-        hub.webrtc_send_tasks.insert(
-            "peer-recovery".to_string(),
-            super::super::PeerSendState {
-                tx,
-                dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                task,
-            },
-        );
-
-        let key = format!("peer-recovery:{session_uuid}");
-        hub.webrtc_backpressure_recovery.insert(
-            key.clone(),
-            super::super::BackpressureRecoveryEntry {
-                browser_identity: "peer-recovery".to_string(),
-                session_uuid: session_uuid.to_string(),
-                subscription_id: format!("terminal_{session_uuid}"),
-                last_drop: Instant::now() - super::super::BACKPRESSURE_SNAPSHOT_COOLDOWN,
-            },
-        );
-
-        // Spawn a thread to act as the broker: read GetSnapshot RPC, respond with snapshot.
-        broker_peer
-            .set_read_timeout(Some(Duration::from_millis(2000)))
-            .expect("set fake broker read timeout");
-
-        let broker = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-
-            let mut decoder = BrokerFrameDecoder::new();
-            let mut buf = [0u8; 512];
-            let deadline = Instant::now() + Duration::from_millis(2000);
-
-            while Instant::now() < deadline {
-                match broker_peer.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let frames = decoder.feed(&buf[..n]).expect("decode broker frame");
-                        for frame in frames {
-                            if let BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) =
-                                frame
-                            {
-                                let response = encode_data(
-                                    frame_type::SNAPSHOT,
-                                    session_id,
-                                    b"\x1b[Hbroker-snapshot-recovery",
-                                );
-                                broker_peer
-                                    .write_all(&response)
-                                    .expect("write broker snapshot");
-                                return;
-                            }
-                        }
-                    }
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        continue;
-                    }
-                    Err(err) => panic!("fake broker read failed: {err}"),
-                }
-            }
-
-            panic!("broker thread did not receive GetSnapshot request");
-        });
-
-        hub.send_backpressure_recovery_snapshots();
-
-        assert!(
-            !hub.webrtc_backpressure_recovery.contains_key(&key),
-            "recovery entry should be cleared for broker-backed session"
-        );
-
-        // Wait for broker thread to complete (it handles the GetSnapshot RPC).
-        broker.join().expect("broker thread panicked");
-
-        // Wait for the async task to deliver snapshot to the peer channel.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut received = Vec::new();
-        while Instant::now() < deadline {
-            match rx.try_recv() {
-                Ok(item) => {
-                    received.push(item);
-                    break;
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(10)),
-            }
-        }
-
-        assert!(
-            !received.is_empty(),
-            "broker-backed recovery should deliver snapshot to peer channel"
-        );
-
-        // Verify the snapshot has the expected prefix and data.
-        if let super::super::WebRtcSendItem::Pty { data, .. } = &received[0] {
-            assert_eq!(data[0], 0x02, "snapshot should have 0x02 prefix");
-            let payload = &data[1..]; // skip prefix byte only
-            let text = String::from_utf8_lossy(payload);
-            assert!(
-                text.contains("broker-snapshot-recovery"),
-                "snapshot should contain broker snapshot data, got: {text:?}"
-            );
-        } else {
-            panic!("Expected Pty send item");
-        }
-    }
+    // test_backpressure_recovery_fetches_broker_snapshot removed — broker module deleted.
 
     fn test_forwarder_request(
         peer_id: &str,
@@ -6619,352 +6170,22 @@ mod tests {
         );
     }
 
-    /// Broker-backed attach fetches snapshot via broker RPC.
-    ///
-    /// The forwarder should issue a `GetSnapshot` RPC and deliver the broker's
-    /// response as scrollback to the TUI.
-    #[test]
-    fn test_tui_forwarder_broker_backed_snapshot_is_prompt() {
-        let (mut hub, _request_tx, mut output_rx) = e2e_hub();
-        let session_uuid = "sess-broker-cached";
-        let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
-        hub.handle_cache.add_session(session);
-
-        let broker = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-
-            broker_peer
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .expect("set fake broker read timeout");
-            let mut decoder = BrokerFrameDecoder::new();
-            let mut buf = [0u8; 512];
-            let deadline = Instant::now() + Duration::from_millis(1200);
-
-            while Instant::now() < deadline {
-                match broker_peer.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let frames = decoder.feed(&buf[..n]).expect("decode broker frame");
-                        for frame in frames {
-                            if let BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) =
-                                frame
-                            {
-                                let response = encode_data(
-                                    frame_type::SNAPSHOT,
-                                    session_id,
-                                    b"cached-broker-output\n",
-                                );
-                                broker_peer
-                                    .write_all(&response)
-                                    .expect("write broker snapshot");
-                                return;
-                            }
-                        }
-                    }
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        continue;
-                    }
-                    Err(err) => panic!("fake broker read failed: {err}"),
-                }
-            }
-
-            panic!("broker thread did not receive GetSnapshot request");
-        });
-
-        let req = crate::lua::primitives::CreateTuiForwarderRequest {
-            session_uuid: session_uuid.to_string(),
-            subscription_id: format!("tui:{session_uuid}"),
-            active_flag: Arc::new(Mutex::new(true)),
-            rows: 24,
-            cols: 80,
-        };
-
-        hub.create_lua_tui_pty_forwarder(req);
-
-        let deadline = Instant::now() + Duration::from_millis(500);
-        let mut saw_scrollback = false;
-        while Instant::now() < deadline {
-            match output_rx.try_recv() {
-                Ok(TuiOutput::Scrollback {
-                    session_uuid: got,
-                    rows,
-                    cols,
-                    data,
-                    ..
-                }) if got == session_uuid => {
-                    assert_eq!((rows, cols), (24, 80));
-                    let text = String::from_utf8_lossy(&data);
-                    assert!(
-                        text.contains("cached-broker-output"),
-                        "broker snapshot should contain seeded output, got: {text:?}"
-                    );
-                    saw_scrollback = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    panic!("TUI output channel disconnected unexpectedly");
-                }
-            }
-        }
-
-        assert!(
-            saw_scrollback,
-            "expected prompt scrollback delivery for broker-backed session"
-        );
-        broker.join().expect("broker thread should finish");
-    }
-
-    /// Regression: broker snapshot must not replay twice across attach.
-    ///
-    /// Bytes returned by the broker `GetSnapshot` RPC should appear in the
-    /// scrollback only, not re-delivered as live output after subscribe.
-    #[test]
-    fn test_tui_forwarder_no_duplicate_output_during_snapshot_window() {
-        let (mut hub, _request_tx, mut output_rx) = e2e_hub();
-        let session_uuid = "sess-broker-no-dup";
-        let injected = "during-window-output";
-        let shadow_seed = format!("pre-subscribe:{injected}\r\n$ ");
-        let (session, mut broker_peer) =
-            test_broker_backed_session_handle_with_seed(session_uuid, shadow_seed.as_bytes());
-        hub.handle_cache.add_session(session);
-
-        let shadow_seed_clone = shadow_seed.clone();
-        let broker = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-
-            broker_peer
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .expect("set fake broker read timeout");
-            let mut decoder = BrokerFrameDecoder::new();
-            let mut buf = [0u8; 512];
-            let deadline = Instant::now() + Duration::from_millis(1200);
-
-            while Instant::now() < deadline {
-                match broker_peer.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let frames = decoder.feed(&buf[..n]).expect("decode broker frame");
-                        for frame in frames {
-                            if let BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) =
-                                frame
-                            {
-                                let response = encode_data(
-                                    frame_type::SNAPSHOT,
-                                    session_id,
-                                    shadow_seed_clone.as_bytes(),
-                                );
-                                broker_peer
-                                    .write_all(&response)
-                                    .expect("write broker snapshot");
-                                return;
-                            }
-                        }
-                    }
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        continue;
-                    }
-                    Err(err) => panic!("fake broker read failed: {err}"),
-                }
-            }
-
-            panic!("broker thread did not receive GetSnapshot request");
-        });
-
-        let req = crate::lua::primitives::CreateTuiForwarderRequest {
-            session_uuid: session_uuid.to_string(),
-            subscription_id: format!("tui:{session_uuid}"),
-            active_flag: Arc::new(Mutex::new(true)),
-            rows: 24,
-            cols: 80,
-        };
-
-        hub.create_lua_tui_pty_forwarder(req);
-
-        let deadline = Instant::now() + Duration::from_millis(800);
-        let mut saw_scrollback = false;
-        let mut scrollback_contains_injected = false;
-        let mut saw_duplicate_live_output = false;
-        while Instant::now() < deadline {
-            match output_rx.try_recv() {
-                Ok(TuiOutput::Scrollback {
-                    session_uuid: got,
-                    data,
-                    ..
-                }) if got == session_uuid => {
-                    saw_scrollback = true;
-                    let text = String::from_utf8_lossy(&data);
-                    if text.contains(injected) {
-                        scrollback_contains_injected = true;
-                    }
-                }
-                Ok(TuiOutput::Output {
-                    session_uuid: got,
-                    data,
-                }) if got == session_uuid => {
-                    let text = String::from_utf8_lossy(&data);
-                    if text.contains(injected) {
-                        saw_duplicate_live_output = true;
-                    }
-                }
-                Ok(TuiOutput::OutputBatch {
-                    session_uuid: got,
-                    chunks,
-                }) if got == session_uuid => {
-                    for chunk in chunks {
-                        let text = String::from_utf8_lossy(&chunk);
-                        if text.contains(injected) {
-                            saw_duplicate_live_output = true;
-                            break;
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    panic!("TUI output channel disconnected unexpectedly");
-                }
-            }
-        }
-
-        assert!(saw_scrollback, "expected a scrollback frame");
-        assert!(
-            scrollback_contains_injected,
-            "snapshot should include output emitted during settle window"
-        );
-        assert!(
-            !saw_duplicate_live_output,
-            "output emitted during snapshot window must not replay as live output"
-        );
-        broker.join().expect("broker thread should finish");
-    }
-
-    /// Regression: same-dimension reconnect still needs a redraw pulse.
-    ///
-    /// Broker-backed forwarders should issue a bounce resize before the
-    /// broker `GetSnapshot` RPC when requested dims match current dims.
-    #[test]
-    fn test_tui_forwarder_same_dims_issues_resize_pulse_before_snapshot() {
-        let (mut hub, _request_tx, mut output_rx) = e2e_hub();
-        let session_uuid = "sess-broker-same-dims";
-        let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
-        hub.handle_cache.add_session(session);
-
-        let broker = std::thread::spawn(move || -> (bool, bool) {
-            use std::io::{Read, Write};
-
-            broker_peer
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .expect("set fake broker read timeout");
-            let mut decoder = BrokerFrameDecoder::new();
-            let mut buf = [0u8; 512];
-            let deadline = Instant::now() + Duration::from_millis(1200);
-            let mut saw_bounce_resize = false;
-            let mut saw_target_resize = false;
-
-            while Instant::now() < deadline {
-                match broker_peer.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let frames = decoder.feed(&buf[..n]).expect("decode broker frame");
-                        for frame in frames {
-                            match frame {
-                                BrokerFrame::HubControl(HubMessage::ResizePty {
-                                    session_id,
-                                    rows,
-                                    cols,
-                                }) => {
-                                    assert_eq!(session_id, 1);
-                                    if (rows, cols) == (24, 79) {
-                                        saw_bounce_resize = true;
-                                    }
-                                    if (rows, cols) == (24, 80) {
-                                        saw_target_resize = true;
-                                    }
-                                }
-                                BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id }) => {
-                                    let response = encode_data(
-                                        frame_type::SNAPSHOT,
-                                        session_id,
-                                        b"cached-broker-output\n",
-                                    );
-                                    broker_peer
-                                        .write_all(&response)
-                                        .expect("write broker snapshot");
-                                    return (saw_bounce_resize, saw_target_resize);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        continue;
-                    }
-                    Err(err) => panic!("fake broker read failed: {err}"),
-                }
-            }
-
-            panic!("broker thread did not receive GetSnapshot request");
-        });
-
-        let req = crate::lua::primitives::CreateTuiForwarderRequest {
-            session_uuid: session_uuid.to_string(),
-            subscription_id: format!("tui:{session_uuid}"),
-            active_flag: Arc::new(Mutex::new(true)),
-            rows: 24,
-            cols: 80,
-        };
-        hub.create_lua_tui_pty_forwarder(req);
-
-        let deadline = Instant::now() + Duration::from_millis(800);
-        let mut saw_scrollback = false;
-        while Instant::now() < deadline {
-            match output_rx.try_recv() {
-                Ok(TuiOutput::Scrollback {
-                    session_uuid: got, ..
-                }) if got == session_uuid => {
-                    saw_scrollback = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    panic!("TUI output channel disconnected unexpectedly");
-                }
-            }
-        }
-
-        assert!(saw_scrollback, "expected a scrollback frame");
-        let (saw_bounce, saw_target) = broker.join().expect("broker thread should finish");
-        assert!(
-            saw_bounce,
-            "expected same-dims attach to issue bounce resize before snapshot"
-        );
-        assert!(
-            saw_target,
-            "expected same-dims attach to issue target resize before snapshot"
-        );
-    }
+    // Broker-backed TUI forwarder tests removed — broker module deleted.
+    // Session-backed forwarders use local shadow screen snapshots.
+    // Removed: test_tui_forwarder_broker_backed_snapshot_is_prompt
+    // Removed: test_tui_forwarder_no_duplicate_output_during_snapshot_window
+    // Removed: test_tui_forwarder_same_dims_issues_resize_pulse_before_snapshot
 }
+
+// Broker-backed test module removed — all tests in this section tested broker-specific
+// code paths (BrokerPtyOutput, BrokerConnection, broker GetSnapshot RPC) that no longer exist.
+// The broker module has been replaced by per-session processes (cli/src/session/).
+//
+// Removed tests:
+// - test_tui_forwarder_broker_backed_snapshot_is_prompt
+// - test_tui_forwarder_no_duplicate_output_during_snapshot_window
+// - test_tui_forwarder_same_dims_issues_resize_pulse_before_snapshot
+// - test_headless_broker_probe_replays_cached_osc_color_reply
+// - test_tui_client_forwards_probe_instead_of_cache_reply
+// - test_browser_client_suppresses_cached_probe_reply
+// - test_backpressure_recovery_fetches_broker_snapshot

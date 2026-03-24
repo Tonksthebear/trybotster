@@ -93,9 +93,6 @@ pub struct HubManifest {
     pub server_id: Option<String>,
     /// Absolute socket path for the hub.
     pub socket_path: String,
-    /// Absolute socket path for the PTY broker process.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub broker_socket_path: Option<String>,
     /// PID of the hub process that wrote this manifest.
     pub pid: u32,
     /// Last write timestamp (unix seconds).
@@ -160,7 +157,6 @@ pub fn write_pid_file(hub_id: &str) -> Result<()> {
 /// Write or update the hub runtime manifest.
 pub fn write_manifest(hub_id: &str, server_id: Option<&str>) -> Result<()> {
     let socket = socket_path(hub_id)?;
-    let broker_socket = crate::broker::broker_socket_path(hub_id)?;
     let path = manifest_path(hub_id)?;
     let manifest = HubManifest {
         hub_id: hub_id.to_string(),
@@ -168,7 +164,6 @@ pub fn write_manifest(hub_id: &str, server_id: Option<&str>) -> Result<()> {
             .filter(|s| !s.is_empty())
             .map(std::string::ToString::to_string),
         socket_path: socket.to_string_lossy().into_owned(),
-        broker_socket_path: Some(broker_socket.to_string_lossy().into_owned()),
         pid: std::process::id(),
         updated_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -551,7 +546,6 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned(),
-            broker_socket_path: None,
             pid: 999999,
             updated_at: 1,
         };

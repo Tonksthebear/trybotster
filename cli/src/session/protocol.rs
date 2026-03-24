@@ -351,7 +351,7 @@ mod tests {
 
         // Session reads hello, writes welcome
         let mut cursor = Cursor::new(&hub_to_session);
-        let mut session_out = Vec::new();
+        let mut session_out: Vec<u8> = Vec::new();
 
         // Manual session-side handshake (read from cursor, write to session_out)
         let mut magic = [0u8; 4];

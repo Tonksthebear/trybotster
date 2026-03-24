@@ -39,13 +39,11 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 
 use crate::agent::notification::AgentNotification;
 use crate::agent::pty::{do_resize, HubEventListener, PtyEvent, SharedPtyState};
-use crate::broker::SharedBrokerConnection;
 use crate::terminal::{generate_ansi_snapshot, AlacrittyParser};
 
 /// Session type distinguishing agents (AI-driven) from accessories (plain PTY).
@@ -233,20 +231,9 @@ pub struct PtyHandle {
     /// `feed_broker_output()`.
     detect_notifs: bool,
 
-    /// Persistent cursor visibility state for transition-only event emission.
-    ///
-    /// [`crate::agent::spawn::process_pty_bytes`] only fires
-    /// [`PtyEvent::CursorVisibilityChanged`] when the state changes. The
-    /// reader thread maintains this as a local variable; the broker path
-    /// stores it here so it persists across `feed_broker_output()` calls.
-    ///
-    /// `Arc<Mutex<_>>` because `PtyHandle` is `Clone` and all clones must
-    /// share the same state.
-    last_cursor_visible: Arc<Mutex<Option<bool>>>,
-
     /// Epoch milliseconds of the last PTY output chunk.
     ///
-    /// Updated by `feed_broker_output()` on each BrokerPtyOutput delivery.
+    /// Updated by the session reader thread on each output delivery.
     /// Read by Lua's `session:last_output_at()` for idle detection.
     last_output_at: Arc<AtomicU64>,
 
@@ -256,23 +243,10 @@ pub struct PtyHandle {
     /// for HTTP preview. `None` for agent sessions or if no port assigned.
     port: Option<u16>,
 
-    /// Broker relay metadata for routing control and snapshot calls.
-    ///
-    /// Runtime handles must always be broker-backed. `None` exists only for
-    /// test-only local PTY fixtures.
-    broker_relay: Option<BrokerRelay>,
-
     /// Per-session process connection for write/resize commands.
     ///
-    /// When set, this handle routes I/O through the session process socket
-    /// instead of the broker. Takes priority over `broker_relay`.
+    /// Routes I/O through the session process socket.
     session_connection: Option<crate::session::connection::SharedSessionConnection>,
-}
-
-#[derive(Clone)]
-struct BrokerRelay {
-    session_id: u32,
-    connection: SharedBrokerConnection,
 }
 
 impl std::fmt::Debug for PtyHandle {
@@ -285,22 +259,15 @@ impl std::fmt::Debug for PtyHandle {
 }
 
 impl PtyHandle {
-    /// Generate a snapshot from the local shadow screen only.
+    /// Generate a snapshot from the local shadow screen.
     ///
-    /// This never performs a broker round-trip and is safe to use in UI attach
-    /// flows where responsiveness is more important than re-fetching broker
-    /// ring-buffer state.
+    /// The shadow screen is fed by the session reader thread and is always
+    /// authoritative for snapshot generation.
     #[must_use]
     pub fn get_snapshot_cached(&self) -> Vec<u8> {
-        #[cfg(not(test))]
-        if self.broker_relay.is_none() {
-            log::error!("get_snapshot_cached invariant violated: missing broker relay");
-            return Vec::new();
-        }
-
         // `resize_pending` means the PTY was resized and we might not have a redraw yet.
         // Test-only local PTY fixtures preserve the old behavior (blank visible grid)
-        // after resize. Broker-backed sessions keep visible rows to preserve recovered
+        // after resize. Session-backed sessions keep visible rows to preserve recovered
         // scrollback on attach/reconnect.
         let has_local_master = self
             .shared_state
@@ -357,45 +324,6 @@ impl PtyHandle {
             detect_notifs,
             last_output_at: Arc::new(AtomicU64::new(0)),
             port,
-            last_cursor_visible: Arc::new(Mutex::new(Some(true))),
-            broker_relay: None,
-            session_connection: None,
-        }
-    }
-
-    /// Create a broker-backed PTY handle.
-    #[must_use]
-    pub fn new_with_broker_relay(
-        event_tx: broadcast::Sender<PtyEvent>,
-        shared_state: Arc<Mutex<SharedPtyState>>,
-        shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
-        kitty_enabled: Arc<AtomicBool>,
-        cursor_visible: Arc<AtomicBool>,
-        resize_pending: Arc<AtomicBool>,
-        detect_notifs: bool,
-        port: Option<u16>,
-        broker_relay: (u32, SharedBrokerConnection),
-        last_output_at: Arc<AtomicU64>,
-    ) -> Self {
-        let (session_id, connection) = broker_relay;
-        Self {
-            event_tx,
-            shared_state,
-            shadow_screen,
-            kitty_enabled,
-            cursor_visible,
-            resize_pending,
-            detect_notifs,
-            last_output_at,
-            // Start as Some(true): alacritty initializes with SHOW_CURSOR set, matching
-            // spawn_reader_thread initialization to avoid a spurious
-            // CursorVisibilityChanged(true) on the very first broker output delivery.
-            last_cursor_visible: Arc::new(Mutex::new(Some(true))),
-            port,
-            broker_relay: Some(BrokerRelay {
-                session_id,
-                connection,
-            }),
             session_connection: None,
         }
     }
@@ -432,9 +360,7 @@ impl PtyHandle {
             resize_pending,
             detect_notifs,
             last_output_at,
-            last_cursor_visible: Arc::new(Mutex::new(Some(true))),
             port,
-            broker_relay: None,
             session_connection: Some(session_connection),
         }
     }
@@ -464,14 +390,9 @@ impl PtyHandle {
 
     /// Subscribe and capture a snapshot for client attach.
     ///
-    /// Subscribes first, then fetches a snapshot from the broker via RPC.
-    /// This ordering guarantees no output gap: any bytes emitted during the
-    /// broker round-trip are captured by the subscription. Clients may see
-    /// brief overlap (bytes in both snapshot and first events), which terminal
-    /// emulators handle gracefully.
-    ///
-    /// Falls back to an empty snapshot if the broker RPC fails — the client
-    /// sees a blank screen that fills in from the live stream.
+    /// Subscribes first, then generates a snapshot from the local shadow screen.
+    /// This ordering guarantees no output gap: any bytes emitted during
+    /// snapshot generation are captured by the subscription.
     #[must_use]
     pub fn snapshot_and_subscribe_cached(
         &self,
@@ -481,30 +402,8 @@ impl PtyHandle {
 
         // Subscribe FIRST so no output is lost during snapshot generation.
         let rx = self.event_tx.subscribe();
-
-        // Session-process path: local shadow screen is authoritative.
-        if self.session_connection.is_some() {
-            let snapshot = self.get_snapshot_cached();
-            return (snapshot, kitty_enabled, rows, cols, rx);
-        }
-
-        // Broker-backed sessions fetch snapshot from the broker's parser.
-        if self.broker_relay.is_some() {
-            let snapshot = self.get_snapshot();
-            return (snapshot, kitty_enabled, rows, cols, rx);
-        }
-
-        #[cfg(test)]
-        {
-            let snapshot = self.get_snapshot_cached();
-            return (snapshot, kitty_enabled, rows, cols, rx);
-        }
-
-        #[cfg(not(test))]
-        {
-            log::error!("snapshot_and_subscribe invariant violated: missing broker relay");
-            return (Vec::new(), kitty_enabled, rows, cols, rx);
-        }
+        let snapshot = self.get_snapshot_cached();
+        (snapshot, kitty_enabled, rows, cols, rx)
     }
 
     /// Broadcast a `ProcessExited` event on this handle's channel.
@@ -563,48 +462,7 @@ impl PtyHandle {
     /// the snapshot clears the screen; the app redraws on SIGWINCH.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
-        // Session-process path: hub's shadow screen is the authority
-        if self.session_connection.is_some() {
-            return self.get_snapshot_cached();
-        }
-
-        // Broker path (legacy): fetch from broker's parser
-        if let Some(relay) = &self.broker_relay {
-            match relay.connection.lock() {
-                Ok(mut guard) => {
-                    if let Some(conn) = guard.as_mut() {
-                        match conn.get_snapshot(relay.session_id) {
-                            Ok(snapshot) => return snapshot,
-                            Err(e) => {
-                                log::error!("Broker-authoritative snapshot failed: {e}");
-                                return Vec::new();
-                            }
-                        }
-                    }
-                    log::error!(
-                        "Broker-authoritative snapshot failed: broker connection not available"
-                    );
-                    return Vec::new();
-                }
-                Err(_) => {
-                    log::error!(
-                        "Broker-authoritative snapshot failed: broker connection lock poisoned"
-                    );
-                    return Vec::new();
-                }
-            }
-        }
-
-        #[cfg(test)]
-        {
-            return self.get_snapshot_cached();
-        }
-
-        #[cfg(not(test))]
-        {
-            log::error!("get_snapshot invariant violated: missing broker relay");
-            Vec::new()
-        }
+        self.get_snapshot_cached()
     }
 
     // =========================================================================
@@ -613,8 +471,7 @@ impl PtyHandle {
 
     /// Write input directly to the PTY.
     ///
-    /// Broker-backed sessions always route writes through the broker control
-    /// connection.
+    /// Session-backed handles route writes through the session process socket.
     ///
     /// # Errors
     ///
@@ -658,21 +515,6 @@ impl PtyHandle {
             return Ok(());
         }
 
-        // Broker path (legacy)
-        if let Some(relay) = &self.broker_relay {
-            drop(state);
-            let mut guard = relay
-                .connection
-                .lock()
-                .map_err(|_| "broker connection lock poisoned".to_string())?;
-            let conn = guard
-                .as_mut()
-                .ok_or_else(|| "Broker connection not available".to_string())?;
-            conn.write_pty_input(relay.session_id, data)
-                .map_err(|e| format!("Failed to write PTY input via broker: {e}"))?;
-            return Ok(());
-        }
-
         #[cfg(test)]
         if let Some(writer) = &mut state.writer {
             writer
@@ -684,7 +526,7 @@ impl PtyHandle {
             return Ok(());
         }
 
-        Err("broker relay not available for session".to_string())
+        Err("session connection not available".to_string())
     }
 
     /// Read the last human input timestamp (milliseconds since epoch).
@@ -699,12 +541,6 @@ impl PtyHandle {
         state
             .last_human_input_ms
             .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Whether this handle is broker-backed.
-    #[must_use]
-    pub fn is_broker_backed(&self) -> bool {
-        self.broker_relay.is_some()
     }
 
     /// Current PTY dimensions `(rows, cols)`.
@@ -745,88 +581,24 @@ impl PtyHandle {
             return;
         }
 
-        // Broker path (legacy)
-        let Some(relay) = &self.broker_relay else {
-            #[cfg(test)]
-            {
-                do_resize(
-                    rows,
-                    cols,
-                    &self.shared_state,
-                    &self.shadow_screen,
-                    &self.event_tx,
-                    &self.resize_pending,
-                );
-                return;
-            }
-
-            #[cfg(not(test))]
-            {
-                log::warn!("resize_direct invariant violated: missing relay");
-                return;
-            }
-        };
-
-        let mut guard = match relay.connection.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                log::warn!("Failed to resize PTY via broker: broker connection lock poisoned");
-                return;
-            }
-        };
-        let Some(conn) = guard.as_mut() else {
-            log::warn!("Failed to resize PTY via broker: broker connection not available");
-            return;
-        };
-        if let Err(e) = conn.resize_pty(relay.session_id, rows, cols) {
-            log::warn!("Failed to resize PTY via broker: {e}");
+        // Test-only local PTY path
+        #[cfg(test)]
+        {
+            do_resize(
+                rows,
+                cols,
+                &self.shared_state,
+                &self.shadow_screen,
+                &self.event_tx,
+                &self.resize_pending,
+            );
             return;
         }
 
-        do_resize(
-            rows,
-            cols,
-            &self.shared_state,
-            &self.shadow_screen,
-            &self.event_tx,
-            &self.resize_pending,
-        );
-    }
-
-    // =========================================================================
-    // Broker relay injection
-    // =========================================================================
-
-    /// Inject PTY output received from the broker into this handle.
-    ///
-    /// Called by `Hub::handle_hub_event` when a `HubEvent::BrokerPtyOutput`
-    /// arrives for this session. Uses the broker's sideband flags for terminal
-    /// mode state (cursor visibility, kitty protocol) instead of a local
-    /// shadow screen.
-    pub fn feed_broker_output(&self, data: &[u8], flags: u8) {
-        // Track last output time for idle detection (epoch ms).
-        self.last_output_at.store(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            Ordering::Relaxed,
-        );
-
-        let mut lcv = self
-            .last_cursor_visible
-            .lock()
-            .expect("last_cursor_visible lock poisoned");
-        crate::agent::spawn::process_broker_bytes(
-            data,
-            flags,
-            &self.event_tx,
-            &self.kitty_enabled,
-            &self.cursor_visible,
-            &self.resize_pending,
-            self.detect_notifs,
-            &mut lcv,
-        );
+        #[cfg(not(test))]
+        {
+            log::warn!("resize_direct: no session connection available");
+        }
     }
 
     /// Epoch milliseconds of the last PTY output, or 0 if no output yet.
@@ -878,12 +650,6 @@ impl PtyHandle {
 mod tests {
     use super::*;
     use crate::agent::pty::PtySession;
-    use crate::broker::connection::BrokerConnection;
-    use crate::broker::protocol::{
-        encode_data, frame_type, BrokerFrame, BrokerFrameDecoder, HubMessage,
-    };
-    use std::io::{Error, ErrorKind, Result as IoResult};
-    use std::os::unix::net::UnixStream;
 
     /// Helper to create a PTY handle for testing (no port).
     fn create_test_pty() -> PtyHandle {
@@ -908,47 +674,6 @@ mod tests {
             true,
             port,
         )
-    }
-
-    fn create_broker_backed_test_pty() -> (PtyHandle, UnixStream) {
-        let pty_session = PtySession::new(24, 80);
-        let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
-            pty_session.get_direct_access();
-        std::mem::forget(pty_session);
-
-        let (client_stream, server_stream) = UnixStream::pair().expect("UnixStream::pair");
-        let conn = BrokerConnection::from_stream(client_stream);
-        let shared = Arc::new(Mutex::new(Some(conn)));
-
-        let handle = PtyHandle::new_with_broker_relay(
-            event_tx,
-            shared_state,
-            shadow_screen,
-            kitty_enabled,
-            cursor_visible,
-            resize_pending,
-            true,
-            None,
-            (42, shared),
-            Arc::new(AtomicU64::new(0)),
-        );
-
-        (handle, server_stream)
-    }
-
-    struct FailingWriter;
-
-    impl Write for FailingWriter {
-        fn write(&mut self, _buf: &[u8]) -> IoResult<usize> {
-            Err(Error::new(
-                ErrorKind::Other,
-                "local writer should not be used for broker-backed session",
-            ))
-        }
-
-        fn flush(&mut self) -> IoResult<()> {
-            Ok(())
-        }
     }
 
     #[test]
@@ -1008,179 +733,6 @@ mod tests {
     #[test]
     fn test_session_type_default() {
         assert_eq!(SessionType::default(), SessionType::Agent);
-    }
-
-    #[test]
-    fn test_write_input_direct_routes_via_broker_for_broker_backed_sessions() {
-        let (pty, mut server_stream) = create_broker_backed_test_pty();
-
-        pty.write_input_direct(b"hello")
-            .expect("broker write should succeed");
-
-        let mut buf = [0u8; 128];
-        let n = std::io::Read::read(&mut server_stream, &mut buf).expect("read broker frame");
-        let frames = BrokerFrameDecoder::new()
-            .feed(&buf[..n])
-            .expect("decode broker frame");
-        assert_eq!(frames.len(), 1);
-        match &frames[0] {
-            BrokerFrame::PtyInput(session_id, data) => {
-                assert_eq!(*session_id, 42);
-                assert_eq!(data, b"hello");
-            }
-            other => panic!("expected PtyInput frame, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_write_input_direct_prefers_broker_even_when_local_writer_exists() {
-        let (pty, mut server_stream) = create_broker_backed_test_pty();
-        {
-            let mut state = pty.shared_state.lock().expect("shared_state lock poisoned");
-            state.writer = Some(Box::new(FailingWriter));
-        }
-
-        pty.write_input_direct(b"broker-only")
-            .expect("broker write should succeed without touching local writer");
-
-        let mut buf = [0u8; 128];
-        let n = std::io::Read::read(&mut server_stream, &mut buf).expect("read broker frame");
-        let frames = BrokerFrameDecoder::new()
-            .feed(&buf[..n])
-            .expect("decode broker frame");
-        assert_eq!(frames.len(), 1);
-        match &frames[0] {
-            BrokerFrame::PtyInput(session_id, data) => {
-                assert_eq!(*session_id, 42);
-                assert_eq!(data, b"broker-only");
-            }
-            other => panic!("expected PtyInput frame, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_resize_direct_routes_via_broker_for_broker_backed_sessions() {
-        let (pty, mut server_stream) = create_broker_backed_test_pty();
-
-        pty.resize_direct(40, 120);
-
-        let mut buf = [0u8; 128];
-        let n = std::io::Read::read(&mut server_stream, &mut buf).expect("read broker frame");
-        let frames = BrokerFrameDecoder::new()
-            .feed(&buf[..n])
-            .expect("decode broker frame");
-        assert_eq!(frames.len(), 1);
-        match &frames[0] {
-            BrokerFrame::HubControl(HubMessage::ResizePty {
-                session_id,
-                rows,
-                cols,
-            }) => {
-                assert_eq!(*session_id, 42);
-                assert_eq!((*rows, *cols), (40, 120));
-            }
-            other => panic!("expected ResizePty frame, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_get_snapshot_prefers_broker_scrollback_for_broker_backed_sessions() {
-        let (pty, mut server_stream) = create_broker_backed_test_pty();
-
-        let broker = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-
-            let mut buf = [0u8; 128];
-            let n = server_stream.read(&mut buf).expect("read broker frame");
-            let frames = BrokerFrameDecoder::new()
-                .feed(&buf[..n])
-                .expect("decode broker frame");
-            assert_eq!(frames.len(), 1);
-            assert!(matches!(
-                &frames[0],
-                BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id: 42 })
-            ));
-
-            let response = encode_data(frame_type::SNAPSHOT, 42, b"full scrollback");
-            server_stream
-                .write_all(&response)
-                .expect("write broker snapshot");
-        });
-
-        let snapshot = pty.get_snapshot();
-        assert_eq!(snapshot, b"full scrollback");
-
-        broker.join().expect("broker thread should finish");
-    }
-
-    #[test]
-    fn test_feed_broker_output_does_not_populate_local_shadow_screen() {
-        let (pty, _server_stream) = create_broker_backed_test_pty();
-        pty.feed_broker_output(b"broker-bytes\n", 0);
-
-        // feed_broker_output uses process_broker_bytes which skips the shadow
-        // screen — the local cached snapshot should NOT contain the broker data.
-        // Production code uses get_snapshot() which routes through broker RPC.
-        let snapshot = pty.get_snapshot_cached();
-        assert!(
-            !String::from_utf8_lossy(&snapshot).contains("broker-bytes"),
-            "broker output should not populate local shadow screen"
-        );
-    }
-
-    #[test]
-    fn test_feed_broker_output_broadcasts_raw_bytes() {
-        let (pty, _server_stream) = create_broker_backed_test_pty();
-        let mut sub = pty.subscribe();
-
-        pty.feed_broker_output(b"event-test\n", 0);
-
-        // Even without shadow screen, raw bytes are broadcast to subscribers.
-        // Drain events until we find Output.
-        loop {
-            match sub.try_recv() {
-                Ok(PtyEvent::Output(data)) => {
-                    assert_eq!(data, b"event-test\n");
-                    break;
-                }
-                Ok(_) => continue, // skip CWD/notification events
-                Err(_) => panic!("expected PtyEvent::Output"),
-            }
-        }
-    }
-
-    #[test]
-    fn test_snapshot_and_subscribe_fetches_from_broker_for_broker_backed_sessions() {
-        let (pty, mut server_stream) = create_broker_backed_test_pty();
-
-        let broker = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-
-            let mut buf = [0u8; 128];
-            let n = server_stream.read(&mut buf).expect("read broker frame");
-            let frames = BrokerFrameDecoder::new()
-                .feed(&buf[..n])
-                .expect("decode broker frame");
-            assert_eq!(frames.len(), 1);
-            assert!(matches!(
-                &frames[0],
-                BrokerFrame::HubControl(HubMessage::GetSnapshot { session_id: 42 })
-            ));
-
-            let response = encode_data(frame_type::SNAPSHOT, 42, b"broker-snapshot-data");
-            server_stream
-                .write_all(&response)
-                .expect("write broker snapshot");
-        });
-
-        let (snapshot, _kitty, rows, cols, _rx) = pty.snapshot_and_subscribe_cached();
-        assert_eq!(
-            snapshot, b"broker-snapshot-data",
-            "attach snapshot should come from broker RPC"
-        );
-        assert_eq!((rows, cols), (24, 80), "dims should come from shared_state");
-
-        broker.join().expect("broker thread should finish");
     }
 
     #[test]
