@@ -558,7 +558,25 @@ where
                         self.handle_pty_input(raw_bytes);
                     }
                 }
-                InputEvent::Key { .. } => {
+                InputEvent::Key { ref raw_bytes, .. } => {
+                    // Intercept OSC color responses from the outer terminal.
+                    // These arrive when the hub forwarded a probe via TerminalQuery.
+                    // Route them back to the hub — NOT to the focused PTY.
+                    if Self::is_osc_color_response(raw_bytes) {
+                        log::debug!(
+                            "[PTY-PROBE] Intercepted terminal color response ({} bytes)",
+                            raw_bytes.len()
+                        );
+                        if let Err(e) =
+                            self.request_tx.send(TuiRequest::TerminalProbeResponse {
+                                data: raw_bytes.clone(),
+                            })
+                        {
+                            log::error!("[PTY-PROBE] Failed to send probe response: {e}");
+                        }
+                        continue;
+                    }
+
                     self.dirty = true;
                     // Flush accumulated scroll before processing the key event,
                     // so key handlers see the correct scroll position.
@@ -873,6 +891,30 @@ where
         false
     }
 
+    /// Detect OSC color response sequences (OSC 10/11/12 with rgb: or # values).
+    ///
+    /// These arrive on stdin when the outer terminal responds to a color probe
+    /// forwarded via `TerminalQuery`. They must be routed back to the hub
+    /// (not to the focused PTY) since the hub sent the probe.
+    fn is_osc_color_response(data: &[u8]) -> bool {
+        // Must start with ESC ] and be at least ESC ] <code> ; <value> BEL
+        if data.len() < 7 || data[0] != 0x1b || data[1] != b']' {
+            return false;
+        }
+        // Check for OSC 10, 11, or 12 followed by semicolon
+        let after_osc = &data[2..];
+        let is_color_code = after_osc.starts_with(b"10;")
+            || after_osc.starts_with(b"11;")
+            || after_osc.starts_with(b"12;");
+        if !is_color_code {
+            return false;
+        }
+        // The value after the semicolon must be a color (rgb: or #), not a query (?)
+        // All color codes (10, 11, 12) are 2 digits + semicolon = 3 bytes
+        let value = &after_osc[3..];
+        value.starts_with(b"rgb:") || value.starts_with(b"#")
+    }
+
     /// Send raw PTY input bytes directly to the PTY writer.
     ///
     /// Bypasses Lua entirely — no JSON serialization, no `from_utf8_lossy`.
@@ -1017,6 +1059,16 @@ where
                 }
                 Ok(TuiOutput::Binary(data)) => {
                     log::debug!("[TUI] Received binary data ({} bytes)", data.len());
+                }
+                Ok(TuiOutput::TerminalQuery { data }) => {
+                    // Write raw bytes directly to stdout so the outer terminal
+                    // sees the OSC probe and auto-responds with color values.
+                    let _ = std::io::Write::write_all(&mut std::io::stdout(), &data);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    log::debug!(
+                        "[PTY-PROBE] Wrote {} bytes of terminal query to stdout",
+                        data.len()
+                    );
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {

@@ -736,6 +736,7 @@ impl Hub {
             terminal_profiles: {
                 let mut store = terminal_profile::TerminalProfileStore::default();
                 store.load_hub_profile();
+                store.probe_spawning_terminal();
                 store
             },
             webrtc_outgoing_signal_tx,

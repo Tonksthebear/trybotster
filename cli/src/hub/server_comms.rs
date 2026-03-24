@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use crate::channel::Channel;
 use crate::hub::actions::{self, HubAction};
 use crate::hub::{
-    registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest, WebRtcPtyOutput,
+    registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest,
+    PtyObserverNotification, WebRtcPtyOutput,
 };
 use crate::notifications::push::send_push_direct;
 use base64::Engine;
@@ -96,6 +97,26 @@ impl Hub {
         self.session_live_terminal_client_count(session_uuid) <= 1
     }
 
+    /// Whether all live clients for a session are TUI-only (no browser/socket).
+    ///
+    /// TUI clients render via ratatui cell-by-cell — OSC queries in PTY output
+    /// are consumed by the panel's alacritty parser and never reach stdout.
+    /// The hub must explicitly forward queries to the TUI as `TerminalQuery`
+    /// for passthrough to the outer terminal.
+    fn session_has_only_tui_clients(&self, session_uuid: &str) -> bool {
+        let tui_key = format!("tui:{session_uuid}");
+        self.pty_forwarders
+            .keys()
+            .filter(|key| {
+                key.strip_prefix("tui:") == Some(session_uuid)
+                    || key
+                        .rsplit_once(':')
+                        .map(|(_, candidate)| candidate == session_uuid)
+                        .unwrap_or(false)
+            })
+            .all(|key| key == &tui_key)
+    }
+
     fn learn_terminal_probe_replies(&mut self, session_uuid: &str, peer_id: &str, data: &[u8]) {
         if !self.should_learn_terminal_probe_replies(session_uuid) {
             return;
@@ -113,11 +134,24 @@ impl Hub {
         let live_clients = self.session_live_terminal_client_count(session_uuid);
         let probes = self
             .terminal_profiles
-            .observe_output(session_uuid, data, live_clients == 1);
-        if probes.is_empty() || live_clients > 0 {
+            .observe_output(session_uuid, data, live_clients <= 1);
+        if probes.is_empty() {
             return;
         }
 
+        if live_clients > 0 {
+            // Client attached — passthrough the query to the client's terminal.
+            // For TUI: write the query directly to stdout via TerminalQuery.
+            // For browser/socket: the query already flows through the forwarder.
+            // The client's terminal responds, and the response is routed back
+            // to this PTY via TerminalProbeResponse / observe_input.
+            if self.session_has_only_tui_clients(session_uuid) {
+                self.forward_probe_to_tui(data);
+            }
+            return;
+        }
+
+        // Headless — answer from cache immediately.
         for probe in probes {
             let Some(reply) = self
                 .terminal_profiles
@@ -140,6 +174,32 @@ impl Hub {
                     probe,
                     session_uuid
                 );
+            }
+        }
+    }
+
+    /// Forward OSC probe bytes to the TUI for passthrough to the outer terminal.
+    fn forward_probe_to_tui(&self, data: &[u8]) {
+        // Extract just the OSC query sequences from the data
+        let mut buffer = data.to_vec();
+        let sequences =
+            super::terminal_profile::extract_osc_queries_from_output(&mut buffer);
+        if sequences.is_empty() {
+            return;
+        }
+
+        if let Some(ref tx) = self.tui_output_tx {
+            let query_bytes: Vec<u8> = sequences.into_iter().flatten().collect();
+            if tx
+                .send(crate::client::TuiOutput::TerminalQuery {
+                    data: query_bytes,
+                })
+                .is_ok()
+            {
+                if let Some(fd) = self.tui_wake_fd {
+                    super::wake_tui_pipe(fd);
+                }
+                log::debug!("[PTY-PROBE] Forwarded OSC query to TUI for passthrough");
             }
         }
     }
@@ -1004,6 +1064,24 @@ impl Hub {
                             &data,
                         );
                         session_handle.pty().feed_broker_output(&data, flags);
+
+                        // Queue pty_output observer notification so Lua hooks
+                        // (idle detection, etc.) fire regardless of which
+                        // client is connected.
+                        if self.lua.has_observers("pty_output") {
+                            if self.pty_observer_queue.len()
+                                >= super::PTY_OBSERVER_QUEUE_CAPACITY
+                            {
+                                self.pty_observer_queue.pop_front();
+                            }
+                            self.pty_observer_queue.push_back(PtyObserverNotification {
+                                ctx: crate::lua::primitives::PtyOutputContext {
+                                    session_uuid: session_uuid.clone(),
+                                    peer_id: String::new(),
+                                },
+                                data: data.clone(),
+                            });
+                        }
                     } else {
                         log::debug!(
                             "[Broker] BrokerPtyOutput session={}: session '{}' not in cache",
@@ -1245,6 +1323,33 @@ impl Hub {
                         "[PTY-INPUT] No session for UUID {} (cache has {} agents)",
                         session_uuid,
                         self.handle_cache.len()
+                    );
+                }
+            }
+            TuiRequest::TerminalProbeResponse { data } => {
+                // Route the terminal's response back to the PTY(s) that asked.
+                // Also updates the hub-level profile cache for future headless use.
+                let routes = self.terminal_profiles.route_probe_response(&data);
+                for (session_uuid, reply) in &routes {
+                    if let Some(session_handle) = self.handle_cache.get_session(session_uuid) {
+                        if let Err(e) = session_handle.pty().write_input_direct(reply) {
+                            log::debug!(
+                                "[PTY-PROBE] Failed to route response to {}: {}",
+                                session_uuid,
+                                e
+                            );
+                        } else {
+                            log::debug!(
+                                "[PTY-PROBE] Routed terminal response to session {}",
+                                session_uuid
+                            );
+                        }
+                    }
+                }
+                if routes.is_empty() {
+                    log::debug!(
+                        "[PTY-PROBE] Terminal probe response updated hub cache ({} bytes)",
+                        data.len()
                     );
                 }
             }
@@ -3295,10 +3400,12 @@ impl Hub {
 
             // Inject hub theme probes right after snapshot so the real
             // terminal sees them and auto-responds with color values.
+            // Uses TerminalQuery to write directly to stdout — Output
+            // would feed into the panel's alacritty parser which silently
+            // consumes OSC queries without responding.
             if let Some(probe_data) = hub_probe_bytes {
                 if sink
-                    .send(TuiOutput::Output {
-                        session_uuid: session_uuid.clone(),
+                    .send(TuiOutput::TerminalQuery {
                         data: probe_data,
                     })
                     .is_err()
@@ -4316,6 +4423,9 @@ impl Hub {
                     } else {
                         log::warn!("[PTY-INPUT] No session for UUID {}", session_uuid);
                     }
+                }
+                TuiRequest::TerminalProbeResponse { .. } => {
+                    // Test-only poll path — probe responses handled by handle_tui_request
                 }
             }
         }
@@ -5656,15 +5766,20 @@ mod tests {
         }
     }
 
+    /// When a TUI client is attached, OSC queries from PTY output are forwarded
+    /// to the TUI for passthrough to the outer terminal — NOT answered from cache.
+    /// The TUI's terminal responds, and the response is routed back to the PTY
+    /// via TerminalProbeResponse.
     #[test]
-    fn test_live_terminal_client_suppresses_cached_probe_reply() {
+    fn test_tui_client_forwards_probe_instead_of_cache_reply() {
         use std::io::Read;
 
-        let (mut hub, _request_tx, _output_rx) = e2e_hub();
-        let session_uuid = "sess-live-probe";
+        let (mut hub, _request_tx, output_rx) = e2e_hub();
+        let session_uuid = "sess-tui-probe";
         let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
         hub.handle_cache.add_session(session);
         hub.broker_sessions.insert(1, session_uuid.to_string());
+        // Pre-populate cache (should NOT be used when TUI is attached)
         hub.terminal_profiles
             .observe_output(session_uuid, b"\x1b]11;?\x07", true);
         hub.learn_terminal_probe_replies(
@@ -5672,6 +5787,10 @@ mod tests {
             "browser-a",
             b"\x1b]11;rgb:aaaa/bbbb/cccc\x07",
         );
+
+        // Register TUI output channel so forward_probe_to_tui can send
+        let (tui_tx, mut tui_rx) = tokio::sync::mpsc::unbounded_channel();
+        hub.tui_output_tx = Some(tui_tx);
 
         let _guard = hub.tokio_runtime.enter();
         hub.pty_forwarders
@@ -5687,10 +5806,69 @@ mod tests {
             data: b"\x1b]11;?\x07".to_vec(),
         });
 
+        // Should NOT write cached reply to the PTY (passthrough instead)
         let mut buf = [0u8; 256];
         let err = broker_peer
             .read(&mut buf)
-            .expect_err("live client should suppress cached reply injection");
+            .expect_err("TUI client should passthrough, not answer from cache");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "expected timeout/empty read, got {err:?}"
+        );
+
+        // Should have forwarded the query to TUI output channel
+        match tui_rx.try_recv() {
+            Ok(crate::client::TuiOutput::TerminalQuery { data }) => {
+                assert!(
+                    data.windows(7).any(|w| w == b"\x1b]11;?\x07"),
+                    "forwarded query should contain OSC 11 probe"
+                );
+            }
+            other => panic!("expected TerminalQuery on TUI channel, got {other:?}"),
+        }
+    }
+
+    /// Browser/WebRTC clients can respond to OSC queries via their terminal
+    /// emulator, so the hub should let them answer rather than injecting cached replies.
+    #[test]
+    fn test_browser_client_suppresses_cached_probe_reply() {
+        use std::io::Read;
+
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-browser-probe";
+        let (session, mut broker_peer) = test_broker_backed_session_handle(session_uuid);
+        hub.handle_cache.add_session(session);
+        hub.broker_sessions.insert(1, session_uuid.to_string());
+        hub.terminal_profiles
+            .observe_output(session_uuid, b"\x1b]11;?\x07", true);
+        hub.learn_terminal_probe_replies(
+            session_uuid,
+            "browser-a",
+            b"\x1b]11;rgb:aaaa/bbbb/cccc\x07",
+        );
+
+        // Simulate a browser client (forwarder key is "browser-identity:session_uuid")
+        let _guard = hub.tokio_runtime.enter();
+        hub.pty_forwarders
+            .insert(format!("browser-a:{session_uuid}"), tokio::spawn(async {}));
+
+        broker_peer
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read timeout");
+
+        hub.handle_hub_event(crate::hub::events::HubEvent::BrokerPtyOutput {
+            session_id: 1,
+            flags: 0,
+            data: b"\x1b]11;?\x07".to_vec(),
+        });
+
+        let mut buf = [0u8; 256];
+        let err = broker_peer
+            .read(&mut buf)
+            .expect_err("browser client should suppress cached reply injection");
         assert!(
             matches!(
                 err.kind(),

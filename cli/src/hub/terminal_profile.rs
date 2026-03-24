@@ -194,6 +194,53 @@ impl TerminalProfileStore {
         probes
     }
 
+    /// Process a terminal probe response from a client (e.g., TUI forwarding
+    /// the outer terminal's reply). Matches replies against all sessions with
+    /// pending probes and returns `(session_uuid, reply_bytes)` pairs for
+    /// routing back to the PTYs that asked. Also updates the hub-level profile.
+    pub(crate) fn route_probe_response(&mut self, data: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let mut buffer = data.to_vec();
+        let sequences = extract_complete_osc_sequences(&mut buffer);
+        let mut routed = Vec::new();
+        let mut learned_any = false;
+
+        for seq in sequences {
+            let Some((probe, reply)) = classify_osc_reply(&seq) else {
+                continue;
+            };
+
+            // Update hub profile for future headless fallback
+            self.hub_profile.store_reply(probe, reply.clone());
+            learned_any = true;
+
+            // Find sessions waiting for this probe type and route the reply
+            let mut matched_sessions = Vec::new();
+            for (session_uuid, pending) in &mut self.pending_by_session {
+                if pending.remove(&probe) {
+                    matched_sessions.push(session_uuid.clone());
+                }
+            }
+
+            for session_uuid in matched_sessions {
+                // Also cache per-session
+                self.profiles_by_session
+                    .entry(session_uuid.clone())
+                    .or_default()
+                    .store_reply(probe, reply.clone());
+                routed.push((session_uuid, reply.clone()));
+            }
+
+            // Clean up empty pending sets
+            self.pending_by_session.retain(|_, pending| !pending.is_empty());
+        }
+
+        if learned_any {
+            self.save_hub_profile();
+        }
+
+        routed
+    }
+
     pub(crate) fn headless_reply(&self, session_uuid: &str, probe: TerminalProbe) -> Option<&[u8]> {
         self.profiles_by_session
             .get(session_uuid)
@@ -240,6 +287,113 @@ impl TerminalProfileStore {
         }
 
         Some(bytes)
+    }
+
+    /// Probe the spawning terminal directly for color information.
+    ///
+    /// Called at hub startup before the TUI takes over stdin/stdout.
+    /// Writes OSC 10/11/12 queries to stdout, reads responses from stdin
+    /// with a short timeout. Updates the hub profile and persists to disk.
+    ///
+    /// Skipped in test mode and when stdin is not a TTY.
+    pub(crate) fn probe_spawning_terminal(&mut self) {
+        use std::io::{Read, Write};
+
+        if crate::env::is_test_mode() {
+            return;
+        }
+
+        // Only probe if stdin is a TTY (not piped/redirected)
+        if !atty::is(atty::Stream::Stdin) {
+            log::debug!("[PTY-PROBE] Skipping boot probe: stdin is not a TTY");
+            return;
+        }
+
+        // Send OSC 10/11/12 queries
+        let probes = b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07";
+        if std::io::stdout().write_all(probes).is_err() {
+            return;
+        }
+        let _ = std::io::stdout().flush();
+
+        // Put stdin into raw mode briefly to read the response
+        let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+        if !was_raw {
+            let _ = crossterm::terminal::enable_raw_mode();
+        }
+
+        // Read with a short timeout — terminal responds within milliseconds
+        let mut response = Vec::new();
+        let mut buf = [0u8; 256];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+
+        // Use non-blocking reads with polling
+        while std::time::Instant::now() < deadline {
+            // Poll stdin for readability
+            let mut pollfd = libc::pollfd {
+                fd: 0, // stdin
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let remaining = deadline.duration_since(std::time::Instant::now());
+            let timeout_ms = remaining.as_millis().min(50) as libc::c_int;
+
+            let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            if ready <= 0 {
+                if !response.is_empty() {
+                    break; // Got some data, no more coming
+                }
+                continue;
+            }
+
+            let n = unsafe {
+                libc::read(
+                    0,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            response.extend_from_slice(&buf[..n as usize]);
+
+            // Check if we have all 3 responses
+            let osc_count = response.iter().filter(|&&b| b == 0x07).count()
+                + response.windows(2).filter(|w| w == &[0x1b, b'\\']).count();
+            if osc_count >= 3 {
+                break;
+            }
+        }
+
+        if !was_raw {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+
+        if response.is_empty() {
+            log::debug!("[PTY-PROBE] No response from spawning terminal");
+            return;
+        }
+
+        // Parse responses
+        let mut buffer = response;
+        let sequences = extract_complete_osc_sequences(&mut buffer);
+        let mut learned = 0;
+        for seq in sequences {
+            if let Some((probe, reply)) = classify_osc_reply(&seq) {
+                self.hub_profile.store_reply(probe, reply);
+                learned += 1;
+            }
+        }
+
+        if learned > 0 {
+            self.save_hub_profile();
+            log::info!(
+                "[PTY-PROBE] Probed spawning terminal: learned {} color values (complete={})",
+                learned,
+                self.hub_profile.is_complete()
+            );
+        }
     }
 
     /// Load a previously persisted hub profile from disk.
@@ -392,6 +546,18 @@ fn osc_payload(seq: &[u8]) -> Option<&[u8]> {
     }
 
     None
+}
+
+/// Extract complete OSC query sequences from a data buffer.
+///
+/// Used by `forward_probe_to_tui` to extract just the query bytes
+/// (e.g., `ESC]10;?BEL`) from PTY output that may contain mixed content.
+pub(crate) fn extract_osc_queries_from_output(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let sequences = extract_complete_osc_sequences(buffer);
+    sequences
+        .into_iter()
+        .filter(|seq| classify_osc_query(seq).is_some())
+        .collect()
 }
 
 fn classify_osc_query(seq: &[u8]) -> Option<TerminalProbe> {
