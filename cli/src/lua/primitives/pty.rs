@@ -68,7 +68,6 @@ use std::sync::{
 
 use crate::agent::pty::{HubEventListener, PtySession, SharedPtyState};
 use crate::agent::spawn::PtySpawnConfig;
-use crate::broker::SharedBrokerConnection;
 use crate::hub::events::HubEvent;
 use crate::terminal::AlacrittyParser;
 use tokio::sync::broadcast;
@@ -136,14 +135,6 @@ pub struct PtySessionHandle {
     /// same value.  Updated by `PtyHandle::feed_broker_output()`.
     last_output_at: Arc<AtomicU64>,
 
-    /// Broker relay for RPC-based terminal state queries.
-    ///
-    /// Set once via [`set_broker_relay`] after broker registration.
-    /// When present, `get_screen()` and `get_snapshot()` route through the
-    /// broker instead of the local shadow screen. (`cursor_visible()` reads
-    /// directly from an `AtomicBool` — no RPC needed.)
-    broker_relay: Arc<std::sync::OnceLock<(u32, SharedBrokerConnection)>>,
-
     /// Per-session process connection.
     ///
     /// Set by `hub.spawn_session()` before the handle is registered.
@@ -184,7 +175,7 @@ impl PtySessionHandle {
     /// No real PTY process or `PtySession` is created — only a minimal shadow
     /// screen (correct dimensions, zero scrollback), broadcast channel, and
     /// AtomicBools. All terminal state queries route through the broker RPC
-    /// once `set_broker_relay()` is called.
+    /// Updated by the session reader thread on each output delivery.
     ///
     /// # Arguments
     ///
@@ -192,7 +183,7 @@ impl PtySessionHandle {
     /// * `cols` - Terminal column count (read from session manifest on restart)
     /// * `hub_event_tx` - Hub event sender for message delivery tasks
     #[must_use]
-    pub(crate) fn new_broker_backed(rows: u16, cols: u16, hub_event_tx: HubEventSender) -> Self {
+    pub(crate) fn new_minimal(rows: u16, cols: u16, hub_event_tx: HubEventSender) -> Self {
         let (event_tx, _) = broadcast::channel(64);
         let shared_state = Arc::new(Mutex::new(SharedPtyState {
             master_pty: None,
@@ -221,18 +212,8 @@ impl PtySessionHandle {
             delivery: Arc::new(std::sync::OnceLock::new()),
             hub_event_tx,
             last_output_at: Arc::new(AtomicU64::new(0)),
-            broker_relay: Arc::new(std::sync::OnceLock::new()),
             session_connection: Arc::new(std::sync::OnceLock::new()),
         }
-    }
-
-    /// Store the broker relay for RPC-based terminal state queries.
-    ///
-    /// Called after broker registration so Lua methods (`get_screen`,
-    /// `get_snapshot`) can route through the broker instead of the local
-    /// shadow screen.
-    pub fn set_broker_relay(&self, relay: (u32, SharedBrokerConnection)) {
-        let _ = self.broker_relay.set(relay);
     }
 
     /// Store the session connection for per-session-process I/O.
@@ -275,37 +256,6 @@ impl PtySessionHandle {
                 .unwrap_or_else(|_| Arc::new(std::sync::atomic::AtomicI64::new(0))),
         )
     }
-
-    /// Create a broker-backed `PtyHandle`.
-    ///
-    /// Runtime sessions are always broker-owned; this attaches broker relay
-    /// metadata so `write_input_direct`, `resize_direct`, and `get_snapshot`
-    /// route through the broker connection.
-    #[must_use]
-    pub fn to_pty_handle_with_broker_relay(
-        &self,
-        broker_relay: (u32, SharedBrokerConnection),
-    ) -> crate::hub::agent_handle::PtyHandle {
-        // Store relay for Lua-facing RPC methods too.
-        self.set_broker_relay(broker_relay.clone());
-
-        crate::hub::agent_handle::PtyHandle::new_with_broker_relay(
-            self.event_tx.clone(),
-            Arc::clone(&self.shared_state),
-            Arc::clone(&self.shadow_screen),
-            Arc::clone(&self.kitty_enabled),
-            Arc::clone(&self.cursor_visible),
-            Arc::clone(&self.resize_pending),
-            true, // Recovered PTYs are always CLI sessions (broker agents)
-            self.port,
-            broker_relay,
-            Arc::clone(&self.last_output_at),
-        )
-    }
-
-    // =========================================================================
-    // Broker integration — FD and PID extraction
-    // =========================================================================
 
     /// Return the raw file descriptor of the master PTY end, if available.
     ///
@@ -461,17 +411,8 @@ impl LuaUserData for PtySessionHandle {
 
         // session:get_snapshot() -> string (clean ANSI bytes)
         // Also aliased as get_scrollback for backwards compatibility.
-        // Prefers broker RPC when available, falls back to local shadow screen.
+        // Uses the local shadow screen (fed by the session reader thread).
         methods.add_method("get_snapshot", |lua, this, ()| {
-            if let Some((session_id, conn)) = this.broker_relay.get() {
-                if let Ok(mut guard) = conn.lock() {
-                    if let Some(conn) = guard.as_mut() {
-                        if let Ok(snapshot) = conn.get_snapshot(*session_id) {
-                            return lua.create_string(&snapshot);
-                        }
-                    }
-                }
-            }
             let parser = this
                 .shadow_screen
                 .lock()
@@ -487,17 +428,7 @@ impl LuaUserData for PtySessionHandle {
         // ANSI escape sequences. Intended for agent/LLM consumption where escape
         // codes add noise. Unlike get_snapshot(), this does not include scrollback
         // and does not affect resize_pending state.
-        // Prefers broker RPC when available, falls back to local shadow screen.
         methods.add_method("get_screen", |lua, this, ()| {
-            if let Some((session_id, conn)) = this.broker_relay.get() {
-                if let Ok(mut guard) = conn.lock() {
-                    if let Some(conn) = guard.as_mut() {
-                        if let Ok(text) = conn.get_screen(*session_id) {
-                            return lua.create_string(text.as_bytes());
-                        }
-                    }
-                }
-            }
             let parser = this
                 .shadow_screen
                 .lock()
@@ -521,17 +452,8 @@ impl LuaUserData for PtySessionHandle {
             Ok(())
         });
 
-        // Backwards-compatible alias — same broker-first logic as get_snapshot.
+        // Backwards-compatible alias for get_snapshot.
         methods.add_method("get_scrollback", |lua, this, ()| {
-            if let Some((session_id, conn)) = this.broker_relay.get() {
-                if let Ok(mut guard) = conn.lock() {
-                    if let Some(conn) = guard.as_mut() {
-                        if let Ok(snapshot) = conn.get_snapshot(*session_id) {
-                            return lua.create_string(&snapshot);
-                        }
-                    }
-                }
-            }
             let parser = this
                 .shadow_screen
                 .lock()
@@ -912,7 +834,6 @@ pub(crate) fn spawn_session_handle_from_opts(
         delivery: Arc::new(std::sync::OnceLock::new()),
         hub_event_tx,
         last_output_at: Arc::new(AtomicU64::new(0)),
-        broker_relay: Arc::new(std::sync::OnceLock::new()),
         session_connection: Arc::new(std::sync::OnceLock::new()),
     })
 }
@@ -1596,7 +1517,6 @@ mod tests {
             delivery: Arc::new(std::sync::OnceLock::new()),
             hub_event_tx: crate::lua::primitives::new_hub_event_sender(),
             last_output_at: Arc::new(AtomicU64::new(0)),
-            broker_relay: Arc::new(std::sync::OnceLock::new()),
             session_connection: Arc::new(std::sync::OnceLock::new()),
         }
     }

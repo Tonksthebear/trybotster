@@ -24,7 +24,6 @@
 pub mod agent;
 pub mod app;
 pub mod auth;
-pub mod broker;
 pub mod session;
 pub mod channel;
 pub mod client;

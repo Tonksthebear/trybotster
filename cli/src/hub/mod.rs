@@ -567,22 +567,6 @@ pub struct Hub {
     /// Connected socket clients, keyed by client_id.
     socket_clients: std::collections::HashMap<String, crate::socket::client_conn::SocketClientConn>,
 
-    // === PTY Broker ===
-    /// Connection to the PTY broker process.
-    ///
-    /// Wrapped in `Arc<Mutex<Option<...>>>` so the Lua `hub.spawn_pty_with_broker()`
-    /// primitive can access it without going through Hub commands.
-    ///
-    /// `None` if the broker has not been started or the connection failed.
-    pub broker_connection: crate::broker::SharedBrokerConnection,
-
-    /// Maps broker session IDs to session UUIDs.
-    ///
-    /// Populated when Lua fires `HubEvent::BrokerSessionRegistered` after
-    /// calling `hub.spawn_pty_with_broker()`. Used to route incoming
-    /// `HubEvent::BrokerPtyOutput` frames to the correct `PtyHandle`.
-    broker_sessions: std::collections::HashMap<u32, String>,
-
     // === TUI via Lua (Hub-side Processing) ===
     /// Sender for TUI output messages to TuiRunner.
     ///
@@ -765,8 +749,6 @@ impl Hub {
             singleton_lock: None,
             socket_server: None,
             socket_clients: std::collections::HashMap::new(),
-            broker_connection: Arc::new(Mutex::new(None)),
-            broker_sessions: std::collections::HashMap::new(),
             tui_output_tx: None,
             tui_wake_fd: None,
             tui_request_rx: None,
@@ -859,7 +841,6 @@ impl Hub {
             self.hub_identifier.clone(),
             Arc::clone(&self.shared_server_id),
             Arc::clone(&self.state),
-            Arc::clone(&self.broker_connection),
         ) {
             log::warn!("Failed to register Hub Lua primitives: {}", e);
         }
@@ -902,47 +883,6 @@ impl Hub {
     /// Query broker inventory and fire Lua recovery enrichment event.
     ///
     /// Returns the number of live sessions reported by the broker.
-    fn recover_broker_sessions(&mut self) -> usize {
-        let sessions = {
-            let mut guard = match self.broker_connection.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    log::warn!("[broker] recovery skipped: broker_connection mutex poisoned");
-                    return 0;
-                }
-            };
-            match guard.as_mut() {
-                Some(conn) => match conn.list_sessions() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!("[broker] recovery inventory failed: {e}");
-                        Vec::new()
-                    }
-                },
-                None => Vec::new(),
-            }
-        };
-
-        let sessions_payload: Vec<serde_json::Value> = sessions
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "session_id": s.session_id,
-                    "session_uuid": s.session_uuid,
-                })
-            })
-            .collect();
-
-        if let Err(e) = self.lua.fire_json_event(
-            "broker_sessions_recovered",
-            &serde_json::json!({ "sessions": sessions_payload }),
-        ) {
-            log::warn!("[broker] broker_sessions_recovered event error: {e}");
-        }
-
-        sessions.len()
-    }
-
     /// Discover live session process sockets and fire Lua recovery event.
     ///
     /// Scans the session socket directory for `.sock` files. For each one,
@@ -1014,166 +954,6 @@ impl Hub {
         }
 
         count
-    }
-
-    // === PTY Broker ===
-
-    /// Attempt to connect to an existing broker process, or spawn a new one.
-    ///
-    /// Called during startup after the socket server is initialised.
-    ///
-    /// # Flow
-    ///
-    /// 1. Check for an existing broker socket (`/tmp/botster-{uid}/broker-{hub_id}.sock`).
-    /// 2. If found, attempt to connect and ping — reuse if alive.
-    /// 3. If no socket or connection fails, spawn a new broker subprocess and
-    ///    connect to it.
-    /// 4. On success, configure the reconnect timeout and store the connection.
-    ///
-    /// The broker demux forwarder is installed after recovery completes so
-    /// recovery snapshot/list RPCs run on the direct request/response path.
-    pub fn try_connect_broker(&mut self) -> Option<bool> {
-        let path = match crate::broker::broker_socket_path(&self.hub_identifier) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("[broker] could not resolve socket path: {e}");
-                return None;
-            }
-        };
-
-        // Try to connect to an existing broker.
-        let existing_conn = if path.exists() {
-            match crate::broker::BrokerConnection::connect(&path) {
-                Ok(mut conn) => {
-                    if conn.ping().is_ok() {
-                        log::info!(
-                            "[broker] reconnected to existing broker at {}",
-                            path.display()
-                        );
-                        Some(conn)
-                    } else {
-                        log::debug!(
-                            "[broker] existing broker socket unresponsive, will spawn fresh"
-                        );
-                        None
-                    }
-                }
-                Err(e) => {
-                    log::debug!("[broker] could not connect to existing broker: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // Track whether this is a reconnect (existing broker) vs a fresh spawn.
-        // Used by startup lifecycle events and recovery metrics.
-        let is_reconnect = existing_conn.is_some();
-
-        let mut conn = if let Some(c) = existing_conn {
-            c
-        } else {
-            // No live broker — spawn one then retry until it binds (up to 500 ms).
-            self.spawn_broker();
-            let conn_opt = (0u8..10).find_map(|attempt| {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                match crate::broker::BrokerConnection::connect(&path) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        log::debug!("[broker] connect attempt {}: {e}", attempt + 1);
-                        None
-                    }
-                }
-            });
-            match conn_opt {
-                Some(c) => c,
-                None => {
-                    log::warn!("[broker] failed to connect after 10 attempts (500 ms)");
-                    return None;
-                }
-            }
-        };
-
-        // Configure the reconnect window.
-        if let Err(e) = conn.set_timeout(120) {
-            log::warn!("[broker] failed to set timeout: {e}");
-        }
-
-        // Store the connection so Lua broker primitives (snapshot fetch,
-        // session recovery) can use it.
-        *self.broker_connection.lock().unwrap() = Some(conn);
-        log::info!("[broker] connected");
-
-        Some(is_reconnect)
-    }
-
-    /// Install broker demux forwarding after recovery control RPCs complete.
-    ///
-    /// Recovery uses synchronous broker control requests (`list_sessions`,
-    /// `get_snapshot`) on the direct socket path. The demux thread is installed
-    /// after recovery so these RPCs don't contend with the channel path.
-    fn install_broker_forwarder(&mut self) {
-        let mut guard = match self.broker_connection.lock() {
-            Ok(g) => g,
-            Err(_) => {
-                log::warn!(
-                    "[broker] failed to install demux reader: broker_connection mutex poisoned"
-                );
-                return;
-            }
-        };
-
-        let Some(conn) = guard.as_mut() else {
-            return;
-        };
-
-        if conn.has_forwarder() {
-            return;
-        }
-
-        if let Err(e) = conn.install_forwarder(self.hub_event_tx.clone()) {
-            log::warn!("[broker] failed to install demux reader: {e}");
-            *guard = None;
-            return;
-        }
-
-        // If demux exits immediately, drop the connection so health checks can
-        // trigger a reconnect instead of waiting on a dead channel path.
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        if !conn.is_demux_alive() {
-            log::warn!(
-                "[broker] demux reader died immediately after install; dropping broker connection"
-            );
-            *guard = None;
-        }
-    }
-
-    /// Spawn the broker subprocess detached from the current process.
-    ///
-    /// Runs `botster broker --hub-id <id> --timeout 120` as a background
-    /// process. It exits on its own when the reconnect timeout expires.
-    fn spawn_broker(&self) {
-        let hub_id = self.hub_identifier.clone();
-        match std::env::current_exe() {
-            Ok(exe) => {
-                match std::process::Command::new(&exe)
-                    .args(["broker", "--hub-id", &hub_id, "--timeout", "120"])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                {
-                    Ok(child) => {
-                        log::info!("[broker] spawned broker process (pid {})", child.id());
-                        // Detach — the broker manages its own lifetime.
-                        std::mem::forget(child);
-                    }
-                    Err(e) => log::warn!("[broker] failed to spawn broker: {e}"),
-                }
-            }
-            Err(e) => log::warn!("[broker] could not locate current exe for broker spawn: {e}"),
-        }
     }
 
     /// Start the Unix domain socket server for IPC.
@@ -1338,28 +1118,6 @@ impl Hub {
 
     /// Send shutdown notification to server and cleanup resources.
     pub fn shutdown(&mut self) {
-        // Signal the PTY broker before any other cleanup.
-        //
-        // - graceful_shutdown || exec_restart → disconnect_graceful(): broker
-        //   keeps PTY FDs alive for the reconnect window so agents survive.
-        //   The broker kills PTYs itself if the Hub does not reconnect within
-        //   its configured timeout (120 s by default).
-        // - plain quit (e.g., ctrl+c on headless) → kill_all(): broker kills
-        //   children immediately and exits, avoiding orphan processes.
-        if let Ok(mut guard) = self.broker_connection.lock() {
-            if let Some(conn) = guard.take() {
-                if self.graceful_shutdown || self.exec_restart {
-                    log::info!(
-                        "[broker] graceful disconnect — PTYs preserved for reconnect window"
-                    );
-                    conn.disconnect_graceful();
-                } else {
-                    log::info!("[broker] kill_all (clean shutdown)");
-                    conn.kill_all();
-                }
-            }
-        }
-
         // Disconnect all socket clients
         for (client_id, conn) in self.socket_clients.drain() {
             log::debug!("Disconnecting socket client: {}", client_id);
@@ -1816,7 +1574,7 @@ mod tests {
     /// 1. Hub boots with real socket server, full Lua handlers
     /// 2. Real socket client connects, subscribes (hub + terminal channels)
     /// 3. PTY input sent via socket → routed to session handle
-    /// 4. PTY output injected via feed_broker_output → forwarder → client reads Frame::PtyOutput
+    /// 4. PTY output injected via reader thread → forwarder → client reads Frame::PtyOutput
     /// 5. Hub shuts down (simulates reboot)
     /// 6. New hub boots, new client connects, repeat — both directions work
     ///
@@ -1831,10 +1589,10 @@ mod tests {
     /// - Real Lua handler processing for subscriptions
     ///
     /// Flow per phase:
-    ///   1. Spawn bash → reader thread reads master FD → feed_broker_output()
+    ///   1. Spawn bash → reader thread reads master FD → shadow_screen + broadcast
     ///   2. Socket client subscribes to terminal channel
     ///   3. Send "echo MARKER\n" via PtyInput frame → hub routes → bash
-    ///   4. bash echoes MARKER → reader thread → feed_broker_output → forwarder → PtyOutput frame
+    ///   4. bash echoes MARKER → reader thread → broadcast → forwarder → PtyOutput frame
     ///   5. Client reads PtyOutput, asserts MARKER present in output
     ///   6. Hub shuts down, bash killed, reader exits
     ///   7. New hub boots, repeat with fresh bash
@@ -1862,7 +1620,6 @@ mod tests {
                     hub.hub_identifier.clone(),
                     Arc::clone(&hub.shared_server_id),
                     Arc::clone(&hub.state),
-                    Arc::clone(&hub.broker_connection),
                 )
                 .expect("register hub primitives");
             hub.load_lua_init();
@@ -1918,12 +1675,12 @@ mod tests {
             // Store the pty handle for the reader thread to use
             *pty_handle_ref.lock().unwrap() = Some(pty.clone());
 
-            // Start a reader thread that reads from the master FD and feeds
-            // output through feed_broker_output — exactly what the broker does,
-            // but in-process with real PTY bytes.
+            // Start a reader thread that reads from the master FD, feeds the
+            // shadow screen, and broadcasts output — same as session reader.
             let stop_flag = Arc::new(AtomicBool::new(false));
             let stop_clone = Arc::clone(&stop_flag);
-            let pty_for_reader = pty.clone();
+            let reader_shadow = pty.shadow_screen();
+            let reader_event_tx = pty.event_tx_clone();
 
             // Get a reader from the master PTY FD
             let reader = {
@@ -1946,7 +1703,14 @@ mod tests {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            pty_for_reader.feed_broker_output(&buf[..n], 0);
+                            // Feed shadow screen for snapshot support
+                            if let Ok(mut screen) = reader_shadow.lock() {
+                                screen.process(&buf[..n]);
+                            }
+                            // Broadcast output to subscribers
+                            let _ = reader_event_tx.send(
+                                crate::agent::pty::events::PtyEvent::output(buf[..n].to_vec()),
+                            );
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break, // EIO = child exited
@@ -2148,7 +1912,7 @@ mod tests {
             .unwrap();
 
         // Wait for bash to echo our marker back through the full pipeline:
-        // bash output → master FD → reader thread → feed_broker_output →
+        // bash output → master FD → reader thread → broadcast →
         // PtyEvent::Output broadcast → socket forwarder → Frame::PtyOutput → client
         let found_a = wait_for_output_containing(
             &mut client_a,
