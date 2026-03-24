@@ -844,7 +844,6 @@ function Session:close(delete_worktree)
     -- the session process survives hub shutdown and will be recovered.
     local session_socket_live = false
     if hub.session_socket_exists then
-        session_socket_live = pcall(hub.session_socket_exists, self.session_uuid) or false
         local ok, exists = pcall(hub.session_socket_exists, self.session_uuid)
         session_socket_live = ok and exists
     end
