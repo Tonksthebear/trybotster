@@ -529,10 +529,12 @@ fn handle_hub_frame(
         }
 
         FRAME_GET_SNAPSHOT => {
-            let skip_visible = resize_pending.swap(false, Ordering::AcqRel);
+            // Never skip visible content — the session process's parser is
+            // always up-to-date (reader thread feeds it continuously).
+            // resize_pending is only relevant for the hub's shadow screen.
             let snapshot = parser
                 .lock()
-                .map(|p| generate_ansi_snapshot(&p, skip_visible))
+                .map(|p| generate_ansi_snapshot(&p, false))
                 .unwrap_or_default();
             let response = encode_frame(FRAME_SNAPSHOT, &snapshot);
             let _ = stream.write_all(&response);
