@@ -490,7 +490,9 @@ function Session._init_recovered(self, config)
     end
     log.info(string.format("Session %s: recovered (index=%s)", key, tostring(reg_index)))
 
-    -- Replay broker scrollback
+    -- Replay scrollback: broker-backed sessions use broker snapshot,
+    -- session-process-backed sessions use the session's snapshot via
+    -- the connection (which register_session just installed a reader for).
     self:replay_broker_scrollback()
 
     -- Register in session registry

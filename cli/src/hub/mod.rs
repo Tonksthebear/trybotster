@@ -943,6 +943,79 @@ impl Hub {
         sessions.len()
     }
 
+    /// Discover live session process sockets and fire Lua recovery event.
+    ///
+    /// Scans the session socket directory for `.sock` files. For each one,
+    /// attempts a connect + handshake to verify liveness and extract metadata.
+    /// Fires `sessions_discovered` with the list of live sessions.
+    fn recover_session_processes(&mut self) -> usize {
+        let sockets = match crate::session::discover_sessions() {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("[session] recovery scan failed: {e}");
+                return 0;
+            }
+        };
+
+        if sockets.is_empty() {
+            log::debug!("[session] no session sockets found");
+            return 0;
+        }
+
+        log::info!("[session] found {} session socket(s)", sockets.len());
+
+        let mut live_sessions = Vec::new();
+
+        for socket_path in &sockets {
+            // Extract session_uuid from filename (e.g., "sess-xxx.sock" → "sess-xxx")
+            let session_uuid = match socket_path.file_stem().and_then(|s| s.to_str()) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+
+            // Try connect + handshake to verify liveness
+            match crate::session::connection::SessionConnection::connect(socket_path) {
+                Ok(conn) => {
+                    log::info!(
+                        "[session] live session: {} (pid={}, {}x{})",
+                        &session_uuid[..session_uuid.len().min(16)],
+                        conn.metadata.pid,
+                        conn.metadata.cols,
+                        conn.metadata.rows,
+                    );
+                    live_sessions.push(serde_json::json!({
+                        "session_uuid": session_uuid,
+                        "socket_path": socket_path.display().to_string(),
+                        "pid": conn.metadata.pid,
+                        "rows": conn.metadata.rows,
+                        "cols": conn.metadata.cols,
+                        "last_output_at": conn.metadata.last_output_at,
+                    }));
+                    // Drop the connection — Lua will reconnect via hub.connect_session
+                    drop(conn);
+                }
+                Err(e) => {
+                    log::debug!(
+                        "[session] stale socket {}: {e} — removing",
+                        socket_path.display()
+                    );
+                    std::fs::remove_file(socket_path).ok();
+                }
+            }
+        }
+
+        let count = live_sessions.len();
+
+        if let Err(e) = self.lua.fire_json_event(
+            "sessions_discovered",
+            &serde_json::json!({ "sockets": live_sessions }),
+        ) {
+            log::warn!("[session] sessions_discovered event error: {e}");
+        }
+
+        count
+    }
+
     // === PTY Broker ===
 
     /// Attempt to connect to an existing broker process, or spawn a new one.
@@ -1163,14 +1236,23 @@ impl Hub {
             }),
         );
 
-        let recovered_sessions = self.recover_broker_sessions();
+        // Recover sessions from per-session processes (new path)
+        let session_count = if !crate::env::is_test_mode() {
+            self.recover_session_processes()
+        } else {
+            0
+        };
+
+        // Recover sessions from broker (legacy path)
+        let broker_count = self.recover_broker_sessions();
         if broker_connected {
             self.install_broker_forwarder();
         }
+
         self.fire_hub_recovery_state(
             "sessions_recovered",
             serde_json::json!({
-                "count": recovered_sessions,
+                "count": session_count + broker_count,
                 "inventory_authority": true,
             }),
         );
