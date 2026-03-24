@@ -210,24 +210,42 @@ pub(crate) fn register(
                     _ => None,
                 };
 
-                // Grab event_tx + recovered flag before consuming the handle
-                let (event_tx_clone, is_recovered) = {
+                // Grab event_tx + recovered flag + session_connection before consuming handle
+                let (event_tx_clone, is_recovered, has_session_conn) = {
                     let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
                         LuaError::runtime(format!("register_session: not a PtySessionHandle: {e}"))
                     })?;
-                    (handle.event_tx(), handle.is_recovered())
+                    (
+                        handle.event_tx(),
+                        handle.is_recovered(),
+                        handle.get_session_connection().is_some(),
+                    )
                 };
 
                 let pty_handle: PtyHandle = {
                     let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
                         LuaError::runtime(format!("register_session: not a PtySessionHandle: {e}"))
                     })?;
-                    let sid = broker_session_id.ok_or_else(|| {
-                        LuaError::runtime(
-                            "register_session: broker_session_id required for all sessions",
-                        )
-                    })?;
-                    handle.to_pty_handle_with_broker_relay((sid, Arc::clone(&register_broker_conn)))
+
+                    if has_session_conn {
+                        // Per-session process path
+                        let conn = handle
+                            .get_session_connection()
+                            .expect("session_connection was Some above")
+                            .clone();
+                        handle.to_pty_handle_with_session(conn)
+                    } else {
+                        // Broker path (legacy)
+                        let sid = broker_session_id.ok_or_else(|| {
+                            LuaError::runtime(
+                                "register_session: broker_session_id required for broker sessions",
+                            )
+                        })?;
+                        handle.to_pty_handle_with_broker_relay((
+                            sid,
+                            Arc::clone(&register_broker_conn),
+                        ))
+                    }
                 };
 
                 let label: String = metadata
@@ -263,10 +281,51 @@ pub(crate) fn register(
                     index
                 );
 
-                // Recovered sessions skip the spawn path which normally creates a
+                // Session-process-backed handles: install reader thread.
+                // The reader feeds the shadow screen and broadcasts output directly.
+                if has_session_conn {
+                    let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
+                        LuaError::runtime(format!("register_session: borrow for reader: {e}"))
+                    })?;
+                    if let Some(conn) = handle.get_session_connection() {
+                        let session_handle = cache2.get_session(&session_uuid);
+                        if let Some(sh) = session_handle {
+                            let pty = sh.pty();
+                            if let Ok(mut guard) = conn.lock() {
+                                if let Some(ref mut session_conn) = *guard {
+                                    if let Err(e) = session_conn.install_reader(
+                                        session_uuid.clone(),
+                                        pty.shadow_screen(),
+                                        pty.event_tx_clone(),
+                                        pty.kitty_enabled_arc(),
+                                        pty.cursor_visible_arc(),
+                                        pty.resize_pending_arc(),
+                                        pty.last_output_at_atomic().clone(),
+                                        session_type == SessionType::Agent,
+                                        {
+                                            let g = register_event_tx
+                                                .lock()
+                                                .expect("HubEventSender mutex poisoned");
+                                            g.as_ref().cloned().ok_or_else(|| {
+                                                LuaError::runtime("hub_event_tx not set")
+                                            })?
+                                        },
+                                    ) {
+                                        log::warn!(
+                                            "[Lua] Failed to install session reader for '{}': {e}",
+                                            session_uuid
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Recovered broker sessions skip the spawn path which normally creates a
                 // notification watcher. Spawn one now so title/CWD/bell events
                 // from the broker reach Lua hooks.
-                if is_recovered {
+                if is_recovered && !has_session_conn {
                     let session_name: String = metadata
                         .get("session_name")
                         .unwrap_or_else(|_| session_type_str.clone());
@@ -597,6 +656,188 @@ pub(crate) fn register(
             .map_err(|e| anyhow!("Failed to create hub.spawn_pty_with_broker stub: {e}"))?;
         hub.set("spawn_pty_with_broker", unsupported_fn)
             .map_err(|e| anyhow!("Failed to set hub.spawn_pty_with_broker stub: {e}"))?;
+    }
+
+    // hub.spawn_session(opts, session_uuid) → PtySessionHandle
+    //
+    // Spawns a per-session process that creates its own PTY and binds a Unix
+    // socket. The hub connects to the socket and installs a reader thread.
+    // No broker, no FD transfer, no multiplexing.
+    //
+    // The session process is a separate OS process (`botster session`) that
+    // survives hub restarts. Recovery reconnects via socket directory scan.
+    //
+    // Arguments:
+    //   opts: table {
+    //     worktree_path: string     — working directory for the child
+    //     command: string?           — command to run (default "bash")
+    //     rows: integer?             — terminal rows (default 24)
+    //     cols: integer?             — terminal cols (default 80)
+    //     detect_notifications: bool? — enable OSC notification detection
+    //     port: integer?             — HTTP forwarding port
+    //     env: table?                — environment variables {KEY=VAL, ...}
+    //     init_commands: table?       — commands to write after spawn
+    //     tee_path: string?          — log file path
+    //     tee_cap: integer?          — log rotation cap (default 10MB)
+    //   }
+    //   session_uuid: string — stable session UUID
+    #[cfg(unix)]
+    {
+        let tx_spawn = hub_event_tx.clone();
+        let spawn_session_fn = lua
+            .create_function(
+                move |_lua_ctx, (opts, session_uuid): (LuaTable, String)| {
+                    use crate::session::connection::SessionConnection;
+                    use crate::session::protocol;
+                    use crate::session::SpawnConfig;
+
+                    // Parse opts
+                    let worktree_path: String = opts
+                        .get("worktree_path")
+                        .map_err(|_| LuaError::runtime("worktree_path is required"))?;
+                    let command: String =
+                        opts.get("command").unwrap_or_else(|_| "bash".to_string());
+                    let rows: u16 = opts.get("rows").unwrap_or(24);
+                    let cols: u16 = opts.get("cols").unwrap_or(80);
+                    let detect_notifications: bool =
+                        opts.get("detect_notifications").unwrap_or(false);
+                    let port: Option<u16> = opts.get("port").ok();
+                    let tee_path: Option<String> = opts.get("tee_path").ok();
+                    let tee_cap: u64 =
+                        opts.get("tee_cap").unwrap_or(10 * 1024 * 1024);
+
+                    // Parse env table
+                    let mut env_pairs = Vec::new();
+                    if let Ok(env_table) = opts.get::<LuaTable>("env") {
+                        for pair in env_table.pairs::<String, String>() {
+                            if let Ok((k, v)) = pair {
+                                env_pairs.push((k, v));
+                            }
+                        }
+                    }
+
+                    // Parse init_commands
+                    let mut args = Vec::new();
+                    if let Ok(cmds_table) = opts.get::<LuaTable>("init_commands") {
+                        for pair in cmds_table.pairs::<i64, String>() {
+                            if let Ok((_, cmd)) = pair {
+                                args.push(cmd);
+                            }
+                        }
+                    }
+
+                    // Determine socket path
+                    let socket_path = crate::session::session_socket_path(&session_uuid)
+                        .map_err(|e| {
+                            LuaError::runtime(format!(
+                                "spawn_session: socket path error: {e}"
+                            ))
+                        })?;
+
+                    // Fork session process
+                    let exe = std::env::current_exe().map_err(|e| {
+                        LuaError::runtime(format!("spawn_session: current_exe: {e}"))
+                    })?;
+                    let socket_str = socket_path.display().to_string();
+                    match std::process::Command::new(&exe)
+                        .args([
+                            "session",
+                            "--uuid",
+                            &session_uuid,
+                            "--socket",
+                            &socket_str,
+                            "--timeout",
+                            "120",
+                        ])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                    {
+                        Ok(child) => {
+                            ::log::info!(
+                                "[Session] spawned session process (pid {})",
+                                child.id()
+                            );
+                            std::mem::forget(child); // detach
+                        }
+                        Err(e) => {
+                            return Err(LuaError::runtime(format!(
+                                "spawn_session: failed to fork: {e}"
+                            )));
+                        }
+                    }
+
+                    // Wait for socket to appear
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_millis(2000);
+                    while !socket_path.exists() {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(LuaError::runtime(
+                                "spawn_session: session process socket did not appear within 2s",
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    // Small settle time for the listener to be ready
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+
+                    // Connect
+                    let mut conn =
+                        SessionConnection::connect(&socket_path).map_err(|e| {
+                            LuaError::runtime(format!(
+                                "spawn_session: connect failed: {e}"
+                            ))
+                        })?;
+
+                    // Send spawn config
+                    let spawn_config = SpawnConfig {
+                        command,
+                        args,
+                        env: env_pairs,
+                        cwd: Some(worktree_path),
+                        rows,
+                        cols,
+                        tee_path,
+                        tee_cap,
+                    };
+                    conn.send_spawn_config(&spawn_config).map_err(|e| {
+                        LuaError::runtime(format!(
+                            "spawn_session: send config failed: {e}"
+                        ))
+                    })?;
+
+                    // Wrap in shared connection
+                    let shared_conn: crate::session::connection::SharedSessionConnection =
+                        std::sync::Arc::new(std::sync::Mutex::new(Some(conn)));
+
+                    // Create a PtySessionHandle that wraps the session connection.
+                    // This handle is returned to Lua and later registered via
+                    // hub.register_session() which creates the PtyHandle and
+                    // installs the reader thread.
+                    use crate::lua::primitives::pty::PtySessionHandle;
+                    let handle = PtySessionHandle::new_broker_backed(
+                        rows,
+                        cols,
+                        std::sync::Arc::clone(&tx_spawn),
+                    );
+
+                    // Store the session connection on the handle so register_session
+                    // can retrieve it later.
+                    handle.set_session_connection(shared_conn);
+
+                    ::log::info!(
+                        "[Session] connected to session process for '{}'",
+                        &session_uuid[..session_uuid.len().min(16)]
+                    );
+
+                    Ok(handle)
+                },
+            )
+            .map_err(|e| anyhow!("Failed to create hub.spawn_session function: {e}"))?;
+
+        hub.set("spawn_session", spawn_session_fn)
+            .map_err(|e| anyhow!("Failed to set hub.spawn_session: {e}"))?;
     }
 
     // hub.pty_tee(session_id, log_path, cap_bytes) → true | nil
