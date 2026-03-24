@@ -12,9 +12,9 @@
 //!
 //! # PTY Session Handles
 //!
-//! Runtime PTY creation is broker-authoritative via
-//! `hub.spawn_pty_with_broker()` (see `hub.rs`). This module provides the
-//! `PtySessionHandle` userdata and PTY forwarder primitives used by that path.
+//! Runtime PTY creation uses per-session processes via
+//! `hub.spawn_session()` (see `hub.rs`). This module provides the
+//! `PtySessionHandle` userdata and PTY forwarder primitives.
 //!
 //! # PTY Forwarders
 //!
