@@ -591,12 +591,12 @@ pub(crate) fn register(
                         }
                     }
 
-                    // Parse init_commands
-                    let mut args = Vec::new();
+                    // Parse init_commands (written to PTY stdin after child spawns)
+                    let mut init_commands = Vec::new();
                     if let Ok(cmds_table) = opts.get::<LuaTable>("init_commands") {
                         for pair in cmds_table.pairs::<i64, String>() {
                             if let Ok((_, cmd)) = pair {
-                                args.push(cmd);
+                                init_commands.push(cmd);
                             }
                         }
                     }
@@ -668,11 +668,12 @@ pub(crate) fn register(
                     // Send spawn config
                     let spawn_config = SpawnConfig {
                         command,
-                        args,
+                        args: Vec::new(),
                         env: env_pairs,
                         cwd: Some(worktree_path),
                         rows,
                         cols,
+                        init_commands,
                         tee_path,
                         tee_cap,
                     };
