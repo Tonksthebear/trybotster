@@ -381,6 +381,20 @@ pub(crate) fn register(
     hub.set("hub_id", hub_id_fn)
         .map_err(|e| anyhow!("Failed to set hub.hub_id: {e}"))?;
 
+    // hub.exe_dir() — directory containing the running botster binary.
+    // Used to prepend to child PATH so `botster` resolves to the same build.
+    let exe_dir_fn = lua
+        .create_function(|_, ()| {
+            let dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.display().to_string()))
+                .unwrap_or_default();
+            Ok(dir)
+        })
+        .map_err(|e| anyhow!("Failed to create hub.exe_dir function: {e}"))?;
+    hub.set("exe_dir", exe_dir_fn)
+        .map_err(|e| anyhow!("Failed to set hub.exe_dir: {e}"))?;
+
     // hub.server_id() - Returns the server-assigned hub ID, or nil if not yet registered.
     let sid = Arc::clone(&server_id);
     let server_id_fn = lua
