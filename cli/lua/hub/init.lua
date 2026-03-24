@@ -197,9 +197,6 @@ end
 -- Load session recovery handler (reconnects to surviving session processes on Hub restart)
 safe_require("handlers.session_recovery")
 
--- Load broker restart recovery handler (legacy — kept for broker-spawned sessions)
-safe_require("handlers.broker")
-
 -- Watch core modules and plugin directories for hot-reload on file changes
 safe_require("handlers.module_watcher")
 
