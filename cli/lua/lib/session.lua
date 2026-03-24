@@ -164,6 +164,7 @@ function Session._init(self, config)
     self.title = nil          -- window title from OSC 0/2 (set by pty_title_changed hook)
     self.cwd = nil            -- current working directory from OSC 7 (set by pty_cwd_changed hook)
     self.notification = false -- true when OSC notification fired, cleared by client
+    self.is_idle = true       -- idle until first PTY output (managed by pty_output hook)
     self.session = nil        -- single PtySessionHandle
     self._session_config = session_config  -- original session config from creation
 
@@ -354,7 +355,7 @@ function Session._init(self, config)
     end
 
     self:set_meta("broker_session_id", tostring(broker_session_id))
-    -- Store PTY dimensions so ghost PTYs use real terminal size
+    -- Store PTY dimensions so recovered PTYs use real terminal size
     local dims_ok, dim_rows, dim_cols = pcall(function() return handle:dimensions() end)
     if dims_ok and dim_rows then
         self:set_meta("broker_pty_rows", tostring(dim_rows))
@@ -416,6 +417,7 @@ function Session._init_recovered(self, config)
     self.label           = config.label
     self.task            = config.task
     self.notification    = false
+    self.is_idle         = true
     self.session         = config.handle
     self._session_config = nil
     self._port           = nil
@@ -474,11 +476,10 @@ function Session._init_recovered(self, config)
         workspace_id      = self._workspace_id,
         broker_session_id = config.broker_session_id,
     })
-    if reg_ok then
-        log.info(string.format("Session %s: recovered (index=%s)", key, tostring(reg_index)))
-    else
-        log.warn(string.format("Session %s: recovery register failed: %s", key, tostring(reg_index)))
+    if not reg_ok then
+        error(string.format("Session %s: recovery register failed: %s", key, tostring(reg_index)))
     end
+    log.info(string.format("Session %s: recovered (index=%s)", key, tostring(reg_index)))
 
     -- Replay broker scrollback
     self:replay_broker_scrollback()
@@ -497,16 +498,29 @@ end
 --- Update one or more session fields and sync the manifest.
 -- This is the only way external code should mutate session state.
 -- @param fields table  Key-value pairs to update (e.g., { title = "foo", cwd = "/tmp" })
+-- Fields that are runtime-only and don't need manifest sync to disk.
+local RUNTIME_ONLY_FIELDS = {
+    is_idle = true,
+    notification = true,
+}
+
 function Session:update(fields)
     local changed = false
+    local needs_sync = false
     for k, v in pairs(fields) do
         if self[k] ~= v then
             self[k] = v
             changed = true
+            if not RUNTIME_ONLY_FIELDS[k] then
+                needs_sync = true
+            end
         end
     end
     if changed then
-        self:_sync_session_manifest()
+        if needs_sync then
+            self:_sync_session_manifest()
+        end
+        hooks.call("session_updated", { session_uuid = self.session_uuid })
     end
 end
 
@@ -581,7 +595,7 @@ function Session:_sync_session_manifest()
     -- Strip runtime-only fields that shouldn't persist
     manifest.port           = nil
     manifest.notification   = nil
-    manifest.last_output_at = nil
+    manifest.is_idle        = nil
 
     local ok, err = pcall(ws.write_session,
         self._data_dir, self._workspace_id, self.session_uuid, manifest)
@@ -962,7 +976,7 @@ function Session:info()
         created_at = self.created_at,
         label = self.label,
         task = self.task,
-        last_output_at = (self.session and self.session.last_output_at and self.session:last_output_at()) or self.last_output_at,
+        is_idle = self.is_idle or false,
     }
 end
 

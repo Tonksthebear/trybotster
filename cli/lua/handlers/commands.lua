@@ -400,10 +400,6 @@ commands.register("update_session", function(_client, _sub_id, command)
 
     if next(fields) then
         session:update(fields)
-        local connections = require("handlers.connections")
-        connections.broadcast_hub_event("agent_list", {
-            agents = Agent.all_info(),
-        })
         log.info(string.format("Session %s updated: %s", session.session_uuid,
             table.concat((function()
                 local parts = {}
