@@ -1416,10 +1416,7 @@ mod tests {
         let events = r.parse_events();
         assert_eq!(events.len(), 1);
         assert_eq!(first_descriptor(&events), "");
-        assert_eq!(
-            first_raw_bytes(&events),
-            b"\x1b]11;rgb:0000/0000/0000\x07"
-        );
+        assert_eq!(first_raw_bytes(&events), b"\x1b]11;rgb:0000/0000/0000\x07");
     }
 
     #[test]
@@ -1451,10 +1448,7 @@ mod tests {
         r.pending.extend_from_slice(b"0000/0000\x07");
         let events = r.parse_events();
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            first_raw_bytes(&events),
-            b"\x1b]11;rgb:0000/0000/0000\x07"
-        );
+        assert_eq!(first_raw_bytes(&events), b"\x1b]11;rgb:0000/0000/0000\x07");
     }
 
     #[test]
@@ -1463,10 +1457,7 @@ mod tests {
         let mut r = reader_with_bytes(b"\x1b]12;rgb:aaaa/bbbb/cccc\x07x");
         let events = r.parse_events();
         assert_eq!(events.len(), 2);
-        assert_eq!(
-            first_raw_bytes(&events),
-            b"\x1b]12;rgb:aaaa/bbbb/cccc\x07"
-        );
+        assert_eq!(first_raw_bytes(&events), b"\x1b]12;rgb:aaaa/bbbb/cccc\x07");
         match &events[1] {
             InputEvent::Key { descriptor, .. } => assert_eq!(descriptor, "x"),
             other => panic!("Expected Key event, got: {other:?}"),
@@ -1483,9 +1474,6 @@ mod tests {
         let mut r = reader_with_bytes(&input);
         let events = r.parse_events();
         assert_eq!(events.len(), 3);
-        assert_eq!(
-            first_raw_bytes(&events),
-            b"\x1b]10;rgb:aaaa/bbbb/cccc\x07"
-        );
+        assert_eq!(first_raw_bytes(&events), b"\x1b]10;rgb:aaaa/bbbb/cccc\x07");
     }
 }

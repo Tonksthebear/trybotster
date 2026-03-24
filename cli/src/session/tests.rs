@@ -36,10 +36,7 @@ mod protocol_tests {
             cols: u16,
         }
 
-        let resize = Resize {
-            rows: 24,
-            cols: 80,
-        };
+        let resize = Resize { rows: 24, cols: 80 };
         let encoded = encode_json(FRAME_RESIZE, &resize).unwrap();
         let mut decoder = FrameDecoder::new();
         let frames = decoder.feed(&encoded);
@@ -138,10 +135,7 @@ mod pty_handle_tests {
         let (event_tx, _rx) = broadcast::channel(64);
         let listener = HubEventListener::new(event_tx.clone());
         let shadow_screen = Arc::new(Mutex::new(AlacrittyParser::new_with_listener(
-            rows,
-            cols,
-            1000,
-            listener,
+            rows, cols, 1000, listener,
         )));
         let kitty_enabled = Arc::new(AtomicBool::new(false));
         let cursor_visible = Arc::new(AtomicBool::new(true));
@@ -159,6 +153,8 @@ mod pty_handle_tests {
             session_connection,
             Arc::new(AtomicU64::new(0)),
             Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            rows,
+            cols,
         );
 
         (handle, shadow_screen)
@@ -171,11 +167,20 @@ mod pty_handle_tests {
     }
 
     #[test]
+    fn session_backed_handle_preserves_initial_dimensions() {
+        let (handle, _) = create_session_backed_pty(59, 201);
+        assert_eq!(handle.dims(), (59, 201));
+    }
+
+    #[test]
     fn snapshot_from_empty_shadow_screen() {
         let (handle, _) = create_session_backed_pty(24, 80);
         let snapshot = handle.get_snapshot();
         // Empty screen should still produce some bytes (cursor positioning, SGR reset)
-        assert!(!snapshot.is_empty(), "even an empty screen produces a snapshot");
+        assert!(
+            !snapshot.is_empty(),
+            "even an empty screen produces a snapshot"
+        );
         // But it should be small — no real content
         assert!(
             snapshot.len() < 500,

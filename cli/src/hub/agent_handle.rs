@@ -345,13 +345,15 @@ impl PtyHandle {
         session_connection: crate::session::connection::SharedSessionConnection,
         last_output_at: Arc<AtomicU64>,
         last_human_input_ms: Arc<std::sync::atomic::AtomicI64>,
+        initial_rows: u16,
+        initial_cols: u16,
     ) -> Self {
         Self {
             event_tx,
             shared_state: Arc::new(Mutex::new(SharedPtyState {
                 master_pty: None,
                 writer: None,
-                dimensions: (24, 80), // updated by reader thread on first output
+                dimensions: (initial_rows, initial_cols),
                 last_human_input_ms,
             })),
             shadow_screen,

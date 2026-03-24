@@ -567,11 +567,9 @@ where
                             "[PTY-PROBE] Intercepted terminal color response ({} bytes)",
                             raw_bytes.len()
                         );
-                        if let Err(e) =
-                            self.request_tx.send(TuiRequest::TerminalProbeResponse {
-                                data: raw_bytes.clone(),
-                            })
-                        {
+                        if let Err(e) = self.request_tx.send(TuiRequest::TerminalProbeResponse {
+                            data: raw_bytes.clone(),
+                        }) {
                             log::error!("[PTY-PROBE] Failed to send probe response: {e}");
                         }
                         continue;

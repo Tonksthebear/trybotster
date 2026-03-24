@@ -186,7 +186,9 @@ pub fn run(session_uuid: &str, socket_path: &str, timeout_secs: u64) -> Result<(
         .set_nonblocking(true)
         .context("set socket nonblocking for accept")?;
     let stream = wait_for_connection(&listener, Duration::from_secs(timeout_secs), socket_path)?;
-    stream.set_nonblocking(false).context("set stream blocking")?;
+    stream
+        .set_nonblocking(false)
+        .context("set stream blocking")?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .context("set read timeout")?;
@@ -290,10 +292,7 @@ fn run_session(
     );
 
     // Get master fd for the reader thread
-    let master_fd = pair
-        .master
-        .as_raw_fd()
-        .context("get PTY master fd")?;
+    let master_fd = pair.master.as_raw_fd().context("get PTY master fd")?;
     let writer = pair.master.take_writer().context("take PTY writer")?;
 
     // Set up shared state
@@ -307,6 +306,7 @@ fn run_session(
         )))
     };
     let last_output_at = Arc::new(AtomicU64::new(0));
+    let current_dims = Arc::new(Mutex::new((config.rows, config.cols)));
     let resize_pending = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
     let tee: SharedTee = Arc::new(Mutex::new(
@@ -319,13 +319,22 @@ fn run_session(
     // Writer thread — owns the writer and master_pty (for resize ioctl)
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<PtyWriteCommand>(64);
     let parser_for_writer = Arc::clone(&parser);
+    let current_dims_for_writer = Arc::clone(&current_dims);
     let resize_pending_writer = Arc::clone(&resize_pending);
     let master_pty = pair.master;
     let init_commands = config.init_commands.clone();
     let _writer_thread = thread::Builder::new()
         .name("session-writer".to_string())
         .spawn(move || {
-            pty_writer_loop(writer, master_pty, parser_for_writer, resize_pending_writer, init_commands, writer_rx);
+            pty_writer_loop(
+                writer,
+                master_pty,
+                parser_for_writer,
+                current_dims_for_writer,
+                resize_pending_writer,
+                init_commands,
+                writer_rx,
+            );
         })
         .context("spawn writer thread")?;
 
@@ -354,17 +363,15 @@ fn run_session(
     let shutdown_for_lease = Arc::clone(&shutdown);
     let _lease_thread = thread::Builder::new()
         .name("session-lease".to_string())
-        .spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(2));
-                if shutdown_for_lease.load(Ordering::Relaxed) {
-                    break;
-                }
-                if !socket_path_owned.exists() {
-                    log::info!("[session] socket file deleted — shutting down");
-                    shutdown_for_lease.store(true, Ordering::Release);
-                    break;
-                }
+        .spawn(move || loop {
+            thread::sleep(Duration::from_secs(2));
+            if shutdown_for_lease.load(Ordering::Relaxed) {
+                break;
+            }
+            if !socket_path_owned.exists() {
+                log::info!("[session] socket file deleted — shutting down");
+                shutdown_for_lease.store(true, Ordering::Release);
+                break;
             }
         })
         .context("spawn lease watcher")?;
@@ -406,13 +413,15 @@ fn run_session(
                         stream.set_read_timeout(Some(Duration::from_millis(50)))?;
 
                         // Re-handshake
+                        let (rows, cols) =
+                            current_dims.lock().map(|dims| *dims).unwrap_or((24, 80));
                         let _ = handshake_session(
                             &mut stream,
                             &SessionMetadata {
                                 session_uuid: session_uuid.to_string(),
                                 pid: child_pid,
-                                rows: config.rows,
-                                cols: config.cols,
+                                rows,
+                                cols,
                                 last_output_at: last_output_at.load(Ordering::Relaxed),
                             },
                         );
@@ -455,7 +464,10 @@ fn run_session(
     if socket_path.exists() {
         std::fs::remove_file(socket_path).ok();
     }
-    log::info!("[session {}] exiting", &session_uuid[..session_uuid.len().min(16)]);
+    log::info!(
+        "[session {}] exiting",
+        &session_uuid[..session_uuid.len().min(16)]
+    );
     Ok(())
 }
 
@@ -543,10 +555,7 @@ fn handle_hub_frame(
         }
 
         FRAME_GET_SCREEN => {
-            let text = parser
-                .lock()
-                .map(|p| p.contents())
-                .unwrap_or_default();
+            let text = parser.lock().map(|p| p.contents()).unwrap_or_default();
             let response = encode_frame(FRAME_SCREEN, text.as_bytes());
             let _ = stream.write_all(&response);
         }
@@ -673,6 +682,7 @@ fn pty_writer_loop(
     mut writer: Box<dyn Write + Send>,
     master_pty: Box<dyn portable_pty::MasterPty + Send>,
     parser: Arc<Mutex<AlacrittyParser<SessionEventListener>>>,
+    current_dims: Arc<Mutex<(u16, u16)>>,
     resize_pending: Arc<AtomicBool>,
     init_commands: Vec<String>,
     rx: std::sync::mpsc::Receiver<PtyWriteCommand>,
@@ -723,6 +733,9 @@ fn pty_writer_loop(
                 // Resize the parser to match
                 if let Ok(mut p) = parser.lock() {
                     p.resize(final_rows, final_cols);
+                }
+                if let Ok(mut dims) = current_dims.lock() {
+                    *dims = (final_rows, final_cols);
                 }
                 log::debug!("[session] resize to {}x{}", final_cols, final_rows);
             }

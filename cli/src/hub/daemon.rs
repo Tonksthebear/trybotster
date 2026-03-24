@@ -197,19 +197,16 @@ pub fn read_manifest(hub_id: &str) -> Option<HubManifest> {
 /// If the manifest doesn't exist, this is a no-op.
 pub fn update_manifest_workspaces(hub_id: &str, workspaces: Vec<String>) -> Result<()> {
     let path = manifest_path(hub_id)?;
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("read manifest: {}", path.display()))?;
-    let mut manifest: HubManifest =
-        serde_json::from_str(&content).context("parse hub manifest")?;
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("read manifest: {}", path.display()))?;
+    let mut manifest: HubManifest = serde_json::from_str(&content).context("parse hub manifest")?;
     manifest.workspaces = workspaces;
     manifest.updated_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let updated =
-        serde_json::to_string_pretty(&manifest).context("serialize hub manifest")?;
-    fs::write(&path, updated)
-        .with_context(|| format!("write manifest: {}", path.display()))?;
+    let updated = serde_json::to_string_pretty(&manifest).context("serialize hub manifest")?;
+    fs::write(&path, updated).with_context(|| format!("write manifest: {}", path.display()))?;
     Ok(())
 }
 

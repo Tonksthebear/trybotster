@@ -366,9 +366,9 @@ pub(crate) fn register(
     let tx = hub_event_tx.clone();
     let create_async_fn = lua
         .create_function(move |lua_inner, params: LuaTable| {
-            let label: String = params.get("label").map_err(|e| {
-                mlua::Error::runtime(format!("create_async: missing label: {e}"))
-            })?;
+            let label: String = params
+                .get("label")
+                .map_err(|e| mlua::Error::runtime(format!("create_async: missing label: {e}")))?;
             let branch: String = params
                 .get("branch")
                 .map_err(|e| mlua::Error::runtime(format!("create_async: missing branch: {e}")))?;

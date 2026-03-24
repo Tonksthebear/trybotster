@@ -182,8 +182,7 @@ impl Hub {
     fn forward_probe_to_tui(&self, data: &[u8]) {
         // Extract just the OSC query sequences from the data
         let mut buffer = data.to_vec();
-        let sequences =
-            super::terminal_profile::extract_osc_queries_from_output(&mut buffer);
+        let sequences = super::terminal_profile::extract_osc_queries_from_output(&mut buffer);
         if sequences.is_empty() {
             return;
         }
@@ -191,9 +190,7 @@ impl Hub {
         if let Some(ref tx) = self.tui_output_tx {
             let query_bytes: Vec<u8> = sequences.into_iter().flatten().collect();
             if tx
-                .send(crate::client::TuiOutput::TerminalQuery {
-                    data: query_bytes,
-                })
+                .send(crate::client::TuiOutput::TerminalQuery { data: query_bytes })
                 .is_ok()
             {
                 if let Some(fd) = self.tui_wake_fd {
@@ -3293,9 +3290,7 @@ impl Hub {
             // consumes OSC queries without responding.
             if let Some(probe_data) = hub_probe_bytes {
                 if sink
-                    .send(TuiOutput::TerminalQuery {
-                        data: probe_data,
-                    })
+                    .send(TuiOutput::TerminalQuery { data: probe_data })
                     .is_err()
                 {
                     log::trace!("[Lua-TUI] Output channel closed before probe inject");
@@ -5291,7 +5286,6 @@ impl Hub {
             &server_url,
         )
     }
-
 }
 
 #[cfg(test)]
@@ -5557,9 +5551,11 @@ mod tests {
         if let Ok(mut screen) = shadow_screen.lock() {
             screen.process(seed_output);
         }
-        let _ = pty.event_tx_clone().send(
-            crate::agent::pty::events::PtyEvent::output(seed_output.to_vec()),
-        );
+        let _ = pty
+            .event_tx_clone()
+            .send(crate::agent::pty::events::PtyEvent::output(
+                seed_output.to_vec(),
+            ));
 
         SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
     }

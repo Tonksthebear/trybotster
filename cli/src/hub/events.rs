@@ -271,7 +271,6 @@ pub(crate) enum HubEvent {
         exit_code: Option<i32>,
     },
 
-
     /// A session was removed from `HandleCache` by `hub.unregister_session()`.
     ///
     /// The Hub removes all `broker_sessions` entries whose `session_uuid` matches
