@@ -264,6 +264,15 @@ impl RawInputReader {
                                 break;
                             }
                         }
+                        b']' => {
+                            // OSC sequence: ESC ]
+                            if let Some(event) = self.parse_osc() {
+                                events.push(event);
+                            } else {
+                                // Incomplete — wait for more bytes
+                                break;
+                            }
+                        }
                         b => {
                             // Alt+key: ESC followed by a regular byte
                             let raw = vec![0x1b, b];
@@ -579,6 +588,62 @@ impl RawInputReader {
             descriptor,
             raw_bytes: raw,
         })
+    }
+
+    /// Parse an OSC sequence: `ESC ] ... BEL` or `ESC ] ... ESC \`.
+    ///
+    /// Terminal responses to color probes (OSC 10/11/12) arrive as OSC
+    /// sequences on stdin. Without this parser, `ESC ]` would be treated
+    /// as `alt+]` and the response bytes would be fragmented across
+    /// multiple InputEvents, corrupting the data.
+    ///
+    /// Returns the complete sequence as a Key with empty descriptor so
+    /// it passes through to the PTY via the normal unbound-key path.
+    fn parse_osc(&mut self) -> Option<InputEvent> {
+        // Minimum: ESC ] <code> ; <value> BEL = at least 5 bytes
+        if self.pending.len() < 4 {
+            return None;
+        }
+
+        // Scan for BEL (0x07) or ST (ESC \) terminator
+        let mut i = 2;
+        while i < self.pending.len() {
+            if self.pending[i] == 0x07 {
+                // BEL terminator
+                let raw = self.pending[..=i].to_vec();
+                self.pending.drain(..=i);
+                return Some(InputEvent::Key {
+                    descriptor: String::new(),
+                    raw_bytes: raw,
+                });
+            }
+            if self.pending[i] == 0x1b {
+                if i + 1 < self.pending.len() {
+                    if self.pending[i + 1] == b'\\' {
+                        // ST terminator (ESC \)
+                        let raw = self.pending[..=i + 1].to_vec();
+                        self.pending.drain(..=i + 1);
+                        return Some(InputEvent::Key {
+                            descriptor: String::new(),
+                            raw_bytes: raw,
+                        });
+                    }
+                    // ESC followed by something else — malformed OSC, emit what we have
+                    let raw = self.pending[..i].to_vec();
+                    self.pending.drain(..i);
+                    return Some(InputEvent::Key {
+                        descriptor: String::new(),
+                        raw_bytes: raw,
+                    });
+                }
+                // ESC at end of buffer — need more bytes
+                return None;
+            }
+            i += 1;
+        }
+
+        // No terminator found yet — wait for more bytes
+        None
     }
 
     /// Continue collecting a bracketed paste, scanning for `ESC[201~`.
@@ -1340,5 +1405,87 @@ mod tests {
         let events = r.parse_events();
         assert_eq!(events.len(), 1);
         assert_eq!(first_paste_bytes(&events), b"\x1b[200~\x1b[201~");
+    }
+
+    // === OSC Sequences ===
+
+    #[test]
+    fn test_osc_color_response_bel_terminated() {
+        // Terminal responds to OSC 11 query with BEL terminator.
+        let mut r = reader_with_bytes(b"\x1b]11;rgb:0000/0000/0000\x07");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(first_descriptor(&events), "");
+        assert_eq!(
+            first_raw_bytes(&events),
+            b"\x1b]11;rgb:0000/0000/0000\x07"
+        );
+    }
+
+    #[test]
+    fn test_osc_color_response_st_terminated() {
+        // Terminal responds with ST (ESC \) terminator.
+        let mut r = reader_with_bytes(b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            first_raw_bytes(&events),
+            b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\"
+        );
+    }
+
+    #[test]
+    fn test_osc_incomplete_waits() {
+        // Incomplete OSC — no terminator yet.
+        let mut r = reader_with_bytes(b"\x1b]11;rgb:1234/");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 0, "Should wait for terminator");
+    }
+
+    #[test]
+    fn test_osc_split_across_reads() {
+        // OSC response arrives in two chunks.
+        let mut r = reader_with_bytes(b"\x1b]11;rgb:0000/");
+        assert_eq!(r.parse_events().len(), 0);
+
+        r.pending.extend_from_slice(b"0000/0000\x07");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            first_raw_bytes(&events),
+            b"\x1b]11;rgb:0000/0000/0000\x07"
+        );
+    }
+
+    #[test]
+    fn test_osc_followed_by_keypress() {
+        // OSC response followed by a regular keypress.
+        let mut r = reader_with_bytes(b"\x1b]12;rgb:aaaa/bbbb/cccc\x07x");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            first_raw_bytes(&events),
+            b"\x1b]12;rgb:aaaa/bbbb/cccc\x07"
+        );
+        match &events[1] {
+            InputEvent::Key { descriptor, .. } => assert_eq!(descriptor, "x"),
+            other => panic!("Expected Key event, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_multiple_osc_responses_in_one_read() {
+        // Three OSC responses batched together (common for OSC 10+11+12 probe).
+        let mut input = Vec::new();
+        input.extend_from_slice(b"\x1b]10;rgb:aaaa/bbbb/cccc\x07");
+        input.extend_from_slice(b"\x1b]11;rgb:1111/2222/3333\x07");
+        input.extend_from_slice(b"\x1b]12;rgb:4444/5555/6666\x07");
+        let mut r = reader_with_bytes(&input);
+        let events = r.parse_events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            first_raw_bytes(&events),
+            b"\x1b]10;rgb:aaaa/bbbb/cccc\x07"
+        );
     }
 }
