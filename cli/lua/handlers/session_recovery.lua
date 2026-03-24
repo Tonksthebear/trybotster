@@ -179,15 +179,7 @@ _event_sub = events.on("sessions_discovered", function(data)
                 #active_workspaces, manifest_count
             ))
         else
-            -- Fallback: no hub manifest workspaces — scan all recoverable
-            local records = ws.scan_recoverable_sessions(data_dir)
-            for _, record in ipairs(records) do
-                manifest_by_uuid[record.session_uuid] = record
-                manifest_count = manifest_count + 1
-            end
-            log.info(string.format(
-                "[session_recovery] Fallback scan: %d recoverable manifest(s) indexed",
-                manifest_count
+            log.info("[session_recovery] No active workspaces in hub manifest — nothing to recover"
             ))
         end
     end
