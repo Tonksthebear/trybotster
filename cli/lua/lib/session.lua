@@ -326,13 +326,26 @@ function Session._init(self, config)
         error(string.format("PTY spawn blocked by interceptor for %s", key))
     end
 
-    local ok, handle, broker_session_id = pcall(hub.spawn_pty_with_broker, spawn_config, session_uuid)
-    if not ok or not handle or not broker_session_id then
-        error(string.format(
-            "Failed to spawn broker-backed PTY for %s: %s",
-            key,
-            tostring(handle)
-        ))
+    -- Spawn via per-session process (preferred) or broker (legacy fallback)
+    local ok, handle
+    if hub.spawn_session then
+        ok, handle = pcall(hub.spawn_session, spawn_config, session_uuid)
+        if not ok or not handle then
+            error(string.format(
+                "Failed to spawn session process for %s: %s",
+                key, tostring(handle)
+            ))
+        end
+    else
+        local broker_session_id
+        ok, handle, broker_session_id = pcall(hub.spawn_pty_with_broker, spawn_config, session_uuid)
+        if not ok or not handle or not broker_session_id then
+            error(string.format(
+                "Failed to spawn broker-backed PTY for %s: %s",
+                key, tostring(handle)
+            ))
+        end
+        self:set_meta("broker_session_id", tostring(broker_session_id))
     end
 
     self.session = handle
@@ -345,7 +358,7 @@ function Session._init(self, config)
         session_type = session_type,
         label = self.label or "",
         workspace_id = self._workspace_id,
-        broker_session_id = broker_session_id,
+        broker_session_id = self:get_meta("broker_session_id"),
     })
     if reg_ok then
         log.info(string.format("Session %s: registered with HandleCache index %s",
@@ -354,17 +367,13 @@ function Session._init(self, config)
         log.error(string.format("Session %s: failed to register: %s", key, tostring(reg_index)))
     end
 
-    self:set_meta("broker_session_id", tostring(broker_session_id))
     -- Store PTY dimensions so recovered PTYs use real terminal size
     local dims_ok, dim_rows, dim_cols = pcall(function() return handle:dimensions() end)
     if dims_ok and dim_rows then
         self:set_meta("broker_pty_rows", tostring(dim_rows))
         self:set_meta("broker_pty_cols", tostring(dim_cols))
     end
-    log.info(string.format("Session %s: registered with broker → session %d",
-        key, broker_session_id))
-
-    -- PTY recovery source-of-truth is broker snapshot state. No file tee arming.
+    log.info(string.format("Session %s: registered (uuid=%s)", key, session_uuid))
 
     -- Register in session registry (keyed by session_uuid)
     sessions[session_uuid] = self
