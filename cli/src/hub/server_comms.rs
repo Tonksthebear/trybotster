@@ -2585,6 +2585,15 @@ impl Hub {
             log::debug!("[Lua] Aborted existing PTY forwarder for {}", forwarder_key);
         }
 
+        // Check if we should proactively probe this client for terminal theme.
+        let hub_probe_bytes = self.terminal_profiles.start_hub_probing();
+        if hub_probe_bytes.is_some() {
+            log::debug!(
+                "[PTY-PROBE] Injecting hub theme probes for peer {}",
+                &req.peer_id[..req.peer_id.len().min(8)]
+            );
+        }
+
         // Snapshot retrieval and subscription setup can block.
         // Run it inside the spawned forwarder task so Hub event processing stays
         // responsive while attach state is being prepared.
@@ -2662,6 +2671,21 @@ impl Hub {
                 snapshot,
             ) {
                 return;
+            }
+
+            // Inject hub theme probes right after snapshot so the client's
+            // terminal sees them and auto-responds with color values.
+            if let Some(probe_data) = hub_probe_bytes {
+                let mut raw_message = Vec::with_capacity(prefix.len() + probe_data.len());
+                raw_message.extend(&prefix);
+                raw_message.extend(&probe_data);
+
+                let _ = output_tx.try_send(WebRtcPtyOutput {
+                    subscription_id: subscription_id.clone(),
+                    browser_identity: peer_id.clone(),
+                    data: raw_message,
+                    session_uuid: session_uuid.clone(),
+                });
             }
 
             loop {
@@ -3175,6 +3199,12 @@ impl Hub {
             );
         }
 
+        // Check if we should proactively probe this client for terminal theme.
+        let hub_probe_bytes = self.terminal_profiles.start_hub_probing();
+        if hub_probe_bytes.is_some() {
+            log::debug!("[PTY-PROBE] Injecting hub theme probes for TUI client");
+        }
+
         // Snapshot retrieval and subscription setup may block. Fetch them in
         // the forwarder task so this handler never blocks the Hub event loop.
         let pty_for_snapshot = pty_handle.clone();
@@ -3261,6 +3291,24 @@ impl Hub {
             }
             if let Some(fd) = wake_fd {
                 super::wake_tui_pipe(fd);
+            }
+
+            // Inject hub theme probes right after snapshot so the real
+            // terminal sees them and auto-responds with color values.
+            if let Some(probe_data) = hub_probe_bytes {
+                if sink
+                    .send(TuiOutput::Output {
+                        session_uuid: session_uuid.clone(),
+                        data: probe_data,
+                    })
+                    .is_err()
+                {
+                    log::trace!("[Lua-TUI] Output channel closed before probe inject");
+                    return;
+                }
+                if let Some(fd) = wake_fd {
+                    super::wake_tui_pipe(fd);
+                }
             }
 
             loop {
@@ -3467,6 +3515,15 @@ impl Hub {
             );
         }
 
+        // Check if we should proactively probe this client for terminal theme.
+        let hub_probe_bytes = self.terminal_profiles.start_hub_probing();
+        if hub_probe_bytes.is_some() {
+            log::debug!(
+                "[PTY-PROBE] Injecting hub theme probes for socket client {}",
+                req.client_id
+            );
+        }
+
         // Snapshot retrieval and subscription setup may block. Fetch them in
         // the forwarder task so this handler never blocks the Hub event loop.
         let pty_for_snapshot = pty_handle.clone();
@@ -3561,6 +3618,15 @@ impl Hub {
                     log::trace!("[Lua-Socket] Frame channel closed before snapshot sent");
                     return;
                 }
+            }
+
+            // Inject hub theme probes right after snapshot.
+            if let Some(probe_data) = hub_probe_bytes {
+                let frame = Frame::PtyOutput {
+                    session_uuid: session_uuid.clone(),
+                    data: probe_data,
+                };
+                let _ = frame_tx.try_send(frame.encode());
             }
 
             loop {
@@ -5318,10 +5384,17 @@ mod cargo_profile_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     use crate::agent::pty::PtySession;
+
+    /// Single shared tokio runtime for all server_comms tests.
+    fn shared_test_runtime() -> Arc<tokio::runtime::Runtime> {
+        static RT: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
+        Arc::clone(RT.get_or_init(|| Arc::new(tokio::runtime::Runtime::new().unwrap())))
+    }
+
     /// Proves that nesting `block_on` inside `block_on` panics.
     ///
     /// This is the exact pattern that caused the WebRTC connection panic
@@ -5430,7 +5503,7 @@ mod tests {
         tokio::sync::mpsc::UnboundedReceiver<TuiOutput>,
     ) {
         let config = e2e_config();
-        let mut hub = Hub::new(config).unwrap();
+        let mut hub = Hub::with_runtime(config, shared_test_runtime()).unwrap();
 
         let crypto_service = create_crypto_service("test-hub");
         hub.browser.crypto_service = Some(crypto_service);

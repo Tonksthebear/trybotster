@@ -1,8 +1,15 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 const MAX_BUFFER_BYTES: usize = 512;
+
+const ALL_PROBES: [TerminalProbe; 3] = [
+    TerminalProbe::DefaultForeground,
+    TerminalProbe::DefaultBackground,
+    TerminalProbe::DefaultCursorColor,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TerminalProbe {
@@ -34,6 +41,35 @@ impl TerminalProfile {
             TerminalProbe::DefaultCursorColor => self.default_cursor_color.as_deref(),
         }
     }
+
+    fn is_complete(&self) -> bool {
+        self.default_foreground.is_some()
+            && self.default_background.is_some()
+            && self.default_cursor_color.is_some()
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        use base64::Engine;
+        let enc = base64::engine::general_purpose::STANDARD;
+        serde_json::json!({
+            "fg": self.default_foreground.as_ref().map(|b| enc.encode(b)),
+            "bg": self.default_background.as_ref().map(|b| enc.encode(b)),
+            "cursor": self.default_cursor_color.as_ref().map(|b| enc.encode(b)),
+        })
+    }
+
+    fn from_json(value: &serde_json::Value) -> Self {
+        use base64::Engine;
+        let enc = base64::engine::general_purpose::STANDARD;
+        let decode = |key: &str| -> Option<Vec<u8>> {
+            value.get(key)?.as_str().and_then(|s| enc.decode(s).ok())
+        };
+        Self {
+            default_foreground: decode("fg"),
+            default_background: decode("bg"),
+            default_cursor_color: decode("cursor"),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -42,12 +78,19 @@ pub(crate) struct TerminalProfileStore {
     pending_by_session: HashMap<String, HashSet<TerminalProbe>>,
     input_buffers: HashMap<String, Vec<u8>>,
     output_buffers: HashMap<String, Vec<u8>>,
+    /// Hub-wide terminal profile learned from the first attached client.
+    /// Used as fallback when a session has no local profile cached.
+    hub_profile: TerminalProfile,
+    /// Probes sent to a client at attach time, awaiting replies.
+    hub_pending: HashSet<TerminalProbe>,
 }
 
 impl TerminalProfileStore {
     pub(crate) fn observe_input(&mut self, session_uuid: &str, peer_id: &str, data: &[u8]) {
         let key = format!("{session_uuid}:{peer_id}");
-        if !self.pending_by_session.contains_key(session_uuid) {
+        let has_session_pending = self.pending_by_session.contains_key(session_uuid);
+        let has_hub_pending = !self.hub_pending.is_empty();
+        if !has_session_pending && !has_hub_pending {
             self.input_buffers.remove(&key);
             return;
         }
@@ -74,16 +117,20 @@ impl TerminalProfileStore {
             extract_complete_osc_sequences(buffer)
         };
 
-        let mut accepted = Vec::new();
+        let mut session_accepted = Vec::new();
+        let mut hub_accepted = Vec::new();
         for seq in sequences {
             if let Some((probe, reply)) = classify_osc_reply(&seq) {
-                let was_pending = self
+                let was_session_pending = self
                     .pending_by_session
                     .get_mut(session_uuid)
                     .map(|pending| pending.remove(&probe))
                     .unwrap_or(false);
-                if was_pending {
-                    accepted.push((probe, reply));
+                if was_session_pending {
+                    session_accepted.push((probe, reply.clone()));
+                }
+                if self.hub_pending.remove(&probe) {
+                    hub_accepted.push((probe, reply));
                 }
             }
         }
@@ -103,11 +150,17 @@ impl TerminalProfileStore {
             self.input_buffers.remove(&key);
         }
 
-        for (probe, reply) in accepted {
+        for (probe, reply) in session_accepted {
             self.profiles_by_session
                 .entry(session_uuid.to_string())
                 .or_default()
                 .store_reply(probe, reply);
+        }
+        if !hub_accepted.is_empty() {
+            for (probe, reply) in hub_accepted {
+                self.hub_profile.store_reply(probe, reply);
+            }
+            self.save_hub_profile();
         }
     }
 
@@ -142,7 +195,111 @@ impl TerminalProfileStore {
     }
 
     pub(crate) fn headless_reply(&self, session_uuid: &str, probe: TerminalProbe) -> Option<&[u8]> {
-        self.profiles_by_session.get(session_uuid)?.get_reply(probe)
+        self.profiles_by_session
+            .get(session_uuid)
+            .and_then(|p| p.get_reply(probe))
+            .or_else(|| self.hub_profile.get_reply(probe))
+    }
+
+    /// Returns OSC probe bytes to inject into a client's output stream if the
+    /// hub-level terminal profile is incomplete. Clears any stale pending state
+    /// so disconnected clients don't block future probing.
+    /// Marks returned probes as hub_pending so replies are captured by `observe_input`.
+    pub(crate) fn start_hub_probing(&mut self) -> Option<Vec<u8>> {
+        if self.hub_profile.is_complete() {
+            return None;
+        }
+        // Clear stale pending probes from a previous client that disconnected
+        // without replying. Re-probing is cheap (21 bytes) and idempotent.
+        self.hub_pending.clear();
+
+        let missing: Vec<TerminalProbe> = ALL_PROBES
+            .iter()
+            .copied()
+            .filter(|p| self.hub_profile.get_reply(*p).is_none())
+            .collect();
+
+        if missing.is_empty() {
+            return None;
+        }
+
+        let mut bytes = Vec::new();
+        for probe in &missing {
+            let code: &[u8] = match probe {
+                TerminalProbe::DefaultForeground => b"10",
+                TerminalProbe::DefaultBackground => b"11",
+                TerminalProbe::DefaultCursorColor => b"12",
+            };
+            bytes.extend_from_slice(&[ESC, b']']);
+            bytes.extend_from_slice(code);
+            bytes.extend_from_slice(&[b';', b'?', BEL]);
+        }
+
+        for probe in missing {
+            self.hub_pending.insert(probe);
+        }
+
+        Some(bytes)
+    }
+
+    /// Load a previously persisted hub profile from disk.
+    /// Called at hub startup so headless sessions can use it immediately.
+    /// Skipped in test mode to avoid cross-test pollution.
+    pub(crate) fn load_hub_profile(&mut self) {
+        if crate::env::is_test_mode() {
+            return;
+        }
+        let Some(path) = Self::hub_profile_path() else {
+            return;
+        };
+        let data = match std::fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let value: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("[PTY-PROBE] Failed to parse hub profile {}: {}", path.display(), e);
+                return;
+            }
+        };
+        self.hub_profile = TerminalProfile::from_json(&value);
+        log::info!(
+            "[PTY-PROBE] Loaded hub terminal profile from {} (complete={})",
+            path.display(),
+            self.hub_profile.is_complete()
+        );
+    }
+
+    /// Persist the hub profile to disk so it survives hub restarts.
+    /// Skipped in test mode to avoid cross-test pollution.
+    fn save_hub_profile(&self) {
+        if crate::env::is_test_mode() {
+            return;
+        }
+        let Some(path) = Self::hub_profile_path() else {
+            return;
+        };
+        let value = self.hub_profile.to_json();
+        let json = match serde_json::to_string_pretty(&value) {
+            Ok(j) => j,
+            Err(e) => {
+                log::warn!("[PTY-PROBE] Failed to serialize hub profile: {}", e);
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&path, json) {
+            log::warn!("[PTY-PROBE] Failed to write hub profile to {}: {}", path.display(), e);
+        } else {
+            log::debug!("[PTY-PROBE] Saved hub terminal profile to {}", path.display());
+        }
+    }
+
+    fn hub_profile_path() -> Option<PathBuf> {
+        crate::env::data_dir().map(|d| d.join("terminal_profile.json"))
     }
 
     pub(crate) fn clear_session(&mut self, session_uuid: &str) {
@@ -360,5 +517,168 @@ mod tests {
             store.headless_reply("sess-1", TerminalProbe::DefaultBackground),
             None
         );
+    }
+
+    // --- Hub-level proactive probing tests ---
+
+    #[test]
+    fn start_hub_probing_returns_all_three_osc_queries() {
+        let mut store = TerminalProfileStore::default();
+
+        let bytes = store.start_hub_probing().expect("should return probe bytes");
+
+        // Should contain OSC 10;? 11;? 12;?
+        assert!(bytes.windows(7).any(|w| w == b"\x1b]10;?\x07"));
+        assert!(bytes.windows(7).any(|w| w == b"\x1b]11;?\x07"));
+        assert!(bytes.windows(7).any(|w| w == b"\x1b]12;?\x07"));
+        assert_eq!(bytes.len(), 21); // 3 probes × 7 bytes each
+    }
+
+    #[test]
+    fn start_hub_probing_re_probes_after_stale_pending() {
+        let mut store = TerminalProfileStore::default();
+
+        // First call sets up pending probes
+        assert!(store.start_hub_probing().is_some());
+        // Second call clears stale pending and re-probes (client may have disconnected)
+        assert!(store.start_hub_probing().is_some(), "should re-probe after stale pending");
+    }
+
+    #[test]
+    fn start_hub_probing_returns_none_when_complete() {
+        let mut store = TerminalProfileStore::default();
+
+        // Populate hub profile by probing and replying
+        let _bytes = store.start_hub_probing();
+        store.observe_input("sess-1", "browser-a", b"\x1b]10;rgb:aaaa/bbbb/cccc\x07");
+        store.observe_input("sess-1", "browser-a", b"\x1b]11;rgb:1111/2222/3333\x07");
+        store.observe_input("sess-1", "browser-a", b"\x1b]12;rgb:4444/5555/6666\x07");
+
+        assert!(store.start_hub_probing().is_none(), "should be None when hub profile is complete");
+    }
+
+    #[test]
+    fn hub_probe_replies_captured_from_client_input() {
+        let mut store = TerminalProfileStore::default();
+
+        let _bytes = store.start_hub_probing();
+
+        // Client responds to the probes
+        store.observe_input(
+            "sess-1",
+            "browser-a",
+            b"\x1b]10;rgb:aaaa/bbbb/cccc\x07\x1b]11;rgb:1111/2222/3333\x07\x1b]12;rgb:4444/5555/6666\x07",
+        );
+
+        // Hub profile should now be populated
+        assert!(store.hub_pending.is_empty());
+        assert!(store.hub_profile.is_complete());
+    }
+
+    #[test]
+    fn headless_reply_falls_back_to_hub_profile() {
+        let mut store = TerminalProfileStore::default();
+
+        // Populate hub profile
+        let _bytes = store.start_hub_probing();
+        store.observe_input(
+            "sess-1",
+            "browser-a",
+            b"\x1b]11;rgb:1111/2222/3333\x07",
+        );
+
+        // A different session with no local profile should get hub fallback
+        assert_eq!(
+            store.headless_reply("sess-new", TerminalProbe::DefaultBackground),
+            Some(b"\x1b]11;rgb:1111/2222/3333\x07".as_slice())
+        );
+    }
+
+    #[test]
+    fn session_profile_takes_precedence_over_hub_profile() {
+        let mut store = TerminalProfileStore::default();
+
+        // Populate hub profile
+        let _bytes = store.start_hub_probing();
+        store.observe_input(
+            "sess-1",
+            "browser-a",
+            b"\x1b]11;rgb:1111/2222/3333\x07",
+        );
+
+        // Populate session-local profile with a different color
+        store.observe_output("sess-2", b"\x1b]11;?\x07", true);
+        store.observe_input(
+            "sess-2",
+            "browser-b",
+            b"\x1b]11;rgb:ffff/ffff/ffff\x07",
+        );
+
+        // Session-local should win
+        assert_eq!(
+            store.headless_reply("sess-2", TerminalProbe::DefaultBackground),
+            Some(b"\x1b]11;rgb:ffff/ffff/ffff\x07".as_slice())
+        );
+    }
+
+    #[test]
+    fn clear_session_does_not_clear_hub_profile() {
+        let mut store = TerminalProfileStore::default();
+
+        // Populate hub profile via sess-1
+        let _bytes = store.start_hub_probing();
+        store.observe_input(
+            "sess-1",
+            "browser-a",
+            b"\x1b]11;rgb:1111/2222/3333\x07",
+        );
+
+        store.clear_session("sess-1");
+
+        // Hub profile should survive session cleanup
+        assert_eq!(
+            store.headless_reply("sess-other", TerminalProbe::DefaultBackground),
+            Some(b"\x1b]11;rgb:1111/2222/3333\x07".as_slice())
+        );
+    }
+
+    #[test]
+    fn hub_probe_replies_split_across_chunks() {
+        let mut store = TerminalProfileStore::default();
+        let _bytes = store.start_hub_probing();
+
+        // Reply arrives split across two chunks
+        store.observe_input("sess-1", "browser-a", b"\x1b]11;rgb:0000/");
+        store.observe_input("sess-1", "browser-a", b"0000/0000\x07");
+
+        assert_eq!(
+            store.hub_profile.get_reply(TerminalProbe::DefaultBackground),
+            Some(b"\x1b]11;rgb:0000/0000/0000\x07".as_slice())
+        );
+    }
+
+    #[test]
+    fn start_hub_probing_only_probes_missing_entries() {
+        let mut store = TerminalProfileStore::default();
+
+        // First round: probe all 3
+        let _bytes = store.start_hub_probing();
+        // Reply to 2 of 3
+        store.observe_input(
+            "sess-1",
+            "browser-a",
+            b"\x1b]10;rgb:aaaa/bbbb/cccc\x07\x1b]11;rgb:1111/2222/3333\x07",
+        );
+
+        // hub_pending should still have cursor color
+        assert!(store.hub_pending.is_empty() || store.hub_pending.contains(&TerminalProbe::DefaultCursorColor));
+
+        // Clear pending so we can re-probe for the missing one
+        store.hub_pending.clear();
+        let bytes = store.start_hub_probing().expect("should probe for missing cursor color");
+        assert!(bytes.windows(7).any(|w| w == b"\x1b]12;?\x07"));
+        // Should NOT re-probe already-answered ones
+        assert!(!bytes.windows(7).any(|w| w == b"\x1b]10;?\x07"));
+        assert!(!bytes.windows(7).any(|w| w == b"\x1b]11;?\x07"));
     }
 }
