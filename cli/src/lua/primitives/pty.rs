@@ -143,6 +143,14 @@ pub struct PtySessionHandle {
     /// broker instead of the local shadow screen. (`cursor_visible()` reads
     /// directly from an `AtomicBool` — no RPC needed.)
     broker_relay: Arc<std::sync::OnceLock<(u32, SharedBrokerConnection)>>,
+
+    /// Per-session process connection.
+    ///
+    /// Set by `hub.spawn_session()` before the handle is registered.
+    /// When present, `register_session` uses this to create a session-backed
+    /// PtyHandle and install a reader thread.
+    session_connection:
+        Arc<std::sync::OnceLock<crate::session::connection::SharedSessionConnection>>,
 }
 
 impl std::fmt::Debug for PtySessionHandle {
@@ -214,6 +222,7 @@ impl PtySessionHandle {
             hub_event_tx,
             last_output_at: Arc::new(AtomicU64::new(0)),
             broker_relay: Arc::new(std::sync::OnceLock::new()),
+            session_connection: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -224,6 +233,47 @@ impl PtySessionHandle {
     /// shadow screen.
     pub fn set_broker_relay(&self, relay: (u32, SharedBrokerConnection)) {
         let _ = self.broker_relay.set(relay);
+    }
+
+    /// Store the session connection for per-session-process I/O.
+    pub fn set_session_connection(
+        &self,
+        conn: crate::session::connection::SharedSessionConnection,
+    ) {
+        let _ = self.session_connection.set(conn);
+    }
+
+    /// Get the session connection, if set.
+    pub fn get_session_connection(
+        &self,
+    ) -> Option<&crate::session::connection::SharedSessionConnection> {
+        self.session_connection.get()
+    }
+
+    /// Create a session-process-backed `PtyHandle`.
+    ///
+    /// Routes write/resize through the session socket. Snapshots use the
+    /// local shadow screen (fed by the reader thread).
+    #[must_use]
+    pub fn to_pty_handle_with_session(
+        &self,
+        session_connection: crate::session::connection::SharedSessionConnection,
+    ) -> crate::hub::agent_handle::PtyHandle {
+        crate::hub::agent_handle::PtyHandle::new_with_session(
+            self.event_tx.clone(),
+            Arc::clone(&self.shadow_screen),
+            Arc::clone(&self.kitty_enabled),
+            Arc::clone(&self.cursor_visible),
+            Arc::clone(&self.resize_pending),
+            true, // session-process PTYs are always CLI sessions
+            self.port,
+            session_connection,
+            Arc::clone(&self.last_output_at),
+            self.shared_state
+                .lock()
+                .map(|s| Arc::clone(&s.last_human_input_ms))
+                .unwrap_or_else(|_| Arc::new(std::sync::atomic::AtomicI64::new(0))),
+        )
     }
 
     /// Create a broker-backed `PtyHandle`.
@@ -863,6 +913,7 @@ pub(crate) fn spawn_session_handle_from_opts(
         hub_event_tx,
         last_output_at: Arc::new(AtomicU64::new(0)),
         broker_relay: Arc::new(std::sync::OnceLock::new()),
+        session_connection: Arc::new(std::sync::OnceLock::new()),
     })
 }
 
@@ -1546,6 +1597,7 @@ mod tests {
             hub_event_tx: crate::lua::primitives::new_hub_event_sender(),
             last_output_at: Arc::new(AtomicU64::new(0)),
             broker_relay: Arc::new(std::sync::OnceLock::new()),
+            session_connection: Arc::new(std::sync::OnceLock::new()),
         }
     }
 

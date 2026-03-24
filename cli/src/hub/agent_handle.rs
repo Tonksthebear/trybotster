@@ -842,6 +842,36 @@ impl PtyHandle {
     pub fn last_output_at_atomic(&self) -> &Arc<AtomicU64> {
         &self.last_output_at
     }
+
+    /// Arc accessor for shadow screen (session reader thread needs this).
+    #[must_use]
+    pub fn shadow_screen(&self) -> Arc<Mutex<AlacrittyParser<HubEventListener>>> {
+        Arc::clone(&self.shadow_screen)
+    }
+
+    /// Clone the event broadcast sender.
+    #[must_use]
+    pub fn event_tx_clone(&self) -> broadcast::Sender<PtyEvent> {
+        self.event_tx.clone()
+    }
+
+    /// Arc accessor for kitty_enabled flag.
+    #[must_use]
+    pub fn kitty_enabled_arc(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.kitty_enabled)
+    }
+
+    /// Arc accessor for cursor_visible flag.
+    #[must_use]
+    pub fn cursor_visible_arc(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cursor_visible)
+    }
+
+    /// Arc accessor for resize_pending flag.
+    #[must_use]
+    pub fn resize_pending_arc(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.resize_pending)
+    }
 }
 
 #[cfg(test)]
