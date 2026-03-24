@@ -278,6 +278,32 @@ impl<L: EventListener> AlacrittyParser<L> {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// Whether the alternate screen buffer is active (`\x1b[?1049h`).
+    pub fn alt_screen_active(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Mouse tracking mode as a bitmask.
+    ///
+    /// 0 = off, nonzero = some combination of click/motion/any tracking.
+    pub fn mouse_mode(&self) -> u8 {
+        let mode = self.term.mode();
+        let mut flags = 0u8;
+        if mode.intersects(TermMode::MOUSE_REPORT_CLICK) {
+            flags |= 1;
+        }
+        if mode.intersects(TermMode::MOUSE_MOTION) {
+            flags |= 2;
+        }
+        if mode.intersects(TermMode::MOUSE_DRAG) {
+            flags |= 4;
+        }
+        if mode.intersects(TermMode::SGR_MOUSE) {
+            flags |= 8;
+        }
+        flags
+    }
+
     /// Extract a plain-text representation of the visible grid contents.
     ///
     /// Walks every cell in the viewport and collects characters into a string

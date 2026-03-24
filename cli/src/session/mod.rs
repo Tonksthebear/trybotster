@@ -145,6 +145,9 @@ pub struct SpawnConfig {
     pub cwd: Option<String>,
     pub rows: u16,
     pub cols: u16,
+    /// Commands to write to PTY stdin after child spawns (e.g., "source init.sh").
+    #[serde(default)]
+    pub init_commands: Vec<String>,
     pub tee_path: Option<String>,
     pub tee_cap: u64,
 }
@@ -311,14 +314,16 @@ fn run_session(
             .and_then(|p| Tee::new(Path::new(p), config.tee_cap).ok()),
     ));
 
-    // Writer thread
+    // Writer thread — owns the writer and master_pty (for resize ioctl)
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<PtyWriteCommand>(64);
     let parser_for_writer = Arc::clone(&parser);
     let resize_pending_writer = Arc::clone(&resize_pending);
+    let master_pty = pair.master;
+    let init_commands = config.init_commands.clone();
     let _writer_thread = thread::Builder::new()
         .name("session-writer".to_string())
         .spawn(move || {
-            pty_writer_loop(writer, parser_for_writer, resize_pending_writer, writer_rx);
+            pty_writer_loop(writer, master_pty, parser_for_writer, resize_pending_writer, init_commands, writer_rx);
         })
         .context("spawn writer thread")?;
 
@@ -549,8 +554,8 @@ fn handle_hub_frame(
                     kitty_enabled: p.kitty_enabled(),
                     cursor_visible: !p.cursor_hidden(),
                     bracketed_paste: p.bracketed_paste(),
-                    mouse_mode: 0, // TODO: expose from AlacrittyParser
-                    alt_screen: false, // TODO: expose from AlacrittyParser
+                    mouse_mode: p.mouse_mode(),
+                    alt_screen: p.alt_screen_active(),
                 })
                 .unwrap_or_default();
             if let Ok(response) = encode_json(FRAME_MODE_FLAGS, &flags) {
@@ -657,12 +662,34 @@ fn reader_loop(
 // ─── Writer loop ─────────────────────────────────────────────────────────────
 
 /// Receive commands from hub, write input / apply resize to PTY.
+///
+/// Owns the master PTY for resize ioctl and the writer for stdin.
+/// Writes init_commands to the PTY immediately on start.
 fn pty_writer_loop(
     mut writer: Box<dyn Write + Send>,
+    master_pty: Box<dyn portable_pty::MasterPty + Send>,
     parser: Arc<Mutex<AlacrittyParser<SessionEventListener>>>,
     resize_pending: Arc<AtomicBool>,
+    init_commands: Vec<String>,
     rx: std::sync::mpsc::Receiver<PtyWriteCommand>,
 ) {
+    // Write init commands (e.g., "source init.sh") to PTY stdin
+    for cmd in &init_commands {
+        let line = if cmd.ends_with('\n') {
+            cmd.clone()
+        } else {
+            format!("{cmd}\n")
+        };
+        if let Err(e) = writer.write_all(line.as_bytes()) {
+            log::warn!("[session] init command write error: {e}");
+            break;
+        }
+    }
+    if !init_commands.is_empty() {
+        let _ = writer.flush();
+        log::info!("[session] wrote {} init command(s)", init_commands.len());
+    }
+
     while let Ok(cmd) = rx.recv() {
         match cmd {
             PtyWriteCommand::Input(data) => {
@@ -680,13 +707,19 @@ fn pty_writer_loop(
                     final_cols = c;
                 }
                 resize_pending.store(true, Ordering::Release);
+                // Resize the actual PTY (sends SIGWINCH to child)
+                if let Err(e) = master_pty.resize(portable_pty::PtySize {
+                    rows: final_rows,
+                    cols: final_cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                }) {
+                    log::warn!("[session] PTY resize ioctl failed: {e}");
+                }
+                // Resize the parser to match
                 if let Ok(mut p) = parser.lock() {
                     p.resize(final_rows, final_cols);
                 }
-                // Note: the actual PTY resize ioctl happens through portable_pty's
-                // MasterPty::resize — but we only have the writer here. The resize
-                // needs the master_pty. This is a TODO that needs the master_pty
-                // passed to the writer loop or resize handled on the main thread.
                 log::debug!("[session] resize to {}x{}", final_cols, final_rows);
             }
             PtyWriteCommand::Shutdown => break,
