@@ -8,18 +8,17 @@
 //!
 //! ```text
 //! PtySession (owns I/O, broadcasts events)
-//!  ├── master_pty: MasterPty (for resizing + FD transfer to broker)
+//!  ├── master_pty: MasterPty (for resizing)
 //!  ├── writer: Write (for input)
 //!  ├── child: Child (spawned process)
 //!  ├── shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>
 //!  └── event_tx: broadcast::Sender<PtyEvent> (output + notification broadcast)
 //! ```
 //!
-//! Output reaches the Hub exclusively via the broker: the broker holds the
-//! PTY master FD (transferred via SCM_RIGHTS), reads raw bytes, and forwards
-//! them as `BrokerPtyOutput` frames. The Hub calls
-//! [`PtyHandle::feed_broker_output`](crate::hub::agent_handle::PtyHandle::feed_broker_output)
-//! which processes bytes through [`crate::agent::spawn::process_pty_bytes`].
+//! Output reaches the Hub via per-session processes: each session process
+//! holds its PTY master FD, reads raw bytes, and forwards them over its
+//! Unix socket. The session reader thread feeds the Hub's shadow screen
+//! and broadcasts `PtyEvent::Output` to subscribers.
 //!
 //! # Shadow Terminal (zmx pattern)
 //!
