@@ -1161,6 +1161,30 @@ impl Hub {
                 }
             }
 
+            // Per-session process exited or disconnected.
+            // The reader thread already broadcasts PtyEvent directly, so we
+            // just need to notify Lua for cleanup (same as broker_pty_exited).
+            HubEvent::SessionProcessExited {
+                session_uuid,
+                exit_code,
+            } => {
+                log::info!(
+                    "[Session] ProcessExited uuid='{}' exit={:?}",
+                    session_uuid,
+                    exit_code
+                );
+                if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
+                    session_handle.pty().notify_process_exited(exit_code);
+                }
+                let data = serde_json::json!({
+                    "session_uuid": session_uuid,
+                    "exit_code": exit_code,
+                });
+                if let Err(e) = self.lua.fire_json_event("session_process_exited", &data) {
+                    log::error!("[Session] Failed to fire session_process_exited event: {e}");
+                }
+            }
+
             HubEvent::SessionUnregistered { session_uuid } => {
                 let before = self.broker_sessions.len();
                 self.broker_sessions.retain(|_, uuid| uuid != &session_uuid);
