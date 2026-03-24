@@ -261,6 +261,12 @@ pub struct PtyHandle {
     /// Runtime handles must always be broker-backed. `None` exists only for
     /// test-only local PTY fixtures.
     broker_relay: Option<BrokerRelay>,
+
+    /// Per-session process connection for write/resize commands.
+    ///
+    /// When set, this handle routes I/O through the session process socket
+    /// instead of the broker. Takes priority over `broker_relay`.
+    session_connection: Option<crate::session::connection::SharedSessionConnection>,
 }
 
 #[derive(Clone)]
@@ -353,6 +359,7 @@ impl PtyHandle {
             port,
             last_cursor_visible: Arc::new(Mutex::new(Some(true))),
             broker_relay: None,
+            session_connection: None,
         }
     }
 
@@ -389,7 +396,53 @@ impl PtyHandle {
                 session_id,
                 connection,
             }),
+            session_connection: None,
         }
+    }
+
+    /// Create a session-process-backed PTY handle.
+    ///
+    /// The reader thread (installed on the session connection) feeds the shadow
+    /// screen and broadcasts output directly. This constructor just wires up
+    /// the connection for write/resize commands.
+    #[must_use]
+    pub fn new_with_session(
+        event_tx: broadcast::Sender<PtyEvent>,
+        shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
+        kitty_enabled: Arc<AtomicBool>,
+        cursor_visible: Arc<AtomicBool>,
+        resize_pending: Arc<AtomicBool>,
+        detect_notifs: bool,
+        port: Option<u16>,
+        session_connection: crate::session::connection::SharedSessionConnection,
+        last_output_at: Arc<AtomicU64>,
+        last_human_input_ms: Arc<std::sync::atomic::AtomicI64>,
+    ) -> Self {
+        Self {
+            event_tx,
+            shared_state: Arc::new(Mutex::new(SharedPtyState {
+                master_pty: None,
+                writer: None,
+                dimensions: (24, 80), // updated by reader thread on first output
+                last_human_input_ms,
+            })),
+            shadow_screen,
+            kitty_enabled,
+            cursor_visible,
+            resize_pending,
+            detect_notifs,
+            last_output_at,
+            last_cursor_visible: Arc::new(Mutex::new(Some(true))),
+            port,
+            broker_relay: None,
+            session_connection: Some(session_connection),
+        }
+    }
+
+    /// Whether this handle is session-process-backed (not broker).
+    #[must_use]
+    pub fn is_session_backed(&self) -> bool {
+        self.session_connection.is_some()
     }
 
     /// Subscribe to PTY events.
@@ -426,10 +479,16 @@ impl PtyHandle {
         let kitty_enabled = self.kitty_enabled.load(Ordering::Relaxed);
         let (rows, cols) = self.dims();
 
-        // Subscribe FIRST so no output is lost during broker RPC.
+        // Subscribe FIRST so no output is lost during snapshot generation.
         let rx = self.event_tx.subscribe();
 
-        // Broker-backed sessions fetch snapshot from the authoritative source.
+        // Session-process path: local shadow screen is authoritative.
+        if self.session_connection.is_some() {
+            let snapshot = self.get_snapshot_cached();
+            return (snapshot, kitty_enabled, rows, cols, rx);
+        }
+
+        // Broker-backed sessions fetch snapshot from the broker's parser.
         if self.broker_relay.is_some() {
             let snapshot = self.get_snapshot();
             return (snapshot, kitty_enabled, rows, cols, rx);
@@ -504,6 +563,12 @@ impl PtyHandle {
     /// the snapshot clears the screen; the app redraws on SIGWINCH.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
+        // Session-process path: hub's shadow screen is the authority
+        if self.session_connection.is_some() {
+            return self.get_snapshot_cached();
+        }
+
+        // Broker path (legacy): fetch from broker's parser
         if let Some(relay) = &self.broker_relay {
             match relay.connection.lock() {
                 Ok(mut guard) => {
@@ -578,6 +643,22 @@ impl PtyHandle {
                 .store(now, std::sync::atomic::Ordering::Relaxed);
         }
 
+        // Session-process path: write directly to session socket
+        if let Some(ref conn) = self.session_connection {
+            drop(state);
+            let mut guard = conn
+                .lock()
+                .map_err(|_| "session connection lock poisoned".to_string())?;
+            let session = guard
+                .as_mut()
+                .ok_or_else(|| "Session connection not available".to_string())?;
+            session
+                .write_input(data)
+                .map_err(|e| format!("Failed to write PTY input via session: {e}"))?;
+            return Ok(());
+        }
+
+        // Broker path (legacy)
         if let Some(relay) = &self.broker_relay {
             drop(state);
             let mut guard = relay
@@ -643,6 +724,28 @@ impl PtyHandle {
     /// Unconditionally resizes the PTY and shadow screen. Lua is the trusted
     /// coordinator — client-level ownership is managed there, not in the PTY.
     pub fn resize_direct(&self, rows: u16, cols: u16) {
+        // Session-process path
+        if let Some(ref conn) = self.session_connection {
+            if let Ok(mut guard) = conn.lock() {
+                if let Some(session) = guard.as_mut() {
+                    if let Err(e) = session.resize(rows, cols) {
+                        log::warn!("Failed to resize PTY via session: {e}");
+                        return;
+                    }
+                }
+            }
+            do_resize(
+                rows,
+                cols,
+                &self.shared_state,
+                &self.shadow_screen,
+                &self.event_tx,
+                &self.resize_pending,
+            );
+            return;
+        }
+
+        // Broker path (legacy)
         let Some(relay) = &self.broker_relay else {
             #[cfg(test)]
             {
@@ -659,7 +762,7 @@ impl PtyHandle {
 
             #[cfg(not(test))]
             {
-                log::warn!("resize_direct invariant violated: missing broker relay");
+                log::warn!("resize_direct invariant violated: missing relay");
                 return;
             }
         };
