@@ -628,20 +628,32 @@ pub(crate) fn register(
                         LuaError::runtime(format!("spawn_session: current_exe: {e}"))
                     })?;
                     let socket_str = socket_path.display().to_string();
-                    match std::process::Command::new(&exe)
-                        .args([
-                            "session",
-                            "--uuid",
-                            &session_uuid,
-                            "--socket",
-                            &socket_str,
-                            "--timeout",
-                            "120",
-                        ])
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
+                    use std::os::unix::process::CommandExt;
+
+                    // SAFETY: pre_exec closure runs after fork, before exec.
+                    // setsid() creates a new session so the child survives hub exit.
+                    match unsafe {
+                        std::process::Command::new(&exe)
+                            .args([
+                                "session",
+                                "--uuid",
+                                &session_uuid,
+                                "--socket",
+                                &socket_str,
+                                "--timeout",
+                                "120",
+                            ])
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .pre_exec(|| {
+                                if libc::setsid() == -1 {
+                                    return Err(std::io::Error::last_os_error());
+                                }
+                                Ok(())
+                            })
+                            .spawn()
+                    }
                     {
                         Ok(child) => {
                             ::log::info!(
