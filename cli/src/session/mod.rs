@@ -23,6 +23,8 @@
 
 pub mod connection;
 pub mod protocol;
+#[cfg(test)]
+mod tests;
 
 use std::io::{self, Read, Write};
 use std::os::unix::io::{FromRawFd, RawFd};
