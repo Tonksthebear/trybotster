@@ -315,6 +315,27 @@ pub(crate) fn register(
                                             "[Lua] Failed to install session reader for '{}': {e}",
                                             session_uuid
                                         );
+                                    } else {
+                                        // Reader installed — request initial snapshot to populate shadow screen.
+                                        // This gives the TUI immediate content on reconnect.
+                                        match session_conn.get_snapshot() {
+                                            Ok(snapshot) if !snapshot.is_empty() => {
+                                                if let Ok(mut screen) = pty.shadow_screen().lock() {
+                                                    screen.process(&snapshot);
+                                                }
+                                                log::info!(
+                                                    "[Lua] Replayed {} bytes of session snapshot for '{}'",
+                                                    snapshot.len(),
+                                                    &session_uuid[..session_uuid.len().min(16)]
+                                                );
+                                            }
+                                            Ok(_) => {
+                                                log::debug!("[Lua] Empty snapshot for '{}'", &session_uuid[..session_uuid.len().min(16)]);
+                                            }
+                                            Err(e) => {
+                                                log::warn!("[Lua] Snapshot replay failed for '{}': {e}", &session_uuid[..session_uuid.len().min(16)]);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -838,6 +859,55 @@ pub(crate) fn register(
 
         hub.set("spawn_session", spawn_session_fn)
             .map_err(|e| anyhow!("Failed to set hub.spawn_session: {e}"))?;
+    }
+
+    // hub.connect_session(session_uuid, socket_path) → PtySessionHandle
+    //
+    // Connects to an existing session process socket for recovery.
+    // Returns a PtySessionHandle with the session connection attached.
+    // The caller then passes this to hub.register_session() which installs
+    // the reader thread and creates the PtyHandle.
+    {
+        let tx_connect = hub_event_tx.clone();
+        let connect_session_fn = lua
+            .create_function(
+                move |_, (session_uuid, socket_path): (String, String)| {
+                    use crate::session::connection::SessionConnection;
+
+                    let path = std::path::Path::new(&socket_path);
+                    let conn = SessionConnection::connect(path).map_err(|e| {
+                        LuaError::runtime(format!(
+                            "connect_session('{}'): {e}",
+                            &session_uuid[..session_uuid.len().min(16)]
+                        ))
+                    })?;
+
+                    let rows = conn.metadata.rows;
+                    let cols = conn.metadata.cols;
+
+                    let shared_conn: crate::session::connection::SharedSessionConnection =
+                        std::sync::Arc::new(std::sync::Mutex::new(Some(conn)));
+
+                    use crate::lua::primitives::pty::PtySessionHandle;
+                    let handle = PtySessionHandle::new_broker_backed(
+                        rows,
+                        cols,
+                        std::sync::Arc::clone(&tx_connect),
+                    );
+                    handle.set_session_connection(shared_conn);
+
+                    ::log::info!(
+                        "[Session] recovery connect for '{}'",
+                        &session_uuid[..session_uuid.len().min(16)]
+                    );
+
+                    Ok(handle)
+                },
+            )
+            .map_err(|e| anyhow!("Failed to create hub.connect_session function: {e}"))?;
+
+        hub.set("connect_session", connect_session_fn)
+            .map_err(|e| anyhow!("Failed to set hub.connect_session: {e}"))?;
     }
 
     // hub.pty_tee(session_id, log_path, cap_bytes) → true | nil
