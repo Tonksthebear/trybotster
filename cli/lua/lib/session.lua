@@ -614,12 +614,15 @@ function Session:_sync_session_manifest()
     manifest.notification   = nil
     manifest.is_idle        = nil
 
+    log.info(string.format("Session %s: writing manifest to %s/workspaces/%s/sessions/%s/manifest.json",
+        self.session_uuid, tostring(self._data_dir), tostring(self._workspace_id), self.session_uuid))
     local ok, err = pcall(ws.write_session,
         self._data_dir, self._workspace_id, self.session_uuid, manifest)
     if not ok then
         log.warn(string.format("Failed to sync session manifest: %s", tostring(err)))
         return
     end
+    log.info(string.format("Session %s: manifest written", self.session_uuid))
     pcall(ws.refresh_workspace_status, self._data_dir, self._workspace_id)
 end
 
