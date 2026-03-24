@@ -918,6 +918,11 @@ function Session:build_env(base_env)
     if self.target_path then env.BOTSTER_TARGET_PATH = self.target_path end
     if self.target_repo then env.BOTSTER_TARGET_REPO = self.target_repo end
     env.BOTSTER_SESSION_UUID = self.session_uuid
+    -- Ensure child processes (e.g., botster mcp-serve) use the same data directory
+    -- as the hub, even if the PATH botster binary is a different build variant.
+    if self._data_dir then
+        env.BOTSTER_CONFIG_DIR = self._data_dir
+    end
     env.BOTSTER_HUB_ID = hub.server_id() or ""
     local local_hub_id = hub.hub_id and hub.hub_id() or nil
     if local_hub_id and hub_discovery and hub_discovery.socket_path then
