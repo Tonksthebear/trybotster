@@ -560,7 +560,8 @@ impl PtyHandle {
     /// Unconditionally resizes the PTY and shadow screen. Lua is the trusted
     /// coordinator — client-level ownership is managed there, not in the PTY.
     pub fn resize_direct(&self, rows: u16, cols: u16) {
-        // Session-process path
+        // Session-process path: send resize to session, resize shadow screen
+        // in-place (reflow, don't wipe), update dimensions.
         if let Some(ref conn) = self.session_connection {
             if let Ok(mut guard) = conn.lock() {
                 if let Some(session) = guard.as_mut() {
@@ -570,14 +571,17 @@ impl PtyHandle {
                     }
                 }
             }
-            do_resize(
-                rows,
-                cols,
-                &self.shared_state,
-                &self.shadow_screen,
-                &self.event_tx,
-                &self.resize_pending,
-            );
+            // Resize the shadow screen parser in-place — alacritty reflows
+            // content instead of clearing. This preserves the snapshot.
+            if let Ok(mut p) = self.shadow_screen.lock() {
+                p.resize(rows, cols);
+            }
+            // Update shared dimensions
+            if let Ok(mut state) = self.shared_state.lock() {
+                state.dimensions = (rows, cols);
+            }
+            self.resize_pending.store(true, Ordering::Release);
+            let _ = self.event_tx.send(PtyEvent::resized(rows, cols));
             return;
         }
 
