@@ -210,12 +210,12 @@ pub(crate) fn register(
                     _ => None,
                 };
 
-                // Grab event_tx + ghost flag before consuming the handle
-                let (event_tx_clone, is_ghost) = {
+                // Grab event_tx + recovered flag before consuming the handle
+                let (event_tx_clone, is_recovered) = {
                     let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
                         LuaError::runtime(format!("register_session: not a PtySessionHandle: {e}"))
                     })?;
-                    (handle.event_tx(), handle.is_ghost())
+                    (handle.event_tx(), handle.is_recovered())
                 };
 
                 let pty_handle: PtyHandle = {
@@ -263,10 +263,10 @@ pub(crate) fn register(
                     index
                 );
 
-                // Ghost sessions skip the spawn path which normally creates a
+                // Recovered sessions skip the spawn path which normally creates a
                 // notification watcher. Spawn one now so title/CWD/bell events
                 // from the broker reach Lua hooks.
-                if is_ghost {
+                if is_recovered {
                     let session_name: String = metadata
                         .get("session_name")
                         .unwrap_or_else(|_| session_type_str.clone());
@@ -736,10 +736,10 @@ pub(crate) fn register(
             .map_err(|e| anyhow!("Failed to set hub.get_pty_snapshot_from_broker: {e}"))?;
     }
 
-    // hub.create_ghost_session(session_uuid, session_id, rows, cols)
+    // hub.create_recovered_session(session_uuid, session_id, rows, cols)
     //   → PtySessionHandle userdata
     //
-    // Creates a lightweight PTY handle for Hub restart recovery.
+    // Creates a broker-backed PTY handle for Hub restart recovery.
     // No real PTY process or PtySession is spawned — only a zero-scrollback
     // parser, broadcast channel, and AtomicBools are created. Terminal state
     // queries route through broker RPCs once registered.
@@ -747,29 +747,28 @@ pub(crate) fn register(
     // Also fires HubEvent::BrokerSessionRegistered so the Hub's
     // broker_sessions routing table maps session_id → session_uuid.
     // BrokerPtyOutput frames then route to the correct HandleCache entry once
-    // the caller registers the ghost handle via hub.register_session().
+    // the caller registers the handle via hub.register_session().
     //
     // Arguments:
     //   session_uuid: string  — session UUID (e.g. "sess-1234567890-abcdef")
-    //   session_id:   integer — broker session ID from context.json metadata
-    //   rows:         integer — terminal rows saved in context.json metadata
-    //   cols:         integer — terminal cols saved in context.json metadata
+    //   session_id:   integer — broker session ID from session manifest
+    //   rows:         integer — terminal rows saved in session manifest
+    //   cols:         integer — terminal cols saved in session manifest
     {
-        let tx_ghost = Arc::clone(&hub_event_tx);
-        let create_ghost_fn = lua
+        let tx_recovered = Arc::clone(&hub_event_tx);
+        let create_recovered_fn = lua
             .create_function(
                 move |_, (session_uuid, session_id, rows, cols): (String, u32, u16, u16)| {
                     use crate::lua::primitives::pty::PtySessionHandle;
 
-                    // Create a lightweight ghost handle — no PtySession, zero-scrollback
-                    // parser. Broker RPCs serve all terminal state.
-                    let handle = PtySessionHandle::new_ghost(rows, cols, Arc::clone(&tx_ghost));
+                    let handle =
+                        PtySessionHandle::new_broker_backed(rows, cols, Arc::clone(&tx_recovered));
 
                     // Register the broker session_id → session_uuid mapping
                     // so BrokerPtyOutput frames route correctly once the caller calls
                     // hub.register_session() to populate HandleCache.
                     {
-                        let guard = tx_ghost.lock().expect("HubEventSender mutex poisoned");
+                        let guard = tx_recovered.lock().expect("HubEventSender mutex poisoned");
                         if let Some(ref sender) = *guard {
                             let _ = sender.send(HubEvent::BrokerSessionRegistered {
                                 session_id,
@@ -779,7 +778,7 @@ pub(crate) fn register(
                     }
 
                     ::log::info!(
-                        "[Broker] Created ghost session '{}' session={}",
+                        "[Broker] Created recovered session '{}' session={}",
                         session_uuid,
                         session_id
                     );
@@ -787,10 +786,10 @@ pub(crate) fn register(
                     Ok(handle)
                 },
             )
-            .map_err(|e| anyhow!("Failed to create hub.create_ghost_session function: {e}"))?;
+            .map_err(|e| anyhow!("Failed to create hub.create_recovered_session function: {e}"))?;
 
-        hub.set("create_ghost_session", create_ghost_fn)
-            .map_err(|e| anyhow!("Failed to set hub.create_ghost_session: {e}"))?;
+        hub.set("create_recovered_session", create_recovered_fn)
+            .map_err(|e| anyhow!("Failed to set hub.create_recovered_session: {e}"))?;
     }
 
     // hub.quit() - Request Hub shutdown (broker kills PTYs immediately).
@@ -841,7 +840,7 @@ pub(crate) fn register(
     // The Hub process replaces itself (execv) with a fresh instance of the same
     // binary using the same arguments.  This is the correct primitive for the
     // TUI "restart_hub" action: the broker stays alive during the reconnect
-    // window, the new Hub picks up ghost agents on startup, and the user sees
+    // window, the new Hub recovers agents on startup, and the user sees
     // their agents restored without manual intervention.
     //
     // Contrast with hub.graceful_restart(), which quits the Hub cleanly but
@@ -956,7 +955,7 @@ mod tests {
 
         lua.load(
             r#"
-            local h = hub.create_ghost_session("sess-relay", 77, 24, 80)
+            local h = hub.create_recovered_session("sess-relay", 77, 24, 80)
             hub.register_session("sess-relay", h, {
                 session_type = "agent",
                 label = "relay-agent",
@@ -965,7 +964,7 @@ mod tests {
         "#,
         )
         .exec()
-        .expect("register broker-backed ghost session");
+        .expect("register broker-backed recovered session");
 
         let handle = cache
             .get_session("sess-relay")
@@ -973,7 +972,7 @@ mod tests {
         let err = handle
             .pty()
             .write_input_direct(b"x")
-            .expect_err("ghost writes should fail when broker connection is absent");
+            .expect_err("recovered session writes should fail when broker connection is absent");
         assert!(
             err.contains("Broker connection not available"),
             "expected broker relay path error, got: {err}"
@@ -990,10 +989,10 @@ mod tests {
         let err = lua
             .load(
                 r#"
-            local h = hub.create_ghost_session("sess-no-relay", 88, 24, 80)
+            local h = hub.create_recovered_session("sess-no-relay", 88, 24, 80)
             hub.register_session("sess-no-relay", h, {
                 session_type = "agent",
-                label = "plain-ghost",
+                label = "plain-recovered",
             })
         "#,
             )
