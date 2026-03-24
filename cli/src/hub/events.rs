@@ -289,6 +289,19 @@ pub(crate) enum HubEvent {
         exit_code: Option<i32>,
     },
 
+    /// A per-session process has exited or disconnected.
+    ///
+    /// Sent by the session reader thread when the session socket closes
+    /// (child process exited) or the reader detects a `ProcessExited` frame.
+    /// The hub routes this to the appropriate session's `PtyEvent` broadcast
+    /// channel and notifies Lua via the `process_exited` hook.
+    SessionProcessExited {
+        /// Session UUID identifying the session.
+        session_uuid: String,
+        /// Exit code, or `None` if killed by signal or socket EOF.
+        exit_code: Option<i32>,
+    },
+
     /// A terminal event forwarded from the broker's alacritty parser.
     ///
     /// Sent when the broker's parser fires `Event::Title`, `Event::ResetTitle`,
@@ -397,6 +410,7 @@ impl HubEvent {
             Self::MessageDelivered { .. } => "message_delivered",
             Self::BrokerPtyOutput { .. } => "broker_pty_output",
             Self::BrokerPtyExited { .. } => "broker_pty_exited",
+            Self::SessionProcessExited { .. } => "session_process_exited",
             Self::BrokerTermEvent { event, .. } => match event {
                 crate::broker::protocol::BrokerTermEvent::TitleChanged { .. } => {
                     "broker_term_title_changed"
