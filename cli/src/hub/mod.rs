@@ -345,7 +345,11 @@ pub struct Hub {
     /// Shared copy of `botster_id` for Lua primitives (updated on registration).
     pub shared_server_id: SharedServerId,
     /// Async runtime for relay and preview channel operations.
-    pub tokio_runtime: tokio::runtime::Runtime,
+    ///
+    /// Wrapped in `Arc` so tests can share a single runtime across all
+    /// `Hub` instances, preventing kqueue file-descriptor exhaustion on
+    /// macOS (each `Runtime::new()` creates ~1 kqueue per worker thread).
+    pub tokio_runtime: Arc<tokio::runtime::Runtime>,
 
     // === Control Flags ===
     /// Whether the hub should quit.
@@ -643,11 +647,23 @@ impl Hub {
     /// - The HTTP client cannot be created
     /// - Device identity cannot be loaded
     pub fn new(config: Config) -> anyhow::Result<Self> {
+        let runtime = Arc::new(tokio::runtime::Runtime::new()?);
+        Self::with_runtime(config, runtime)
+    }
+
+    /// Create a Hub that shares an externally-owned tokio runtime.
+    ///
+    /// Used by tests to avoid creating one runtime per Hub instance (each
+    /// runtime allocates ~1 kqueue FD per worker thread on macOS, which
+    /// exhausts file descriptors when dozens of tests run in parallel).
+    pub fn with_runtime(
+        config: Config,
+        tokio_runtime: Arc<tokio::runtime::Runtime>,
+    ) -> anyhow::Result<Self> {
         use std::sync::RwLock;
         use std::time::Duration;
 
         let state = Arc::new(RwLock::new(HubState::new(config.worktree_base.clone())));
-        let tokio_runtime = tokio::runtime::Runtime::new()?;
 
         // Load or create device identity before computing the local hub ID.
         // Device-scoped startup must never derive trust or identity from cwd.
@@ -717,7 +733,11 @@ impl Hub {
             pty_forwarders: std::collections::HashMap::new(),
             webrtc_backpressure_recovery: std::collections::HashMap::new(),
             pending_terminal_attaches: std::collections::HashMap::new(),
-            terminal_profiles: terminal_profile::TerminalProfileStore::default(),
+            terminal_profiles: {
+                let mut store = terminal_profile::TerminalProfileStore::default();
+                store.load_hub_profile();
+                store
+            },
             webrtc_outgoing_signal_tx,
             webrtc_outgoing_signal_rx: Some(webrtc_outgoing_signal_rx),
             stream_muxes: std::collections::HashMap::new(),
@@ -936,8 +956,8 @@ impl Hub {
     ///    connect to it.
     /// 4. On success, configure the reconnect timeout and store the connection.
     ///
-    /// The broker demux forwarder is installed after recovery completes so
-    /// recovery snapshot/list RPCs run on the direct request/response path.
+    /// The broker demux forwarder is installed before recovery so the full
+    /// I/O pipeline is ready when sessions are created.
     pub fn try_connect_broker(&mut self) -> Option<bool> {
         let path = match crate::broker::broker_socket_path(&self.hub_identifier) {
             Ok(p) => p,
@@ -1006,20 +1026,19 @@ impl Hub {
             log::warn!("[broker] failed to set timeout: {e}");
         }
 
-        // Store the connection before Rust-driven recovery so Lua broker
-        // primitives (snapshot fetch, ghost registration) can use it.
+        // Store the connection so Lua broker primitives (snapshot fetch,
+        // session recovery) can use it.
         *self.broker_connection.lock().unwrap() = Some(conn);
         log::info!("[broker] connected");
 
         Some(is_reconnect)
     }
 
-    /// Install broker demux forwarding after recovery control RPCs complete.
+    /// Install broker demux forwarding before recovery.
     ///
-    /// Recovery uses synchronous broker control requests (`list_sessions`,
-    /// `get_snapshot`) and is simpler/safer on the direct response path before
-    /// demux takeover. Once recovery is done, install demux so broker PTY output
-    /// is streamed into Hub events.
+    /// The demux thread takes over socket reads and routes PTY output into
+    /// Hub events. Installed before recovery so the full I/O pipeline is
+    /// ready when recovered sessions are created and registered.
     fn install_broker_forwarder(&mut self) {
         let mut guard = match self.broker_connection.lock() {
             Ok(g) => g,
@@ -1143,10 +1162,10 @@ impl Hub {
             }),
         );
 
-        let recovered_sessions = self.recover_broker_sessions();
         if broker_connected {
             self.install_broker_forwarder();
         }
+        let recovered_sessions = self.recover_broker_sessions();
         self.fire_hub_recovery_state(
             "sessions_recovered",
             serde_json::json!({
@@ -1447,6 +1466,19 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Single shared tokio runtime for all Hub tests.
+    ///
+    /// Each `Runtime::new()` allocates ~1 kqueue FD per worker thread on
+    /// macOS. With dozens of tests each creating a Hub (and thus a runtime),
+    /// the process quickly exhausts file descriptors. Sharing one runtime
+    /// eliminates the leak while still allowing parallel test execution
+    /// (tokio runtimes are thread-safe by design).
+    fn shared_test_runtime() -> Arc<tokio::runtime::Runtime> {
+        use std::sync::OnceLock;
+        static RT: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
+        Arc::clone(RT.get_or_init(|| Arc::new(tokio::runtime::Runtime::new().unwrap())))
+    }
+
     #[test]
     fn test_hub_id_for_device_fingerprint_normalizes_to_device_scoped_id() {
         assert_eq!(
@@ -1470,7 +1502,7 @@ mod tests {
     #[test]
     fn test_hub_creation() {
         let config = test_config();
-        let hub = Hub::new(config).unwrap();
+        let hub = Hub::with_runtime(config, shared_test_runtime()).unwrap();
 
         assert!(!hub.should_quit());
     }
@@ -1487,7 +1519,7 @@ mod tests {
         std::env::set_var("BOTSTER_OFFLINE", "1");
 
         let config = test_config();
-        let mut hub = Hub::new(config).unwrap();
+        let mut hub = Hub::with_runtime(config, shared_test_runtime()).unwrap();
         hub.setup();
 
         // Server registration was skipped — botster_id should be None
@@ -1517,7 +1549,7 @@ mod tests {
     #[test]
     fn test_generate_connection_url_without_crypto_returns_err() {
         let config = test_config();
-        let mut hub = Hub::new(config).unwrap();
+        let mut hub = Hub::with_runtime(config, shared_test_runtime()).unwrap();
         // Don't call setup() — crypto_service stays None
         assert!(hub.browser.crypto_service.is_none());
         // The non-offline path should also fail gracefully (no panic)
@@ -1540,6 +1572,10 @@ mod tests {
     /// The fix: `Hub::drop()` calls `lua.stop_all_watchers()` before the
     /// runtime drops, aborting forwarder tasks and dropping watchers so the
     /// blocking pool can shut down cleanly.
+    ///
+    /// NOTE: This test intentionally uses a dedicated runtime (not the shared
+    /// test runtime) so the runtime actually drops when the Hub drops,
+    /// exercising the real drop-order deadlock scenario.
     #[test]
     fn test_hub_drop_completes_with_shutdown() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1549,7 +1585,8 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             let config = test_config();
-            let mut hub = Hub::new(config).unwrap();
+            let dedicated_rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+            let mut hub = Hub::with_runtime(config, dedicated_rt).unwrap();
 
             let tx = hub.hub_event_tx.clone();
             hub.lua
@@ -1584,6 +1621,8 @@ mod tests {
     /// Verifies Hub drop completes even without calling shutdown().
     ///
     /// The `Drop` impl must handle this case (panic unwind, early return).
+    ///
+    /// NOTE: Dedicated runtime — same rationale as `test_hub_drop_completes_with_shutdown`.
     #[test]
     fn test_hub_drop_without_shutdown() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1593,7 +1632,8 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             let config = test_config();
-            let mut hub = Hub::new(config).unwrap();
+            let dedicated_rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+            let mut hub = Hub::with_runtime(config, dedicated_rt).unwrap();
 
             let tx = hub.hub_event_tx.clone();
             hub.lua
@@ -1624,7 +1664,7 @@ mod tests {
     #[test]
     fn test_hub_quit() {
         let config = test_config();
-        let mut hub = Hub::new(config).unwrap();
+        let mut hub = Hub::with_runtime(config, shared_test_runtime()).unwrap();
 
         assert!(!hub.should_quit());
         hub.request_quit();
@@ -1634,7 +1674,7 @@ mod tests {
     #[test]
     fn test_handle_action_quit() {
         let config = test_config();
-        let mut hub = Hub::new(config).unwrap();
+        let mut hub = Hub::with_runtime(config, shared_test_runtime()).unwrap();
 
         hub.handle_action(HubAction::Quit);
         assert!(hub.should_quit());
@@ -1649,7 +1689,7 @@ mod tests {
         let test_hub_id = format!("_test_singleton_reboot_{}", std::process::id());
 
         // --- Hub A: starts successfully ---
-        let mut hub_a = Hub::new(test_config()).unwrap();
+        let mut hub_a = Hub::with_runtime(test_config(), shared_test_runtime()).unwrap();
         hub_a.hub_identifier = test_hub_id.clone();
         hub_a
             .start_socket_server()
@@ -1668,7 +1708,7 @@ mod tests {
         );
 
         // --- Hub B: blocked by singleton lock ---
-        let mut hub_b = Hub::new(test_config()).unwrap();
+        let mut hub_b = Hub::with_runtime(test_config(), shared_test_runtime()).unwrap();
         hub_b.hub_identifier = test_hub_id.clone();
         let err = hub_b
             .start_socket_server()
@@ -1689,7 +1729,7 @@ mod tests {
         );
 
         // --- Hub C: reboot succeeds after A released the lock ---
-        let mut hub_c = Hub::new(test_config()).unwrap();
+        let mut hub_c = Hub::with_runtime(test_config(), shared_test_runtime()).unwrap();
         hub_c.hub_identifier = test_hub_id.clone();
         hub_c
             .start_socket_server()
@@ -1946,7 +1986,7 @@ mod tests {
         // Phase 1: Hub A — real bash, real I/O
         // ============================================================
 
-        let mut hub_a = Hub::new(test_config()).unwrap();
+        let mut hub_a = Hub::with_runtime(test_config(), shared_test_runtime()).unwrap();
         hub_a.hub_identifier = test_hub_id.clone();
         init_hub_with_lua(&mut hub_a);
         hub_a
@@ -2084,7 +2124,7 @@ mod tests {
         // Phase 3: Hub B boots — fresh bash, same flow
         // ============================================================
 
-        let mut hub_b = Hub::new(test_config()).unwrap();
+        let mut hub_b = Hub::with_runtime(test_config(), shared_test_runtime()).unwrap();
         hub_b.hub_identifier = test_hub_id.clone();
         init_hub_with_lua(&mut hub_b);
         hub_b
