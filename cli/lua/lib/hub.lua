@@ -586,10 +586,6 @@ function Hub:update_session(agent_id, fields)
 
         if next(allowed) then
             session:update(allowed)
-            local connections = require("handlers.connections")
-            connections.broadcast_hub_event("agent_list", {
-                agents = Agent.all_info(),
-            })
         end
 
         return session:info()

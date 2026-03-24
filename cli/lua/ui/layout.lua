@@ -136,12 +136,8 @@ local function build_list_items()
                              or (agent.display_name or agent.branch_name or entry.agent_id)
         local notification = agent.notification
 
-        -- Activity indicator for agent sessions: "Working..." when PTY output recent
-        local is_active = false
-        if agent.session_type == "agent" and agent.last_output_at then
-          local now_ms = os.time() * 1000
-          is_active = (now_ms - agent.last_output_at) < 5000
-        end
+        -- Activity indicator for agent sessions
+        local is_active = agent.session_type == "agent" and not agent.is_idle
 
         local text
         if notification then
@@ -217,11 +213,7 @@ local function build_agent_items(state)
     local name = has_label and agent.label
                  or (agent.display_name or agent.branch_name)
     -- Activity indicator for agent sessions
-    local is_active = false
-    if agent.session_type == "agent" and agent.last_output_at then
-      local now_ms = os.time() * 1000
-      is_active = (now_ms - agent.last_output_at) < 5000
-    end
+    local is_active = agent.session_type == "agent" and not agent.is_idle
 
     local item
     if agent.notification then

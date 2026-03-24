@@ -199,13 +199,9 @@ end)
 hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
     log.info(string.format("Broadcasting agent_deleted: %s", agent_id or "?"))
 
-    -- Clean up idle tracking state and cancel idle timer for the deleted session.
-    local idle_st = state.get("connections._idle_state", {})
-    for uuid in pairs(idle_st) do
-        if not Agent.get(uuid) then
-            idle_st[uuid] = nil
-            timer.cancel("idle:" .. uuid)
-        end
+    -- Cancel idle timer for the deleted session.
+    if agent_id then
+        timer.cancel("idle:" .. agent_id)
     end
 
     broadcast_hub_event("agent_deleted", { agent_id = agent_id })
@@ -266,10 +262,9 @@ hooks.on("pty_notification", "push_notification", function(info)
     end
     local body = info.message or info.body or "Your attention is needed"
 
-    -- Set notification flag and broadcast updated list
+    -- Set notification flag (session_updated hook broadcasts agent_list)
     if agent then
-        agent.notification = true
-        broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+        agent:update({ notification = true })
     end
 
     local badge_count = 0
@@ -294,8 +289,7 @@ local function clear_session_notification(session_uuid)
     local agent = Agent.get(session_uuid)
     local cleared = false
     if agent and agent.notification then
-        agent.notification = false
-        broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+        agent:update({ notification = false })
         cleared = true
     end
     local any_remaining = false
@@ -328,10 +322,7 @@ end
 hooks.on("pty_title_changed", "update_agent_title", function(info)
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
     if agent then
-        if agent.title ~= info.title then
-            agent:update({ title = info.title })
-            broadcast_hub_event("agent_list", { agents = Agent.all_info() })
-        end
+        agent:update({ title = info.title })
     end
 end)
 
@@ -339,27 +330,7 @@ end)
 hooks.on("pty_cwd_changed", "update_agent_cwd", function(info)
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
     if agent then
-        if agent.cwd ~= info.cwd then
-            agent:update({ cwd = info.cwd })
-            broadcast_hub_event("agent_list", { agents = Agent.all_info() })
-        end
-    end
-end)
-
--- Track last PTY output time for idle detection.
--- Fires on the Rust PTY output hot path (debounced by observer queue budget).
--- Does NOT broadcast agent_list — that would be too noisy. Clients read
--- last_output_at from the next agent_list broadcast triggered by other events.
---
--- Reads the ms-precision timestamp from the Rust AtomicU64 (set by
--- PtyHandle::feed_broker_output) rather than using os.time() seconds.
-hooks.on("pty_output", "update_last_output_at", function(ctx, _data)
-    local session = ctx.session_uuid and Agent.get(ctx.session_uuid)
-    if session and session.session then
-        local ms = session.session:last_output_at()
-        if ms then
-            session.last_output_at = ms
-        end
+        agent:update({ cwd = info.cwd })
     end
 end)
 
@@ -385,38 +356,37 @@ end)
 -- Idle detection: event-driven via timer.after_idle (no polling).
 --
 -- Each pty_output event resets a per-session idle timer. If no output
--- arrives within IDLE_THRESHOLD_SECS, the timer fires session_idle.
--- When output resumes after idle, session_active fires immediately.
+-- arrives within IDLE_THRESHOLD_SECS, the timer fires and sets is_idle = true.
+-- When output resumes after idle, is_idle is cleared immediately.
 --
 -- timer.after_idle is a Rust primitive: spawns a tokio::time::sleep task
 -- that is aborted and replaced on each reset. Zero polling.
 
 local IDLE_THRESHOLD_SECS = 5
-local _idle_state = state.get("connections._idle_state", {})
 
 hooks.on("pty_output", "idle_activity_reset", function(ctx, _data)
     local uuid = ctx.session_uuid
     if not uuid then return end
 
-    -- If session was idle, it's now active
-    if _idle_state[uuid] then
-        _idle_state[uuid] = false
-        hooks.call("session_active", { session_uuid = uuid })
+    local session = Agent.get(uuid)
+    if not session then return end
+
+    -- Mark active (session:update triggers session_updated → broadcast)
+    if session.is_idle then
+        session:update({ is_idle = false })
     end
 
     -- Reset the idle timer — fires only after IDLE_THRESHOLD_SECS of silence
     timer.after_idle("idle:" .. uuid, IDLE_THRESHOLD_SECS, function()
-        _idle_state[uuid] = true
-        hooks.call("session_idle", { session_uuid = uuid })
+        local s = Agent.get(uuid)
+        if s and not s.is_idle then
+            s:update({ is_idle = true })
+        end
     end)
 end)
 
--- Broadcast agent list on idle/active transitions so TUI updates the activity indicator.
-hooks.on("session_idle", "broadcast_idle_status", function()
-    last_agent_list_snapshot = nil
-    broadcast_hub_event("agent_list", { agents = Agent.all_info() })
-end)
-hooks.on("session_active", "broadcast_active_status", function()
+-- Auto-broadcast agent list when any session field changes.
+hooks.on("session_updated", "broadcast_session_updated", function()
     last_agent_list_snapshot = nil
     broadcast_hub_event("agent_list", { agents = Agent.all_info() })
 end)
@@ -564,10 +534,8 @@ function M._before_reload()
     hooks.off("pty_notification", "push_notification")
     hooks.off("pty_title_changed", "update_agent_title")
     hooks.off("pty_cwd_changed", "update_agent_cwd")
-    hooks.off("pty_output", "update_last_output_at")
     hooks.off("pty_output", "idle_activity_reset")
-    hooks.off("session_idle", "broadcast_idle_status")
-    hooks.off("session_active", "broadcast_active_status")
+    hooks.off("session_updated", "broadcast_session_updated")
     hooks.off("pty_prompt", "update_agent_prompt")
     hooks.off("pty_cursor_visibility", "update_agent_cursor")
     _set_pty_focused = nil
