@@ -524,6 +524,18 @@ enum Commands {
         #[arg(long, default_value_t = 120)]
         timeout: u64,
     },
+    /// Run a per-session PTY process (internal — spawned by the hub)
+    Session {
+        /// Session UUID
+        #[arg(long)]
+        uuid: String,
+        /// Unix socket path for hub communication
+        #[arg(long)]
+        socket: String,
+        /// Seconds to wait for Hub reconnect before exiting
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
 }
 
 /// Raise the process file descriptor limit to accommodate WebRTC connections.
@@ -958,6 +970,7 @@ fn main() -> Result<()> {
             Commands::Start { headless: true, .. } => "hub",
             Commands::Start { .. } => "tui",
             Commands::Attach { .. } => "attach",
+            Commands::Session { .. } => "session",
             _ => "cli",
         };
         let log_path = if let Ok(path) = std::env::var("BOTSTER_LOG_FILE") {
@@ -1139,6 +1152,13 @@ fn main() -> Result<()> {
         }
         Commands::Broker { hub_id, timeout } => {
             botster::broker::run(&hub_id, timeout)?;
+        }
+        Commands::Session {
+            uuid,
+            socket,
+            timeout,
+        } => {
+            botster::session::run(&uuid, &socket, timeout)?;
         }
     }
 
