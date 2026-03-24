@@ -50,13 +50,17 @@ cli/src/main.rs             # TUI, daemon logic
 cli/src/agent/mod.rs        # Agent PTY management (Rust struct)
 cli/src/hub/mod.rs          # Hub orchestrator
 cli/src/hub/handle_cache.rs # Thread-safe agent PTY handle cache
+cli/src/session/mod.rs      # Per-session PTY process (replaces broker)
+cli/src/session/protocol.rs # Session process wire protocol
+cli/src/session/connection.rs # Hub-side session connection + reader thread
 cli/src/relay/              # E2E encrypted browser communication
 cli/src/wireguard.rs        # WireGuard VPN client
 cli/src/git.rs              # Worktree operations
 
 # Lua (agent lifecycle + TUI)
-cli/lua/lib/agent.lua          # Agent class, metadata store, context.json
+cli/lua/lib/agent.lua          # Agent class, metadata store
 cli/lua/handlers/agents.lua    # Agent creation, matching, lifecycle
+cli/lua/handlers/session_recovery.lua # Session recovery on hub restart
 cli/lua/handlers/commands.lua  # Hub command dispatch
 cli/lua/ui/layout.lua          # TUI layout composition
 ```
@@ -85,6 +89,30 @@ cd cli
 This ensures `BOTSTER_ENV=test` is set, preventing macOS keyring prompts.
 
 **Rails:** Standard `rails test` or `rspec`.
+
+## Per-Session Process Architecture
+
+Each PTY gets its own process (`botster session`) with its own Unix socket.
+No broker, no multiplexing, no demux thread.
+
+```
+Hub spawns session process → session creates PTY + binds socket
+Hub connects to socket → handshake → sends spawn config
+Session reader thread → feeds hub shadow screen → broadcasts PtyEvent::Output
+Hub owns shadow screen (snapshot authority) → forwarders stream to clients
+```
+
+**Session process owns:** PTY fd, alacritty parser (state tracking), socket, tee/logging, resize
+**Hub owns:** shadow screen (snapshots), client routing, byte scanning (OSC 7/133/notifications)
+**Socket-as-lease:** session process exits if its socket file is deleted
+**setsid:** session processes survive hub restart (own process group)
+**Recovery:** hub scans `/tmp/botster-{uid}/sessions/*.sock`, connects to live ones
+
+Key paths:
+- `cli/src/session/mod.rs` — session process entry point
+- `cli/src/session/connection.rs` — hub-side connection + reader thread
+- `cli/src/session/protocol.rs` — wire protocol (15 frame types)
+- `cli/lua/handlers/session_recovery.lua` — recovery handler
 
 ## Patterns
 

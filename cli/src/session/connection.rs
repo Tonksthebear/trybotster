@@ -20,8 +20,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use tokio::sync::broadcast;
 
-use crate::agent::pty::{HubEventListener, PtyEvent};
 use crate::agent::notification::detect_notifications;
+use crate::agent::pty::{HubEventListener, PtyEvent};
 use crate::agent::spawn::{scan_cwd, scan_prompt_marks};
 use crate::terminal::AlacrittyParser;
 
@@ -74,9 +74,7 @@ impl SessionConnection {
     /// Send spawn configuration to the session process.
     pub fn send_spawn_config(&mut self, config: &SpawnConfig) -> Result<()> {
         let frame = encode_json(FRAME_PTY_INPUT, config)?;
-        self.stream
-            .write_all(&frame)
-            .context("send spawn config")?;
+        self.stream.write_all(&frame).context("send spawn config")?;
         self.stream.flush().context("flush spawn config")?;
         Ok(())
     }
@@ -158,8 +156,10 @@ impl SessionConnection {
 
     /// Send a resize command.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
-        let frame =
-            encode_json(FRAME_RESIZE, &serde_json::json!({"rows": rows, "cols": cols}))?;
+        let frame = encode_json(
+            FRAME_RESIZE,
+            &serde_json::json!({"rows": rows, "cols": cols}),
+        )?;
         self.stream.write_all(&frame).context("send resize")?;
         Ok(())
     }
@@ -181,9 +181,7 @@ impl SessionConnection {
     /// Used on reconnect to initialize the hub's shadow screen state.
     pub fn get_mode_flags(&mut self) -> Result<ModeFlags> {
         let req = encode_empty(FRAME_GET_MODE_FLAGS);
-        self.stream
-            .write_all(&req)
-            .context("send GetModeFlags")?;
+        self.stream.write_all(&req).context("send GetModeFlags")?;
         self.stream.flush()?;
         let frame = self.read_response(FRAME_MODE_FLAGS)?;
         frame.json()
@@ -245,8 +243,7 @@ impl SessionConnection {
             }
 
             for frame in self.decoder.feed(&buf[..n]) {
-                if frame.frame_type == FRAME_PTY_OUTPUT
-                    || frame.frame_type == FRAME_PROCESS_EXITED
+                if frame.frame_type == FRAME_PTY_OUTPUT || frame.frame_type == FRAME_PROCESS_EXITED
                 {
                     continue;
                 }
@@ -361,16 +358,11 @@ fn session_reader(
                         .ok()
                         .and_then(|v| v["exit_code"].as_i64())
                         .map(|c| c as i32);
-                    let _ = hub_event_tx.send(
-                        crate::hub::events::HubEvent::SessionProcessExited {
-                            session_uuid: session_uuid.clone(),
-                            exit_code,
-                        },
-                    );
-                    log::info!(
-                        "[session-reader] process exited (code={:?})",
-                        exit_code
-                    );
+                    let _ = hub_event_tx.send(crate::hub::events::HubEvent::SessionProcessExited {
+                        session_uuid: session_uuid.clone(),
+                        exit_code,
+                    });
+                    log::info!("[session-reader] process exited (code={:?})", exit_code);
                 }
 
                 _ => {

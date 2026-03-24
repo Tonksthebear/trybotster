@@ -231,7 +231,8 @@ impl TerminalProfileStore {
             }
 
             // Clean up empty pending sets
-            self.pending_by_session.retain(|_, pending| !pending.is_empty());
+            self.pending_by_session
+                .retain(|_, pending| !pending.is_empty());
         }
 
         if learned_any {
@@ -346,13 +347,7 @@ impl TerminalProfileStore {
                 continue;
             }
 
-            let n = unsafe {
-                libc::read(
-                    0,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                )
-            };
+            let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n <= 0 {
                 break;
             }
@@ -413,7 +408,11 @@ impl TerminalProfileStore {
         let value: serde_json::Value = match serde_json::from_str(&data) {
             Ok(v) => v,
             Err(e) => {
-                log::warn!("[PTY-PROBE] Failed to parse hub profile {}: {}", path.display(), e);
+                log::warn!(
+                    "[PTY-PROBE] Failed to parse hub profile {}: {}",
+                    path.display(),
+                    e
+                );
                 return;
             }
         };
@@ -446,9 +445,16 @@ impl TerminalProfileStore {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Err(e) = std::fs::write(&path, json) {
-            log::warn!("[PTY-PROBE] Failed to write hub profile to {}: {}", path.display(), e);
+            log::warn!(
+                "[PTY-PROBE] Failed to write hub profile to {}: {}",
+                path.display(),
+                e
+            );
         } else {
-            log::debug!("[PTY-PROBE] Saved hub terminal profile to {}", path.display());
+            log::debug!(
+                "[PTY-PROBE] Saved hub terminal profile to {}",
+                path.display()
+            );
         }
     }
 
@@ -691,7 +697,9 @@ mod tests {
     fn start_hub_probing_returns_all_three_osc_queries() {
         let mut store = TerminalProfileStore::default();
 
-        let bytes = store.start_hub_probing().expect("should return probe bytes");
+        let bytes = store
+            .start_hub_probing()
+            .expect("should return probe bytes");
 
         // Should contain OSC 10;? 11;? 12;?
         assert!(bytes.windows(7).any(|w| w == b"\x1b]10;?\x07"));
@@ -707,7 +715,10 @@ mod tests {
         // First call sets up pending probes
         assert!(store.start_hub_probing().is_some());
         // Second call clears stale pending and re-probes (client may have disconnected)
-        assert!(store.start_hub_probing().is_some(), "should re-probe after stale pending");
+        assert!(
+            store.start_hub_probing().is_some(),
+            "should re-probe after stale pending"
+        );
     }
 
     #[test]
@@ -720,7 +731,10 @@ mod tests {
         store.observe_input("sess-1", "browser-a", b"\x1b]11;rgb:1111/2222/3333\x07");
         store.observe_input("sess-1", "browser-a", b"\x1b]12;rgb:4444/5555/6666\x07");
 
-        assert!(store.start_hub_probing().is_none(), "should be None when hub profile is complete");
+        assert!(
+            store.start_hub_probing().is_none(),
+            "should be None when hub profile is complete"
+        );
     }
 
     #[test]
@@ -747,11 +761,7 @@ mod tests {
 
         // Populate hub profile
         let _bytes = store.start_hub_probing();
-        store.observe_input(
-            "sess-1",
-            "browser-a",
-            b"\x1b]11;rgb:1111/2222/3333\x07",
-        );
+        store.observe_input("sess-1", "browser-a", b"\x1b]11;rgb:1111/2222/3333\x07");
 
         // A different session with no local profile should get hub fallback
         assert_eq!(
@@ -766,19 +776,11 @@ mod tests {
 
         // Populate hub profile
         let _bytes = store.start_hub_probing();
-        store.observe_input(
-            "sess-1",
-            "browser-a",
-            b"\x1b]11;rgb:1111/2222/3333\x07",
-        );
+        store.observe_input("sess-1", "browser-a", b"\x1b]11;rgb:1111/2222/3333\x07");
 
         // Populate session-local profile with a different color
         store.observe_output("sess-2", b"\x1b]11;?\x07", true);
-        store.observe_input(
-            "sess-2",
-            "browser-b",
-            b"\x1b]11;rgb:ffff/ffff/ffff\x07",
-        );
+        store.observe_input("sess-2", "browser-b", b"\x1b]11;rgb:ffff/ffff/ffff\x07");
 
         // Session-local should win
         assert_eq!(
@@ -793,11 +795,7 @@ mod tests {
 
         // Populate hub profile via sess-1
         let _bytes = store.start_hub_probing();
-        store.observe_input(
-            "sess-1",
-            "browser-a",
-            b"\x1b]11;rgb:1111/2222/3333\x07",
-        );
+        store.observe_input("sess-1", "browser-a", b"\x1b]11;rgb:1111/2222/3333\x07");
 
         store.clear_session("sess-1");
 
@@ -818,7 +816,9 @@ mod tests {
         store.observe_input("sess-1", "browser-a", b"0000/0000\x07");
 
         assert_eq!(
-            store.hub_profile.get_reply(TerminalProbe::DefaultBackground),
+            store
+                .hub_profile
+                .get_reply(TerminalProbe::DefaultBackground),
             Some(b"\x1b]11;rgb:0000/0000/0000\x07".as_slice())
         );
     }
@@ -837,11 +837,18 @@ mod tests {
         );
 
         // hub_pending should still have cursor color
-        assert!(store.hub_pending.is_empty() || store.hub_pending.contains(&TerminalProbe::DefaultCursorColor));
+        assert!(
+            store.hub_pending.is_empty()
+                || store
+                    .hub_pending
+                    .contains(&TerminalProbe::DefaultCursorColor)
+        );
 
         // Clear pending so we can re-probe for the missing one
         store.hub_pending.clear();
-        let bytes = store.start_hub_probing().expect("should probe for missing cursor color");
+        let bytes = store
+            .start_hub_probing()
+            .expect("should probe for missing cursor color");
         assert!(bytes.windows(7).any(|w| w == b"\x1b]12;?\x07"));
         // Should NOT re-probe already-answered ones
         assert!(!bytes.windows(7).any(|w| w == b"\x1b]10;?\x07"));

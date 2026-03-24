@@ -166,8 +166,8 @@ impl FrameDecoder {
             if self.buf.len() < 4 {
                 break;
             }
-            let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]])
-                as usize;
+            let len =
+                u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
             if len == 0 || self.buf.len() < 4 + len {
                 break;
             }
@@ -196,7 +196,9 @@ pub fn handshake_hub(stream: &mut (impl Read + Write)) -> Result<(u8, SessionMet
 
     // Read welcome
     let mut magic = [0u8; 4];
-    stream.read_exact(&mut magic).context("read welcome magic")?;
+    stream
+        .read_exact(&mut magic)
+        .context("read welcome magic")?;
     if &magic != WELCOME_MAGIC {
         bail!(
             "bad welcome magic: expected {:?}, got {:?}",
@@ -205,7 +207,9 @@ pub fn handshake_hub(stream: &mut (impl Read + Write)) -> Result<(u8, SessionMet
         );
     }
     let mut version = [0u8; 1];
-    stream.read_exact(&mut version).context("read welcome version")?;
+    stream
+        .read_exact(&mut version)
+        .context("read welcome version")?;
 
     // Read metadata length (u32 LE) + JSON
     let mut len_buf = [0u8; 4];
@@ -240,7 +244,9 @@ pub fn handshake_session(
         );
     }
     let mut version = [0u8; 1];
-    stream.read_exact(&mut version).context("read hello version")?;
+    stream
+        .read_exact(&mut version)
+        .context("read hello version")?;
 
     // Send welcome
     stream.write_all(WELCOME_MAGIC)?;
@@ -319,10 +325,7 @@ mod tests {
             cols: u16,
         }
 
-        let resize = Resize {
-            rows: 24,
-            cols: 80,
-        };
+        let resize = Resize { rows: 24, cols: 80 };
         let encoded = encode_json(FRAME_RESIZE, &resize).unwrap();
         let mut decoder = FrameDecoder::new();
         let frames = decoder.feed(&encoded);

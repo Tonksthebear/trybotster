@@ -276,10 +276,7 @@ mod tests {
         }"#,
         );
 
-        assert!(
-            ctx.get("agent_key").is_none(),
-            "agent_key mapping removed"
-        );
+        assert!(ctx.get("agent_key").is_none(), "agent_key mapping removed");
         assert_eq!(ctx.get("hub_id").map(String::as_str), Some("hub-ok"));
         assert!(ctx.get("repo").is_none(), "empty string should be skipped");
     }

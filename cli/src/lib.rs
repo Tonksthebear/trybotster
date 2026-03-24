@@ -24,7 +24,6 @@
 pub mod agent;
 pub mod app;
 pub mod auth;
-pub mod session;
 pub mod channel;
 pub mod client;
 pub mod commands;
@@ -32,6 +31,7 @@ pub mod hub;
 pub mod lua;
 pub mod mcp_gateway;
 pub mod relay;
+pub mod session;
 pub mod socket;
 pub mod tui;
 pub mod ws;

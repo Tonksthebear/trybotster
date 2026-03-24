@@ -69,7 +69,7 @@ use std::sync::{
 use crate::agent::pty::{HubEventListener, PtySession, SharedPtyState};
 use crate::agent::spawn::PtySpawnConfig;
 use crate::hub::events::HubEvent;
-use crate::terminal::AlacrittyParser;
+use crate::terminal::{AlacrittyParser, DEFAULT_SCROLLBACK_LINES};
 use tokio::sync::broadcast;
 
 use anyhow::{anyhow, Result};
@@ -192,12 +192,15 @@ impl PtySessionHandle {
             last_human_input_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }));
 
-        // Minimal shadow screen: correct dimensions, zero scrollback.
-        // All real reads go through broker RPCs; this exists only to satisfy
-        // do_resize() and fallback paths that expect the type.
+        // Recovery shadow screen: correct dimensions plus normal scrollback.
+        // Session-backed recovery uses this parser as the hub's local
+        // authority after the initial snapshot replay.
         let listener = HubEventListener::new(event_tx.clone());
         let shadow_screen = Arc::new(Mutex::new(AlacrittyParser::new_with_listener(
-            rows, cols, 0, listener,
+            rows,
+            cols,
+            DEFAULT_SCROLLBACK_LINES,
+            listener,
         )));
 
         Self {
@@ -240,6 +243,7 @@ impl PtySessionHandle {
         &self,
         session_connection: crate::session::connection::SharedSessionConnection,
     ) -> crate::hub::agent_handle::PtyHandle {
+        let (rows, cols) = self.get_dims();
         crate::hub::agent_handle::PtyHandle::new_with_session(
             self.event_tx.clone(),
             Arc::clone(&self.shadow_screen),
@@ -254,6 +258,8 @@ impl PtySessionHandle {
                 .lock()
                 .map(|s| Arc::clone(&s.last_human_input_ms))
                 .unwrap_or_else(|_| Arc::new(std::sync::atomic::AtomicI64::new(0))),
+            rows,
+            cols,
         )
     }
 

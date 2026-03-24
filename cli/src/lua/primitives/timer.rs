@@ -272,50 +272,52 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
     // fires only when activity stops for the specified duration.
     let reg_idle = Arc::clone(&registry);
     let after_idle_fn = lua
-        .create_function(move |lua, (id, seconds, callback): (String, f64, LuaFunction)| {
-            let callback_key = lua.create_registry_value(callback).map_err(|e| {
-                LuaError::external(format!("timer.after_idle: failed to store callback: {e}"))
-            })?;
+        .create_function(
+            move |lua, (id, seconds, callback): (String, f64, LuaFunction)| {
+                let callback_key = lua.create_registry_value(callback).map_err(|e| {
+                    LuaError::external(format!("timer.after_idle: failed to store callback: {e}"))
+                })?;
 
-            let duration = Duration::from_secs_f64(seconds);
-            let mut entries = reg_idle.lock().expect("TimerEntries mutex poisoned");
+                let duration = Duration::from_secs_f64(seconds);
+                let mut entries = reg_idle.lock().expect("TimerEntries mutex poisoned");
 
-            // Cancel any existing timer with this ID.
-            for (eid, entry) in &mut entries.entries {
-                if *eid == id && !entry.cancelled {
-                    entry.cancelled = true;
-                    if let Some(handle) = entry.task_handle.take() {
-                        handle.abort();
+                // Cancel any existing timer with this ID.
+                for (eid, entry) in &mut entries.entries {
+                    if *eid == id && !entry.cancelled {
+                        entry.cancelled = true;
+                        if let Some(handle) = entry.task_handle.take() {
+                            handle.abort();
+                        }
                     }
                 }
-            }
 
-            // Spawn a fresh tokio task.
-            let task_handle = match (&entries.hub_event_tx, &entries.tokio_handle) {
-                (Some(tx), Some(handle)) => {
-                    let tx = tx.clone();
-                    let timer_id = id.clone();
-                    Some(handle.spawn(async move {
-                        tokio::time::sleep(duration).await;
-                        let _ = tx.send(HubEvent::TimerFired { timer_id });
-                    }))
-                }
-                _ => None,
-            };
+                // Spawn a fresh tokio task.
+                let task_handle = match (&entries.hub_event_tx, &entries.tokio_handle) {
+                    (Some(tx), Some(handle)) => {
+                        let tx = tx.clone();
+                        let timer_id = id.clone();
+                        Some(handle.spawn(async move {
+                            tokio::time::sleep(duration).await;
+                            let _ = tx.send(HubEvent::TimerFired { timer_id });
+                        }))
+                    }
+                    _ => None,
+                };
 
-            entries.entries.push((
-                id.clone(),
-                TimerEntry {
-                    callback_key,
-                    fire_at: Instant::now() + duration,
-                    repeat_interval: None,
-                    cancelled: false,
-                    task_handle,
-                },
-            ));
+                entries.entries.push((
+                    id.clone(),
+                    TimerEntry {
+                        callback_key,
+                        fire_at: Instant::now() + duration,
+                        repeat_interval: None,
+                        cancelled: false,
+                        task_handle,
+                    },
+                ));
 
-            Ok(id)
-        })
+                Ok(id)
+            },
+        )
         .map_err(|e| anyhow!("Failed to create timer.after_idle function: {e}"))?;
 
     timer_table
