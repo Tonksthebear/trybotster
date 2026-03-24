@@ -1219,40 +1219,25 @@ impl Hub {
             serde_json::json!({ "socket_path": socket_path }),
         );
 
-        let mut broker_connected = false;
-        let mut broker_reconnected = false;
-        if !crate::env::is_test_mode() {
-            if let Some(is_reconnect) = self.try_connect_broker() {
-                broker_connected = true;
-                broker_reconnected = is_reconnect;
-            }
-        }
-
         self.fire_hub_recovery_state(
             "broker_connected",
             serde_json::json!({
-                "connected": broker_connected,
-                "reconnected": broker_reconnected,
+                "connected": false,
+                "reconnected": false,
             }),
         );
 
-        // Recover sessions from per-session processes (new path)
+        // Recover sessions from per-session processes
         let session_count = if !crate::env::is_test_mode() {
             self.recover_session_processes()
         } else {
             0
         };
 
-        // Recover sessions from broker (legacy path)
-        let broker_count = self.recover_broker_sessions();
-        if broker_connected {
-            self.install_broker_forwarder();
-        }
-
         self.fire_hub_recovery_state(
             "sessions_recovered",
             serde_json::json!({
-                "count": session_count + broker_count,
+                "count": session_count,
                 "inventory_authority": true,
             }),
         );
