@@ -284,6 +284,13 @@ pub fn shutdown(client: &Client, server_url: &str, hub_identifier: &str, api_key
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, OnceLock};
+
+    /// Single shared tokio runtime for all registration tests.
+    fn shared_test_runtime() -> Arc<tokio::runtime::Runtime> {
+        static RT: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
+        Arc::clone(RT.get_or_init(|| Arc::new(tokio::runtime::Runtime::new().unwrap())))
+    }
 
     #[test]
     #[ignore = "requires keyring access - run manually"]
@@ -346,8 +353,7 @@ mod tests {
         let mut browser = BrowserState::default();
         init_crypto_service(&mut browser, &hub_id);
 
-        // Create runtime for bundle generation
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = shared_test_runtime();
 
         // First call should generate bundle
         let result1 = get_or_generate_connection_bundle(&mut browser, &runtime);
@@ -379,7 +385,7 @@ mod tests {
         let mut browser = BrowserState::default();
         init_crypto_service(&mut browser, &hub_id);
 
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = shared_test_runtime();
 
         // Generate first bundle
         let result1 = get_or_generate_connection_bundle(&mut browser, &runtime);
