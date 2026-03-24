@@ -656,7 +656,7 @@ impl Hub {
     /// Used by tests to avoid creating one runtime per Hub instance (each
     /// runtime allocates ~1 kqueue FD per worker thread on macOS, which
     /// exhausts file descriptors when dozens of tests run in parallel).
-    pub fn with_runtime(
+    pub(crate) fn with_runtime(
         config: Config,
         tokio_runtime: Arc<tokio::runtime::Runtime>,
     ) -> anyhow::Result<Self> {

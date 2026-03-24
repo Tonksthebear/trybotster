@@ -1,9 +1,16 @@
 //! Tests for hub actions.
 
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use super::*;
 use crate::config::Config;
+
+/// Single shared tokio runtime for all action tests.
+fn shared_test_runtime() -> Arc<tokio::runtime::Runtime> {
+    static RT: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
+    Arc::clone(RT.get_or_init(|| Arc::new(tokio::runtime::Runtime::new().unwrap())))
+}
 
 fn test_config() -> Config {
     Config {
@@ -22,7 +29,7 @@ fn test_hub() -> Hub {
     use crate::relay::create_crypto_service;
 
     let config = test_config();
-    let mut hub = Hub::new(config).unwrap();
+    let mut hub = Hub::with_runtime(config, shared_test_runtime()).unwrap();
 
     // Register TUI via Lua (Hub-side processing)
     let (_request_tx, request_rx) =
