@@ -126,18 +126,70 @@ _event_sub = events.on("sessions_discovered", function(data)
     local seen_keys = {}
     local manifest_by_uuid = {}
 
-    -- Build manifest index
+    -- Build manifest index from hub manifest's active workspaces.
+    -- The hub manifest tracks which workspaces were active — only scan those,
+    -- not the entire workspace store. This avoids a full scan of hundreds of
+    -- historical workspaces and ignores manifest status (the socket is the
+    -- liveness authority, not the status field).
     local data_dir = config.data_dir and config.data_dir() or nil
     if data_dir then
         local ws = require("lib.workspace_store")
-        local records = ws.scan_recoverable_sessions(data_dir)
-        for _, record in ipairs(records) do
-            manifest_by_uuid[record.session_uuid] = record
+        local active_workspaces = {}
+
+        -- Read active workspace IDs from the hub manifest
+        local hub_id = hub.hub_id and hub.hub_id() or nil
+        if hub_id and hub_discovery and hub_discovery.manifest_path then
+            local ok, path = pcall(hub_discovery.manifest_path, hub_id)
+            if ok and path then
+                local content_ok, content = pcall(fs.read, path)
+                if content_ok and content then
+                    local json_ok, manifest = pcall(json.decode, content)
+                    if json_ok and manifest and manifest.workspaces then
+                        active_workspaces = manifest.workspaces
+                    end
+                end
+            end
         end
-        log.info(string.format(
-            "[session_recovery] Workspace store: %d recoverable manifest(s) indexed",
-            #records
-        ))
+
+        local manifest_count = 0
+        if #active_workspaces > 0 then
+            -- Targeted scan: only look at workspaces the hub had active
+            for _, workspace_id in ipairs(active_workspaces) do
+                local sessions_dir = ws.workspace_dir(data_dir, workspace_id) .. "/sessions"
+                if fs.exists(sessions_dir) then
+                    local sess_entries = fs.list_dir(sessions_dir)
+                    if sess_entries then
+                        for _, session_uuid in ipairs(sess_entries) do
+                            local manifest = ws.read_session(data_dir, workspace_id, session_uuid)
+                            if manifest then
+                                manifest_by_uuid[session_uuid] = {
+                                    workspace_id = workspace_id,
+                                    session_uuid = session_uuid,
+                                    manifest = manifest,
+                                    data_dir = data_dir,
+                                }
+                                manifest_count = manifest_count + 1
+                            end
+                        end
+                    end
+                end
+            end
+            log.info(string.format(
+                "[session_recovery] Scanned %d active workspace(s), found %d session manifest(s)",
+                #active_workspaces, manifest_count
+            ))
+        else
+            -- Fallback: no hub manifest workspaces — scan all recoverable
+            local records = ws.scan_recoverable_sessions(data_dir)
+            for _, record in ipairs(records) do
+                manifest_by_uuid[record.session_uuid] = record
+                manifest_count = manifest_count + 1
+            end
+            log.info(string.format(
+                "[session_recovery] Fallback scan: %d recoverable manifest(s) indexed",
+                manifest_count
+            ))
+        end
     end
 
     for _, socket_info in ipairs(sockets) do

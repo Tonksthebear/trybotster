@@ -97,6 +97,10 @@ pub struct HubManifest {
     pub pid: u32,
     /// Last write timestamp (unix seconds).
     pub updated_at: u64,
+    /// Active workspace IDs. Updated by Lua when sessions are created/closed.
+    /// Empty workspaces (no sessions) are automatically removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<String>,
 }
 
 /// Get the per-hub directory path.
@@ -169,6 +173,7 @@ pub fn write_manifest(hub_id: &str, server_id: Option<&str>) -> Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        workspaces: Vec::new(),
     };
     let content =
         serde_json::to_string_pretty(&manifest).context("Failed to serialize hub manifest")?;
@@ -184,6 +189,28 @@ pub fn read_manifest(hub_id: &str) -> Option<HubManifest> {
     let path = manifest_path(hub_id).ok()?;
     let content = fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// Update the workspaces list in the hub manifest.
+///
+/// Reads the current manifest, replaces `workspaces`, and writes back.
+/// If the manifest doesn't exist, this is a no-op.
+pub fn update_manifest_workspaces(hub_id: &str, workspaces: Vec<String>) -> Result<()> {
+    let path = manifest_path(hub_id)?;
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("read manifest: {}", path.display()))?;
+    let mut manifest: HubManifest =
+        serde_json::from_str(&content).context("parse hub manifest")?;
+    manifest.workspaces = workspaces;
+    manifest.updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let updated =
+        serde_json::to_string_pretty(&manifest).context("serialize hub manifest")?;
+    fs::write(&path, updated)
+        .with_context(|| format!("write manifest: {}", path.display()))?;
+    Ok(())
 }
 
 /// Return true if a manifest appears live (PID alive + socket exists).
@@ -548,6 +575,7 @@ mod tests {
                 .into_owned(),
             pid: 999999,
             updated_at: 1,
+            workspaces: Vec::new(),
         };
         let manifest_content = serde_json::to_string_pretty(&manifest).unwrap();
         fs::write(manifest_path(&test_id).unwrap(), manifest_content).unwrap();

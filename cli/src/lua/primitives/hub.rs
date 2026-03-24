@@ -372,6 +372,9 @@ pub(crate) fn register(
         .map_err(|e| anyhow!("Failed to set hub.unregister_session: {e}"))?;
 
     // hub.hub_id() - Returns the local hub identifier (stable hash).
+    // Clone hub_identifier before it's moved into the hub_id closure.
+    let manifest_hub_id = hub_identifier.clone();
+
     // This is the same ID returned by hub_discovery.list(), suitable for
     // comparing against discovered hubs to identify self.
     let hub_id_fn = lua
@@ -394,6 +397,40 @@ pub(crate) fn register(
         .map_err(|e| anyhow!("Failed to create hub.exe_dir function: {e}"))?;
     hub.set("exe_dir", exe_dir_fn)
         .map_err(|e| anyhow!("Failed to set hub.exe_dir: {e}"))?;
+
+    // hub.update_manifest_workspaces(workspace_ids) — update active workspaces in hub manifest.
+    // Called by Lua whenever a workspace gains or loses its last session.
+    let update_ws_fn = lua
+        .create_function(move |_, ids: LuaTable| {
+            let mut workspace_ids = Vec::new();
+            for pair in ids.pairs::<i64, String>() {
+                if let Ok((_, id)) = pair {
+                    workspace_ids.push(id);
+                }
+            }
+            if let Err(e) =
+                crate::hub::daemon::update_manifest_workspaces(&manifest_hub_id, workspace_ids)
+            {
+                ::log::debug!("[hub] update_manifest_workspaces: {e}");
+            }
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create hub.update_manifest_workspaces function: {e}"))?;
+    hub.set("update_manifest_workspaces", update_ws_fn)
+        .map_err(|e| anyhow!("Failed to set hub.update_manifest_workspaces: {e}"))?;
+
+    // hub.session_socket_exists(session_uuid) — check if a session socket file exists.
+    // Used by close() to avoid marking "closed" when the session process is still alive.
+    let session_socket_fn = lua
+        .create_function(|_, session_uuid: String| {
+            let exists = crate::session::session_socket_path(&session_uuid)
+                .map(|p| p.exists())
+                .unwrap_or(false);
+            Ok(exists)
+        })
+        .map_err(|e| anyhow!("Failed to create hub.session_socket_exists function: {e}"))?;
+    hub.set("session_socket_exists", session_socket_fn)
+        .map_err(|e| anyhow!("Failed to set hub.session_socket_exists: {e}"))?;
 
     // hub.server_id() - Returns the server-assigned hub ID, or nil if not yet registered.
     let sid = Arc::clone(&server_id);

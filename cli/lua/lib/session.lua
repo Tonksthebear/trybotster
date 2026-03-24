@@ -31,6 +31,22 @@ local sessions = state.get("agent_registry", {})
 -- Sequential port counter for forward_port sessions (persistent across reloads)
 local port_state = state.get("agent_port_state", { next_port = 8080 })
 
+--- Update the hub manifest with currently active workspace IDs.
+-- Called whenever the session registry changes (create/close).
+local function sync_manifest_workspaces()
+    if not hub.update_manifest_workspaces then return end
+    local ws_ids = {}
+    local seen = {}
+    for _, session in pairs(sessions) do
+        local ws_id = session._workspace_id
+        if ws_id and not seen[ws_id] then
+            seen[ws_id] = true
+            ws_ids[#ws_ids + 1] = ws_id
+        end
+    end
+    pcall(hub.update_manifest_workspaces, ws_ids)
+end
+
 -- =============================================================================
 -- UUID Generation
 -- =============================================================================
@@ -377,6 +393,7 @@ function Session._init(self, config)
 
     -- Register in session registry (keyed by session_uuid)
     sessions[session_uuid] = self
+    sync_manifest_workspaces()
 
     -- Notify observers
     hooks.notify("after_agent_create", self)
@@ -497,6 +514,7 @@ function Session._init_recovered(self, config)
 
     -- Register in session registry
     sessions[self.session_uuid] = self
+    sync_manifest_workspaces()
 
     log.info(string.format("Session recovered: %s (uuid=%s, type=%s)",
         key, self.session_uuid, self.session_type))
@@ -819,9 +837,18 @@ function Session:close(delete_worktree)
 
     -- Remove from registry
     sessions[self.session_uuid] = nil
+    sync_manifest_workspaces()
 
-    -- Mark the Central Session Store session as closed
-    if self._data_dir and self._workspace_id then
+    -- Mark the Central Session Store session as closed.
+    -- Skip for session-process-backed sessions whose socket is still live —
+    -- the session process survives hub shutdown and will be recovered.
+    local session_socket_live = false
+    if hub.session_socket_exists then
+        session_socket_live = pcall(hub.session_socket_exists, self.session_uuid) or false
+        local ok, exists = pcall(hub.session_socket_exists, self.session_uuid)
+        session_socket_live = ok and exists
+    end
+    if self._data_dir and self._workspace_id and not session_socket_live then
         local ws = require("lib.workspace_store")
         local manifest = ws.read_session(self._data_dir, self._workspace_id, self.session_uuid)
         if manifest then
