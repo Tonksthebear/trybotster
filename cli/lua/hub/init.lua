@@ -194,7 +194,7 @@ do
     end
 end
 
--- Load broker restart recovery handler (creates ghost PTYs on Hub restart)
+-- Load broker restart recovery handler (recovers PTYs on Hub restart)
 safe_require("handlers.broker")
 
 -- Watch core modules and plugin directories for hot-reload on file changes

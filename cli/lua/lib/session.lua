@@ -520,7 +520,7 @@ function Session:update(fields)
         if needs_sync then
             self:_sync_session_manifest()
         end
-        hooks.call("session_updated", { session_uuid = self.session_uuid })
+        hooks.notify("session_updated", { session_uuid = self.session_uuid })
     end
 end
 

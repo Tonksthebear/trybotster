@@ -3596,7 +3596,7 @@ mod tests {
                     return nil
                 end
 
-                hub.create_ghost_session = function(_session_uuid, _session_id, _rows, _cols)
+                hub.create_recovered_session = function(_session_uuid, _session_id, _rows, _cols)
                     return {
                         feed_output = function(_self, _data)
                             _test_feed_calls = _test_feed_calls + 1
@@ -3650,7 +3650,7 @@ mod tests {
     }
 
     /// Regression test for restart recovery scrollback source of truth:
-    /// replay comes from broker snapshot RPC and feeds ghost shadow screen.
+    /// replay comes from broker snapshot RPC and feeds recovered session shadow screen.
     #[test]
     fn test_broker_sessions_recovered_replays_broker_snapshot() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
@@ -3751,7 +3751,7 @@ mod tests {
                     return "broker-snapshot-line\n"
                 end
 
-                hub.create_ghost_session = function(_session_uuid, _session_id, _rows, _cols)
+                hub.create_recovered_session = function(_session_uuid, _session_id, _rows, _cols)
                     return {
                         feed_output = function(_self, data)
                             _test_feed_calls = _test_feed_calls + 1
@@ -3811,7 +3811,7 @@ mod tests {
     }
 
     /// Regression test for unified session registry behavior:
-    /// Broker recovery produces first-class session instances (no ghost concept).
+    /// Broker recovery produces first-class session instances.
     /// Session.get() returns the recovered instance, all_info() includes it as "running".
     #[test]
     fn test_broker_recovery_produces_real_session_instances() {
@@ -3908,7 +3908,7 @@ mod tests {
                     return nil
                 end
 
-                hub.create_ghost_session = function(_session_uuid, _session_id, _rows, _cols)
+                hub.create_recovered_session = function(_session_uuid, _session_id, _rows, _cols)
                     return {
                         feed_output = function(_self, _data) end,
                         dimensions = function(_self) return _rows, _cols end,
@@ -3959,7 +3959,7 @@ mod tests {
             "Session.get(session_uuid) must return the recovered session instance"
         );
 
-        // The session should appear in all_info() as "running", not "ghost"
+        // The session should appear in all_info() as "running"
         let running_count: i64 = runtime
             .lua()
             .load(

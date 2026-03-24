@@ -65,10 +65,10 @@ local function recover_session(record, broker_session, recovered, seen_keys)
 
     -- Create a lightweight PTY handle (no real process, broker owns the PTY)
     local ok, handle = pcall(
-        hub.create_ghost_session, session_uuid, session_id, rows, cols
+        hub.create_recovered_session, session_uuid, session_id, rows, cols
     )
     if not ok or not handle then
-        log.warn(string.format("[broker] create_ghost_session failed for %s: %s",
+        log.warn(string.format("[broker] create_recovered_session failed for %s: %s",
             session_uuid, tostring(handle)))
         return
     end
@@ -121,6 +121,10 @@ local function recover_session(record, broker_session, recovered, seen_keys)
     if not ok2 or not session then
         log.warn(string.format("[broker] Failed to recover session %s: %s",
             session_uuid, tostring(session)))
+        -- Clean up the BrokerSessionRegistered entry that create_recovered_session
+        -- already queued. Without this, BrokerPtyOutput for the failed session
+        -- would hit the "session not in cache" path on every output chunk.
+        pcall(hub.unregister_session, session_uuid)
         return
     end
 

@@ -956,8 +956,8 @@ impl Hub {
     ///    connect to it.
     /// 4. On success, configure the reconnect timeout and store the connection.
     ///
-    /// The broker demux forwarder is installed before recovery so the full
-    /// I/O pipeline is ready when sessions are created.
+    /// The broker demux forwarder is installed after recovery completes so
+    /// recovery snapshot/list RPCs run on the direct request/response path.
     pub fn try_connect_broker(&mut self) -> Option<bool> {
         let path = match crate::broker::broker_socket_path(&self.hub_identifier) {
             Ok(p) => p,
@@ -1034,11 +1034,11 @@ impl Hub {
         Some(is_reconnect)
     }
 
-    /// Install broker demux forwarding before recovery.
+    /// Install broker demux forwarding after recovery control RPCs complete.
     ///
-    /// The demux thread takes over socket reads and routes PTY output into
-    /// Hub events. Installed before recovery so the full I/O pipeline is
-    /// ready when recovered sessions are created and registered.
+    /// Recovery uses synchronous broker control requests (`list_sessions`,
+    /// `get_snapshot`) on the direct socket path. The demux thread is installed
+    /// after recovery so these RPCs don't contend with the channel path.
     fn install_broker_forwarder(&mut self) {
         let mut guard = match self.broker_connection.lock() {
             Ok(g) => g,
@@ -1162,10 +1162,10 @@ impl Hub {
             }),
         );
 
+        let recovered_sessions = self.recover_broker_sessions();
         if broker_connected {
             self.install_broker_forwarder();
         }
-        let recovered_sessions = self.recover_broker_sessions();
         self.fire_hub_recovery_state(
             "sessions_recovered",
             serde_json::json!({

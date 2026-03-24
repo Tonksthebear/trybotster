@@ -91,13 +91,13 @@ use crate::agent::pty::events::PtyEvent;
 ///
 /// The `_session` field keeps the `PtySession` alive via `Arc` -- dropping
 /// the last reference triggers `PtySession::drop()` which kills the child
-/// process and aborts the command processor task. Ghost sessions (broker
+/// process and aborts the command processor task. Recovered sessions (broker
 /// recovery) set this to `None` since they have no child process.
 ///
 /// Runtime sessions are created by `hub.spawn_pty_with_broker()`.
 pub struct PtySessionHandle {
     /// Keep `PtySession` alive -- its `Drop` impl kills the child process
-    /// and aborts the command processor task. `None` for ghost sessions.
+    /// and aborts the command processor task. `None` for broker-backed recovered sessions.
     _session: Option<Arc<Mutex<PtySession>>>,
 
     /// Shared state for direct write/resize operations.
@@ -157,26 +157,26 @@ impl PtySessionHandle {
     /// Clone the event broadcast sender for subscribing to PTY events.
     ///
     /// Used by `register_session` to spawn a notification watcher for
-    /// ghost sessions that were created without one.
+    /// recovered sessions that were created without one.
     pub(crate) fn event_tx(&self) -> broadcast::Sender<PtyEvent> {
         self.event_tx.clone()
     }
 
-    /// Whether this is a ghost handle (no live PTY process).
+    /// Whether this is a recovered broker-backed handle (no local PTY process).
     ///
-    /// Ghost handles are created by `create_ghost_session` during broker
+    /// Recovered handles are created by `create_recovered_session` during broker
     /// recovery. They skip the spawn path which normally creates a
     /// notification watcher, so `register_session` must create one.
-    pub(crate) fn is_ghost(&self) -> bool {
+    pub(crate) fn is_recovered(&self) -> bool {
         self._session.is_none()
     }
 
-    /// Create a ghost `PtySessionHandle` for Hub restart recovery.
+    /// Create a broker-backed `PtySessionHandle` for Hub restart recovery.
     ///
-    /// A ghost handle has no real PTY process and no heavy `PtySession`. Only
-    /// a minimal shadow screen (correct dimensions, zero scrollback), broadcast
-    /// channel, and AtomicBools are created. All terminal state queries route
-    /// through the broker RPC once `set_broker_relay()` is called.
+    /// No real PTY process or `PtySession` is created — only a minimal shadow
+    /// screen (correct dimensions, zero scrollback), broadcast channel, and
+    /// AtomicBools. All terminal state queries route through the broker RPC
+    /// once `set_broker_relay()` is called.
     ///
     /// # Arguments
     ///
@@ -184,7 +184,7 @@ impl PtySessionHandle {
     /// * `cols` - Terminal column count (read from session manifest on restart)
     /// * `hub_event_tx` - Hub event sender for message delivery tasks
     #[must_use]
-    pub(crate) fn new_ghost(rows: u16, cols: u16, hub_event_tx: HubEventSender) -> Self {
+    pub(crate) fn new_broker_backed(rows: u16, cols: u16, hub_event_tx: HubEventSender) -> Self {
         let (event_tx, _) = broadcast::channel(64);
         let shared_state = Arc::new(Mutex::new(SharedPtyState {
             master_pty: None,
@@ -246,7 +246,7 @@ impl PtySessionHandle {
             Arc::clone(&self.kitty_enabled),
             Arc::clone(&self.cursor_visible),
             Arc::clone(&self.resize_pending),
-            true, // Ghost PTYs are always CLI sessions (broker agents)
+            true, // Recovered PTYs are always CLI sessions (broker agents)
             self.port,
             broker_relay,
             Arc::clone(&self.last_output_at),
@@ -458,7 +458,7 @@ impl LuaUserData for PtySessionHandle {
 
         // session:feed_output(bytes) - Feed raw bytes into the shadow screen.
         //
-        // Processes `bytes` through the local alacritty parser. For ghost
+        // Processes `bytes` through the local alacritty parser. For recovered
         // sessions (zero-scrollback parser), this updates mode state but
         // retains no scrollback — get_snapshot()/get_screen() route through
         // broker RPCs instead.
@@ -521,7 +521,7 @@ impl LuaUserData for PtySessionHandle {
         //
         // Locks the PtySession and calls kill_child(). After this call,
         // is_alive() will return false and write() will be a no-op.
-        // No-op for ghost sessions (no child process).
+        // No-op for recovered sessions (no child process).
         methods.add_method("kill", |_, this, ()| {
             if let Some(ref session_arc) = this._session {
                 let mut session = session_arc
