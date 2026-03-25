@@ -15,6 +15,8 @@ GitHub webhook → Rails server → Message queue → Rust daemon polls
 **Rails server** (trybotster.com):
 
 - Receives GitHub webhooks, creates `Integrations::Github::Message` records
+- Hub registration (one hub = one device, identified by Ed25519 fingerprint)
+- `HubToken` for CLI auth, `BrowserKey` for browser E2E key exchange
 - VPN coordination via `WireguardCoordinator` (key exchange, IP allocation)
 - MCP tools for agents (GitHub operations)
 - User auth via GitHub OAuth
@@ -38,10 +40,12 @@ GitHub webhook → Rails server → Message queue → Rust daemon polls
 
 ```
 # Rails
+app/models/hub.rb                          # Hub = device identity (fingerprint, tokens)
+app/models/hub_token.rb                    # CLI auth token (btstr_ prefix)
+app/models/browser_key.rb                  # Browser E2E public key registration
+app/models/hub_authorization.rb            # OAuth device flow (RFC 8628)
 app/models/integrations/github/message.rb  # GitHub webhook messages
 app/models/hub_command.rb                  # Hub platform commands
-app/models/vpn_node.rb                     # VPN node records
-app/services/wireguard_coordinator.rb      # VPN key exchange
 app/controllers/github/webhooks_controller.rb
 app/templates/plugins/github.lua           # GitHub plugin template
 
@@ -53,6 +57,7 @@ cli/src/hub/handle_cache.rs # Thread-safe agent PTY handle cache
 cli/src/session/mod.rs      # Per-session PTY process (replaces broker)
 cli/src/session/protocol.rs # Session process wire protocol
 cli/src/session/connection.rs # Hub-side session connection + reader thread
+cli/src/device.rs           # Local device identity (Ed25519 keypair, fingerprint)
 cli/src/relay/              # E2E encrypted browser communication
 cli/src/wireguard.rs        # WireGuard VPN client
 cli/src/git.rs              # Worktree operations
