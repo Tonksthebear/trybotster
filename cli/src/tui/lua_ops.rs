@@ -15,7 +15,7 @@
 pub enum LuaOp {
     /// Update the mode shadow (canonical state lives in Lua's `_tui_state.mode`).
     SetMode {
-        /// The new mode name (e.g. "insert", "menu", "agents").
+        /// The new mode name (e.g. "terminal", "list", "menu").
         mode: String,
     },
 
@@ -135,9 +135,9 @@ mod tests {
 
     #[test]
     fn parse_set_mode() {
-        let val = json!({"op": "set_mode", "mode": "insert"});
+        let val = json!({"op": "set_mode", "mode": "terminal"});
         let op = LuaOp::parse(&val).expect("should parse");
-        assert!(matches!(op, LuaOp::SetMode { mode } if mode == "insert"));
+        assert!(matches!(op, LuaOp::SetMode { mode } if mode == "terminal"));
     }
 
     #[test]
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn parse_missing_op_returns_none() {
-        let val = json!({"mode": "insert"});
+        let val = json!({"mode": "terminal"});
         assert!(LuaOp::parse(&val).is_none());
     }
 

@@ -195,7 +195,11 @@ pub struct TuiRunner<B: Backend> {
     /// resize, hot-reload). Cleared after render.
     dirty: bool,
 
-
+    /// Cached notification focus state. True when the TUI is subscribed to
+    /// a PTY (`current_session_uuid` is Some), has no overlay, and the
+    /// terminal window is focused. Only sends `FocusChanged` when this
+    /// value actually transitions.
+    notification_focused: bool,
 }
 
 impl<B: Backend> std::fmt::Debug for TuiRunner<B>
@@ -264,6 +268,7 @@ where
             focused_list_id: None,
             focused_input_id: None,
             dirty: true, // render on first frame
+            notification_focused: false,
         }
     }
 
@@ -511,9 +516,8 @@ where
                         self.mode,
                         self.has_overlay
                     );
-                    if self.mode == "insert" && !self.has_overlay {
-                        // Always notify hub of focus state for notification suppression
-                        self.send_focus_changed(true);
+                    self.sync_notification_focus();
+                    if self.mode == "terminal" && !self.has_overlay {
                         if self.focus_reporting_enabled_for_current_session() {
                             log::debug!(
                                 "[FOCUS] forwarding \\x1b[I to PTY session={:?}",
@@ -530,9 +534,8 @@ where
                         self.mode,
                         self.has_overlay
                     );
-                    if self.mode == "insert" && !self.has_overlay {
-                        // Always notify hub of focus state for notification suppression
-                        self.send_focus_changed(false);
+                    self.sync_notification_focus();
+                    if self.mode == "terminal" && !self.has_overlay {
                         if self.focus_reporting_enabled_for_current_session() {
                             log::debug!(
                                 "[FOCUS] forwarding \\x1b[O to PTY session={:?}",
@@ -548,7 +551,7 @@ where
                     // Apps like Claude Code rely on receiving the full paste
                     // (start marker + content + end marker) in one read to detect
                     // file drag/drop vs typed input.
-                    if self.mode == "insert" && !self.has_overlay {
+                    if self.mode == "terminal" && !self.has_overlay {
                         log::debug!("[PASTE] Forwarding {} bytes to PTY", raw_bytes.len());
                         self.handle_pty_input(raw_bytes);
                     }
@@ -617,7 +620,7 @@ where
     /// 2. Ctrl+Q is hardcoded as Quit (safety — works even if Lua is broken)
     /// 3. Call Lua `handle_key(descriptor, mode, context)`
     /// 4. If Lua returns an action → map to `TuiAction` and handle
-    /// 5. If Lua returns `nil` in Normal mode → forward original raw bytes to PTY
+    /// 5. If Lua returns `nil` in List mode → forward original raw bytes to PTY
     /// 6. If Lua returns `nil` in modal mode → ignore (swallow key)
     ///
     /// Mouse scroll events are handled directly.
@@ -672,8 +675,8 @@ where
                                 return;
                             }
                             Ok(None) => {
-                                // Unbound key — forward raw bytes to PTY only in insert mode
-                                if self.mode == "insert"
+                                // Unbound key — forward raw bytes to PTY only in terminal mode
+                                if self.mode == "terminal"
                                     && !self.has_overlay
                                     && !raw_bytes.is_empty()
                                 {
@@ -688,7 +691,7 @@ where
                             }
                             Err(e) => {
                                 log::warn!("Lua handle_key failed: {e}");
-                                if self.mode == "insert"
+                                if self.mode == "terminal"
                                     && !self.has_overlay
                                     && !raw_bytes.is_empty()
                                 {
@@ -700,8 +703,8 @@ where
                     }
                 }
 
-                // No Lua keybindings loaded — forward raw bytes only in insert mode
-                if self.mode == "insert" && !self.has_overlay && !raw_bytes.is_empty() {
+                // No Lua keybindings loaded — forward raw bytes only in terminal mode
+                if self.mode == "terminal" && !self.has_overlay && !raw_bytes.is_empty() {
                     self.handle_pty_input(&raw_bytes);
                 }
             }
@@ -982,6 +985,21 @@ where
         }
     }
 
+    /// Recompute notification focus from current state and send a
+    /// `FocusChanged` message only when the value actually transitions.
+    ///
+    /// Focused = subscribed to a PTY AND no overlay AND terminal window
+    /// has OS-level focus.
+    fn sync_notification_focus(&mut self) {
+        let should_focus = self.panel_pool.current_session_uuid.is_some()
+            && !self.has_overlay
+            && self.terminal_modes.terminal_focused();
+        if should_focus != self.notification_focused {
+            self.notification_focused = should_focus;
+            self.send_focus_changed(should_focus);
+        }
+    }
+
     /// Mirror terminal modes from PTY to the outer terminal.
     ///
     /// Handle resize event.
@@ -1094,7 +1112,6 @@ where
                 Err(TryRecvError::Disconnected) => {
                     log::debug!("PTY output channel disconnected");
                     if self.terminal_modes.terminal_focused() {
-                        self.send_focus_changed(false);
                         if self.focus_reporting_enabled_for_current_session() {
                             self.handle_pty_input(b"\x1b[O");
                         }
@@ -1103,6 +1120,7 @@ where
                     for msg in msgs {
                         self.send_msg(msg);
                     }
+                    self.sync_notification_focus();
                     break;
                 }
             }
@@ -1283,6 +1301,7 @@ where
 
             // Track overlay presence for input routing (PTY vs keybindings)
             self.has_overlay = result.overlay.is_some();
+            self.sync_notification_focus();
 
             // Cache overlay list actions for menu selection dispatch
             self.overlay_list_actions = result
@@ -1349,26 +1368,25 @@ where
             match op {
                 LuaOp::SetMode { mode } => {
                     log::info!("[TUI-OP] set_mode: {} -> {}", self.mode, mode);
-                    let was_insert = self.mode == "insert" && !self.has_overlay;
+                    let was_terminal = self.mode == "terminal" && !self.has_overlay;
                     self.mode = mode;
-                    let now_insert = self.mode == "insert" && !self.has_overlay;
-                    // Synthetic focus events on mode transition so the viewed
-                    // PTY tracks whether it's "active" even across overlays.
-                    if self.terminal_modes.terminal_focused() && was_insert != now_insert {
-                        // Always notify hub for notification suppression
-                        self.send_focus_changed(now_insert);
+                    let now_terminal = self.mode == "terminal" && !self.has_overlay;
+                    // Synthetic focus sequences on mode transition so
+                    // focus-reporting PTY apps track active/inactive state.
+                    if self.terminal_modes.terminal_focused() && was_terminal != now_terminal {
                         if self.focus_reporting_enabled_for_current_session() {
-                            if now_insert {
-                                log::debug!("[FOCUS] synthetic focus-in on mode change to insert");
+                            if now_terminal {
+                                log::debug!("[FOCUS] synthetic focus-in on mode change to terminal");
                                 self.handle_pty_input(b"\x1b[I");
                             } else {
                                 log::debug!(
-                                    "[FOCUS] synthetic focus-out on mode change from insert"
+                                    "[FOCUS] synthetic focus-out on mode change from terminal"
                                 );
                                 self.handle_pty_input(b"\x1b[O");
                             }
                         }
                     }
+                    self.sync_notification_focus();
                     // Reset Rust-side widget state on mode transition
                     // (mirrors Lua's set_mode_ops resetting list_selected/input_buffer)
                     self.widget_states.reset_all();
@@ -1418,6 +1436,8 @@ where
                 }
             }
         }
+        // Subscription or mode may have changed — re-evaluate notification focus.
+        self.sync_notification_focus();
     }
 
     /// Execute the `focus_terminal` op — switch to a specific agent and PTY.
@@ -1917,14 +1937,14 @@ mod tests {
 
     /// Creates a `LayoutLua` with keybindings and actions loaded from actual files.
     fn make_test_layout_with_keybindings() -> LayoutLua {
-        let layout_source = "function render(s) return { type = 'empty' } end\nfunction render_overlay(s) return nil end\nfunction initial_mode() return 'normal' end";
+        let layout_source = "function render(s) return { type = 'empty' } end\nfunction render_overlay(s) return nil end\nfunction initial_mode() return 'list' end";
         let kb_source = include_str!("../../lua/ui/keybindings.lua");
         let actions_source = include_str!("../../lua/ui/actions.lua");
         let events_source = include_str!("../../lua/ui/events.lua");
         let mut lua = LayoutLua::new(layout_source).expect("test layout should load");
         // Bootstrap _tui_state (actions.lua and events.lua read from it)
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'list', input_buffer = '', list_selected = 0 }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
         lua.preload_module(
@@ -2081,12 +2101,12 @@ mod tests {
     // E2E Menu Flow Tests - Full Keyboard Input Chain
     // =========================================================================
 
-    /// Verifies Ctrl+P opens the menu from Normal mode.
+    /// Verifies Ctrl+P opens the menu from List mode.
     #[test]
     fn test_e2e_ctrl_p_opens_menu() {
         let (mut runner, _cmd_rx) = create_test_runner();
 
-        assert_eq!(runner.mode(), "normal");
+        assert_eq!(runner.mode(), "list");
 
         process_key(&mut runner, make_key_ctrl('p'));
 
@@ -2119,7 +2139,7 @@ mod tests {
 
         // Close with Escape
         process_key_with_lua(&mut runner, make_key_escape(), &lua);
-        assert_eq!(runner.mode(), "normal");
+        assert_eq!(runner.mode(), "list");
     }
 
     /// Verifies menu up does not go below zero.
@@ -2183,21 +2203,21 @@ mod tests {
         assert!(runner.quit, "Ctrl+Q should set quit flag");
     }
 
-    /// Verifies plain keys in Normal mode go to PTY (via Lua returning nil).
+    /// Verifies plain keys in List mode go to PTY (via Lua returning nil).
     #[test]
-    fn test_e2e_normal_mode_keys_go_to_pty() {
+    fn test_e2e_list_mode_keys_go_to_pty() {
         let lua = make_test_layout_with_keybindings();
         let context = KeyContext::default();
 
-        // Plain 'q' should NOT match any binding in normal mode -> nil -> PTY
-        let result = lua.call_handle_key("q", "normal", &context).unwrap();
+        // Plain 'q' should NOT match any binding in list mode -> nil -> PTY
+        let result = lua.call_handle_key("q", "list", &context).unwrap();
         assert!(
             result.is_none(),
             "Plain 'q' should return nil (PTY forward)"
         );
 
-        // Plain 'p' should NOT match any binding in normal mode -> nil -> PTY
-        let result = lua.call_handle_key("p", "normal", &context).unwrap();
+        // Plain 'p' should NOT match any binding in list mode -> nil -> PTY
+        let result = lua.call_handle_key("p", "list", &context).unwrap();
         assert!(
             result.is_none(),
             "Plain 'p' should return nil (PTY forward)"
@@ -2245,7 +2265,7 @@ mod tests {
 
         // 4. Close with Escape
         process_key_with_lua(&mut runner, make_key_escape(), &lua);
-        assert_eq!(runner.mode(), "normal");
+        assert_eq!(runner.mode(), "list");
     }
 
     /// Verifies the `restart_hub` menu action sends the right message and does
@@ -2266,7 +2286,7 @@ mod tests {
     /// This test verifies:
     /// 1. `runner.quit` is NOT set after selecting restart_hub (no race).
     /// 2. A `restart_hub` message is sent to Hub.
-    /// 3. The menu is closed (mode returns to normal/insert, not "menu").
+    /// 3. The menu is closed (mode returns to list/terminal, not "menu").
     #[test]
     fn test_e2e_restart_hub_does_not_quit_tui() {
         let (mut runner, _output_tx, mut request_rx, shutdown) =
@@ -2477,12 +2497,12 @@ mod tests {
         }
         assert!(found_create, "create_agent JSON message should be sent");
 
-        // Modal closes after submit — stays in normal mode until agent_created
-        // event arrives and selects the agent (which sets insert mode).
+        // Modal closes after submit — stays in list mode until agent_created
+        // event arrives and selects the agent (which sets terminal mode).
         assert_eq!(
             runner.mode(),
-            "normal",
-            "Should be normal mode until agent_created event selects the agent"
+            "list",
+            "Should be list mode until agent_created event selects the agent"
         );
 
         // Cleanup
@@ -2596,11 +2616,11 @@ mod tests {
 
         thread::sleep(Duration::from_millis(10));
 
-        // Modal closes after selection — stays in normal mode until agent_created event
+        // Modal closes after selection — stays in list mode until agent_created event
         assert_eq!(
             runner.mode(),
-            "normal",
-            "Should be normal mode until agent_created event selects the agent"
+            "list",
+            "Should be list mode until agent_created event selects the agent"
         );
 
         // Verify reopen_worktree JSON message with path
@@ -2659,7 +2679,7 @@ mod tests {
         runner.mode = "new_agent_select_worktree".to_string();
         let _ = lua.exec("_tui_state.mode = 'new_agent_select_worktree'");
         process_key_with_lua(&mut runner, make_key_escape(), &lua);
-        assert_eq!(runner.mode(), "normal");
+        assert_eq!(runner.mode(), "list");
 
         // Cancel at issue input
         runner.mode = "new_agent_create_worktree".to_string();
@@ -2667,7 +2687,7 @@ mod tests {
             "_tui_state.mode = 'new_agent_create_worktree'; _tui_state.input_buffer = 'partial'",
         );
         process_key_with_lua(&mut runner, make_key_escape(), &lua);
-        assert_eq!(runner.mode(), "normal");
+        assert_eq!(runner.mode(), "list");
         assert!(
             lua_input_buffer(&lua).is_empty(),
             "Buffer should be cleared"
@@ -2677,7 +2697,7 @@ mod tests {
         runner.mode = "new_agent_prompt".to_string();
         let _ = lua.exec("_tui_state.mode = 'new_agent_prompt'");
         process_key_with_lua(&mut runner, make_key_escape(), &lua);
-        assert_eq!(runner.mode(), "normal");
+        assert_eq!(runner.mode(), "list");
 
         // No commands sent
         assert!(cmd_rx.try_recv().is_err());
@@ -2780,7 +2800,7 @@ mod tests {
 
         // Shift+PageUp for scroll up
         let result = lua
-            .call_handle_key("shift+pageup", "normal", &context)
+            .call_handle_key("shift+pageup", "list", &context)
             .unwrap();
         assert_eq!(
             result.as_ref().map(|a| a.action.as_str()),
@@ -2790,7 +2810,7 @@ mod tests {
 
         // Shift+PageDown for scroll down
         let result = lua
-            .call_handle_key("shift+pagedown", "normal", &context)
+            .call_handle_key("shift+pagedown", "list", &context)
             .unwrap();
         assert_eq!(
             result.as_ref().map(|a| a.action.as_str()),
@@ -2821,14 +2841,14 @@ mod tests {
         let lua = make_test_layout_with_keybindings();
         let context = KeyContext::default();
 
-        let result = lua.call_handle_key("ctrl+j", "normal", &context).unwrap();
+        let result = lua.call_handle_key("ctrl+j", "list", &context).unwrap();
         assert_eq!(
             result.as_ref().map(|a| a.action.as_str()),
             Some("select_next"),
             "Ctrl+J should be select_next"
         );
 
-        let result = lua.call_handle_key("ctrl+k", "normal", &context).unwrap();
+        let result = lua.call_handle_key("ctrl+k", "list", &context).unwrap();
         assert_eq!(
             result.as_ref().map(|a| a.action.as_str()),
             Some("select_previous"),
@@ -2842,7 +2862,7 @@ mod tests {
         let lua = make_test_layout_with_keybindings();
         let context = KeyContext::default();
 
-        let result = lua.call_handle_key("ctrl+]", "normal", &context).unwrap();
+        let result = lua.call_handle_key("ctrl+]", "list", &context).unwrap();
         assert_eq!(
             result.as_ref().map(|a| a.action.as_str()),
             None,
@@ -2938,22 +2958,22 @@ mod tests {
         );
     }
 
-    /// Verifies render in Normal mode succeeds without connection code.
+    /// Verifies render in List mode succeeds without connection code.
     ///
     /// # Purpose
     ///
-    /// In Normal mode, no connection code is needed. Render should succeed
+    /// In List mode, no connection code is needed. Render should succeed
     /// regardless of the cached connection code state.
     #[test]
-    fn test_normal_mode_render_succeeds_without_connection_code_fetch() {
+    fn test_list_mode_render_succeeds_without_connection_code_fetch() {
         let (mut runner, _cmd_rx) = create_test_runner();
 
-        // Stay in Normal mode
-        assert_eq!(runner.mode, "normal");
+        // Stay in List mode
+        assert_eq!(runner.mode, "list");
 
-        // Render in Normal mode should succeed without any Hub calls
+        // Render in List mode should succeed without any Hub calls
         let result = runner.render(None, None);
-        assert!(result.is_ok(), "Render should succeed in Normal mode");
+        assert!(result.is_ok(), "Render should succeed in List mode");
     }
 
     // =========================================================================
@@ -3803,7 +3823,7 @@ mod tests {
 
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         lua.load_extension(
-            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'normal', input_buffer = '', list_selected = 0, selected_agent_index = nil }",
+            "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'list', input_buffer = '', list_selected = 0, selected_agent_index = nil }",
             "_tui_state_init",
         ).expect("_tui_state bootstrap should succeed");
         lua.preload_module(
@@ -3863,8 +3883,8 @@ mod tests {
             .render(Some(&lua), None)
             .expect("initial render should succeed");
 
-        assert_eq!(runner.mode(), "normal");
-        assert!(!runner.has_overlay, "no overlay in normal mode");
+        assert_eq!(runner.mode(), "list");
+        assert!(!runner.has_overlay, "no overlay in list mode");
 
         // === Step 1: Ctrl+P opens menu ===
         press_key_and_render(&mut runner, make_key_ctrl('p'), &lua);
@@ -4016,11 +4036,11 @@ mod tests {
             "create_agent message should be sent through real render pipeline"
         );
 
-        // Mode should return to normal after submit
+        // Mode should return to list after submit
         assert_eq!(
             runner.mode(),
-            "normal",
-            "Should return to normal mode after agent creation"
+            "list",
+            "Should return to list mode after agent creation"
         );
 
         shutdown.store(true, Ordering::Relaxed);
@@ -4168,7 +4188,7 @@ mod tests {
             }
         }
         assert!(found_create, "create_agent with worktree should be sent");
-        assert_eq!(runner.mode(), "normal");
+        assert_eq!(runner.mode(), "list");
 
         shutdown.store(true, Ordering::Relaxed);
     }
@@ -4187,8 +4207,8 @@ mod tests {
         press_key_and_render(&mut runner, make_key_escape(), &lua);
         assert_eq!(
             runner.mode(),
-            "normal",
-            "Escape from menu should return to normal"
+            "list",
+            "Escape from menu should return to list"
         );
 
         // Open menu → New Agent → escape from agent config selection
@@ -4207,8 +4227,8 @@ mod tests {
         press_key_and_render(&mut runner, make_key_escape(), &lua);
         assert_eq!(
             runner.mode(),
-            "normal",
-            "Escape from agent config selection should return to normal"
+            "list",
+            "Escape from agent config selection should return to list"
         );
 
         shutdown.store(true, Ordering::Relaxed);

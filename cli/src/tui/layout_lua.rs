@@ -431,7 +431,7 @@ impl LayoutLua {
     /// # Arguments
     ///
     /// * `descriptor` - Key descriptor string (e.g., `"ctrl+p"`, `"shift+enter"`)
-    /// * `mode` - Current app mode as Lua string (e.g., `"normal"`, `"menu"`)
+    /// * `mode` - Current app mode as Lua string (e.g., `"list"`, `"terminal"`, `"menu"`)
     /// * `context` - Additional context for keybinding logic
     pub fn call_handle_key(
         &self,
@@ -736,7 +736,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = make_test_ctx("normal");
+        let ctx = make_test_ctx("list");
         let tree = layout.call_render(&ctx).unwrap();
         assert!(matches!(tree, RenderNode::HSplit { .. }));
     }
@@ -762,7 +762,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = make_test_ctx("normal");
+        let ctx = make_test_ctx("list");
         let tree = layout.call_render(&ctx).unwrap();
         match tree {
             RenderNode::HSplit { children, .. } => match &children[0] {
@@ -793,7 +793,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = make_test_ctx("normal");
+        let ctx = make_test_ctx("list");
         let overlay = layout.call_render_overlay(&ctx).unwrap();
         assert!(overlay.is_none());
     }
@@ -802,7 +802,7 @@ mod tests {
     fn test_layout_lua_overlay_menu() {
         let layout = LayoutLua::new(
             r#"
-            _tui_state = _tui_state or { mode = "normal" }
+            _tui_state = _tui_state or { mode = "list" }
             function render(state)
                 return { type = "empty" }
             end
@@ -843,7 +843,7 @@ mod tests {
 
         // Map of every mode string to whether it should produce an overlay
         let mode_expectations: Vec<(&str, bool)> = vec![
-            ("normal", false),
+            ("list", false),
             ("menu", true),
             ("new_agent_select_worktree", true),
             ("new_agent_create_worktree", true),
@@ -944,7 +944,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = make_test_ctx("normal");
+        let ctx = make_test_ctx("list");
 
         let result = layout.call_render(&ctx);
         assert!(result.is_err());
@@ -977,7 +977,7 @@ mod tests {
             )
             .unwrap();
 
-        let ctx = make_test_ctx("normal");
+        let ctx = make_test_ctx("list");
 
         let tree = layout.call_render(&ctx).unwrap();
         assert!(matches!(tree, RenderNode::HSplit { .. }));
@@ -1014,7 +1014,7 @@ mod tests {
             )
             .unwrap();
 
-        let ctx = make_test_ctx("normal");
+        let ctx = make_test_ctx("list");
 
         let tree = layout.call_render(&ctx).unwrap();
         // Extension wrapped the terminal in a vsplit
@@ -1037,7 +1037,7 @@ mod tests {
         assert!(result.is_err());
 
         // Original render still works
-        let ctx = make_test_ctx("normal");
+        let ctx = make_test_ctx("list");
 
         let tree = layout.call_render(&ctx).unwrap();
         assert!(matches!(tree, RenderNode::Widget { .. }));
@@ -1090,7 +1090,7 @@ mod tests {
             )
             .unwrap();
 
-        let ctx = make_test_ctx("normal");
+        let ctx = make_test_ctx("list");
 
         // Second extension saw _test_value from first, so wrapped in hsplit
         let tree = layout.call_render(&ctx).unwrap();
@@ -1173,7 +1173,7 @@ mod tests {
         // Register a new keybinding via botster API
         lua.load_extension(
             r#"
-            botster.keymap.set("normal", "ctrl+n", "open_menu", {
+            botster.keymap.set("list", "ctrl+n", "open_menu", {
                 desc = "Quick new agent",
                 namespace = "test",
             })
@@ -1191,7 +1191,7 @@ mod tests {
             list_count: 0,
             terminal_rows: 24,
         };
-        let result = lua.call_handle_key("ctrl+n", "normal", &ctx).unwrap();
+        let result = lua.call_handle_key("ctrl+n", "list", &ctx).unwrap();
         assert!(result.is_some(), "ctrl+n should be bound");
         assert_eq!(result.unwrap().action, "open_menu");
     }
@@ -1203,7 +1203,7 @@ mod tests {
         // Register a function-based keybinding
         lua.load_extension(
             r#"
-            botster.keymap.set("normal", "ctrl+n", function(context)
+            botster.keymap.set("list", "ctrl+n", function(context)
                 return { action = "toggle_pty" }
             end, { desc = "Smart toggle" })
         "#,
@@ -1220,7 +1220,7 @@ mod tests {
             list_count: 0,
             terminal_rows: 24,
         };
-        let result = lua.call_handle_key("ctrl+n", "normal", &ctx).unwrap();
+        let result = lua.call_handle_key("ctrl+n", "list", &ctx).unwrap();
         assert!(result.is_some(), "ctrl+n function binding should resolve");
         assert_eq!(result.unwrap().action, "toggle_pty");
     }
@@ -1234,13 +1234,13 @@ mod tests {
             list_count: 0,
             terminal_rows: 24,
         };
-        let result = lua.call_handle_key("ctrl+p", "normal", &ctx).unwrap();
+        let result = lua.call_handle_key("ctrl+p", "list", &ctx).unwrap();
         assert!(result.is_some(), "ctrl+p should be bound initially");
 
         // Delete the binding
         lua.load_extension(
             r#"
-            botster.keymap.del("normal", "ctrl+p")
+            botster.keymap.del("list", "ctrl+p")
         "#,
             "test_del",
         )
@@ -1249,7 +1249,7 @@ mod tests {
         lua.load_extension("botster._wire_keybindings()", "_wire")
             .unwrap();
 
-        let result = lua.call_handle_key("ctrl+p", "normal", &ctx).unwrap();
+        let result = lua.call_handle_key("ctrl+p", "list", &ctx).unwrap();
         assert!(result.is_none(), "ctrl+p should be unbound after del");
     }
 
@@ -1260,8 +1260,8 @@ mod tests {
         // Register two bindings under same namespace
         lua.load_extension(
             r#"
-            botster.keymap.set("normal", "ctrl+n", "action_a", { namespace = "myplugin" })
-            botster.keymap.set("normal", "ctrl+m", "action_b", { namespace = "myplugin" })
+            botster.keymap.set("list", "ctrl+n", "action_a", { namespace = "myplugin" })
+            botster.keymap.set("list", "ctrl+m", "action_b", { namespace = "myplugin" })
         "#,
             "test_ns",
         )
@@ -1277,11 +1277,11 @@ mod tests {
 
         // Both should be bound
         assert!(lua
-            .call_handle_key("ctrl+n", "normal", &ctx)
+            .call_handle_key("ctrl+n", "list", &ctx)
             .unwrap()
             .is_some());
         assert!(lua
-            .call_handle_key("ctrl+m", "normal", &ctx)
+            .call_handle_key("ctrl+m", "list", &ctx)
             .unwrap()
             .is_some());
 
@@ -1299,11 +1299,11 @@ mod tests {
 
         // Both should be unbound
         assert!(lua
-            .call_handle_key("ctrl+n", "normal", &ctx)
+            .call_handle_key("ctrl+n", "list", &ctx)
             .unwrap()
             .is_none());
         assert!(lua
-            .call_handle_key("ctrl+m", "normal", &ctx)
+            .call_handle_key("ctrl+m", "list", &ctx)
             .unwrap()
             .is_none());
     }
@@ -1362,7 +1362,7 @@ mod tests {
 
         lua.load_extension(
             r#"
-            botster.keymap.set("normal", "ctrl+n", "my_action", {
+            botster.keymap.set("list", "ctrl+n", "my_action", {
                 desc = "My description",
                 namespace = "test_ns",
             })
@@ -1513,8 +1513,8 @@ mod tests {
         lua.load_extension(botster_source, "botster")
             .expect("botster.lua should load");
 
-        // Render should succeed in normal mode
-        let ctx = make_test_ctx("normal");
+        // Render should succeed in list mode
+        let ctx = make_test_ctx("list");
         let tree = lua.call_render(&ctx);
         assert!(
             tree.is_ok(),
@@ -1522,12 +1522,12 @@ mod tests {
             tree.err()
         );
 
-        // Overlay should return None in normal mode
+        // Overlay should return None in list mode
         let overlay = lua.call_render_overlay(&ctx);
         assert!(overlay.is_ok(), "render_overlay() should succeed");
         assert!(
             overlay.unwrap().is_none(),
-            "normal mode should have no overlay"
+            "list mode should have no overlay"
         );
 
         // Key handling should work
@@ -1535,7 +1535,7 @@ mod tests {
             list_count: 0,
             terminal_rows: 24,
         };
-        let result = lua.call_handle_key("ctrl+p", "normal", &key_ctx);
+        let result = lua.call_handle_key("ctrl+p", "list", &key_ctx);
         assert!(result.is_ok(), "handle_key should work: {:?}", result.err());
     }
 
@@ -1550,7 +1550,7 @@ mod tests {
         ).unwrap();
 
         // Verify built-in render works
-        let ctx = make_test_ctx("normal");
+        let ctx = make_test_ctx("list");
         let tree = lua.call_render(&ctx);
         assert!(tree.is_ok(), "built-in render should work");
 
@@ -1600,27 +1600,27 @@ mod tests {
     fn test_user_keybinding_extension() {
         let lua = make_full_lua();
 
-        // Built-in: ctrl+p should map to "menu" action in normal mode
+        // Built-in: ctrl+p should map to "menu" action in list mode
         let key_ctx = KeyContext {
             list_count: 0,
             terminal_rows: 24,
         };
-        let result = lua.call_handle_key("ctrl+p", "normal", &key_ctx).unwrap();
+        let result = lua.call_handle_key("ctrl+p", "list", &key_ctx).unwrap();
         assert!(result.is_some(), "built-in ctrl+p should be bound");
 
         // User extension adds a new binding
         lua.load_extension(
-            r#"botster.keymap.set("normal", "ctrl+t", "my_custom_action", { desc = "Test" })"#,
+            r#"botster.keymap.set("list", "ctrl+t", "my_custom_action", { desc = "Test" })"#,
             "user_keys",
         )
         .expect("user keybinding extension should load");
 
         // New binding works
-        let result = lua.call_handle_key("ctrl+t", "normal", &key_ctx).unwrap();
+        let result = lua.call_handle_key("ctrl+t", "list", &key_ctx).unwrap();
         assert!(result.is_some(), "user ctrl+t should be bound");
 
         // Built-in binding still works
-        let result = lua.call_handle_key("ctrl+p", "normal", &key_ctx).unwrap();
+        let result = lua.call_handle_key("ctrl+p", "list", &key_ctx).unwrap();
         assert!(result.is_some(), "built-in ctrl+p should still work");
     }
 
@@ -1836,8 +1836,8 @@ mod tests {
 
         // Verify mode switches to insert
         let mode_op = ops.iter().find(|op| op["op"] == "set_mode");
-        assert!(mode_op.is_some(), "Should switch to insert mode");
-        assert_eq!(mode_op.unwrap()["mode"], "insert");
+        assert!(mode_op.is_some(), "Should switch to terminal mode");
+        assert_eq!(mode_op.unwrap()["mode"], "terminal");
     }
 
     /// Extract list item plain-text strings from the sidebar (first child of HSplit).
@@ -1906,7 +1906,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = make_test_ctx("normal");
+        let ctx = make_test_ctx("list");
         let tree = lua.call_render(&ctx).unwrap();
         let items = extract_sidebar_items(&tree);
 
@@ -1947,7 +1947,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = make_test_ctx("insert");
+        let ctx = make_test_ctx("terminal");
         let tree = lua.call_render(&ctx).unwrap();
         let items = extract_sidebar_items(&tree);
 
@@ -1978,7 +1978,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = make_test_ctx("insert");
+        let ctx = make_test_ctx("terminal");
         let tree = lua.call_render(&ctx).unwrap();
         let items = extract_sidebar_items(&tree);
 
@@ -2010,7 +2010,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = make_test_ctx("insert");
+        let ctx = make_test_ctx("terminal");
         let tree = lua.call_render(&ctx).unwrap();
         let items = extract_sidebar_items(&tree);
 
@@ -2046,7 +2046,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = make_test_ctx("insert");
+        let ctx = make_test_ctx("terminal");
         let tree = lua.call_render(&ctx).unwrap();
         let items = extract_sidebar_items(&tree);
         let secondary = extract_sidebar_secondary_items(&tree);
@@ -2145,12 +2145,12 @@ mod tests {
         );
         assert!(
             ops.iter()
-                .any(|op| op["op"] == "set_mode" && op["mode"] == "insert"),
-            "Should enter insert mode"
+                .any(|op| op["op"] == "set_mode" && op["mode"] == "terminal"),
+            "Should enter terminal mode"
         );
 
         // Verify: layout renders the agent (workspace header + agent row)
-        let render_ctx = make_test_ctx("insert");
+        let render_ctx = make_test_ctx("terminal");
         let tree = lua.call_render(&render_ctx).unwrap();
         let items = extract_sidebar_items(&tree);
         assert_eq!(items.len(), 2, "Should have workspace header + agent row");
@@ -2201,7 +2201,7 @@ mod tests {
             .unwrap();
 
         // Verify creating indicator renders
-        let render_ctx = make_test_ctx("normal");
+        let render_ctx = make_test_ctx("list");
         let tree = lua.call_render(&render_ctx).unwrap();
         let items = extract_sidebar_items(&tree);
         assert!(!items.is_empty(), "Should show creating indicator");
@@ -2300,7 +2300,7 @@ mod tests {
         );
         assert!(
             ops.iter()
-                .any(|op| op["op"] == "set_mode" && op["mode"] == "insert"),
+                .any(|op| op["op"] == "set_mode" && op["mode"] == "terminal"),
             "ready recovery should leave restarting mode"
         );
     }
@@ -2591,7 +2591,7 @@ mod tests {
 
         // Should transition back to base mode (normal, since no agent selected)
         let mode_op = ops.iter().find(|op| op["op"] == "set_mode").unwrap();
-        assert_eq!(mode_op["mode"], "normal");
+        assert_eq!(mode_op["mode"], "list");
 
         // Verify creating_agent_id was set for progress tracking
         let creating_id = lua
@@ -2792,8 +2792,8 @@ mod tests {
         // Should transition back to base mode (skips prompt entirely)
         let mode_op = ops.iter().find(|op| op["op"] == "set_mode").unwrap();
         assert_eq!(
-            mode_op["mode"], "normal",
-            "Existing worktree should return to normal mode (no prompt step)"
+            mode_op["mode"], "list",
+            "Existing worktree should return to list mode (no prompt step)"
         );
     }
 
@@ -2836,8 +2836,8 @@ mod tests {
         let ops = lua.call_on_action("close_modal", &ctx).unwrap().unwrap();
         assert_eq!(ops[0]["op"], "set_mode");
         assert_eq!(
-            ops[0]["mode"], "normal",
-            "Escape should return to normal mode (no agent selected)"
+            ops[0]["mode"], "list",
+            "Escape should return to list mode (no agent selected)"
         );
 
         // Start over and escape from branch name input
@@ -2845,16 +2845,16 @@ mod tests {
         lua.exec("_tui_state.list_selected = 1").unwrap();
         lua.call_on_action("list_select", &ctx).unwrap();
         let ops = lua.call_on_action("close_modal", &ctx).unwrap().unwrap();
-        assert_eq!(ops[0]["mode"], "normal");
+        assert_eq!(ops[0]["mode"], "list");
 
         // Start over and escape from prompt input
         enter_new_agent_flow(&lua);
         lua.call_on_action("list_select", &ctx).unwrap(); // Use Main Branch
         let ops = lua.call_on_action("close_modal", &ctx).unwrap().unwrap();
-        assert_eq!(ops[0]["mode"], "normal");
+        assert_eq!(ops[0]["mode"], "list");
     }
 
-    /// When an agent is selected, escape returns to insert mode (not normal).
+    /// When an agent is selected, escape returns to terminal mode (not normal).
     #[test]
     fn test_create_agent_flow_escape_returns_to_insert_when_agent_selected() {
         let lua = make_full_lua();
@@ -2866,8 +2866,8 @@ mod tests {
         };
         let ops = lua.call_on_action("close_modal", &ctx).unwrap().unwrap();
         assert_eq!(
-            ops[0]["mode"], "insert",
-            "Escape with selected agent should return to insert mode"
+            ops[0]["mode"], "terminal",
+            "Escape with selected agent should return to terminal mode"
         );
     }
 
@@ -2881,9 +2881,9 @@ mod tests {
             terminal_rows: 24,
         };
 
-        // ctrl+p in normal mode → open_menu
+        // ctrl+p in list mode → open_menu
         let action = lua
-            .call_handle_key("ctrl+p", "normal", &key_ctx)
+            .call_handle_key("ctrl+p", "list", &key_ctx)
             .unwrap()
             .unwrap();
         assert_eq!(action.action, "open_menu");

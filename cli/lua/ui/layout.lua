@@ -789,5 +789,5 @@ end
 
 --- Initial UI mode at boot. Rust calls this once during initialization.
 function initial_mode()
-  return "normal"
+  return "list"
 end
