@@ -7,9 +7,9 @@
 --   { action = "open_menu" }              -- generic: Rust maps to TuiAction directly
 --   { action = "list_select", index = 2 } -- compound: Rust calls actions.on_action()
 --   { action = "input_char", char = "a" } -- generic with extra data
---   nil                                   -- insert: forward raw bytes to PTY
+--   nil                                   -- terminal: forward raw bytes to PTY
 --                                         -- modal: swallow key (no-op)
---                                         -- normal: swallow key (Rust gates PTY on mode)
+--                                         -- list: swallow key (Rust gates PTY on mode)
 --
 -- Key descriptor format (built by Rust):
 --   Modifiers prefix-sorted: ctrl+shift+alt+<key>
@@ -18,13 +18,13 @@
 -- Safety: Ctrl+Q is hardcoded in Rust and never reaches Lua.
 --
 -- Modes (automatic, not user-invoked):
---   normal  - No agent selected. Keys swallowed unless bound.
---   insert  - Agent selected. Unbound keys forward to PTY.
+--   list     - No agent selected. Keys swallowed unless bound.
+--   terminal - Agent selected. Unbound keys forward to PTY.
 
 local M = {}
 
 -- =============================================================================
--- Shared modifier bindings (used in both normal and insert)
+-- Shared modifier bindings (used in both list and terminal)
 -- =============================================================================
 
 local shared_bindings = {
@@ -41,13 +41,13 @@ local shared_bindings = {
   ["ctrl+r"]         = "refresh_agents",
 }
 
--- Normal mode: no agent selected, shared modifier bindings + enter for list select
-M.normal = { ["enter"] = "list_select" }
-for k, v in pairs(shared_bindings) do M.normal[k] = v end
+-- List mode: no agent selected, shared modifier bindings + enter for list select
+M.list = { ["enter"] = "list_select" }
+for k, v in pairs(shared_bindings) do M.list[k] = v end
 
--- Insert mode: agent selected, PTY forwarding, only shared modifier bindings
-M.insert = {}
-for k, v in pairs(shared_bindings) do M.insert[k] = v end
+-- Terminal mode: agent selected, PTY forwarding, only shared modifier bindings
+M.terminal = {}
+for k, v in pairs(shared_bindings) do M.terminal[k] = v end
 
 M.menu = {
   ["escape"]  = "close_modal",
@@ -193,8 +193,8 @@ function M.handle_key(key, mode, context)
     return nil
   end
 
-  -- Normal/insert: unbound keys return nil.
-  -- Rust gates PTY forwarding on mode == "insert".
+  -- List/terminal: unbound keys return nil.
+  -- Rust gates PTY forwarding on mode == "terminal".
   return nil
 end
 

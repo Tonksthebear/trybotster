@@ -45,9 +45,9 @@ local function set_mode_ops(mode)
   return { op = "set_mode", mode = mode }
 end
 
---- Return the appropriate base mode: "insert" if an agent is selected, "normal" otherwise.
+--- Return the appropriate base mode: "terminal" if an agent is selected, "list" otherwise.
 local function base_mode(context)
-  return context.selected_agent and "insert" or "normal"
+  return context.selected_agent and "terminal" or "list"
 end
 
 --- Transition from workspace selection to worktree selection.
@@ -118,7 +118,7 @@ local function focus_agent_ops(agent_id, context)
 
   local ops = {
     { op = "focus_terminal", agent_id = agent_id, session_uuid = agent.session_uuid },
-    set_mode_ops("insert"),
+    set_mode_ops("terminal"),
   }
   if agent.notification then
     table.insert(ops, { op = "send_msg", data = {
@@ -263,8 +263,8 @@ function M.on_action(action, context)
     return { set_mode_ops(base_mode(context)) }
   end
 
-  -- === Workspace collapse toggle (normal mode Enter on workspace header) ===
-  if action == "list_select" and _tui_state.mode == "normal" then
+  -- === Workspace collapse toggle (list mode Enter on workspace header) ===
+  if action == "list_select" and _tui_state.mode == "list" then
     local item = current_cursor_item()
     if item and item.type == "workspace_header" then
       _tui_state._ws_collapsed = _tui_state._ws_collapsed or {}
@@ -658,7 +658,7 @@ function M.on_action(action, context)
           subscriptionId = "tui_hub",
           data = { type = "delete_agent", agent_id = context.selected_agent, delete_worktree = false },
         }},
-        set_mode_ops("normal"),
+        set_mode_ops("list"),
       }
     end
     return { set_mode_ops(base_mode(context)) }
@@ -673,7 +673,7 @@ function M.on_action(action, context)
           subscriptionId = "tui_hub",
           data = { type = "delete_agent", agent_id = context.selected_agent, delete_worktree = true },
         }},
-        set_mode_ops("normal"),
+        set_mode_ops("list"),
       }
     end
     return { set_mode_ops(base_mode(context)) }
@@ -768,8 +768,8 @@ function M.on_action(action, context)
       if item and item.type == "agent" then
         return focus_agent_ops(item.agent_id, context)
       end
-      -- Landed on workspace header: switch to normal mode so Enter toggles collapse
-      return { set_mode_ops("normal") }
+      -- Landed on workspace header: switch to list mode so Enter toggles collapse
+      return { set_mode_ops("list") }
     end
 
     -- Fallback: legacy flat agent navigation (before workspace data arrives)
@@ -793,7 +793,7 @@ function M.on_action(action, context)
     _tui_state.selected_session_uuid = next_agent.session_uuid
     local ops = {
       { op = "focus_terminal", agent_id = next_agent.id, session_uuid = next_agent.session_uuid },
-      set_mode_ops("insert"),
+      set_mode_ops("terminal"),
     }
     if next_agent.notification then
       table.insert(ops, { op = "send_msg", data = {
@@ -826,8 +826,8 @@ function M.on_action(action, context)
       if item and item.type == "agent" then
         return focus_agent_ops(item.agent_id, context)
       end
-      -- Landed on workspace header: switch to normal mode so Enter toggles collapse
-      return { set_mode_ops("normal") }
+      -- Landed on workspace header: switch to list mode so Enter toggles collapse
+      return { set_mode_ops("list") }
     end
 
     -- Fallback: legacy flat agent navigation
@@ -851,7 +851,7 @@ function M.on_action(action, context)
     _tui_state.selected_session_uuid = prev_agent.session_uuid
     local ops = {
       { op = "focus_terminal", agent_id = prev_agent.id, session_uuid = prev_agent.session_uuid },
-      set_mode_ops("insert"),
+      set_mode_ops("terminal"),
     }
     if prev_agent.notification then
       table.insert(ops, { op = "send_msg", data = {

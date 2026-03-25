@@ -241,7 +241,7 @@ function M.on_hub_event(event_type, event_data, context)
       _tui_state.list_cursor_pos = find_agent_cursor_pos(agent.id)
       return {
         { op = "focus_terminal", agent_id = agent.id, session_uuid = agent.session_uuid },
-        set_mode_ops("insert"),
+        set_mode_ops("terminal"),
       }
     end
 
@@ -266,14 +266,14 @@ function M.on_hub_event(event_type, event_data, context)
         _tui_state.list_cursor_pos = find_agent_cursor_pos(next.id)
         return {
           { op = "focus_terminal", agent_id = next.id, session_uuid = next.session_uuid },
-          set_mode_ops("insert"),
+          set_mode_ops("terminal"),
         }
       else
         _tui_state.selected_session_uuid = nil
         _tui_state.list_cursor_pos = nil
         return {
           { op = "focus_terminal" },  -- nil agent_id clears selection
-          set_mode_ops("normal"),
+          set_mode_ops("list"),
         }
       end
     end
@@ -435,7 +435,7 @@ function M.on_hub_event(event_type, event_data, context)
           session_uuid = selected.session_uuid,
         }
       end
-      ops[#ops + 1] = set_mode_ops(selected and "insert" or "normal")
+      ops[#ops + 1] = set_mode_ops(selected and "terminal" or "list")
       return ops
     end
     return {}

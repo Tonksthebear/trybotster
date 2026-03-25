@@ -5,7 +5,7 @@
 -- so extensions don't need to poke at raw globals.
 --
 -- Usage in user/plugin extensions:
---   botster.keymap.set("normal", "ctrl+n", "my_action", { desc = "..." })
+--   botster.keymap.set("list", "ctrl+n", "my_action", { desc = "..." })
 --   botster.action.register("my_action", function(ctx) ... end)
 --   botster.ui.register_component("status", function(state) ... end)
 
@@ -55,7 +55,7 @@ local keymap_registry = {}
 local keymap_functions = {}
 
 --- Register a keybinding.
--- @param modes string|table Mode name(s) (e.g., "normal" or {"normal", "menu"})
+-- @param modes string|table Mode name(s) (e.g., "list" or {"list", "menu"})
 -- @param key string Key descriptor (e.g., "ctrl+n", "shift+enter")
 -- @param action string|function Action name or function(context) -> {action=...}
 -- @param opts table|nil { desc = "...", namespace = "default" }
