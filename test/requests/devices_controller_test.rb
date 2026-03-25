@@ -2,23 +2,19 @@
 
 require "test_helper"
 
-# Tests for device management endpoints.
+# Tests for browser key management endpoints.
 #
-# The CLI uses these endpoints to:
-# 1. Register itself as a device (POST /devices)
-# 2. Validate token / list devices (GET /devices)
+# The DevicesController now manages BrowserKey records:
+# 1. Register a browser key (POST /devices with device_type: "browser")
+# 2. List browser keys (GET /devices)
+# 3. Delete a browser key (DELETE /devices/:id)
 #
-# These tests verify the API contract the CLI expects.
+# These tests verify the API contract.
 class DevicesControllerTest < ActionDispatch::IntegrationTest
   include ApiTestHelper
 
-  # Helper to generate unique fingerprints per test
-  def unique_fingerprint(prefix = "test")
-    "#{prefix}:#{SecureRandom.hex(7).scan(/../).join(':')}"
-  end
-
   # ==========================================================================
-  # GET /devices - List devices / validate token
+  # GET /devices - List browser keys / validate token
   # ==========================================================================
 
   test "GET /devices returns 401 with invalid token" do
@@ -31,7 +27,7 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
     assert_json_error("Invalid API key")
   end
 
-  test "GET /devices returns device list with valid token" do
+  test "GET /devices returns browser key list with valid token" do
     get devices_url, headers: auth_headers_for(:primary_user)
 
     assert_response :ok
@@ -40,12 +36,12 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
     assert_kind_of Array, json
   end
 
-  test "GET /devices returns correct device fields" do
-    # Create a device first
-    users(:primary_user).devices.create!(
-      device_type: "cli",
-      name: "Test CLI Device",
-      fingerprint: unique_fingerprint("fields")
+  test "GET /devices returns correct browser key fields" do
+    # Create a browser key first
+    users(:primary_user).browser_keys.create!(
+      name: "Test Browser",
+      public_key: "test_browser_pk_#{SecureRandom.hex(8)}",
+      fingerprint: "te:st:#{SecureRandom.hex(6).scan(/../).join(':')}"
     )
 
     get devices_url, headers: auth_headers_for(:primary_user)
@@ -55,128 +51,49 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
 
     assert_operator json.length, :>=, 1
 
-    device = json.find { |d| d["name"] == "Test CLI Device" }
-    assert_not_nil device, "Expected to find 'Test CLI Device' in response"
-    assert device.key?("id")
-    assert device.key?("name")
-    assert device.key?("device_type")
-    assert device.key?("fingerprint")
-    assert device.key?("last_seen_at")
+    browser_key = json.find { |d| d["name"] == "Test Browser" }
+    assert_not_nil browser_key, "Expected to find 'Test Browser' in response"
+    assert browser_key.key?("id")
+    assert browser_key.key?("name")
+    assert browser_key.key?("device_type")
+    assert browser_key.key?("fingerprint")
+    assert browser_key.key?("last_seen_at")
   end
 
-  test "GET /devices only returns current user's devices" do
-    # Create devices for different users
-    users(:primary_user).devices.create!(device_type: "cli", name: "Jason Device", fingerprint: unique_fingerprint("jason"))
-    users(:one).devices.create!(device_type: "cli", name: "Other User Device", fingerprint: unique_fingerprint("one"))
+  test "GET /devices only returns current user's browser keys" do
+    users(:primary_user).browser_keys.create!(
+      name: "Primary Browser",
+      public_key: "primary_bk_#{SecureRandom.hex(8)}",
+      fingerprint: "ja:#{SecureRandom.hex(7).scan(/../).join(':')}"
+    )
+    users(:one).browser_keys.create!(
+      name: "Other User Browser",
+      public_key: "other_bk_#{SecureRandom.hex(8)}",
+      fingerprint: "ot:#{SecureRandom.hex(7).scan(/../).join(':')}"
+    )
 
     get devices_url, headers: auth_headers_for(:primary_user)
 
     json = assert_json_response
-    device_names = json.map { |d| d["name"] }
+    names = json.map { |d| d["name"] }
 
-    assert_includes device_names, "Jason Device"
-    refute_includes device_names, "Other User Device"
+    assert_includes names, "Primary Browser"
+    refute_includes names, "Other User Browser"
   end
 
   # ==========================================================================
-  # POST /devices - Register device
+  # POST /devices - Register browser key
   # ==========================================================================
 
   test "POST /devices returns 401 without authentication" do
     post devices_url,
-      params: { device_type: "cli", name: "Test", fingerprint: unique_fingerprint }.to_json,
+      params: { device_type: "browser", name: "Test", public_key: "pk_test" }.to_json,
       headers: json_headers
 
     assert_response :unauthorized
   end
 
-  test "POST /devices creates new device with fingerprint" do
-    fingerprint = unique_fingerprint("create")
-    # Pre-create auth headers so auth device isn't counted in assert_difference
-    headers = auth_headers_for(:primary_user)
-
-    assert_difference -> { Device.count }, 1 do
-      post devices_url,
-        params: {
-          device_type: "cli",
-          name: "My CLI Device",
-          fingerprint: fingerprint
-        }.to_json,
-        headers: headers
-    end
-
-    assert_response :created
-    json = assert_json_keys(:device_id, :fingerprint, :created)
-
-    assert_kind_of Integer, json["device_id"]
-    assert_equal fingerprint, json["fingerprint"]
-    assert_equal true, json["created"]
-  end
-
-  test "POST /devices returns existing device if fingerprint matches" do
-    fingerprint = unique_fingerprint("existing")
-    # Pre-create auth headers so auth device isn't counted in assert_difference
-    headers = auth_headers_for(:primary_user)
-
-    # Create device first
-    existing = users(:primary_user).devices.create!(
-      device_type: "cli",
-      name: "Existing Device",
-      fingerprint: fingerprint
-    )
-
-    assert_no_difference -> { Device.count } do
-      post devices_url,
-        params: {
-          device_type: "cli",
-          name: "Updated Name",
-          fingerprint: fingerprint
-        }.to_json,
-        headers: headers
-    end
-
-    assert_response :ok  # Not 201 since not newly created
-    json = assert_json_keys(:device_id, :fingerprint, :created)
-
-    assert_equal existing.id, json["device_id"]
-    assert_equal false, json["created"]
-  end
-
-  test "POST /devices requires device_type" do
-    post devices_url,
-      params: {
-        name: "Test Device",
-        fingerprint: unique_fingerprint
-      }.to_json,
-      headers: auth_headers_for(:primary_user)
-
-    assert_response :bad_request
-  end
-
-  test "POST /devices requires name" do
-    post devices_url,
-      params: {
-        device_type: "cli",
-        fingerprint: unique_fingerprint
-      }.to_json,
-      headers: auth_headers_for(:primary_user)
-
-    assert_response :bad_request
-  end
-
-  test "POST /devices requires fingerprint or public_key" do
-    post devices_url,
-      params: {
-        device_type: "cli",
-        name: "Test Device"
-      }.to_json,
-      headers: auth_headers_for(:primary_user)
-
-    assert_response :bad_request
-    assert_json_error(/fingerprint or public_key/i)
-  end
-
-  test "POST /devices can register browser device with public_key" do
+  test "POST /devices can register browser key with public_key" do
     post devices_url,
       params: {
         device_type: "browser",
@@ -189,62 +106,60 @@ class DevicesControllerTest < ActionDispatch::IntegrationTest
     json = assert_json_keys(:device_id, :created)
   end
 
+  test "POST /devices requires browser device_type" do
+    post devices_url,
+      params: {
+        device_type: "cli",
+        name: "CLI Device",
+        fingerprint: "te:st:00:11:22:33:44:55"
+      }.to_json,
+      headers: auth_headers_for(:primary_user)
+
+    assert_response :bad_request
+  end
+
+  test "POST /devices requires public_key for browser" do
+    post devices_url,
+      params: {
+        device_type: "browser",
+        name: "Browser"
+      }.to_json,
+      headers: auth_headers_for(:primary_user)
+
+    assert_response :bad_request
+  end
+
   # ==========================================================================
-  # DELETE /devices/:id - Remove device
+  # DELETE /devices/:id - Remove browser key
   # ==========================================================================
 
-  test "DELETE /devices/:id removes device" do
-    # Pre-create auth headers so auth device isn't counted in assert_difference
+  test "DELETE /devices/:id removes browser key" do
     headers = auth_headers_for(:primary_user)
 
-    device = users(:primary_user).devices.create!(
-      device_type: "cli",
-      name: "Device to Delete",
-      fingerprint: unique_fingerprint("delete")
+    browser_key = users(:primary_user).browser_keys.create!(
+      name: "Browser to Delete",
+      public_key: "delete_pk_#{SecureRandom.hex(8)}",
+      fingerprint: "de:#{SecureRandom.hex(7).scan(/../).join(':')}"
     )
 
-    assert_difference -> { Device.count }, -1 do
-      delete device_url(device), headers: headers
+    assert_difference -> { BrowserKey.count }, -1 do
+      delete device_url(browser_key), headers: headers
     end
 
     assert_response :no_content
   end
 
-  test "DELETE /devices/:id cascades to destroy associated hubs" do
+  test "DELETE /devices/:id returns 404 for other user's browser key" do
     headers = auth_headers_for(:primary_user)
 
-    device = users(:primary_user).devices.create!(
-      device_type: "cli",
-      name: "Device with Hubs",
-      fingerprint: unique_fingerprint("cascade")
+    other_key = users(:one).browser_keys.create!(
+      name: "Other User Browser",
+      public_key: "other_pk_#{SecureRandom.hex(8)}",
+      fingerprint: "ot:#{SecureRandom.hex(7).scan(/../).join(':')}"
     )
 
-    hub1 = users(:primary_user).hubs.create!(identifier: "cascade-hub-1-#{SecureRandom.hex(4)}", device: device, last_seen_at: Time.current)
-    hub2 = users(:primary_user).hubs.create!(identifier: "cascade-hub-2-#{SecureRandom.hex(4)}", device: device, last_seen_at: Time.current)
-
-    assert_difference -> { Hub.count }, -2 do
-      assert_difference -> { Device.count }, -1 do
-        delete device_url(device), headers: headers
-      end
-    end
-
-    assert_response :no_content
-    assert_not Hub.exists?(hub1.id), "Hub 1 should be destroyed with device"
-    assert_not Hub.exists?(hub2.id), "Hub 2 should be destroyed with device"
-  end
-
-  test "DELETE /devices/:id returns 404 for other user's device" do
-    # Pre-create auth headers so auth device isn't counted in assert_difference
-    headers = auth_headers_for(:primary_user)
-
-    other_device = users(:one).devices.create!(
-      device_type: "cli",
-      name: "Other User Device",
-      fingerprint: unique_fingerprint("other")
-    )
-
-    assert_no_difference -> { Device.count } do
-      delete device_url(other_device), headers: headers
+    assert_no_difference -> { BrowserKey.count } do
+      delete device_url(other_key), headers: headers
     end
 
     assert_response :not_found

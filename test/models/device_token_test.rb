@@ -2,16 +2,15 @@
 
 require "test_helper"
 
-class DeviceTokenTest < ActiveSupport::TestCase
+class HubTokenTest < ActiveSupport::TestCase
   setup do
     @user = User.create!(
-      email: "device_token_test@example.com",
-      username: "device_token_test"
+      email: "hub_token_test@example.com",
+      username: "hub_token_test"
     )
-    @device = @user.devices.create!(
-      name: "Test Device",
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+    @hub = @user.hubs.create!(
+      identifier: "hub-token-test-#{SecureRandom.hex(8)}",
+      last_seen_at: Time.current
     )
   end
 
@@ -20,32 +19,31 @@ class DeviceTokenTest < ActiveSupport::TestCase
   end
 
   test "generates token with btstr_ prefix" do
-    token = @device.create_device_token!
+    token = @hub.create_hub_token!
 
     assert token.token.start_with?("btstr_")
   end
 
   test "token is unique" do
-    token1 = @device.create_device_token!
-    device2 = @user.devices.create!(
-      name: "Device 2",
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+    token1 = @hub.create_hub_token!
+    hub2 = @user.hubs.create!(
+      identifier: "hub-token-test-2-#{SecureRandom.hex(8)}",
+      last_seen_at: Time.current
     )
-    token2 = device2.create_device_token!
+    token2 = hub2.create_hub_token!
 
     assert_not_equal token1.token, token2.token
   end
 
   test "token is long enough for security" do
-    token = @device.create_device_token!
+    token = @hub.create_hub_token!
 
     # btstr_ prefix (6) + 32 bytes base64 (~43 chars)
     assert token.token.length >= 40
   end
 
   test "display_token shows prefix and last 8 chars" do
-    token = @device.create_device_token!
+    token = @hub.create_hub_token!
     display = token.display_token
 
     assert display.start_with?("btstr_...")
@@ -53,7 +51,7 @@ class DeviceTokenTest < ActiveSupport::TestCase
   end
 
   test "touch_usage! updates last_used_at and last_ip" do
-    token = @device.create_device_token!
+    token = @hub.create_hub_token!
     assert_nil token.last_used_at
     assert_nil token.last_ip
 
@@ -63,28 +61,28 @@ class DeviceTokenTest < ActiveSupport::TestCase
     assert_equal "192.168.1.1", token.last_ip
   end
 
-  test "requires device" do
-    token = DeviceToken.new
+  test "requires hub" do
+    token = HubToken.new
 
     assert_not token.valid?
-    assert_includes token.errors[:device], "must exist"
+    assert_includes token.errors[:hub], "must exist"
   end
 
   test "name is optional" do
-    token = @device.create_device_token!
+    token = @hub.create_hub_token!
 
     assert token.valid?
     assert_nil token.name
   end
 
   test "can have a name" do
-    token = @device.create_device_token!(name: "MacBook Pro")
+    token = @hub.create_hub_token!(name: "MacBook Pro")
 
     assert_equal "MacBook Pro", token.name
   end
 
-  test "user convenience method returns device owner" do
-    token = @device.create_device_token!
+  test "user convenience method returns hub owner" do
+    token = @hub.create_hub_token!
 
     assert_equal @user, token.user
   end

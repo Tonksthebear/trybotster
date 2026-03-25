@@ -9,21 +9,14 @@ class Hubs::HeartbeatsControllerTest < ActionDispatch::IntegrationTest
     @user = users(:primary_user)
     @hub = hubs(:active_hub)
 
-    # Create a device + token dynamically so encrypted token lookup works
-    @device = @user.devices.create!(
-      name: "Heartbeat Test CLI",
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
-    )
-    @device_token = @device.create_device_token!(name: "Heartbeat Test Token")
-
-    # Associate the hub with this device so set_hub can find it
-    @hub.update!(device: @device)
+    # Create a hub token dynamically so encrypted token lookup works
+    # Destroy any fixture-created token first (raw fixture values don't survive encryption)
+    @hub.hub_token&.destroy
+    @hub_token = @hub.create_hub_token!(name: "Heartbeat Test Token")
   end
 
   teardown do
-    @device_token&.destroy
-    @device&.destroy
+    @hub_token&.destroy
   end
 
   # --- Successful heartbeat via Bearer token ---
@@ -32,7 +25,7 @@ class Hubs::HeartbeatsControllerTest < ActionDispatch::IntegrationTest
     old_last_seen = @hub.last_seen_at
 
     patch hub_heartbeat_path(@hub),
-      headers: { "Authorization" => "Bearer #{@device_token.token}" },
+      headers: { "Authorization" => "Bearer #{@hub_token.token}" },
       as: :json
 
     assert_response :success
@@ -42,7 +35,7 @@ class Hubs::HeartbeatsControllerTest < ActionDispatch::IntegrationTest
 
   test "heartbeat returns success JSON with last_seen_at" do
     patch hub_heartbeat_path(@hub),
-      headers: { "Authorization" => "Bearer #{@device_token.token}" },
+      headers: { "Authorization" => "Bearer #{@hub_token.token}" },
       as: :json
 
     assert_response :success
@@ -55,7 +48,7 @@ class Hubs::HeartbeatsControllerTest < ActionDispatch::IntegrationTest
 
   test "heartbeat with X-API-Key header authenticates successfully" do
     patch hub_heartbeat_path(@hub),
-      headers: { "X-API-Key" => @device_token.token },
+      headers: { "X-API-Key" => @hub_token.token },
       as: :json
 
     assert_response :success
@@ -101,7 +94,7 @@ class Hubs::HeartbeatsControllerTest < ActionDispatch::IntegrationTest
     other_hub = Hub.create!(user: other_user, identifier: "other-heartbeat-hub", last_seen_at: Time.current)
 
     patch hub_heartbeat_path(other_hub),
-      headers: { "Authorization" => "Bearer #{@device_token.token}" },
+      headers: { "Authorization" => "Bearer #{@hub_token.token}" },
       as: :json
 
     assert_response :not_found
@@ -119,17 +112,17 @@ class Hubs::HeartbeatsControllerTest < ActionDispatch::IntegrationTest
     assert_response :not_found
   end
 
-  # --- Device token usage tracking ---
+  # --- Hub token usage tracking ---
 
-  test "heartbeat via API key touches device token last_used_at" do
-    assert_nil @device_token.last_used_at
+  test "heartbeat via API key touches hub token last_used_at" do
+    assert_nil @hub_token.last_used_at
 
     patch hub_heartbeat_path(@hub),
-      headers: { "Authorization" => "Bearer #{@device_token.token}" },
+      headers: { "Authorization" => "Bearer #{@hub_token.token}" },
       as: :json
 
     assert_response :success
-    @device_token.reload
-    assert_not_nil @device_token.last_used_at, "device token last_used_at should be set after auth"
+    @hub_token.reload
+    assert_not_nil @hub_token.last_used_at, "hub token last_used_at should be set after auth"
   end
 end

@@ -3,18 +3,17 @@
 require "test_helper"
 require "ostruct"
 
-class DeviceTokenIdentifierTest < ActiveSupport::TestCase
+class HubTokenIdentifierTest < ActiveSupport::TestCase
   setup do
     @user = User.create!(
       email: "identifier_test@example.com",
       username: "identifier_test"
     )
-    @device = @user.devices.create!(
-      name: "Test Device",
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+    @hub = @user.hubs.create!(
+      identifier: "identifier-test-#{SecureRandom.hex(8)}",
+      last_seen_at: Time.current
     )
-    @mcp_token = @device.create_mcp_token!
+    @mcp_token = @hub.create_mcp_token!
   end
 
   teardown do
@@ -34,14 +33,14 @@ class DeviceTokenIdentifierTest < ActiveSupport::TestCase
   end
 
   test "identifier is configured correctly" do
-    assert_equal :user, DeviceTokenIdentifier.identifier_name
-    assert_equal "api_key", DeviceTokenIdentifier.auth_method
+    assert_equal :user, HubTokenIdentifier.identifier_name
+    assert_equal "api_key", HubTokenIdentifier.auth_method
   end
 
   test "resolves user from valid bearer token" do
     request = mock_request(auth_header: "Bearer #{@mcp_token.token}")
 
-    identifier = DeviceTokenIdentifier.new(request)
+    identifier = HubTokenIdentifier.new(request)
     result = identifier.resolve
 
     assert_equal @user, result
@@ -50,7 +49,7 @@ class DeviceTokenIdentifierTest < ActiveSupport::TestCase
   test "returns nil when no authorization header" do
     request = mock_request(auth_header: nil)
 
-    identifier = DeviceTokenIdentifier.new(request)
+    identifier = HubTokenIdentifier.new(request)
     result = identifier.resolve
 
     assert_nil result
@@ -59,7 +58,7 @@ class DeviceTokenIdentifierTest < ActiveSupport::TestCase
   test "returns nil when token not found in database" do
     request = mock_request(auth_header: "Bearer btmcp_nonexistent_token")
 
-    identifier = DeviceTokenIdentifier.new(request)
+    identifier = HubTokenIdentifier.new(request)
     result = identifier.resolve
 
     assert_nil result
@@ -68,7 +67,7 @@ class DeviceTokenIdentifierTest < ActiveSupport::TestCase
   test "returns nil for empty bearer token" do
     request = mock_request(auth_header: "Bearer ")
 
-    identifier = DeviceTokenIdentifier.new(request)
+    identifier = HubTokenIdentifier.new(request)
     result = identifier.resolve
 
     assert_nil result
@@ -77,7 +76,7 @@ class DeviceTokenIdentifierTest < ActiveSupport::TestCase
   test "returns nil for malformed authorization header" do
     request = mock_request(auth_header: "Basic dXNlcjpwYXNz")
 
-    identifier = DeviceTokenIdentifier.new(request)
+    identifier = HubTokenIdentifier.new(request)
     result = identifier.resolve
 
     assert_nil result
@@ -89,7 +88,7 @@ class DeviceTokenIdentifierTest < ActiveSupport::TestCase
 
     request = mock_request(auth_header: "Bearer #{@mcp_token.token}", remote_ip: "192.168.1.100")
 
-    identifier = DeviceTokenIdentifier.new(request)
+    identifier = HubTokenIdentifier.new(request)
     identifier.resolve
 
     @mcp_token.reload

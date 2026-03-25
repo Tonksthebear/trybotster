@@ -21,7 +21,7 @@ module Hubs
       # User code should be formatted as XXXX-XXXX
       assert_match(/\A[A-Z0-9]{4}-[A-Z0-9]{4}\z/, json["user_code"])
     ensure
-      DeviceAuthorization.find_by(device_code: json&.dig("device_code"))&.destroy
+      HubAuthorization.find_by(device_code: json&.dig("device_code"))&.destroy
     end
 
     test "create includes user code in verification_uri for auto-fill" do
@@ -36,15 +36,15 @@ module Hubs
       assert_equal json["user_code"], code_param,
         "verification_uri should include code param matching user_code"
     ensure
-      DeviceAuthorization.find_by(device_code: json&.dig("device_code"))&.destroy
+      HubAuthorization.find_by(device_code: json&.dig("device_code"))&.destroy
     end
 
-    test "create persists a pending device authorization" do
-      assert_difference "DeviceAuthorization.count", 1 do
+    test "create persists a pending hub authorization" do
+      assert_difference "HubAuthorization.count", 1 do
         post codes_path, params: { device_name: "test-cli" }, as: :json
       end
 
-      auth = DeviceAuthorization.last
+      auth = HubAuthorization.last
       assert_equal "pending", auth.status
       assert_equal "test-cli", auth.device_name
       assert auth.expires_at > Time.current
@@ -55,7 +55,7 @@ module Hubs
     # GET /hubs/codes/:id - polling for authorization status
 
     test "show returns pending status when authorization is not yet approved" do
-      auth = DeviceAuthorization.create!(device_name: "poll-test")
+      auth = HubAuthorization.create!(device_name: "poll-test")
 
       get code_path(auth.device_code), as: :json
 
@@ -69,7 +69,7 @@ module Hubs
 
     test "show returns approved status with tokens when authorization is approved" do
       user = users(:primary_user)
-      auth = DeviceAuthorization.create!(device_name: "approved-test")
+      auth = HubAuthorization.create!(device_name: "approved-test")
       auth.approve!(user)
 
       get code_path(auth.device_code), as: :json
@@ -82,17 +82,16 @@ module Hubs
       assert_equal "bearer", json["token_type"]
 
       # Tokens should have the correct prefixes
-      assert json["access_token"].start_with?(DeviceToken::TOKEN_PREFIX)
+      assert json["access_token"].start_with?(HubToken::TOKEN_PREFIX)
       assert json["mcp_token"].start_with?(Integrations::Github::MCPToken::TOKEN_PREFIX)
     ensure
-      # Clean up: device created by create_device_tokens, plus auth
-      device = Device.find_by(name: "approved-test", user: user)
-      device&.destroy
+      # Clean up: hub created by create_hub_tokens, plus auth
+      Hub.where(name: "approved-test", user: user).destroy_all
       auth&.destroy
     end
 
     test "show returns denied status when authorization is denied" do
-      auth = DeviceAuthorization.create!(device_name: "denied-test")
+      auth = HubAuthorization.create!(device_name: "denied-test")
       auth.deny!
 
       get code_path(auth.device_code), as: :json
@@ -106,7 +105,7 @@ module Hubs
     end
 
     test "show returns expired status for expired authorization" do
-      auth = DeviceAuthorization.create!(device_name: "expired-test")
+      auth = HubAuthorization.create!(device_name: "expired-test")
       auth.update_columns(expires_at: 1.minute.ago)
 
       get code_path(auth.device_code), as: :json
@@ -132,51 +131,50 @@ module Hubs
       assert_equal "invalid_grant", json["error"]
     end
 
-    # Authorization approval creates Device and DeviceToken
+    # Authorization approval creates Hub and HubToken
 
-    test "approval creates a device and both tokens for the user" do
+    test "approval creates a hub and both tokens for the user" do
       user = users(:primary_user)
-      auth = DeviceAuthorization.create!(device_name: "new-device")
+      auth = HubAuthorization.create!(device_name: "new-hub")
       auth.approve!(user)
 
-      assert_difference [ "Device.count", "DeviceToken.count", "Integrations::Github::MCPToken.count" ], 1 do
+      assert_difference [ "Hub.count", "HubToken.count", "Integrations::Github::MCPToken.count" ], 1 do
         get code_path(auth.device_code), as: :json
       end
 
       assert_response :success
 
-      device = Device.where(user: user, name: "new-device").last
-      assert_not_nil device
-      assert_equal "cli", device.device_type
-      assert device.fingerprint.present?
-      assert_not_nil device.device_token
-      assert_not_nil device.mcp_token
+      hub = Hub.where(user: user, name: "new-hub").last
+      assert_not_nil hub
+      assert hub.fingerprint.present?
+      assert_not_nil hub.hub_token
+      assert_not_nil hub.mcp_token
     ensure
-      Device.where(user: user, name: "new-device").destroy_all
+      Hub.where(user: user, name: "new-hub").destroy_all
       auth&.destroy
     end
 
-    test "polling an already-consumed approved authorization does not create duplicate devices" do
+    test "polling an already-consumed approved authorization does not create duplicate hubs" do
       user = users(:primary_user)
-      auth = DeviceAuthorization.create!(device_name: "once-only")
+      auth = HubAuthorization.create!(device_name: "once-only")
       auth.approve!(user)
 
-      # First poll creates the device
+      # First poll creates the hub
       get code_path(auth.device_code), as: :json
       assert_response :success
 
-      # Second poll would try to create another device - verify behavior
-      # The controller creates a new device each time, so we verify the first call worked
+      # Second poll would try to create another hub - verify behavior
+      # The controller finds existing hub by fingerprint, so we verify the first call worked
       json = JSON.parse(response.body)
       assert json["access_token"].present?
       assert json["mcp_token"].present?
     ensure
-      Device.where(user: user, name: "once-only").destroy_all
+      Hub.where(user: user, name: "once-only").destroy_all
       auth&.destroy
     end
 
     test "expired pending authorization transitions status to expired" do
-      auth = DeviceAuthorization.create!(device_name: "transition-test")
+      auth = HubAuthorization.create!(device_name: "transition-test")
       auth.update_columns(expires_at: 1.second.ago)
 
       assert_equal "pending", auth.status
@@ -191,7 +189,7 @@ module Hubs
     end
 
     test "already-expired non-pending authorization does not re-expire" do
-      auth = DeviceAuthorization.create!(device_name: "already-denied")
+      auth = HubAuthorization.create!(device_name: "already-denied")
       auth.deny!
       auth.update_columns(expires_at: 1.second.ago)
 

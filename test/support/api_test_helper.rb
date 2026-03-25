@@ -7,10 +7,10 @@
 #
 # Usage in request tests:
 #
-#   class DevicesControllerTest < ActionDispatch::IntegrationTest
+#   class HubsControllerTest < ActionDispatch::IntegrationTest
 #     include ApiTestHelper
 #
-#     test "list devices with valid token" do
+#     test "list browser keys with valid token" do
 #       get devices_url, headers: auth_headers_for(:primary_user)
 #       assert_response :ok
 #       assert_json_response
@@ -26,7 +26,7 @@ module ApiTestHelper
   end
 
   # Returns authorization headers for a user fixture.
-  # Creates a device and device token dynamically to avoid encrypted attribute issues.
+  # Creates a hub and hub token dynamically to avoid encrypted attribute issues.
   #
   # @param user_fixture [Symbol] Name of the user fixture
   # @return [Hash] Headers hash with Authorization bearer token
@@ -38,12 +38,11 @@ module ApiTestHelper
     user = users(user_fixture)
     @_api_tokens ||= {}
     @_api_tokens[user_fixture] ||= begin
-      device = user.devices.create!(
-        name: "Test Device",
-        device_type: "cli",
-        fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+      hub = user.hubs.create!(
+        identifier: "auth-hub-#{SecureRandom.hex(8)}",
+        last_seen_at: Time.current
       )
-      device.create_device_token!(name: "Test Token")
+      hub.create_hub_token!(name: "Test Token")
     end
 
     {
@@ -101,14 +100,14 @@ module ApiTestHelper
     json
   end
 
-  # Creates a device and device token for a user and returns auth headers.
+  # Creates a hub and hub token for a user and returns auth headers.
   # Useful when you need a fresh token not from fixtures.
   #
   # @param user [User, Symbol] User record or fixture name
   # @return [Hash] Headers hash with Authorization bearer token
   def create_token_headers(user)
     user = users(user) if user.is_a?(Symbol)
-    token = create_device_token_for(user)
+    token = create_hub_token_for(user)
     {
       "Authorization" => "Bearer #{token.token}",
       "Content-Type" => "application/json",
@@ -116,19 +115,17 @@ module ApiTestHelper
     }
   end
 
-  # Creates a device and device token for a user.
-  # DeviceToken now belongs to Device, so we need to create a device first.
+  # Creates a hub and hub token for a user.
   #
   # @param user [User] User record
-  # @param name [String] Token name (also used for device name)
-  # @return [DeviceToken] The created device token
-  def create_device_token_for(user, name: nil)
+  # @param name [String] Token name (also used for hub name)
+  # @return [HubToken] The created hub token
+  def create_hub_token_for(user, name: nil)
     name ||= "Test Token #{SecureRandom.hex(4)}"
-    device = user.devices.create!(
-      name: name,
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+    hub = user.hubs.create!(
+      identifier: "test-hub-#{SecureRandom.hex(8)}",
+      last_seen_at: Time.current
     )
-    device.create_device_token!(name: name)
+    hub.create_hub_token!(name: name)
   end
 end

@@ -7,12 +7,12 @@ class ApplicationCable::ConnectionTest < ActionCable::Connection::TestCase
     @user = users(:one)
   end
 
-  test "connects with valid device token via Authorization header" do
-    # Create a device token for the user
-    device_token = create_device_token(@user, "Test CLI")
+  test "connects with valid hub token via Authorization header" do
+    # Create a hub token for the user
+    hub_token = create_hub_token(@user, "Test CLI")
 
-    # Connect with the device token in Authorization header
-    connect headers: { "Authorization" => "Bearer #{device_token.token}" }
+    # Connect with the hub token in Authorization header
+    connect headers: { "Authorization" => "Bearer #{hub_token.token}" }
 
     assert_equal @user, connection.current_user
   end
@@ -35,20 +35,20 @@ class ApplicationCable::ConnectionTest < ActionCable::Connection::TestCase
     end
   end
 
-  test "connects with btstr_ prefixed device token" do
-    device_token = create_device_token(@user, "Prefixed Token")
+  test "connects with btstr_ prefixed hub token" do
+    hub_token = create_hub_token(@user, "Prefixed Token")
 
     # Verify it has the btstr_ prefix
-    assert device_token.token.start_with?("btstr_"), "Token should have btstr_ prefix"
+    assert hub_token.token.start_with?("btstr_"), "Token should have btstr_ prefix"
 
-    connect headers: { "Authorization" => "Bearer #{device_token.token}" }
+    connect headers: { "Authorization" => "Bearer #{hub_token.token}" }
 
     assert_equal @user, connection.current_user
   end
 
-  test "device token from different user does not authenticate as wrong user" do
+  test "hub token from different user does not authenticate as wrong user" do
     other_user = users(:two)
-    other_token = create_device_token(other_user, "Other CLI")
+    other_token = create_hub_token(other_user, "Other CLI")
 
     connect headers: { "Authorization" => "Bearer #{other_token.token}" }
 
@@ -58,12 +58,11 @@ class ApplicationCable::ConnectionTest < ActionCable::Connection::TestCase
 
   private
 
-  def create_device_token(user, name)
-    device = user.devices.create!(
-      name: name,
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+  def create_hub_token(user, name)
+    hub = user.hubs.create!(
+      identifier: "test-hub-#{SecureRandom.hex(8)}",
+      last_seen_at: Time.current
     )
-    device.create_device_token!(name: name)
+    hub.create_hub_token!(name: name)
   end
 end

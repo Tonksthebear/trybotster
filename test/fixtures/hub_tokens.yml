@@ -1,0 +1,14 @@
+# Hub tokens for API authentication in tests
+# Token format: btstr_<base64>
+
+active_hub_token:
+  hub: active_hub
+  name: "Active Hub Token"
+  token: "btstr_test_token_active_hub_12345678"
+  last_used_at: <%= 1.hour.ago %>
+
+stale_hub_token:
+  hub: stale_hub
+  name: "Stale Hub Token"
+  token: "btstr_test_token_stale_hub_87654321"
+  last_used_at: <%= 2.hours.ago %>

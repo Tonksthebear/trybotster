@@ -182,38 +182,7 @@ class HubTest < ActiveSupport::TestCase
     assert_equal "My Custom Name", hub.name
   end
 
-  test "name returns column value over device name" do
-    device = @user.devices.create!(
-      name: "My CLI",
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8)
-    )
-    hub = Hub.new(
-      user: @user,
-      name: "Custom Name",
-      device: device,
-      identifier: SecureRandom.uuid,
-      last_seen_at: Time.current
-    )
-    assert_equal "Custom Name", hub.name
-  end
-
-  test "name returns device name when column is blank" do
-    device = @user.devices.create!(
-      name: "My CLI",
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8)
-    )
-    hub = Hub.new(
-      user: @user,
-      device: device,
-      identifier: SecureRandom.uuid,
-      last_seen_at: Time.current
-    )
-    assert_equal "My CLI", hub.name
-  end
-
-  test "name returns truncated identifier when no column and no device" do
+  test "name returns truncated identifier when column is blank" do
     hub = Hub.new(
       user: @user,
       identifier: "a-very-long-hub-identifier-string",
@@ -222,51 +191,13 @@ class HubTest < ActiveSupport::TestCase
     assert_equal "a-very-long-hub-i...", hub.name
   end
 
-  test "e2e_enabled? returns true when device is present" do
-    device = @user.devices.create!(
-      name: "CLI",
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8)
-    )
+  test "e2e_enabled? always returns true" do
     hub = Hub.new(
       user: @user,
-      device: device,
       identifier: SecureRandom.uuid,
       last_seen_at: Time.current
     )
     assert hub.e2e_enabled?
-  end
-
-  test "e2e_enabled? returns false when no device" do
-    hub = Hub.new(
-      user: @user,
-      identifier: SecureRandom.uuid,
-      last_seen_at: Time.current
-    )
-    assert_not hub.e2e_enabled?
-  end
-
-  test "with_device scope returns only hubs with a device" do
-    device = @user.devices.create!(
-      name: "CLI",
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8)
-    )
-    hub_with_device = Hub.create!(
-      user: @user,
-      device: device,
-      identifier: SecureRandom.uuid,
-      last_seen_at: Time.current
-    )
-    hub_without_device = Hub.create!(
-      user: @user,
-      identifier: SecureRandom.uuid,
-      last_seen_at: Time.current
-    )
-
-    result = Hub.with_device
-    assert_includes result, hub_with_device
-    assert_not_includes result, hub_without_device
   end
 
   test "next_message_sequence! increments atomically" do

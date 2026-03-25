@@ -2,9 +2,9 @@
 
 require "test_helper"
 
-# Integration test to verify DeviceToken authentication works for Action Cable
+# Integration test to verify HubToken authentication works for Action Cable
 # This simulates what the CLI does when connecting
-class DeviceTokenActionCableTest < ActionDispatch::IntegrationTest
+class HubTokenActionCableTest < ActionDispatch::IntegrationTest
   setup do
     @user = users(:one)
     @hub = Hub.create!(
@@ -18,34 +18,32 @@ class DeviceTokenActionCableTest < ActionDispatch::IntegrationTest
     @hub&.destroy
   end
 
-  test "device token is properly created with btstr_ prefix" do
-    device_token = create_device_token(@user, "Test CLI")
+  test "hub token is properly created with btstr_ prefix" do
+    hub_token = create_hub_token(@user, "Test CLI")
 
-    assert device_token.token.present?
-    assert device_token.token.start_with?("btstr_"), "Token should have btstr_ prefix, got: #{device_token.token[0..10]}..."
+    assert hub_token.token.present?
+    assert hub_token.token.start_with?("btstr_"), "Token should have btstr_ prefix, got: #{hub_token.token[0..10]}..."
   end
 
-  test "device token can be found by token value" do
-    device_token = create_device_token(@user, "Test CLI")
-    token_value = device_token.token
+  test "hub token can be found by token value" do
+    hub_token = create_hub_token(@user, "Test CLI")
+    token_value = hub_token.token
 
-    found = DeviceToken.find_by(token: token_value)
+    found = HubToken.find_by(token: token_value)
     assert_not_nil found
-    assert_equal device_token.id, found.id
+    assert_equal hub_token.id, found.id
     assert_equal @user.id, found.user.id
   end
 
-  test "action cable connection find_user_by_token works with device token" do
-    device_token = create_device_token(@user, "Test CLI")
+  test "action cable connection find_user_by_token works with hub token" do
+    hub_token = create_hub_token(@user, "Test CLI")
 
     # Simulate what ApplicationCable::Connection does
-    token = device_token.token
+    token = hub_token.token
 
     # This is the logic from connection.rb
-    if token.start_with?(DeviceToken::TOKEN_PREFIX)
-      found_token = DeviceToken.find_by(token: token)
-      user = found_token&.user
-    end
+    found_token = HubToken.find_by(token: token)
+    user = found_token&.user
 
     assert_not_nil user
     assert_equal @user.id, user.id
@@ -54,17 +52,15 @@ class DeviceTokenActionCableTest < ActionDispatch::IntegrationTest
   test "action cable connection find_user_by_token returns nil for invalid token" do
     token = "btstr_invalid_token_that_does_not_exist"
 
-    if token.start_with?(DeviceToken::TOKEN_PREFIX)
-      found_token = DeviceToken.find_by(token: token)
-      user = found_token&.user
-    end
+    found_token = HubToken.find_by(token: token)
+    user = found_token&.user
 
     assert_nil user
   end
 
   test "terminal channel subscription works with authenticated user" do
     # This test verifies the channel would accept a subscription
-    # if the connection is authenticated with a device token user
+    # if the connection is authenticated with a hub token user
 
     # Verify hub belongs to user
     assert_equal @user.id, @hub.user_id
@@ -75,19 +71,19 @@ class DeviceTokenActionCableTest < ActionDispatch::IntegrationTest
     assert_equal @hub.id, hub.id
   end
 
-  test "config get_api_key returns device token when set" do
+  test "config get_api_key returns hub token when set" do
     # This simulates what the CLI's Config does
-    device_token = create_device_token(@user, "Test CLI")
+    hub_token = create_hub_token(@user, "Test CLI")
 
     # The CLI would call config.get_api_key() which should return the token
     # For this test, we just verify the token is usable
-    token = device_token.token
+    token = hub_token.token
 
     assert token.present?
     assert token.start_with?("btstr_")
 
     # Verify it can authenticate
-    found = DeviceToken.find_by(token: token)
+    found = HubToken.find_by(token: token)
     assert_not_nil found
   end
 
@@ -108,12 +104,11 @@ class DeviceTokenActionCableTest < ActionDispatch::IntegrationTest
 
   private
 
-  def create_device_token(user, name)
-    device = user.devices.create!(
-      name: name,
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
+  def create_hub_token(user, name)
+    hub = user.hubs.create!(
+      identifier: "test-hub-#{SecureRandom.hex(8)}",
+      last_seen_at: Time.current
     )
-    device.create_device_token!(name: name)
+    hub.create_hub_token!(name: name)
   end
 end
