@@ -1,18 +1,18 @@
 # frozen_string_literal: true
 
-# Custom ActionCable configuration to allow DeviceToken authenticated connections
+# Custom ActionCable configuration to allow HubToken authenticated connections
 # to bypass origin checking (for CLI WebSocket connections)
 
 Rails.application.config.after_initialize do
   ActionCable::Connection::Base.class_eval do
-    # Override the default origin checking to allow DeviceToken authenticated requests
+    # Override the default origin checking to allow HubToken authenticated requests
     def allow_request_origin?
-      # If request has a valid DeviceToken, skip origin check (CLI connections)
+      # If request has a valid HubToken, skip origin check (CLI connections)
       # Check Authorization header (Bearer token) - same pattern as ApplicationCable::Connection
       auth_header = request.headers["Authorization"] || env["HTTP_AUTHORIZATION"]
       if auth_header.present? && auth_header.start_with?("Bearer ")
         token = auth_header.sub("Bearer ", "")
-        device_token = DeviceToken.find_by(token: token)
+        device_token = HubToken.find_by(token: token)
         return true if device_token.present?
       end
 

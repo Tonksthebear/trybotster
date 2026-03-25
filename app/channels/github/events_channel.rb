@@ -13,7 +13,7 @@
 #
 # Stream: github_events:{repo}
 #
-# Auth: DeviceToken Bearer (same as HubCommandChannel)
+# Auth: HubToken Bearer (same as HubCommandChannel)
 module Github
   class EventsChannel < ApplicationCable::Channel
     def subscribed

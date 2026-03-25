@@ -18,7 +18,7 @@ require_relative "concerns/health_status"
 #
 # Stream: hub_command:{hub_id}
 #
-# Auth: DeviceToken Bearer (CLI only — browsers use HubSignalingChannel for E2E relay)
+# Auth: HubToken Bearer (CLI only — browsers use HubSignalingChannel for E2E relay)
 class HubCommandChannel < ApplicationCable::Channel
   def subscribed
     hub = find_hub
