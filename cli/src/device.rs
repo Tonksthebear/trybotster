@@ -2,7 +2,6 @@
 //!
 //! This module handles:
 //! - Ed25519 signing keypair generation and persistence
-//! - Device registration with the Rails server
 //! - Fingerprint generation for visual verification
 //!
 //! Note: E2E encryption is handled by Olm (vodozemac) in the relay module.
@@ -34,8 +33,6 @@ pub struct StoredDevice {
     pub fingerprint: String,
     /// Device name (e.g., "Botster CLI")
     pub name: String,
-    /// Server-assigned device ID (set after registration)
-    pub device_id: Option<i64>,
 }
 
 /// Runtime device identity with parsed keys
@@ -48,8 +45,6 @@ pub struct Device {
     pub fingerprint: String,
     /// Device name (e.g., hostname).
     pub name: String,
-    /// Server-assigned device ID after registration.
-    pub device_id: Option<i64>,
     /// Path to the device config file.
     config_path: PathBuf,
 }
@@ -59,7 +54,6 @@ impl std::fmt::Debug for Device {
         f.debug_struct("Device")
             .field("fingerprint", &self.fingerprint)
             .field("name", &self.name)
-            .field("device_id", &self.device_id)
             .field("config_path", &self.config_path)
             .finish_non_exhaustive()
     }
@@ -262,7 +256,6 @@ impl Device {
             verifying_key,
             fingerprint: stored.fingerprint,
             name: stored.name,
-            device_id: stored.device_id,
             config_path: path.clone(),
         })
     }
@@ -287,7 +280,6 @@ impl Device {
             verifying_key: BASE64.encode(verifying_key.as_bytes()),
             fingerprint: fingerprint.clone(),
             name: name.clone(),
-            device_id: None,
         };
 
         let content =
@@ -311,7 +303,6 @@ impl Device {
             verifying_key,
             fingerprint,
             name,
-            device_id: None,
             config_path: path.clone(),
         })
     }
@@ -350,7 +341,6 @@ impl Device {
             verifying_key: BASE64.encode(self.verifying_key.as_bytes()),
             fingerprint: self.fingerprint.clone(),
             name: self.name.clone(),
-            device_id: self.device_id,
         };
 
         let content =
@@ -368,78 +358,6 @@ impl Device {
         Ok(())
     }
 
-    /// Update device ID after server registration
-    pub fn set_device_id(&mut self, id: i64) -> Result<()> {
-        self.device_id = Some(id);
-        self.save()
-    }
-
-    /// Clear stale device ID (e.g., after database reset)
-    pub fn clear_device_id(&mut self) -> Result<()> {
-        if self.device_id.is_some() {
-            log::info!("Clearing stale device_id={:?}", self.device_id);
-            self.device_id = None;
-            self.save()?;
-        }
-        Ok(())
-    }
-
-    /// Register device with server (POST /api/devices)
-    pub fn register(
-        &mut self,
-        client: &reqwest::blocking::Client,
-        server_url: &str,
-        api_key: &str,
-    ) -> Result<i64> {
-        #[derive(Serialize)]
-        struct RegisterRequest {
-            device_type: String,
-            name: String,
-            fingerprint: String,
-        }
-
-        #[derive(Deserialize)]
-        struct RegisterResponse {
-            device_id: i64,
-            fingerprint: String,
-            created: bool,
-        }
-
-        let request = RegisterRequest {
-            device_type: "cli".to_string(),
-            name: self.name.clone(),
-            fingerprint: self.fingerprint.clone(),
-        };
-
-        let url = format!("{}/devices", server_url);
-        let response = client
-            .post(&url)
-            .bearer_auth(api_key)
-            .json(&request)
-            .send()
-            .context("Failed to send device registration request")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().unwrap_or_default();
-            anyhow::bail!("Device registration failed: {} - {}", status, body);
-        }
-
-        let data: RegisterResponse = response
-            .json()
-            .context("Failed to parse device registration response")?;
-
-        log::info!(
-            "Device registered: id={} fingerprint={} created={}",
-            data.device_id,
-            data.fingerprint,
-            data.created
-        );
-
-        self.set_device_id(data.device_id)?;
-
-        Ok(data.device_id)
-    }
 }
 
 #[cfg(test)]

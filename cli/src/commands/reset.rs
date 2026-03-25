@@ -1,7 +1,7 @@
 //! Reset command - removes all botster data from the system.
 //!
 //! This command provides a clean way to remove all botster-related data:
-//! - Notifies server to remove device record (fault-tolerant)
+//! - Notifies server to remove hubs for this device fingerprint (fault-tolerant)
 //! - Credentials from OS keyring
 //! - Config directory and all files within
 //!
@@ -28,7 +28,7 @@ pub fn run(skip_confirm: bool) -> Result<()> {
 
     // Show what will be deleted
     println!("  Server:");
-    println!("    - Device registration (if reachable)");
+    println!("    - Hub registrations for this device (if reachable)");
     println!();
     println!("  Keyring:");
     println!("    - botster/credentials (API token, MCP token, signing key, crypto keys)");
@@ -103,11 +103,11 @@ pub fn run(skip_confirm: bool) -> Result<()> {
     Ok(())
 }
 
-/// Notify the server to remove the device record.
+/// Notify the server to clean up hubs for this device fingerprint.
 ///
 /// This is best-effort: if it fails (network issues, server down, etc.),
 /// we log and continue with local cleanup. The server can clean up stale
-/// devices later if needed.
+/// hubs later if needed.
 fn notify_server_of_reset() {
     // Load config and device info - if either fails, we can't notify
     let config = match Config::load() {
@@ -131,16 +131,11 @@ fn notify_server_of_reset() {
         }
     };
 
-    let device_id = match device.device_id {
-        Some(id) => id,
-        None => {
-            println!("  - Device not registered with server, skipping notification");
-            return;
-        }
-    };
-
-    // Send DELETE request to remove device from server
-    let url = format!("{}/devices/{}", config.server_url, device_id);
+    // Send DELETE request to remove hubs for this fingerprint
+    let url = format!(
+        "{}/hubs?fingerprint={}",
+        config.server_url, device.fingerprint
+    );
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -148,7 +143,7 @@ fn notify_server_of_reset() {
 
     match client.delete(&url).bearer_auth(config.get_api_key()).send() {
         Ok(response) if response.status().is_success() => {
-            println!("  ✓ Notified server (device removed)");
+            println!("  ✓ Notified server (hubs removed)");
         }
         Ok(response) => {
             // Server returned an error, but we continue anyway

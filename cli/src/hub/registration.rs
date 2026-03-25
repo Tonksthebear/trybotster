@@ -1,12 +1,11 @@
 //! Hub registration and connection management.
 //!
-//! This module handles device/hub registration with the Rails server
+//! This module handles hub registration with the Rails server
 //! and WebSocket connection setup for browser relay.
 //!
 //! # Responsibilities
 //!
-//! - Device identity registration (E2E encryption keypairs)
-//! - Hub registration for message routing
+//! - Hub registration for message routing (with device fingerprint)
 //! - Vodozemac crypto initialization for E2E encryption (lazy bundle generation)
 //!
 //! # Lazy Bundle Generation
@@ -26,30 +25,14 @@
 
 use reqwest::blocking::Client;
 
-use crate::config::Config;
-use crate::device::Device;
 use crate::relay::BrowserState;
-
-/// Register the device with the server if not already registered.
-///
-/// This should be called after Hub creation to ensure the device identity
-/// is known to the server for browser-based key exchange.
-pub fn register_device(device: &mut Device, client: &Client, config: &Config) {
-    if device.device_id.is_some() {
-        return;
-    }
-
-    match device.register(client, &config.server_url, config.get_api_key()) {
-        Ok(id) => log::info!("Device registered with server: id={id}"),
-        Err(e) => log::warn!("Device registration failed: {e} - will retry later"),
-    }
-}
 
 /// Register the hub with the server and get the Rails-assigned ID.
 ///
 /// This creates the Hub record on the server and returns the database ID
 /// which should be used for all subsequent URLs and WebSocket subscriptions
-/// to guarantee uniqueness.
+/// to guarantee uniqueness. The device `fingerprint` is sent so the server
+/// can associate identity without a separate device registration step.
 ///
 /// # Returns
 ///
@@ -59,7 +42,7 @@ pub fn register_hub_with_server(
     local_identifier: &str,
     server_url: &str,
     api_key: &str,
-    device_id: Option<i64>,
+    fingerprint: &str,
     hub_name: Option<&str>,
 ) -> String {
     // Detect repo: env var > git detection (optional — not stored on server)
@@ -77,7 +60,7 @@ pub fn register_hub_with_server(
     let url = format!("{server_url}/hubs");
     let mut payload = serde_json::json!({
         "identifier": local_identifier,
-        "device_id": device_id,
+        "fingerprint": fingerprint,
     });
     if let Some(ref repo) = repo_name {
         payload["repo"] = serde_json::Value::String(repo.clone());
@@ -290,30 +273,6 @@ mod tests {
     fn shared_test_runtime() -> Arc<tokio::runtime::Runtime> {
         static RT: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
         Arc::clone(RT.get_or_init(|| Arc::new(tokio::runtime::Runtime::new().unwrap())))
-    }
-
-    #[test]
-    #[ignore = "requires keyring access - run manually"]
-    fn test_register_device_skips_if_already_registered() {
-        // This test verifies the early return path
-        let mut device = Device::load_or_create().expect("Device creation failed");
-        device.device_id = Some(123);
-
-        // Should not panic or make network calls
-        let client = Client::new();
-        let config = Config {
-            server_url: "http://localhost:3000".to_string(),
-            token: "test".to_string(),
-            poll_interval: 10,
-            agent_timeout: 300,
-            max_sessions: 10,
-            worktree_base: std::path::PathBuf::from("/tmp"),
-            hub_name: None,
-        };
-
-        register_device(&mut device, &client, &config);
-        // Success = no panic, device_id unchanged
-        assert_eq!(device.device_id, Some(123));
     }
 
     #[test]

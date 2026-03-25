@@ -806,7 +806,6 @@ impl Hub {
         let offline = crate::env::is_offline();
 
         if !crate::env::is_test_mode() && !offline {
-            self.register_device();
             self.register_hub_with_server();
         }
 
