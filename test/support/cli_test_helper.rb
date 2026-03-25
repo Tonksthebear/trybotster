@@ -39,7 +39,8 @@ module CliTestHelper
   class CliProcess
     include WaitHelper
 
-    attr_reader :pid, :hub, :temp_dir, :log_file_path, :started_at
+    attr_reader :pid, :temp_dir, :log_file_path, :started_at
+    attr_accessor :hub
     attr_accessor :hub_token
 
     def initialize(pid:, hub:, stdout_r:, stderr_r:, temp_dir:, log_thread:, log_file_path: nil, hub_token: nil, started_at: nil)
@@ -98,14 +99,41 @@ module CliTestHelper
     end
 
     def ready?
-      # CLI is ready when it has sent at least one heartbeat
-      # Heartbeat updates hub.last_seen_at - more reliable than file-based detection
-      @hub.reload
-      heartbeat_ready = @hub.last_seen_at.present? && @hub.last_seen_at > @started_at
+      # CLI is ready when it outputs "Hub ready" or has sent a heartbeat.
+      # The CLI creates its own hub with a device-fingerprint identifier,
+      # which may differ from @hub. Once ready, resolve the actual hub.
       output_ready = recent_output(lines: 20).include?("Hub ready. Waiting for connections...")
-      heartbeat_ready || output_ready
+      if output_ready
+        resolve_cli_hub!
+        return true
+      end
+
+      @hub.reload
+      @hub.last_seen_at.present? && @hub.last_seen_at > @started_at
     rescue ActiveRecord::RecordNotFound
       false
+    end
+
+    # After CLI startup, find the hub the CLI actually registered.
+    # The CLI uses "device-{fingerprint}" as identifier, which may differ
+    # from the pre-created test hub. Update @hub to point at the real one.
+    def resolve_cli_hub!
+      return if @cli_hub_resolved
+
+      # Read the CLI's device.json to get its fingerprint
+      device_json_path = File.join(@temp_dir, "device.json")
+      if File.exist?(device_json_path)
+        device_data = JSON.parse(File.read(device_json_path))
+        fingerprint = device_data["fingerprint"]
+        if fingerprint
+          cli_identifier = "device-" + fingerprint.delete(":")
+          cli_hub = @hub.user.hubs.find_by(identifier: cli_identifier)
+          if cli_hub && cli_hub.id != @hub.id
+            @hub = cli_hub
+          end
+        end
+      end
+      @cli_hub_resolved = true
     end
 
     # Get the connection URL from the running CLI
@@ -211,12 +239,11 @@ module CliTestHelper
 
     # Create temp directory for CLI data
     temp_dir = options[:temp_dir] || Dir.mktmpdir("cli_test_")
-    # Match CLI local hub identity (repo/cwd hash) without env overrides.
-    # This keeps tests aligned with production behavior.
-    local_hub_identifier = local_hub_id_for_path(temp_dir)
-    hub.update_column(:identifier, local_hub_identifier) if hub.identifier != local_hub_identifier
-
-    # Create device token for CLI authentication
+    # The CLI generates its own hub identifier from its device fingerprint
+    # (format: "device-{fingerprint_hex}"). We can't predict this before startup,
+    # so we create the token on the provided hub and let the CLI register.
+    # After startup, the CLI's hub may be different from the passed-in hub
+    # if the identifier doesn't match — use cli.hub to get the actual hub.
     hub_token = create_hub_token_for_hub(hub)
     api_key = hub_token.token
     Rails.logger.info "[CliTestHelper] Created HubToken id=#{hub_token.id} token=#{api_key[0..15]}..."
