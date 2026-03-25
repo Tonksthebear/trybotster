@@ -30,11 +30,20 @@ class Hubs::WebrtcControllerTest < ActionDispatch::IntegrationTest
 
   # === CLI Auth (Bearer token) ===
 
-  test "returns ICE servers for CLI with device token" do
+  test "returns ICE servers for CLI with hub token" do
     ENV.delete("METERED_DOMAIN")
     ENV.delete("METERED_SECRET_KEY")
 
-    get hub_webrtc_path(@hub), headers: auth_headers_for(:primary_user)
+    # WebRTC controller authenticates hub tokens directly (not via ApiKeyAuthenticatable),
+    # so the token must belong to the requested hub.
+    # Destroy fixture token (raw values don't survive encryption) and create dynamically.
+    @hub.hub_token&.destroy
+    hub_token = @hub.create_hub_token!(name: "WebRTC Test Token")
+
+    get hub_webrtc_path(@hub), headers: {
+      "Authorization" => "Bearer #{hub_token.token}",
+      "Content-Type" => "application/json"
+    }
 
     assert_response :success
     json = JSON.parse(response.body)

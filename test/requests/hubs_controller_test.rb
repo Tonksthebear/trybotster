@@ -28,11 +28,13 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
   test "POST /hubs creates new hub and returns id" do
     identifier = "new-hub-#{SecureRandom.hex(8)}"
+    # Pre-create auth headers so auth hub isn't counted in assert_difference
+    headers = auth_headers_for(:primary_user)
 
     assert_difference -> { Hub.count }, 1 do
       post hubs_url,
         params: { identifier: identifier }.to_json,
-        headers: auth_headers_for(:primary_user)
+        headers: headers
     end
 
     assert_response :created
@@ -88,11 +90,12 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
   test "POST /hubs finds existing hub by identifier and returns 200" do
     hub = hubs(:active_hub)
     original_id = hub.id
+    headers = auth_headers_for(:primary_user)
 
     assert_no_difference -> { Hub.count } do
       post hubs_url,
         params: { identifier: hub.identifier }.to_json,
-        headers: auth_headers_for(:primary_user)
+        headers: headers
     end
 
     assert_response :ok  # 200 for existing, 201 for new
@@ -140,25 +143,6 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
     hub.reload
     assert_operator hub.last_seen_at, :>, old_last_seen
-  end
-
-  test "PUT /hubs/:id associates device when device_id provided" do
-    device = users(:primary_user).devices.create!(
-      device_type: "cli",
-      name: "My CLI",
-      fingerprint: "hub:test:#{SecureRandom.hex(6)}"
-    )
-
-    hub = hubs(:active_hub)
-
-    put hub_url(hub),
-      params: { device_id: device.id }.to_json,
-      headers: auth_headers_for(:primary_user)
-
-    assert_response :ok
-
-    hub.reload
-    assert_equal device, hub.device
   end
 
   test "PUT /hubs/:id returns e2e_enabled status" do
@@ -284,10 +268,11 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
   test "DELETE /hubs/:id destroys hub record" do
     hub = hubs(:active_hub)
+    headers = auth_headers_for(:primary_user)
 
     assert_difference -> { Hub.count }, -1 do
       delete hub_url(hub),
-        headers: auth_headers_for(:primary_user)
+        headers: headers
     end
 
     assert_response :ok
@@ -308,6 +293,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "DELETE /hubs/:id cannot delete other user's hub" do
+    headers = auth_headers_for(:primary_user)
     other_hub = users(:one).hubs.create!(
       identifier: "other-hub-#{SecureRandom.hex(4)}",
       last_seen_at: Time.current
@@ -315,7 +301,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
     assert_no_difference -> { Hub.count } do
       delete hub_url(other_hub),
-        headers: auth_headers_for(:primary_user)
+        headers: headers
     end
 
     # Returns success because it's idempotent (hub "not found" for this user)

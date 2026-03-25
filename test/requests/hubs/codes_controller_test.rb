@@ -2,7 +2,7 @@
 
 require "test_helper"
 
-# Tests for the device authorization flow (RFC 8628).
+# Tests for the hub authorization flow (RFC 8628).
 #
 # This is the flow the CLI uses to authenticate:
 # 1. CLI requests device code (POST /hubs/codes)
@@ -18,7 +18,7 @@ class Hubs::CodesControllerTest < ActionDispatch::IntegrationTest
   # POST /hubs/codes - Request device code
   # ==========================================================================
 
-  test "POST /hubs/codes creates device authorization and returns expected JSON shape" do
+  test "POST /hubs/codes creates hub authorization and returns expected JSON shape" do
     post codes_url, params: { device_name: "Test CLI" }.to_json, headers: json_headers
 
     assert_response :ok
@@ -44,12 +44,12 @@ class Hubs::CodesControllerTest < ActionDispatch::IntegrationTest
     assert_operator json["interval"], :<=, 30
   end
 
-  test "POST /hubs/codes creates a DeviceAuthorization record" do
-    assert_difference -> { DeviceAuthorization.count }, 1 do
+  test "POST /hubs/codes creates a HubAuthorization record" do
+    assert_difference -> { HubAuthorization.count }, 1 do
       post codes_url, params: { device_name: "My CLI Device" }.to_json, headers: json_headers
     end
 
-    auth = DeviceAuthorization.last
+    auth = HubAuthorization.last
     assert_equal "pending", auth.status
     assert_equal "My CLI Device", auth.device_name
     assert auth.expires_at > Time.current
@@ -80,7 +80,7 @@ class Hubs::CodesControllerTest < ActionDispatch::IntegrationTest
   # ==========================================================================
 
   test "GET /hubs/codes/:id returns authorization_pending for pending auth" do
-    auth = DeviceAuthorization.create!(device_name: "Test CLI")
+    auth = HubAuthorization.create!(device_name: "Test CLI")
 
     get code_url(auth.device_code), headers: json_headers
 
@@ -89,7 +89,7 @@ class Hubs::CodesControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "GET /hubs/codes/:id returns access_token and mcp_token when approved" do
-    auth = DeviceAuthorization.create!(device_name: "Test CLI")
+    auth = HubAuthorization.create!(device_name: "Test CLI")
     auth.approve!(users(:primary_user))
 
     get code_url(auth.device_code), headers: json_headers
@@ -102,22 +102,22 @@ class Hubs::CodesControllerTest < ActionDispatch::IntegrationTest
     assert json["mcp_token"].start_with?("btmcp_"), "MCP token should start with btmcp_ prefix"
     assert_equal "bearer", json["token_type"]
 
-    # Verify DeviceToken was created
-    device_token = DeviceToken.find_by(token: json["access_token"])
-    assert_not_nil device_token
-    assert_equal users(:primary_user), device_token.user
+    # Verify HubToken was created
+    hub_token = HubToken.find_by(token: json["access_token"])
+    assert_not_nil hub_token
+    assert_equal users(:primary_user), hub_token.user
 
     # Verify MCPToken was created
     mcp_token = Integrations::Github::MCPToken.find_by(token: json["mcp_token"])
     assert_not_nil mcp_token
     assert_equal users(:primary_user), mcp_token.user
 
-    # Both tokens should belong to the same device
-    assert_equal device_token.device, mcp_token.device
+    # Both tokens should belong to the same hub
+    assert_equal hub_token.hub, mcp_token.hub
   end
 
   test "GET /hubs/codes/:id returns access_denied when denied" do
-    auth = DeviceAuthorization.create!(device_name: "Test CLI")
+    auth = HubAuthorization.create!(device_name: "Test CLI")
     auth.deny!
 
     get code_url(auth.device_code), headers: json_headers
@@ -127,7 +127,7 @@ class Hubs::CodesControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "GET /hubs/codes/:id returns expired_token for expired auth" do
-    auth = DeviceAuthorization.create!(device_name: "Test CLI")
+    auth = HubAuthorization.create!(device_name: "Test CLI")
     auth.update!(expires_at: 1.minute.ago)
 
     get code_url(auth.device_code), headers: json_headers
@@ -148,7 +148,7 @@ class Hubs::CodesControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "GET /hubs/codes/:id only creates one token per approval" do
-    auth = DeviceAuthorization.create!(device_name: "Test CLI")
+    auth = HubAuthorization.create!(device_name: "Test CLI")
     auth.approve!(users(:primary_user))
 
     # First poll - creates token

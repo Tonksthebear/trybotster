@@ -200,15 +200,10 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     local_hub_identifier = Digest::SHA256.hexdigest(File.realpath(temp_dir))[0, 32]
     hub.update_column(:identifier, local_hub_identifier) if hub.identifier != local_hub_identifier
 
-    # Create device token for CLI authentication
-    token_name = "CLI Test Token #{SecureRandom.hex(4)}"
-    device = hub.user.devices.create!(
-      name: token_name,
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
-    )
-    device_token = device.create_device_token!(name: token_name)
-    api_key = device_token.token
+    # Create hub token for CLI authentication
+    hub_token = hub.hub_token || hub.create_hub_token!(name: "CLI Test Token #{SecureRandom.hex(4)}")
+    device_token = hub_token
+    api_key = hub_token.token
 
     log_file_path = File.join(temp_dir, "botster.log")
 

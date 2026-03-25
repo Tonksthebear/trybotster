@@ -98,8 +98,12 @@ class UserTest < ActiveSupport::TestCase
     assert_respond_to @user, :hubs
   end
 
-  test "has many devices" do
-    assert_respond_to @user, :devices
+  test "has many browser_keys" do
+    assert_respond_to @user, :browser_keys
+  end
+
+  test "has many hub_tokens through hubs" do
+    assert_respond_to @user, :hub_tokens
   end
 
   test "destroying user destroys hubs" do

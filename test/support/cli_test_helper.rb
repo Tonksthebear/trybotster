@@ -219,8 +219,8 @@ module CliTestHelper
     # Create device token for CLI authentication
     device_token = create_device_token_for_hub(hub)
     api_key = device_token.token
-    Rails.logger.info "[CliTestHelper] Created DeviceToken id=#{device_token.id} token=#{api_key[0..15]}..."
-    Rails.logger.info "[CliTestHelper] DeviceToken user_id=#{device_token.user&.id}"
+    Rails.logger.info "[CliTestHelper] Created HubToken id=#{device_token.id} token=#{api_key[0..15]}..."
+    Rails.logger.info "[CliTestHelper] HubToken user_id=#{device_token.user&.id}"
 
     # Set up environment
     # BOTSTER_ENV=system_test enables test behaviors while making network calls:
@@ -362,16 +362,9 @@ module CliTestHelper
   end
 
   def create_device_token_for_hub(hub)
-    # Create a device token for the CLI to authenticate
-    # Returns the DeviceToken record (not just the token string) for cleanup
-    # DeviceToken now belongs to Device, so we need to create a device first
-    name = "CLI Test Token #{SecureRandom.hex(4)}"
-    device = hub.user.devices.create!(
-      name: name,
-      device_type: "cli",
-      fingerprint: SecureRandom.hex(8).scan(/../).join(":")
-    )
-    device.create_device_token!(name: name)
+    # Create a hub token for the CLI to authenticate
+    # Returns the HubToken record (not just the token string) for cleanup
+    hub.hub_token || hub.create_hub_token!(name: "CLI Test Token #{SecureRandom.hex(4)}")
   end
 
   def local_hub_id_for_path(path)

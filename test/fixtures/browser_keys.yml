@@ -1,0 +1,8 @@
+# Browser keys for E2E encryption testing
+
+chrome_browser:
+  user: primary_user
+  name: Chrome Browser
+  fingerprint: "11:22:33:44:55:66:77:88"
+  public_key: "browser_public_key_base64_encoded"
+  last_seen_at: <%= Time.current %>
