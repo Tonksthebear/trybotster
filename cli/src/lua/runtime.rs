@@ -1455,6 +1455,7 @@ impl LuaRuntime {
         hub_identifier: String,
         server_id: primitives::SharedServerId,
         shared_state: Arc<std::sync::RwLock<crate::hub::state::HubState>>,
+        color_cache: crate::lua::primitives::hub::SharedColorCache,
     ) -> Result<()> {
         primitives::register_hub(
             &self.lua,
@@ -1463,6 +1464,7 @@ impl LuaRuntime {
             hub_identifier,
             server_id,
             shared_state,
+            color_cache,
         )
         .context("Failed to register Hub primitives")?;
 
@@ -2361,6 +2363,7 @@ mod tests {
                 std::sync::Arc::new(std::sync::RwLock::new(crate::hub::state::HubState::new(
                     worktree_base,
                 ))),
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             )
             .expect("register hub/worktree primitives");
 
@@ -3492,7 +3495,7 @@ mod tests {
         }
     }
 
-    // Broker recovery tests removed — broker module deleted, replaced by per-session processes.
+    // Legacy recovery tests removed after the session-process migration.
     // Session recovery is now handled via `recover_session_processes()` in hub/mod.rs.
 
     // =========================================================================

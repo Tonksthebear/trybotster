@@ -234,8 +234,8 @@ function M.on_action(action, context)
       -- Do NOT include { op = "quit" } here — the TUI runs on a separate thread
       -- and quits immediately, racing with Hub processing. If the TUI shutdown
       -- flag fires before the Hub processes ExecRestart (a two-hop path
-      -- through hub_event_rx), hub.exec_restart stays false and shutdown()
-      -- calls kill_all() instead of disconnect_graceful() — killing agents.
+      -- through hub_event_rx), the current process can exit before the restart
+      -- request is committed and recovery becomes flaky.
       -- Instead, let hub.quit = true propagate via the shared shutdown flag:
       -- Hub processes restart_hub → ExecRestart → quit = true → exits →
       -- shutdown.store(true) in run_with_hub → TUI sees it → exits cleanly,

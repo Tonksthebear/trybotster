@@ -220,6 +220,21 @@ function _set_pty_focused(session_uuid, peer_id, focused)
     end
 end
 
+-- Send synthetic focus-out to sessions that a disconnecting client had focused.
+-- Without this, the PTY would think it still has focus after a client disappears.
+hooks.on("client_disconnected", "unfocus_on_disconnect", function(info)
+    local peer_id = info.peer_id
+    if not peer_id then return end
+
+    local focused_sessions = pty_clients.get_focused_sessions(peer_id)
+    for _, session_uuid in ipairs(focused_sessions) do
+        hub.write_pty(session_uuid, "\x1b[O")
+        pty_clients.set_focused(session_uuid, peer_id, false)
+        log.debug(string.format("Sent synthetic focus-out to %s on client %s disconnect",
+            session_uuid:sub(1, 16), peer_id:sub(1, 8)))
+    end
+end)
+
 -- Enrich raw PTY notifications from Rust with agent state, then re-dispatch.
 hooks.on("_pty_notification_raw", "enrich_and_dispatch", function(info)
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
@@ -362,7 +377,7 @@ end)
 -- timer.after_idle is a Rust primitive: spawns a tokio::time::sleep task
 -- that is aborted and replaced on each reset. Zero polling.
 
-local IDLE_THRESHOLD_SECS = 5
+local IDLE_THRESHOLD_SECS = 2
 
 hooks.on("pty_output", "idle_activity_reset", function(ctx, _data)
     local uuid = ctx.session_uuid
@@ -386,9 +401,16 @@ hooks.on("pty_output", "idle_activity_reset", function(ctx, _data)
 end)
 
 -- Auto-broadcast agent list when any session field changes.
+-- Debounced: rapid field changes (title, cwd, idle toggles) coalesce into
+-- one broadcast after 150ms of quiet. Prevents full-sidebar re-render storms
+-- that make all indicators flicker in sync.
+local AGENT_LIST_DEBOUNCE_SECS = 0.15
+
 hooks.on("session_updated", "broadcast_session_updated", function()
-    last_agent_list_snapshot = nil
-    broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+    timer.after_idle("agent_list_broadcast", AGENT_LIST_DEBOUNCE_SECS, function()
+        last_agent_list_snapshot = nil
+        broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+    end)
 end)
 
 hooks.on("agent_lifecycle", "broadcast_lifecycle", function(info)
@@ -536,8 +558,10 @@ function M._before_reload()
     hooks.off("pty_cwd_changed", "update_agent_cwd")
     hooks.off("pty_output", "idle_activity_reset")
     hooks.off("session_updated", "broadcast_session_updated")
+    timer.cancel("agent_list_broadcast")
     hooks.off("pty_prompt", "update_agent_prompt")
     hooks.off("pty_cursor_visibility", "update_agent_cursor")
+    hooks.off("client_disconnected", "unfocus_on_disconnect")
     _set_pty_focused = nil
     _on_pty_input = nil
     _clear_session_notification = nil

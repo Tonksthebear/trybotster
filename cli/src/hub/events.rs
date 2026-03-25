@@ -68,6 +68,30 @@ pub(crate) enum HubEvent {
         exit_code: Option<i32>,
     },
 
+    /// PTY output observed directly from the session PTY stream.
+    ///
+    /// Used to feed Lua `pty_output` hooks from the session itself, so
+    /// output-driven logic like idle detection does not depend on any client
+    /// transport being attached.
+    PtyOutputObserved {
+        /// Session UUID for hook context.
+        session_uuid: String,
+        /// Raw PTY bytes produced by the session.
+        data: Vec<u8>,
+    },
+
+    /// Child process queried a terminal color via OSC 10/11/12 and the hub
+    /// should respond if no live client is attached.
+    ///
+    /// The response string is pre-formatted by the alacritty formatter using
+    /// the hub's cached RGB value. The hub just needs to write it to the PTY.
+    ColorResponse {
+        /// Session UUID whose PTY emitted the query.
+        session_uuid: String,
+        /// Pre-formatted OSC response string to write to the PTY.
+        response: String,
+    },
+
     /// WebRTC DataChannel has opened for a browser peer.
     ///
     /// Sent from the `on_data_channel` callback. Triggers `peer_connected`
@@ -273,8 +297,8 @@ pub(crate) enum HubEvent {
 
     /// A session was removed from `HandleCache` by `hub.unregister_session()`.
     ///
-    /// The Hub removes all `broker_sessions` entries whose `session_uuid` matches
-    /// so the routing table does not grow without bound when sessions cycle.
+    /// The Hub removes any per-session routing state whose `session_uuid`
+    /// matches so in-memory indexes do not grow without bound when sessions cycle.
     SessionUnregistered {
         /// The session UUID that was removed.
         session_uuid: String,
@@ -327,6 +351,8 @@ impl HubEvent {
                 _ => "pty_osc_event",
             },
             Self::PtyProcessExited { .. } => "pty_process_exited",
+            Self::PtyOutputObserved { .. } => "pty_output_observed",
+            Self::ColorResponse { .. } => "color_response",
             Self::DcOpened { .. } => "dc_opened",
             Self::WebRtcIngressBackpressure { .. } => "webrtc_ingress_backpressure",
             Self::TimerFired { .. } => "timer_fired",

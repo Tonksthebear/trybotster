@@ -1866,6 +1866,33 @@ mod tests {
         }
     }
 
+    fn extract_sidebar_secondary_items(tree: &RenderNode) -> Vec<Option<String>> {
+        use crate::tui::render_tree::{ListProps, StyledContent, WidgetProps};
+        match tree {
+            RenderNode::HSplit { children, .. } => match &children[0] {
+                RenderNode::Widget { props, .. } => {
+                    if let Some(WidgetProps::List(ListProps { items, .. })) = props {
+                        items
+                            .iter()
+                            .map(|item| {
+                                item.secondary.as_ref().map(|secondary| match secondary {
+                                    StyledContent::Plain(s) => s.clone(),
+                                    StyledContent::Styled(spans) => {
+                                        spans.iter().map(|s| s.text.clone()).collect::<String>()
+                                    }
+                                })
+                            })
+                            .collect()
+                    } else {
+                        panic!("Expected List props on sidebar widget");
+                    }
+                }
+                _ => panic!("Expected Widget (list) as first child"),
+            },
+            _ => panic!("Expected HSplit root layout"),
+        }
+    }
+
     /// Layout should render the creating indicator during creation.
     #[test]
     fn test_layout_renders_creating_indicator() {
@@ -1928,6 +1955,113 @@ mod tests {
         assert_eq!(
             items[0], "feature-auth",
             "Agent item should show display name"
+        );
+    }
+
+    #[test]
+    fn test_layout_renders_idle_icon_for_idle_agent() {
+        let lua = make_full_lua_with_events();
+
+        lua.exec(
+            r#"
+            _tui_state.agents = {
+                {
+                    id = "sess-idle",
+                    display_name = "feature-auth",
+                    branch_name = "feature-auth",
+                    session_type = "agent",
+                    is_idle = true,
+                    status = "running",
+                }
+            }
+        "#,
+        )
+        .unwrap();
+
+        let ctx = make_test_ctx("insert");
+        let tree = lua.call_render(&ctx).unwrap();
+        let items = extract_sidebar_items(&tree);
+
+        assert_eq!(items.len(), 1, "Should have exactly 1 agent item");
+        assert!(
+            items[0].starts_with("◌ "),
+            "Idle agent row should render idle glyph, got: {}",
+            items[0]
+        );
+    }
+
+    #[test]
+    fn test_layout_renders_active_icon_for_running_agent() {
+        let lua = make_full_lua_with_events();
+
+        lua.exec(
+            r#"
+            _tui_state.agents = {
+                {
+                    id = "sess-active",
+                    display_name = "feature-auth",
+                    branch_name = "feature-auth",
+                    session_type = "agent",
+                    is_idle = false,
+                    status = "running",
+                }
+            }
+        "#,
+        )
+        .unwrap();
+
+        let ctx = make_test_ctx("insert");
+        let tree = lua.call_render(&ctx).unwrap();
+        let items = extract_sidebar_items(&tree);
+
+        assert_eq!(items.len(), 1, "Should have exactly 1 agent item");
+        assert!(
+            items[0].starts_with("✺ "),
+            "Active agent row should render active glyph, got: {}",
+            items[0]
+        );
+    }
+
+    #[test]
+    fn test_layout_renders_title_as_secondary_when_label_present() {
+        let lua = make_full_lua_with_events();
+
+        lua.exec(
+            r#"
+            _tui_state.agents = {
+                {
+                    id = "sess-title",
+                    label = "Important agent",
+                    display_name = "Agent runtime title",
+                    title = "Agent runtime title",
+                    branch_name = "feature-auth",
+                    target_name = "trybotster",
+                    agent_name = "claude",
+                    session_type = "agent",
+                    is_idle = false,
+                    status = "running",
+                }
+            }
+        "#,
+        )
+        .unwrap();
+
+        let ctx = make_test_ctx("insert");
+        let tree = lua.call_render(&ctx).unwrap();
+        let items = extract_sidebar_items(&tree);
+        let secondary = extract_sidebar_secondary_items(&tree);
+
+        assert_eq!(items.len(), 1, "Should have exactly 1 agent item");
+        assert!(
+            items[0].contains("Important agent"),
+            "Primary row should use label, got: {}",
+            items[0]
+        );
+        let secondary_text = secondary[0].as_deref().unwrap_or("");
+        assert!(
+            secondary_text.contains("Agent runtime title"),
+            "Secondary row should include runtime title, got: {}",
+            secondary_text
         );
     }
 

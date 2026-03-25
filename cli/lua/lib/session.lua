@@ -342,26 +342,12 @@ function Session._init(self, config)
         error(string.format("PTY spawn blocked by interceptor for %s", key))
     end
 
-    -- Spawn via per-session process (preferred) or broker (legacy fallback)
-    local ok, handle
-    if hub.spawn_session then
-        ok, handle = pcall(hub.spawn_session, spawn_config, session_uuid)
-        if not ok or not handle then
-            error(string.format(
-                "Failed to spawn session process for %s: %s",
-                key, tostring(handle)
-            ))
-        end
-    else
-        local broker_session_id
-        ok, handle, broker_session_id = pcall(hub.spawn_pty_with_broker, spawn_config, session_uuid)
-        if not ok or not handle or not broker_session_id then
-            error(string.format(
-                "Failed to spawn broker-backed PTY for %s: %s",
-                key, tostring(handle)
-            ))
-        end
-        self:set_meta("broker_session_id", tostring(broker_session_id))
+    local ok, handle = pcall(hub.spawn_session, spawn_config, session_uuid)
+    if not ok or not handle then
+        error(string.format(
+            "Failed to spawn session process for %s: %s",
+            key, tostring(handle)
+        ))
     end
 
     self.session = handle
@@ -372,9 +358,9 @@ function Session._init(self, config)
     -- Register with HandleCache via hub.register_session()
     local reg_ok, reg_index = pcall(hub.register_session, session_uuid, handle, {
         session_type = session_type,
+        session_name = session_name,
         label = self.label or "",
         workspace_id = self._workspace_id,
-        broker_session_id = self:get_meta("broker_session_id"),
     })
     if reg_ok then
         log.info(string.format("Session %s: registered with HandleCache index %s",
@@ -383,12 +369,7 @@ function Session._init(self, config)
         log.error(string.format("Session %s: failed to register: %s", key, tostring(reg_index)))
     end
 
-    -- Store PTY dimensions so recovered PTYs use real terminal size
-    local dims_ok, dim_rows, dim_cols = pcall(function() return handle:dimensions() end)
-    if dims_ok and dim_rows then
-        self:set_meta("broker_pty_rows", tostring(dim_rows))
-        self:set_meta("broker_pty_cols", tostring(dim_cols))
-    end
+    self:_sync_session_manifest()
     log.info(string.format("Session %s: registered (uuid=%s)", key, session_uuid))
 
     -- Register in session registry (keyed by session_uuid)
@@ -401,14 +382,14 @@ function Session._init(self, config)
     log.info(string.format("Session created: %s (uuid=%s, type=%s)", key, session_uuid, session_type))
 end
 
---- Initialize a session from a persisted manifest during broker recovery.
--- Hydrates all fields from the manifest + broker handle without spawning a
+--- Initialize a session from a persisted manifest during session recovery.
+-- Hydrates all fields from the manifest + live handle without spawning a
 -- new PTY or generating a new UUID. The resulting instance is a first-class
 -- session, identical to a freshly created one.
 --
 -- @param self The instance (metatable already set by subclass)
 -- @param config Table with manifest fields plus recovery-specific keys:
---   handle (PtySessionHandle); broker_session_id (integer); dims ({ rows, cols })
+--   handle (PtySessionHandle); dims ({ rows, cols })
 function Session._init_recovered(self, config)
     local recovered_target = TargetContext.resolve({
         explicit = {
@@ -451,17 +432,12 @@ function Session._init_recovered(self, config)
     self._workspace_name = config.workspace_name
     self._workspace_metadata = {}
 
-    -- Metadata: manifest metadata + broker runtime keys
+    -- Metadata: manifest metadata enriched with resolved target identity.
     local metadata = {}
     if config.metadata then
         for k, v in pairs(config.metadata) do metadata[k] = v end
     end
     metadata = TargetContext.with_metadata(metadata, recovered_target)
-    metadata["broker_session_id"] = tostring(config.broker_session_id)
-    if config.dims then
-        metadata["broker_pty_rows"] = tostring(config.dims.rows or 24)
-        metadata["broker_pty_cols"] = tostring(config.dims.cols or 80)
-    end
     self.metadata = metadata
 
     -- Filesystem checks
@@ -500,17 +476,11 @@ function Session._init_recovered(self, config)
         session_name      = self.session_name,
         label             = self.label or "",
         workspace_id      = self._workspace_id,
-        broker_session_id = config.broker_session_id,
     })
     if not reg_ok then
         error(string.format("Session %s: recovery register failed: %s", key, tostring(reg_index)))
     end
     log.info(string.format("Session %s: recovered (index=%s)", key, tostring(reg_index)))
-
-    -- Replay scrollback: broker-backed sessions use broker snapshot,
-    -- session-process-backed sessions use the session's snapshot via
-    -- the connection (which register_session just installed a reader for).
-    self:replay_broker_scrollback()
 
     -- Register in session registry
     sessions[self.session_uuid] = self
@@ -569,7 +539,7 @@ function Session:get_meta(key)
 end
 
 --- Sync the Central Session Store session manifest.
--- Writes self:info() shape so broker recovery can load it directly.
+-- Writes self:info() shape so session recovery can load it directly.
 function Session:_sync_session_manifest()
     if not self._data_dir or not self._workspace_id then
         log.debug(string.format("Session %s: skip manifest sync (data_dir=%s, workspace_id=%s)",
@@ -596,28 +566,17 @@ function Session:_sync_session_manifest()
     manifest.created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at)
     manifest.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
 
-    -- Broker session mapping (structured, separate from plugin metadata)
-    local broker_sessions = {}
-    local pty_dimensions  = {}
-    local sid = self.metadata["broker_session_id"]
-    if sid then
-        broker_sessions["0"] = tonumber(sid)
-        local dim_rows = tonumber(self.metadata["broker_pty_rows"])
-        local dim_cols = tonumber(self.metadata["broker_pty_cols"])
-        if dim_rows and dim_cols then
-            pty_dimensions["0"] = { rows = dim_rows, cols = dim_cols }
+    local pty_dimensions = {}
+    if self.session then
+        local ok_dims, rows, cols = pcall(function() return self.session:dimensions() end)
+        if ok_dims and rows and cols then
+            pty_dimensions["0"] = { rows = rows, cols = cols }
         end
     end
-    manifest.broker_sessions = broker_sessions
     manifest.pty_dimensions  = pty_dimensions
 
-    -- Filter internal broker keys out of persisted metadata
-    -- (they're already represented as structured fields above)
     local plugin_metadata = {}
     local internal_keys = {
-        broker_session_id = true,
-        broker_pty_rows = true,
-        broker_pty_cols = true,
         tee_log_path = true,
     }
     for k, v in pairs(self.metadata) do
@@ -769,18 +728,15 @@ function Session:move_to_workspace(opts)
 
     -- Update HandleCache metadata so Rust-side lookups see the new workspace_id.
     if self.session then
-        local sid = tonumber(self.metadata["broker_session_id"])
-        if sid then
-            local ok_reg, reg_err = pcall(hub.register_session, self.session_uuid, self.session, {
-                session_type = self.session_type,
-                label = self.label or "",
-                workspace_id = workspace_id,
-                broker_session_id = sid,
-            })
-            if not ok_reg then
-                log.warn(string.format("Session %s: failed to refresh HandleCache workspace: %s",
-                    self.session_uuid, tostring(reg_err)))
-            end
+        local ok_reg, reg_err = pcall(hub.register_session, self.session_uuid, self.session, {
+            session_type = self.session_type,
+            session_name = self.session_name,
+            label = self.label or "",
+            workspace_id = workspace_id,
+        })
+        if not ok_reg then
+            log.warn(string.format("Session %s: failed to refresh HandleCache workspace: %s",
+                self.session_uuid, tostring(reg_err)))
         end
     end
 
@@ -840,14 +796,9 @@ function Session:close(delete_worktree)
     sync_manifest_workspaces()
 
     -- Mark the Central Session Store session as closed.
-    -- Skip for session-process-backed sessions whose socket is still live —
-    -- the session process survives hub shutdown and will be recovered.
-    local session_socket_live = false
-    if hub.session_socket_exists then
-        local ok, exists = pcall(hub.session_socket_exists, self.session_uuid)
-        session_socket_live = ok and exists
-    end
-    if self._data_dir and self._workspace_id and not session_socket_live then
+    -- Explicit user close is authoritative; hub restart recovery does not use
+    -- Session:close(), so a closed manifest here is a do-not-recover tombstone.
+    if self._data_dir and self._workspace_id then
         local ws = require("lib.workspace_store")
         local manifest = ws.read_session(self._data_dir, self._workspace_id, self.session_uuid)
         if manifest then
@@ -887,25 +838,6 @@ function Session:close(delete_worktree)
 
     log.info(string.format("Session closed: %s (uuid=%s, delete_worktree=%s)",
         key, self.session_uuid, tostring(delete_worktree or false)))
-end
-
---- Replay broker ring-buffer scrollback into the session's shadow screen.
-function Session:replay_broker_scrollback()
-    local key = self.session_uuid
-    local session_id = tonumber(self:get_meta("broker_session_id"))
-    if not session_id then return end
-
-    local snapshot = hub.get_pty_snapshot_from_broker(session_id)
-    if snapshot and #snapshot > 0 and self.session then
-        local ok, err = pcall(function() self.session:feed_output(snapshot) end)
-        if ok then
-            log.info(string.format("Session %s: replayed %d bytes of broker scrollback",
-                key, #snapshot))
-        else
-            log.warn(string.format("Session %s: failed to replay scrollback: %s",
-                key, tostring(err)))
-        end
-    end
 end
 
 --- Build environment variables for spawned sessions.

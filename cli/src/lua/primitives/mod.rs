@@ -228,6 +228,7 @@ pub(crate) fn register_hub(
     hub_identifier: String,
     server_id: SharedServerId,
     shared_state: Arc<std::sync::RwLock<crate::hub::state::HubState>>,
+    color_cache: hub::SharedColorCache,
 ) -> Result<()> {
     hub::register(
         lua,
@@ -236,6 +237,7 @@ pub(crate) fn register_hub(
         hub_identifier,
         server_id,
         shared_state,
+        color_cache,
     )?;
     Ok(())
 }

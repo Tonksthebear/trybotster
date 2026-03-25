@@ -23,7 +23,9 @@ use ratatui::{
     widgets::{Block, Widget},
 };
 
-use crate::terminal::{to_ratatui_color, NoopListener};
+use alacritty_terminal::event::EventListener;
+
+use crate::terminal::to_ratatui_color;
 
 /// Configuration for cursor rendering.
 #[derive(Debug, Clone)]
@@ -48,14 +50,14 @@ impl Default for CursorConfig {
 }
 
 /// A widget that renders an alacritty `Term` to a ratatui buffer.
-pub struct TerminalWidget<'a> {
-    term: &'a Term<NoopListener>,
+pub struct TerminalWidget<'a, L: EventListener> {
+    term: &'a Term<L>,
     scroll_offset: usize,
     block: Option<Block<'a>>,
     cursor: CursorConfig,
 }
 
-impl std::fmt::Debug for TerminalWidget<'_> {
+impl<L: EventListener> std::fmt::Debug for TerminalWidget<'_, L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TerminalWidget")
             .field("cursor", &self.cursor)
@@ -65,12 +67,12 @@ impl std::fmt::Debug for TerminalWidget<'_> {
     }
 }
 
-impl<'a> TerminalWidget<'a> {
+impl<'a, L: EventListener> TerminalWidget<'a, L> {
     /// Create a new terminal widget from an alacritty `Term`.
     ///
     /// `scroll_offset` is the number of lines scrolled up from the bottom
     /// (0 = live view, N = N lines into history).
-    pub fn new(term: &'a Term<NoopListener>, scroll_offset: usize) -> Self {
+    pub fn new(term: &'a Term<L>, scroll_offset: usize) -> Self {
         Self {
             term,
             scroll_offset,
@@ -98,7 +100,7 @@ impl<'a> TerminalWidget<'a> {
     }
 }
 
-impl Widget for TerminalWidget<'_> {
+impl<L: EventListener> Widget for TerminalWidget<'_, L> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Render block if present and get inner area
         let inner_area = if let Some(block) = &self.block {
@@ -128,7 +130,7 @@ impl Widget for TerminalWidget<'_> {
 ///
 /// With scroll_offset N, the top of the rendered area shows the line that
 /// is N lines above the top of the viewport.
-fn render_grid(term: &Term<NoopListener>, scroll_offset: usize, area: Rect, buf: &mut Buffer) {
+fn render_grid<L: EventListener>(term: &Term<L>, scroll_offset: usize, area: Rect, buf: &mut Buffer) {
     let grid = term.grid();
 
     for row in 0..area.height {
@@ -181,8 +183,8 @@ fn render_grid(term: &Term<NoopListener>, scroll_offset: usize, area: Rect, buf:
 /// - `Beam` — thin left bar `▎` overlaid on the cell
 /// - `Underline` — underline modifier on the cell character (or `_` on a space)
 /// - `Hidden` — early return; nothing rendered
-fn render_cursor(
-    term: &Term<NoopListener>,
+fn render_cursor<L: EventListener>(
+    term: &Term<L>,
     area: Rect,
     buf: &mut Buffer,
     cursor_config: &CursorConfig,

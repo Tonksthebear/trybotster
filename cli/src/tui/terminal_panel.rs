@@ -26,7 +26,7 @@
 
 use alacritty_terminal::term::Term;
 
-use crate::terminal::{AlacrittyParser, NoopListener};
+use crate::terminal::{AlacrittyParser, TuiColorQuery, TuiPanelListener};
 
 /// Default scrollback buffer size in lines for TUI panels.
 ///
@@ -59,7 +59,9 @@ pub enum PanelState {
 /// Methods return `Option<serde_json::Value>` messages for the caller
 /// to send via the transport channel.
 pub struct TerminalPanel {
-    parser: AlacrittyParser<NoopListener>,
+    parser: AlacrittyParser<TuiPanelListener>,
+    /// Listener handle for draining `ColorRequest` events after `process()`.
+    listener: TuiPanelListener,
     state: PanelState,
     dims: (u16, u16),
     /// Lines scrolled up from live view. Zero means at bottom (live).
@@ -78,8 +80,10 @@ impl std::fmt::Debug for TerminalPanel {
 impl TerminalPanel {
     /// Create a panel with an empty parser at the given dimensions.
     pub fn new(rows: u16, cols: u16) -> Self {
+        let (parser, listener) = AlacrittyParser::new_tui(rows, cols, TUI_SCROLLBACK);
         Self {
-            parser: AlacrittyParser::new_noop(rows, cols, TUI_SCROLLBACK),
+            parser,
+            listener,
             state: PanelState::Idle,
             dims: (rows, cols),
             scroll_offset: 0,
@@ -90,8 +94,13 @@ impl TerminalPanel {
     ///
     /// Returns the alacritty `Term` — callers use grid indexing with
     /// `scroll_offset()` to render the correct portion of history.
-    pub fn term(&self) -> &Term<NoopListener> {
+    pub fn term(&self) -> &Term<TuiPanelListener> {
         self.parser.term()
+    }
+
+    /// Whether focus reporting mode is active (`CSI ? 1004 h`).
+    pub fn focus_reporting(&self) -> bool {
+        self.parser.focus_reporting()
     }
 
     /// Whether DECCKM (application cursor keys) mode is active.
@@ -198,7 +207,9 @@ impl TerminalPanel {
         self.dims = (rows, cols);
 
         // Replace the parser entirely so the old scrollback buffer is discarded.
-        self.parser = AlacrittyParser::new_noop(rows, cols, TUI_SCROLLBACK);
+        let (parser, listener) = AlacrittyParser::new_tui(rows, cols, TUI_SCROLLBACK);
+        self.parser = parser;
+        self.listener = listener;
         self.parser.process(data);
 
         // Reset scroll state — reconnect starts at live view
@@ -219,6 +230,14 @@ impl TerminalPanel {
             return;
         }
         self.parser.process(data);
+    }
+
+    /// Drain pending color queries that alacritty emitted during `process()`.
+    ///
+    /// Returns indices (256=fg, 257=bg, 258=cursor) that need to be forwarded
+    /// to the outer terminal via stdout.
+    pub fn drain_color_queries(&self) -> Vec<TuiColorQuery> {
+        self.listener.drain_color_queries()
     }
 
     /// Resize the parser and notify the PTY if subscribed.

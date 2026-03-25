@@ -161,7 +161,7 @@ end
 -- Workspace Store Init + Migration (Phase 1: Central Session Store)
 -- ============================================================================
 -- Ensure the workspaces directory exists and migrate any old context.json files
--- before the broker handler loads so resurrected sessions find new-format manifests.
+-- before session recovery runs so resurrected sessions find new-format manifests.
 
 do
     local ws_data_dir = (config.data_dir and config.data_dir()) or nil

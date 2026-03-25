@@ -43,7 +43,9 @@ use std::sync::{
 use tokio::sync::broadcast;
 
 use crate::agent::notification::AgentNotification;
-use crate::agent::pty::{do_resize, HubEventListener, PtyEvent, SharedPtyState};
+use crate::agent::pty::{HubEventListener, PtyEvent, SharedPtyState};
+#[cfg(test)]
+use crate::agent::pty::do_resize;
 use crate::terminal::{generate_ansi_snapshot, AlacrittyParser};
 
 /// Session type distinguishing agents (AI-driven) from accessories (plain PTY).
@@ -215,7 +217,7 @@ pub struct PtyHandle {
     /// Whether the terminal cursor is currently visible (DECTCEM).
     ///
     /// Updated by [`crate::agent::spawn::process_pty_bytes`] from the shadow
-    /// screen's cursor state. Readable without a broker RPC.
+    /// screen's cursor state. Readable without an RPC.
     cursor_visible: Arc<AtomicBool>,
 
     /// Whether a resize happened without the application redrawing yet.
@@ -227,8 +229,8 @@ pub struct PtyHandle {
     /// Whether OSC notification sequences should be detected and broadcast.
     ///
     /// `true` for agent PTYs, `false` for accessory PTYs.
-    /// Passed directly to [`crate::agent::spawn::process_pty_bytes`] in
-    /// `feed_broker_output()`.
+    /// Passed directly to [`crate::agent::spawn::process_pty_bytes`] by the
+    /// session reader path.
     detect_notifs: bool,
 
     /// Epoch milliseconds of the last PTY output chunk.
@@ -247,6 +249,10 @@ pub struct PtyHandle {
     ///
     /// Routes I/O through the session process socket.
     session_connection: Option<crate::session::connection::SharedSessionConnection>,
+
+    /// Clone of the shadow screen's event listener for draining `ColorRequest`
+    /// events after each `process()` call.
+    shadow_listener: Option<HubEventListener>,
 }
 
 impl std::fmt::Debug for PtyHandle {
@@ -286,7 +292,7 @@ impl PtyHandle {
     /// Create a new local PTY handle with direct sync access.
     ///
     /// Test-only constructor for in-process PTY fixtures that do not involve
-    /// the broker transport.
+    /// the session socket transport.
     ///
     /// Direct access enables immediate I/O operations without async channel delays:
     /// - `write_input_direct()` - sync input, no channel hop
@@ -325,6 +331,7 @@ impl PtyHandle {
             last_output_at: Arc::new(AtomicU64::new(0)),
             port,
             session_connection: None,
+            shadow_listener: None,
         }
     }
 
@@ -347,6 +354,7 @@ impl PtyHandle {
         last_human_input_ms: Arc<std::sync::atomic::AtomicI64>,
         initial_rows: u16,
         initial_cols: u16,
+        shadow_listener: HubEventListener,
     ) -> Self {
         Self {
             event_tx,
@@ -364,10 +372,11 @@ impl PtyHandle {
             last_output_at,
             port,
             session_connection: Some(session_connection),
+            shadow_listener: Some(shadow_listener),
         }
     }
 
-    /// Whether this handle is session-process-backed (not broker).
+    /// Whether this handle is session-process-backed.
     #[must_use]
     pub fn is_session_backed(&self) -> bool {
         self.session_connection.is_some()
@@ -410,27 +419,24 @@ impl PtyHandle {
 
     /// Broadcast a `ProcessExited` event on this handle's channel.
     ///
-    /// Used by the `BrokerPtyExited` handler to bridge broker-side exit
-    /// detection into the PtyHandle broadcast channel, so the notification
-    /// watcher fires `process_exited` for live broker-owned sessions.
+    /// Used by session lifecycle handlers to bridge process exit detection
+    /// into the PtyHandle broadcast channel.
     pub fn notify_process_exited(&self, exit_code: Option<i32>) {
         let _ = self.event_tx.send(PtyEvent::process_exited(exit_code));
     }
 
     /// Broadcast a `TitleChanged` event on this handle's channel.
     ///
-    /// Used by the `BrokerTermEvent` handler to bridge broker-side title
-    /// changes into the PtyHandle broadcast channel, so the notification
-    /// watcher fires `pty_title_changed` for broker-owned sessions.
+    /// Used by session lifecycle handlers to bridge title changes into the
+    /// PtyHandle broadcast channel.
     pub fn notify_title_changed(&self, title: String) {
         let _ = self.event_tx.send(PtyEvent::title_changed(title));
     }
 
     /// Broadcast a bell `Notification` event on this handle's channel.
     ///
-    /// Used by the `BrokerTermEvent` handler to bridge broker-side BEL
-    /// detection into the PtyHandle broadcast channel, so the notification
-    /// watcher fires `pty_notification` for broker-owned sessions.
+    /// Used by session lifecycle handlers to bridge BEL notifications into the
+    /// PtyHandle broadcast channel.
     pub fn notify_bell(&self) {
         let _ = self
             .event_tx
@@ -625,6 +631,14 @@ impl PtyHandle {
     #[must_use]
     pub fn shadow_screen(&self) -> Arc<Mutex<AlacrittyParser<HubEventListener>>> {
         Arc::clone(&self.shadow_screen)
+    }
+
+    /// Clone of the shadow screen's event listener for the session reader.
+    ///
+    /// Returns `None` for legacy (non-session-backed) handles.
+    #[must_use]
+    pub fn shadow_listener(&self) -> Option<HubEventListener> {
+        self.shadow_listener.clone()
     }
 
     /// Clone the event broadcast sender.

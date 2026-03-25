@@ -94,6 +94,66 @@ impl EventListener for NoopListener {
     fn send_event(&self, _event: alacritty_terminal::event::Event) {}
 }
 
+/// Pending color query from the TUI panel's alacritty parser.
+///
+/// The TUI forwards these to the outer terminal via stdout.
+#[derive(Debug)]
+pub struct TuiColorQuery {
+    /// Color index: 256=foreground, 257=background, 258=cursor.
+    pub index: usize,
+}
+
+/// TUI panel event listener that captures `ColorRequest` events.
+///
+/// When the inner PTY queries terminal colors (OSC 10/11/12), alacritty fires
+/// `ColorRequest`. The TUI runner drains these and forwards the query to the
+/// outer terminal, which responds with the actual color values.
+#[derive(Clone)]
+pub struct TuiPanelListener {
+    pending: std::sync::Arc<std::sync::Mutex<Vec<TuiColorQuery>>>,
+}
+
+impl TuiPanelListener {
+    /// Create a new TUI panel listener.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            pending: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Drain all buffered color queries since the last call.
+    pub fn drain_color_queries(&self) -> Vec<TuiColorQuery> {
+        self.pending
+            .lock()
+            .ok()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default()
+    }
+}
+
+impl Default for TuiPanelListener {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for TuiPanelListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TuiPanelListener").finish()
+    }
+}
+
+impl EventListener for TuiPanelListener {
+    fn send_event(&self, event: alacritty_terminal::event::Event) {
+        if let alacritty_terminal::event::Event::ColorRequest(index, _) = event {
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.push(TuiColorQuery { index });
+            }
+        }
+    }
+}
+
 // ── AlacrittyParser ───────────────────────────────────────────────────────────
 
 /// Thin wrapper around [`Term<L>`] + [`Processor`].
@@ -148,9 +208,21 @@ impl<L: EventListener> std::fmt::Debug for AlacrittyParser<L> {
 impl AlacrittyParser<NoopListener> {
     /// Create a no-op parser — events are silently discarded.
     ///
-    /// Suitable for TUI-local parsers where title / bell events are not needed.
+    /// Suitable for parsers where terminal events are not needed.
     pub fn new_noop(rows: u16, cols: u16, scrollback: usize) -> Self {
         Self::new_with_listener(rows, cols, scrollback, NoopListener)
+    }
+}
+
+impl AlacrittyParser<TuiPanelListener> {
+    /// Create a TUI panel parser that captures `ColorRequest` events.
+    ///
+    /// The returned listener handle is used by the TUI runner to drain
+    /// pending color queries after each `process()` call.
+    pub fn new_tui(rows: u16, cols: u16, scrollback: usize) -> (Self, TuiPanelListener) {
+        let listener = TuiPanelListener::new();
+        let listener_clone = listener.clone();
+        (Self::new_with_listener(rows, cols, scrollback, listener), listener_clone)
     }
 }
 
@@ -187,7 +259,7 @@ impl<L: EventListener> AlacrittyParser<L> {
 
     /// Feed raw PTY bytes into the terminal emulator.
     ///
-    /// Hot path — bytes from the broker or PTY reader arrive here and update
+    /// Hot path — bytes from the PTY reader arrive here and update
     /// the internal grid, cursor, and mode state atomically.
     pub fn process(&mut self, data: &[u8]) {
         self.track_control_state(data);
@@ -259,6 +331,15 @@ impl<L: EventListener> AlacrittyParser<L> {
         self.term
             .mode()
             .intersects(TermMode::KITTY_KEYBOARD_PROTOCOL)
+    }
+
+    /// Whether focus reporting mode is active (`CSI ? 1004 h`).
+    ///
+    /// When true, the app expects `\x1b[I` on focus-in and `\x1b[O` on
+    /// focus-out. The TUI forwards OS-level terminal focus events to the
+    /// PTY when this mode is set.
+    pub fn focus_reporting(&self) -> bool {
+        self.term.mode().contains(TermMode::FOCUS_IN_OUT)
     }
 
     /// Whether DECCKM (application cursor keys) mode is active.
@@ -578,14 +659,15 @@ pub fn generate_ansi_snapshot<L: EventListener>(
     if cursor_hidden {
         out.extend_from_slice(b"\x1b[?25l");
     } else {
+        out.extend_from_slice(b"\x1b[?25h");
         // Emit DECSCUSR so the browser shows the correct cursor shape (beam in
         // vim insert mode, underline, etc.).
         out.extend_from_slice(cursor_shape_seq);
     }
 
     // Restore kitty keyboard protocol if the terminal had it active.
-    // Appended here (not in callers) so both the broker snapshot path and the
-    // hub shadow-screen path get it automatically without separate bookkeeping.
+    // Appended here (not in callers) so all snapshot paths get it
+    // automatically without separate bookkeeping.
     if wants_kitty {
         // CSI > 1 u = push with DISAMBIGUATE_ESCAPE_CODES flag.
         out.extend_from_slice(b"\x1b[>1u");

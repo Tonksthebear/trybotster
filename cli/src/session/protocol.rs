@@ -9,8 +9,9 @@
 //! [u32 LE: payload_len + 1][u8: frame_type][payload_bytes]
 //! ```
 //!
-//! Same wire encoding as the broker protocol for familiarity and tooling reuse,
-//! but dramatically fewer frame types since there's no session-id multiplexing.
+//! Uses the same wire encoding as the earlier socket protocol for familiarity
+//! and tooling reuse, but dramatically fewer frame types since there's no
+//! session-id multiplexing.
 //!
 //! # Handshake
 //!
@@ -18,8 +19,7 @@
 //! with `Welcome` containing session metadata. No capabilities negotiation —
 //! protocol version is sufficient.
 
-use std::collections::VecDeque;
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 
 use anyhow::{bail, Context, Result};
 
@@ -86,20 +86,30 @@ pub const FRAME_SCREEN: u8 = 0x0F;
 /// Session metadata sent in the welcome handshake.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionMetadata {
+    /// Unique session identifier.
     pub session_uuid: String,
+    /// PID of the session process.
     pub pid: u32,
+    /// Current PTY row count.
     pub rows: u16,
+    /// Current PTY column count.
     pub cols: u16,
+    /// Unix timestamp of last PTY output.
     pub last_output_at: u64,
 }
 
 /// Terminal mode flags reported on reconnect.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModeFlags {
+    /// Kitty keyboard protocol enabled.
     pub kitty_enabled: bool,
+    /// Cursor is visible.
     pub cursor_visible: bool,
+    /// Bracketed paste mode enabled.
     pub bracketed_paste: bool,
+    /// Mouse tracking mode (0=off, 1000/1002/1003/1006).
     pub mouse_mode: u8,
+    /// Alternate screen buffer active.
     pub alt_screen: bool,
 }
 
@@ -131,7 +141,9 @@ pub fn encode_json<T: serde::Serialize>(frame_type: u8, value: &T) -> Result<Vec
 /// A decoded frame.
 #[derive(Debug)]
 pub struct Frame {
+    /// Wire frame type byte.
     pub frame_type: u8,
+    /// Raw frame payload bytes.
     pub payload: Vec<u8>,
 }
 
@@ -146,11 +158,13 @@ impl Frame {
 /// Incremental frame decoder.
 ///
 /// Feed bytes via `feed()`, drain complete frames from the returned `Vec`.
+#[derive(Debug)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
 }
 
 impl FrameDecoder {
+    /// Create a new frame decoder with default buffer capacity.
     pub fn new() -> Self {
         Self {
             buf: Vec::with_capacity(8192),
@@ -354,7 +368,7 @@ mod tests {
 
         // Session reads hello, writes welcome
         let mut cursor = Cursor::new(&hub_to_session);
-        let mut session_out: Vec<u8> = Vec::new();
+        let _session_out: Vec<u8> = Vec::new();
 
         // Manual session-side handshake (read from cursor, write to session_out)
         let mut magic = [0u8; 4];

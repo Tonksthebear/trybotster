@@ -44,7 +44,7 @@
 
 // Rust guideline compliant 2026-02
 
-use std::collections::HashSet;
+
 use std::io::Stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -195,11 +195,7 @@ pub struct TuiRunner<B: Backend> {
     /// resize, hot-reload). Cleared after render.
     dirty: bool,
 
-    /// Session UUIDs that explicitly requested focus reporting (CSI ? 1004 h).
-    ///
-    /// We only forward synthetic focus in/out sequences to these sessions to
-    /// avoid corrupting terminal state for apps that did not opt in.
-    focus_reporting_sessions: HashSet<String>,
+
 }
 
 impl<B: Backend> std::fmt::Debug for TuiRunner<B>
@@ -268,7 +264,6 @@ where
             focused_list_id: None,
             focused_input_id: None,
             dirty: true, // render on first frame
-            focus_reporting_sessions: HashSet::new(),
         }
     }
 
@@ -560,18 +555,14 @@ where
                 }
                 InputEvent::Key { ref raw_bytes, .. } => {
                     // Intercept OSC color responses from the outer terminal.
-                    // These arrive when the hub forwarded a probe via TerminalQuery.
-                    // Route them back to the hub — NOT to the focused PTY.
+                    // These arrive when we forwarded a probe from PTY output
+                    // to stdout. Route them back to the PTY that asked.
                     if Self::is_osc_color_response(raw_bytes) {
                         log::debug!(
-                            "[PTY-PROBE] Intercepted terminal color response ({} bytes)",
+                            "[PTY-PROBE] Intercepted terminal color response ({} bytes), routing to PTY",
                             raw_bytes.len()
                         );
-                        if let Err(e) = self.request_tx.send(TuiRequest::TerminalProbeResponse {
-                            data: raw_bytes.clone(),
-                        }) {
-                            log::error!("[PTY-PROBE] Failed to send probe response: {e}");
-                        }
+                        self.handle_pty_input(raw_bytes);
                         continue;
                     }
 
@@ -724,14 +715,11 @@ where
         }
     }
 
-    fn focus_reporting_enabled_for(&self, session_uuid: &str) -> bool {
-        self.focus_reporting_sessions.contains(session_uuid)
-    }
-
     fn focus_reporting_enabled_for_current_session(&self) -> bool {
         self.panel_pool
             .current_session_uuid()
-            .map(|uuid| self.focus_reporting_enabled_for(uuid))
+            .and_then(|uuid| self.panel_pool.panels().get(uuid))
+            .map(|panel| panel.focus_reporting())
             .unwrap_or(false)
     }
 
@@ -889,11 +877,53 @@ where
         false
     }
 
+    /// Forward pending color queries from a TUI panel to the outer terminal.
+    ///
+    /// Alacritty fires `ColorRequest` when the inner PTY queries OSC 10/11/12.
+    /// We construct the raw query and write it to stdout so the outer terminal
+    /// responds. The response arrives on stdin and is intercepted by
+    /// `is_osc_color_response`, which routes it back to the PTY.
+    fn forward_panel_color_queries(panel: &super::terminal_panel::TerminalPanel) {
+        /// Foreground dynamic color index in alacritty's color table.
+        const IDX_FOREGROUND: usize = 256;
+        /// Background dynamic color index in alacritty's color table.
+        const IDX_BACKGROUND: usize = 257;
+        /// Cursor dynamic color index in alacritty's color table.
+        const IDX_CURSOR: usize = 258;
+
+        let queries = panel.drain_color_queries();
+        if queries.is_empty() {
+            return;
+        }
+
+        let mut buf = Vec::new();
+        for query in &queries {
+            let osc_code = match query.index {
+                IDX_FOREGROUND => "10",
+                IDX_BACKGROUND => "11",
+                IDX_CURSOR => "12",
+                _ => continue,
+            };
+            // OSC query: ESC ] <code> ; ? BEL
+            buf.extend_from_slice(b"\x1b]");
+            buf.extend_from_slice(osc_code.as_bytes());
+            buf.extend_from_slice(b";?\x07");
+        }
+
+        if !buf.is_empty() {
+            log::debug!(
+                "[PTY-PROBE] Forwarding {} color queries to outer terminal",
+                queries.len()
+            );
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), &buf);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    }
+
     /// Detect OSC color response sequences (OSC 10/11/12 with rgb: or # values).
     ///
-    /// These arrive on stdin when the outer terminal responds to a color probe
-    /// forwarded via `TerminalQuery`. They must be routed back to the hub
-    /// (not to the focused PTY) since the hub sent the probe.
+    /// These arrive on stdin when the outer terminal responds to a probe we
+    /// forwarded. They are routed back to the focused PTY as input.
     fn is_osc_color_response(data: &[u8]) -> bool {
         // Must start with ESC ] and be at least ESC ] <code> ; <value> BEL
         if data.len() < 7 || data[0] != 0x1b || data[1] != b']' {
@@ -1002,6 +1032,7 @@ where
                         (local_rows, local_cols, true)
                     };
                     panel.on_scrollback_with_dims(applied_rows, applied_cols, &data);
+                    Self::forward_panel_color_queries(panel);
                     let after = panel.state();
                     let after_dims = panel.dims();
                     let is_focused = self.panel_pool.is_focused(&session_uuid);
@@ -1029,6 +1060,7 @@ where
                     self.dirty = true;
                     let panel = self.panel_pool.resolve_panel(&session_uuid);
                     panel.on_output(&data);
+                    Self::forward_panel_color_queries(panel);
                 }
                 Ok(TuiOutput::OutputBatch {
                     session_uuid,
@@ -1039,13 +1071,13 @@ where
                     for data in &chunks {
                         panel.on_output(data);
                     }
+                    Self::forward_panel_color_queries(panel);
                 }
                 Ok(TuiOutput::ProcessExited {
                     session_uuid,
                     exit_code,
                 }) => {
                     self.dirty = true;
-                    self.focus_reporting_sessions.remove(&session_uuid);
                     log::info!("PTY process exited with code {:?}", exit_code);
                     if self.panel_pool.is_focused(&session_uuid) {
                         self.terminal_modes.clear_inner_kitty();
@@ -1057,16 +1089,6 @@ where
                 }
                 Ok(TuiOutput::Binary(data)) => {
                     log::debug!("[TUI] Received binary data ({} bytes)", data.len());
-                }
-                Ok(TuiOutput::TerminalQuery { data }) => {
-                    // Write raw bytes directly to stdout so the outer terminal
-                    // sees the OSC probe and auto-responds with color values.
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), &data);
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                    log::debug!(
-                        "[PTY-PROBE] Wrote {} bytes of terminal query to stdout",
-                        data.len()
-                    );
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -1113,7 +1135,6 @@ where
         if event_type == "bridge_reconnected" {
             self.terminal_modes.clear_inner_kitty();
             self.panel_pool.reset_for_reattach();
-            self.focus_reporting_sessions.clear();
             self.widget_states.reset_all();
             self.focused_list_id = None;
             self.focused_input_id = None;
@@ -1123,28 +1144,24 @@ where
             log::debug!("[TUI] Bridge reconnected: reset to attach-like state");
         }
 
-        // Handle focus_requested — PTY enabled focus reporting (CSI ? 1004 h).
-        // Respond with current terminal focus state so the app knows immediately.
-        if event_type == "focus_requested" {
+        // Handle focus_reporting_changed — PTY toggled focus reporting mode.
+        // When newly enabled and the session is focused, send immediate focus state.
+        if event_type == "focus_reporting_changed" {
+            let enabled = msg.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
             let msg_uuid = msg.get("session_uuid").and_then(|v| v.as_str());
-            if let Some(uuid) = msg_uuid {
-                self.focus_reporting_sessions.insert(uuid.to_string());
-            }
-            if msg_uuid == self.panel_pool.current_session_uuid() {
-                let seq = if self.terminal_modes.terminal_focused() {
-                    b"\x1b[I" as &[u8]
-                } else {
-                    b"\x1b[O"
-                };
-                log::debug!(
-                    "[FOCUS] PTY requested focus reporting, responding with {}",
-                    if self.terminal_modes.terminal_focused() {
-                        "focused"
+            if enabled {
+                if msg_uuid == self.panel_pool.current_session_uuid() {
+                    let seq = if self.terminal_modes.terminal_focused() {
+                        b"\x1b[I" as &[u8]
                     } else {
-                        "unfocused"
-                    }
-                );
-                self.handle_pty_input(seq);
+                        b"\x1b[O"
+                    };
+                    log::debug!(
+                        "[FOCUS] Focus reporting enabled, responding with {}",
+                        if self.terminal_modes.terminal_focused() { "focused" } else { "unfocused" }
+                    );
+                    self.handle_pty_input(seq);
+                }
             }
             return;
         }
@@ -1440,9 +1457,13 @@ where
                 session_uuid: input.session_uuid.clone(),
                 focused,
             });
-            if !self.focus_reporting_enabled_for(&input.session_uuid) {
+            let focus_reporting = self.panel_pool.panels()
+                .get(&input.session_uuid)
+                .map(|p| p.focus_reporting())
+                .unwrap_or(false);
+            if !focus_reporting {
                 log::trace!(
-                    "[FOCUS] skipping synthetic focus sequence for {} (focus reporting not requested)",
+                    "[FOCUS] skipping synthetic focus sequence for {} (focus reporting not enabled)",
                     input.session_uuid
                 );
                 continue;
@@ -2235,12 +2256,12 @@ mod tests {
     /// The original implementation returned `{ op = "quit" }` alongside the
     /// `restart_hub` send_msg. The TUI thread calls `shutdown.store(true)` as
     /// soon as `runner.quit` is set, which races with the hub's two-hop
-    /// GracefulRestart processing. If the shutdown flag fires first, the hub
-    /// calls `kill_all()` instead of `disconnect_graceful()`, killing the broker
-    /// and all agent PTYs.
+    /// restart processing. If the shutdown flag fires first, the hub can exit
+    /// before the restart request is committed, leaving session recovery in an
+    /// inconsistent state.
     ///
     /// The fix removes `{ op = "quit" }` from the action, letting hub.quit = true
-    /// propagate via the shared shutdown flag after GracefulRestart completes.
+    /// propagate via the shared shutdown flag after the restart request completes.
     ///
     /// This test verifies:
     /// 1. `runner.quit` is NOT set after selecting restart_hub (no race).

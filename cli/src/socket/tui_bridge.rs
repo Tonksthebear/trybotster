@@ -370,11 +370,6 @@ fn tui_request_to_frame(request: &TuiRequest) -> Frame {
             "session_uuid": session_uuid,
             "focused": focused,
         })),
-        TuiRequest::TerminalProbeResponse { .. } => {
-            // Probe responses are handled locally by the hub — not forwarded
-            // over the socket bridge. Encode as a no-op JSON frame.
-            Frame::Json(serde_json::json!({"type": "terminal_probe_response"}))
-        }
     }
 }
 

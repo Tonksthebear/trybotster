@@ -58,8 +58,10 @@
 //! end, { timeout_ms = 10 })
 //! ```
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::io::Write;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -67,6 +69,7 @@ use std::sync::{
 };
 
 use crate::agent::pty::{HubEventListener, PtySession, SharedPtyState};
+#[cfg(test)]
 use crate::agent::spawn::PtySpawnConfig;
 use crate::hub::events::HubEvent;
 use crate::terminal::{AlacrittyParser, DEFAULT_SCROLLBACK_LINES};
@@ -77,6 +80,42 @@ use mlua::prelude::*;
 
 use super::HubEventSender;
 use crate::agent::pty::events::PtyEvent;
+
+// =============================================================================
+// SessionConnectionWriter - bridges SharedPtyState.writer to session socket
+// =============================================================================
+
+/// A [`Write`] adapter that routes PTY input through a session connection socket.
+///
+/// In the per-session process architecture, the hub doesn't own the PTY master
+/// fd — the session process does. This writer bridges the gap so that
+/// [`SharedPtyState::writer`] (used by the message delivery task in
+/// [`crate::agent::message_delivery`]) can transparently write through the
+/// session socket.
+struct SessionConnectionWriter {
+    conn: crate::session::connection::SharedSessionConnection,
+}
+
+impl Write for SessionConnectionWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut guard = self
+            .conn
+            .lock()
+            .map_err(|_| std::io::Error::other("session connection lock poisoned"))?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("session connection closed"))?;
+        session
+            .write_input(buf)
+            .map_err(|e| std::io::Error::other(format!("session write_input failed: {e}")))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Session socket is unbuffered — flush is a no-op.
+        Ok(())
+    }
+}
 
 // =============================================================================
 // PtySessionHandle - Lua-facing handle to a spawned PtySession
@@ -90,13 +129,11 @@ use crate::agent::pty::events::PtyEvent;
 ///
 /// The `_session` field keeps the `PtySession` alive via `Arc` -- dropping
 /// the last reference triggers `PtySession::drop()` which kills the child
-/// process and aborts the command processor task. Recovered sessions (broker
-/// recovery) set this to `None` since they have no child process.
-///
-/// Runtime sessions are created by `hub.spawn_pty_with_broker()`.
+/// process and aborts the command processor task. Recovered sessions set this
+/// to `None` since the hub is attaching to an already-running session process.
 pub struct PtySessionHandle {
     /// Keep `PtySession` alive -- its `Drop` impl kills the child process
-    /// and aborts the command processor task. `None` for broker-backed recovered sessions.
+    /// and aborts the command processor task. `None` for recovered sessions.
     _session: Option<Arc<Mutex<PtySession>>>,
 
     /// Shared state for direct write/resize operations.
@@ -132,7 +169,7 @@ pub struct PtySessionHandle {
     /// Epoch milliseconds of the last PTY output chunk.
     ///
     /// Shared with the corresponding `PtyHandle` so both Lua and Rust see the
-    /// same value.  Updated by `PtyHandle::feed_broker_output()`.
+    /// same value. Updated by the session reader thread as output arrives.
     last_output_at: Arc<AtomicU64>,
 
     /// Per-session process connection.
@@ -142,6 +179,9 @@ pub struct PtySessionHandle {
     /// PtyHandle and install a reader thread.
     session_connection:
         Arc<std::sync::OnceLock<crate::session::connection::SharedSessionConnection>>,
+
+    /// Clone of the shadow screen's event listener for draining alacritty events.
+    shadow_listener: HubEventListener,
 }
 
 impl std::fmt::Debug for PtySessionHandle {
@@ -155,27 +195,18 @@ impl std::fmt::Debug for PtySessionHandle {
 impl PtySessionHandle {
     /// Clone the event broadcast sender for subscribing to PTY events.
     ///
-    /// Used by `register_session` to spawn a notification watcher for
-    /// recovered sessions that were created without one.
+    /// Used by `register_session` to spawn a notification watcher once the
+    /// session handle is attached to the hub.
     pub(crate) fn event_tx(&self) -> broadcast::Sender<PtyEvent> {
         self.event_tx.clone()
     }
 
-    /// Whether this is a recovered broker-backed handle (no local PTY process).
-    ///
-    /// Recovered handles are created by `create_recovered_session` during broker
-    /// recovery. They skip the spawn path which normally creates a
-    /// notification watcher, so `register_session` must create one.
-    pub(crate) fn is_recovered(&self) -> bool {
-        self._session.is_none()
-    }
-
-    /// Create a broker-backed `PtySessionHandle` for Hub restart recovery.
+    /// Create a minimal `PtySessionHandle` for Hub restart recovery.
     ///
     /// No real PTY process or `PtySession` is created — only a minimal shadow
     /// screen (correct dimensions, zero scrollback), broadcast channel, and
-    /// AtomicBools. All terminal state queries route through the broker RPC
-    /// Updated by the session reader thread on each output delivery.
+    /// AtomicBools. Terminal state is updated by the session reader thread on
+    /// each output delivery.
     ///
     /// # Arguments
     ///
@@ -183,7 +214,12 @@ impl PtySessionHandle {
     /// * `cols` - Terminal column count (read from session manifest on restart)
     /// * `hub_event_tx` - Hub event sender for message delivery tasks
     #[must_use]
-    pub(crate) fn new_minimal(rows: u16, cols: u16, hub_event_tx: HubEventSender) -> Self {
+    pub(crate) fn new_minimal(
+        rows: u16,
+        cols: u16,
+        hub_event_tx: HubEventSender,
+        color_cache: super::hub::SharedColorCache,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(64);
         let shared_state = Arc::new(Mutex::new(SharedPtyState {
             master_pty: None,
@@ -195,7 +231,8 @@ impl PtySessionHandle {
         // Recovery shadow screen: correct dimensions plus normal scrollback.
         // Session-backed recovery uses this parser as the hub's local
         // authority after the initial snapshot replay.
-        let listener = HubEventListener::new(event_tx.clone());
+        let listener = HubEventListener::with_color_cache(event_tx.clone(), color_cache);
+        let listener_clone = listener.clone();
         let shadow_screen = Arc::new(Mutex::new(AlacrittyParser::new_with_listener(
             rows,
             cols,
@@ -216,14 +253,33 @@ impl PtySessionHandle {
             hub_event_tx,
             last_output_at: Arc::new(AtomicU64::new(0)),
             session_connection: Arc::new(std::sync::OnceLock::new()),
+            shadow_listener: listener_clone,
         }
     }
 
     /// Store the session connection for per-session-process I/O.
+    ///
+    /// Also installs a [`SessionConnectionWriter`] into `SharedPtyState` so that
+    /// probe-based message delivery (`send_message`) can write through the
+    /// session socket rather than requiring a direct PTY master fd.
     pub fn set_session_connection(
         &self,
         conn: crate::session::connection::SharedSessionConnection,
     ) {
+        // Install a writer that routes through the session socket.
+        // This bridges the gap between SharedPtyState.writer (used by the
+        // message delivery task) and the per-session process architecture
+        // where the hub doesn't own the PTY fd directly.
+        {
+            let writer = SessionConnectionWriter {
+                conn: Arc::clone(&conn),
+            };
+            let mut state = self
+                .shared_state
+                .lock()
+                .expect("shared_state lock poisoned");
+            state.writer = Some(Box::new(writer));
+        }
         let _ = self.session_connection.set(conn);
     }
 
@@ -260,6 +316,7 @@ impl PtySessionHandle {
                 .unwrap_or_else(|_| Arc::new(std::sync::atomic::AtomicI64::new(0))),
             rows,
             cols,
+            self.shadow_listener.clone(),
         )
     }
 
@@ -268,8 +325,7 @@ impl PtySessionHandle {
     /// Returns `None` if the PTY session mutex is poisoned or the master FD
     /// has already been transferred (post-`exec` replacement).
     ///
-    /// Used by `hub.spawn_pty_with_broker()` to pass the FD to the broker
-    /// process via `SCM_RIGHTS`.
+    /// Available for low-level PTY integration and tests.
     #[cfg(unix)]
     #[must_use]
     pub fn get_master_fd(&self) -> Option<std::os::unix::io::RawFd> {
@@ -281,8 +337,7 @@ impl PtySessionHandle {
     /// Returns `None` if the PTY session mutex is poisoned or the child PID
     /// is not yet set (spawn not yet completed).
     ///
-    /// Used by `hub.spawn_pty_with_broker()` to pass the PID to the broker
-    /// so it can monitor the child process lifetime.
+    /// Available for low-level PTY integration and tests.
     #[must_use]
     pub fn get_child_pid(&self) -> Option<u32> {
         self._session.as_ref()?.lock().ok()?.get_child_pid()
@@ -293,9 +348,8 @@ impl PtySessionHandle {
     /// Reads from `SharedPtyState` so the value reflects the most recent
     /// `resize()` call. Falls back to `(24, 80)` if the mutex is poisoned.
     ///
-    /// Used by `hub.spawn_pty_with_broker()` to pass accurate terminal
-    /// dimensions to the broker at registration time instead of hard-coding
-    /// the VT100 defaults.
+    /// Used when constructing session-backed hub handles so recovery preserves
+    /// the actual terminal geometry instead of falling back to VT100 defaults.
     #[must_use]
     pub fn get_dims(&self) -> (u16, u16) {
         self.shared_state
@@ -448,7 +502,7 @@ impl LuaUserData for PtySessionHandle {
         // Processes `bytes` through the local alacritty parser. For recovered
         // sessions (zero-scrollback parser), this updates mode state but
         // retains no scrollback — get_snapshot()/get_screen() route through
-        // broker RPCs instead.
+        // the local shadow screen instead.
         //
         // Does NOT write bytes to the PTY process — use `write()` for input.
         methods.add_method("feed_output", |_, this, data: LuaString| {
@@ -501,6 +555,16 @@ impl LuaUserData for PtySessionHandle {
         // is_alive() will return false and write() will be a no-op.
         // No-op for recovered sessions (no child process).
         methods.add_method("kill", |_, this, ()| {
+            if let Some(conn) = this.session_connection.get() {
+                let mut guard = conn
+                    .lock()
+                    .map_err(|_| LuaError::runtime("session connection lock poisoned"))?;
+                if let Some(session) = guard.as_mut() {
+                    session.shutdown().map_err(|e| {
+                        LuaError::runtime(format!("Failed to shut down session process: {e}"))
+                    })?;
+                }
+            }
             if let Some(ref session_arc) = this._session {
                 let mut session = session_arc
                     .lock()
@@ -686,6 +750,13 @@ pub enum PtyRequest {
         session_uuid: String,
         /// Session name (e.g., "cli", "server").
         session_name: String,
+        /// Whether raw PTY output should be forwarded as `PtyOutputObserved`.
+        ///
+        /// Local PTY sessions need this because the watcher is the only source
+        /// of raw output events. Session-process-backed PTYs set this false and
+        /// let the session reader emit output observations directly, avoiding a
+        /// subscribe-after-start race and duplicate probe forwarding.
+        observe_output: bool,
         /// Event sender to subscribe to PTY events.
         event_tx: broadcast::Sender<PtyEvent>,
     },
@@ -718,11 +789,13 @@ impl Clone for PtyRequest {
                 watcher_key,
                 session_uuid,
                 session_name,
+                observe_output,
                 event_tx,
             } => Self::SpawnNotificationWatcher {
                 watcher_key: watcher_key.clone(),
                 session_uuid: session_uuid.clone(),
                 session_name: session_name.clone(),
+                observe_output: *observe_output,
                 event_tx: event_tx.clone(),
             },
             Self::CreateSocketForwarder(req) => Self::CreateSocketForwarder(req.clone()),
@@ -744,8 +817,9 @@ fn send_pty_event(tx: &HubEventSender, request: PtyRequest) {
 
 /// Spawn a PTY session handle from Lua options.
 ///
-/// This is the shared spawn implementation used by the broker-authoritative
-/// `hub.spawn_pty_with_broker()` primitive and by test-only `pty.spawn()`.
+/// This is the shared spawn implementation used by `hub.spawn_session()` and
+/// by test-only `pty.spawn()`.
+#[cfg(test)]
 pub(crate) fn spawn_session_handle_from_opts(
     opts: LuaTable,
     hub_event_tx: HubEventSender,
@@ -820,6 +894,7 @@ pub(crate) fn spawn_session_handle_from_opts(
                 watcher_key,
                 session_uuid: uuid.clone(),
                 session_name: sn.clone(),
+                observe_output: true,
                 event_tx: event_tx.clone(),
             },
         );
@@ -832,6 +907,7 @@ pub(crate) fn spawn_session_handle_from_opts(
         _session: Some(session_arc),
         shared_state,
         shadow_screen,
+        shadow_listener: HubEventListener::new(event_tx.clone()),
         event_tx,
         kitty_enabled,
         cursor_visible,
@@ -1091,7 +1167,10 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
 pub struct PtyOutputContext {
     /// Session UUID identifying the PTY producing output.
     pub session_uuid: String,
-    /// Browser peer receiving this output.
+    /// Logical source identifier for this output stream.
+    ///
+    /// Browser delivery uses a browser identity. Session-scoped output uses a
+    /// synthetic identifier like `session:<uuid>`.
     pub peer_id: String,
 }
 
@@ -1515,6 +1594,7 @@ mod tests {
             _session: Some(session_arc),
             shared_state,
             shadow_screen,
+            shadow_listener: HubEventListener::new(event_tx.clone()),
             event_tx,
             kitty_enabled,
             cursor_visible,
@@ -1931,11 +2011,13 @@ mod tests {
                 watcher_key,
                 session_uuid,
                 session_name,
+                observe_output,
                 ..
             }) => {
                 assert_eq!(watcher_key, "agent-1:cli");
                 assert_eq!(session_uuid, "agent-1");
                 assert_eq!(session_name, "cli");
+                assert!(observe_output);
             }
             other => panic!(
                 "Expected LuaPtyRequest SpawnNotificationWatcher, got {:?}",
@@ -2014,11 +2096,13 @@ mod tests {
                 watcher_key,
                 session_uuid,
                 session_name,
+                observe_output,
                 ..
             }) => {
                 assert_eq!(watcher_key, "agent-1:server");
                 assert_eq!(session_uuid, "agent-1");
                 assert_eq!(session_name, "server");
+                assert!(observe_output);
             }
             other => panic!("Expected SpawnNotificationWatcher, got {:?}", other),
         }

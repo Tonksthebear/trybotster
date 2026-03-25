@@ -115,11 +115,12 @@ pub enum PtyEvent {
     /// or `CSI < u` (pop, false) in the PTY output stream.
     KittyChanged(bool),
 
-    /// PTY enabled focus reporting via `CSI ? 1004 h`.
+    /// Focus reporting mode changed via `CSI ? 1004 h` (enable) or `l` (disable).
     ///
-    /// The TUI should respond with the current terminal focus state
-    /// (`CSI I` or `CSI O`) so the inner application knows immediately.
-    FocusRequested,
+    /// When enabled, clients should forward terminal focus-in (`\x1b[I`) and
+    /// focus-out (`\x1b[O`) events to the PTY. On first enable, the current
+    /// focus state should be sent immediately.
+    FocusReportingChanged(bool),
 
     /// Cursor visibility changed via DECTCEM (`CSI ? 25 h` / `CSI ? 25 l`).
     ///
@@ -178,10 +179,10 @@ impl PtyEvent {
         Self::KittyChanged(enabled)
     }
 
-    /// Create a focus reporting requested event.
+    /// Create a focus reporting mode change event.
     #[must_use]
-    pub fn focus_requested() -> Self {
-        Self::FocusRequested
+    pub fn focus_reporting_changed(enabled: bool) -> Self {
+        Self::FocusReportingChanged(enabled)
     }
 
     /// Create a cursor visibility changed event.
