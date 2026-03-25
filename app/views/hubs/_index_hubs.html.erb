@@ -22,12 +22,6 @@
         </div>
       </div>
       <div class="flex items-center gap-4 text-[11px] text-zinc-600">
-        <% if hub.device %>
-          <span class="flex items-center gap-1">
-            <%= icon "device-phone-mobile", class: "size-3" %>
-            <%= hub.device.name %>
-          </span>
-        <% end %>
         <% if hub.last_seen_at %>
           <span class="flex items-center gap-1 ml-auto">
             <%= icon "clock", class: "size-3" %>

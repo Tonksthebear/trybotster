@@ -25,7 +25,7 @@ class ApplicationController < ActionController::Base
   end
 
   def set_sidebar_hubs
-    @sidebar_hubs = current_user.hubs.includes(:device).order(last_seen_at: :desc)
+    @sidebar_hubs = current_user.hubs.order(last_seen_at: :desc)
   end
 
   def set_current_attributes

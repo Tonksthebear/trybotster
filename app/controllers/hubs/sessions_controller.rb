@@ -14,7 +14,6 @@ module Hubs
 
     # GET /hubs/:hub_id/sessions/:session_uuid
     def show
-      @browser_device = current_user.devices.browser_devices.order(last_seen_at: :desc).first
     end
 
     private

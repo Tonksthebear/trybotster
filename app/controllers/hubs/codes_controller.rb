@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module Hubs
-  # Handles device authorization flow (RFC 8628).
+  # Handles hub authorization flow (RFC 8628).
   # CLI requests device code, polls for approval, receives token.
   class CodesController < ApplicationController
     skip_before_action :verify_authenticity_token
@@ -9,7 +9,7 @@ module Hubs
     # POST /hubs/codes
     # CLI requests a new device code to start auth flow
     def create
-      auth = DeviceAuthorization.create!(
+      auth = HubAuthorization.create!(
         device_name: params[:device_name],
         fingerprint: params[:fingerprint]
       )
@@ -26,7 +26,7 @@ module Hubs
     # GET /hubs/codes/:id
     # CLI polls for authorization status
     def show
-      auth = DeviceAuthorization.find_by(device_code: params[:id])
+      auth = HubAuthorization.find_by(device_code: params[:id])
 
       if auth.nil?
         render json: { error: "invalid_grant" }, status: :bad_request
@@ -43,9 +43,9 @@ module Hubs
       when "pending"
         render json: { error: "authorization_pending" }, status: :accepted
       when "approved"
-        tokens = create_device_tokens(auth)
+        tokens = create_hub_tokens(auth)
         render json: {
-          access_token: tokens[:device_token].token,
+          access_token: tokens[:hub_token].token,
           mcp_token: tokens[:mcp_token].token,
           token_type: "bearer"
         }
@@ -58,16 +58,22 @@ module Hubs
 
     private
 
-    def create_device_tokens(auth)
+    def create_hub_tokens(auth)
       fingerprint = auth.fingerprint.presence || SecureRandom.hex(8).scan(/../).join(":")
-      device = auth.user.devices.find_or_initialize_by(fingerprint: fingerprint)
-      device.update!(name: auth.device_name, device_type: "cli")
 
-      # Create tokens if the device doesn't already have them
-      device_token = device.device_token || device.create_device_token!(name: auth.device_name)
-      mcp_token = device.mcp_token || device.create_mcp_token!(name: "#{auth.device_name} MCP")
+      # Find or create hub by fingerprint
+      hub = auth.user.hubs.find_or_initialize_by(fingerprint: fingerprint)
+      hub.update!(
+        name: auth.device_name,
+        identifier: hub.identifier.presence || SecureRandom.hex(16),
+        last_seen_at: Time.current,
+        alive: false
+      )
 
-      { device_token: device_token, mcp_token: mcp_token }
+      hub_token = hub.hub_token || hub.create_hub_token!
+      mcp_token = hub.mcp_token || hub.create_mcp_token!(name: "#{auth.device_name} MCP")
+
+      { hub_token: hub_token, mcp_token: mcp_token }
     end
   end
 end

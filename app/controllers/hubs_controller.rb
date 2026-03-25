@@ -11,7 +11,7 @@ class HubsController < ApplicationController
   # GET /hubs
   # Dashboard showing list of hubs with health status
   def index
-    @hubs = current_user.hubs.includes(:device).order(last_seen_at: :desc)
+    @hubs = current_user.hubs.order(last_seen_at: :desc)
   end
 
   # GET /hubs/:id
@@ -29,12 +29,9 @@ class HubsController < ApplicationController
 
     respond_to do |format|
       format.html do
-        @browser_device = current_user.devices.browser_devices.order(last_seen_at: :desc).first
         @recommended_template = read_template("agents/claude.sh")
       end
       format.json do
-        # Return hub status for browser-side error handling
-        # Used by hub_connection_controller.js to show appropriate error messages
         render json: {
           id: Current.hub.id,
           identifier: Current.hub.identifier,
@@ -61,14 +58,7 @@ class HubsController < ApplicationController
       hub.name = params[:repo]
     end
 
-    if params[:device_id].present?
-      device = current_hub_user.devices.find_by(id: params[:device_id])
-      hub.device = device if device
-    elsif hub.device.nil?
-      # Auto-associate: if user has exactly one CLI device, link it
-      cli_devices = current_hub_user.devices.where(device_type: "cli")
-      hub.device = cli_devices.first if cli_devices.one?
-    end
+    hub.fingerprint = params[:fingerprint] if params[:fingerprint].present?
 
     if hub.save
       status = is_new ? :created : :ok
@@ -88,14 +78,7 @@ class HubsController < ApplicationController
 
     Current.hub.last_seen_at = Time.current
     Current.hub.alive = params.key?(:alive) ? ActiveModel::Type::Boolean.new.cast(params[:alive]) : true
-
-    if params[:device_id].present?
-      device = current_hub_user.devices.find_by(id: params[:device_id])
-      Current.hub.device = device if device
-    elsif Current.hub.device.nil?
-      cli_devices = current_hub_user.devices.where(device_type: "cli")
-      Current.hub.device = cli_devices.first if cli_devices.one?
-    end
+    Current.hub.fingerprint = params[:fingerprint] if params[:fingerprint].present?
 
     if Current.hub.save
       render json: { success: true, hub_id: Current.hub.id, e2e_enabled: Current.hub.e2e_enabled? }

@@ -21,7 +21,7 @@
       <div class="flex items-center justify-between gap-2">
         <%# Hub/Agent label %>
         <span class="text-sm font-mono text-zinc-300 truncate min-w-0">
-          <%= Current.hub.device&.name || Current.hub.identifier.truncate(16) %>
+          <%= Current.hub.name %>
         </span>
 
         <%# Connection status %>
@@ -37,7 +37,7 @@
         <div class="flex items-center gap-4 min-w-0">
           <div class="min-w-0">
             <h1 class="text-lg font-bold text-zinc-100 font-mono truncate">
-              <%= Current.hub.device&.name || Current.hub.identifier.truncate(24) %>
+              <%= Current.hub.name %>
             </h1>
             <p class="text-xs text-zinc-500 truncate">
               <%= Current.hub.identifier %>
