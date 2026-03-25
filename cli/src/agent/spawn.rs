@@ -19,6 +19,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::io::Read;
 use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -28,10 +29,14 @@ use std::thread;
 
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
+#[cfg(test)]
 use tokio::sync::broadcast;
 
+#[cfg(test)]
 use super::notification::detect_notifications;
+#[cfg(test)]
 use super::pty::{HubEventListener, PtyEvent};
+#[cfg(test)]
 use crate::terminal::AlacrittyParser;
 
 /// Configuration for spawning a process in a PtySession.
@@ -134,10 +139,9 @@ pub fn build_command(
 /// Process a single chunk of raw PTY output bytes.
 ///
 /// Single source of truth for per-chunk PTY byte processing.
-/// Both the reader thread ([`spawn_reader_thread`]) and the broker output
-/// path ([`crate::hub::agent_handle::PtyHandle::feed_broker_output`]) call
-/// this function, guaranteeing identical behavior regardless of which path
-/// delivers bytes to the Hub.
+/// Both the reader thread ([`spawn_reader_thread`]) and the session-process
+/// output path call this function, guaranteeing identical behavior regardless
+/// of which path delivers bytes to the Hub.
 ///
 /// # What this does per chunk
 ///
@@ -162,11 +166,9 @@ pub fn build_command(
 ///
 /// # Note: Focus reporting
 ///
-/// CSI ? 1004 h (focus reporting enable) is intentionally **not** handled here.
-/// Responding to every occurrence fires [`PtyEvent::FocusRequested`] → TUI writes
-/// `\x1b[I` → app redraws → re-emits `\x1b[?1004h` → infinite loop. Focus event
-/// delivery requires "arm once" state tracking (fire on first enable, suppress until
-/// `\x1b[?1004l` disables it) which is not yet implemented.
+/// CSI ? 1004 h (focus reporting) is handled by alacritty's `FOCUS_IN_OUT` mode
+/// flag, not by byte scanning here. The session reader detects mode changes after
+/// `process()` and broadcasts [`PtyEvent::FocusReportingChanged`].
 ///
 /// # Arguments
 ///
@@ -180,6 +182,7 @@ pub fn build_command(
 ///   Caller must preserve this across calls (local var in reader thread,
 ///   `Arc<Mutex<Option<bool>>>` field in [`crate::hub::agent_handle::PtyHandle`]).
 /// * `label` - Log label for this session (e.g., `"CLI"`, `"Server"`, `"Broker"`).
+#[cfg(test)]
 pub(crate) fn process_pty_bytes(
     data: &[u8],
     shadow_screen: &Arc<Mutex<AlacrittyParser<HubEventListener>>>,
@@ -250,8 +253,7 @@ pub(crate) fn process_pty_bytes(
 ///
 /// Used exclusively in unit tests to exercise [`process_pty_bytes`] via a
 /// live pipe reader. Production agents route output through session processes and
-/// call [`process_pty_bytes`] directly via
-/// [`PtyHandle::feed_broker_output`](crate::hub::agent_handle::PtyHandle::feed_broker_output).
+/// call [`process_pty_bytes`] from the session reader thread.
 ///
 /// # Arguments
 ///

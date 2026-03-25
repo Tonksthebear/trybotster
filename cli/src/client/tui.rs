@@ -55,16 +55,6 @@ pub enum TuiRequest {
         /// Whether the session is now focused.
         focused: bool,
     },
-
-    /// Terminal probe response — outer terminal replied to an OSC query.
-    ///
-    /// Routed back to the PTY(s) that sent the query via
-    /// `TerminalProfileStore::route_probe_response`, and cached in the
-    /// hub profile for future headless sessions.
-    TerminalProbeResponse {
-        /// Raw OSC response bytes from the outer terminal.
-        data: Vec<u8>,
-    },
 }
 
 /// Output messages sent from Hub to TuiRunner.
@@ -143,17 +133,6 @@ pub enum TuiOutput {
     /// Plugin-level binary messaging — not PTY output. Carries no session UUID
     /// because it isn't routed to a terminal panel.
     Binary(Vec<u8>),
-
-    /// Raw bytes to write directly to the outer terminal (stdout).
-    ///
-    /// Bypasses the panel's alacritty parser entirely. Used for OSC probes
-    /// (e.g., `ESC]10;?BEL`) that the outer terminal must see and respond to.
-    /// The terminal's responses arrive via stdin and flow back to the Hub
-    /// through the normal `TuiRequest::PtyInput` path.
-    TerminalQuery {
-        /// Raw escape sequence bytes to write to stdout.
-        data: Vec<u8>,
-    },
 }
 
 #[cfg(test)]
@@ -179,16 +158,12 @@ mod tests {
         };
         let message = TuiOutput::Message(serde_json::json!({"type": "agent_created"}));
         let binary = TuiOutput::Binary(vec![0xFF, 0xFE]);
-        let terminal_query = TuiOutput::TerminalQuery {
-            data: b"\x1b]10;?\x07".to_vec(),
-        };
 
         assert!(format!("{:?}", scrollback).contains("Scrollback"));
         assert!(format!("{:?}", output).contains("Output"));
         assert!(format!("{:?}", exited).contains("ProcessExited"));
         assert!(format!("{:?}", message).contains("Message"));
         assert!(format!("{:?}", binary).contains("Binary"));
-        assert!(format!("{:?}", terminal_query).contains("TerminalQuery"));
     }
 
     #[test]

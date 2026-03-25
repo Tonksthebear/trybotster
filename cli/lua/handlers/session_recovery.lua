@@ -48,6 +48,20 @@ local function recover_session(record, socket_info, recovered, seen_keys)
     if not ok or not handle then
         log.warn(string.format("[session_recovery] connect failed for %s: %s",
             session_uuid, tostring(handle)))
+        if socket_info and socket_info.socket_path then
+            local deleted, del_err = fs.delete(socket_info.socket_path)
+            if deleted then
+                log.info(string.format(
+                    "[session_recovery] Removed stale session socket %s",
+                    tostring(socket_info.socket_path)
+                ))
+            elseif del_err then
+                log.debug(string.format(
+                    "[session_recovery] Failed to remove stale socket %s: %s",
+                    tostring(socket_info.socket_path), tostring(del_err)
+                ))
+            end
+        end
         return
     end
 
@@ -161,7 +175,7 @@ _event_sub = events.on("sessions_discovered", function(data)
                     if sess_entries then
                         for _, session_uuid in ipairs(sess_entries) do
                             local manifest = ws.read_session(data_dir, workspace_id, session_uuid)
-                            if manifest then
+                            if manifest and manifest.status ~= "closed" then
                                 manifest_by_uuid[session_uuid] = {
                                     workspace_id = workspace_id,
                                     session_uuid = session_uuid,

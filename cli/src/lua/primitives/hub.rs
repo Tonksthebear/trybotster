@@ -21,7 +21,7 @@
 //! -- Register session PTY handle
 //! local index = hub.register_session("sess-abc123", handle, {
 //!   label = "owner-repo-42",
-//!   broker_session_id = 123,
+//!   session_name = "agent",
 //! })
 //!
 //! -- Get server-assigned hub ID
@@ -57,19 +57,15 @@ pub enum HubRequest {
     Quit,
     /// Request update-and-restart (exec into new binary).
     ExecRestart,
-    /// Request a graceful restart: broker keeps PTYs alive for the reconnect
-    /// window so agents survive the Hub restarting.
-    ///
-    /// Unlike [`HubRequest::Quit`] (which sends `kill_all` to the broker),
-    /// this calls `disconnect_graceful()`, giving the user 120 s to rerun
-    /// `botster` before the broker times out and kills PTYs itself.
+    /// Request a graceful restart so the hub exits without treating live
+    /// sessions as a normal close.
     GracefulRestart,
     /// Rebuild the CLI binary in the background, then exec-restart into it.
     ///
     /// Runs `cargo build` against the manifest embedded at compile time
     /// ([`env!("CARGO_MANIFEST_DIR")`]). On success the Hub exec-replaces
-    /// itself with the freshly built binary; the broker preserves PTY FDs
-    /// across the restart so agents survive.
+    /// itself with the freshly built binary; session processes survive and
+    /// reconnect on startup.
     ///
     /// On build failure the Hub logs an error and keeps running — no agents
     /// are disrupted.  Intended for development iteration only.
@@ -109,7 +105,6 @@ pub type SharedServerId = Arc<Mutex<Option<String>>>;
 /// - `hub.get_worktrees()` - Get available worktrees
 /// - `hub.register_session(uuid, handle, metadata)` - Register session PTY handle
 /// - `hub.unregister_session(uuid)` - Unregister session PTY handle
-/// - `hub.spawn_pty_with_broker(spawn_opts, session_uuid)` - Spawn and broker-register PTY
 /// - `hub.hub_id()` - Get local hub identifier (stable hash, matches hub_discovery IDs)
 /// - `hub.server_id()` - Get server-assigned hub ID
 /// - `hub.detect_repo()` - Detect current repo name
@@ -130,6 +125,9 @@ pub type SharedServerId = Arc<Mutex<Option<String>>>;
 /// # Errors
 ///
 /// Returns an error if Lua table or function creation fails.
+/// Shared color cache type for boot-probed terminal colors.
+pub type SharedColorCache = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, alacritty_terminal::vte::ansi::Rgb>>>;
+
 pub(crate) fn register(
     lua: &Lua,
     hub_event_tx: HubEventSender,
@@ -137,6 +135,7 @@ pub(crate) fn register(
     hub_identifier: String,
     server_id: SharedServerId,
     _shared_state: Arc<RwLock<HubState>>,
+    color_cache: SharedColorCache,
 ) -> Result<()> {
     // Get or create the hub table
     let hub: LuaTable = lua
@@ -182,7 +181,7 @@ pub(crate) fn register(
     //     session_type = "agent"|"accessory",
     //     label = "owner-repo-42",
     //     workspace_id = nil,
-    //     broker_session_id = 123, -- required for all runtime sessions
+    //     session_name = "agent",
     //   }
     let cache2 = Arc::clone(&handle_cache);
     let register_event_tx = Arc::clone(&hub_event_tx);
@@ -192,14 +191,13 @@ pub(crate) fn register(
                 use crate::hub::agent_handle::{PtyHandle, SessionHandle, SessionType};
                 use crate::lua::primitives::pty::PtySessionHandle;
 
-                // Grab event_tx + recovered flag + session_connection before consuming handle
-                let (event_tx_clone, is_recovered, has_session_conn) = {
+                // Grab event_tx + session_connection before consuming handle
+                let (event_tx_clone, has_session_conn) = {
                     let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
                         LuaError::runtime(format!("register_session: not a PtySessionHandle: {e}"))
                     })?;
                     (
                         handle.event_tx(),
-                        handle.is_recovered(),
                         handle.get_session_connection().is_some(),
                     )
                 };
@@ -218,7 +216,7 @@ pub(crate) fn register(
                         handle.to_pty_handle_with_session(conn)
                     } else {
                         return Err(LuaError::runtime(
-                            "register_session: session_connection required (broker path removed)",
+                            "register_session: session_connection required",
                         ));
                     }
                 };
@@ -234,6 +232,9 @@ pub(crate) fn register(
                     "accessory" => SessionType::Accessory,
                     _ => SessionType::Agent,
                 };
+                let session_name: String = metadata
+                    .get("session_name")
+                    .unwrap_or_else(|_| session_type_str.clone());
 
                 let workspace_id: Option<String> = metadata.get("workspace_id").ok();
 
@@ -267,9 +268,13 @@ pub(crate) fn register(
                             let pty = sh.pty();
                             if let Ok(mut guard) = conn.lock() {
                                 if let Some(ref mut session_conn) = *guard {
+                                    let listener = pty.shadow_listener().unwrap_or_else(|| {
+                                        crate::agent::pty::HubEventListener::new(pty.event_tx_clone())
+                                    });
                                     if let Err(e) = session_conn.install_reader(
                                         session_uuid.clone(),
                                         pty.shadow_screen(),
+                                        listener,
                                         pty.event_tx_clone(),
                                         pty.kitty_enabled_arc(),
                                         pty.cursor_visible_arc(),
@@ -317,13 +322,10 @@ pub(crate) fn register(
                     }
                 }
 
-                // Recovered broker sessions skip the spawn path which normally creates a
-                // notification watcher. Spawn one now so title/CWD/bell events
-                // from the broker reach Lua hooks.
-                if is_recovered && !has_session_conn {
-                    let session_name: String = metadata
-                        .get("session_name")
-                        .unwrap_or_else(|_| session_type_str.clone());
+                // Session-process handles do not create their watcher on the Lua
+                // spawn/connect side. Register it here so PTY output and OSC events
+                // reach Lua hooks for both fresh spawns and recovered sessions.
+                if has_session_conn {
                     let watcher_key = format!("{}:{}", session_uuid, session_name);
                     let guard = register_event_tx.lock().expect("HubEventSender mutex poisoned");
                     if let Some(ref sender) = *guard {
@@ -332,6 +334,7 @@ pub(crate) fn register(
                                 watcher_key,
                                 session_uuid: session_uuid.clone(),
                                 session_name,
+                                observe_output: false,
                                 event_tx: event_tx_clone,
                             },
                         ));
@@ -349,7 +352,7 @@ pub(crate) fn register(
     // hub.unregister_session(session_uuid) - Unregister session PTY handle
     //
     // Called by Lua when a session is closed to remove it from HandleCache.
-    // Also fires SessionUnregistered so the Hub can clean up broker_sessions entries.
+    // Also fires SessionUnregistered so the Hub can clean up session state.
     let cache3 = Arc::clone(&handle_cache);
     let tx_unreg = hub_event_tx.clone();
     let unregister_session_fn = lua
@@ -588,7 +591,6 @@ pub(crate) fn register(
     //
     // Spawns a per-session process that creates its own PTY and binds a Unix
     // socket. The hub connects to the socket and installs a reader thread.
-    // No broker, no FD transfer, no multiplexing.
     //
     // The session process is a separate OS process (`botster session`) that
     // survives hub restarts. Recovery reconnects via socket directory scan.
@@ -610,10 +612,10 @@ pub(crate) fn register(
     #[cfg(unix)]
     {
         let tx_spawn = hub_event_tx.clone();
+        let cc_spawn = color_cache.clone();
         let spawn_session_fn = lua
             .create_function(move |_lua_ctx, (opts, session_uuid): (LuaTable, String)| {
                 use crate::session::connection::SessionConnection;
-                use crate::session::protocol;
                 use crate::session::SpawnConfig;
 
                 // Parse opts
@@ -623,8 +625,6 @@ pub(crate) fn register(
                 let command: String = opts.get("command").unwrap_or_else(|_| "bash".to_string());
                 let rows: u16 = opts.get("rows").unwrap_or(24);
                 let cols: u16 = opts.get("cols").unwrap_or(80);
-                let detect_notifications: bool = opts.get("detect_notifications").unwrap_or(false);
-                let port: Option<u16> = opts.get("port").ok();
                 let tee_path: Option<String> = opts.get("tee_path").ok();
                 let tee_cap: u64 = opts.get("tee_cap").unwrap_or(10 * 1024 * 1024);
 
@@ -739,7 +739,7 @@ pub(crate) fn register(
                 // installs the reader thread.
                 use crate::lua::primitives::pty::PtySessionHandle;
                 let handle =
-                    PtySessionHandle::new_minimal(rows, cols, std::sync::Arc::clone(&tx_spawn));
+                    PtySessionHandle::new_minimal(rows, cols, std::sync::Arc::clone(&tx_spawn), std::sync::Arc::clone(&cc_spawn));
 
                 // Store the session connection on the handle so register_session
                 // can retrieve it later.
@@ -766,6 +766,7 @@ pub(crate) fn register(
     // the reader thread and creates the PtyHandle.
     {
         let tx_connect = hub_event_tx.clone();
+        let cc_connect = color_cache.clone();
         let connect_session_fn = lua
             .create_function(move |_, (session_uuid, socket_path): (String, String)| {
                 use crate::session::connection::SessionConnection;
@@ -786,7 +787,7 @@ pub(crate) fn register(
 
                 use crate::lua::primitives::pty::PtySessionHandle;
                 let handle =
-                    PtySessionHandle::new_minimal(rows, cols, std::sync::Arc::clone(&tx_connect));
+                    PtySessionHandle::new_minimal(rows, cols, std::sync::Arc::clone(&tx_connect), std::sync::Arc::clone(&cc_connect));
                 handle.set_session_connection(shared_conn);
 
                 ::log::info!(
@@ -804,11 +805,10 @@ pub(crate) fn register(
 
     // hub.pty_tee(session_id, log_path, cap_bytes) → true | nil
     //
-    // Arms a file tee on an existing broker session.  After this call the
-    // broker writes a copy of every PTY output byte to `log_path`.  The tee
-    // survives Hub reconnects without needing to be re-armed.
+    // Session processes now own PTY teeing via spawn config. This primitive is
+    // retained as a no-op compatibility stub.
     //
-    // Path validation (Hub-side, before sending to broker):
+    // Path validation (Hub-side):
     //   - Must contain "workspaces/" path component
     //   - Must contain "sessions/" path component
     //   These two constraints ensure the path stays within the workspace
@@ -849,13 +849,8 @@ pub(crate) fn register(
     hub.set("quit", quit_fn)
         .map_err(|e| anyhow!("Failed to set hub.quit: {e}"))?;
 
-    // hub.graceful_restart() - Request Hub shutdown with broker keeping PTYs
-    // alive so agents survive the restart.
-    //
-    // The broker will wait up to its configured timeout (120 s by default)
-    // for the Hub to reconnect.  If it does not, the broker kills PTYs and
-    // exits on its own.  Use this from the TUI / browser "Restart" action
-    // instead of hub.quit() when you intend to immediately relaunch botster.
+    // hub.graceful_restart() - Request Hub shutdown while leaving session
+    // processes alive for a later reconnect.
     let tx = hub_event_tx.clone();
     let graceful_restart_fn = lua
         .create_function(move |_, ()| {
@@ -874,14 +869,13 @@ pub(crate) fn register(
     hub.set("graceful_restart", graceful_restart_fn)
         .map_err(|e| anyhow!("Failed to set hub.graceful_restart: {e}"))?;
 
-    // hub.exec_restart() - Exec-restart the Hub process: broker keeps PTYs alive
-    // across the exec() so agents survive.
+    // hub.exec_restart() - Exec-restart the Hub process. Session processes stay
+    // alive across the restart so agents survive.
     //
     // The Hub process replaces itself (execv) with a fresh instance of the same
-    // binary using the same arguments.  This is the correct primitive for the
-    // TUI "restart_hub" action: the broker stays alive during the reconnect
-    // window, the new Hub recovers agents on startup, and the user sees
-    // their agents restored without manual intervention.
+    // binary using the same arguments. This is the correct primitive for the
+    // TUI "restart_hub" action: session processes stay alive, the new Hub
+    // recovers them on startup, and the user sees agents restored.
     //
     // Contrast with hub.graceful_restart(), which quits the Hub cleanly but
     // does NOT re-exec — the user must manually relaunch botster.
@@ -905,7 +899,7 @@ pub(crate) fn register(
     //
     // Runs `cargo build` in a background task using the manifest dir embedded
     // at compile time. On success, fires ExecRestart so the Hub exec-replaces
-    // itself with the fresh binary while the broker preserves PTY FDs.
+    // itself with the fresh binary while session processes stay alive.
     //
     // On build failure the Hub logs the error and keeps running — no agents
     // are disrupted. This is a development-time convenience primitive; it is
@@ -938,6 +932,7 @@ pub(crate) fn register(
 mod tests {
     use super::super::new_hub_event_sender;
     use super::*;
+    use crate::lua::primitives::pty::{PtyRequest, PtySessionHandle};
 
     fn create_test_deps() -> (
         HubEventSender,
@@ -945,6 +940,7 @@ mod tests {
         String,
         SharedServerId,
         Arc<RwLock<HubState>>,
+        SharedColorCache,
     ) {
         let state = Arc::new(RwLock::new(HubState::new(std::path::PathBuf::from(
             "/tmp/test-worktrees",
@@ -955,15 +951,16 @@ mod tests {
             "test-local-hub-id".to_string(),
             Arc::new(Mutex::new(Some("test-hub-id".to_string()))),
             state,
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         )
     }
 
     #[test]
     fn test_register_creates_hub_table() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register hub primitives");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register hub primitives");
 
         let hub: LuaTable = lua.globals().get("hub").expect("hub table should exist");
         assert!(hub.contains_key("get_worktrees").unwrap());
@@ -981,16 +978,72 @@ mod tests {
         assert!(hub.contains_key("pty_tee").unwrap());
     }
 
-    // Broker-specific register_session tests removed — broker module deleted.
+    #[test]
+    fn test_register_session_spawns_notification_watcher_for_session_handles() {
+        let lua = Lua::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx: HubEventSender = Arc::new(Mutex::new(Some(event_tx.into())));
+        let cache = Arc::new(HandleCache::new());
+        let hid = "test-local-hub-id".to_string();
+        let sid = Arc::new(Mutex::new(Some("test-hub-id".to_string())));
+        let state = Arc::new(RwLock::new(HubState::new(std::path::PathBuf::from(
+            "/tmp/test-worktrees",
+        ))));
+
+        let cc = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        register(&lua, tx.clone(), cache, hid, sid, state, cc.clone()).expect("Should register");
+
+        let handle = PtySessionHandle::new_minimal(24, 80, tx, cc);
+        handle.set_session_connection(Arc::new(Mutex::new(None)));
+        let handle_ud = lua
+            .create_userdata(handle)
+            .expect("should create session userdata");
+        lua.globals()
+            .set("handle", handle_ud)
+            .expect("should set handle");
+
+        let index: usize = lua
+            .load(
+                r#"
+                return hub.register_session("sess-1", handle, {
+                    session_type = "agent",
+                    session_name = "codex",
+                    label = "",
+                })
+                "#,
+            )
+            .eval()
+            .expect("register_session should succeed");
+        assert_eq!(index, 0);
+
+        let event = event_rx.try_recv().expect("Should send watcher event");
+        match event {
+            HubEvent::LuaPtyRequest(PtyRequest::SpawnNotificationWatcher {
+                watcher_key,
+                session_uuid,
+                session_name,
+                observe_output,
+                ..
+            }) => {
+                assert_eq!(watcher_key, "sess-1:codex");
+                assert_eq!(session_uuid, "sess-1");
+                assert_eq!(session_name, "codex");
+                assert!(!observe_output);
+            }
+            other => panic!("Expected SpawnNotificationWatcher, got {:?}", other),
+        }
+    }
+
+    // Legacy register_session tests removed during the session-process migration.
     // Registration now requires a session_connection.
 
     /// `hub.pty_tee` is now a no-op stub (returns nil always).
     #[test]
     fn test_pty_tee_rejects_unsafe_path() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         // Path lacks required "workspaces" component.
         let result: LuaValue = lua
@@ -1004,9 +1057,9 @@ mod tests {
     #[test]
     fn test_pty_tee_rejects_path_without_sessions() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         // Path has "workspaces" component but not "sessions".
         let result: LuaValue = lua
@@ -1024,9 +1077,9 @@ mod tests {
     #[test]
     fn test_pty_tee_rejects_workspaces_as_substring() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         // "evil-workspaces" satisfies a naive contains("workspaces/") check but is
         // not the exact "workspaces" path component — must be rejected.
@@ -1044,9 +1097,9 @@ mod tests {
     #[test]
     fn test_pty_tee_rejects_path_traversal() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         let result: LuaValue = lua
             .load(r#"return hub.pty_tee(1, "/data/workspaces/agent/../../../etc/sessions/0/pty-0.log", 0)"#)
@@ -1059,9 +1112,9 @@ mod tests {
     #[test]
     fn test_pty_tee_rejects_relative_path() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         let result: LuaValue = lua
             .load(r#"return hub.pty_tee(1, "workspaces/agent/sessions/0/pty-0.log", 0)"#)
@@ -1074,9 +1127,9 @@ mod tests {
     #[test]
     fn test_pty_tee_returns_nil_stub() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         let result: LuaValue = lua
             .load(r#"return hub.pty_tee(1, "/data/workspaces/key/sessions/0/pty-0.log", 0)"#)
@@ -1088,9 +1141,9 @@ mod tests {
     #[test]
     fn test_get_worktrees_returns_empty_array() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         let worktrees: LuaTable = lua.load("return hub.get_worktrees()").eval().unwrap();
         assert_eq!(worktrees.len().unwrap(), 0);
@@ -1100,9 +1153,9 @@ mod tests {
     #[test]
     fn test_get_worktrees_empty_returns_table() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         let worktrees: LuaTable = lua.load("return hub.get_worktrees()").eval().unwrap();
         assert_eq!(
@@ -1115,12 +1168,12 @@ mod tests {
     #[test]
     fn test_quit_sends_event() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
         *tx.lock().unwrap() = Some(sender.into());
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         lua.load("hub.quit()")
             .exec()
@@ -1135,12 +1188,12 @@ mod tests {
     #[test]
     fn test_graceful_restart_sends_event() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
         *tx.lock().unwrap() = Some(sender.into());
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         lua.load("hub.graceful_restart()")
             .exec()
@@ -1153,17 +1206,16 @@ mod tests {
     }
 
     /// `hub.exec_restart()` sends `HubRequest::ExecRestart`, which causes the
-    /// Hub to re-exec itself after gracefully disconnecting the broker so agents
-    /// survive the restart.
+    /// Hub to re-exec itself while live session processes survive the restart.
     #[test]
     fn test_exec_restart_sends_event() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
         *tx.lock().unwrap() = Some(sender.into());
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         lua.load("hub.exec_restart()")
             .exec()
@@ -1178,12 +1230,12 @@ mod tests {
     #[test]
     fn test_dev_rebuild_sends_event() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
         *tx.lock().unwrap() = Some(sender.into());
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         lua.load("hub.dev_rebuild()")
             .exec()
@@ -1198,9 +1250,9 @@ mod tests {
     #[test]
     fn test_server_id_returns_value() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         let id: String = lua.load("return hub.server_id()").eval().unwrap();
         assert_eq!(id, "test-hub-id");
@@ -1209,10 +1261,10 @@ mod tests {
     #[test]
     fn test_server_id_returns_nil_when_unset() {
         let lua = Lua::new();
-        let (tx, cache, hid, _sid, state) = create_test_deps();
+        let (tx, cache, hid, _sid, state, cc) = create_test_deps();
         let nil_sid: SharedServerId = Arc::new(Mutex::new(None));
 
-        register(&lua, tx, cache, hid, nil_sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, nil_sid, state, cc).expect("Should register");
 
         let id: LuaValue = lua.load("return hub.server_id()").eval().unwrap();
         assert!(id.is_nil());
@@ -1221,12 +1273,12 @@ mod tests {
     #[test]
     fn test_handle_webrtc_offer_sends_event() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
         *tx.lock().unwrap() = Some(sender.into());
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         lua.load(r#"hub.handle_webrtc_offer("browser-123", "v=0 test-sdp")"#)
             .exec()
@@ -1247,12 +1299,12 @@ mod tests {
     #[test]
     fn test_handle_ice_candidate_sends_event() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
         let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
         *tx.lock().unwrap() = Some(sender.into());
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         lua.load(
             r#"hub.handle_ice_candidate("browser-456", {candidate = "candidate:...", sdpMid = "0"})"#,
@@ -1282,12 +1334,12 @@ mod tests {
     #[test]
     fn test_get_worktrees_null_field_is_nil_not_userdata() {
         let lua = Lua::new();
-        let (tx, cache, hid, sid, state) = create_test_deps();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
         // Inject a worktree so get_worktrees returns data
         cache.set_worktrees(vec![("/tmp/wt".to_string(), "main".to_string())]);
 
-        register(&lua, tx, cache, hid, sid, state).expect("Should register");
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         // get_worktrees returns array of {path, branch} - both strings, no nulls.
         // But the conversion path must use json_to_lua for safety.

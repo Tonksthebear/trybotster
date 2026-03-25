@@ -742,7 +742,7 @@ end
 --- Scan the workspaces directory for session metadata usable during restart.
 --
 -- Unlike scan_active_sessions(), this intentionally does NOT decide liveness.
--- Liveness authority is the broker inventory; manifests are metadata-only.
+-- Live session sockets are the liveness authority; manifests are metadata-only.
 --
 -- Returns all session manifests except those explicitly closed.
 -- Each record has fields:
@@ -846,22 +846,6 @@ function M.migrate(data_dir)
             metadata   = ws_metadata,
         }
 
-        -- Lift flat broker_session_N / broker_pty_rows_N keys into structured tables
-        local broker_sessions = {}
-        local pty_dimensions  = {}
-        local idx = 0
-        while true do
-            local sid = meta["broker_session_" .. idx]
-            if not sid then break end
-            broker_sessions[tostring(idx)] = tonumber(sid)
-            local rows = tonumber(meta["broker_pty_rows_" .. idx])
-            local cols = tonumber(meta["broker_pty_cols_" .. idx])
-            if rows and cols then
-                pty_dimensions[tostring(idx)] = { rows = rows, cols = cols }
-            end
-            idx = idx + 1
-        end
-
         local session_manifest = {
             uuid          = session_uuid,
             workspace_id  = workspace_id,
@@ -873,8 +857,6 @@ function M.migrate(data_dir)
             agent_name    = ctx.agent_name or ctx.profile_name,
             profile_name  = ctx.agent_name or ctx.profile_name,  -- backward compat
             status        = "active",
-            broker_sessions = broker_sessions,
-            pty_dimensions  = pty_dimensions,
             created_at    = ctx.created_at or now,
             updated_at    = now,
         }

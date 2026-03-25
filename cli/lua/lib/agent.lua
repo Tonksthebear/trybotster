@@ -2,7 +2,7 @@
 --
 -- Inherits from Session (lib/session.lua) which owns:
 -- - Session UUID generation, PTY lifecycle, manifest sync
--- - Metadata store, environment building, broker integration
+-- - Metadata store, environment building, session-process integration
 -- - Session registry and lookup functions
 --
 -- Agent adds:
@@ -45,8 +45,8 @@ function Agent.new(config)
     return self
 end
 
---- Recover an Agent from a persisted manifest during broker recovery.
--- @param config Table with manifest fields + handle/broker_session_id/dims
+--- Recover an Agent from a persisted manifest during session recovery.
+-- @param config Table with manifest fields + handle/dims
 -- @return Agent instance (first-class, identical to Agent.new())
 function Agent.from_recovery(config)
     config.session_type = config.session_type or "agent"

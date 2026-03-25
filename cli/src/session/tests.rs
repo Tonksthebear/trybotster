@@ -116,14 +116,14 @@ mod protocol_tests {
 
 #[cfg(test)]
 mod pty_handle_tests {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::{Arc, Mutex};
 
     use tokio::sync::broadcast;
 
-    use crate::agent::pty::{HubEventListener, PtyEvent, PtySession};
+    use crate::agent::pty::HubEventListener;
     use crate::hub::agent_handle::PtyHandle;
-    use crate::terminal::{generate_ansi_snapshot, AlacrittyParser};
+    use crate::terminal::AlacrittyParser;
 
     /// Create a session-backed PtyHandle for testing.
     ///
@@ -134,6 +134,7 @@ mod pty_handle_tests {
     ) -> (PtyHandle, Arc<Mutex<AlacrittyParser<HubEventListener>>>) {
         let (event_tx, _rx) = broadcast::channel(64);
         let listener = HubEventListener::new(event_tx.clone());
+        let listener_clone = listener.clone();
         let shadow_screen = Arc::new(Mutex::new(AlacrittyParser::new_with_listener(
             rows, cols, 1000, listener,
         )));
@@ -155,6 +156,7 @@ mod pty_handle_tests {
             Arc::new(std::sync::atomic::AtomicI64::new(0)),
             rows,
             cols,
+            listener_clone,
         );
 
         (handle, shadow_screen)

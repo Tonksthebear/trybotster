@@ -49,7 +49,7 @@ pub mod registration;
 pub mod run;
 mod server_comms;
 pub mod state;
-mod terminal_profile;
+pub(crate) mod terminal_profile;
 
 pub use actions::HubAction;
 pub use agent_handle::{SessionHandle, SessionType};
@@ -140,18 +140,6 @@ pub(crate) struct PendingTerminalAttach {
     pub request: PendingTerminalAttachRequest,
     /// Timestamp when the attach intent was first recorded.
     pub requested_at: Instant,
-}
-
-/// Pending observer notification for PTY output.
-///
-/// Queued during [`Hub::poll_webrtc_pty_output`] and drained separately in
-/// [`Hub::poll_pty_observers`] to avoid blocking the WebRTC send path.
-#[derive(Debug)]
-pub struct PtyObserverNotification {
-    /// Context for the hook callback.
-    pub ctx: crate::lua::primitives::PtyOutputContext,
-    /// Data that was sent (post-interception).
-    pub data: Vec<u8>,
 }
 
 /// A PTY notification event queued by a watcher task for the Hub tick loop.
@@ -248,10 +236,6 @@ const PEER_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2)
 
 /// Maximum pending observer notifications before oldest are dropped.
 ///
-/// Prevents unbounded memory growth if observers are registered but
-/// the Lua callback is slow. At ~4KB per PTY chunk this caps at ~4MB.
-const PTY_OBSERVER_QUEUE_CAPACITY: usize = 1024;
-
 /// Cooldown before sending a backpressure-recovery snapshot.
 ///
 /// After the per-peer send channel drops PTY frames, we wait this long
@@ -356,13 +340,6 @@ pub struct Hub {
     pub quit: bool,
     /// Whether to exec-restart after shutdown (for self-update).
     pub exec_restart: bool,
-    /// Whether shutdown was requested as a graceful restart.
-    ///
-    /// When `true`, `shutdown()` calls `disconnect_graceful()` on the broker
-    /// so it preserves PTY file descriptors across the restart window.
-    /// When `false` (plain quit), `kill_all` is sent and the broker exits.
-    pub graceful_shutdown: bool,
-
     // === Browser Relay ===
     /// Browser connection state and communication.
     pub browser: crate::relay::BrowserState,
@@ -455,6 +432,16 @@ pub struct Hub {
     /// Used only as a headless fallback when a PTY emits startup probes before
     /// any terminal client is attached to answer them live.
     terminal_profiles: terminal_profile::TerminalProfileStore,
+    /// Shared color cache from boot probe, shared with all `HubEventListener` instances.
+    ///
+    /// Populated once at startup. `HubEventListener` references this Arc so
+    /// `ColorRequest` events are answered immediately from cached values.
+    shared_color_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, alacritty_terminal::vte::ansi::Rgb>>>,
+    /// Focused terminal owner per session.
+    ///
+    /// Used to ensure OSC color queries are only forwarded to the active
+    /// client terminal, avoiding duplicate auto-replies from passive clients.
+    active_terminal_peers: Arc<Mutex<std::collections::HashMap<String, String>>>,
 
     /// Sender for outgoing WebRTC signals (ICE candidates) from async callbacks.
     ///
@@ -517,13 +504,6 @@ pub struct Hub {
     /// Lua-managed outgoing hub client connections keyed by connection ID.
     lua_hub_client_connections:
         std::collections::HashMap<String, crate::lua::primitives::hub_client::LuaHubClientConn>,
-
-    /// Pending PTY output observer notifications.
-    ///
-    /// Populated during [`Self::poll_webrtc_pty_output`] (after WebRTC send),
-    /// drained independently in [`Self::poll_pty_observers`] so slow observers
-    /// never block the WebRTC fast path.
-    pty_observer_queue: std::collections::VecDeque<PtyObserverNotification>,
 
     /// Pending PTY notification events from watcher tasks (test-only fallback).
     ///
@@ -691,7 +671,7 @@ impl Hub {
         // threads can send events directly instead of pushing to shared vecs.
         lua.set_hub_event_tx(hub_event_tx.clone(), tokio_runtime.handle().clone());
 
-        Ok(Self {
+        let mut hub = Self {
             state,
             config,
             client,
@@ -702,7 +682,6 @@ impl Hub {
             tokio_runtime,
             quit: false,
             exec_restart: false,
-            graceful_shutdown: false,
             browser: crate::relay::BrowserState::default(),
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),
@@ -719,10 +698,12 @@ impl Hub {
             pending_terminal_attaches: std::collections::HashMap::new(),
             terminal_profiles: {
                 let mut store = terminal_profile::TerminalProfileStore::default();
-                store.load_hub_profile();
                 store.probe_spawning_terminal();
                 store
             },
+            // Populated below after terminal_profiles is available.
+            shared_color_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_terminal_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             webrtc_outgoing_signal_tx,
             webrtc_outgoing_signal_rx: Some(webrtc_outgoing_signal_rx),
             stream_muxes: std::collections::HashMap::new(),
@@ -737,7 +718,6 @@ impl Hub {
             lua_ac_connections: std::collections::HashMap::new(),
             lua_ac_channels: std::collections::HashMap::new(),
             lua_hub_client_connections: std::collections::HashMap::new(),
-            pty_observer_queue: std::collections::VecDeque::new(),
             #[cfg(test)]
             pty_notification_queue: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
@@ -758,7 +738,18 @@ impl Hub {
             hub_event_metrics,
             hub_event_metrics_last_log: Instant::now(),
             hub_event_rx: Some(hub_event_rx),
-        })
+        };
+
+        // Populate shared color cache from boot probe results.
+        hub.shared_color_cache = hub.terminal_profiles.shared_color_cache();
+        if let Ok(cache) = hub.shared_color_cache.lock() {
+            log::info!(
+                "[PTY-PROBE] Shared color cache populated with {} entries",
+                cache.len()
+            );
+        }
+
+        Ok(hub)
     }
 
     /// Get the hub ID to use for server communication.
@@ -841,6 +832,7 @@ impl Hub {
             self.hub_identifier.clone(),
             Arc::clone(&self.shared_server_id),
             Arc::clone(&self.state),
+            Arc::clone(&self.shared_color_cache),
         ) {
             log::warn!("Failed to register Hub Lua primitives: {}", e);
         }
@@ -880,9 +872,6 @@ impl Hub {
         }
     }
 
-    /// Query broker inventory and fire Lua recovery enrichment event.
-    ///
-    /// Returns the number of live sessions reported by the broker.
     /// Discover live session process sockets and fire Lua recovery event.
     ///
     /// Scans the session socket directory for `.sock` files. For each one,
@@ -979,14 +968,6 @@ impl Hub {
         self.fire_hub_recovery_state(
             "socket_ready",
             serde_json::json!({ "socket_path": socket_path }),
-        );
-
-        self.fire_hub_recovery_state(
-            "broker_connected",
-            serde_json::json!({
-                "connected": false,
-                "reconnected": false,
-            }),
         );
 
         // Recover sessions from per-session processes
@@ -1566,7 +1547,7 @@ mod tests {
     ///
     /// This test uses NO mocks:
     /// - Real bash process spawned via PtySession::spawn()
-    /// - Real master FD reader thread (simulating broker's role)
+    /// - Real master FD reader thread inside the PTY session
     /// - Real socket client (same protocol the TUI uses)
     /// - Real Lua handler processing for subscriptions
     ///
@@ -1602,6 +1583,7 @@ mod tests {
                     hub.hub_identifier.clone(),
                     Arc::clone(&hub.shared_server_id),
                     Arc::clone(&hub.state),
+                    Arc::clone(&hub.shared_color_cache),
                 )
                 .expect("register hub primitives");
             hub.load_lua_init();

@@ -50,6 +50,16 @@ pub struct SessionConnection {
     pub metadata: SessionMetadata,
 }
 
+impl std::fmt::Debug for SessionConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionConnection")
+            .field("protocol_version", &self.protocol_version)
+            .field("metadata", &self.metadata)
+            .field("reader_alive", &self.reader_alive)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SessionConnection {
     /// Connect to a session process socket and perform handshake.
     pub fn connect(socket_path: &Path) -> Result<Self> {
@@ -90,10 +100,11 @@ impl SessionConnection {
     ///
     /// After this call, `read_response()` uses the channel instead of
     /// reading the socket directly.
-    pub fn install_reader(
+    pub(crate) fn install_reader(
         &mut self,
         session_uuid: String,
         shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
+        shadow_listener: HubEventListener,
         event_tx: broadcast::Sender<PtyEvent>,
         kitty_enabled: Arc<AtomicBool>,
         cursor_visible: Arc<AtomicBool>,
@@ -121,6 +132,7 @@ impl SessionConnection {
                     reader_stream,
                     session_uuid,
                     shadow_screen,
+                    shadow_listener,
                     event_tx,
                     kitty_enabled,
                     cursor_visible,
@@ -267,6 +279,7 @@ fn session_reader(
     stream: UnixStream,
     session_uuid: String,
     shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
+    shadow_listener: HubEventListener,
     event_tx: broadcast::Sender<PtyEvent>,
     kitty_enabled: Arc<AtomicBool>,
     cursor_visible: Arc<AtomicBool>,
@@ -281,6 +294,7 @@ fn session_reader(
     let _ = stream.set_read_timeout(None); // block indefinitely
     let mut buf = [0u8; 8192];
     let mut last_cursor_visible: Option<bool> = None;
+    let mut last_focus_reporting: Option<bool> = None;
 
     log::info!(
         "[session-reader] started for {}",
@@ -304,14 +318,35 @@ fn session_reader(
             match frame.frame_type {
                 FRAME_PTY_OUTPUT => {
                     let data = &frame.payload;
+                    let probe_descriptions =
+                        crate::hub::terminal_profile::describe_probe_sequences(data);
+                    if !probe_descriptions.is_empty() {
+                        log::info!(
+                            "[session-reader][PTY-PROBE] session={} observed {}",
+                            session_uuid,
+                            probe_descriptions.join(", ")
+                        );
+                    }
 
                     // Feed shadow screen — hub becomes terminal state authority
-                    let (new_kitty, new_visible) = if let Ok(mut p) = shadow_screen.lock() {
-                        p.process(data);
-                        (p.kitty_enabled(), !p.cursor_hidden())
-                    } else {
-                        (false, true)
-                    };
+                    let (new_kitty, new_visible, new_focus_reporting) =
+                        if let Ok(mut p) = shadow_screen.lock() {
+                            p.process(data);
+                            (p.kitty_enabled(), !p.cursor_hidden(), p.focus_reporting())
+                        } else {
+                            (false, true, false)
+                        };
+
+                    // Drain color responses that the shadow screen's alacritty
+                    // produced from cached RGB values during process().
+                    for resp in shadow_listener.drain_color_responses() {
+                        let _ = hub_event_tx.send(
+                            crate::hub::events::HubEvent::ColorResponse {
+                                session_uuid: session_uuid.clone(),
+                                response: resp.response,
+                            },
+                        );
+                    }
 
                     // Update state atomics
                     let old_kitty = kitty_enabled.load(Ordering::Relaxed);
@@ -323,6 +358,10 @@ fn session_reader(
                         last_cursor_visible = Some(new_visible);
                         cursor_visible.store(new_visible, Ordering::Relaxed);
                         let _ = event_tx.send(PtyEvent::cursor_visibility_changed(new_visible));
+                    }
+                    if last_focus_reporting != Some(new_focus_reporting) {
+                        last_focus_reporting = Some(new_focus_reporting);
+                        let _ = event_tx.send(PtyEvent::focus_reporting_changed(new_focus_reporting));
                     }
                     resize_pending.store(false, Ordering::Release);
 
@@ -347,6 +386,14 @@ fn session_reader(
                     for mark in scan_prompt_marks(data) {
                         let _ = event_tx.send(PtyEvent::prompt_mark(mark));
                     }
+
+                    // Session-backed PTYs must emit raw output observations from
+                    // the reader itself so startup probe queries are not missed
+                    // before the Lua notification watcher subscribes.
+                    let _ = hub_event_tx.send(crate::hub::events::HubEvent::PtyOutputObserved {
+                        session_uuid: session_uuid.clone(),
+                        data: data.to_vec(),
+                    });
 
                     // Broadcast raw bytes to subscribers (forwarders)
                     let _ = event_tx.send(PtyEvent::output(data.to_vec()));

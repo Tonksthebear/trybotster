@@ -22,8 +22,6 @@ import { HubManager } from "connections";
  *
  * Workspace template placeholders:
  *   data-field="workspace-title"  - Sets textContent to workspace name
- *   data-field="workspace-status" - Sets textContent to workspace status
- *   data-workspace-badge          - Status badge dot (gets status-specific color class)
  *
  * Usage:
  *   <div data-controller="agent-list"
@@ -365,20 +363,11 @@ export default class extends Controller {
       const field = el.dataset.field;
       if (field === "workspace-title") {
         el.textContent = ws.name || ws.id;
-      } else if (field === "workspace-status") {
-        el.textContent = ws.status || "inactive";
       } else if (field === "workspace-count") {
         const count = Array.isArray(ws.agents) ? ws.agents.length : 0;
         el.textContent = count;
       }
     });
-
-    // Status badge color
-    const badge = root.querySelector("[data-workspace-badge]");
-    if (badge) {
-      const colorClass = this.#statusBadgeColor(ws.status);
-      badge.classList.add(colorClass);
-    }
 
     // Collapse indicator
     const collapsed = this.#collapsedWorkspaces.has(ws.id);
@@ -477,7 +466,31 @@ export default class extends Controller {
       badge.classList.toggle("hidden", !agent.notification);
     }
 
+    this.#renderActivityIndicator(root, agent, isAccessory);
+
     return root;
+  }
+
+  // Private: render activity state for real agent sessions
+  #renderActivityIndicator(root, agent, isAccessory) {
+    const indicator = root.querySelector("[data-activity-indicator]");
+    if (!indicator) return;
+
+    if (isAccessory) {
+      indicator.textContent = "";
+      indicator.title = "";
+      indicator.setAttribute("aria-hidden", "true");
+      indicator.classList.add("hidden");
+      indicator.classList.remove("text-emerald-300", "text-sky-500");
+      return;
+    }
+
+    const isIdle = agent.is_idle !== false;
+    indicator.textContent = isIdle ? "◌" : "✺";
+    indicator.title = isIdle ? "Idle" : "Active";
+    indicator.setAttribute("aria-label", isIdle ? "Idle" : "Active");
+    indicator.classList.remove("hidden", "text-emerald-300", "text-sky-500");
+    indicator.classList.add(isIdle ? "text-sky-500" : "text-emerald-300");
   }
 
   // Private: set data attributes on the cloned element
@@ -498,22 +511,6 @@ export default class extends Controller {
     return this.workspacesValue.find((ws) =>
       Array.isArray(ws?.agents) ? ws.agents.includes(agentId) : false,
     );
-  }
-
-  // Private: map workspace status to Tailwind badge color class
-  #statusBadgeColor(status) {
-    switch (status) {
-      case "active":
-        return "bg-success-500";
-      case "suspended":
-        return "bg-yellow-500";
-      case "orphaned":
-        return "bg-orange-500";
-      case "closed":
-        return "bg-zinc-600";
-      default:
-        return "bg-zinc-600";
-    }
   }
 
   // Private: derive selected agent from current URL path

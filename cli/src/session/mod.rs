@@ -1,6 +1,6 @@
 //! Per-session process: holds a single PTY fd, binds a Unix socket, relays bytes.
 //!
-//! Replaces the broker's multiplexed architecture with one process per PTY.
+//! Uses one process per PTY instead of the old multiplexed architecture.
 //! Each session process is spawned by the Hub and communicates over its own
 //! Unix socket. The Hub connects, performs a handshake, and streams I/O.
 //!
@@ -46,20 +46,53 @@ use protocol::*;
 
 /// Event listener for the session process's alacritty parser.
 ///
-/// Handles `PtyWrite` responses (DSR/DA) by writing directly back to the PTY fd.
-/// All other events (Title, Bell) are ignored — the Hub's own parser handles those.
+/// Handles terminal responses that must be written back to the PTY fd:
+/// - `PtyWrite`: DSR/DA responses
+/// - `TextAreaSizeRequest`: XTWINOPS `CSI 14 t` query (text area size in pixels)
+///
+/// Other events (Title, Bell, ColorRequest) are handled by the hub's own parser.
 #[derive(Clone)]
 struct SessionEventListener {
     pty_fd: RawFd,
+    /// Current terminal dimensions for answering `TextAreaSizeRequest`.
+    current_dims: Arc<Mutex<(u16, u16)>>,
 }
+
+/// Default cell dimensions in pixels for XTWINOPS responses.
+///
+/// Used when the session process doesn't know actual pixel cell sizes.
+/// Most apps just need a non-zero response to proceed.
+const DEFAULT_CELL_WIDTH: u16 = 8;
+const DEFAULT_CELL_HEIGHT: u16 = 16;
 
 impl EventListener for SessionEventListener {
     fn send_event(&self, event: AlacrittyEvent) {
-        if let AlacrittyEvent::PtyWrite(response) = event {
-            let bytes = response.as_bytes();
-            unsafe {
-                libc::write(self.pty_fd, bytes.as_ptr().cast(), bytes.len());
+        match event {
+            AlacrittyEvent::PtyWrite(response) => {
+                let bytes = response.as_bytes();
+                unsafe {
+                    libc::write(self.pty_fd, bytes.as_ptr().cast(), bytes.len());
+                }
             }
+            AlacrittyEvent::TextAreaSizeRequest(formatter) => {
+                let (rows, cols) = self
+                    .current_dims
+                    .lock()
+                    .map(|d| *d)
+                    .unwrap_or((24, 80));
+                let window_size = alacritty_terminal::event::WindowSize {
+                    num_lines: rows,
+                    num_cols: cols,
+                    cell_width: DEFAULT_CELL_WIDTH,
+                    cell_height: DEFAULT_CELL_HEIGHT,
+                };
+                let response = formatter(window_size);
+                let bytes = response.as_bytes();
+                unsafe {
+                    libc::write(self.pty_fd, bytes.as_ptr().cast(), bytes.len());
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -141,16 +174,24 @@ enum PtyWriteCommand {
 /// Configuration for spawning a session process.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SpawnConfig {
+    /// Shell command to execute (e.g., "bash", "zsh").
     pub command: String,
+    /// Arguments passed to the command.
     pub args: Vec<String>,
+    /// Environment variable overrides as (key, value) pairs.
     pub env: Vec<(String, String)>,
+    /// Working directory for the spawned process.
     pub cwd: Option<String>,
+    /// Initial PTY row count.
     pub rows: u16,
+    /// Initial PTY column count.
     pub cols: u16,
     /// Commands to write to PTY stdin after child spawns (e.g., "source init.sh").
     #[serde(default)]
     pub init_commands: Vec<String>,
+    /// Path for tee logging of PTY output.
     pub tee_path: Option<String>,
+    /// Maximum tee log file size in bytes.
     pub tee_cap: u64,
 }
 
@@ -296,8 +337,12 @@ fn run_session(
     let writer = pair.master.take_writer().context("take PTY writer")?;
 
     // Set up shared state
+    let current_dims = Arc::new(Mutex::new((config.rows, config.cols)));
     let parser = {
-        let listener = SessionEventListener { pty_fd: master_fd };
+        let listener = SessionEventListener {
+            pty_fd: master_fd,
+            current_dims: Arc::clone(&current_dims),
+        };
         Arc::new(Mutex::new(AlacrittyParser::new_with_listener(
             config.rows,
             config.cols,
@@ -306,7 +351,6 @@ fn run_session(
         )))
     };
     let last_output_at = Arc::new(AtomicU64::new(0));
-    let current_dims = Arc::new(Mutex::new((config.rows, config.cols)));
     let resize_pending = Arc::new(AtomicBool::new(false));
     let shutdown = Arc::new(AtomicBool::new(false));
     let tee: SharedTee = Arc::new(Mutex::new(
@@ -369,7 +413,36 @@ fn run_session(
                 break;
             }
             if !socket_path_owned.exists() {
-                log::info!("[session] socket file deleted — shutting down");
+                // Gather context: does the parent directory still exist?
+                let parent_exists = socket_path_owned
+                    .parent()
+                    .map(|p| p.exists())
+                    .unwrap_or(false);
+                let parent_contents = socket_path_owned.parent().and_then(|p| {
+                    std::fs::read_dir(p).ok().map(|entries| {
+                        let names: Vec<_> = entries
+                            .filter_map(|e| {
+                                e.ok()
+                                    .and_then(|e| e.file_name().into_string().ok())
+                            })
+                            .take(20)
+                            .collect();
+                        let count = names.len();
+                        let joined = names.join(", ");
+                        if count == 20 {
+                            format!("{joined}, ... (truncated)")
+                        } else {
+                            joined
+                        }
+                    })
+                });
+                log::warn!(
+                    "[session] socket file deleted — shutting down \
+                     (parent_dir_exists={}, parent_contents=[{}], socket_path={})",
+                    parent_exists,
+                    parent_contents.unwrap_or_default(),
+                    socket_path_owned.display()
+                );
                 shutdown_for_lease.store(true, Ordering::Release);
                 break;
             }
@@ -381,6 +454,7 @@ fn run_session(
     let mut hub_decoder = FrameDecoder::new();
     let mut read_buf = [0u8; 8192];
 
+    let mut exit_reason = "shutdown_flag";
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -431,6 +505,7 @@ fn run_session(
                     }
                     Err(e) => {
                         log::info!("[session] no reconnect: {e}");
+                        exit_reason = "reconnect_failed";
                         break;
                     }
                 }
@@ -453,6 +528,7 @@ fn run_session(
             }
             Err(e) => {
                 log::warn!("[session] hub read error: {e}");
+                exit_reason = "hub_read_error";
                 break;
             }
         }
@@ -461,12 +537,15 @@ fn run_session(
     // Clean shutdown
     shutdown.store(true, Ordering::Release);
     let _ = writer_tx.send(PtyWriteCommand::Shutdown);
-    if socket_path.exists() {
+    let socket_existed = socket_path.exists();
+    if socket_existed {
         std::fs::remove_file(socket_path).ok();
     }
     log::info!(
-        "[session {}] exiting",
-        &session_uuid[..session_uuid.len().min(16)]
+        "[session {}] exiting (reason={}, socket_existed={})",
+        &session_uuid[..session_uuid.len().min(16)],
+        exit_reason,
+        socket_existed
     );
     Ok(())
 }
@@ -530,6 +609,14 @@ fn handle_hub_frame(
 ) {
     match frame.frame_type {
         FRAME_PTY_INPUT => {
+            let probe_descriptions =
+                crate::hub::terminal_profile::describe_probe_sequences(&frame.payload);
+            if !probe_descriptions.is_empty() {
+                log::info!(
+                    "[session][PTY-PROBE] hub injected input into PTY: {}",
+                    probe_descriptions.join(", ")
+                );
+            }
             let _ = writer_tx.try_send(PtyWriteCommand::Input(frame.payload.clone()));
         }
 

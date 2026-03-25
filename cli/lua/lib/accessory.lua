@@ -2,7 +2,7 @@
 --
 -- Inherits from Session (lib/session.lua) which owns:
 -- - Session UUID generation, PTY lifecycle, manifest sync
--- - Metadata store, environment building, broker integration
+-- - Metadata store, environment building, session-process integration
 -- - Session registry and lookup functions
 --
 -- Accessory is minimal — a plain PTY session without AI autonomy.
@@ -41,8 +41,8 @@ function Accessory.new(config)
     return self
 end
 
---- Recover an Accessory from a persisted manifest during broker recovery.
--- @param config Table with manifest fields + handle/broker_session_id/dims
+--- Recover an Accessory from a persisted manifest during session recovery.
+-- @param config Table with manifest fields + handle/dims
 -- @return Accessory instance (first-class, identical to Accessory.new())
 function Accessory.from_recovery(config)
     config.session_type = config.session_type or "accessory"

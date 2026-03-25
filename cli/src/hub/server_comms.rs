@@ -22,8 +22,7 @@ use std::time::{Duration, Instant};
 use crate::channel::Channel;
 use crate::hub::actions::{self, HubAction};
 use crate::hub::{
-    registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest,
-    PtyObserverNotification, WebRtcPtyOutput,
+    registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest, WebRtcPtyOutput,
 };
 use crate::notifications::push::send_push_direct;
 use base64::Engine;
@@ -80,126 +79,35 @@ impl Hub {
         format!("{truncated}...<truncated,len={char_count}>")
     }
 
-    fn session_live_terminal_client_count(&self, session_uuid: &str) -> usize {
-        self.pty_forwarders
-            .keys()
-            .filter(|key| {
-                key.strip_prefix("tui:") == Some(session_uuid)
-                    || key
-                        .rsplit_once(':')
-                        .map(|(_, candidate)| candidate == session_uuid)
-                        .unwrap_or(false)
-            })
-            .count()
-    }
+    fn set_active_terminal_peer(&self, session_uuid: &str, peer_id: &str, focused: bool) {
+        let Ok(mut active) = self.active_terminal_peers.lock() else {
+            return;
+        };
 
-    fn should_learn_terminal_probe_replies(&self, session_uuid: &str) -> bool {
-        self.session_live_terminal_client_count(session_uuid) <= 1
-    }
+        if focused {
+            active.insert(session_uuid.to_string(), peer_id.to_string());
+            return;
+        }
 
-    /// Whether all live clients for a session are TUI-only (no browser/socket).
-    ///
-    /// TUI clients render via ratatui cell-by-cell — OSC queries in PTY output
-    /// are consumed by the panel's alacritty parser and never reach stdout.
-    /// The hub must explicitly forward queries to the TUI as `TerminalQuery`
-    /// for passthrough to the outer terminal.
-    fn session_has_only_tui_clients(&self, session_uuid: &str) -> bool {
-        let tui_key = format!("tui:{session_uuid}");
-        self.pty_forwarders
-            .keys()
-            .filter(|key| {
-                key.strip_prefix("tui:") == Some(session_uuid)
-                    || key
-                        .rsplit_once(':')
-                        .map(|(_, candidate)| candidate == session_uuid)
-                        .unwrap_or(false)
-            })
-            .all(|key| key == &tui_key)
+        if active.get(session_uuid).is_some_and(|current| current == peer_id) {
+            active.remove(session_uuid);
+        }
     }
 
     fn learn_terminal_probe_replies(&mut self, session_uuid: &str, peer_id: &str, data: &[u8]) {
-        if !self.should_learn_terminal_probe_replies(session_uuid) {
-            return;
+        let descriptions = crate::hub::terminal_profile::describe_probe_sequences(data);
+        if !descriptions.is_empty() {
+            log::info!(
+                "[PTY-PROBE] Learned terminal reply candidates from peer={} session={}: {}",
+                peer_id,
+                session_uuid,
+                descriptions.join(", ")
+            );
         }
         self.terminal_profiles
             .observe_input(session_uuid, peer_id, data);
     }
 
-    fn reply_to_headless_terminal_probes(
-        &mut self,
-        session_uuid: &str,
-        pty: &crate::hub::agent_handle::PtyHandle,
-        data: &[u8],
-    ) {
-        let live_clients = self.session_live_terminal_client_count(session_uuid);
-        let probes = self
-            .terminal_profiles
-            .observe_output(session_uuid, data, live_clients <= 1);
-        if probes.is_empty() {
-            return;
-        }
-
-        if live_clients > 0 {
-            // Client attached — passthrough the query to the client's terminal.
-            // For TUI: write the query directly to stdout via TerminalQuery.
-            // For browser/socket: the query already flows through the forwarder.
-            // The client's terminal responds, and the response is routed back
-            // to this PTY via TerminalProbeResponse / observe_input.
-            if self.session_has_only_tui_clients(session_uuid) {
-                self.forward_probe_to_tui(data);
-            }
-            return;
-        }
-
-        // Headless — answer from cache immediately.
-        for probe in probes {
-            let Some(reply) = self
-                .terminal_profiles
-                .headless_reply(session_uuid, probe)
-                .map(std::borrow::ToOwned::to_owned)
-            else {
-                continue;
-            };
-
-            if let Err(e) = pty.write_input_direct(&reply) {
-                log::debug!(
-                    "[PTY-PROBE] Failed to answer {:?} for headless session {}: {}",
-                    probe,
-                    session_uuid,
-                    e
-                );
-            } else {
-                log::debug!(
-                    "[PTY-PROBE] Answered {:?} from cache for headless session {}",
-                    probe,
-                    session_uuid
-                );
-            }
-        }
-    }
-
-    /// Forward OSC probe bytes to the TUI for passthrough to the outer terminal.
-    fn forward_probe_to_tui(&self, data: &[u8]) {
-        // Extract just the OSC query sequences from the data
-        let mut buffer = data.to_vec();
-        let sequences = super::terminal_profile::extract_osc_queries_from_output(&mut buffer);
-        if sequences.is_empty() {
-            return;
-        }
-
-        if let Some(ref tx) = self.tui_output_tx {
-            let query_bytes: Vec<u8> = sequences.into_iter().flatten().collect();
-            if tx
-                .send(crate::client::TuiOutput::TerminalQuery { data: query_bytes })
-                .is_ok()
-            {
-                if let Some(fd) = self.tui_wake_fd {
-                    super::wake_tui_pipe(fd);
-                }
-                log::debug!("[PTY-PROBE] Forwarded OSC query to TUI for passthrough");
-            }
-        }
-    }
 
     /// Legacy polling entrypoint — calls all poll functions + flush.
     ///
@@ -234,7 +142,6 @@ impl Hub {
     fn tick_periodic(&mut self) {
         self.cleanup_disconnected_webrtc_channels();
         self.poll_stream_frames_outgoing();
-        self.poll_pty_observers();
         self.process_pending_terminal_attaches();
         self.send_backpressure_recovery_snapshots();
     }
@@ -289,6 +196,41 @@ impl Hub {
                 });
                 if let Err(e) = self.lua.fire_json_event("process_exited", &data) {
                     log::error!("Failed to fire process_exited event: {e}");
+                }
+            }
+            HubEvent::ColorResponse {
+                session_uuid,
+                response,
+            } => {
+                // Always answer from boot cache. The first probe fires before
+                // any client can subscribe, and even after subscription the TUI
+                // passthrough may not be ready yet. The cached values come from
+                // the spawning terminal — correct for both headless and TUI.
+                // Browser clients that re-probe get answered by xterm.js natively.
+                if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
+                    if let Err(e) = session_handle.pty().write_input_direct(response.as_bytes()) {
+                        log::debug!(
+                            "[PTY-PROBE] Failed to answer color probe for {session_uuid}: {e}"
+                        );
+                    } else {
+                        log::info!(
+                            "[PTY-PROBE] Answered color probe from cache for session {session_uuid}"
+                        );
+                    }
+                }
+            }
+            HubEvent::PtyOutputObserved { session_uuid, data } => {
+                // Learn terminal probes from raw session output (headless-safe).
+                // Without this, probe responses are only learned through client
+                // input paths (TUI/WebRTC/socket), missing headless sessions.
+                self.learn_terminal_probe_replies(&session_uuid, "session", &data);
+
+                if self.lua.has_observers("pty_output") {
+                    let ctx = crate::lua::primitives::PtyOutputContext {
+                        peer_id: format!("session:{session_uuid}"),
+                        session_uuid,
+                    };
+                    self.lua.notify_pty_output_observers(&ctx, &data);
                 }
             }
             HubEvent::TimerFired { timer_id } => {
@@ -396,7 +338,6 @@ impl Hub {
             HubEvent::CleanupTick => {
                 self.cleanup_disconnected_webrtc_channels();
                 self.poll_stream_frames_outgoing();
-                self.poll_pty_observers();
                 self.send_backpressure_recovery_snapshots();
                 self.ratchet_restarted_peers.clear();
                 if self.hub_event_metrics_last_log.elapsed() >= std::time::Duration::from_secs(30) {
@@ -561,6 +502,9 @@ impl Hub {
                 if let Some(conn) = self.socket_clients.remove(&client_id) {
                     conn.disconnect();
                 }
+                if let Ok(mut active) = self.active_terminal_peers.lock() {
+                    active.retain(|_, peer_id| peer_id != &client_id);
+                }
                 let client_prefix = format!("{client_id}:");
                 self.pty_forwarders.retain(|key, task| {
                     if key.starts_with(&client_prefix) {
@@ -594,6 +538,7 @@ impl Hub {
                             .get("focused")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
+                        self.set_active_terminal_peer(session_uuid, &client_id, focused);
                         self.lua.set_pty_focused(session_uuid, &client_id, focused);
                     }
                 } else if let Err(e) = self.lua.call_socket_message(&client_id, msg) {
@@ -606,10 +551,14 @@ impl Hub {
                 data,
             } => {
                 if data == b"\x1b[I" {
+                    self.set_active_terminal_peer(&session_uuid, &client_id, true);
                     self.lua.set_pty_focused(&session_uuid, &client_id, true);
                 } else if data == b"\x1b[O" {
+                    self.set_active_terminal_peer(&session_uuid, &client_id, false);
                     self.lua.set_pty_focused(&session_uuid, &client_id, false);
                 }
+                self.terminal_profiles.observe_peer_input(&client_id, &data);
+                self.learn_terminal_probe_replies(&session_uuid, &client_id, &data);
                 self.lua.notify_pty_input(&session_uuid);
 
                 if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
@@ -682,12 +631,14 @@ impl Hub {
                         watcher_key,
                         session_uuid,
                         session_name,
+                        observe_output,
                         event_tx,
                     } => {
                         self.spawn_notification_watcher(
                             watcher_key,
                             session_uuid,
                             session_name,
+                            observe_output,
                             event_tx,
                         );
                     }
@@ -710,15 +661,13 @@ impl Hub {
                         log::info!(
                             "[Lua] Processing graceful-restart request — agents will survive"
                         );
-                        self.graceful_shutdown = true;
                         self.quit = true;
                     }
                     HubRequest::DevRebuild => {
                         // Run `cargo build` in the background using the same Cargo profile as
                         // the currently running executable when we can infer it from `current_exe()`.
                         // On success, fire ExecRestart so the Hub exec-replaces itself with the
-                        // freshly built binary. The broker keeps PTY FDs alive across the exec so
-                        // agents survive.
+                        // freshly built binary while session processes survive.
                         //
                         // On failure the Hub logs the error and keeps running — no agents
                         // are disrupted.
@@ -1033,7 +982,7 @@ impl Hub {
             }
             // Per-session process exited or disconnected.
             // The reader thread already broadcasts PtyEvent directly, so we
-            // just need to notify Lua for cleanup (same as broker_pty_exited).
+            // just need to notify Lua for cleanup.
             HubEvent::SessionProcessExited {
                 session_uuid,
                 exit_code,
@@ -1057,6 +1006,9 @@ impl Hub {
 
             HubEvent::SessionUnregistered { session_uuid } => {
                 self.terminal_profiles.clear_session(&session_uuid);
+                if let Ok(mut active) = self.active_terminal_peers.lock() {
+                    active.remove(&session_uuid);
+                }
                 log::debug!("[Session] Unregistered '{}'", session_uuid);
             }
             HubEvent::WebRtcOfferCompleted {
@@ -1194,6 +1146,7 @@ impl Hub {
                 session_uuid,
                 focused,
             } => {
+                self.set_active_terminal_peer(&session_uuid, "tui", focused);
                 self.lua.set_pty_focused(&session_uuid, "tui", focused);
             }
             TuiRequest::PtyInput { session_uuid, data } => {
@@ -1211,45 +1164,22 @@ impl Hub {
                     );
                 }
             }
-            TuiRequest::TerminalProbeResponse { data } => {
-                // Route the terminal's response back to the PTY(s) that asked.
-                // Also updates the hub-level profile cache for future headless use.
-                let routes = self.terminal_profiles.route_probe_response(&data);
-                for (session_uuid, reply) in &routes {
-                    if let Some(session_handle) = self.handle_cache.get_session(session_uuid) {
-                        if let Err(e) = session_handle.pty().write_input_direct(reply) {
-                            log::debug!(
-                                "[PTY-PROBE] Failed to route response to {}: {}",
-                                session_uuid,
-                                e
-                            );
-                        } else {
-                            log::debug!(
-                                "[PTY-PROBE] Routed terminal response to session {}",
-                                session_uuid
-                            );
-                        }
-                    }
-                }
-                if routes.is_empty() {
-                    log::debug!(
-                        "[PTY-PROBE] Terminal probe response updated hub cache ({} bytes)",
-                        data.len()
-                    );
-                }
-            }
         }
     }
 
     /// Handle a single binary PTY input from a browser (WebRTC).
     pub fn handle_pty_input(&mut self, input: crate::channel::webrtc::PtyInputIncoming) {
         if input.data == b"\x1b[I" {
+            self.set_active_terminal_peer(&input.session_uuid, &input.browser_identity, true);
             self.lua
                 .set_pty_focused(&input.session_uuid, &input.browser_identity, true);
         } else if input.data == b"\x1b[O" {
+            self.set_active_terminal_peer(&input.session_uuid, &input.browser_identity, false);
             self.lua
                 .set_pty_focused(&input.session_uuid, &input.browser_identity, false);
         }
+        self.terminal_profiles
+            .observe_peer_input(&input.browser_identity, &input.data);
         self.learn_terminal_probe_replies(
             &input.session_uuid,
             &input.browser_identity,
@@ -1452,10 +1382,6 @@ impl Hub {
         self.poll_webrtc_pty_output();
         // Extract it back out
         *rx = self.webrtc_pty_output_rx.take();
-
-        // Drain PTY observer notifications inline — avoids periodic polling delay.
-        // Observers are populated by poll_webrtc_pty_output above.
-        self.poll_pty_observers();
     }
 
     /// Poll user file watches created by `watch.directory()` in Lua.
@@ -1504,6 +1430,7 @@ impl Hub {
         watcher_key: String,
         session_uuid: String,
         session_name: String,
+        observe_output: bool,
         event_tx: tokio::sync::broadcast::Sender<crate::agent::pty::PtyEvent>,
     ) {
         // Abort any existing watcher for this key
@@ -1555,6 +1482,20 @@ impl Hub {
                         };
                         let _ = hub_tx.send(event);
                         break;
+                    }
+                    Ok(PtyEvent::Output(data)) => {
+                        if observe_output {
+                            if hub_tx
+                                .send(super::events::HubEvent::PtyOutputObserved {
+                                    session_uuid: session_uuid.clone(),
+                                    data,
+                                })
+                                .is_err()
+                            {
+                                log::warn!("[NotifWatcher] Hub event channel closed for {}", key);
+                                break;
+                            }
+                        }
                     }
                     Ok(event @ PtyEvent::TitleChanged(_))
                     | Ok(event @ PtyEvent::CwdChanged(_))
@@ -1933,6 +1874,9 @@ impl Hub {
                 true
             }
         });
+        if let Ok(mut active) = self.active_terminal_peers.lock() {
+            active.retain(|_, peer_id| peer_id != browser_identity);
+        }
 
         // Notify Lua of peer disconnection (Lua handles subscription cleanup)
         if let Err(e) = self.lua.call_peer_disconnected(browser_identity) {
@@ -2575,15 +2519,6 @@ impl Hub {
             log::debug!("[Lua] Aborted existing PTY forwarder for {}", forwarder_key);
         }
 
-        // Check if we should proactively probe this client for terminal theme.
-        let hub_probe_bytes = self.terminal_profiles.start_hub_probing();
-        if hub_probe_bytes.is_some() {
-            log::debug!(
-                "[PTY-PROBE] Injecting hub theme probes for peer {}",
-                &req.peer_id[..req.peer_id.len().min(8)]
-            );
-        }
-
         // Snapshot retrieval and subscription setup can block.
         // Run it inside the spawned forwarder task so Hub event processing stays
         // responsive while attach state is being prepared.
@@ -2598,6 +2533,7 @@ impl Hub {
         let target_cols = req.cols;
         let prefix = req.prefix.clone().unwrap_or_else(|| vec![0x01]);
         let active_flag = req.active_flag.clone();
+        let active_terminal_peers = Arc::clone(&self.active_terminal_peers);
 
         // Use browser-provided subscription ID for message routing.
         let subscription_id = req.subscription_id.clone();
@@ -2611,6 +2547,7 @@ impl Hub {
                 &peer_id[..peer_id.len().min(8)],
                 session_uuid
             );
+            let mut query_filter_buffer = Vec::new();
 
             let (snapshot, mut pty_rx) = match tokio::task::spawn_blocking(move || {
                 if pty_for_snapshot.is_session_backed() {
@@ -2663,21 +2600,6 @@ impl Hub {
                 return;
             }
 
-            // Inject hub theme probes right after snapshot so the client's
-            // terminal sees them and auto-responds with color values.
-            if let Some(probe_data) = hub_probe_bytes {
-                let mut raw_message = Vec::with_capacity(prefix.len() + probe_data.len());
-                raw_message.extend(&prefix);
-                raw_message.extend(&probe_data);
-
-                let _ = output_tx.try_send(WebRtcPtyOutput {
-                    subscription_id: subscription_id.clone(),
-                    browser_identity: peer_id.clone(),
-                    data: raw_message,
-                    session_uuid: session_uuid.clone(),
-                });
-            }
-
             loop {
                 // Check if forwarder was stopped by Lua.
                 {
@@ -2692,10 +2614,29 @@ impl Hub {
 
                 match pty_rx.recv().await {
                     Ok(PtyEvent::Output(data)) => {
+                        let filtered = if active_terminal_peers
+                            .lock()
+                            .ok()
+                            .and_then(|active| active.get(&session_uuid).cloned())
+                            .is_some_and(|active_peer| active_peer != peer_id.as_str())
+                        {
+                            crate::hub::terminal_profile::strip_osc_queries_from_output(
+                                &mut query_filter_buffer,
+                                &data,
+                            )
+                        } else {
+                            query_filter_buffer.clear();
+                            data
+                        };
+
+                        if filtered.is_empty() {
+                            continue;
+                        }
+
                         // Send raw bytes with prefix.
-                        let mut raw_message = Vec::with_capacity(prefix.len() + data.len());
+                        let mut raw_message = Vec::with_capacity(prefix.len() + filtered.len());
                         raw_message.extend(&prefix);
-                        raw_message.extend(&data);
+                        raw_message.extend(&filtered);
 
                         match output_tx.try_send(WebRtcPtyOutput {
                             subscription_id: subscription_id.clone(),
@@ -2952,7 +2893,7 @@ impl Hub {
                     }
 
                     log::info!(
-                        "[WebRTC] Sending broker backpressure recovery snapshot ({} bytes) to {} for session {}",
+                        "[WebRTC] Sending async backpressure recovery snapshot ({} bytes) to {} for session {}",
                         snapshot.len(),
                         &browser_identity[..browser_identity.len().min(8)],
                         &session_uuid[..session_uuid.len().min(8)]
@@ -2985,7 +2926,7 @@ impl Hub {
     /// Send a snapshot directly through a per-peer channel.
     ///
     /// Bypasses the output queue to avoid re-triggering backpressure.
-    /// Used by both sync (cached) and async (broker) recovery paths.
+    /// Used by both sync (cached) and async recovery paths.
     fn send_snapshot_to_peer(
         peer_tx: &tokio::sync::mpsc::Sender<super::WebRtcSendItem>,
         subscription_id: &str,
@@ -3189,12 +3130,6 @@ impl Hub {
             );
         }
 
-        // Check if we should proactively probe this client for terminal theme.
-        let hub_probe_bytes = self.terminal_profiles.start_hub_probing();
-        if hub_probe_bytes.is_some() {
-            log::debug!("[PTY-PROBE] Injecting hub theme probes for TUI client");
-        }
-
         // Snapshot retrieval and subscription setup may block. Fetch them in
         // the forwarder task so this handler never blocks the Hub event loop.
         let pty_for_snapshot = pty_handle.clone();
@@ -3205,7 +3140,6 @@ impl Hub {
         let target_cols = req.cols;
         let active_flag = Arc::clone(&req.active_flag);
         let wake_fd = self.tui_wake_fd;
-
         let _guard = self.tokio_runtime.enter();
         let task = tokio::spawn(async move {
             use crate::agent::pty::PtyEvent;
@@ -3283,24 +3217,6 @@ impl Hub {
                 super::wake_tui_pipe(fd);
             }
 
-            // Inject hub theme probes right after snapshot so the real
-            // terminal sees them and auto-responds with color values.
-            // Uses TerminalQuery to write directly to stdout — Output
-            // would feed into the panel's alacritty parser which silently
-            // consumes OSC queries without responding.
-            if let Some(probe_data) = hub_probe_bytes {
-                if sink
-                    .send(TuiOutput::TerminalQuery { data: probe_data })
-                    .is_err()
-                {
-                    log::trace!("[Lua-TUI] Output channel closed before probe inject");
-                    return;
-                }
-                if let Some(fd) = wake_fd {
-                    super::wake_tui_pipe(fd);
-                }
-            }
-
             loop {
                 // Check if forwarder was stopped by Lua
                 {
@@ -3350,7 +3266,7 @@ impl Hub {
 
                         // Process the stashed non-output event that was consumed
                         // during batching. These are rare (KittyChanged,
-                        // FocusRequested, ProcessExited) but must not be dropped.
+                        // FocusReportingChanged, ProcessExited) but must not be dropped.
                         if let Some(event) = stashed {
                             match event {
                                 PtyEvent::ProcessExited { exit_code } => {
@@ -3377,9 +3293,10 @@ impl Hub {
                                         super::wake_tui_pipe(fd);
                                     }
                                 }
-                                PtyEvent::FocusRequested => {
+                                PtyEvent::FocusReportingChanged(enabled) => {
                                     let _ = sink.send(TuiOutput::Message(serde_json::json!({
-                                        "type": "focus_requested",
+                                        "type": "focus_reporting_changed",
+                                        "enabled": enabled,
                                         "session_uuid": session_uuid,
                                     })));
                                     if let Some(fd) = wake_fd {
@@ -3416,9 +3333,10 @@ impl Hub {
                             super::wake_tui_pipe(fd);
                         }
                     }
-                    Ok(PtyEvent::FocusRequested) => {
+                    Ok(PtyEvent::FocusReportingChanged(enabled)) => {
                         let _ = sink.send(TuiOutput::Message(serde_json::json!({
-                            "type": "focus_requested",
+                            "type": "focus_reporting_changed",
+                            "enabled": enabled,
                             "session_uuid": session_uuid,
                         })));
                         if let Some(fd) = wake_fd {
@@ -3505,14 +3423,7 @@ impl Hub {
             );
         }
 
-        // Check if we should proactively probe this client for terminal theme.
-        let hub_probe_bytes = self.terminal_profiles.start_hub_probing();
-        if hub_probe_bytes.is_some() {
-            log::debug!(
-                "[PTY-PROBE] Injecting hub theme probes for socket client {}",
-                req.client_id
-            );
-        }
+        let active_terminal_peers = Arc::clone(&self.active_terminal_peers);
 
         // Snapshot retrieval and subscription setup may block. Fetch them in
         // the forwarder task so this handler never blocks the Hub event loop.
@@ -3536,6 +3447,7 @@ impl Hub {
                 client_id,
                 session_uuid
             );
+            let mut query_filter_buffer = Vec::new();
 
             let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, mut pty_rx) =
                 match tokio::task::spawn_blocking(move || {
@@ -3610,15 +3522,6 @@ impl Hub {
                 }
             }
 
-            // Inject hub theme probes right after snapshot.
-            if let Some(probe_data) = hub_probe_bytes {
-                let frame = Frame::PtyOutput {
-                    session_uuid: session_uuid.clone(),
-                    data: probe_data,
-                };
-                let _ = frame_tx.try_send(frame.encode());
-            }
-
             loop {
                 {
                     let active = active_flag
@@ -3632,9 +3535,28 @@ impl Hub {
 
                 match pty_rx.recv().await {
                     Ok(PtyEvent::Output(data)) => {
+                        let filtered = if active_terminal_peers
+                            .lock()
+                            .ok()
+                            .and_then(|active| active.get(&session_uuid).cloned())
+                            .is_some_and(|active_peer| active_peer != client_id.as_str())
+                        {
+                            crate::hub::terminal_profile::strip_osc_queries_from_output(
+                                &mut query_filter_buffer,
+                                &data,
+                            )
+                        } else {
+                            query_filter_buffer.clear();
+                            data
+                        };
+
+                        if filtered.is_empty() {
+                            continue;
+                        }
+
                         let frame = Frame::PtyOutput {
                             session_uuid: session_uuid.clone(),
-                            data,
+                            data: filtered,
                         };
                         match frame_tx.try_send(frame.encode()) {
                             Ok(()) => {}
@@ -3680,9 +3602,10 @@ impl Hub {
                         }));
                         let _ = frame_tx.try_send(frame.encode());
                     }
-                    Ok(PtyEvent::FocusRequested) => {
+                    Ok(PtyEvent::FocusReportingChanged(enabled)) => {
                         let frame = Frame::Json(serde_json::json!({
-                            "type": "focus_requested",
+                            "type": "focus_reporting_changed",
+                            "enabled": enabled,
                             "session_uuid": session_uuid,
                         }));
                         let _ = frame_tx.try_send(frame.encode());
@@ -4061,18 +3984,9 @@ impl Hub {
             .insert(browser_identity.to_string(), task);
     }
 
-    /// Poll for queued PTY output and send via WebRTC.
-    ///
-    /// Forwarder tasks queue [`WebRtcPtyOutput`] messages; this drains and
-    /// sends them. If interceptors are registered, they run synchronously
-    /// (opt-in blocking). If observers are registered, notifications are
-    /// queued for [`Self::poll_pty_observers`] — never inline.
-    ///
     /// Process a single PTY output message: run interceptors, send via WebRTC,
-    /// and queue observer notifications. Used by `handle_webrtc_pty_output_batch`
-    /// to process the first message before draining the rest.
+    /// and notify observers inline.
     fn process_single_pty_output(&mut self, msg: WebRtcPtyOutput) {
-        use crate::hub::PtyObserverNotification;
         use crate::lua::primitives::PtyOutputContext;
 
         #[cfg(test)]
@@ -4128,13 +4042,7 @@ impl Hub {
         }
 
         if self.lua.has_observers("pty_output") {
-            if self.pty_observer_queue.len() >= super::PTY_OBSERVER_QUEUE_CAPACITY {
-                self.pty_observer_queue.pop_front();
-            }
-            self.pty_observer_queue.push_back(PtyObserverNotification {
-                ctx,
-                data: final_data,
-            });
+            self.lua.notify_pty_output_observers(&ctx, &final_data);
         }
     }
 
@@ -4142,7 +4050,6 @@ impl Hub {
     /// open, all remaining messages for that peer are skipped (prevents the
     /// tick loop from being starved by hundreds of failed `block_on` calls).
     fn poll_webrtc_pty_output(&mut self) {
-        use crate::hub::PtyObserverNotification;
         use crate::lua::primitives::PtyOutputContext;
 
         /// Max messages to process per tick to keep the event loop responsive.
@@ -4222,16 +4129,10 @@ impl Hub {
                 }
             }
 
-            // Observers: queue for async processing, never block here
+            // Observers: fire inline — the idle detection hook is cheap
+            // (hash lookup + timer reset). No reason to defer.
             if has_observers {
-                // Drop oldest if queue is full
-                if self.pty_observer_queue.len() >= super::PTY_OBSERVER_QUEUE_CAPACITY {
-                    self.pty_observer_queue.pop_front();
-                }
-                self.pty_observer_queue.push_back(PtyObserverNotification {
-                    ctx,
-                    data: final_data,
-                });
+                self.lua.notify_pty_output_observers(&ctx, &final_data);
             }
         }
 
@@ -4243,29 +4144,6 @@ impl Hub {
         }
     }
 
-    /// Drain pending PTY observer notifications (budget-limited).
-    ///
-    /// Called separately from [`Self::poll_webrtc_pty_output`] so slow
-    /// observers never block the WebRTC send path. Processes up to
-    /// `OBSERVER_BUDGET_PER_TICK` notifications per tick to keep the
-    /// main loop responsive.
-    fn poll_pty_observers(&mut self) {
-        /// Max observer callbacks per tick to prevent stalling the event loop.
-        const OBSERVER_BUDGET_PER_TICK: usize = 64;
-
-        if self.pty_observer_queue.is_empty() {
-            return;
-        }
-
-        let budget = OBSERVER_BUDGET_PER_TICK.min(self.pty_observer_queue.len());
-        for _ in 0..budget {
-            let Some(notification) = self.pty_observer_queue.pop_front() else {
-                break;
-            };
-            self.lua
-                .notify_pty_output_observers(&notification.ctx, &notification.data);
-        }
-    }
 
     // === TUI via Lua (Hub-side Processing) ===
 
@@ -4306,9 +4184,6 @@ impl Hub {
                     } else {
                         log::warn!("[PTY-INPUT] No session for UUID {}", session_uuid);
                     }
-                }
-                TuiRequest::TerminalProbeResponse { .. } => {
-                    // Test-only poll path — probe responses handled by handle_tui_request
                 }
             }
         }
@@ -5425,7 +5300,6 @@ mod tests {
     // These tests use Hub::setup() to load ALL real Lua handlers, then
     // exercise the full TUI → Lua → Hub → TUI pipeline without mocks.
 
-    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
 
     use crate::client::{TuiOutput, TuiRequest};
@@ -5472,6 +5346,7 @@ mod tests {
                 hub.hub_identifier.clone(),
                 std::sync::Arc::clone(&hub.shared_server_id),
                 std::sync::Arc::clone(&hub.state),
+                std::sync::Arc::clone(&hub.shared_color_cache),
             )
             .expect("Should register hub primitives");
 
@@ -5564,7 +5439,7 @@ mod tests {
         test_local_session_handle_with_seed(session_uuid, b"cached-local-output\n")
     }
 
-    // Broker-specific probe tests removed — broker module deleted.
+    // Legacy probe tests removed during the session-process migration.
     // Terminal probe caching is now exercised via session-process paths.
 
     #[test]
@@ -5573,24 +5448,17 @@ mod tests {
         let session_uuid = "sess-clear-profile";
 
         hub.terminal_profiles
-            .observe_output(session_uuid, b"\x1b]11;?\x07", true);
+            .observe_output(session_uuid, b"\x1b]11;?\x07");
+
+        hub.handle_hub_event(crate::hub::events::HubEvent::SessionUnregistered {
+            session_uuid: session_uuid.to_string(),
+        });
+
         hub.learn_terminal_probe_replies(
             session_uuid,
             "browser-a",
             b"\x1b]11;rgb:1234/5678/9abc\x07",
         );
-
-        assert!(hub
-            .terminal_profiles
-            .headless_reply(
-                session_uuid,
-                crate::hub::terminal_profile::TerminalProbe::DefaultBackground
-            )
-            .is_some());
-
-        hub.handle_hub_event(crate::hub::events::HubEvent::SessionUnregistered {
-            session_uuid: session_uuid.to_string(),
-        });
 
         assert_eq!(
             hub.terminal_profiles.headless_reply(
@@ -5613,7 +5481,7 @@ mod tests {
             .insert(format!("browser-a:{session_uuid}"), tokio::spawn(async {}));
 
         hub.terminal_profiles
-            .observe_output(session_uuid, b"\x1b]11;?\x07", true);
+            .observe_output(session_uuid, b"\x1b]11;?\x07");
         hub.learn_terminal_probe_replies(
             session_uuid,
             "browser-a",
@@ -5629,7 +5497,206 @@ mod tests {
         );
     }
 
-    // test_backpressure_recovery_fetches_broker_snapshot removed — broker module deleted.
+    #[test]
+    fn test_headless_probe_detected_and_cache_available() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-headless-probe";
+
+        // Populate hub cache with color values.
+        hub.terminal_profiles
+            .observe_peer_input("boot", b"\x1b]10;rgb:aaaa/bbbb/cccc\x07");
+        hub.terminal_profiles
+            .observe_peer_input("boot", b"\x1b]11;rgb:1111/2222/3333\x07");
+        hub.terminal_profiles
+            .observe_peer_input("boot", b"\x1b]12;rgb:4444/5555/6666\x07");
+
+        hub.handle_cache
+            .add_session(test_local_session_handle(session_uuid));
+
+        // No live clients (headless) — hub should attempt to answer from cache.
+        // write_input_direct returns Err in tests (no real PTY), but the hub
+        // should still detect the probe and have the right cache value.
+        assert!(hub.terminal_profiles.hub_profile_is_complete());
+        assert_eq!(
+            hub.terminal_profiles.headless_reply(
+                session_uuid,
+                crate::hub::terminal_profile::TerminalProbe::DefaultBackground
+            ),
+            Some(b"\x1b]11;rgb:1111/2222/3333\x07".as_slice())
+        );
+    }
+
+    #[test]
+    fn test_live_client_skips_hub_probe_answering() {
+        let (mut hub, _request_tx, mut output_rx) = e2e_hub();
+        let session_uuid = "sess-live-client-probe";
+
+        // Populate hub cache.
+        hub.terminal_profiles
+            .observe_peer_input("boot", b"\x1b]11;rgb:1111/2222/3333\x07");
+
+        hub.handle_cache
+            .add_session(test_local_session_handle(session_uuid));
+
+        // Add a live client forwarder — hub should NOT answer probes.
+        let _guard = hub.tokio_runtime.enter();
+        hub.pty_forwarders
+            .insert(format!("socket:abc:{session_uuid}"), tokio::spawn(async {}));
+
+        hub.handle_hub_event(crate::hub::events::HubEvent::PtyOutputObserved {
+            session_uuid: session_uuid.to_string(),
+            data: b"\x1b]11;?\x07".to_vec(),
+        });
+
+        // Drain output — hub should not have sent any probe-related messages.
+        while output_rx.try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn test_pty_output_observed_tracks_probe_queries_for_later_replies() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-observed-probe";
+
+        hub.handle_cache
+            .add_session(test_local_session_handle(session_uuid));
+
+        hub.handle_hub_event(crate::hub::events::HubEvent::PtyOutputObserved {
+            session_uuid: session_uuid.to_string(),
+            data: b"\x1b]11;?\x07".to_vec(),
+        });
+
+        hub.learn_terminal_probe_replies(
+            session_uuid,
+            "browser-a",
+            b"\x1b]11;rgb:1234/5678/9abc\x07",
+        );
+
+        assert_eq!(
+            hub.terminal_profiles.headless_reply(
+                session_uuid,
+                crate::hub::terminal_profile::TerminalProbe::DefaultBackground
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_inactive_webrtc_forwarder_strips_probe_queries() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-filter-inactive-webrtc";
+        let session = test_session_handle(session_uuid);
+        let event_tx = session.pty().event_tx_clone();
+        hub.handle_cache.add_session(session);
+
+        assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
+            "browser-a",
+            session_uuid,
+            "terminal_sub"
+        )));
+        hub.set_active_terminal_peer(session_uuid, "tui", true);
+        let _ = recv_next_webrtc_output_with_prefix(&mut hub, 0x02);
+
+        let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(
+            b"before\x1b]11;?\x07after".to_vec(),
+        ));
+
+        let output = recv_next_live_webrtc_output(&mut hub);
+        assert_eq!(output.data, b"\x01beforeafter");
+    }
+
+    #[test]
+    fn test_active_webrtc_forwarder_keeps_probe_queries() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-filter-active-webrtc";
+        let session = test_session_handle(session_uuid);
+        let event_tx = session.pty().event_tx_clone();
+        hub.handle_cache.add_session(session);
+
+        assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
+            "browser-a",
+            session_uuid,
+            "terminal_sub"
+        )));
+        hub.set_active_terminal_peer(session_uuid, "browser-a", true);
+        let _ = recv_next_webrtc_output_with_prefix(&mut hub, 0x02);
+
+        let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(
+            b"\x1b]11;?\x07after".to_vec(),
+        ));
+
+        let output = recv_next_live_webrtc_output(&mut hub);
+        assert_eq!(output.data, b"\x01\x1b]11;?\x07after");
+    }
+
+    #[test]
+    fn test_browser_focus_input_updates_active_terminal_peer() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-browser-focus";
+
+        hub.handle_pty_input(crate::channel::webrtc::PtyInputIncoming {
+            session_uuid: session_uuid.to_string(),
+            browser_identity: "browser-a".to_string(),
+            data: b"\x1b[I".to_vec(),
+        });
+
+        assert_eq!(
+            hub.active_terminal_peers
+                .lock()
+                .expect("active peers mutex")
+                .get(session_uuid)
+                .cloned(),
+            Some("browser-a".to_string())
+        );
+
+        hub.handle_pty_input(crate::channel::webrtc::PtyInputIncoming {
+            session_uuid: session_uuid.to_string(),
+            browser_identity: "browser-a".to_string(),
+            data: b"\x1b[O".to_vec(),
+        });
+
+        assert!(
+            hub.active_terminal_peers
+                .lock()
+                .expect("active peers mutex")
+                .get(session_uuid)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_tui_focus_request_updates_active_terminal_peer() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-tui-focus";
+
+        hub.handle_tui_request(TuiRequest::FocusChanged {
+            session_uuid: session_uuid.to_string(),
+            focused: true,
+        });
+
+        assert_eq!(
+            hub.active_terminal_peers
+                .lock()
+                .expect("active peers mutex")
+                .get(session_uuid)
+                .cloned(),
+            Some("tui".to_string())
+        );
+
+        hub.handle_tui_request(TuiRequest::FocusChanged {
+            session_uuid: session_uuid.to_string(),
+            focused: false,
+        });
+
+        assert!(
+            hub.active_terminal_peers
+                .lock()
+                .expect("active peers mutex")
+                .get(session_uuid)
+                .is_none()
+        );
+    }
+
+    // test_backpressure_recovery_fetches_snapshot removed during the migration.
 
     fn test_forwarder_request(
         peer_id: &str,
@@ -5659,6 +5726,33 @@ mod tests {
             }
         }
         messages
+    }
+
+    fn recv_next_live_webrtc_output(hub: &mut Hub) -> super::WebRtcPtyOutput {
+        recv_next_webrtc_output_with_prefix(hub, 0x01)
+    }
+
+    fn recv_next_webrtc_output_with_prefix(
+        hub: &mut Hub,
+        prefix: u8,
+    ) -> super::WebRtcPtyOutput {
+        for _ in 0..20 {
+            hub.tokio_runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            });
+
+            let rx = hub
+                .webrtc_pty_output_rx
+                .as_mut()
+                .expect("webrtc output rx");
+            while let Ok(output) = rx.try_recv() {
+                if output.data.first() == Some(&prefix) {
+                    return output;
+                }
+            }
+        }
+
+        panic!("expected webrtc PTY output with prefix {prefix:#x}");
     }
 
     /// TUI subscribe triggers state broadcasts through real Lua handlers.
@@ -6166,22 +6260,21 @@ mod tests {
         );
     }
 
-    // Broker-backed TUI forwarder tests removed — broker module deleted.
+    // Legacy TUI forwarder tests removed during the session-process migration.
     // Session-backed forwarders use local shadow screen snapshots.
-    // Removed: test_tui_forwarder_broker_backed_snapshot_is_prompt
+    // Removed: test_tui_forwarder_snapshot_is_prompt
     // Removed: test_tui_forwarder_no_duplicate_output_during_snapshot_window
     // Removed: test_tui_forwarder_same_dims_issues_resize_pulse_before_snapshot
 }
 
-// Broker-backed test module removed — all tests in this section tested broker-specific
-// code paths (BrokerPtyOutput, BrokerConnection, broker GetSnapshot RPC) that no longer exist.
-// The broker module has been replaced by per-session processes (cli/src/session/).
+// Legacy test module removed — these tests targeted code paths that no longer
+// exist after the session-process migration.
 //
 // Removed tests:
-// - test_tui_forwarder_broker_backed_snapshot_is_prompt
+// - test_tui_forwarder_snapshot_is_prompt
 // - test_tui_forwarder_no_duplicate_output_during_snapshot_window
 // - test_tui_forwarder_same_dims_issues_resize_pulse_before_snapshot
-// - test_headless_broker_probe_replays_cached_osc_color_reply
+// - test_headless_probe_replays_cached_osc_color_reply
 // - test_tui_client_forwards_probe_instead_of_cache_reply
 // - test_browser_client_suppresses_cached_probe_reply
-// - test_backpressure_recovery_fetches_broker_snapshot
+// - test_backpressure_recovery_fetches_snapshot

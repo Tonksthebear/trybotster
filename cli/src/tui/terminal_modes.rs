@@ -39,6 +39,10 @@ pub struct TerminalModes {
     /// `None` means the default has not been set yet — next sync will
     /// always emit the sequence to establish a known baseline.
     outer_cursor_style: Option<CursorStyle>,
+    /// Whether the outer terminal cursor is currently visible.
+    ///
+    /// Mirrored from the focused PTY's DECTCEM state via `CSI ? 25 h/l`.
+    outer_cursor_visible: Option<bool>,
     /// Whether the outer terminal window has OS-level focus.
     terminal_focused: bool,
 }
@@ -52,6 +56,7 @@ impl TerminalModes {
             inner_kitty_enabled: false,
             outer_kitty_enabled: false,
             outer_cursor_style: None,
+            outer_cursor_visible: None,
             terminal_focused: true,
         }
     }
@@ -68,15 +73,16 @@ impl TerminalModes {
     ///
     /// [ghostty]: https://github.com/ghostty-org/ghostty/discussions/7780
     pub fn sync(&mut self, focused_panel: Option<&TerminalPanel>, has_overlay: bool) {
-        let (app_cursor, bp, desired_cursor_style) = focused_panel
+        let (app_cursor, bp, desired_cursor_style, desired_cursor_visible) = focused_panel
             .map(|panel| {
                 (
                     panel.application_cursor(),
                     panel.bracketed_paste(),
                     Some(panel.cursor_style()),
+                    !panel.cursor_hidden(),
                 )
             })
-            .unwrap_or((false, false, None));
+            .unwrap_or((false, false, None, true));
 
         if app_cursor != self.outer_app_cursor {
             self.outer_app_cursor = app_cursor;
@@ -139,6 +145,16 @@ impl TerminalModes {
             };
             let _ = std::io::Write::write_all(&mut std::io::stdout(), seq);
         }
+
+        if self.outer_cursor_visible != Some(desired_cursor_visible) {
+            self.outer_cursor_visible = Some(desired_cursor_visible);
+            let seq: &[u8] = if desired_cursor_visible {
+                b"\x1b[?25h"
+            } else {
+                b"\x1b[?25l"
+            };
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), seq);
+        }
     }
 
     /// Update inner kitty state when the focused PTY's kitty mode changes.
@@ -174,6 +190,17 @@ impl TerminalModes {
     /// Whether the inner PTY has kitty keyboard protocol enabled.
     pub fn inner_kitty_enabled(&self) -> bool {
         self.inner_kitty_enabled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_modes_start_with_visible_cursor() {
+        let modes = TerminalModes::new();
+        assert_eq!(modes.outer_cursor_visible, None);
     }
 }
 

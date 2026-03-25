@@ -189,6 +189,22 @@ function M.set_focused(session_uuid, peer_id, focused)
     if entry then entry.focused = focused end
 end
 
+--- Get all sessions where a specific peer has focus.
+-- @param peer_id string Client peer ID
+-- @return table Array of session_uuid strings
+function M.get_focused_sessions(peer_id)
+    local result = {}
+    local store = get_store()
+    for session_uuid, list in pairs(store) do
+        for _, entry in ipairs(list) do
+            if entry.peer_id == peer_id and entry.focused then
+                result[#result + 1] = session_uuid
+            end
+        end
+    end
+    return result
+end
+
 --- Check if any client is currently focused on a session.
 -- Used by the push notification handler to suppress notifications
 -- when at least one client is actively viewing the PTY.

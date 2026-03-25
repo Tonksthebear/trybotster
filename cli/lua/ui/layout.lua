@@ -69,6 +69,43 @@ local WORKSPACE_STATUS_ICON = {
   closed            = { text = "·", style = "dim" },
 }
 
+local function session_primary_name(agent, fallback)
+  local has_label = agent.label and agent.label:match("%S")
+  if has_label then
+    return agent.label, true
+  end
+  return agent.display_name or agent.branch_name or fallback, false
+end
+
+local function session_secondary_parts(agent, using_label)
+  local parts = {}
+  local title = agent.title and agent.title:match("%S") and agent.title or nil
+
+  if using_label and title and title ~= agent.label then
+    parts[#parts + 1] = title
+  end
+  if agent.target_name then parts[#parts + 1] = agent.target_name end
+  if agent.branch_name then parts[#parts + 1] = agent.branch_name end
+  local config_name = agent.agent_name or agent.profile_name
+  if config_name then parts[#parts + 1] = config_name end
+  if agent.task and agent.task ~= "" then parts[#parts + 1] = agent.task end
+
+  return parts
+end
+
+local function session_activity_icon(agent)
+  if agent.notification then
+    return { text = "● ", style = { fg = "yellow" } }
+  end
+  if agent.session_type ~= "agent" then
+    return nil
+  end
+  if agent.is_idle then
+    return { text = "◌ ", style = { fg = "blue", modifier = "dim" } }
+  end
+  return { text = "✺ ", style = { fg = "green" } }
+end
+
 -- =============================================================================
 -- Helper: Build list items from workspace-grouped state (Phase 3)
 -- =============================================================================
@@ -130,26 +167,14 @@ local function build_list_items()
       -- Agent row: indented under workspace header
       local agent = agents_by_id[entry.agent_id]
       if agent then
-        -- Label is primary display name when present
-        local has_label    = agent.label and agent.label:match("%S")
-        local name         = has_label and agent.label
-                             or (agent.display_name or agent.branch_name or entry.agent_id)
-        local notification = agent.notification
-
-        -- Activity indicator for agent sessions
-        local is_active = agent.session_type == "agent" and not agent.is_idle
+        local name, using_label = session_primary_name(agent, entry.agent_id)
+        local activity_icon = session_activity_icon(agent)
 
         local text
-        if notification then
+        if activity_icon then
           text = {
             { text = "  " },
-            { text = "● ", style = { fg = "yellow" } },
-            { text = name },
-          }
-        elseif is_active then
-          text = {
-            { text = "  " },
-            { text = "✦ ", style = { fg = "green" } },
+            activity_icon,
             { text = name },
           }
         else
@@ -160,13 +185,7 @@ local function build_list_items()
         end
 
         local item = { text = text }
-        -- Secondary: spawn target name · branch · config name, plus task
-        local parts = {}
-        if agent.target_name then parts[#parts+1] = agent.target_name end
-        if agent.branch_name then parts[#parts+1] = agent.branch_name end
-        local config_name = agent.agent_name or agent.profile_name
-        if config_name then parts[#parts+1] = config_name end
-        if agent.task and agent.task ~= "" then parts[#parts+1] = agent.task end
+        local parts = session_secondary_parts(agent, using_label)
         if #parts > 0 then
           item.secondary = { { text = "  " .. table.concat(parts, " · "), style = "dim" } }
         end
@@ -208,33 +227,19 @@ local function build_agent_items(state)
 
   -- Existing agents from client-side cache
   for _, agent in ipairs(_tui_state and _tui_state.agents or {}) do
-    -- Label is primary display name when present
-    local has_label = agent.label and agent.label:match("%S")
-    local name = has_label and agent.label
-                 or (agent.display_name or agent.branch_name)
-    -- Activity indicator for agent sessions
-    local is_active = agent.session_type == "agent" and not agent.is_idle
+    local name, using_label = session_primary_name(agent)
+    local activity_icon = session_activity_icon(agent)
 
     local item
-    if agent.notification then
+    if activity_icon then
       item = { text = {
-        { text = "● ", style = { fg = "yellow" } },
-        { text = name },
-      } }
-    elseif is_active then
-      item = { text = {
-        { text = "✦ ", style = { fg = "green" } },
+        activity_icon,
         { text = name },
       } }
     else
       item = { text = name }
     end
-    -- Secondary: spawn target name · branch · config name
-    local secondary_parts = {}
-    if agent.target_name then secondary_parts[#secondary_parts+1] = agent.target_name end
-    if agent.branch_name then secondary_parts[#secondary_parts+1] = agent.branch_name end
-    local config_name = agent.agent_name or agent.profile_name
-    if config_name then secondary_parts[#secondary_parts+1] = config_name end
+    local secondary_parts = session_secondary_parts(agent, using_label)
     if #secondary_parts > 0 then
       item.secondary = { { text = table.concat(secondary_parts, " · "), style = "dim" } }
     end

@@ -83,27 +83,99 @@ const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
 /// start missing events. Set high enough to handle bursts of output.
 const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
 
-/// Event listener that routes alacritty terminal events to the PTY broadcast channel.
+/// A pre-formatted color response ready to write to the PTY.
+#[derive(Debug)]
+pub struct FormattedColorResponse {
+    /// The complete OSC response string.
+    pub response: String,
+}
+
+/// Event listener that routes alacritty terminal events to the PTY broadcast
+/// channel and resolves `ColorRequest` events against cached boot-probe colors.
 ///
-/// Installed on hub-side shadow screens so that title changes detected by the
-/// alacritty parser are automatically broadcast as [`PtyEvent::TitleChanged`].
+/// Installed on hub-side shadow screens. Title changes are broadcast as
+/// [`PtyEvent::TitleChanged`]. Color requests are resolved against cached
+/// RGB values and buffered as formatted responses for the session reader
+/// thread to drain after each `process()` call.
 #[derive(Clone)]
 pub struct HubEventListener {
     /// Broadcast sender for PTY events.
     event_tx: broadcast::Sender<PtyEvent>,
+    /// Cached RGB values for dynamic colors (set from boot probe).
+    ///
+    /// When a `ColorRequest` fires, the formatter is called with the cached
+    /// RGB to produce the response string. Indexed by alacritty color index
+    /// (256=fg, 257=bg, 258=cursor).
+    cached_colors: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, alacritty_terminal::vte::ansi::Rgb>>>,
+    /// Buffered formatted color responses (drained by session reader).
+    pending_color_responses: std::sync::Arc<std::sync::Mutex<Vec<FormattedColorResponse>>>,
 }
 
 impl HubEventListener {
     /// Create a new listener that routes events to the given broadcast channel.
     pub fn new(event_tx: broadcast::Sender<PtyEvent>) -> Self {
-        Self { event_tx }
+        Self {
+            event_tx,
+            cached_colors: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_color_responses: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
     }
+
+    /// Create a listener with a shared color cache from the hub.
+    ///
+    /// All sessions share the same cache so boot probe colors are
+    /// immediately available when the first `ColorRequest` fires.
+    pub fn with_color_cache(
+        event_tx: broadcast::Sender<PtyEvent>,
+        cached_colors: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, alacritty_terminal::vte::ansi::Rgb>>>,
+    ) -> Self {
+        Self {
+            event_tx,
+            cached_colors,
+            pending_color_responses: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Drain all buffered color responses since the last call.
+    ///
+    /// Called by the session reader thread after `shadow_screen.process()`.
+    pub fn drain_color_responses(&self) -> Vec<FormattedColorResponse> {
+        self.pending_color_responses
+            .lock()
+            .ok()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default()
+    }
+
 }
 
 impl EventListener for HubEventListener {
     fn send_event(&self, event: Event) {
-        if let Event::Title(title) = event {
-            let _ = self.event_tx.send(PtyEvent::title_changed(title));
+        match event {
+            Event::Title(title) => {
+                let _ = self.event_tx.send(PtyEvent::title_changed(title));
+            }
+            Event::ResetTitle => {
+                let _ = self.event_tx.send(PtyEvent::title_changed(String::new()));
+            }
+            Event::ColorRequest(index, formatter) => {
+                // Look up cached RGB and format the response immediately.
+                // If no cached value exists, the request is silently dropped.
+                if let Ok(colors) = self.cached_colors.lock() {
+                    if let Some(&rgb) = colors.get(&index) {
+                        let response = formatter(rgb);
+                        if let Ok(mut pending) = self.pending_color_responses.lock() {
+                            pending.push(FormattedColorResponse { response });
+                        }
+                    }
+                }
+            }
+            // PtyWrite (DSR/DA) and TextAreaSizeRequest (XTWINOPS) are NOT
+            // handled here — the session process's own alacritty parser writes
+            // these directly to the PTY fd. Handling them here would cause
+            // double-writes.
+            Event::PtyWrite(_) | Event::TextAreaSizeRequest(_) => {}
+            _ => {}
         }
     }
 }
@@ -243,7 +315,7 @@ pub struct PtySession {
     ///
     /// Updated by the reader thread from `parser.cursor_hidden()` after
     /// processing each output chunk. Read by `PtySessionHandle::cursor_visible()`
-    /// and `PtyHandle` without requiring a broker RPC.
+    /// and `PtyHandle` without requiring any round-trip to the session process.
     cursor_visible: Arc<AtomicBool>,
 
     /// Whether the shadow screen was resized without the application redrawing.
@@ -377,14 +449,13 @@ impl PtySession {
     }
 
     // =========================================================================
-    // Broker integration
+    // PTY introspection
     // =========================================================================
 
     /// Get the raw file descriptor of the master PTY.
     ///
-    /// Used by the broker integration to send the FD via SCM_RIGHTS for
-    /// zero-downtime Hub restarts.  The kernel duplicates the FD during the
-    /// `sendmsg()` call, so the `PtySession` retains its own copy.
+    /// Exposes the PTY master FD for low-level integration. The kernel
+    /// duplicates the FD during `sendmsg()` when passed to another process.
     ///
     /// Returns `None` if the PTY has not been spawned yet.
     #[cfg(unix)]
@@ -399,8 +470,7 @@ impl PtySession {
 
     /// Get the child process ID.
     ///
-    /// Used by the broker to track and kill the child if the Hub disconnects
-    /// without sending a `KillAll`.
+    /// Exposes the PTY child PID for low-level integration.
     ///
     /// Returns `None` if the PTY has not been spawned yet.
     pub fn get_child_pid(&self) -> Option<u32> {
@@ -470,9 +540,8 @@ impl PtySession {
         self.set_child(child);
         self.set_writer(pair.master.take_writer()?);
 
-        // The broker is the sole reader of the PTY master FD.
-        // Output reaches the Hub via BrokerPtyOutput → feed_broker_output.
-        // No Hub-side reader thread is started here.
+        // The session process is the sole reader of the PTY master FD.
+        // Output is forwarded to the hub over the session socket.
         self.set_master_pty(pair.master);
 
         // Start command processor task
@@ -923,6 +992,7 @@ fn process_single_command(cmd: PtyCommand, shared_state: &Arc<Mutex<SharedPtySta
 /// See `PtySession::resize` for detailed rationale.
 ///
 /// Exposed as `pub(crate)` for direct sync resize from `PtyHandle`.
+#[cfg(test)]
 pub(crate) fn do_resize(
     rows: u16,
     cols: u16,
