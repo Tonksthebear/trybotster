@@ -10,7 +10,7 @@ module Integrations
       TOKEN_PREFIX = "btmcp_"
       TOKEN_LENGTH = 32
 
-      belongs_to :device
+      belongs_to :hub
 
       encrypts :token, deterministic: true
 
@@ -26,9 +26,9 @@ module Integrations
         "#{TOKEN_PREFIX}...#{token.last(8)}"
       end
 
-      # Convenience method to get the user through device
+      # Convenience method to get the user through hub
       def user
-        device&.user
+        hub&.user
       end
 
       private

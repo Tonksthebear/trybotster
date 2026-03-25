@@ -4,7 +4,7 @@
 #
 # Agents use MCP tokens for scoped access to MCP operations only.
 # Tokens are passed as Bearer tokens in the Authorization header.
-class DeviceTokenIdentifier < ActionMCP::GatewayIdentifier
+class HubTokenIdentifier < ActionMCP::GatewayIdentifier
   identifier :user
   authenticates :api_key
 
