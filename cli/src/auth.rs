@@ -356,8 +356,8 @@ pub fn validate_token(server_url: &str, token: &str) -> bool {
         }
     };
 
-    // Try to list devices - a simple authenticated endpoint
-    let url = format!("{}/devices", server_url);
+    // Try to list hubs - a simple authenticated endpoint
+    let url = format!("{}/hubs", server_url);
     println!("  Validating token against {}...", url);
 
     match client.get(&url).bearer_auth(token).send() {

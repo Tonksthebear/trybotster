@@ -4838,16 +4838,16 @@ impl Hub {
         );
     }
 
-    /// Notify Rails that this device's notifications_enabled flag changed.
+    /// Notify Rails that this hub's notifications_enabled flag changed.
     ///
-    /// PATCHes `/devices/{device_id}` with the new value. Fire-and-forget:
+    /// PATCHes `/hubs/{hub_id}` with the new value. Fire-and-forget:
     /// a failure here doesn't block the push subscription flow.
     fn set_notifications_enabled(&self, enabled: bool) {
-        let Some(device_id) = self.device.device_id else {
-            log::warn!("[WebPush] No device_id, cannot update notifications_enabled on Rails");
+        let Some(ref hub_id) = self.botster_id else {
+            log::warn!("[WebPush] No hub_id, cannot update notifications_enabled on Rails");
             return;
         };
-        let url = format!("{}/devices/{}", self.config.server_url, device_id);
+        let url = format!("{}/hubs/{}", self.config.server_url, hub_id);
         let body = serde_json::json!({ "notifications_enabled": enabled });
         // block_in_place: reqwest::blocking cannot run inside a tokio runtime
         // (it drops an internal runtime, which panics in async context).
@@ -5041,11 +5041,6 @@ impl Hub {
 
     // === Connection Setup ===
 
-    /// Register the device with the server if not already registered.
-    pub(crate) fn register_device(&mut self) {
-        registration::register_device(&mut self.device, &self.client, &self.config);
-    }
-
     /// Register the hub with the server and store the server-assigned ID.
     ///
     /// The server-assigned `botster_id` is used for all URLs and WebSocket subscriptions
@@ -5056,7 +5051,7 @@ impl Hub {
             &self.hub_identifier,
             &self.config.server_url,
             self.config.get_api_key(),
-            self.device.device_id,
+            &self.device.fingerprint,
             self.config.hub_name.as_deref(),
         );
         // Store server-assigned ID (used for all server communication)
@@ -5268,7 +5263,7 @@ mod tests {
             // This is exactly what set_notifications_enabled did:
             // blocking HTTP inside the select! loop's block_on context.
             let _ = client
-                .patch("http://127.0.0.1:1/devices/1")
+                .patch("http://127.0.0.1:1/hubs/1")
                 .json(&serde_json::json!({"notifications_enabled": true}))
                 .send();
         });
@@ -5287,7 +5282,7 @@ mod tests {
             tokio::task::block_in_place(|| {
                 // Will fail to connect (no server), but won't panic
                 let result = client
-                    .patch("http://127.0.0.1:1/devices/1")
+                    .patch("http://127.0.0.1:1/hubs/1")
                     .json(&serde_json::json!({"notifications_enabled": true}))
                     .send();
                 assert!(result.is_err()); // connection refused, not a panic
