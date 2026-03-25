@@ -64,8 +64,7 @@
 
         <%# Template for each agent item %>
         <template data-agent-list-target="template">
-          <div class="group relative flex items-center gap-1 rounded transition-colors hover:bg-zinc-800/50 data-[selected=true]:bg-primary-500/20">
-            <span data-notification-badge class="hidden absolute top-0.5 right-0.5 size-2 rounded-full bg-yellow-400 ring-2 ring-zinc-900 animate-pulse"></span>
+          <div class="group relative flex items-center gap-1 rounded transition-colors hover:bg-zinc-800/50 data-[selected=true]:bg-primary-500/20 border-l-2 border-l-transparent data-[notification=true]:border-l-yellow-400">
             <a data-href="/hubs/{hubId}/sessions/{sessionUuid}"
                data-agent-id
                data-action="agent-list#select"

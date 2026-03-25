@@ -460,10 +460,11 @@ export default class extends Controller {
       root.dataset.selected = "true";
     }
 
-    // Notification badge
-    const badge = root.querySelector("[data-notification-badge]");
-    if (badge) {
-      badge.classList.toggle("hidden", !agent.notification);
+    // Notification left border (via data attribute)
+    if (agent.notification) {
+      root.dataset.notification = "true";
+    } else {
+      delete root.dataset.notification;
     }
 
     this.#renderActivityIndicator(root, agent, isAccessory);

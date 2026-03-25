@@ -12,8 +12,8 @@ Rails.application.config.after_initialize do
       auth_header = request.headers["Authorization"] || env["HTTP_AUTHORIZATION"]
       if auth_header.present? && auth_header.start_with?("Bearer ")
         token = auth_header.sub("Bearer ", "")
-        device_token = HubToken.find_by(token: token)
-        return true if device_token.present?
+        hub_token = HubToken.find_by(token: token)
+        return true if hub_token.present?
       end
 
       # Otherwise, fall back to default origin checking

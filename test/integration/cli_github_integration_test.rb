@@ -202,7 +202,6 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
 
     # Create hub token for CLI authentication
     hub_token = hub.hub_token || hub.create_hub_token!(name: "CLI Test Token #{SecureRandom.hex(4)}")
-    device_token = hub_token
     api_key = hub_token.token
 
     log_file_path = File.join(temp_dir, "botster.log")
@@ -252,7 +251,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
       temp_dir: temp_dir,
       log_thread: nil,
       log_file_path: log_file_path,
-      device_token: device_token
+      hub_token: hub_token
     )
 
     log_thread = Thread.new do

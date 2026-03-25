@@ -94,16 +94,30 @@ local function session_secondary_parts(agent, using_label)
 end
 
 local function session_activity_icon(agent)
+  local spans = {}
+
+  -- Colored left bar for notifications (independent of idle/active)
   if agent.notification then
-    return { text = "● ", style = { fg = "yellow" } }
+    spans[#spans + 1] = { text = "▎", style = { fg = "yellow" } }
   end
+
   if agent.session_type ~= "agent" then
+    if #spans > 0 then
+      spans[#spans].text = spans[#spans].text .. " "
+      return spans
+    end
     return nil
   end
+
+  -- Idle/active indicator
   if agent.is_idle then
-    return { text = "◌ ", style = { fg = "blue", modifier = "dim" } }
+    spans[#spans + 1] = { text = "◌ ", style = { fg = "blue", modifier = "dim" } }
+  else
+    spans[#spans + 1] = { text = "✺ ", style = { fg = "green" } }
   end
-  return { text = "✺ ", style = { fg = "green" } }
+
+  if #spans == 0 then return nil end
+  return spans
 end
 
 -- =============================================================================
@@ -171,18 +185,13 @@ local function build_list_items()
         local activity_icon = session_activity_icon(agent)
 
         local text
+        text = { { text = "  " } }
         if activity_icon then
-          text = {
-            { text = "  " },
-            activity_icon,
-            { text = name },
-          }
-        else
-          text = {
-            { text = "  " },
-            { text = name },
-          }
+          for _, span in ipairs(activity_icon) do
+            text[#text + 1] = span
+          end
         end
+        text[#text + 1] = { text = name }
 
         local item = { text = text }
         local parts = session_secondary_parts(agent, using_label)
@@ -232,10 +241,12 @@ local function build_agent_items(state)
 
     local item
     if activity_icon then
-      item = { text = {
-        activity_icon,
-        { text = name },
-      } }
+      local text = {}
+      for _, span in ipairs(activity_icon) do
+        text[#text + 1] = span
+      end
+      text[#text + 1] = { text = name }
+      item = { text = text }
     else
       item = { text = name }
     end
