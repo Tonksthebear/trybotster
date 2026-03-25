@@ -13,20 +13,16 @@ require_relative "cli_integration_test_case"
 #
 class CliHubRegistrationTest < CliIntegrationTestCase
   test "CLI registers hub on startup" do
-    # Record initial state
-    initial_hub_count = Hub.count
-    initial_last_seen = @hub.last_seen_at
-
-    # Start CLI
+    # Start CLI — it creates/finds its own hub using device-fingerprint identifier
     cli = start_cli(@hub, timeout: 20)
 
     # CLI should be running
     assert cli.running?, "CLI should be running"
 
-    # Hub should have been updated (last_seen_at should be recent)
-    @hub.reload
-    assert @hub.last_seen_at > initial_last_seen, "Hub last_seen_at should be updated"
-    assert @hub.last_seen_at > 5.seconds.ago, "Hub should have been seen recently"
+    # The CLI's hub (resolved after startup) should have recent last_seen_at
+    cli.hub.reload
+    assert cli.hub.last_seen_at > 5.seconds.ago, "Hub should have been seen recently"
+    assert cli.hub.fingerprint.present?, "Hub should have a fingerprint"
   end
 
   test "CLI creates connection URL with vodozemac DeviceKeyBundle" do
@@ -48,20 +44,10 @@ class CliHubRegistrationTest < CliIntegrationTestCase
   end
 
   test "CLI updates hub last_seen_at on registration" do
-    hub = Hub.create!(
-      user: @user,
-      identifier: "cli-update-test-#{SecureRandom.hex(4)}",
-      last_seen_at: 1.hour.ago
-    )
+    cli = start_cli(@hub, timeout: 20)
 
-    cli = start_cli(hub, timeout: 20)
-    @started_clis << cli
-
-    hub.reload
-    assert hub.last_seen_at > 1.minute.ago
-
-    # Cleanup
-    hub.destroy
+    cli.hub.reload
+    assert cli.hub.last_seen_at > 1.minute.ago, "CLI hub should have recent last_seen_at"
   end
 
   test "CLI process can be stopped cleanly" do
