@@ -33,7 +33,6 @@ Rails.application.routes.draw do
       resources :notifications, only: [ :create ]
       resource :webrtc, only: [ :show ], controller: :webrtc  # GET config
       resource :settings, only: [ :show ], controller: :settings
-      resource :device, only: [ :show ], controller: :device
       resource :pairing, only: [ :show ], controller: :pairing
       # Session terminal view by session UUID
       # /hubs/:hub_id/sessions/:session_uuid - terminal for a specific session
@@ -49,19 +48,16 @@ Rails.application.routes.draw do
   # Integration-specific endpoints
   namespace :integrations do
     namespace :github do
-      # MCP token creation/refresh for plugins (bearer auth via device token)
+      # MCP token creation/refresh for plugins (bearer auth via hub token)
       resources :mcp_tokens, only: [ :create ]
     end
   end
 
-  # E2E devices (browser keypairs - no heartbeat, they're session-based)
-  resources :devices, only: [ :index, :create, :update, :destroy ]
+  # Browser key registration (E2E keypairs - backward compat with CLI API calls)
+  resources :devices, only: [ :index, :create, :destroy ]
 
   # User settings
   resource :settings, only: [ :show ]
-  namespace :settings do
-    resources :devices, only: [ :index, :show ]
-  end
 
   # Documentation (public)
   get "docs", to: "docs#show", as: :docs

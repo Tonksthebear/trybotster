@@ -18,7 +18,7 @@
         <% end %>
       </div>
       <div class="hubs-list flex-1 overflow-y-auto px-2 pb-2">
-        <%= render "layouts/sidebar_hubs", hubs: Current.user.hubs.includes(:device).order(last_seen_at: :desc) %>
+        <%= render "layouts/sidebar_hubs", hubs: Current.user.hubs.order(last_seen_at: :desc) %>
       </div>
     </div>
 
@@ -113,12 +113,12 @@
 
   <%# Bottom section - Docs, Settings & User %>
   <div class="shrink-0 border-t border-zinc-800">
-    <%# Device Settings - only when viewing a hub with a device %>
-    <% if Current.hub&.device %>
-      <%= link_to hub_device_path(Current.hub),
+    <%# Hub Settings - only when viewing a hub %>
+    <% if Current.hub %>
+      <%= link_to hub_settings_path(Current.hub),
           class: "flex items-center gap-3 px-4 py-3 text-sm text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200 transition-colors" do %>
-          <%= icon "device-phone-mobile", class: "size-5" %>
-        <span>Device Settings</span>
+          <%= icon "cog-6-tooth", class: "size-5" %>
+        <span>Hub Settings</span>
       <% end %>
     <% end %>
 

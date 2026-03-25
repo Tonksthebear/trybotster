@@ -74,7 +74,7 @@ module Users
 
     def find_authorization(code)
       normalized = normalize_user_code(code)
-      DeviceAuthorization.find_by(user_code: normalized) if normalized.present?
+      HubAuthorization.find_by(user_code: normalized) if normalized.present?
     end
 
     def normalize_user_code(code)

@@ -10,10 +10,10 @@ module Hubs
   #
   # Auth:
   # - Browser: session auth (current_user)
-  # - CLI: DeviceToken Bearer auth
+  # - CLI: HubToken Bearer auth
   class WebrtcController < ApplicationController
     skip_before_action :verify_authenticity_token
-    before_action :authenticate_user_or_device!
+    before_action :authenticate_user_or_hub!
     before_action :set_hub
 
     # GET /hubs/:hub_id/webrtc
@@ -24,35 +24,31 @@ module Hubs
 
     private
 
-    def authenticate_user_or_device!
+    def authenticate_user_or_hub!
       return if current_user
-      return if authenticate_device_from_token
+      return if authenticate_hub_from_token
 
       render json: { error: "Unauthorized" }, status: :unauthorized
     end
 
-    def authenticate_device_from_token
+    def authenticate_hub_from_token
       auth_header = request.headers["Authorization"]
       return false unless auth_header&.start_with?("Bearer ")
 
       token = auth_header.split(" ", 2).last
-      device = DeviceToken.find_by(token: token)&.device
-      return false unless device
+      hub_token = HubToken.find_by(token: token)
+      return false unless hub_token&.hub
 
-      @current_device = device
+      @current_hub_from_token = hub_token.hub
       true
-    end
-
-    def current_device
-      @current_device
     end
 
     def set_hub
       @hub = if current_user
                current_user.hubs.find_by(id: params[:hub_id])
-      elsif current_device
-               # Device belongs to user, check user's hubs
-               current_device.user.hubs.find_by(id: params[:hub_id])
+      elsif @current_hub_from_token
+               # Verify the token's hub matches the requested hub
+               @current_hub_from_token if @current_hub_from_token.id == params[:hub_id].to_i
       end
 
       render json: { error: "Hub not found" }, status: :not_found unless @hub

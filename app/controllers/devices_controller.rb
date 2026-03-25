@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
-# Manages device registration for E2E encrypted terminal access.
+# Manages browser key registration for E2E encrypted terminal access.
+#
+# POST /devices (device_type: "browser") → creates BrowserKey
+# GET /devices → returns browser keys for key exchange
 class DevicesController < ApplicationController
   include ApiKeyAuthenticatable
 
@@ -9,63 +12,49 @@ class DevicesController < ApplicationController
   before_action :authenticate_device_request!
 
   # GET /devices
-  # List all devices for the current user (for key exchange)
+  # List all browser keys for the current user (for key exchange)
   def index
-    devices = current_device_user.devices.by_last_seen
+    browser_keys = current_device_user.browser_keys.by_last_seen
 
-    render json: devices.map { |d| device_json(d) }
+    render json: browser_keys.map { |bk| browser_key_json(bk) }
   end
 
   # POST /devices
-  # Register a new device (CLI or browser)
+  # Register a browser key (browser E2E key exchange)
   def create
-    fingerprint = params[:fingerprint]
-    public_key = params[:public_key]
-
-    # Browser devices always send public_key (they need it for key exchange)
-    if params[:device_type] == "browser"
-      device = current_device_user.devices.find_or_initialize_by(public_key: public_key)
-    elsif fingerprint.present?
-      device = current_device_user.devices.find_or_initialize_by(fingerprint: fingerprint)
-    elsif public_key.present?
-      device = current_device_user.devices.find_or_initialize_by(public_key: public_key)
-    else
-      render json: { error: "Either fingerprint or public_key is required" }, status: :bad_request
+    unless params[:device_type] == "browser"
+      render json: { error: "Only browser device_type is supported" }, status: :bad_request
       return
     end
 
-    device.assign_attributes(
-      device_type: params.require(:device_type),
+    public_key = params[:public_key]
+    unless public_key.present?
+      render json: { error: "public_key is required" }, status: :bad_request
+      return
+    end
+
+    browser_key = current_device_user.browser_keys.find_or_initialize_by(public_key: public_key)
+    browser_key.assign_attributes(
       name: params.require(:name),
-      public_key: public_key,
-      fingerprint: fingerprint.presence || device.fingerprint,
       last_seen_at: Time.current
     )
 
-    if device.save
+    if browser_key.save
       render json: {
-        device_id: device.id,
-        fingerprint: device.fingerprint,
-        created: device.previously_new_record?
-      }, status: device.previously_new_record? ? :created : :ok
+        device_id: browser_key.id,
+        fingerprint: browser_key.fingerprint,
+        created: browser_key.previously_new_record?
+      }, status: browser_key.previously_new_record? ? :created : :ok
     else
-      render json: { errors: device.errors.full_messages }, status: :unprocessable_entity
+      render json: { errors: browser_key.errors.full_messages }, status: :unprocessable_entity
     end
   end
 
-  # PATCH /devices/:id
-  # Update device attributes (currently: notifications_enabled)
-  def update
-    device = current_device_user.devices.find(params[:id])
-    device.update!(params.permit(:notifications_enabled))
-    render json: device_json(device)
-  end
-
   # DELETE /devices/:id
-  # Remove a device (and revoke its access)
+  # Remove a browser key
   def destroy
-    device = current_device_user.devices.find(params[:id])
-    device.destroy!
+    browser_key = current_device_user.browser_keys.find(params[:id])
+    browser_key.destroy!
 
     head :no_content
   end
@@ -84,17 +73,15 @@ class DevicesController < ApplicationController
     current_api_user || current_user
   end
 
-  def device_json(device)
+  def browser_key_json(bk)
     {
-      id: device.id,
-      name: device.name,
-      device_type: device.device_type,
-      public_key: device.public_key,
-      fingerprint: device.fingerprint,
-      last_seen_at: device.last_seen_at,
-      active: device.active?,
-      hubs_count: device.hubs.active.count,
-      notifications_enabled: device.notifications_enabled
+      id: bk.id,
+      name: bk.name,
+      device_type: "browser",
+      public_key: bk.public_key,
+      fingerprint: bk.fingerprint,
+      last_seen_at: bk.last_seen_at,
+      active: bk.active?
     }
   end
 end
