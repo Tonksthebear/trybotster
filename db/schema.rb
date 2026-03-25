@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_02_20_041932) do
+ActiveRecord::Schema[8.1].define(version: 2026_03_25_172100) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -82,47 +82,17 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_20_041932) do
     t.index ["session_id"], name: "index_action_mcp_sse_events_on_session_id"
   end
 
-  create_table "device_authorizations", force: :cascade do |t|
+  create_table "browser_keys", force: :cascade do |t|
     t.datetime "created_at", null: false
-    t.string "device_code", null: false
-    t.string "device_name"
-    t.datetime "expires_at", null: false
-    t.string "fingerprint"
-    t.string "status", default: "pending", null: false
-    t.datetime "updated_at", null: false
-    t.string "user_code", null: false
-    t.bigint "user_id"
-    t.index ["device_code"], name: "index_device_authorizations_on_device_code", unique: true
-    t.index ["user_code"], name: "index_device_authorizations_on_user_code", unique: true
-    t.index ["user_id"], name: "index_device_authorizations_on_user_id"
-  end
-
-  create_table "device_tokens", force: :cascade do |t|
-    t.datetime "created_at", null: false
-    t.bigint "device_id", null: false
-    t.string "last_ip"
-    t.datetime "last_used_at"
-    t.string "name"
-    t.string "token", null: false
-    t.datetime "updated_at", null: false
-    t.index ["device_id"], name: "index_device_tokens_on_device_id"
-    t.index ["token"], name: "index_device_tokens_on_token", unique: true
-  end
-
-  create_table "devices", force: :cascade do |t|
-    t.datetime "created_at", null: false
-    t.string "device_type", null: false
     t.string "fingerprint", null: false
     t.datetime "last_seen_at"
     t.string "name", null: false
-    t.boolean "notifications_enabled", default: false, null: false
-    t.string "public_key"
+    t.string "public_key", null: false
     t.datetime "updated_at", null: false
     t.bigint "user_id", null: false
-    t.index ["fingerprint"], name: "index_devices_on_fingerprint"
-    t.index ["public_key"], name: "index_devices_on_public_key", unique: true, where: "(public_key IS NOT NULL)"
-    t.index ["user_id", "device_type"], name: "index_devices_on_user_id_and_device_type"
-    t.index ["user_id"], name: "index_devices_on_user_id"
+    t.index ["public_key"], name: "index_browser_keys_on_public_key", unique: true
+    t.index ["user_id", "fingerprint"], name: "index_browser_keys_on_user_id_and_fingerprint", unique: true
+    t.index ["user_id"], name: "index_browser_keys_on_user_id"
   end
 
   create_table "github_messages", force: :cascade do |t|
@@ -140,6 +110,21 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_20_041932) do
     t.index ["status"], name: "index_github_messages_on_status"
   end
 
+  create_table "hub_authorizations", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.string "device_code", null: false
+    t.string "device_name"
+    t.datetime "expires_at", null: false
+    t.string "fingerprint"
+    t.string "status", default: "pending", null: false
+    t.datetime "updated_at", null: false
+    t.string "user_code", null: false
+    t.bigint "user_id"
+    t.index ["device_code"], name: "index_hub_authorizations_on_device_code", unique: true
+    t.index ["user_code"], name: "index_hub_authorizations_on_user_code", unique: true
+    t.index ["user_id"], name: "index_hub_authorizations_on_user_id"
+  end
+
   create_table "hub_commands", force: :cascade do |t|
     t.datetime "acknowledged_at"
     t.datetime "created_at", null: false
@@ -154,17 +139,30 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_20_041932) do
     t.index ["status"], name: "index_hub_commands_on_status"
   end
 
+  create_table "hub_tokens", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.bigint "hub_id", null: false
+    t.string "last_ip"
+    t.datetime "last_used_at"
+    t.string "name"
+    t.string "token", null: false
+    t.datetime "updated_at", null: false
+    t.index ["hub_id"], name: "index_hub_tokens_on_hub_id"
+    t.index ["token"], name: "index_hub_tokens_on_token", unique: true
+  end
+
   create_table "hubs", force: :cascade do |t|
     t.boolean "alive", default: false, null: false
     t.datetime "created_at", null: false
-    t.bigint "device_id"
+    t.string "fingerprint"
     t.string "identifier", null: false
     t.datetime "last_seen_at", null: false
     t.bigint "message_sequence", default: 0, null: false
     t.string "name"
+    t.boolean "notifications_enabled", default: false, null: false
     t.datetime "updated_at", null: false
     t.bigint "user_id", null: false
-    t.index ["device_id"], name: "index_hubs_on_device_id"
+    t.index ["fingerprint"], name: "index_hubs_on_fingerprint"
     t.index ["identifier"], name: "index_hubs_on_identifier", unique: true
     t.index ["user_id"], name: "index_hubs_on_user_id"
   end
@@ -184,13 +182,13 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_20_041932) do
 
   create_table "integrations_github_mcp_tokens", force: :cascade do |t|
     t.datetime "created_at", null: false
-    t.bigint "device_id", null: false
+    t.bigint "hub_id", null: false
     t.string "last_ip"
     t.datetime "last_used_at"
     t.string "name"
     t.string "token"
     t.datetime "updated_at", null: false
-    t.index ["device_id"], name: "index_integrations_github_mcp_tokens_on_device_id"
+    t.index ["hub_id"], name: "index_integrations_github_mcp_tokens_on_hub_id"
     t.index ["token"], name: "index_integrations_github_mcp_tokens_on_token", unique: true
   end
 
@@ -231,12 +229,11 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_20_041932) do
   add_foreign_key "action_mcp_session_resources", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_session_subscriptions", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_sse_events", "action_mcp_sessions", column: "session_id"
-  add_foreign_key "device_authorizations", "users"
-  add_foreign_key "device_tokens", "devices"
-  add_foreign_key "devices", "users"
+  add_foreign_key "browser_keys", "users"
+  add_foreign_key "hub_authorizations", "users"
   add_foreign_key "hub_commands", "hubs"
-  add_foreign_key "hubs", "devices"
+  add_foreign_key "hub_tokens", "hubs"
   add_foreign_key "hubs", "users"
-  add_foreign_key "integrations_github_mcp_tokens", "devices"
+  add_foreign_key "integrations_github_mcp_tokens", "hubs"
   add_foreign_key "users", "teams"
 end

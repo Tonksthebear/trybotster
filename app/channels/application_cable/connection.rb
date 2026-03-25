@@ -17,18 +17,18 @@ module ApplicationCable
         return user
       end
 
-      # Try DeviceToken auth (for CLI via Authorization header)
-      token = extract_device_token
+      # Try HubToken auth (for CLI via Authorization header)
+      token = extract_hub_token
       Rails.logger.debug "[ActionCable] Authorization header present: #{token.present?}"
 
       if token.present?
-        device_token = DeviceToken.find_by(token: token)
-        if device_token
-          device_token.touch_usage!(ip: request.remote_ip)
-          Rails.logger.info "[ActionCable] Auth via DeviceToken: user=#{device_token.user&.id}"
-          return device_token.user
+        hub_token = HubToken.find_by(token: token)
+        if hub_token
+          hub_token.touch_usage!(ip: request.remote_ip)
+          Rails.logger.info "[ActionCable] Auth via HubToken: user=#{hub_token.user&.id}"
+          return hub_token.user
         else
-          Rails.logger.warn "[ActionCable] DeviceToken not found for provided token"
+          Rails.logger.warn "[ActionCable] HubToken not found for provided token"
         end
       end
 
@@ -36,7 +36,7 @@ module ApplicationCable
       reject_unauthorized_connection
     end
 
-    def extract_device_token
+    def extract_hub_token
       # Bearer token in Authorization header only (no query param for security)
       auth_header = request.headers["HTTP_AUTHORIZATION"] || request.headers["Authorization"]
       return nil unless auth_header.present?

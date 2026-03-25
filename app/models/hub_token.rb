@@ -1,13 +1,13 @@
 # frozen_string_literal: true
 
-# Device token for hub authentication with the API.
+# Hub token for hub authentication with the API.
 #
 # This is the main API token used by the CLI for all hub operations.
-class DeviceToken < ApplicationRecord
+class HubToken < ApplicationRecord
   TOKEN_PREFIX = "btstr_"
   TOKEN_LENGTH = 32
 
-  belongs_to :device
+  belongs_to :hub
 
   encrypts :token, deterministic: true
 
@@ -25,9 +25,8 @@ class DeviceToken < ApplicationRecord
     "#{TOKEN_PREFIX}...#{token.last(8)}"
   end
 
-  # Convenience method to get the user through device
   def user
-    device&.user
+    hub&.user
   end
 
   private

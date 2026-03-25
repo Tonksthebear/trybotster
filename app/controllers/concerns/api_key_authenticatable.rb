@@ -48,10 +48,10 @@ module ApiKeyAuthenticatable
   end
 
   def find_user_by_token(token)
-    device_token = DeviceToken.find_by(token: token)
-    return nil unless device_token
+    hub_token = HubToken.find_by(token: token)
+    return nil unless hub_token
 
-    device_token.touch_usage!(ip: request.remote_ip)
-    device_token.device&.user
+    hub_token.touch_usage!(ip: request.remote_ip)
+    hub_token.user
   end
 end

@@ -1,4 +1,4 @@
-class DeviceAuthorization < ApplicationRecord
+class HubAuthorization < ApplicationRecord
   # User code alphabet - no ambiguous characters (0/O, 1/I/L, 5/S, A/4, U/V)
   USER_CODE_ALPHABET = "BCDFGHJKMNPQRTWXZ2346789".chars.freeze
   USER_CODE_LENGTH = 8
@@ -67,7 +67,7 @@ class DeviceAuthorization < ApplicationRecord
   def generate_user_code
     loop do
       code = Array.new(USER_CODE_LENGTH) { USER_CODE_ALPHABET.sample }.join
-      break code unless DeviceAuthorization.exists?(user_code: code)
+      break code unless HubAuthorization.exists?(user_code: code)
     end
   end
 

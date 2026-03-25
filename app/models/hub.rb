@@ -2,15 +2,17 @@
 
 class Hub < ApplicationRecord
   belongs_to :user
-  belongs_to :device, optional: true  # The CLI device running this hub
   has_many :hub_commands, dependent: :destroy
+  has_one :hub_token, dependent: :destroy
+  has_one :mcp_token, class_name: "Integrations::Github::MCPToken", dependent: :destroy
 
   validates :identifier, presence: true, uniqueness: true
   validates :last_seen_at, presence: true
+  validates :fingerprint, uniqueness: { scope: :user_id }, allow_nil: true
 
   scope :active, -> { where(alive: true).where("last_seen_at > ?", 2.minutes.ago) }
   scope :stale, -> { where(alive: false).or(where("last_seen_at <= ?", 2.minutes.ago)) }
-  scope :with_device, -> { where.not(device_id: nil) }
+  scope :with_notifications, -> { where(notifications_enabled: true) }
 
   after_commit :broadcast_hubs_list
   after_create_commit :broadcast_redirect_to_hub
@@ -19,7 +21,7 @@ class Hub < ApplicationRecord
 
   # Check if this hub supports E2E encrypted terminal access
   def e2e_enabled?
-    device.present?
+    true
   end
 
   # Check if this hub is active (alive flag set and seen within 2 minutes)
@@ -29,7 +31,7 @@ class Hub < ApplicationRecord
 
   # Display name for the hub
   def name
-    read_attribute(:name).presence || device&.name || identifier.truncate(20)
+    read_attribute(:name).presence || identifier.truncate(20)
   end
 
   # Atomically increment and return the next message sequence number.
@@ -54,7 +56,7 @@ class Hub < ApplicationRecord
   end
 
   def broadcast_hubs_list
-    hubs = user.hubs.includes(:device).order(last_seen_at: :desc)
+    hubs = user.hubs.order(last_seen_at: :desc)
 
     Turbo::StreamsChannel.broadcast_update_to(
       [ user, :hubs ],
