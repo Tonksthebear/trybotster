@@ -40,9 +40,9 @@ module CliTestHelper
     include WaitHelper
 
     attr_reader :pid, :hub, :temp_dir, :log_file_path, :started_at
-    attr_accessor :device_token
+    attr_accessor :hub_token
 
-    def initialize(pid:, hub:, stdout_r:, stderr_r:, temp_dir:, log_thread:, log_file_path: nil, device_token: nil, started_at: nil)
+    def initialize(pid:, hub:, stdout_r:, stderr_r:, temp_dir:, log_thread:, log_file_path: nil, hub_token: nil, started_at: nil)
       @pid = pid
       @hub = hub
       @stdout_r = stdout_r
@@ -50,7 +50,7 @@ module CliTestHelper
       @temp_dir = temp_dir
       @log_thread = log_thread
       @log_file_path = log_file_path
-      @device_token = device_token
+      @hub_token = hub_token
       @started_at = started_at || Time.current
       @output_buffer = []
       @mutex = Mutex.new
@@ -89,7 +89,7 @@ module CliTestHelper
       cleanup_socket_file
 
       # Clean up the device token (important for non-transactional tests)
-      @device_token&.destroy
+      @hub_token&.destroy
     end
 
     # Wait for CLI to be ready (connected to relay)
@@ -191,9 +191,9 @@ module CliTestHelper
           path: path,
           enabled: true,
           created_at: now,
-          updated_at: now,
-        },
-      ],
+          updated_at: now
+        }
+      ]
     }
 
     File.write(File.join(path, "spawn_targets.json"), JSON.pretty_generate(payload))
@@ -217,10 +217,10 @@ module CliTestHelper
     hub.update_column(:identifier, local_hub_identifier) if hub.identifier != local_hub_identifier
 
     # Create device token for CLI authentication
-    device_token = create_device_token_for_hub(hub)
-    api_key = device_token.token
-    Rails.logger.info "[CliTestHelper] Created HubToken id=#{device_token.id} token=#{api_key[0..15]}..."
-    Rails.logger.info "[CliTestHelper] HubToken user_id=#{device_token.user&.id}"
+    hub_token = create_hub_token_for_hub(hub)
+    api_key = hub_token.token
+    Rails.logger.info "[CliTestHelper] Created HubToken id=#{hub_token.id} token=#{api_key[0..15]}..."
+    Rails.logger.info "[CliTestHelper] HubToken user_id=#{hub_token.user&.id}"
 
     # Set up environment
     # BOTSTER_ENV=system_test enables test behaviors while making network calls:
@@ -282,7 +282,7 @@ module CliTestHelper
       temp_dir: temp_dir,
       log_thread: nil,
       log_file_path: log_file_path,
-      device_token: device_token,
+      hub_token: hub_token,
       started_at: started_at
     )
 
@@ -361,7 +361,7 @@ module CliTestHelper
     "http://127.0.0.1:#{ENV.fetch('PORT', 3000)}"
   end
 
-  def create_device_token_for_hub(hub)
+  def create_hub_token_for_hub(hub)
     # Create a hub token for the CLI to authenticate
     # Returns the HubToken record (not just the token string) for cleanup
     hub.hub_token || hub.create_hub_token!(name: "CLI Test Token #{SecureRandom.hex(4)}")

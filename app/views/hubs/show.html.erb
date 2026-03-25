@@ -175,8 +175,7 @@
 
         <%# Template for agent cards %>
         <template data-agent-list-target="template">
-          <div class="group relative flex items-center gap-0 bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 hover:border-zinc-700 rounded-lg transition-colors">
-            <span data-notification-badge class="hidden absolute -top-1 -right-1 size-2.5 rounded-full bg-yellow-400 ring-2 ring-zinc-900 animate-pulse"></span>
+          <div class="group relative flex items-center gap-0 bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 hover:border-zinc-700 rounded-lg transition-colors border-l-2 border-l-transparent data-[notification=true]:border-l-yellow-400">
             <a data-href="/hubs/{hubId}/sessions/{sessionUuid}"
                data-agent-id
                class="flex items-center gap-3 px-4 py-3 flex-1 min-w-0">

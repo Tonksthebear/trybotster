@@ -11,7 +11,7 @@ class CollapseDeviceIntoHub < ActiveRecord::Migration[8.1]
       t.datetime :last_seen_at
       t.timestamps
       t.index :public_key, unique: true
-      t.index [:user_id, :fingerprint], unique: true
+      t.index [ :user_id, :fingerprint ], unique: true
     end
 
     # Migrate browser devices to browser_keys
