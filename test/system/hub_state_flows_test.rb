@@ -97,8 +97,7 @@ class HubStateFlowsTest < ApplicationSystemTestCase
   end
 
   def associate_hub_device!
-    cli_device = @hub.user.devices.cli_devices.order(:created_at).last
-    @hub.update!(device: cli_device) if cli_device
+    # No-op after Device→Hub collapse: Hub IS the device now.
   end
 
   def sign_in_and_connect
