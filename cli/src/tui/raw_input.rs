@@ -55,6 +55,21 @@ pub enum InputEvent {
     MouseScroll {
         /// Scroll direction (up or down).
         direction: ScrollDirection,
+        /// Screen column (0-indexed).
+        x: u16,
+        /// Screen row (0-indexed).
+        y: u16,
+    },
+    /// Mouse button event (from SGR mouse encoding).
+    Mouse {
+        /// Which button.
+        button: MouseButton,
+        /// Press, release, or drag.
+        event_type: MouseEventType,
+        /// Screen column (0-indexed).
+        x: u16,
+        /// Screen row (0-indexed).
+        y: u16,
     },
     /// Outer terminal gained focus (`CSI I`).
     FocusGained,
@@ -69,6 +84,28 @@ pub enum ScrollDirection {
     Up,
     /// Scroll down (towards present).
     Down,
+}
+
+/// Mouse button identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    /// Left mouse button.
+    Left,
+    /// Middle mouse button.
+    Middle,
+    /// Right mouse button.
+    Right,
+}
+
+/// Mouse event type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseEventType {
+    /// Button pressed.
+    Press,
+    /// Button released.
+    Release,
+    /// Mouse moved while button held (drag).
+    Drag,
 }
 
 /// Bracketed paste end marker: `ESC[201~`.
@@ -523,8 +560,13 @@ impl RawInputReader {
     }
 
     /// Parse an SGR mouse sequence: ESC [ < Cb ; Cx ; Cy M/m
+    ///
+    /// SGR encoding (button byte `Cb`):
+    /// - Bits 0-1: button (0=left, 1=middle, 2=right)
+    /// - Bit 5 (32): motion flag (set during drag)
+    /// - Values 64/65: scroll up/down
+    /// - Final byte: `M` = press, `m` = release
     fn parse_sgr_mouse(&mut self, seq_len: usize) -> Option<InputEvent> {
-        let raw = self.pending[..seq_len].to_vec();
         let final_byte = self.pending[seq_len - 1];
 
         // Extract parameters: ESC [ < params M
@@ -532,31 +574,61 @@ impl RawInputReader {
         let param_str = String::from_utf8_lossy(&self.pending[3..seq_len - 1]).to_string();
         let parts: Vec<&str> = param_str.split(';').collect();
 
-        self.pending.drain(..seq_len);
-
         if parts.len() < 3 {
-            // Malformed — forward as raw
+            // Malformed — allocate raw bytes only for the error path
+            let raw = self.pending[..seq_len].to_vec();
+            self.pending.drain(..seq_len);
             return Some(InputEvent::Key {
                 descriptor: String::new(),
                 raw_bytes: raw,
             });
         }
 
-        let button = parts[0].parse::<u16>().unwrap_or(0);
+        self.pending.drain(..seq_len);
+
+        let cb = parts[0].parse::<u16>().unwrap_or(0);
+        // SGR coordinates are 1-indexed; convert to 0-indexed.
+        let x = parts[1].parse::<u16>().unwrap_or(1).saturating_sub(1);
+        let y = parts[2].parse::<u16>().unwrap_or(1).saturating_sub(1);
 
         // Scroll wheel: button 64 = up, 65 = down (only on press, 'M')
-        if final_byte == b'M' && (button == 64 || button == 65) {
+        if final_byte == b'M' && (cb & !0x1C == 64 || cb & !0x1C == 65) {
             return Some(InputEvent::MouseScroll {
-                direction: if button == 64 {
+                direction: if cb & 1 == 0 {
                     ScrollDirection::Up
                 } else {
                     ScrollDirection::Down
                 },
+                x,
+                y,
             });
         }
 
-        // Other mouse events — ignore (don't forward to PTY)
-        None
+        // Decode button from low bits (masking out modifier/motion bits).
+        let button_id = cb & 0x03;
+        let is_motion = cb & 32 != 0;
+
+        let button = match button_id {
+            0 => MouseButton::Left,
+            1 => MouseButton::Middle,
+            2 => MouseButton::Right,
+            _ => return None, // Unknown button encoding
+        };
+
+        let event_type = if is_motion {
+            MouseEventType::Drag
+        } else if final_byte == b'm' {
+            MouseEventType::Release
+        } else {
+            MouseEventType::Press
+        };
+
+        Some(InputEvent::Mouse {
+            button,
+            event_type,
+            x,
+            y,
+        })
     }
 
     /// Parse an SS3 sequence (ESC O ...).
@@ -1096,7 +1168,9 @@ mod tests {
         assert!(matches!(
             events[0],
             InputEvent::MouseScroll {
-                direction: ScrollDirection::Up
+                direction: ScrollDirection::Up,
+                x: 9,
+                y: 4,
             }
         ));
     }
@@ -1108,7 +1182,96 @@ mod tests {
         assert!(matches!(
             events[0],
             InputEvent::MouseScroll {
-                direction: ScrollDirection::Down
+                direction: ScrollDirection::Down,
+                x: 9,
+                y: 4,
+            }
+        ));
+    }
+
+    // === Mouse Button Events ===
+
+    #[test]
+    fn test_sgr_left_click_press() {
+        // ESC [ < 0 ; 15 ; 10 M — left button press at (14, 9) 0-indexed
+        let mut r = reader_with_bytes(b"\x1b[<0;15;10M");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            InputEvent::Mouse {
+                button: MouseButton::Left,
+                event_type: MouseEventType::Press,
+                x: 14,
+                y: 9,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_sgr_left_click_release() {
+        // ESC [ < 0 ; 15 ; 10 m — left button release (lowercase m)
+        let mut r = reader_with_bytes(b"\x1b[<0;15;10m");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            InputEvent::Mouse {
+                button: MouseButton::Left,
+                event_type: MouseEventType::Release,
+                x: 14,
+                y: 9,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_sgr_left_drag() {
+        // ESC [ < 32 ; 20 ; 8 M — left button drag (bit 5 set: 0 + 32 = 32)
+        let mut r = reader_with_bytes(b"\x1b[<32;20;8M");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            InputEvent::Mouse {
+                button: MouseButton::Left,
+                event_type: MouseEventType::Drag,
+                x: 19,
+                y: 7,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_sgr_right_click() {
+        // ESC [ < 2 ; 5 ; 3 M — right button press
+        let mut r = reader_with_bytes(b"\x1b[<2;5;3M");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            InputEvent::Mouse {
+                button: MouseButton::Right,
+                event_type: MouseEventType::Press,
+                x: 4,
+                y: 2,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_sgr_middle_click() {
+        // ESC [ < 1 ; 40 ; 12 M — middle button press
+        let mut r = reader_with_bytes(b"\x1b[<1;40;12M");
+        let events = r.parse_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            InputEvent::Mouse {
+                button: MouseButton::Middle,
+                event_type: MouseEventType::Press,
+                x: 39,
+                y: 11,
             }
         ));
     }

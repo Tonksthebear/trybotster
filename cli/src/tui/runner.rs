@@ -64,7 +64,7 @@ use crate::tui::layout::terminal_widget_inner_area;
 use super::actions::TuiAction;
 use super::layout_lua::{KeyContext, LayoutLua, LuaKeyAction};
 use super::qr::ConnectionCodeData;
-use super::raw_input::{InputEvent, RawInputReader, ScrollDirection};
+use super::raw_input::{InputEvent, MouseEventType, RawInputReader, ScrollDirection};
 
 /// Default scrollback lines for VT100 parser.
 
@@ -200,6 +200,27 @@ pub struct TuiRunner<B: Backend> {
     /// terminal window is focused. Only sends `FocusChanged` when this
     /// value actually transitions.
     notification_focused: bool,
+
+    // === Mouse State ===
+    /// Cached widget areas from the last render pass, for mouse hit-testing.
+    /// Keyed by widget ID (session_uuid for terminals, `id` prop for others).
+    last_widget_areas: std::collections::HashMap<String, super::render::WidgetArea>,
+
+    /// Widget currently "captured" by a mouse drag. Set on mouse-down,
+    /// cleared on mouse-up. While set, all mouse events route to this
+    /// widget regardless of cursor position.
+    mouse_capture: Option<MouseCapture>,
+}
+
+/// State for an active mouse drag capture.
+#[derive(Debug, Clone)]
+struct MouseCapture {
+    /// Widget ID that captured the mouse.
+    widget_id: String,
+    /// Widget type (e.g., "terminal", "list").
+    widget_type: String,
+    /// Widget rect at capture time (for stable local coordinate calculation).
+    origin_rect: ratatui::layout::Rect,
 }
 
 impl<B: Backend> std::fmt::Debug for TuiRunner<B>
@@ -269,6 +290,8 @@ where
             focused_input_id: None,
             dirty: true, // render on first frame
             notification_focused: false,
+            last_widget_areas: std::collections::HashMap::new(),
+            mouse_capture: None,
         }
     }
 
@@ -495,7 +518,7 @@ where
 
         for event in events {
             match &event {
-                InputEvent::MouseScroll { direction } if !self.has_overlay => {
+                InputEvent::MouseScroll { direction, .. } if !self.has_overlay => {
                     self.dirty = true;
                     scroll_event_count += 1;
                     // Acceleration: first event = 1 line, then ramp up.
@@ -508,6 +531,18 @@ where
                 }
                 InputEvent::MouseScroll { .. } => {
                     // Overlay active — swallow scroll events.
+                }
+                InputEvent::Mouse {
+                    button,
+                    event_type,
+                    x,
+                    y,
+                } if !self.has_overlay => {
+                    self.dirty = true;
+                    self.handle_mouse_event(*button, *event_type, *x, *y, layout_lua);
+                }
+                InputEvent::Mouse { .. } => {
+                    // Overlay active — swallow mouse events.
                 }
                 InputEvent::FocusGained => {
                     self.terminal_modes.on_focus_gained();
@@ -613,6 +648,125 @@ where
         }
     }
 
+    /// Handle a mouse button event (press, drag, release).
+    ///
+    /// Implements GUI-style pointer capture semantics:
+    /// - Press: hit-test widget areas, set capture, dispatch to Lua
+    /// - Drag: route to captured widget regardless of cursor position
+    /// - Release: route to captured widget, clear capture
+    /// - Modal blocking: only overlay widgets receive events when overlay active
+    fn handle_mouse_event(
+        &mut self,
+        button: super::raw_input::MouseButton,
+        event_type: MouseEventType,
+        x: u16,
+        y: u16,
+        layout_lua: Option<&super::layout_lua::LayoutLua>,
+    ) {
+        let button_str = match button {
+            super::raw_input::MouseButton::Left => "left",
+            super::raw_input::MouseButton::Middle => "middle",
+            super::raw_input::MouseButton::Right => "right",
+        };
+
+        // Resolve the target widget and local coordinates based on event type.
+        let target: Option<(String, String, ratatui::layout::Rect, u16, u16)> = match event_type {
+            MouseEventType::Press => {
+                // Hit-test: find which widget contains (x, y)
+                let hit = self.last_widget_areas.iter().find(|(_, area)| {
+                    let r = &area.rect;
+                    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+                });
+
+                if let Some((widget_id, area)) = hit {
+                    let local_x = x.saturating_sub(area.rect.x);
+                    let local_y = y.saturating_sub(area.rect.y);
+
+                    let capture = MouseCapture {
+                        widget_id: widget_id.clone(),
+                        widget_type: area.widget_type.clone(),
+                        origin_rect: area.rect,
+                    };
+                    let result = Some((
+                        widget_id.clone(),
+                        area.widget_type.clone(),
+                        area.rect,
+                        local_x,
+                        local_y,
+                    ));
+                    self.mouse_capture = Some(capture);
+                    result
+                } else {
+                    None
+                }
+            }
+            MouseEventType::Drag => {
+                self.mouse_capture.as_ref().map(|capture| {
+                    let local_x = x.saturating_sub(capture.origin_rect.x);
+                    let local_y = y.saturating_sub(capture.origin_rect.y);
+                    (
+                        capture.widget_id.clone(),
+                        capture.widget_type.clone(),
+                        capture.origin_rect,
+                        local_x,
+                        local_y,
+                    )
+                })
+            }
+            MouseEventType::Release => {
+                self.mouse_capture.take().map(|capture| {
+                    let local_x = x.saturating_sub(capture.origin_rect.x);
+                    let local_y = y.saturating_sub(capture.origin_rect.y);
+                    (
+                        capture.widget_id,
+                        capture.widget_type,
+                        capture.origin_rect,
+                        local_x,
+                        local_y,
+                    )
+                })
+            }
+        };
+
+        let Some((widget_id, widget_type, _rect, local_x, local_y)) = target else {
+            return;
+        };
+
+        let event_str = match event_type {
+            MouseEventType::Press => "press",
+            MouseEventType::Drag => "drag",
+            MouseEventType::Release => "release",
+        };
+
+        log::debug!(
+            "[MOUSE] {} {:?} on {}:{} at local ({},{})",
+            event_str,
+            button,
+            widget_type,
+            widget_id,
+            local_x,
+            local_y
+        );
+
+        // Dispatch to Lua
+        if let Some(lua) = layout_lua {
+            match lua.call_handle_mouse(
+                event_str,
+                button_str,
+                x,
+                y,
+                Some(&widget_type),
+                Some(&widget_id),
+                local_x,
+                local_y,
+            ) {
+                Ok(Some(ops)) => self.execute_lua_ops(ops),
+                Ok(None) => {} // No handler claimed the event
+                Err(e) => log::warn!("[MOUSE] Lua handle_mouse error: {e}"),
+            }
+        }
+    }
+
     /// Handle a raw input event from the stdin reader.
     ///
     /// Key events go through Lua keybinding dispatch:
@@ -710,10 +864,11 @@ where
             }
             InputEvent::Paste { .. }
             | InputEvent::MouseScroll { .. }
+            | InputEvent::Mouse { .. }
             | InputEvent::FocusGained
             | InputEvent::FocusLost => {
-                // Paste, mouse scroll, and focus events are handled in poll_input()
-                // and never reach here. These arms exist only for exhaustiveness.
+                // Paste, mouse scroll, mouse button, and focus events are handled
+                // in poll_input() and never reach here. Arms for exhaustiveness.
             }
         }
     }
@@ -1245,7 +1400,7 @@ where
             terminal_rows: self.panel_pool.terminal_dims().0,
 
             // Widget area tracking (populated during rendering)
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
+            widget_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
 
         // Try Lua-driven render, fall back to hardcoded Rust layout
@@ -1270,18 +1425,23 @@ where
             render(&mut self.terminal, &ctx, None)?;
         }
 
-        // Extract terminal areas and drop ctx (which borrows self) before mutation
-        let rendered_areas = ctx.terminal_areas.borrow().clone();
+        // Extract widget areas and drop ctx (which borrows self) before mutation
+        let rendered_areas = ctx.widget_areas.borrow().clone();
         drop(ctx);
+
+        // Cache widget areas for mouse hit-testing (used in poll_input).
+        self.last_widget_areas = rendered_areas.clone();
 
         if let Some(ref result) = lua_result {
             if let Some(focused_uuid) = self.panel_pool.current_session_uuid() {
-                if let Some((rows, cols)) = rendered_areas.get(focused_uuid) {
+                if let Some(area) = rendered_areas.get(focused_uuid) {
                     log::debug!(
-                        "[TUI] focused area for {} => {}x{}",
+                        "[TUI] focused area for {} => {}x{} at ({},{})",
                         focused_uuid,
-                        cols,
-                        rows
+                        area.rect.width,
+                        area.rect.height,
+                        area.rect.x,
+                        area.rect.y
                     );
                 } else {
                     log::debug!(
@@ -3343,7 +3503,10 @@ mod tests {
             )),
         };
         let mut areas = std::collections::HashMap::new();
-        areas.insert("sess-1".to_string(), (20, 60));
+        areas.insert("sess-1".to_string(), crate::tui::render::WidgetArea {
+            rect: ratatui::layout::Rect::new(0, 0, 60, 20),
+            widget_type: "terminal".to_string(),
+        });
         let msgs = runner.panel_pool.sync_subscriptions(&tree, &areas);
         for msg in msgs {
             runner.send_msg(msg);
@@ -3589,7 +3752,7 @@ mod tests {
             vpn_status: None,
             terminal_cols: 80,
             terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
+            widget_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -3616,11 +3779,14 @@ mod tests {
         };
 
         let mut areas = std::collections::HashMap::new();
-        areas.insert("sess-0".to_string(), (24, 80));
+        areas.insert("sess-0".to_string(), crate::tui::render::WidgetArea {
+            rect: ratatui::layout::Rect::new(0, 0, 80, 24),
+            widget_type: "terminal".to_string(),
+        });
         let msgs = runner.panel_pool.sync_subscriptions(&tree, &areas);
         for msg in msgs {
             runner.send_msg(msg);
-        }
+}
 
         // Should have sent a subscribe message for sess-0
         match request_rx.try_recv() {
@@ -3677,7 +3843,10 @@ mod tests {
         };
 
         let mut areas = std::collections::HashMap::new();
-        areas.insert("sess-0".to_string(), (57, 148));
+        areas.insert("sess-0".to_string(), crate::tui::render::WidgetArea {
+            rect: ratatui::layout::Rect::new(0, 0, 148, 57),
+            widget_type: "terminal".to_string(),
+        });
 
         let msgs = runner.panel_pool.sync_subscriptions(&tree, &areas);
         for msg in msgs {
