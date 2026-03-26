@@ -3248,17 +3248,22 @@ impl Hub {
                         // before sending. One wake per batch instead of per chunk.
                         //
                         // try_recv() consumes items before pattern matching, so
-                        // a non-Output event would be lost if we used `while let`.
-                        // Instead, we stash it and feed it back through the same
-                        // match arms after sending the batch.
+                        // non-Output events would be lost if we used `while let`.
+                        // Collect ALL non-output events into a vec rather than a
+                        // single stash slot — multiple mode changes can arrive
+                        // together (e.g., kitty pop + cursor show when a TUI app
+                        // exits) and a single slot silently drops all but the last.
                         let mut chunks = vec![data];
-                        let mut stashed: Option<PtyEvent> = None;
+                        let mut stashed: Vec<PtyEvent> = Vec::new();
                         loop {
                             match pty_rx.try_recv() {
                                 Ok(PtyEvent::Output(more)) => chunks.push(more),
                                 Ok(other) => {
-                                    stashed = Some(other);
-                                    break;
+                                    let is_terminal = matches!(other, PtyEvent::ProcessExited { .. });
+                                    stashed.push(other);
+                                    if is_terminal {
+                                        break; // ProcessExited must be last
+                                    }
                                 }
                                 Err(_) => break,
                             }
@@ -3277,10 +3282,11 @@ impl Hub {
                             super::wake_tui_pipe(fd);
                         }
 
-                        // Process the stashed non-output event that was consumed
+                        // Process all stashed non-output events that were consumed
                         // during batching. These are rare (KittyChanged,
                         // FocusReportingChanged, ProcessExited) but must not be dropped.
-                        if let Some(event) = stashed {
+                        let mut should_break = false;
+                        for event in stashed {
                             match event {
                                 PtyEvent::ProcessExited { exit_code } => {
                                     log::info!(
@@ -3294,7 +3300,7 @@ impl Hub {
                                     if let Some(fd) = wake_fd {
                                         super::wake_tui_pipe(fd);
                                     }
-                                    break; // exit forwarder on process exit
+                                    should_break = true;
                                 }
                                 PtyEvent::KittyChanged(enabled) => {
                                     let _ = sink.send(TuiOutput::Message(serde_json::json!({
@@ -3319,6 +3325,9 @@ impl Hub {
                                 PtyEvent::Output(_) => unreachable!("output handled above"),
                                 _ => {} // Resized, Notification, etc. — not forwarded to TUI
                             }
+                        }
+                        if should_break {
+                            break; // exit forwarder on process exit
                         }
                     }
                     Ok(PtyEvent::ProcessExited { exit_code }) => {
