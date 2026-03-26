@@ -25,7 +25,7 @@ class Hubs::WebrtcControllerTest < ActionDispatch::IntegrationTest
     assert_response :success
     json = JSON.parse(response.body)
     assert json["ice_servers"].is_a?(Array)
-    assert json["ice_servers"].any? { |s| s["urls"]&.include?("stun:") }
+    # Localhost is LAN — no external STUN returned (host candidates suffice)
   end
 
   # === CLI Auth (Bearer token) ===
@@ -108,12 +108,35 @@ class Hubs::WebrtcControllerTest < ActionDispatch::IntegrationTest
     assert turn["credential"].present?
     # Username format: timestamp:hub_id
     assert_match(/\d+:#{@hub.id}/, turn["username"])
+
+    # External STUN should NOT be included when TURN is configured
+    stun_servers = json["ice_servers"].select { |s| s["urls"]&.include?("stun:") }
+    assert_empty stun_servers, "Should not include external STUN when TURN handles STUN natively"
   ensure
     ENV.delete("TURN_SERVER_URL")
     ENV.delete("TURN_SECRET")
   end
 
-  test "returns only STUN when no TURN config" do
+  test "filters TCP TURN URLs" do
+    sign_in @user
+
+    ENV.delete("METERED_DOMAIN")
+    ENV.delete("METERED_SECRET_KEY")
+    ENV["TURN_SERVER_URL"] = "turn:turn.example.com:3478?transport=tcp"
+    ENV["TURN_SECRET"] = "test_secret"
+
+    get hub_webrtc_path(@hub)
+
+    assert_response :success
+    json = JSON.parse(response.body)
+
+    assert_empty json["ice_servers"], "TCP TURN should be filtered out"
+  ensure
+    ENV.delete("TURN_SERVER_URL")
+    ENV.delete("TURN_SECRET")
+  end
+
+  test "returns empty ICE servers for LAN client when no TURN config" do
     sign_in @user
 
     ENV.delete("TURN_SERVER_URL")
@@ -121,11 +144,30 @@ class Hubs::WebrtcControllerTest < ActionDispatch::IntegrationTest
     ENV.delete("METERED_DOMAIN")
     ENV.delete("METERED_SECRET_KEY")
 
+    # Default test requests come from 127.0.0.1 (LAN)
     get hub_webrtc_path(@hub)
 
     assert_response :success
     json = JSON.parse(response.body)
 
+    assert_empty json["ice_servers"], "LAN clients should get empty ICE servers (host candidates suffice)"
+  end
+
+  test "returns STUN for WAN client when no TURN config" do
+    sign_in @user
+
+    ENV.delete("TURN_SERVER_URL")
+    ENV.delete("TURN_SECRET")
+    ENV.delete("METERED_DOMAIN")
+    ENV.delete("METERED_SECRET_KEY")
+
+    get hub_webrtc_path(@hub), headers: { "REMOTE_ADDR" => "8.8.8.8" }
+
+    assert_response :success
+    json = JSON.parse(response.body)
+
+    assert json["ice_servers"].any? { |s| s["urls"]&.include?("stun:") },
+      "WAN clients should get external STUN servers"
     turn_servers = json["ice_servers"].select { |s| s["urls"]&.include?("turn:") }
     assert_empty turn_servers, "Should not include TURN servers without config"
   end

@@ -159,7 +159,7 @@ function handleSessionInvalid(event, hubId, bridge, cb) {
 
 async function handleSessionRefreshed(event, cb, getInFlight, setInFlight) {
   cb.log("Session refreshed via ratchet restart")
-  cb.clearSessionError()
+  await cb.clearSessionError()
 
   // During initial connect, the peer/DataChannel may still be negotiating and
   // subscribe() has not completed yet. Tearing the peer down here can trap the

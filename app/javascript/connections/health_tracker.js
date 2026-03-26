@@ -60,8 +60,7 @@ export class HealthTracker {
    * Per-browser: { cli: "connected" | "disconnected" } — CLI on E2E channel
    */
   handleHealthMessage(message) {
-    if (this.#callbacks.getErrorCode() === "unpaired" ||
-        this.#callbacks.getErrorCode() === "session_invalid") return
+    if (this.#callbacks.getErrorCode() === "unpaired") return
 
     const newStatus = CLI_STATUS_MAP[message.cli] || this.#cliStatus
 
