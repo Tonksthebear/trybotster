@@ -310,6 +310,9 @@ M.hooks = {
 
         -- Inter-hub
         { name = "hub_rpc_request",        data = "(client_id, msg)",                desc = "Incoming RPC from another hub via socket" },
+
+        -- Plugin lifecycle
+        { name = "plugin_status_changed",  data = "{name, status, error?}",          desc = "Plugin loaded, errored, enabled, or disabled" },
     },
 
     interceptors = {
