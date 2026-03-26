@@ -3,7 +3,7 @@
 -- Rust dispatches pre-routed mouse events here after hit-testing widget areas.
 -- Handlers are registered by plugins via botster.mouse.on(). Each handler
 -- receives an event table with widget-local coordinates and can return an
--- action table (like handle_key) or nil to pass through.
+-- ops array (like on_action/on_hub_event) or nil to pass through.
 --
 -- Event table shape:
 --   {
@@ -25,7 +25,7 @@ local handlers = {}
 --- Register a mouse event handler.
 ---
 --- @param event_type string "press"|"release"|"drag"|"*"
---- @param callback function(event) -> {action=...}|nil
+--- @param callback function(event) -> table[]|nil  -- ops array: { {op="...", ...}, ... }
 --- @param opts table? {widget_type=string?, namespace=string?}
 function M.on(event_type, callback, opts)
   opts = opts or {}

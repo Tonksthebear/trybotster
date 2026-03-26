@@ -3786,7 +3786,7 @@ mod tests {
         let msgs = runner.panel_pool.sync_subscriptions(&tree, &areas);
         for msg in msgs {
             runner.send_msg(msg);
-}
+        }
 
         // Should have sent a subscribe message for sess-0
         match request_rx.try_recv() {
