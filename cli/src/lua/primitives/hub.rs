@@ -258,6 +258,7 @@ pub(crate) fn register(
 
                 // Session-process-backed handles: install reader thread.
                 // The reader feeds the shadow screen and broadcasts output directly.
+                // Guard: skip if a reader is already alive (e.g., workspace move re-registration).
                 if has_session_conn {
                     let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
                         LuaError::runtime(format!("register_session: borrow for reader: {e}"))
@@ -268,51 +269,61 @@ pub(crate) fn register(
                             let pty = sh.pty();
                             if let Ok(mut guard) = conn.lock() {
                                 if let Some(ref mut session_conn) = *guard {
-                                    let listener = pty.shadow_listener().unwrap_or_else(|| {
-                                        crate::agent::pty::HubEventListener::new(pty.event_tx_clone())
-                                    });
-                                    if let Err(e) = session_conn.install_reader(
-                                        session_uuid.clone(),
-                                        pty.shadow_screen(),
-                                        listener,
-                                        pty.event_tx_clone(),
-                                        pty.kitty_enabled_arc(),
-                                        pty.cursor_visible_arc(),
-                                        pty.resize_pending_arc(),
-                                        pty.last_output_at_atomic().clone(),
-                                        session_type == SessionType::Agent,
-                                        {
-                                            let g = register_event_tx
-                                                .lock()
-                                                .expect("HubEventSender mutex poisoned");
-                                            g.as_ref().cloned().ok_or_else(|| {
-                                                LuaError::runtime("hub_event_tx not set")
-                                            })?
-                                        },
-                                    ) {
-                                        log::warn!(
-                                            "[Lua] Failed to install session reader for '{}': {e}",
-                                            session_uuid
+                                    // Guard: don't install a second reader if one is already alive.
+                                    // This prevents duplicate readers competing on the same socket,
+                                    // which causes "response channel closed" errors and orphaned sessions.
+                                    if session_conn.has_reader() && session_conn.is_reader_alive() {
+                                        log::info!(
+                                            "[Lua] Skipping reader install for '{}': reader already alive",
+                                            &session_uuid[..session_uuid.len().min(16)]
                                         );
                                     } else {
-                                        // Reader installed — request initial snapshot to populate shadow screen.
-                                        // This gives the TUI immediate content on reconnect.
-                                        match session_conn.get_snapshot() {
-                                            Ok(snapshot) if !snapshot.is_empty() => {
-                                                if let Ok(mut screen) = pty.shadow_screen().lock() {
-                                                    screen.process(&snapshot);
+                                        let listener = pty.shadow_listener().unwrap_or_else(|| {
+                                            crate::agent::pty::HubEventListener::new(pty.event_tx_clone())
+                                        });
+                                        if let Err(e) = session_conn.install_reader(
+                                            session_uuid.clone(),
+                                            pty.shadow_screen(),
+                                            listener,
+                                            pty.event_tx_clone(),
+                                            pty.kitty_enabled_arc(),
+                                            pty.cursor_visible_arc(),
+                                            pty.resize_pending_arc(),
+                                            pty.last_output_at_atomic().clone(),
+                                            session_type == SessionType::Agent,
+                                            {
+                                                let g = register_event_tx
+                                                    .lock()
+                                                    .expect("HubEventSender mutex poisoned");
+                                                g.as_ref().cloned().ok_or_else(|| {
+                                                    LuaError::runtime("hub_event_tx not set")
+                                                })?
+                                            },
+                                        ) {
+                                            log::warn!(
+                                                "[Lua] Failed to install session reader for '{}': {e}",
+                                                session_uuid
+                                            );
+                                        } else {
+                                            // Reader installed — request initial snapshot to populate shadow screen.
+                                            // This gives the TUI immediate content on reconnect.
+                                            match session_conn.get_snapshot() {
+                                                Ok(snapshot) if !snapshot.is_empty() => {
+                                                    if let Ok(mut screen) = pty.shadow_screen().lock() {
+                                                        screen.process(&snapshot);
+                                                    }
+                                                    log::info!(
+                                                        "[Lua] Replayed {} bytes of session snapshot for '{}'",
+                                                        snapshot.len(),
+                                                        &session_uuid[..session_uuid.len().min(16)]
+                                                    );
                                                 }
-                                                log::info!(
-                                                    "[Lua] Replayed {} bytes of session snapshot for '{}'",
-                                                    snapshot.len(),
-                                                    &session_uuid[..session_uuid.len().min(16)]
-                                                );
-                                            }
-                                            Ok(_) => {
-                                                log::debug!("[Lua] Empty snapshot for '{}'", &session_uuid[..session_uuid.len().min(16)]);
-                                            }
-                                            Err(e) => {
-                                                log::warn!("[Lua] Snapshot replay failed for '{}': {e}", &session_uuid[..session_uuid.len().min(16)]);
+                                                Ok(_) => {
+                                                    log::debug!("[Lua] Empty snapshot for '{}'", &session_uuid[..session_uuid.len().min(16)]);
+                                                }
+                                                Err(e) => {
+                                                    log::warn!("[Lua] Snapshot replay failed for '{}': {e}", &session_uuid[..session_uuid.len().min(16)]);
+                                                }
                                             }
                                         }
                                     }
@@ -373,6 +384,50 @@ pub(crate) fn register(
 
     hub.set("unregister_session", unregister_session_fn)
         .map_err(|e| anyhow!("Failed to set hub.unregister_session: {e}"))?;
+
+    // hub.update_session_metadata(session_uuid, metadata) - Update metadata without re-registering
+    //
+    // Lightweight alternative to register_session for updating label/workspace_id
+    // on an already-registered session. Does NOT create a new PtyHandle or reader thread.
+    let cache_meta = Arc::clone(&handle_cache);
+    let update_session_metadata_fn = lua
+        .create_function(move |_, (session_uuid, metadata): (String, LuaTable)| {
+            let label: Option<String> = metadata.get("label").ok();
+            let workspace_id: Option<Option<String>> = if metadata.contains_key("workspace_id")? {
+                let val: Option<String> = metadata.get("workspace_id").ok();
+                Some(val)
+            } else {
+                None
+            };
+
+            let updated = cache_meta.update_session_metadata(
+                &session_uuid,
+                label.as_deref(),
+                workspace_id
+                    .as_ref()
+                    .map(|ws| ws.as_deref()),
+            );
+
+            if updated {
+                log::info!(
+                    "[Lua] Updated session metadata for '{}' (label={:?}, workspace_id={:?})",
+                    &session_uuid[..session_uuid.len().min(16)],
+                    label,
+                    workspace_id
+                );
+            } else {
+                log::warn!(
+                    "[Lua] update_session_metadata: session '{}' not found in HandleCache",
+                    &session_uuid[..session_uuid.len().min(16)]
+                );
+            }
+
+            Ok(updated)
+        })
+        .map_err(|e| anyhow!("Failed to create hub.update_session_metadata function: {e}"))?;
+
+    hub.set("update_session_metadata", update_session_metadata_fn)
+        .map_err(|e| anyhow!("Failed to set hub.update_session_metadata: {e}"))?;
 
     // hub.hub_id() - Returns the local hub identifier (stable hash).
     // Clone hub_identifier before it's moved into the hub_id closure.
@@ -966,6 +1021,7 @@ mod tests {
         assert!(hub.contains_key("get_worktrees").unwrap());
         assert!(hub.contains_key("register_session").unwrap());
         assert!(hub.contains_key("unregister_session").unwrap());
+        assert!(hub.contains_key("update_session_metadata").unwrap());
         assert!(hub.contains_key("hub_id").unwrap());
         assert!(hub.contains_key("server_id").unwrap());
         assert!(hub.contains_key("detect_repo").unwrap());
