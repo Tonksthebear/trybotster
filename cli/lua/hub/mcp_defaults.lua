@@ -12,6 +12,7 @@
 -- take effect naturally.
 
 local mcp = require("lib.mcp")
+local ref = require("hub.reference")
 
 -- =============================================================================
 -- botster-customize-tui
@@ -201,14 +202,7 @@ mcp.prompt("botster-customize-hub", {
     description = "How to hook into Botster hub events, add hub commands, react to agent lifecycle, and run background tasks",
     arguments = {},
 }, function(_args)
-    return {
-        description = "Botster hub customization — instruction manual",
-        messages = {
-            {
-                role = "user",
-                content = {
-                    type = "text",
-                    text = [[
+    local prose = [[
 The user wants to customize how the Botster hub behaves — reacting to events, adding commands, running background work. Here is everything you need to implement it.
 
 ## Where the Code Goes
@@ -239,9 +233,7 @@ first, restart once, then subsequent file changes hot-reload without restarting.
     log.info("Agent closed: " .. agent.session_uuid)
   end)
 
-Available agent observer events:
-  after_agent_create    after_agent_close    before_agent_close
-  agent_created         agent_deleted
+See the full hooks reference at the bottom of this document.
 
 ## Adding a Hub Command (Ctrl+P palette)
 
@@ -264,13 +256,6 @@ Interceptors run synchronously before the event occurs. Return the (optionally m
     params.display_name = params.branch_name .. " [verified]"
     return params  -- allow with modification
   end, { timeout_ms = 50 })
-
-Available interceptable events:
-  before_agent_create    params table    → return modified or nil to block
-  before_agent_delete    config table    → return modified or nil to block
-  before_command         command table   → return modified or nil to block
-  before_client_subscribe context table → return modified or nil to block
-  filter_agent_env       (env, agent)    → return modified env (PTY env vars)
 
 ## Injecting Environment Variables into Agent PTYs
 
@@ -321,8 +306,8 @@ hub.state is an in-memory key-value store that survives require() reloads:
 
 ## Looking Up Agents
 
-  local agents = Agent.list()                   -- all Agent instances
-  local agent  = Agent.get("owner-repo-branch") -- by key, or nil
+  local agents = Agent.list()                           -- all Agent instances
+  local agent  = Agent.get("sess-1234-abcd-...")        -- by session_uuid, or nil
   local found  = Agent.find_by_meta("env", "production")  -- array
 
   -- On an instance:
@@ -378,7 +363,27 @@ Raw WebSocket:
   if err then log.error("websocket.connect failed: " .. tostring(err)) return end
   websocket.send(ws, "hello")
   websocket.close(ws)
-]],
+]]
+
+    return {
+        description = "Botster hub customization — instruction manual",
+        messages = {
+            {
+                role = "user",
+                content = {
+                    type = "text",
+                    text = table.concat({
+                        prose,
+                        ref.format_hooks(),
+                        "",
+                        ref.format_events(),
+                        "",
+                        ref.format_info_fields(),
+                        "",
+                        ref.format_lua_libs({"Agent / Session", "commands", "hooks", "hub.state"}),
+                        "",
+                        ref.format_primitives(),
+                    }, "\n"),
                 },
             },
         },
@@ -403,14 +408,7 @@ mcp.prompt("botster-create-plugin", {
         and (base .. "/profiles/" .. profile .. "/plugins/{name}")
         or  (base .. "/shared/plugins/{name}")
 
-    return {
-        description = "Botster plugin creation — instruction manual",
-        messages = {
-            {
-                role = "user",
-                content = {
-                    type = "text",
-                    text = string.format([[
+    local prose = string.format([[
 The user wants to create a Botster plugin. Here is everything you need to build and wire it up.
 
 ## Step 1: Create the File
@@ -440,7 +438,7 @@ across multiple files using a lua/ subdir:
   {plugin-dir}/
     init.lua
     lua/
-      {name}/           ← namespace matches the plugin directory name
+      {name}/           <- namespace matches the plugin directory name
         api.lua
         config.lua
 
@@ -479,13 +477,13 @@ collide with other plugins. Example — splitting HTTP helpers into api.lua:
 
 Most plugins combine some of these building blocks:
 
-  Credentials      → secrets.get / secrets.set
-  Outbound HTTP    → http.request
-  Persistent conn  → action_cable.subscribe or websocket.connect
-  Polling          → timer.every (with hot-reload guard)
-  React to agents  → hooks.on("after_agent_create", ...)
-  Expose to Claude → mcp.tool / mcp.prompt
-  TUI palette      → commands.register
+  Credentials      -> secrets.get / secrets.set
+  Outbound HTTP    -> http.request
+  Persistent conn  -> action_cable.subscribe or websocket.connect
+  Polling          -> timer.every (with hot-reload guard)
+  React to agents  -> hooks.on("after_agent_create", ...)
+  Expose to Claude -> mcp.tool / mcp.prompt
+  TUI palette      -> commands.register
 
 ## Step 3: Store Credentials
 
@@ -558,9 +556,6 @@ Use the state guard pattern:
     log.info("my-plugin: agent closed: " .. agent.session_uuid)
   end)
 
-Other useful agent events:
-  before_agent_close
-
 ## Step 7: Expose Tools to Claude
 
   mcp.tool("send_message", {
@@ -585,7 +580,7 @@ Other useful agent events:
     -- do work
   end, { description = "My plugin action" })
 
-The user can invoke this with Ctrl+P → "my-plugin-action".
+The user can invoke this with Ctrl+P -> "my-plugin-action".
 
 ## Step 9: Expose a Prompt to Claude
 
@@ -663,7 +658,7 @@ The user can invoke this with Ctrl+P → "my-plugin-action".
 
 ## Hot-Reload Notes
 
-- Save the file → it reloads automatically in ~1 second
+- Save the file -> it reloads automatically in ~1 second
 - Top-level code re-runs on every reload
 - Use state.get() + the _started guard for timers and one-time setup
 - Use function S._before_reload() to cancel timers before reload
@@ -674,7 +669,25 @@ The user can invoke this with Ctrl+P → "my-plugin-action".
   Plugins that lazily call require("my-plugin.api") inside functions after a failed
   reload will get a fresh load from disk rather than the previous cached version —
   correct behavior, but worth knowing if sub-module initialization has side effects.
-]], layer, layer),
+]], layer, layer)
+
+    return {
+        description = "Botster plugin creation — instruction manual",
+        messages = {
+            {
+                role = "user",
+                content = {
+                    type = "text",
+                    text = table.concat({
+                        prose,
+                        ref.format_hooks(),
+                        "",
+                        ref.format_info_fields(),
+                        "",
+                        ref.format_mcp_api({"tools", "prompts"}),
+                        "",
+                        ref.format_primitives(),
+                    }, "\n"),
                 },
             },
         },
@@ -689,14 +702,7 @@ mcp.prompt("botster-customize-mcp", {
     description = "How to expose MCP tools and prompts to Claude from Botster plugins",
     arguments = {},
 }, function(_args)
-    return {
-        description = "Botster MCP tools and prompts — instruction manual",
-        messages = {
-            {
-                role = "user",
-                content = {
-                    type = "text",
-                    text = [[
+    local prose = [[
 The user wants to add MCP tools or prompts so Claude can interact with the hub. Here is everything you need to implement it.
 
 ## Where the Code Goes
@@ -855,14 +861,23 @@ Manual removal is only needed if you want to conditionally unregister at runtime
 
   Tools:   snake_case  — "list_agents", "get_worktree_status", "run_tests"
   Prompts: kebab-case  — "hub-context", "start-task", "code-review"
+]]
 
-## Checking What's Registered
-
-  mcp.list_tools()    -- array of { name, description, input_schema }
-  mcp.list_prompts()  -- array of { name, description, arguments }
-  mcp.count()         -- int
-  mcp.count_prompts() -- int
-]],
+    return {
+        description = "Botster MCP tools and prompts — instruction manual",
+        messages = {
+            {
+                role = "user",
+                content = {
+                    type = "text",
+                    text = table.concat({
+                        prose,
+                        ref.format_mcp_api(),
+                        "",
+                        ref.format_lua_libs({"Agent / Session"}),
+                        "",
+                        ref.format_info_fields(),
+                    }, "\n"),
                 },
             },
         },

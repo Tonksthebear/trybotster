@@ -4085,4 +4085,189 @@ mod tests {
         assert_eq!(title, "Build Done");
         assert_eq!(body, "All tests passed");
     }
+
+    // =========================================================================
+    // MCP Prompt Composition Tests — reference.lua + mcp_defaults.lua
+    // =========================================================================
+
+    /// Verifies that all 4 MCP prompts compose without error and contain
+    /// expected dynamic sections from hub/reference.lua. Catches drift when
+    /// prompts or the reference module are edited.
+    #[test]
+    fn test_mcp_prompt_composition() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+
+        // Stub mcp and secrets so mcp_defaults.lua can load without the full hub
+        runtime
+            .lua()
+            .load(
+                r#"
+            local prompts = {}
+            local stub_mcp = {
+                tool = function() end,
+                prompt = function(name, schema, handler)
+                    prompts[name] = handler
+                end,
+            }
+            package.loaded["lib.mcp"] = stub_mcp
+            _G._test_prompts = prompts
+
+            -- secrets stub (telegram example calls secrets.get)
+            secrets = { set = function() end, get = function() return nil end }
+        "#,
+            )
+            .exec()
+            .expect("Should set up stubs");
+
+        // Load mcp_defaults.lua
+        let mcp_defaults_path = runtime.base_path().join("hub/mcp_defaults.lua");
+        if !mcp_defaults_path.exists() {
+            // Skip if running from a context without the Lua files
+            return;
+        }
+
+        let load_code = format!(
+            "dofile('{}')",
+            mcp_defaults_path.display().to_string().replace('\'', "\\'")
+        );
+        runtime
+            .lua()
+            .load(&load_code)
+            .exec()
+            .expect("mcp_defaults.lua should load without error");
+
+        // Helper: call a prompt handler and return its text content
+        let get_prompt_text = |name: &str, args: &str| -> String {
+            let code = format!(
+                r#"
+                local handler = _G._test_prompts["{name}"]
+                if not handler then return "" end
+                local result = handler({args})
+                if type(result) == "string" then return result end
+                if type(result) == "table" and result.messages then
+                    return result.messages[1].content.text or ""
+                end
+                return ""
+            "#,
+                name = name,
+                args = args,
+            );
+            runtime
+                .lua()
+                .load(&code)
+                .eval::<String>()
+                .unwrap_or_default()
+        };
+
+        // --- botster-customize-hub ---
+        let hub_text = get_prompt_text("botster-customize-hub", "");
+        assert!(
+            hub_text.contains("## Hooks"),
+            "customize-hub should have dynamic hooks section"
+        );
+        assert!(
+            hub_text.contains("before_pty_spawn"),
+            "customize-hub should include before_pty_spawn hook"
+        );
+        assert!(
+            hub_text.contains("## agent:info() Fields"),
+            "customize-hub should have info fields section"
+        );
+        assert!(
+            hub_text.contains("## Available Primitives"),
+            "customize-hub should have primitives section"
+        );
+        assert!(
+            hub_text.contains("timer.after_idle"),
+            "customize-hub should include timer.after_idle primitive"
+        );
+        assert!(
+            !hub_text.contains("owner-repo-branch"),
+            "customize-hub should not have stale agent_key example"
+        );
+
+        // --- botster-create-plugin ---
+        let plugin_text = get_prompt_text("botster-create-plugin", "scope = 'device'");
+        assert!(
+            plugin_text.contains("## Hooks"),
+            "create-plugin should have dynamic hooks section"
+        );
+        assert!(
+            plugin_text.contains("## MCP API"),
+            "create-plugin should have MCP API section"
+        );
+        assert!(
+            plugin_text.contains("## Available Primitives"),
+            "create-plugin should have primitives section"
+        );
+
+        // --- botster-customize-mcp ---
+        let mcp_text = get_prompt_text("botster-customize-mcp", "");
+        assert!(
+            mcp_text.contains("## MCP API"),
+            "customize-mcp should have MCP API section"
+        );
+        assert!(
+            mcp_text.contains("Agent / Session"),
+            "customize-mcp should have Agent/Session lib reference"
+        );
+        assert!(
+            mcp_text.contains("## agent:info() Fields"),
+            "customize-mcp should have info fields section"
+        );
+
+        // --- botster-customize-tui (unchanged, no reference module) ---
+        let tui_text = get_prompt_text("botster-customize-tui", "");
+        assert!(
+            tui_text.contains("## How Layout Works"),
+            "customize-tui should have layout section"
+        );
+
+        // --- reference.lua data integrity ---
+        let counts: mlua::Table = runtime
+            .lua()
+            .load(
+                r#"
+            local ref = require("hub.reference")
+            return {
+                primitives = #ref.primitives,
+                observers = #ref.hooks.observers,
+                interceptors = #ref.hooks.interceptors,
+                events = #ref.events,
+                info_fields = #ref.session_info_fields,
+            }
+        "#,
+            )
+            .eval()
+            .expect("reference.lua should load and return counts");
+
+        let primitives: i64 = counts.get("primitives").unwrap();
+        let observers: i64 = counts.get("observers").unwrap();
+        let interceptors: i64 = counts.get("interceptors").unwrap();
+        let events: i64 = counts.get("events").unwrap();
+        let info_fields: i64 = counts.get("info_fields").unwrap();
+
+        // These are minimum counts — they should only go up as features are added.
+        // If a count drops, something was accidentally removed from reference.lua.
+        assert!(
+            primitives >= 23,
+            "reference.lua should have at least 23 primitives, got {primitives}"
+        );
+        assert!(
+            observers >= 25,
+            "reference.lua should have at least 25 observer hooks, got {observers}"
+        );
+        assert!(
+            interceptors >= 7,
+            "reference.lua should have at least 7 interceptor hooks, got {interceptors}"
+        );
+        assert!(
+            events >= 14,
+            "reference.lua should have at least 14 events, got {events}"
+        );
+        assert!(
+            info_fields >= 26,
+            "reference.lua should have at least 26 info fields, got {info_fields}"
+        );
+    }
 }
