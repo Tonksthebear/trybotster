@@ -1066,50 +1066,63 @@ impl Hub {
                     self.webrtc_pending_ice_candidates.remove(&browser_identity)
                 {
                     if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
-                        for (candidate_generation, candidate) in candidates {
-                            if candidate_generation != offer_generation {
-                                log::debug!(
-                                    "[WebRTC] Dropping stale queued ICE candidate for {} (candidate gen {}, current gen {})",
-                                    &browser_identity[..browser_identity.len().min(8)],
-                                    candidate_generation,
-                                    offer_generation
-                                );
-                                continue;
-                            }
-                            let candidate_str = candidate
-                                .get("candidate")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("");
-                            if candidate_str.is_empty() {
-                                log::debug!(
-                                    "[WebRTC] Ignoring empty queued ICE candidate for {}",
-                                    &browser_identity[..browser_identity.len().min(8)]
-                                );
-                                continue;
-                            }
-                            let sdp_mid = candidate.get("sdpMid").and_then(|m| m.as_str());
-                            let sdp_mline_index = candidate
-                                .get("sdpMLineIndex")
-                                .and_then(|i| i.as_u64())
-                                .map(|i| i as u16);
+                        // Collect valid candidates, then apply all in a single
+                        // block_in_place call to reduce event loop blocking.
+                        let valid: Vec<_> = candidates
+                            .into_iter()
+                            .filter_map(|(candidate_generation, candidate)| {
+                                if candidate_generation != offer_generation {
+                                    log::debug!(
+                                        "[WebRTC] Dropping stale queued ICE candidate for {} (candidate gen {}, current gen {})",
+                                        &browser_identity[..browser_identity.len().min(8)],
+                                        candidate_generation,
+                                        offer_generation
+                                    );
+                                    return None;
+                                }
+                                let candidate_str = candidate
+                                    .get("candidate")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if candidate_str.is_empty() {
+                                    return None;
+                                }
+                                let sdp_mid = candidate
+                                    .get("sdpMid")
+                                    .and_then(|m| m.as_str())
+                                    .map(String::from);
+                                let sdp_mline_index = candidate
+                                    .get("sdpMLineIndex")
+                                    .and_then(|i| i.as_u64())
+                                    .map(|i| i as u16);
+                                Some((candidate_generation, candidate_str, sdp_mid, sdp_mline_index))
+                            })
+                            .collect();
 
-                            if let Err(e) = tokio::task::block_in_place(|| {
-                                self.tokio_runtime.block_on(channel.handle_ice_candidate(
-                                    candidate_str,
-                                    sdp_mid,
-                                    sdp_mline_index,
-                                ))
-                            }) {
-                                log::warn!(
-                                    "[WebRTC] Failed to apply queued ICE candidate for {}: {} (gen={}, mid={:?}, mline={:?}, candidate='{}')",
-                                    &browser_identity[..browser_identity.len().min(8)],
-                                    e,
-                                    candidate_generation,
-                                    sdp_mid,
-                                    sdp_mline_index,
-                                    Self::ice_candidate_preview(candidate_str),
-                                );
-                            }
+                        if !valid.is_empty() {
+                            let browser_id_short = browser_identity[..browser_identity.len().min(8)].to_string();
+                            tokio::task::block_in_place(|| {
+                                self.tokio_runtime.block_on(async {
+                                    for (gen, candidate_str, sdp_mid, sdp_mline_index) in &valid {
+                                        if let Err(e) = channel.handle_ice_candidate(
+                                            candidate_str,
+                                            sdp_mid.as_deref(),
+                                            *sdp_mline_index,
+                                        ).await {
+                                            log::warn!(
+                                                "[WebRTC] Failed to apply queued ICE candidate for {}: {} (gen={}, mid={:?}, mline={:?}, candidate='{}')",
+                                                browser_id_short,
+                                                e,
+                                                gen,
+                                                sdp_mid,
+                                                sdp_mline_index,
+                                                Self::ice_candidate_preview(candidate_str),
+                                            );
+                                        }
+                                    }
+                                });
+                            });
                         }
                     }
                 }
@@ -4269,15 +4282,17 @@ impl Hub {
                 self.cleanup_webrtc_channel(&stale_id, "replaced");
             }
 
-            // Wait for the previous connection's sockets to be released.
-            // 500ms is short enough to not meaningfully block signaling.
+            // Wait briefly for the previous connection's sockets to be released.
+            // Keep this short — the event loop is blocked during this wait.
+            // The code proceeds regardless on timeout, so 100ms is sufficient
+            // to catch the common case (already closed) without stalling.
             if let Some(mut close_rx) = self.webrtc_pending_closes.remove(olm_key) {
                 if *close_rx.borrow() {
                     log::debug!("[WebRTC] Previous connection already closed");
                 } else {
                     match tokio::task::block_in_place(|| {
                         self.tokio_runtime.block_on(tokio::time::timeout(
-                            std::time::Duration::from_millis(500),
+                            std::time::Duration::from_millis(100),
                             close_rx.wait_for(|v| *v),
                         ))
                     }) {
@@ -5060,13 +5075,23 @@ impl Hub {
         *self
             .shared_server_id
             .lock()
-            .expect("SharedServerId mutex poisoned") = Some(botster_id);
+            .expect("SharedServerId mutex poisoned") = Some(botster_id.clone());
         // Keep runtime manifest aligned with server-assigned hub ID.
         if let Err(e) =
             crate::hub::daemon::write_manifest(&self.hub_identifier, self.botster_id.as_deref())
         {
             log::warn!("Failed to refresh hub manifest after server registration: {e}");
         }
+
+        // Prefetch ICE config so the first WebRTC offer doesn't pay
+        // the HTTP round-trip cost (100-300ms saved on first connection).
+        let server_url = self.config.server_url.clone();
+        let api_key = self.config.get_api_key().to_string();
+        let hub_id = botster_id;
+        self.tokio_runtime.spawn(async move {
+            crate::channel::WebRtcChannel::prefetch_ice_config(&server_url, &api_key, &hub_id)
+                .await;
+        });
     }
 
     /// Initialize web push state from encrypted storage.
