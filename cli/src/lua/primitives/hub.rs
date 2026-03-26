@@ -723,7 +723,7 @@ pub(crate) fn register(
                     "--uuid".to_string(),
                     session_uuid.clone(),
                     "--socket".to_string(),
-                    socket_str.clone(),
+                    socket_str,
                     "--timeout".to_string(),
                     "120".to_string(),
                 ];

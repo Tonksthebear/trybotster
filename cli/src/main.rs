@@ -613,9 +613,8 @@ impl Drop for WakePipe {
 /// processes include the agent label when available, falling back to a
 /// truncated UUID.
 fn set_process_title(command: &Commands) {
+    // Start is handled inline in its match arm (may redirect to attach).
     let title = match command {
-        Commands::Start { headless: true, .. } => "botster hub".to_string(),
-        Commands::Start { .. } => "botster tui".to_string(),
         Commands::Attach { .. } => "botster attach".to_string(),
         Commands::McpServe => {
             // Include truncated session UUID for correlation
@@ -1057,8 +1056,11 @@ fn main() -> Result<()> {
         default_hook(panic_info);
     }));
 
-    // Set descriptive process title so `ps` and Activity Monitor show the subprocess role.
-    set_process_title(&cli.command);
+    // Set descriptive process title for non-Start commands up front.
+    // Start is handled inside its match arm because it may redirect to attach.
+    if !matches!(cli.command, Commands::Start { .. }) {
+        set_process_title(&cli.command);
+    }
 
     match cli.command {
         Commands::Start { headless, offline } => {
@@ -1097,9 +1099,11 @@ fn main() -> Result<()> {
                          duplicate hub. Stop the existing hub first."
                     );
                 }
+                proctitle::set_title("botster hub");
                 run_headless()?;
             } else {
                 if let Some((_hub_id, Some(_socket), _)) = existing_hub.as_ref() {
+                    proctitle::set_title("botster attach");
                     println!("Hub already running — attaching...");
                     run_attach(None)?;
                 } else if let Some((hub_id, None, true)) = existing_hub.as_ref() {
@@ -1112,6 +1116,7 @@ fn main() -> Result<()> {
                          duplicate hub."
                     );
                 } else {
+                    proctitle::set_title("botster tui");
                     run_with_tui()?;
                 }
             }
