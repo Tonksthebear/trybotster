@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use alacritty_terminal::grid::Dimensions;
+
 use anyhow::{bail, Context, Result};
 use tokio::sync::broadcast;
 
@@ -295,6 +297,7 @@ fn session_reader(
     let mut buf = [0u8; 8192];
     let mut last_cursor_visible: Option<bool> = None;
     let mut last_focus_reporting: Option<bool> = None;
+    let mut last_alt_screen: Option<bool> = None;
 
     log::info!(
         "[session-reader] started for {}",
@@ -329,12 +332,17 @@ fn session_reader(
                     }
 
                     // Feed shadow screen — hub becomes terminal state authority
-                    let (new_kitty, new_visible, new_focus_reporting) =
+                    let (new_kitty, new_visible, new_focus_reporting, new_alt_screen) =
                         if let Ok(mut p) = shadow_screen.lock() {
                             p.process(data);
-                            (p.kitty_enabled(), !p.cursor_hidden(), p.focus_reporting())
+                            (
+                                p.kitty_enabled(),
+                                !p.cursor_hidden(),
+                                p.focus_reporting(),
+                                p.alt_screen_active(),
+                            )
                         } else {
-                            (false, true, false)
+                            (false, true, false, false)
                         };
 
                     // Drain color responses that the shadow screen's alacritty
@@ -364,6 +372,31 @@ fn session_reader(
                         let _ = event_tx.send(PtyEvent::focus_reporting_changed(new_focus_reporting));
                     }
                     resize_pending.store(false, Ordering::Release);
+
+                    // Alt screen transition: prepare a scrollback refresh.
+                    // Sent AFTER PtyEvent::Output so the old parser handles the
+                    // raw bytes first (including CSI ?1049l), then gets replaced.
+                    let pending_alt_scrollback = if last_alt_screen != Some(new_alt_screen) {
+                        let was_alt = last_alt_screen.unwrap_or(false);
+                        last_alt_screen = Some(new_alt_screen);
+                        // Only on exit (alt → normal). On entry the alt screen
+                        // starts empty and the app redraws immediately.
+                        if was_alt && !new_alt_screen {
+                            if let Ok(p) = shadow_screen.lock() {
+                                let rows = p.term().grid().screen_lines() as u16;
+                                let cols = p.term().grid().columns() as u16;
+                                let snapshot =
+                                    crate::terminal::generate_ansi_snapshot(&*p, false);
+                                Some((snapshot, rows, cols))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
 
                     // Update idle timestamp
                     last_output_at.store(
@@ -397,6 +430,20 @@ fn session_reader(
 
                     // Broadcast raw bytes to subscribers (forwarders)
                     let _ = event_tx.send(PtyEvent::output(data.to_vec()));
+
+                    // Send alt screen scrollback refresh AFTER Output so clients
+                    // process the raw bytes (on the old parser) before replacing it.
+                    if let Some((snap_data, snap_rows, snap_cols)) = pending_alt_scrollback {
+                        log::info!(
+                            "[session-reader] alt screen exited, sending {} byte scrollback refresh",
+                            snap_data.len()
+                        );
+                        let _ = event_tx.send(PtyEvent::AltScreenScrollback {
+                            data: snap_data,
+                            rows: snap_rows,
+                            cols: snap_cols,
+                        });
+                    }
                 }
 
                 FRAME_PROCESS_EXITED => {
