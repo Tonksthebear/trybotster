@@ -266,6 +266,13 @@ impl LuaBootstrap {
                 Ok(()) => log::info!("Lua workspace helpers preloaded"),
                 Err(e) => log::warn!("Failed to preload workspace helpers: {e}"),
             }
+            match lua.preload_module(
+                "ui.mouse",
+                include_str!("../../lua/ui/mouse.lua"),
+            ) {
+                Ok(()) => log::info!("Lua mouse module preloaded"),
+                Err(e) => log::warn!("Failed to preload mouse module: {e}"),
+            }
             if let Some(actions_source) = &self.actions_source {
                 match lua.load_actions(actions_source) {
                     Ok(()) => log::info!("Lua actions loaded"),

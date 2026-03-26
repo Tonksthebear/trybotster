@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use super::render::WidgetArea;
 use super::render_tree::RenderNode;
 use super::terminal_panel::{PanelState, TerminalPanel};
 
@@ -121,7 +122,7 @@ impl PanelPool {
     pub fn sync_subscriptions(
         &mut self,
         tree: &RenderNode,
-        areas: &HashMap<String, (u16, u16)>,
+        areas: &HashMap<String, WidgetArea>,
     ) -> OutMessages {
         let mut msgs = OutMessages::new();
 
@@ -131,7 +132,7 @@ impl PanelPool {
 
         // Connect panels for new bindings
         for uuid in &desired {
-            let Some((rows, cols)) = areas.get(uuid).copied() else {
+            let Some(area) = areas.get(uuid) else {
                 // Subscription geometry must come from the actual rendered widget
                 // area. Skip connect for this frame if the area is missing.
                 log::debug!(
@@ -140,6 +141,7 @@ impl PanelPool {
                 );
                 continue;
             };
+            let (rows, cols) = (area.rect.height, area.rect.width);
             let panel = self
                 .panels
                 .entry(uuid.clone())
@@ -183,10 +185,11 @@ impl PanelPool {
     /// Resize panels to match rendered widget areas.
     ///
     /// Returns resize messages for panels whose dimensions changed.
-    pub fn sync_widget_dims(&mut self, areas: &HashMap<String, (u16, u16)>) -> OutMessages {
+    pub fn sync_widget_dims(&mut self, areas: &HashMap<String, WidgetArea>) -> OutMessages {
         let mut msgs = OutMessages::new();
 
-        for (uuid, &(rows, cols)) in areas {
+        for (uuid, area) in areas {
+            let (rows, cols) = (area.rect.height, area.rect.width);
             if let Some(panel) = self.panels.get_mut(uuid) {
                 if let Some(msg) = panel.resize(rows, cols, uuid) {
                     msgs.push(msg);

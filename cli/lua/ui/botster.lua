@@ -301,6 +301,31 @@ function botster.ui.list_components()
 end
 
 -- =============================================================================
+-- Mouse
+-- =============================================================================
+
+-- Mouse event handler registration.
+-- Delegates to ui.mouse module (preloaded by Rust).
+botster.mouse = {}
+
+local ok, _mouse = pcall(require, "ui.mouse")
+if not ok then _mouse = nil end
+
+--- Register a mouse event handler.
+-- @param event_type string "press"|"release"|"drag"|"*"
+-- @param callback function(event) -> table|nil
+-- @param opts table? {widget_type=string?, namespace=string?}
+function botster.mouse.on(event_type, callback, opts)
+  if _mouse then _mouse.on(event_type, callback, opts) end
+end
+
+--- Remove all handlers in a namespace.
+-- @param namespace string
+function botster.mouse.off(namespace)
+  if _mouse then _mouse.off(namespace) end
+end
+
+-- =============================================================================
 -- Internal: Wire up action and keymap dispatch
 -- =============================================================================
 
