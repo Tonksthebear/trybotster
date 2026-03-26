@@ -387,11 +387,16 @@ class HubPeerConnection {
     console.debug(
       `[WebRTCTransport] ICE config ready for hub ${hubId} in ${Math.round(performance.now() - conn.peerSetupStartedAt)}ms`,
     )
-    const pc = new RTCPeerConnection({ iceServers: iceConfig.ice_servers })
+    const pc = new RTCPeerConnection({
+      iceServers: iceConfig.ice_servers,
+      iceCandidatePoolSize: 1,
+    })
     conn.pc = pc
     conn.state = TransportState.CONNECTING
 
-    // ICE candidate handler
+    // ICE candidate handler — sends each candidate individually.
+    // Batching requires CLI-side support for ice_batch message type;
+    // until that's implemented, individual candidates maintain compatibility.
     pc.onicecandidate = async (event) => {
       if (event.candidate) {
         try {
@@ -1308,6 +1313,11 @@ class HubPeerConnection {
         } else if (decrypted.type === "ice") {
           console.debug("[WebRTCTransport] Received ICE candidate via ActionCable")
           await this.#handleIceCandidate(hubId, decrypted.candidate)
+        } else if (decrypted.type === "ice_batch") {
+          console.debug(`[WebRTCTransport] Received ${decrypted.candidates?.length || 0} batched ICE candidates via ActionCable`)
+          for (const candidate of (decrypted.candidates || [])) {
+            await this.#handleIceCandidate(hubId, candidate)
+          }
         }
       } catch (e) {
         console.error("[WebRTCTransport] Signal decryption/handling error:", e)

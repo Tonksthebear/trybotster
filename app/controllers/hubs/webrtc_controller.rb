@@ -55,15 +55,24 @@ module Hubs
     end
 
     def ice_servers
-      servers = [
-        { urls: "stun:stun.l.google.com:19302" },
-        { urls: "stun:stun1.l.google.com:19302" }
-      ]
-
       turn = turn_credentials
-      servers.concat(Array(turn))
+      turn = filter_tcp_turn(Array(turn))
 
-      servers
+      # When TURN is configured, skip external Google STUN — TURN servers
+      # handle STUN natively, and unreachable external STUN adds a 5s timeout
+      # per server (rustrtc stun_timeout default).
+      if turn.any?
+        turn
+      elsif lan_request?
+        # LAN clients only need host candidates — skip external STUN to avoid
+        # 5s timeout probes to Google servers that add no value on local networks.
+        []
+      else
+        [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" }
+        ]
+      end
     end
 
     # TURN credentials
@@ -88,6 +97,52 @@ module Hubs
         } ]
       else
         []
+      end
+    end
+
+    # Detect LAN clients by request IP (private RFC 1918 / link-local ranges).
+    # Used to skip external STUN servers that add 5s timeout on local networks.
+    def lan_request?
+      ip = request.remote_ip
+      return false if ip.blank?
+
+      addr = IPAddr.new(ip)
+      LAN_RANGES.any? { |range| range.include?(addr) }
+    rescue IPAddr::InvalidAddressError
+      false
+    end
+
+    LAN_RANGES = [
+      IPAddr.new("10.0.0.0/8"),
+      IPAddr.new("172.16.0.0/12"),
+      IPAddr.new("192.168.0.0/16"),
+      IPAddr.new("127.0.0.0/8"),
+      IPAddr.new("::1/128"),
+      IPAddr.new("fc00::/7")
+    ].freeze
+
+    # Remove TCP TURN URLs — TCP TURN in rustrtc has no connect timeout,
+    # so a firewalled TCP port hangs for 30-75s (OS TCP timeout).
+    # UDP TURN is preferred and sufficient for all use cases.
+    #
+    # Handles both string URLs ("turn:host:3478?transport=tcp") and array
+    # URLs (["turn:host:3478?transport=tcp", "turn:host:443?transport=tcp"])
+    # as returned by metered.co.
+    def filter_tcp_turn(servers)
+      servers.filter_map do |server|
+        urls = server[:urls] || server["urls"]
+
+        if urls.is_a?(Array)
+          filtered = urls.reject { |u| u.is_a?(String) && u.match?(/\?transport=tcp\z/i) }
+          next if filtered.empty?
+          next server if filtered.length == urls.length # nothing removed
+
+          server.merge(urls: filtered)
+        elsif urls.is_a?(String) && urls.match?(/\?transport=tcp\z/i)
+          next # reject entirely
+        else
+          server
+        end
       end
     end
 

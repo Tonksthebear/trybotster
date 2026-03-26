@@ -239,6 +239,23 @@ async function getPickleKey() {
   return pickleKeyCache
 }
 
+/**
+ * Debounced persist — schedules a persistState() after a short delay.
+ * Rapid encrypt/decrypt calls during signaling coalesce into a single IDB write.
+ */
+const pendingPersists = new Map() // hubId -> timer
+const PERSIST_DEBOUNCE_MS = 500
+
+function schedulePersist(hubId) {
+  if (pendingPersists.has(hubId)) {
+    clearTimeout(pendingPersists.get(hubId))
+  }
+  pendingPersists.set(hubId, setTimeout(() => {
+    pendingPersists.delete(hubId)
+    persistState(hubId)
+  }, PERSIST_DEBOUNCE_MS))
+}
+
 /** Persist browser account + trusted CLI identity, but never the live session. */
 async function persistState(hubId) {
   try {
@@ -513,9 +530,8 @@ async function handleEncrypt(hubId, message) {
     envelope.k = account.curve25519Key()
   }
 
-  // Persist the long-term account/trust anchor. The live ratchet remains
-  // memory-only and will be rebuilt from a fresh signed bundle later.
-  await persistState(hubId)
+  // Debounced persist — coalesces rapid signaling encrypt calls into one IDB write.
+  schedulePersist(hubId)
 
   return { encrypted: envelope }
 }
@@ -558,9 +574,8 @@ async function handleDecrypt(hubId, encryptedData) {
     plaintextBytes = session.decrypt(envelope.t, ciphertext)
   }
 
-  // Persist the long-term account/trust anchor. The live ratchet remains
-  // memory-only and will be rebuilt from a fresh signed bundle later.
-  await persistState(hubId)
+  // Debounced persist — coalesces rapid signaling decrypt calls into one IDB write.
+  schedulePersist(hubId)
 
   // Decode UTF-8 and parse JSON
   const plaintextStr = new TextDecoder().decode(plaintextBytes)
@@ -612,7 +627,7 @@ async function handleEncryptBinary(hubId, plaintext) {
     frame.set(ciphertext, 1)
   }
 
-  await persistState(hubId)
+  schedulePersist(hubId)
   return { data: frame }
 }
 
@@ -647,7 +662,7 @@ async function handleDecryptBinary(hubId, data) {
     if (session) {
       try {
         plaintextBytes = session.decrypt(0, ciphertext)
-        await persistState(hubId)
+        schedulePersist(hubId)
         return { data: new Uint8Array(plaintextBytes) }
       } catch {
         // Session couldn't decrypt — new pairing, create inbound
@@ -667,7 +682,7 @@ async function handleDecryptBinary(hubId, data) {
     plaintextBytes = session.decrypt(1, ciphertext)
   }
 
-  await persistState(hubId)
+  schedulePersist(hubId)
   return { data: new Uint8Array(plaintextBytes) }
 }
 
@@ -701,6 +716,12 @@ async function handleClearActiveSession(hubId) {
  * Clear all pairing state for a hub (memory + IndexedDB).
  */
 async function handleClearSession(hubId) {
+  // Cancel any debounced persist to prevent stale data write after clear
+  if (pendingPersists.has(hubId)) {
+    clearTimeout(pendingPersists.get(hubId))
+    pendingPersists.delete(hubId)
+  }
+
   await handleClearActiveSession(hubId)
   accounts.delete(hubId)
   bundles.delete(hubId)
@@ -719,6 +740,12 @@ async function handleClearSession(hubId) {
  * pickle key cache, and closes the IDB connection to prevent stale handles.
  */
 async function handleClearAllSessions() {
+  // Cancel all debounced persists to prevent stale data writes after clear
+  for (const timer of pendingPersists.values()) {
+    clearTimeout(timer)
+  }
+  pendingPersists.clear()
+
   accounts.clear()
   sessions.clear()
   sessionOwners.clear()

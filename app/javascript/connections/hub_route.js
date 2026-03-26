@@ -766,10 +766,20 @@ export class HubRoute {
         this.#setState(ConnectionState.ERROR)
         this.emit("error", { reason: code, message: msg })
       },
-      clearSessionError: () => {
-        if (this.errorCode === "session_invalid") {
-          this.errorCode = null
-          this.errorReason = null
+      clearSessionError: async () => {
+        if (this.errorCode !== "session_invalid") return
+        this.errorCode = null
+        this.errorReason = null
+        // Restore identity key from SharedWorker (still persisted in IDB)
+        try {
+          const hubId = this.getHubId()
+          const keyResult = await bridge.getIdentityKey(hubId)
+          this.identityKey = keyResult.identityKey
+          this.browserIdentity = `${this.identityKey}:${HubRoute.tabId}`
+          this.#setState(ConnectionState.DISCONNECTED)
+          this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
+        } catch {
+          // Identity key not recoverable — user must re-pair
         }
       },
     })
