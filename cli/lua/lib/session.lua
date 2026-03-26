@@ -299,6 +299,7 @@ function Session._init(self, config)
         detect_notifications = session_config.notifications or false,
         session_uuid = key,
         session_name = session_name,
+        label = self.label,
         rows = rows,
         cols = cols,
     }

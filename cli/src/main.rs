@@ -526,6 +526,9 @@ enum Commands {
         /// Seconds to wait for Hub reconnect before exiting
         #[arg(long, default_value_t = 120)]
         timeout: u64,
+        /// Human-readable label for process title (e.g. agent name)
+        #[arg(long)]
+        label: Option<String>,
     },
 }
 
@@ -601,6 +604,37 @@ impl Drop for WakePipe {
             }
         }
     }
+}
+
+/// Set a descriptive process title so each botster subprocess is identifiable
+/// in `ps`, Activity Monitor, and `top`.
+///
+/// Titles are kept concise for narrow Activity Monitor columns. Session
+/// processes include the agent label when available, falling back to a
+/// truncated UUID.
+fn set_process_title(command: &Commands) {
+    let title = match command {
+        Commands::Start { headless: true, .. } => "botster hub".to_string(),
+        Commands::Start { .. } => "botster tui".to_string(),
+        Commands::Attach { .. } => "botster attach".to_string(),
+        Commands::McpServe => {
+            // Include truncated session UUID for correlation
+            let suffix = std::env::var("BOTSTER_SESSION_UUID")
+                .ok()
+                .map(|u| format!(" [{}]", &u[..u.len().min(16)]))
+                .unwrap_or_default();
+            format!("botster mcp-gateway{suffix}")
+        }
+        Commands::Session { label, uuid, .. } => {
+            let tag = label
+                .as_deref()
+                .unwrap_or_else(|| &uuid[..uuid.len().min(16)]);
+            format!("botster session [{tag}]")
+        }
+        // Short-lived CLI commands — no title change needed
+        _ => return,
+    };
+    proctitle::set_title(title);
 }
 
 /// Normalize the hub process cwd to the user's home directory.
@@ -1023,6 +1057,9 @@ fn main() -> Result<()> {
         default_hook(panic_info);
     }));
 
+    // Set descriptive process title so `ps` and Activity Monitor show the subprocess role.
+    set_process_title(&cli.command);
+
     match cli.command {
         Commands::Start { headless, offline } => {
             if offline {
@@ -1145,6 +1182,7 @@ fn main() -> Result<()> {
             uuid,
             socket,
             timeout,
+            ..
         } => {
             botster::session::run(&uuid, &socket, timeout)?;
         }
