@@ -150,6 +150,8 @@ pub struct ListItemProps {
     pub content: StyledContent,
     /// Optional second line rendered below the primary content.
     pub secondary: Option<StyledContent>,
+    /// Optional third line rendered below the secondary content.
+    pub tertiary: Option<StyledContent>,
     /// If true, this item is a non-selectable header (rendered dim+bold).
     pub header: bool,
     /// Optional per-item style override.
@@ -571,6 +573,7 @@ fn parse_list_props(table: &LuaTable) -> Option<WidgetProps> {
                 items.push(ListItemProps {
                     content: StyledContent::Plain(s.to_string_lossy().to_string()),
                     secondary: None,
+                    tertiary: None,
                     header: false,
                     style: None,
                     action: None,
@@ -589,6 +592,10 @@ fn parse_list_props(table: &LuaTable) -> Option<WidgetProps> {
                     .get::<LuaValue>("secondary")
                     .ok()
                     .and_then(|v| parse_styled_content(&v).ok());
+                let tertiary = item_table
+                    .get::<LuaValue>("tertiary")
+                    .ok()
+                    .and_then(|v| parse_styled_content(&v).ok());
                 let header: bool = item_table.get("header").unwrap_or(false);
                 let style = item_table
                     .get::<LuaValue>("style")
@@ -598,6 +605,7 @@ fn parse_list_props(table: &LuaTable) -> Option<WidgetProps> {
                 items.push(ListItemProps {
                     content,
                     secondary,
+                    tertiary,
                     header,
                     style,
                     action,

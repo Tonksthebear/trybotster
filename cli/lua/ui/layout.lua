@@ -77,20 +77,36 @@ local function session_primary_name(agent, fallback)
   return agent.display_name or agent.branch_name or fallback, false
 end
 
-local function session_secondary_parts(agent, using_label)
+--- Build spawn-info parts: target · branch · config (always bottom line).
+local function session_spawn_parts(agent)
   local parts = {}
-  local title = agent.title and agent.title:match("%S") and agent.title or nil
-
-  if using_label and title and title ~= agent.label then
-    parts[#parts + 1] = title
-  end
   if agent.target_name then parts[#parts + 1] = agent.target_name end
   if agent.branch_name then parts[#parts + 1] = agent.branch_name end
   local config_name = agent.agent_name or agent.profile_name
   if config_name then parts[#parts + 1] = config_name end
-  if agent.task and agent.task ~= "" then parts[#parts + 1] = agent.task end
-
   return parts
+end
+
+--- Build optional title line: title/task when different from primary name.
+local function session_title_text(agent, using_label)
+  local parts = {}
+  local title = agent.title and agent.title:match("%S") and agent.title or nil
+  if title then
+    -- Suppress title when it duplicates the primary name (label or display_name)
+    local dominated = (using_label and title == agent.label)
+      or (not using_label and title == (agent.display_name or agent.branch_name))
+    if not dominated then
+      parts[#parts + 1] = title
+    end
+  end
+  if agent.task and agent.task ~= "" then parts[#parts + 1] = agent.task end
+  if #parts == 0 then return nil end
+  return table.concat(parts, " · ")
+end
+
+--- Build a dim sub-line with indentation.
+local function sub_line(indent, content)
+  return { { text = indent .. content, style = "dim" } }
 end
 
 local function session_activity_icon(agent)
@@ -194,9 +210,26 @@ local function build_list_items()
         text[#text + 1] = { text = name }
 
         local item = { text = text }
-        local parts = session_secondary_parts(agent, using_label)
-        if #parts > 0 then
-          item.secondary = { { text = "  " .. table.concat(parts, " · "), style = "dim" } }
+
+        -- Indent secondary/tertiary lines to align under name text.
+        local sub_indent
+        if agent.session_type == "agent" then
+          sub_indent = "   "
+        elseif agent.notification then
+          sub_indent = "  "
+        else
+          sub_indent = " "
+        end
+
+        -- Line 2: title (optional, only if present and different from primary)
+        local tert = session_title_text(agent, using_label)
+        if tert then
+          item.secondary = sub_line(sub_indent, tert)
+        end
+        -- Line 3: spawn info (always)
+        local spawn_parts = session_spawn_parts(agent)
+        if #spawn_parts > 0 then
+          item.tertiary = sub_line(sub_indent, table.concat(spawn_parts, " · "))
         end
         items[#items+1] = item
       else
@@ -250,9 +283,15 @@ local function build_agent_items(state)
     else
       item = { text = name }
     end
-    local secondary_parts = session_secondary_parts(agent, using_label)
-    if #secondary_parts > 0 then
-      item.secondary = { { text = table.concat(secondary_parts, " · "), style = "dim" } }
+    -- Line 2: title (optional)
+    local tert = session_title_text(agent, using_label)
+    if tert then
+      item.secondary = sub_line("", tert)
+    end
+    -- Line 3: spawn info (always)
+    local spawn_parts = session_spawn_parts(agent)
+    if #spawn_parts > 0 then
+      item.tertiary = sub_line("", table.concat(spawn_parts, " · "))
     end
     table.insert(items, item)
   end
