@@ -378,22 +378,16 @@ impl LayoutLua {
         match result {
             LuaValue::Nil => Ok(None),
             LuaValue::Table(table) => {
-                // Check if it's a single action table or an ops array
-                if table.contains_key("action").unwrap_or(false) {
-                    // Single action — wrap as one-element ops array
-                    let json_val = lua_table_to_json(&self.lua, &table)?;
-                    Ok(Some(vec![json_val]))
-                } else {
-                    // Ops array
-                    let mut ops = Vec::new();
-                    for pair in table.sequence_values::<mlua::Table>() {
-                        let op_table =
-                            pair.map_err(|e| anyhow!("Invalid op in mouse result: {e}"))?;
-                        let json_val = lua_table_to_json(&self.lua, &op_table)?;
-                        ops.push(json_val);
-                    }
-                    Ok(Some(ops))
+                // Mouse handlers return an ops array (same format as on_action/on_hub_event).
+                // Each op must have an "op" field: { op = "send_msg", data = {...} }
+                let mut ops = Vec::new();
+                for pair in table.sequence_values::<mlua::Table>() {
+                    let op_table =
+                        pair.map_err(|e| anyhow!("Invalid op in mouse result: {e}"))?;
+                    let json_val = lua_table_to_json(&self.lua, &op_table)?;
+                    ops.push(json_val);
                 }
+                Ok(Some(ops))
             }
             _ => {
                 log::warn!("handle_mouse() returned unexpected type: {:?}", result);
