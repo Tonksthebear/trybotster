@@ -117,6 +117,9 @@ local function recover_session(record, socket_info, recovered, seen_keys)
         log.warn(string.format("[session_recovery] Failed to recover session %s: %s",
             session_uuid, tostring(session)))
         pcall(hub.unregister_session, session_uuid)
+        -- Explicitly close the connection so the session process detects
+        -- disconnect immediately instead of waiting for Lua GC.
+        pcall(handle.kill, handle)
         return
     end
 
