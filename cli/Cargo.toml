@@ -104,6 +104,9 @@ futures-util = "0.3"
 # MCP SDK — official Rust MCP server implementation (JSON-RPC framing, method dispatch)
 rmcp = { version = "1.1", features = ["transport-io"] }
 
+# Process title — sets what shows in `ps`, Activity Monitor, `top` (M-DOCUMENTED-MAGIC)
+proctitle = "0.1"
+
 [dev-dependencies]
 tempfile = "3.23"
 portable-pty = "0.9"

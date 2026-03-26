@@ -703,6 +703,9 @@ pub(crate) fn register(
                     }
                 }
 
+                // Read optional label for process title identification
+                let label: Option<String> = opts.get("label").ok();
+
                 // Determine socket path
                 let socket_path =
                     crate::session::session_socket_path(&session_uuid).map_err(|e| {
@@ -715,19 +718,25 @@ pub(crate) fn register(
                 let socket_str = socket_path.display().to_string();
                 use std::os::unix::process::CommandExt;
 
+                let mut args = vec![
+                    "session".to_string(),
+                    "--uuid".to_string(),
+                    session_uuid.clone(),
+                    "--socket".to_string(),
+                    socket_str.clone(),
+                    "--timeout".to_string(),
+                    "120".to_string(),
+                ];
+                if let Some(ref lbl) = label {
+                    args.push("--label".to_string());
+                    args.push(lbl.clone());
+                }
+
                 // SAFETY: pre_exec closure runs after fork, before exec.
                 // setsid() creates a new session so the child survives hub exit.
                 match unsafe {
                     std::process::Command::new(&exe)
-                        .args([
-                            "session",
-                            "--uuid",
-                            &session_uuid,
-                            "--socket",
-                            &socket_str,
-                            "--timeout",
-                            "120",
-                        ])
+                        .args(&args)
                         .stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
