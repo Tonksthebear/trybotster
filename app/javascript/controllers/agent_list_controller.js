@@ -414,7 +414,7 @@ export default class extends Controller {
           el.classList.remove("text-zinc-100");
         }
       } else if (field === "subtext") {
-        // Secondary: spawn target · branch · config name (matches TUI)
+        // Bottom line: spawn info (target · branch · config) — always shown
         const parts = [];
         if (agent.target_name) parts.push(agent.target_name);
         if (agent.branch_name) parts.push(agent.branch_name);
@@ -422,15 +422,21 @@ export default class extends Controller {
         if (configName) parts.push(configName);
         if (isAccessory && parts.length === 0) parts.push("accessory");
         el.textContent = parts.join(" · ");
-      } else if (field === "label") {
-        // Label already shown as primary name — hide this field
-        if (hasLabel) {
-          // Don't show label again; keep hidden
+      } else if (field === "title-line") {
+        // Line 2: title/task when different from primary name (optional)
+        const titleParts = [];
+        const title = agent.title?.trim();
+        const primaryName = hasLabel ? agent.label : (agent.display_name || agent.id);
+        if (title && title !== primaryName) {
+          titleParts.push(title);
         }
-      } else if (field === "task") {
-        if (agent.task) {
-          el.textContent = agent.task;
+        if (agent.task) titleParts.push(agent.task);
+        if (titleParts.length > 0) {
+          el.textContent = titleParts.join(" · ");
           el.classList.remove("hidden");
+        } else {
+          el.textContent = "";
+          el.classList.add("hidden");
         }
       } else if (field === "id") {
         el.textContent = agent.id;

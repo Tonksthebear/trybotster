@@ -34,6 +34,15 @@ use ratatui::{
 
 use crate::app::buffer_to_ansi;
 
+/// A widget's screen area and type, for mouse hit-testing.
+#[derive(Debug, Clone)]
+pub struct WidgetArea {
+    /// Screen position and dimensions (inner area, minus borders).
+    pub rect: Rect,
+    /// Widget type name (e.g., "terminal", "list", "input").
+    pub widget_type: String,
+}
+
 use super::render_tree::{
     InputProps, ListProps, ParagraphAlignment, ParagraphProps, SpanStyle, StyledContent,
 };
@@ -84,9 +93,10 @@ pub struct RenderContext<'a> {
     pub terminal_rows: u16,
 
     // === Widget Area Tracking ===
-    /// Actual rendered area (rows, cols) of each terminal widget, keyed by session_uuid.
-    /// Populated during rendering so the runner can resize parsers and PTYs to match.
-    pub terminal_areas: std::cell::RefCell<std::collections::HashMap<String, (u16, u16)>>,
+    /// Actual rendered area of each widget, keyed by widget ID (session_uuid for
+    /// terminals, `id` prop for other widgets). Populated during rendering so the
+    /// runner can resize PTYs and hit-test mouse events.
+    pub widget_areas: std::cell::RefCell<std::collections::HashMap<String, WidgetArea>>,
 }
 
 impl<'a> std::fmt::Debug for RenderContext<'a> {
@@ -210,13 +220,17 @@ pub(super) fn render_terminal_panel(
     // Resolve which panel to use: explicit binding → pool lookup
     let session_uuid = binding.and_then(|b| b.session_uuid.as_deref());
 
-    // Record the inner area (minus borders) so the runner can resize parsers/PTYs
+    // Record the inner area (minus borders) for PTY resize and mouse hit-testing.
     let inner = block.inner(area);
     if let Some(uuid) = session_uuid {
         if inner.width > 0 && inner.height > 0 {
-            ctx.terminal_areas
-                .borrow_mut()
-                .insert(uuid.to_string(), (inner.height, inner.width));
+            ctx.widget_areas.borrow_mut().insert(
+                uuid.to_string(),
+                WidgetArea {
+                    rect: inner,
+                    widget_type: "terminal".to_string(),
+                },
+            );
         }
     }
 
@@ -290,13 +304,23 @@ pub(super) fn render_list_widget(
         } else {
             selectable_to_absolute.push(i);
             let primary = item.content.to_line();
-            let li = if let Some(ref secondary) = item.secondary {
-                let secondary_line = secondary
-                    .to_line()
-                    .style(Style::default().add_modifier(Modifier::DIM));
-                ListItem::new(Text::from(vec![primary, secondary_line]))
-            } else {
-                ListItem::new(primary)
+            let li = {
+                let mut lines = vec![primary];
+                if let Some(ref secondary) = item.secondary {
+                    lines.push(
+                        secondary
+                            .to_line()
+                            .style(Style::default().add_modifier(Modifier::DIM)),
+                    );
+                }
+                if let Some(ref tertiary) = item.tertiary {
+                    lines.push(
+                        tertiary
+                            .to_line()
+                            .style(Style::default().add_modifier(Modifier::DIM)),
+                    );
+                }
+                ListItem::new(Text::from(lines))
             };
             let li = if let Some(ref style) = item.style {
                 li.style(style.to_ratatui_style())

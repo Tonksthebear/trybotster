@@ -312,6 +312,96 @@ impl LayoutLua {
         self.events_loaded
     }
 
+    // === Mouse Support ===
+
+    /// Call Lua `mouse.handle_mouse(event)`.
+    ///
+    /// Returns `Ok(Some(ops))` if a handler returned an ops array,
+    /// `Ok(None)` if no handler claimed the event.
+    pub fn call_handle_mouse(
+        &self,
+        event_type: &str,
+        button: &str,
+        x: u16,
+        y: u16,
+        widget_type: Option<&str>,
+        widget_id: Option<&str>,
+        local_x: u16,
+        local_y: u16,
+    ) -> Result<Option<Vec<serde_json::Value>>> {
+        // mouse module is preloaded — check if it's available
+        let globals = self.lua.globals();
+        let loaded: mlua::Table = match globals.get::<mlua::Table>("package") {
+            Ok(pkg) => match pkg.get::<mlua::Table>("loaded") {
+                Ok(l) => l,
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        };
+        let mouse_module: mlua::Table = match loaded.get::<mlua::Table>("ui.mouse") {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let handle_fn: mlua::Function = match mouse_module.get::<mlua::Function>("handle_mouse") {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+
+        // Build event table
+        let event_table = self
+            .lua
+            .create_table()
+            .map_err(|e| anyhow!("Failed to create mouse event table: {e}"))?;
+        set_field(&event_table, "type", event_type)?;
+        set_field(&event_table, "button", button)?;
+        set_field(&event_table, "x", x)?;
+        set_field(&event_table, "y", y)?;
+
+        if let (Some(wt), Some(wid)) = (widget_type, widget_id) {
+            let widget_table = self
+                .lua
+                .create_table()
+                .map_err(|e| anyhow!("Failed to create widget table: {e}"))?;
+            set_field(&widget_table, "type", wt)?;
+            set_field(&widget_table, "id", wid)?;
+            set_field(&widget_table, "x", local_x)?;
+            set_field(&widget_table, "y", local_y)?;
+            event_table
+                .set("widget", widget_table)
+                .map_err(|e| anyhow!("Failed to set widget field: {e}"))?;
+        }
+
+        let result: LuaValue = handle_fn
+            .call(event_table)
+            .map_err(|e| anyhow!("Lua handle_mouse() failed: {e}"))?;
+
+        match result {
+            LuaValue::Nil => Ok(None),
+            LuaValue::Table(table) => {
+                // Check if it's a single action table or an ops array
+                if table.contains_key("action").unwrap_or(false) {
+                    // Single action — wrap as one-element ops array
+                    let json_val = lua_table_to_json(&self.lua, &table)?;
+                    Ok(Some(vec![json_val]))
+                } else {
+                    // Ops array
+                    let mut ops = Vec::new();
+                    for pair in table.sequence_values::<mlua::Table>() {
+                        let op_table =
+                            pair.map_err(|e| anyhow!("Invalid op in mouse result: {e}"))?;
+                        let json_val = lua_table_to_json(&self.lua, &op_table)?;
+                        ops.push(json_val);
+                    }
+                    Ok(Some(ops))
+                }
+            }
+            _ => {
+                log::warn!("handle_mouse() returned unexpected type: {:?}", result);
+                Ok(None)
+            }
+        }
+    }
+
     /// Call Lua `actions.on_action(action, context)`.
     ///
     /// Returns `Ok(Some(ops))` if Lua returned a list of compound ops,
@@ -714,7 +804,7 @@ mod tests {
             vpn_status: None,
             terminal_cols: 80,
             terminal_rows: 24,
-            terminal_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
+            widget_areas: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1866,7 +1956,10 @@ mod tests {
         }
     }
 
-    fn extract_sidebar_secondary_items(tree: &RenderNode) -> Vec<Option<String>> {
+    fn extract_sidebar_field(
+        tree: &RenderNode,
+        field: &str,
+    ) -> Vec<Option<String>> {
         use crate::tui::render_tree::{ListProps, StyledContent, WidgetProps};
         match tree {
             RenderNode::HSplit { children, .. } => match &children[0] {
@@ -1875,7 +1968,12 @@ mod tests {
                         items
                             .iter()
                             .map(|item| {
-                                item.secondary.as_ref().map(|secondary| match secondary {
+                                let opt = match field {
+                                    "secondary" => item.secondary.as_ref(),
+                                    "tertiary" => item.tertiary.as_ref(),
+                                    _ => None,
+                                };
+                                opt.map(|sc| match sc {
                                     StyledContent::Plain(s) => s.clone(),
                                     StyledContent::Styled(spans) => {
                                         spans.iter().map(|s| s.text.clone()).collect::<String>()
@@ -1891,6 +1989,10 @@ mod tests {
             },
             _ => panic!("Expected HSplit root layout"),
         }
+    }
+
+    fn extract_sidebar_secondary_items(tree: &RenderNode) -> Vec<Option<String>> {
+        extract_sidebar_field(tree, "secondary")
     }
 
     /// Layout should render the creating indicator during creation.
@@ -2023,7 +2125,7 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_renders_title_as_secondary_when_label_present() {
+    fn test_layout_title_on_secondary_spawn_info_on_tertiary() {
         let lua = make_full_lua_with_events();
 
         lua.exec(
@@ -2050,6 +2152,7 @@ mod tests {
         let tree = lua.call_render(&ctx).unwrap();
         let items = extract_sidebar_items(&tree);
         let secondary = extract_sidebar_secondary_items(&tree);
+        let tertiary = extract_sidebar_field(&tree, "tertiary");
 
         assert_eq!(items.len(), 1, "Should have exactly 1 agent item");
         assert!(
@@ -2057,11 +2160,19 @@ mod tests {
             "Primary row should use label, got: {}",
             items[0]
         );
+        // Secondary = title (different from label)
         let secondary_text = secondary[0].as_deref().unwrap_or("");
         assert!(
             secondary_text.contains("Agent runtime title"),
-            "Secondary row should include runtime title, got: {}",
+            "Secondary should include runtime title, got: {}",
             secondary_text
+        );
+        // Tertiary = spawn info (target · branch · config) — always present
+        let tertiary_text = tertiary[0].as_deref().unwrap_or("");
+        assert!(
+            tertiary_text.contains("trybotster") && tertiary_text.contains("feature-auth") && tertiary_text.contains("claude"),
+            "Tertiary should contain spawn info (target · branch · config), got: {}",
+            tertiary_text
         );
     }
 
