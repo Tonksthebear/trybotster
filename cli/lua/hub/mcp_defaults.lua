@@ -908,4 +908,93 @@ mcp.tool("secrets_set", {
     end
 end)
 
-log.info("MCP default prompts registered: botster-customize-tui, botster-customize-hub, botster-create-plugin, botster-customize-mcp")
+-- =============================================================================
+-- Plugin Management Tools
+-- =============================================================================
+
+local loader = require("hub.loader")
+
+mcp.tool("list_plugins", {
+    description = "List all plugins with their status (loaded, errored, disabled). Use this to check what plugins are available and their health.",
+    input_schema = { type = "object", properties = {} },
+}, function(_params, _ctx)
+    return loader.list_plugins()
+end)
+
+mcp.tool("reload_plugin", {
+    description = "Reload a plugin by name. Use after editing plugin code. Returns success/failure with error details.",
+    input_schema = {
+        type = "object",
+        properties = {
+            name = { type = "string", description = "Plugin name (directory name, e.g. 'github')" },
+        },
+        required = { "name" },
+    },
+}, function(params, _ctx)
+    local ok, err = loader.reload_plugin(params.name)
+    if ok then
+        return string.format("Plugin '%s' reloaded successfully.", params.name)
+    else
+        error(string.format("Failed to reload '%s': %s", params.name, tostring(err)))
+    end
+end)
+
+mcp.tool("enable_plugin", {
+    description = "Enable a disabled plugin. Loads it immediately.",
+    input_schema = {
+        type = "object",
+        properties = {
+            name = { type = "string", description = "Plugin name to enable" },
+        },
+        required = { "name" },
+    },
+}, function(params, _ctx)
+    local ok, err = loader.enable_plugin(params.name)
+    if ok then
+        return string.format("Plugin '%s' enabled and loaded.", params.name)
+    else
+        error(string.format("Failed to enable '%s': %s", params.name, tostring(err)))
+    end
+end)
+
+mcp.tool("disable_plugin", {
+    description = "Disable a plugin. Unloads it and prevents it from loading on hub restart. Persists across restarts.",
+    input_schema = {
+        type = "object",
+        properties = {
+            name = { type = "string", description = "Plugin name to disable" },
+        },
+        required = { "name" },
+    },
+}, function(params, _ctx)
+    local ok, err = loader.disable_plugin(params.name)
+    if ok then
+        return string.format("Plugin '%s' disabled.", params.name)
+    else
+        error(string.format("Failed to disable '%s': %s", params.name, tostring(err)))
+    end
+end)
+
+mcp.tool("get_plugin_logs", {
+    description = "Get recent log entries for a specific plugin. Useful for debugging plugin issues.",
+    input_schema = {
+        type = "object",
+        properties = {
+            name  = { type = "string",  description = "Plugin name" },
+            level = { type = "string",  description = "Filter by level: info, warn, error, debug" },
+            limit = { type = "number",  description = "Max entries to return (default 50)" },
+        },
+        required = { "name" },
+    },
+}, function(params, _ctx)
+    local entries = loader.get_plugin_logs(params.name, {
+        level = params.level,
+        limit = params.limit or 50,
+    })
+    if #entries == 0 then
+        return string.format("No log entries for plugin '%s'.", params.name)
+    end
+    return entries
+end)
+
+log.info("MCP default prompts and tools registered")

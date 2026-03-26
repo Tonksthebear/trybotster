@@ -553,6 +553,55 @@ end, { description = "Install update and restart (kills active agents)" })
 
 local M = {}
 
+-- ============================================================================
+-- Plugin Management Commands
+-- ============================================================================
+
+local loader = require("hub.loader")
+
+commands.register("list_plugins", function(client, sub_id, _command)
+    local plugins = loader.list_plugins()
+    if client then
+        client:send({ subscriptionId = sub_id, type = "plugin_list", plugins = plugins })
+    end
+end, { description = "List all plugins with status" })
+
+commands.register("reload_plugin", function(client, sub_id, command)
+    local name = command.name or command.plugin_name
+    if not name then
+        if client then client:send({ subscriptionId = sub_id, type = "error", message = "Missing plugin name" }) end
+        return
+    end
+    local ok, err = loader.reload_plugin(name)
+    if client then
+        client:send({ subscriptionId = sub_id, type = "plugin_reloaded", name = name, success = ok, error = not ok and tostring(err) or nil })
+    end
+end, { description = "Reload a plugin by name" })
+
+commands.register("enable_plugin", function(client, sub_id, command)
+    local name = command.name or command.plugin_name
+    if not name then
+        if client then client:send({ subscriptionId = sub_id, type = "error", message = "Missing plugin name" }) end
+        return
+    end
+    local ok, err = loader.enable_plugin(name)
+    if client then
+        client:send({ subscriptionId = sub_id, type = "plugin_enabled", name = name, success = ok, error = not ok and tostring(err) or nil })
+    end
+end, { description = "Enable a disabled plugin" })
+
+commands.register("disable_plugin", function(client, sub_id, command)
+    local name = command.name or command.plugin_name
+    if not name then
+        if client then client:send({ subscriptionId = sub_id, type = "error", message = "Missing plugin name" }) end
+        return
+    end
+    local ok, err = loader.disable_plugin(name)
+    if client then
+        client:send({ subscriptionId = sub_id, type = "plugin_disabled", name = name, success = ok, error = not ok and tostring(err) or nil })
+    end
+end, { description = "Disable a plugin" })
+
 -- Lifecycle hooks for hot-reload
 function M._before_reload()
     log.info("handlers/commands.lua reloading")

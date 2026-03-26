@@ -13,6 +13,10 @@ local protected_modules = {
     ["hub.loader"] = true,
 }
 
+-- Per-plugin log ring buffers: name -> array of {time, level, msg}
+local plugin_logs = {}
+local MAX_LOG_ENTRIES = 200
+
 -- Reload a module by path
 function M.reload(module_name)
     if protected_modules[module_name] then
@@ -116,6 +120,138 @@ local function clear_plugin_namespace(name)
     end
 end
 
+-- ============================================================================
+-- Plugin Status, Logging, and Disabled Set (local helpers — must precede load_plugin)
+-- ============================================================================
+
+--- Update a plugin's registry entry with status information.
+-- @param name string Plugin name
+-- @param status string "loaded" | "errored" | "disabled" | "unloaded"
+-- @param error_msg string|nil Error message (for "errored" status)
+local function update_registry_status(name, status, error_msg)
+    local state = require("hub.state")
+    local registry = state.get("plugin_registry", {})
+    local entry = registry[name]
+    if not entry then return end
+
+    entry.status = status
+    if status == "loaded" then
+        entry.loaded_at = os.time()
+        entry.error = nil
+        entry.error_at = nil
+        entry.reload_count = (entry.reload_count or 0) + 1
+    elseif status == "errored" then
+        entry.error = error_msg
+        entry.error_at = os.time()
+    elseif status == "disabled" then
+        entry.error = nil
+    end
+
+    hooks.notify("plugin_status_changed", { name = name, status = status, error = error_msg })
+end
+
+--- Capture a log entry into a plugin's ring buffer.
+-- @param name string Plugin name
+-- @param level string Log level
+-- @param msg string Log message
+local function capture_plugin_log(name, level, msg)
+    if not plugin_logs[name] then
+        plugin_logs[name] = {}
+    end
+    local ring = plugin_logs[name]
+    table.insert(ring, { time = os.time(), level = level, msg = msg })
+    if #ring > MAX_LOG_ENTRIES then
+        table.remove(ring, 1)
+    end
+end
+
+--- Create a wrapped log table that captures entries for a plugin.
+-- @param name string Plugin name
+-- @param real_log table The real log global
+-- @return table Wrapped log table
+local function create_plugin_logger(name, real_log)
+    if not plugin_logs[name] then
+        plugin_logs[name] = {}
+    end
+    local ring = plugin_logs[name]
+
+    local function capture(level, msg)
+        table.insert(ring, { time = os.time(), level = level, msg = msg })
+        if #ring > MAX_LOG_ENTRIES then
+            table.remove(ring, 1)
+        end
+    end
+
+    return {
+        info = function(msg)
+            capture("info", msg)
+            real_log.info(string.format("[%s] %s", name, msg))
+        end,
+        warn = function(msg)
+            capture("warn", msg)
+            real_log.warn(string.format("[%s] %s", name, msg))
+        end,
+        error = function(msg)
+            capture("error", msg)
+            real_log.error(string.format("[%s] %s", name, msg))
+        end,
+        debug = function(msg)
+            capture("debug", msg)
+            real_log.debug(string.format("[%s] %s", name, msg))
+        end,
+    }
+end
+
+--- Persist the disabled set to disk.
+local function save_disabled_set()
+    local data_dir = config.data_dir and config.data_dir() or nil
+    if not data_dir then return end
+
+    local S = M.get_disabled_set()
+    local names = {}
+    for k, v in pairs(S) do
+        if v == true and k ~= "_loaded" then
+            table.insert(names, k)
+        end
+    end
+    table.sort(names)
+    json.file_set(data_dir .. "/plugin_state.json", "disabled", names)
+end
+
+--- Get the disabled plugins set, loading from disk if needed.
+-- @return table Set of disabled plugin names
+function M.get_disabled_set()
+    local state = require("hub.state")
+    local S = state.get("plugin_disabled", {})
+    -- Lazy-load from disk on first access
+    if not S._loaded then
+        S._loaded = true
+        local data_dir = config.data_dir and config.data_dir() or nil
+        if data_dir then
+            local path = data_dir .. "/plugin_state.json"
+            local disabled, _ = json.file_get(path, "disabled")
+            if disabled and type(disabled) == "table" then
+                for _, name in ipairs(disabled) do
+                    S[name] = true
+                end
+            end
+        end
+    end
+    return S
+end
+
+--- Check if a plugin is disabled.
+-- @param name string Plugin name
+-- @return boolean
+function M.is_disabled(name)
+    local S = M.get_disabled_set()
+    return S[name] == true
+end
+
+-- ============================================================================
+-- Plugin Loading
+-- ============================================================================
+
 --- Load a plugin by absolute path (not via require/package.path).
 -- Loads the file with full _ENV (same trust as user plugins), registers
 -- it in package.loaded so it can be reloaded by name.
@@ -124,7 +260,14 @@ end
 -- @param path string Absolute path to the plugin's init.lua
 -- @param name string Plugin name (used for registration and logging)
 -- @return boolean success
+-- @return string|nil error message on failure
 function M.load_plugin(path, name)
+    -- Skip disabled plugins
+    if M.is_disabled(name) then
+        log.info(string.format("Skipping disabled plugin: %s", name))
+        return false, "Plugin is disabled: " .. name
+    end
+
     if not fs.exists(path) then
         local msg = string.format("load_plugin: %s not found at %s", name, path)
         log.warn(msg)
@@ -141,6 +284,7 @@ function M.load_plugin(path, name)
     local chunk, err = load(source, "@" .. path)
     if not chunk then
         local msg = string.format("load_plugin: syntax error in %s: %s", path, tostring(err))
+        capture_plugin_log(name, "error", msg)
         log.error(msg)
         return false, msg
     end
@@ -161,7 +305,15 @@ function M.load_plugin(path, name)
     -- Set source context so mcp.tool() can track which plugin registered each tool
     _G._loading_plugin_source = "@" .. path
     _G._loading_plugin_name = name
+
+    -- Install per-plugin logger during load
+    local real_log = _G.log
+    _G.log = create_plugin_logger(name, real_log)
+
     local ok, result = pcall(chunk)
+
+    -- Restore real logger
+    _G.log = real_log
     _G._loading_plugin_source = nil
     _G._loading_plugin_name = nil
 
@@ -169,6 +321,8 @@ function M.load_plugin(path, name)
 
     if not ok then
         local msg = string.format("load_plugin: runtime error in %s: %s", path, tostring(result))
+        -- Capture error in plugin's log ring even though logger is restored
+        capture_plugin_log(name, "error", msg)
         log.error(msg)
         return false, msg
     end
@@ -193,6 +347,10 @@ function M.reload_plugin(name)
     local entry = registry[name]
     if not entry then
         return false, "Plugin not found in registry: " .. name
+    end
+
+    if M.is_disabled(name) then
+        return false, "Plugin is disabled: " .. name .. " (enable it first)"
     end
 
     local module_key = "plugin." .. name
@@ -254,9 +412,11 @@ function M.reload_plugin(name)
             package.loaded[k] = v
         end
         add_to_package_path(lua_dir)
+        update_registry_status(name, "errored", "Failed to reload plugin: " .. name)
         return false, "Failed to reload plugin: " .. name
     end
 
+    update_registry_status(name, "loaded", nil)
     return true
 end
 
@@ -311,6 +471,119 @@ function M.unload_plugin(name)
 
     log.info(string.format("Unloaded plugin: %s", name))
     return true
+end
+
+--- Disable a plugin. Unloads it if currently loaded, persists across restarts.
+-- @param name string Plugin name
+-- @return boolean success
+-- @return string|nil error message
+function M.disable_plugin(name)
+    local state = require("hub.state")
+    local registry = state.get("plugin_registry", {})
+
+    if not registry[name] then
+        return false, "Plugin not found in registry: " .. name
+    end
+
+    -- Mark as disabled
+    local S = M.get_disabled_set()
+    S[name] = true
+    save_disabled_set()
+
+    -- Save path before unload removes the registry entry
+    local saved_path = registry[name].path
+
+    -- Unload if currently loaded
+    local module_key = "plugin." .. name
+    if package.loaded[module_key] then
+        M.unload_plugin(name)
+    end
+
+    -- Re-add to registry (unload_plugin removes it, but we need it for enable)
+    registry[name] = { path = saved_path, reload_count = 0 }
+    update_registry_status(name, "disabled", nil)
+    log.info(string.format("Disabled plugin: %s", name))
+    return true
+end
+
+--- Enable a previously disabled plugin. Loads it immediately.
+-- @param name string Plugin name
+-- @return boolean success
+-- @return string|nil error message
+function M.enable_plugin(name)
+    local state = require("hub.state")
+    local registry = state.get("plugin_registry", {})
+
+    if not registry[name] then
+        return false, "Plugin not found in registry: " .. name
+    end
+
+    -- Remove from disabled set
+    local S = M.get_disabled_set()
+    S[name] = nil
+    save_disabled_set()
+
+    -- Load the plugin
+    local entry = registry[name]
+    local ok, err = M.load_plugin(entry.path, name)
+    if ok then
+        update_registry_status(name, "loaded", nil)
+    else
+        update_registry_status(name, "errored", err)
+    end
+    return ok, err
+end
+
+--- Get status of all plugins.
+-- @return table Array of {name, path, status, error, loaded_at, reload_count}
+function M.list_plugins()
+    local state = require("hub.state")
+    local registry = state.get("plugin_registry", {})
+    local result = {}
+    for name, entry in pairs(registry) do
+        table.insert(result, {
+            name = name,
+            path = entry.path,
+            status = entry.status or "unknown",
+            error = entry.error,
+            loaded_at = entry.loaded_at,
+            error_at = entry.error_at,
+            reload_count = entry.reload_count or 0,
+        })
+    end
+    table.sort(result, function(a, b) return a.name < b.name end)
+    return result
+end
+
+--- Get log entries for a plugin.
+-- @param name string Plugin name
+-- @param opts table|nil {level=string, limit=number}
+-- @return table Array of log entries
+function M.get_plugin_logs(name, opts)
+    opts = opts or {}
+    local ring = plugin_logs[name]
+    if not ring then return {} end
+
+    local result = {}
+    for i = #ring, 1, -1 do
+        local entry = ring[i]
+        if not opts.level or entry.level == opts.level then
+            table.insert(result, entry)
+            if opts.limit and #result >= opts.limit then break end
+        end
+    end
+    -- Reverse to chronological order
+    local reversed = {}
+    for i = #result, 1, -1 do
+        table.insert(reversed, result[i])
+    end
+    return reversed
+end
+
+--- Clear log entries for a plugin.
+-- @param name string Plugin name
+function M.clear_plugin_logs(name)
+    plugin_logs[name] = {}
 end
 
 -- ============================================================================

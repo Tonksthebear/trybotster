@@ -145,9 +145,28 @@ if device_root then
 
     if unified and unified.plugins then
         for _, plugin in ipairs(unified.plugins) do
-            if loader.load_plugin(plugin.init_path, plugin.name) then
-                loaded_plugin_names[plugin.name] = true
-                plugin_registry[plugin.name] = { path = plugin.init_path }
+            -- Register in plugin_registry first (load_plugin checks disabled set)
+            plugin_registry[plugin.name] = {
+                path = plugin.init_path,
+                status = "pending",
+                reload_count = 0,
+            }
+
+            if loader.is_disabled(plugin.name) then
+                plugin_registry[plugin.name].status = "disabled"
+                log.info(string.format("Plugin disabled, skipping: %s", plugin.name))
+            else
+                local load_ok, load_err = loader.load_plugin(plugin.init_path, plugin.name)
+                if load_ok then
+                    loaded_plugin_names[plugin.name] = true
+                    plugin_registry[plugin.name].status = "loaded"
+                    plugin_registry[plugin.name].loaded_at = os.time()
+                    plugin_registry[plugin.name].reload_count = 1
+                else
+                    plugin_registry[plugin.name].status = "errored"
+                    plugin_registry[plugin.name].error = load_err
+                    plugin_registry[plugin.name].error_at = os.time()
+                end
             end
         end
     end
@@ -197,7 +216,7 @@ end
 -- Load session recovery handler (reconnects to surviving session processes on Hub restart)
 safe_require("handlers.session_recovery")
 
--- Watch core modules and plugin directories for hot-reload on file changes
+-- Watch core Lua modules for hot-reload (plugins use explicit reload)
 safe_require("handlers.module_watcher")
 
 -- ============================================================================
