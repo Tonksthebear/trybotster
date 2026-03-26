@@ -3322,6 +3322,18 @@ impl Hub {
                                         super::wake_tui_pipe(fd);
                                     }
                                 }
+                                PtyEvent::AltScreenScrollback { data, rows, cols } => {
+                                    let _ = sink.send(TuiOutput::Scrollback {
+                                        session_uuid: session_uuid.clone(),
+                                        rows,
+                                        cols,
+                                        data,
+                                        kitty_enabled: false,
+                                    });
+                                    if let Some(fd) = wake_fd {
+                                        super::wake_tui_pipe(fd);
+                                    }
+                                }
                                 PtyEvent::Output(_) => unreachable!("output handled above"),
                                 _ => {} // Resized, Notification, etc. — not forwarded to TUI
                             }
@@ -3361,6 +3373,18 @@ impl Hub {
                             "enabled": enabled,
                             "session_uuid": session_uuid,
                         })));
+                        if let Some(fd) = wake_fd {
+                            super::wake_tui_pipe(fd);
+                        }
+                    }
+                    Ok(PtyEvent::AltScreenScrollback { data, rows, cols }) => {
+                        let _ = sink.send(TuiOutput::Scrollback {
+                            session_uuid: session_uuid.clone(),
+                            rows,
+                            cols,
+                            data,
+                            kitty_enabled: false,
+                        });
                         if let Some(fd) = wake_fd {
                             super::wake_tui_pipe(fd);
                         }
@@ -3630,6 +3654,16 @@ impl Hub {
                             "enabled": enabled,
                             "session_uuid": session_uuid,
                         }));
+                        let _ = frame_tx.try_send(frame.encode());
+                    }
+                    Ok(PtyEvent::AltScreenScrollback { data, rows, cols }) => {
+                        let frame = Frame::Scrollback {
+                            session_uuid: session_uuid.clone(),
+                            rows,
+                            cols,
+                            kitty_enabled: false,
+                            data,
+                        };
                         let _ = frame_tx.try_send(frame.encode());
                     }
                     Ok(_) => {}

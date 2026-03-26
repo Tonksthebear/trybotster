@@ -918,7 +918,7 @@ impl PtySession {
             .lock()
             .expect("shadow_screen lock poisoned");
         let skip_visible = self.resize_pending.swap(false, Ordering::AcqRel);
-        // generate_ansi_snapshot includes kitty restore and alt-screen entry
+        // generate_ansi_snapshot includes kitty restore and core mode
         // sequences automatically — no manual appends needed here.
         crate::terminal::generate_ansi_snapshot(&*parser, skip_visible)
     }

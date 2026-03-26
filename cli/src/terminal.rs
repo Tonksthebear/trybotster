@@ -538,11 +538,10 @@ pub fn generate_ansi_snapshot<L: EventListener>(
     // when the app later exits and restores the normal buffer.
     //
     // Limitation: `inactive_grid` is private in alacritty_terminal, so we cannot
-    // serialize the normal buffer before entering alt screen. When the app exits
-    // alt screen (`\x1b[?1049l`), the receiving terminal restores a blank normal
-    // buffer rather than the pre-alt content. This is acceptable because:
-    // 1. Alt-screen apps (vim, less, htop) immediately redraw on exit
-    // 2. The alt-screen content itself (the important part) round-trips correctly
+    // serialize the normal buffer before entering alt screen. The receiving
+    // parser gets an empty normal buffer. To compensate, the hub sends a fresh
+    // scrollback when alt screen exits (detected by session_reader's alt_screen
+    // tracking), so the client's normal buffer is populated at that point.
     if term.mode().contains(TermMode::ALT_SCREEN) {
         out.extend_from_slice(b"\x1b[?1049h");
     }
@@ -1601,6 +1600,8 @@ mod tests {
     fn snapshot_alt_screen_round_trips_and_exit_works() {
         // Regression: alt-screen reconnect — content should round-trip, and
         // exiting alt screen (?1049l) should work after snapshot replay.
+        // Note: the normal buffer is empty after snapshot replay. The hub
+        // compensates by sending a fresh scrollback on alt screen exit.
         let mut src = AlacrittyParser::new_noop(4, 20, 100);
         // Write normal screen content, enter alt screen, write alt content.
         src.process(b"NORMAL\x1b[?1049h\x1b[HALT_CONTENT");

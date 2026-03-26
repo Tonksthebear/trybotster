@@ -614,4 +614,53 @@ mod tests {
         assert!(!panel.is_scrolled());
         assert_eq!(panel.scroll_offset(), 0);
     }
+
+    #[test]
+    fn alt_screen_scrollback_refresh_restores_normal_buffer() {
+        // Simulates: panel bootstraps from snapshot taken during alt screen,
+        // then receives alt screen exit bytes followed by a scrollback refresh.
+        // This is the fix for blank-screen-after-Claude-Code-exit.
+        let mut panel = TerminalPanel::new(24, 80);
+        panel.connect("sess-0");
+
+        // 1. Bootstrap from snapshot taken while alt screen is active.
+        //    The snapshot includes CSI ?1049h — fresh parser enters alt screen
+        //    with an empty normal buffer.
+        let snapshot = b"\x1b[?1049h\x1b[HAlt screen content here";
+        panel.on_scrollback(snapshot);
+        assert_eq!(panel.state(), PanelState::Connected);
+
+        // Verify parser is in alt screen
+        let in_alt = panel.term().mode().contains(
+            alacritty_terminal::term::TermMode::ALT_SCREEN,
+        );
+        assert!(in_alt, "panel should be in alt screen after snapshot");
+
+        // 2. Claude Code exits: raw bytes with CSI ?1049l arrive.
+        //    The old parser processes them and exits alt screen.
+        panel.on_output(b"\x1b[?1049l");
+        let in_alt_after = panel.term().mode().contains(
+            alacritty_terminal::term::TermMode::ALT_SCREEN,
+        );
+        assert!(!in_alt_after, "panel should exit alt screen");
+
+        // At this point the normal buffer is EMPTY (from the snapshot bootstrap).
+        let cell = &panel.term().grid()[Point::new(Line(0), Column(0))];
+        assert_eq!(cell.c, ' ', "normal buffer should be empty after snapshot bootstrap");
+
+        // 3. AltScreenScrollback arrives with correct normal screen content.
+        //    This replaces the parser entirely.
+        panel.on_scrollback(b"bash-5.2$ \r\nreal normal content");
+        let cell_after = &panel.term().grid()[Point::new(Line(0), Column(0))];
+        assert_eq!(
+            cell_after.c, 'b',
+            "scrollback refresh should restore normal buffer content"
+        );
+
+        // Parser should NOT be in alt screen
+        let in_alt_final = panel.term().mode().contains(
+            alacritty_terminal::term::TermMode::ALT_SCREEN,
+        );
+        assert!(!in_alt_final, "should be on normal screen after refresh");
+    }
 }
