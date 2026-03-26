@@ -161,6 +161,7 @@ M.primitives = {
             { sig = "hub.connect_session(uuid, conn)", desc = "Connect to a session socket" },
             { sig = "hub.register_session(uuid, handle, meta)", desc = "Register PTY handle with hub" },
             { sig = "hub.unregister_session(uuid)", desc = "Unregister PTY handle" },
+            { sig = "hub.update_session_metadata(uuid, meta)", desc = "Update label/workspace_id without re-registering" },
             { sig = "hub.is_offline()",            desc = "Check if hub is in offline mode" },
             { sig = "hub.quit()",                  desc = "Request hub shutdown" },
             { sig = "hub.graceful_restart()",      desc = "Restart hub (sessions survive)" },

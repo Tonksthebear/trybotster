@@ -162,6 +162,30 @@ impl HandleCache {
         }
     }
 
+    /// Update metadata (label, workspace_id) on an existing session handle.
+    ///
+    /// Returns `true` if the session was found and updated. The PtyHandle
+    /// is left untouched — no new reader thread, no new connection.
+    pub fn update_session_metadata(
+        &self,
+        uuid: &str,
+        label: Option<&str>,
+        workspace_id: Option<Option<&str>>,
+    ) -> bool {
+        if let Ok(mut sessions) = self.sessions.write() {
+            if let Some(handle) = sessions.get_mut(uuid) {
+                if let Some(l) = label {
+                    handle.label = l.to_string();
+                }
+                if let Some(ws) = workspace_id {
+                    handle.workspace_id = ws.map(|s| s.to_string());
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     /// Remove a session by UUID.
     ///
     /// Returns true if the session was found and removed.
@@ -316,5 +340,89 @@ mod tests {
         cache.remove_worktree_by_branch("nonexistent");
 
         assert_eq!(cache.get_worktrees().len(), 1);
+    }
+
+    // ── update_session_metadata tests ────────────────────────────────────
+
+    /// Helper: create a test SessionHandle with a real PtyHandle.
+    fn create_test_session(uuid: &str, label: &str, workspace_id: Option<&str>) -> SessionHandle {
+        use crate::agent::pty::PtySession;
+        let pty_session = PtySession::new(24, 80);
+        let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
+            pty_session.get_direct_access();
+        std::mem::forget(pty_session);
+        let pty = super::super::agent_handle::PtyHandle::new(
+            event_tx,
+            shared_state,
+            shadow_screen,
+            kitty_enabled,
+            cursor_visible,
+            resize_pending,
+            true,
+            None,
+        );
+        SessionHandle::new(uuid, label, Default::default(), workspace_id.map(String::from), pty)
+    }
+
+    #[test]
+    fn test_update_session_metadata_updates_label() {
+        let cache = HandleCache::new();
+        cache.add_session(create_test_session("sess-1", "old-label", None));
+
+        let updated = cache.update_session_metadata("sess-1", Some("new-label"), None);
+
+        assert!(updated);
+        let handle = cache.get_session("sess-1").unwrap();
+        assert_eq!(handle.label(), "new-label");
+    }
+
+    #[test]
+    fn test_update_session_metadata_updates_workspace_id() {
+        let cache = HandleCache::new();
+        cache.add_session(create_test_session("sess-1", "label", None));
+
+        let updated =
+            cache.update_session_metadata("sess-1", None, Some(Some("ws-new")));
+
+        assert!(updated);
+        let handle = cache.get_session("sess-1").unwrap();
+        assert_eq!(handle.workspace_id(), Some("ws-new"));
+    }
+
+    #[test]
+    fn test_update_session_metadata_clears_workspace_id() {
+        let cache = HandleCache::new();
+        cache.add_session(create_test_session("sess-1", "label", Some("ws-old")));
+
+        let updated = cache.update_session_metadata("sess-1", None, Some(None));
+
+        assert!(updated);
+        let handle = cache.get_session("sess-1").unwrap();
+        assert!(handle.workspace_id().is_none());
+    }
+
+    #[test]
+    fn test_update_session_metadata_returns_false_when_not_found() {
+        let cache = HandleCache::new();
+
+        let updated = cache.update_session_metadata("nonexistent", Some("label"), None);
+
+        assert!(!updated);
+    }
+
+    #[test]
+    fn test_update_session_metadata_preserves_pty_handle() {
+        let cache = HandleCache::new();
+        cache.add_session(create_test_session("sess-1", "label", Some("ws-1")));
+
+        // Subscribe before update to verify event_tx is the same Arc
+        let handle_before = cache.get_session("sess-1").unwrap();
+        let _rx = handle_before.pty().subscribe();
+
+        cache.update_session_metadata("sess-1", Some("new-label"), Some(Some("ws-2")));
+
+        // PtyHandle should still work — same broadcast channel
+        let handle_after = cache.get_session("sess-1").unwrap();
+        handle_after.pty().notify_process_exited(Some(0));
     }
 }

@@ -727,17 +727,15 @@ function Session:move_to_workspace(opts)
     self._workspace_name = workspace_name
 
     -- Update HandleCache metadata so Rust-side lookups see the new workspace_id.
-    if self.session then
-        local ok_reg, reg_err = pcall(hub.register_session, self.session_uuid, self.session, {
-            session_type = self.session_type,
-            session_name = self.session_name,
-            label = self.label or "",
-            workspace_id = workspace_id,
-        })
-        if not ok_reg then
-            log.warn(string.format("Session %s: failed to refresh HandleCache workspace: %s",
-                self.session_uuid, tostring(reg_err)))
-        end
+    -- Use update_session_metadata (lightweight) instead of register_session to avoid
+    -- creating a duplicate reader thread on the same socket.
+    local ok_meta, meta_err = pcall(hub.update_session_metadata, self.session_uuid, {
+        label = self.label or "",
+        workspace_id = workspace_id,
+    })
+    if not ok_meta then
+        log.warn(string.format("Session %s: failed to update HandleCache metadata: %s",
+            self.session_uuid, tostring(meta_err)))
     end
 
     self:_sync_workspace_manifest()

@@ -91,13 +91,13 @@ pub struct SessionHandle {
     session_uuid: String,
 
     /// Human-readable display label (e.g., "owner-repo-42").
-    label: String,
+    pub(crate) label: String,
 
     /// Whether this is an agent or accessory session.
     session_type: SessionType,
 
     /// Optional workspace identifier for grouping sessions.
-    workspace_id: Option<String>,
+    pub(crate) workspace_id: Option<String>,
 
     /// Single PTY handle for this session.
     pty: PtyHandle,
