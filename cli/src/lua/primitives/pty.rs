@@ -72,8 +72,6 @@ use crate::agent::pty::{PtySession, SharedPtyState};
 #[cfg(test)]
 use crate::agent::spawn::PtySpawnConfig;
 use crate::hub::events::HubEvent;
-#[cfg(test)]
-use crate::terminal::TerminalParser;
 use tokio::sync::broadcast;
 
 /// Strip ANSI escape sequences from bytes, returning plain text.
