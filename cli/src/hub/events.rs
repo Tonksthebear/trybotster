@@ -80,18 +80,6 @@ pub(crate) enum HubEvent {
         data: Vec<u8>,
     },
 
-    /// Child process queried a terminal color via OSC 10/11/12 and the hub
-    /// should respond if no live client is attached.
-    ///
-    /// The response string is pre-formatted by the alacritty formatter using
-    /// the hub's cached RGB value. The hub just needs to write it to the PTY.
-    /// Legacy — ghostty handles color queries internally via write_pty callback.
-    #[allow(dead_code)]
-    ColorResponse {
-        session_uuid: String,
-        response: String,
-    },
-
     /// WebRTC DataChannel has opened for a browser peer.
     ///
     /// Sent from the `on_data_channel` callback. Triggers `peer_connected`
@@ -352,7 +340,6 @@ impl HubEvent {
             },
             Self::PtyProcessExited { .. } => "pty_process_exited",
             Self::PtyOutputObserved { .. } => "pty_output_observed",
-            Self::ColorResponse { .. } => "color_response",
             Self::DcOpened { .. } => "dc_opened",
             Self::WebRtcIngressBackpressure { .. } => "webrtc_ingress_backpressure",
             Self::TimerFired { .. } => "timer_fired",
