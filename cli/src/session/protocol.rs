@@ -23,6 +23,8 @@ use std::io::{Read, Write};
 
 use anyhow::{bail, Context, Result};
 
+use crate::ghostty_vt::{GhosttyPageCapacity, GhosttyScreenKey};
+
 // ─── Protocol version ────────────────────────────────────────────────────────
 
 /// Current protocol version. Bump on breaking wire changes.
@@ -48,10 +50,10 @@ pub const FRAME_RESIZE: u8 = 0x03;
 /// Hub → Session: arm tee log (JSON payload: `{"log_path": str, "cap_bytes": u64}`).
 pub const FRAME_ARM_TEE: u8 = 0x04;
 
-/// Hub → Session: request ANSI snapshot of current terminal state.
+/// Hub → Session: request binary page snapshot of current terminal state.
 pub const FRAME_GET_SNAPSHOT: u8 = 0x05;
 
-/// Session → Hub: ANSI snapshot response.
+/// Session → Hub: binary page snapshot response.
 pub const FRAME_SNAPSHOT: u8 = 0x06;
 
 /// Session → Hub: child process exited (JSON payload: `{"exit_code": i32|null}`).
@@ -357,6 +359,204 @@ pub fn handshake_session(
     Ok(version[0])
 }
 
+// ─── Binary snapshot wire format ─────────────────────────────────────────────
+//
+// Wire format (version 1):
+// ```
+// [u8: version=1]
+// [u8: screen_count (1 or 2)]
+// [u8: active_screen_key (0=primary, 1=alt)]
+// --- per screen ---
+//   [u32 LE: page_count]
+//   --- per page ---
+//     [u32 LE: memory_len]
+//     [u16 LE: used_cols][u16 LE: used_rows]
+//     [u16 LE: cap_cols][u16 LE: cap_rows][u16 LE: cap_styles]
+//     [u32 LE: cap_grapheme_bytes][u16 LE: cap_hyperlink_bytes][u32 LE: cap_string_bytes]
+//     [memory_len bytes: raw page data]
+// --- after all screens ---
+// [u32 LE: state_blob_len]
+// [state_blob bytes]
+// ```
+
+const BINARY_SNAPSHOT_VERSION: u8 = 1;
+
+/// A single page in the binary snapshot.
+#[derive(Debug)]
+pub struct SnapshotPage {
+    /// Page allocation capacity.
+    pub capacity: GhosttyPageCapacity,
+    /// Columns actually used in this page.
+    pub used_cols: u16,
+    /// Rows actually used in this page.
+    pub used_rows: u16,
+    /// Raw page memory.
+    pub data: Vec<u8>,
+}
+
+/// A screen (primary or alternate) in the binary snapshot.
+#[derive(Debug)]
+pub struct SnapshotScreen {
+    /// Pages in this screen, ordered from oldest to newest.
+    pub pages: Vec<SnapshotPage>,
+}
+
+/// Decoded binary snapshot.
+#[derive(Debug)]
+pub struct BinarySnapshot {
+    /// Which screen is currently active.
+    pub active_screen: GhosttyScreenKey,
+    /// Screens: index 0 = primary, index 1 = alternate (if present).
+    pub screens: Vec<SnapshotScreen>,
+    /// Non-page terminal state (modes, cursor, colors, etc.).
+    pub state_blob: Vec<u8>,
+}
+
+/// Encode a binary snapshot into wire format.
+pub fn encode_binary_snapshot(
+    active_screen: GhosttyScreenKey,
+    screens: &[SnapshotScreen],
+    state_blob: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64 * 1024);
+
+    // Header
+    buf.push(BINARY_SNAPSHOT_VERSION);
+    buf.push(screens.len() as u8);
+    buf.push(active_screen as u8);
+
+    // Per-screen pages
+    for screen in screens {
+        buf.extend_from_slice(&(screen.pages.len() as u32).to_le_bytes());
+        for page in &screen.pages {
+            buf.extend_from_slice(&(page.data.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&page.used_cols.to_le_bytes());
+            buf.extend_from_slice(&page.used_rows.to_le_bytes());
+            buf.extend_from_slice(&page.capacity.cols.to_le_bytes());
+            buf.extend_from_slice(&page.capacity.rows.to_le_bytes());
+            buf.extend_from_slice(&page.capacity.styles.to_le_bytes());
+            buf.extend_from_slice(&page.capacity.grapheme_bytes.to_le_bytes());
+            buf.extend_from_slice(&page.capacity.hyperlink_bytes.to_le_bytes());
+            buf.extend_from_slice(&page.capacity.string_bytes.to_le_bytes());
+            buf.extend_from_slice(&page.data);
+        }
+    }
+
+    // State blob
+    buf.extend_from_slice(&(state_blob.len() as u32).to_le_bytes());
+    buf.extend_from_slice(state_blob);
+
+    buf
+}
+
+/// Decode a binary snapshot from wire format.
+pub fn decode_binary_snapshot(data: &[u8]) -> Result<BinarySnapshot> {
+    if data.len() < 3 {
+        bail!("binary snapshot too short for header");
+    }
+
+    let mut pos = 0;
+
+    let version = data[pos];
+    pos += 1;
+    if version != BINARY_SNAPSHOT_VERSION {
+        bail!("unsupported binary snapshot version: {version}");
+    }
+
+    let screen_count = data[pos] as usize;
+    pos += 1;
+
+    let active_key = data[pos];
+    pos += 1;
+    let active_screen = if active_key == 1 {
+        GhosttyScreenKey::Alternate
+    } else {
+        GhosttyScreenKey::Primary
+    };
+
+    let mut screens = Vec::with_capacity(screen_count);
+    for _ in 0..screen_count {
+        if pos + 4 > data.len() {
+            bail!("binary snapshot truncated at page_count");
+        }
+        let page_count =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        let mut pages = Vec::with_capacity(page_count);
+        for _ in 0..page_count {
+            // memory_len(4) + used_cols(2) + used_rows(2) + cap: cols(2) + rows(2) + styles(2) + grapheme(4) + hyperlink(2) + string(4) = 24
+            if pos + 24 > data.len() {
+                bail!("binary snapshot truncated at page header");
+            }
+            let memory_len =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                    as usize;
+            pos += 4;
+
+            let used_cols = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            pos += 2;
+            let used_rows = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            pos += 2;
+
+            let cap_cols = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            pos += 2;
+            let cap_rows = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            pos += 2;
+            let cap_styles = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            pos += 2;
+            let cap_grapheme_bytes =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            pos += 4;
+            let cap_hyperlink_bytes = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            pos += 2;
+            let cap_string_bytes =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            pos += 4;
+
+            if pos + memory_len > data.len() {
+                bail!("binary snapshot truncated at page data");
+            }
+            let page_data = data[pos..pos + memory_len].to_vec();
+            pos += memory_len;
+
+            pages.push(SnapshotPage {
+                capacity: GhosttyPageCapacity {
+                    cols: cap_cols,
+                    rows: cap_rows,
+                    styles: cap_styles,
+                    grapheme_bytes: cap_grapheme_bytes,
+                    hyperlink_bytes: cap_hyperlink_bytes,
+                    string_bytes: cap_string_bytes,
+                },
+                used_cols,
+                used_rows,
+                data: page_data,
+            });
+        }
+        screens.push(SnapshotScreen { pages });
+    }
+
+    // State blob
+    if pos + 4 > data.len() {
+        bail!("binary snapshot truncated at state_blob_len");
+    }
+    let state_len =
+        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+    pos += 4;
+
+    if pos + state_len > data.len() {
+        bail!("binary snapshot truncated at state_blob data");
+    }
+    let state_blob = data[pos..pos + state_len].to_vec();
+
+    Ok(BinarySnapshot {
+        active_screen,
+        screens,
+        state_blob,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,5 +770,101 @@ mod tests {
         assert_eq!(decoded.pid, 42);
         assert_eq!(decoded.rows, 24);
         assert_eq!(decoded.cols, 80);
+    }
+
+    #[test]
+    fn binary_snapshot_encode_decode_roundtrip() {
+        use crate::ghostty_vt::{GhosttyPageCapacity, GhosttyScreenKey};
+
+        let page_data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
+        let state_blob = vec![0x01, 0x42, 0xFF];
+
+        let screens = vec![
+            SnapshotScreen {
+                pages: vec![
+                    SnapshotPage {
+                        capacity: GhosttyPageCapacity {
+                            cols: 80,
+                            rows: 100,
+                            styles: 256,
+                            grapheme_bytes: 4096,
+                            hyperlink_bytes: 64,
+                            string_bytes: 2048,
+                        },
+                        used_cols: 80,
+                        used_rows: 50,
+                        data: page_data.clone(),
+                    },
+                    SnapshotPage {
+                        capacity: GhosttyPageCapacity {
+                            cols: 80,
+                            rows: 24,
+                            styles: 128,
+                            grapheme_bytes: 1024,
+                            hyperlink_bytes: 0,
+                            string_bytes: 512,
+                        },
+                        used_cols: 78,
+                        used_rows: 24,
+                        data: vec![0xCA, 0xFE],
+                    },
+                ],
+            },
+            SnapshotScreen {
+                pages: vec![],
+            },
+        ];
+
+        let encoded =
+            encode_binary_snapshot(GhosttyScreenKey::Alternate, &screens, &state_blob);
+        let decoded = decode_binary_snapshot(&encoded).expect("decode failed");
+
+        // Header
+        assert_eq!(decoded.active_screen, GhosttyScreenKey::Alternate);
+        assert_eq!(decoded.screens.len(), 2);
+
+        // Primary screen, page 0
+        let p0 = &decoded.screens[0].pages[0];
+        assert_eq!(p0.data, page_data);
+        assert_eq!(p0.used_cols, 80);
+        assert_eq!(p0.used_rows, 50);
+        assert_eq!(p0.capacity.cols, 80);
+        assert_eq!(p0.capacity.rows, 100);
+        assert_eq!(p0.capacity.styles, 256);
+        assert_eq!(p0.capacity.grapheme_bytes, 4096);
+        assert_eq!(p0.capacity.hyperlink_bytes, 64);
+        assert_eq!(p0.capacity.string_bytes, 2048);
+
+        // Primary screen, page 1
+        let p1 = &decoded.screens[0].pages[1];
+        assert_eq!(p1.data, vec![0xCA, 0xFE]);
+        assert_eq!(p1.used_cols, 78);
+        assert_eq!(p1.capacity.rows, 24);
+
+        // Alt screen (empty)
+        assert!(decoded.screens[1].pages.is_empty());
+
+        // State blob
+        assert_eq!(decoded.state_blob, state_blob);
+    }
+
+    #[test]
+    fn binary_snapshot_empty_roundtrip() {
+        use crate::ghostty_vt::GhosttyScreenKey;
+
+        let encoded = encode_binary_snapshot(GhosttyScreenKey::Primary, &[], &[]);
+        let decoded = decode_binary_snapshot(&encoded).expect("decode failed");
+
+        assert_eq!(decoded.active_screen, GhosttyScreenKey::Primary);
+        assert!(decoded.screens.is_empty());
+        assert!(decoded.state_blob.is_empty());
+    }
+
+    #[test]
+    fn binary_snapshot_truncated_rejects() {
+        // Just a version byte, no screen count
+        assert!(decode_binary_snapshot(&[1]).is_err());
+        // Version + screen_count but no active_screen
+        assert!(decode_binary_snapshot(&[1, 1]).is_err());
     }
 }
