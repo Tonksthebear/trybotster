@@ -126,7 +126,8 @@ pub type SharedServerId = Arc<Mutex<Option<String>>>;
 ///
 /// Returns an error if Lua table or function creation fails.
 /// Shared color cache type for boot-probed terminal colors.
-pub type SharedColorCache = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>;
+pub type SharedColorCache =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>;
 
 pub(crate) fn register(
     lua: &Lua,
@@ -185,7 +186,6 @@ pub(crate) fn register(
     //   }
     let cache2 = Arc::clone(&handle_cache);
     let register_event_tx = Arc::clone(&hub_event_tx);
-    let cc_register = color_cache.clone();
     let register_session_fn = lua
         .create_function(
             move |_, (session_uuid, session_ud, metadata): (String, LuaAnyUserData, LuaTable)| {
@@ -257,17 +257,8 @@ pub(crate) fn register(
                     index
                 );
 
-                // Apply cached terminal colors to the shadow screen so OSC 10/11/12
-                // queries from running processes are answered correctly.
-                {
-                    let session_handle = cache2.get_session(&session_uuid);
-                    if let Some(sh) = session_handle {
-                        sh.pty().apply_color_cache(&cc_register);
-                    }
-                }
-
                 // Session-process-backed handles: install reader thread.
-                // The reader feeds the shadow screen and broadcasts output directly.
+                // The reader broadcasts output directly.
                 // Guard: skip if a reader is already alive (e.g., workspace move re-registration).
                 if has_session_conn {
                     let handle = session_ud.borrow::<PtySessionHandle>().map_err(|e| {
@@ -309,8 +300,7 @@ pub(crate) fn register(
                                                 session_uuid
                                             );
                                         }
-                                        // No shadow screen replay needed — snapshots are fetched
-                                        // via RPC when clients attach.
+                                        // Snapshots are fetched via RPC when clients attach.
                                     }
                                 }
                             }
@@ -388,9 +378,7 @@ pub(crate) fn register(
             let updated = cache_meta.update_session_metadata(
                 &session_uuid,
                 label.as_deref(),
-                workspace_id
-                    .as_ref()
-                    .map(|ws| ws.as_deref()),
+                workspace_id.as_ref().map(|ws| ws.as_deref()),
             );
 
             if updated {
@@ -763,6 +751,16 @@ pub(crate) fn register(
                 })?;
 
                 // Send spawn config
+                let (default_foreground, default_background, default_cursor) =
+                    if let Ok(colors) = cc_spawn.lock() {
+                        (
+                            colors.get(&256).copied(),
+                            colors.get(&257).copied(),
+                            colors.get(&258).copied(),
+                        )
+                    } else {
+                        (None, None, None)
+                    };
                 let spawn_config = SpawnConfig {
                     command,
                     args: Vec::new(),
@@ -773,6 +771,9 @@ pub(crate) fn register(
                     init_commands,
                     tee_path,
                     tee_cap,
+                    default_foreground,
+                    default_background,
+                    default_cursor,
                 };
                 conn.send_spawn_config(&spawn_config).map_err(|e| {
                     LuaError::runtime(format!("spawn_session: send config failed: {e}"))
@@ -787,8 +788,12 @@ pub(crate) fn register(
                 // hub.register_session() which creates the PtyHandle and
                 // installs the reader thread.
                 use crate::lua::primitives::pty::PtySessionHandle;
-                let handle =
-                    PtySessionHandle::new_minimal(rows, cols, std::sync::Arc::clone(&tx_spawn), std::sync::Arc::clone(&cc_spawn));
+                let handle = PtySessionHandle::new_minimal(
+                    rows,
+                    cols,
+                    std::sync::Arc::clone(&tx_spawn),
+                    std::sync::Arc::clone(&cc_spawn),
+                );
 
                 // Store the session connection on the handle so register_session
                 // can retrieve it later.
@@ -835,8 +840,12 @@ pub(crate) fn register(
                     std::sync::Arc::new(std::sync::Mutex::new(Some(conn)));
 
                 use crate::lua::primitives::pty::PtySessionHandle;
-                let handle =
-                    PtySessionHandle::new_minimal(rows, cols, std::sync::Arc::clone(&tx_connect), std::sync::Arc::clone(&cc_connect));
+                let handle = PtySessionHandle::new_minimal(
+                    rows,
+                    cols,
+                    std::sync::Arc::clone(&tx_connect),
+                    std::sync::Arc::clone(&cc_connect),
+                );
                 handle.set_session_connection(shared_conn);
 
                 ::log::info!(

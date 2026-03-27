@@ -72,8 +72,62 @@ use crate::agent::pty::{PtySession, SharedPtyState};
 #[cfg(test)]
 use crate::agent::spawn::PtySpawnConfig;
 use crate::hub::events::HubEvent;
-use crate::terminal::{TerminalParser, DEFAULT_SCROLLBACK_LINES};
+#[cfg(test)]
+use crate::terminal::TerminalParser;
 use tokio::sync::broadcast;
+
+/// Strip ANSI escape sequences from bytes, returning plain text.
+///
+/// Handles CSI (ESC [ ... final), OSC (ESC ] ... ST/BEL), and simple
+/// ESC sequences. Used by `get_screen()` to convert ANSI snapshots
+/// to plain text for agent/LLM consumption.
+fn strip_ansi_escapes(input: &[u8]) -> String {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == 0x1b {
+            i += 1;
+            if i >= input.len() {
+                break;
+            }
+            match input[i] {
+                b'[' => {
+                    // CSI sequence: skip until final byte (0x40..=0x7E)
+                    i += 1;
+                    while i < input.len() && !(0x40..=0x7E).contains(&input[i]) {
+                        i += 1;
+                    }
+                    if i < input.len() {
+                        i += 1; // skip final byte
+                    }
+                }
+                b']' => {
+                    // OSC sequence: skip until ST (ESC \) or BEL (0x07)
+                    i += 1;
+                    while i < input.len() {
+                        if input[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if input[i] == 0x1b && i + 1 < input.len() && input[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {
+                    // Simple ESC sequence (e.g., ESC M, ESC =): skip one byte
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
@@ -139,9 +193,6 @@ pub struct PtySessionHandle {
     /// Shared state for direct write/resize operations.
     shared_state: Arc<Mutex<SharedPtyState>>,
 
-    /// Shadow terminal for clean ANSI snapshots on reconnect.
-    shadow_screen: Arc<Mutex<TerminalParser>>,
-
     /// Event broadcast sender for subscribing to PTY output.
     event_tx: broadcast::Sender<PtyEvent>,
 
@@ -150,7 +201,7 @@ pub struct PtySessionHandle {
 
     /// Whether the terminal cursor is currently visible (DECTCEM).
     ///
-    /// Updated by `process_pty_bytes()` from the shadow screen's cursor state.
+    /// Updated by the session reader from `FRAME_MODE_CHANGED` events.
     /// Read directly by `cursor_visible()` without any RPC.
     cursor_visible: Arc<AtomicBool>,
 
@@ -179,7 +230,6 @@ pub struct PtySessionHandle {
     /// PtyHandle and install a reader thread.
     session_connection:
         Arc<std::sync::OnceLock<crate::session::connection::SharedSessionConnection>>,
-
 }
 
 impl std::fmt::Debug for PtySessionHandle {
@@ -201,10 +251,9 @@ impl PtySessionHandle {
 
     /// Create a minimal `PtySessionHandle` for Hub restart recovery.
     ///
-    /// No real PTY process or `PtySession` is created — only a minimal shadow
-    /// screen (correct dimensions, zero scrollback), broadcast channel, and
-    /// AtomicBools. Terminal state is updated by the session reader thread on
-    /// each output delivery.
+    /// No real PTY process or `PtySession` is created — only a broadcast
+    /// channel, shared state, and AtomicBools. Terminal state is managed
+    /// by the session process; snapshots come via RPC.
     ///
     /// # Arguments
     ///
@@ -216,7 +265,7 @@ impl PtySessionHandle {
         rows: u16,
         cols: u16,
         hub_event_tx: HubEventSender,
-        color_cache: super::hub::SharedColorCache,
+        _color_cache: super::hub::SharedColorCache,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(64);
         let shared_state = Arc::new(Mutex::new(SharedPtyState {
@@ -226,21 +275,9 @@ impl PtySessionHandle {
             last_human_input_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }));
 
-        // Recovery shadow screen: correct dimensions plus normal scrollback.
-        // Session-backed recovery uses this parser as the hub's local
-        // authority after the initial snapshot replay.
-        let mut parser = TerminalParser::new(
-            rows,
-            cols,
-            DEFAULT_SCROLLBACK_LINES,
-        );
-        parser.apply_color_cache(&color_cache);
-        let shadow_screen = Arc::new(Mutex::new(parser));
-
         Self {
             _session: None,
             shared_state,
-            shadow_screen,
             event_tx,
             kitty_enabled: Arc::new(AtomicBool::new(false)),
             cursor_visible: Arc::new(AtomicBool::new(true)),
@@ -289,7 +326,7 @@ impl PtySessionHandle {
     /// Create a session-process-backed `PtyHandle`.
     ///
     /// Routes write/resize through the session socket. Snapshots are fetched
-    /// via RPC to the session process (no local shadow screen).
+    /// via RPC to the session process.
     #[must_use]
     pub fn to_pty_handle_with_session(
         &self,
@@ -464,56 +501,68 @@ impl LuaUserData for PtySessionHandle {
 
         // session:get_snapshot() -> string (clean ANSI bytes)
         // Also aliased as get_scrollback for backwards compatibility.
-        // Uses the local shadow screen (fed by the session reader thread).
+        // Routes through session process RPC (FRAME_GET_SNAPSHOT).
         methods.add_method("get_snapshot", |lua, this, ()| {
-            let parser = this
-                .shadow_screen
-                .lock()
-                .expect("PtySessionHandle shadow_screen lock poisoned");
-            let skip_visible = this.resize_pending.swap(false, Ordering::AcqRel);
-            let output = crate::terminal::generate_snapshot(&*parser, skip_visible);
-            lua.create_string(&output)
+            if let Some(conn) = this.session_connection.get() {
+                if let Ok(mut guard) = conn.lock() {
+                    if let Some(session) = guard.as_mut() {
+                        match session.get_snapshot() {
+                            Ok(snapshot) => return lua.create_string(&snapshot),
+                            Err(e) => {
+                                log::warn!("get_snapshot RPC failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            lua.create_string(b"" as &[u8])
         });
 
         // session:get_screen() -> string (plain text, visible screen only)
         //
-        // Returns the current visible terminal contents as plain text with no
-        // ANSI escape sequences. Intended for agent/LLM consumption where escape
-        // codes add noise. Unlike get_snapshot(), this does not include scrollback
-        // and does not affect resize_pending state.
+        // Fetches ANSI snapshot via session RPC, then strips escape sequences
+        // to produce plain text. A dedicated text-only RPC would be more
+        // efficient but requires a new session protocol frame.
         methods.add_method("get_screen", |lua, this, ()| {
-            let parser = this
-                .shadow_screen
-                .lock()
-                .expect("PtySessionHandle shadow_screen lock poisoned");
-            let text = parser.contents();
-            lua.create_string(text.as_bytes())
+            if let Some(conn) = this.session_connection.get() {
+                if let Ok(mut guard) = conn.lock() {
+                    if let Some(session) = guard.as_mut() {
+                        match session.get_snapshot() {
+                            Ok(snapshot) => {
+                                let text = strip_ansi_escapes(&snapshot);
+                                return lua.create_string(text.as_bytes());
+                            }
+                            Err(e) => {
+                                log::warn!("get_screen RPC failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            lua.create_string(b"" as &[u8])
         });
 
-        // session:feed_output(bytes) - Feed raw bytes into the shadow screen.
+        // session:feed_output(bytes) - No-op.
         //
-        // Processes `bytes` through the local alacritty parser. For recovered
-        // sessions (zero-scrollback parser), this updates mode state but
-        // retains no scrollback — get_snapshot()/get_screen() route through
-        // the local shadow screen instead.
-        //
-        // Does NOT write bytes to the PTY process — use `write()` for input.
-        methods.add_method("feed_output", |_, this, data: LuaString| {
-            if let Ok(mut parser) = this.shadow_screen.lock() {
-                parser.process(&data.as_bytes());
-            }
-            Ok(())
-        });
+        // Previously fed raw bytes into a local shadow screen. Now the session
+        // process owns all terminal parsing. Retained for API compatibility.
+        methods.add_method("feed_output", |_, _this, _data: LuaString| Ok(()));
 
         // Backwards-compatible alias for get_snapshot.
         methods.add_method("get_scrollback", |lua, this, ()| {
-            let parser = this
-                .shadow_screen
-                .lock()
-                .expect("PtySessionHandle shadow_screen lock poisoned");
-            let skip_visible = this.resize_pending.swap(false, Ordering::AcqRel);
-            let output = crate::terminal::generate_snapshot(&*parser, skip_visible);
-            lua.create_string(&output)
+            if let Some(conn) = this.session_connection.get() {
+                if let Ok(mut guard) = conn.lock() {
+                    if let Some(session) = guard.as_mut() {
+                        match session.get_snapshot() {
+                            Ok(snapshot) => return lua.create_string(&snapshot),
+                            Err(e) => {
+                                log::warn!("get_scrollback RPC failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            lua.create_string(b"" as &[u8])
         });
 
         // session:port() -> number or nil
@@ -870,7 +919,7 @@ pub(crate) fn spawn_session_handle_from_opts(
         .map_err(|e| LuaError::runtime(format!("Failed to spawn PTY session: {e}")))?;
 
     // Extract direct access handles before wrapping in Arc
-    let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
+    let (shared_state, event_tx, kitty_enabled, cursor_visible, resize_pending) =
         session.get_direct_access();
     let session_port = session.port();
 
@@ -899,8 +948,6 @@ pub(crate) fn spawn_session_handle_from_opts(
     Ok(PtySessionHandle {
         _session: Some(session_arc),
         shared_state,
-        shadow_screen,
-
         event_tx,
         kitty_enabled,
         cursor_visible,
@@ -1576,18 +1623,16 @@ mod tests {
 
     /// Helper to create a PtySessionHandle for testing without spawning a real
     /// process. Uses the direct PtySession constructor and sets up shared state
-    /// manually.
+    /// manually. No shadow screen — session process owns terminal parsing.
     fn create_test_session_handle() -> PtySessionHandle {
         let session = PtySession::new(24, 80);
-        let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
+        let (shared_state, event_tx, kitty_enabled, cursor_visible, resize_pending) =
             session.get_direct_access();
         let session_arc = Arc::new(Mutex::new(session));
 
         PtySessionHandle {
             _session: Some(session_arc),
             shared_state,
-            shadow_screen,
-    
             event_tx,
             kitty_enabled,
             cursor_visible,
@@ -1701,7 +1746,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pty_session_handle_get_snapshot_empty() {
+    fn test_pty_session_handle_get_snapshot_without_session() {
         let lua = Lua::new();
         let handle = create_test_session_handle();
 
@@ -1709,64 +1754,37 @@ mod tests {
             .set("session", handle)
             .expect("Failed to set session");
 
-        // Empty shadow screen returns reset + cursor position
-        let result: LuaString = lua
-            .load("return session:get_snapshot()")
-            .eval()
-            .expect("get_snapshot should work");
-        // Ghostty formatter produces VT output for the empty screen.
-        let bytes = result.as_bytes();
-        assert!(!bytes.is_empty(), "snapshot should produce non-empty output");
-    }
-
-    #[test]
-    fn test_pty_session_handle_get_snapshot_with_data() {
-        let lua = Lua::new();
-        let handle = create_test_session_handle();
-
-        // Feed data to shadow screen directly
-        handle
-            .shadow_screen
-            .lock()
-            .expect("shadow_screen lock")
-            .process(b"hello world");
-
-        lua.globals()
-            .set("session", handle)
-            .expect("Failed to set session");
-
+        // Without a session process connection, snapshot returns empty
         let result: LuaString = lua
             .load("return session:get_snapshot()")
             .eval()
             .expect("get_snapshot should work");
         let bytes = result.as_bytes();
-        let result_str = String::from_utf8_lossy(&bytes);
-        assert!(result_str.contains("hello world"));
+        assert!(
+            bytes.is_empty(),
+            "snapshot without session process should be empty"
+        );
     }
 
     #[test]
-    fn test_pty_session_handle_get_scrollback_alias() {
+    fn test_pty_session_handle_get_scrollback_without_session() {
         let lua = Lua::new();
         let handle = create_test_session_handle();
-
-        handle
-            .shadow_screen
-            .lock()
-            .expect("shadow_screen lock")
-            .process(b"alias test");
 
         lua.globals()
             .set("session", handle)
             .expect("Failed to set session");
 
-        // get_scrollback should work as an alias for get_snapshot
+        // get_scrollback is an alias for get_snapshot — also empty without session
         let result: LuaString = lua
             .load("return session:get_scrollback()")
             .eval()
             .expect("get_scrollback alias should work");
         let bytes = result.as_bytes();
-        let result_str = String::from_utf8_lossy(&bytes);
-        assert!(result_str.contains("alias test"));
+        assert!(
+            bytes.is_empty(),
+            "scrollback without session process should be empty"
+        );
     }
 
     #[test]
@@ -2134,14 +2152,15 @@ mod tests {
         // Give the PTY a moment to process
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // Snapshot should have some data (at least the shell prompt + reset sequence)
+        // Snapshot requires session process RPC — pty.spawn() creates a local
+        // PTY without a session process, so snapshot returns empty.
         let snapshot: LuaString = lua
             .load("return session:get_snapshot()")
             .eval()
             .expect("get_snapshot should work");
         assert!(
-            snapshot.as_bytes().len() > 10,
-            "Snapshot should have data after writing (got {} bytes)",
+            snapshot.as_bytes().is_empty(),
+            "snapshot without session process should be empty (got {} bytes)",
             snapshot.as_bytes().len()
         );
 

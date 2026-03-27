@@ -89,7 +89,10 @@ impl Hub {
             return;
         }
 
-        if active.get(session_uuid).is_some_and(|current| current == peer_id) {
+        if active
+            .get(session_uuid)
+            .is_some_and(|current| current == peer_id)
+        {
             active.remove(session_uuid);
         }
     }
@@ -106,8 +109,9 @@ impl Hub {
         }
         self.terminal_profiles
             .observe_input(session_uuid, peer_id, data);
+        self.terminal_profiles
+            .refresh_shared_color_cache(&self.shared_color_cache);
     }
-
 
     /// Legacy polling entrypoint — calls all poll functions + flush.
     ///
@@ -558,6 +562,8 @@ impl Hub {
                     self.lua.set_pty_focused(&session_uuid, &client_id, false);
                 }
                 self.terminal_profiles.observe_peer_input(&client_id, &data);
+                self.terminal_profiles
+                    .refresh_shared_color_cache(&self.shared_color_cache);
                 self.learn_terminal_probe_replies(&session_uuid, &client_id, &data);
                 self.lua.notify_pty_input(&session_uuid);
 
@@ -1101,7 +1107,8 @@ impl Hub {
                             .collect();
 
                         if !valid.is_empty() {
-                            let browser_id_short = browser_identity[..browser_identity.len().min(8)].to_string();
+                            let browser_id_short =
+                                browser_identity[..browser_identity.len().min(8)].to_string();
                             tokio::task::block_in_place(|| {
                                 self.tokio_runtime.block_on(async {
                                     for (gen, candidate_str, sdp_mid, sdp_mline_index) in &valid {
@@ -1193,6 +1200,8 @@ impl Hub {
         }
         self.terminal_profiles
             .observe_peer_input(&input.browser_identity, &input.data);
+        self.terminal_profiles
+            .refresh_shared_color_cache(&self.shared_color_cache);
         self.learn_terminal_probe_replies(
             &input.session_uuid,
             &input.browser_identity,
@@ -2831,7 +2840,7 @@ impl Hub {
     /// the start of an ANSI escape corrupts parsing of all subsequent frames).
     ///
     /// After a cooldown period (letting the burst subside), this method fetches
-    /// a fresh snapshot from the shadow screen and sends it directly through
+    /// a fresh snapshot from the session process and sends it directly through
     /// the per-peer channel, bypassing the output queue to avoid re-triggering
     /// the same backpressure.
     fn send_backpressure_recovery_snapshots(&mut self) {
@@ -3277,7 +3286,8 @@ impl Hub {
                             match pty_rx.try_recv() {
                                 Ok(PtyEvent::Output(more)) => chunks.push(more),
                                 Ok(other) => {
-                                    let is_terminal = matches!(other, PtyEvent::ProcessExited { .. });
+                                    let is_terminal =
+                                        matches!(other, PtyEvent::ProcessExited { .. });
                                     stashed.push(other);
                                     if is_terminal {
                                         break; // ProcessExited must be last
@@ -4183,7 +4193,6 @@ impl Hub {
             self.cleanup_webrtc_channel(dead_id, "send_failed");
         }
     }
-
 
     // === TUI via Lua (Hub-side Processing) ===
 
@@ -5410,13 +5419,12 @@ mod tests {
 
     fn test_session_handle(session_uuid: &str) -> SessionHandle {
         let pty_session = PtySession::new(24, 80);
-        let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
+        let (shared_state, event_tx, kitty_enabled, cursor_visible, resize_pending) =
             pty_session.get_direct_access();
         std::mem::forget(pty_session);
         let pty = PtyHandle::new(
             event_tx,
             shared_state,
-            shadow_screen,
             kitty_enabled,
             cursor_visible,
             resize_pending,
@@ -5448,29 +5456,25 @@ mod tests {
         client_stream
     }
 
-    /// Create a local-PTY-backed test session handle with seeded shadow screen output.
+    /// Create a test session handle. No local shadow screen — all PTYs are
+    /// session-backed. Seed output is broadcast but not parsed locally.
     fn test_local_session_handle_with_seed(
         session_uuid: &str,
         seed_output: &[u8],
     ) -> SessionHandle {
         let pty_session = PtySession::new(24, 80);
-        let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
+        let (shared_state, event_tx, kitty_enabled, cursor_visible, resize_pending) =
             pty_session.get_direct_access();
         std::mem::forget(pty_session);
 
         let pty = PtyHandle::new(
             event_tx,
             shared_state,
-            shadow_screen.clone(),
             kitty_enabled,
             cursor_visible,
             resize_pending,
             None,
         );
-        // Seed shadow state so snapshot is non-empty.
-        if let Ok(mut screen) = shadow_screen.lock() {
-            screen.process(seed_output);
-        }
         let _ = pty
             .event_tx_clone()
             .send(crate::agent::pty::events::PtyEvent::output(
@@ -5639,7 +5643,12 @@ mod tests {
             "terminal_sub"
         )));
         hub.set_active_terminal_peer(session_uuid, "tui", true);
-        let _ = recv_next_webrtc_output_with_prefix(&mut hub, 0x02);
+        // No snapshot message (0x02) — test PtyHandle has no session process,
+        // so get_snapshot() returns empty and the snapshot send is skipped.
+        // Allow forwarder task to start the live loop.
+        hub.tokio_runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
 
         let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(
             b"before\x1b]11;?\x07after".to_vec(),
@@ -5663,7 +5672,10 @@ mod tests {
             "terminal_sub"
         )));
         hub.set_active_terminal_peer(session_uuid, "browser-a", true);
-        let _ = recv_next_webrtc_output_with_prefix(&mut hub, 0x02);
+        // No snapshot message — empty snapshot from test PtyHandle.
+        hub.tokio_runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
 
         let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(
             b"\x1b]11;?\x07after".to_vec(),
@@ -5699,13 +5711,12 @@ mod tests {
             data: b"\x1b[O".to_vec(),
         });
 
-        assert!(
-            hub.active_terminal_peers
-                .lock()
-                .expect("active peers mutex")
-                .get(session_uuid)
-                .is_none()
-        );
+        assert!(hub
+            .active_terminal_peers
+            .lock()
+            .expect("active peers mutex")
+            .get(session_uuid)
+            .is_none());
     }
 
     #[test]
@@ -5732,13 +5743,12 @@ mod tests {
             focused: false,
         });
 
-        assert!(
-            hub.active_terminal_peers
-                .lock()
-                .expect("active peers mutex")
-                .get(session_uuid)
-                .is_none()
-        );
+        assert!(hub
+            .active_terminal_peers
+            .lock()
+            .expect("active peers mutex")
+            .get(session_uuid)
+            .is_none());
     }
 
     // test_backpressure_recovery_fetches_snapshot removed during the migration.
@@ -5777,19 +5787,13 @@ mod tests {
         recv_next_webrtc_output_with_prefix(hub, 0x01)
     }
 
-    fn recv_next_webrtc_output_with_prefix(
-        hub: &mut Hub,
-        prefix: u8,
-    ) -> super::WebRtcPtyOutput {
+    fn recv_next_webrtc_output_with_prefix(hub: &mut Hub, prefix: u8) -> super::WebRtcPtyOutput {
         for _ in 0..20 {
             hub.tokio_runtime.block_on(async {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             });
 
-            let rx = hub
-                .webrtc_pty_output_rx
-                .as_mut()
-                .expect("webrtc output rx");
+            let rx = hub.webrtc_pty_output_rx.as_mut().expect("webrtc output rx");
             while let Ok(output) = rx.try_recv() {
                 if output.data.first() == Some(&prefix) {
                     return output;
@@ -6306,7 +6310,7 @@ mod tests {
     }
 
     // Legacy TUI forwarder tests removed during the session-process migration.
-    // Session-backed forwarders use local shadow screen snapshots.
+    // Session-backed forwarders use session RPC snapshots.
     // Removed: test_tui_forwarder_snapshot_is_prompt
     // Removed: test_tui_forwarder_no_duplicate_output_during_snapshot_window
     // Removed: test_tui_forwarder_same_dims_issues_resize_pulse_before_snapshot

@@ -436,7 +436,8 @@ pub struct Hub {
     ///
     /// Populated once at startup. `HubEventListener` references this Arc so
     /// `ColorRequest` events are answered immediately from cached values.
-    shared_color_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>,
+    shared_color_cache:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>,
     /// Focused terminal owner per session.
     ///
     /// Used to ensure OSC color queries are only forwarded to the active
@@ -702,7 +703,9 @@ impl Hub {
                 store
             },
             // Populated below after terminal_profiles is available.
-            shared_color_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            shared_color_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             active_terminal_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             webrtc_outgoing_signal_tx,
             webrtc_outgoing_signal_rx: Some(webrtc_outgoing_signal_rx),
@@ -1551,7 +1554,7 @@ mod tests {
     /// - Real Lua handler processing for subscriptions
     ///
     /// Flow per phase:
-    ///   1. Spawn bash → reader thread reads master FD → shadow_screen + broadcast
+    ///   1. Spawn bash → reader thread reads master FD → broadcast output
     ///   2. Socket client subscribes to terminal channel
     ///   3. Send "echo MARKER\n" via PtyInput frame → hub routes → bash
     ///   4. bash echoes MARKER → reader thread → broadcast → forwarder → PtyOutput frame
@@ -1615,19 +1618,12 @@ mod tests {
                 })
                 .expect("spawn bash");
 
-            let (
-                shared_state,
-                shadow_screen,
-                event_tx,
-                kitty_enabled,
-                cursor_visible,
-                resize_pending,
-            ) = pty_session.get_direct_access();
+            let (shared_state, event_tx, kitty_enabled, cursor_visible, resize_pending) =
+                pty_session.get_direct_access();
 
             let pty = PtyHandle::new(
                 event_tx,
                 Arc::clone(&shared_state),
-                shadow_screen,
                 kitty_enabled,
                 cursor_visible,
                 resize_pending,
@@ -1637,11 +1633,10 @@ mod tests {
             // Store the pty handle for the reader thread to use
             *pty_handle_ref.lock().unwrap() = Some(pty.clone());
 
-            // Start a reader thread that reads from the master FD, feeds the
-            // shadow screen, and broadcasts output — same as session reader.
+            // Start a reader thread that reads from the master FD and
+            // broadcasts output — hub is a router, no local parsing.
             let stop_flag = Arc::new(AtomicBool::new(false));
             let stop_clone = Arc::clone(&stop_flag);
-            let reader_shadow = pty.shadow_screen().expect("test PTY has shadow screen");
             let reader_event_tx = pty.event_tx_clone();
 
             // Get a reader from the master PTY FD
@@ -1665,11 +1660,7 @@ mod tests {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            // Feed shadow screen for snapshot support
-                            if let Ok(mut screen) = reader_shadow.lock() {
-                                screen.process(&buf[..n]);
-                            }
-                            // Broadcast output to subscribers
+                            // Broadcast output to subscribers (no local parsing)
                             let _ = reader_event_tx.send(
                                 crate::agent::pty::events::PtyEvent::output(buf[..n].to_vec()),
                             );
@@ -1853,10 +1844,10 @@ mod tests {
                     (24, 80),
                     "[Phase 1] unexpected scrollback dims"
                 );
-                assert!(
-                    !data.is_empty(),
-                    "[Phase 1] scrollback should not be empty after bash startup"
-                );
+                // Scrollback is empty: test PtyHandle has no session process,
+                // so get_snapshot() returns empty bytes. Live output still
+                // flows through the broadcast channel.
+                let _ = data;
             }
             other => panic!("[Phase 1] expected Scrollback frame, got {other:?}"),
         }
@@ -1985,10 +1976,8 @@ mod tests {
                     (24, 80),
                     "[Phase 2] unexpected scrollback dims"
                 );
-                assert!(
-                    !data.is_empty(),
-                    "[Phase 2] scrollback should not be empty after bash startup"
-                );
+                // Scrollback is empty: test PtyHandle has no session process.
+                let _ = data;
             }
             other => panic!("[Phase 2] expected Scrollback frame, got {other:?}"),
         }
