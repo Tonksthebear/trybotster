@@ -73,7 +73,8 @@ fn create_parser_with_content(rows: u16, cols: u16, line_count: usize) -> TestPa
 /// Create a RenderState updated from a parser.
 fn make_render_state(parser: &mut TerminalParser) -> RenderState {
     let mut rs = RenderState::new().expect("render state creation");
-    rs.update(parser.terminal_mut()).expect("render state update");
+    rs.update(parser.terminal_mut())
+        .expect("render state update");
     rs
 }
 
@@ -106,7 +107,10 @@ fn test_scroll_then_render() {
 
     // Verify we have scrollback history
     let history = parser.lock().unwrap().history_size();
-    assert!(history > 0, "should have scrollback after loading 100 lines");
+    assert!(
+        history > 0,
+        "should have scrollback after loading 100 lines"
+    );
 
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -332,9 +336,8 @@ fn test_spawn_real_pty_with_init_script() {
         // Wait for output to be generated
         thread::sleep(Duration::from_millis(500));
 
-        // Verify we received some output via scrollback buffer
-        let buffer = agent.get_snapshot();
-        assert!(!buffer.is_empty(), "PTY should have produced output");
+        // Snapshot verification requires a session process (not available in
+        // unit tests). PTY spawning is verified by is_spawned() above.
 
         tx.send(()).unwrap();
     });
@@ -395,9 +398,8 @@ fn test_spawn_pty_with_server_script() {
         // Wait for server to produce output
         thread::sleep(Duration::from_secs(3));
 
-        // Check PTY content
-        let buffer = agent.get_snapshot();
-        assert!(!buffer.is_empty(), "PTY should have output");
+        // Snapshot verification requires a session process (not available in
+        // unit tests). PTY spawning is verified by is_spawned() above.
 
         tx.send(()).unwrap();
     });
@@ -571,15 +573,5 @@ fn test_pty_resize_direct() {
     assert_eq!(session.dimensions(), (50, 100));
 }
 
-/// Test that Agent's get_snapshot works correctly.
-#[test]
-fn test_agent_scrollback_snapshot_for_browser() {
-    let (agent, _temp_dir) = create_test_agent();
-
-    let snapshot = agent.get_snapshot();
-    let snapshot_str = String::from_utf8_lossy(&snapshot);
-    assert!(
-        !snapshot_str.contains("$") && !snapshot_str.contains("~"),
-        "Snapshot should have no shell content before spawn, got: {snapshot_str}"
-    );
-}
+// Agent::get_snapshot() removed — snapshots are session-process-backed via RPC.
+// Snapshot testing requires a running session process, not available in unit tests.
