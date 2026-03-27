@@ -202,27 +202,6 @@ impl Hub {
                     log::error!("Failed to fire process_exited event: {e}");
                 }
             }
-            HubEvent::ColorResponse {
-                session_uuid,
-                response,
-            } => {
-                // Always answer from boot cache. The first probe fires before
-                // any client can subscribe, and even after subscription the TUI
-                // passthrough may not be ready yet. The cached values come from
-                // the spawning terminal — correct for both headless and TUI.
-                // Browser clients that re-probe get answered by xterm.js natively.
-                if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
-                    if let Err(e) = session_handle.pty().write_input_direct(response.as_bytes()) {
-                        log::debug!(
-                            "[PTY-PROBE] Failed to answer color probe for {session_uuid}: {e}"
-                        );
-                    } else {
-                        log::info!(
-                            "[PTY-PROBE] Answered color probe from cache for session {session_uuid}"
-                        );
-                    }
-                }
-            }
             HubEvent::PtyOutputObserved { session_uuid, data } => {
                 // Learn terminal probes from raw session output (headless-safe).
                 // Without this, probe responses are only learned through client

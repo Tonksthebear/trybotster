@@ -404,6 +404,16 @@ impl TerminalParser {
         self.terminal.background_color().map(Into::into)
     }
 
+    /// Default foreground color, ignoring transient terminal state.
+    pub fn foreground_color_default(&self) -> Option<Rgb> {
+        self.terminal.foreground_color_default().map(Into::into)
+    }
+
+    /// Default background color, ignoring transient terminal state.
+    pub fn background_color_default(&self) -> Option<Rgb> {
+        self.terminal.background_color_default().map(Into::into)
+    }
+
     /// Whether the cursor is hidden.
     pub fn cursor_hidden(&self) -> bool {
         self.terminal.cursor_hidden()
