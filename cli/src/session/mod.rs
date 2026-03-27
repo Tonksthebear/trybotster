@@ -8,16 +8,23 @@
 //!
 //! - **PTY ownership**: creates the PTY via `portable_pty`, owns the master fd
 //! - **Socket server**: binds a Unix socket, accepts one connection (the Hub)
-//! - **Reader thread**: reads PTY output → feeds alacritty parser → forwards to Hub
+//! - **Reader thread**: reads PTY output → feeds ghostty parser → forwards to Hub
 //! - **Writer thread**: receives input from Hub → writes to PTY master fd
-//! - **Terminal state**: alacritty parser tracks mode flags (kitty, cursor, mouse, etc.)
+//! - **Terminal state**: ghostty parser tracks mode flags (kitty, cursor, mouse, etc.)
+//! - **Event emission**: detects state changes and emits event frames to the Hub
 //! - **Snapshot generation**: generates ANSI snapshots from parser state on request
 //! - **Tee/logging**: optional file tee with rotation
 //! - **Lifecycle**: exits when socket file is deleted or child process dies
 //!
+//! # Event detection
+//!
+//! The reader thread emits event frames for terminal state changes:
+//! - **Ghostty callbacks**: all event detection via patched libghostty-vt callbacks
+//!   (title, bell, pwd/OSC 7, notifications/OSC 9/777, prompt marks/OSC 133, mode changes)
+//! - **Zero byte scanning**: ghostty handles all VT parsing, Rust only wires callbacks to frames
+//!
 //! # What it does NOT do
 //!
-//! - No byte scanning (OSC 7, OSC 133, notifications — Hub handles these)
 //! - No client routing (Hub manages TUI, browser, socket clients)
 //! - No multiplexing (one socket, one session)
 
@@ -37,65 +44,9 @@ use std::{mem::ManuallyDrop, thread};
 
 use anyhow::{bail, Context, Result};
 
-use crate::terminal::{generate_ansi_snapshot, AlacrittyParser, DEFAULT_SCROLLBACK_LINES};
-use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener};
+use crate::terminal::{generate_snapshot, CallbackConfig, TerminalParser, DEFAULT_SCROLLBACK_LINES};
 
 use protocol::*;
-
-// ─── Session event listener (for alacritty parser) ───────────────────────────
-
-/// Event listener for the session process's alacritty parser.
-///
-/// Handles terminal responses that must be written back to the PTY fd:
-/// - `PtyWrite`: DSR/DA responses
-/// - `TextAreaSizeRequest`: XTWINOPS `CSI 14 t` query (text area size in pixels)
-///
-/// Other events (Title, Bell, ColorRequest) are handled by the hub's own parser.
-#[derive(Clone)]
-struct SessionEventListener {
-    pty_fd: RawFd,
-    /// Current terminal dimensions for answering `TextAreaSizeRequest`.
-    current_dims: Arc<Mutex<(u16, u16)>>,
-}
-
-/// Default cell dimensions in pixels for XTWINOPS responses.
-///
-/// Used when the session process doesn't know actual pixel cell sizes.
-/// Most apps just need a non-zero response to proceed.
-const DEFAULT_CELL_WIDTH: u16 = 8;
-const DEFAULT_CELL_HEIGHT: u16 = 16;
-
-impl EventListener for SessionEventListener {
-    fn send_event(&self, event: AlacrittyEvent) {
-        match event {
-            AlacrittyEvent::PtyWrite(response) => {
-                let bytes = response.as_bytes();
-                unsafe {
-                    libc::write(self.pty_fd, bytes.as_ptr().cast(), bytes.len());
-                }
-            }
-            AlacrittyEvent::TextAreaSizeRequest(formatter) => {
-                let (rows, cols) = self
-                    .current_dims
-                    .lock()
-                    .map(|d| *d)
-                    .unwrap_or((24, 80));
-                let window_size = alacritty_terminal::event::WindowSize {
-                    num_lines: rows,
-                    num_cols: cols,
-                    cell_width: DEFAULT_CELL_WIDTH,
-                    cell_height: DEFAULT_CELL_HEIGHT,
-                };
-                let response = formatter(window_size);
-                let bytes = response.as_bytes();
-                unsafe {
-                    libc::write(self.pty_fd, bytes.as_ptr().cast(), bytes.len());
-                }
-            }
-            _ => {}
-        }
-    }
-}
 
 // ─── Tee (log file) ─────────────────────────────────────────────────────────
 
@@ -167,6 +118,24 @@ enum PtyWriteCommand {
     Input(Vec<u8>),
     Resize { rows: u16, cols: u16 },
     Shutdown,
+}
+
+/// Messages from the reader/child threads to the main I/O relay loop.
+enum SessionOutput {
+    /// Raw PTY output bytes.
+    PtyData(Vec<u8>),
+    /// Child process exited with optional exit code.
+    ChildExited(Option<i32>),
+    /// Pre-encoded event frame (mode changed, title, bell, CWD, notification, prompt mark).
+    EventFrame(Vec<u8>),
+}
+
+/// Events from ghostty callbacks (fired during process(), relayed to reader thread).
+enum VtEvent {
+    Notification { title: String, body: String },
+    SemanticPrompt(u8),
+    ModeChanged { mode: u16, enabled: bool },
+    KittyKeyboardChanged,
 }
 
 // ─── Session process entry point ─────────────────────────────────────────────
@@ -338,16 +307,62 @@ fn run_session(
 
     // Set up shared state
     let current_dims = Arc::new(Mutex::new((config.rows, config.cols)));
+
+    // Event channel for ghostty callbacks → reader thread → hub.
+    // Callbacks fire inside process() (parser mutex held), so we use
+    // a lock-free mpsc channel to avoid deadlock.
+    let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<VtEvent>(64);
+
+    let title_changed_flag = Arc::new(AtomicBool::new(false));
+    let bell_flag = Arc::new(AtomicBool::new(false));
+    let pwd_changed_flag = Arc::new(AtomicBool::new(false));
+
     let parser = {
-        let listener = SessionEventListener {
-            pty_fd: master_fd,
-            current_dims: Arc::clone(&current_dims),
+        let write_fd = master_fd;
+        let title_flag = Arc::clone(&title_changed_flag);
+        let bell_flag_cb = Arc::clone(&bell_flag);
+        let pwd_flag = Arc::clone(&pwd_changed_flag);
+        let notif_tx = event_tx.clone();
+        let prompt_tx = event_tx.clone();
+        let mode_tx = event_tx.clone();
+        let kitty_tx = event_tx;
+
+        let callbacks = CallbackConfig {
+            write_pty: Some(Box::new(move |data: &[u8]| {
+                unsafe {
+                    libc::write(write_fd, data.as_ptr().cast(), data.len());
+                }
+            })),
+            title_changed: Some(Box::new(move |_title: &str| {
+                title_flag.store(true, Ordering::Release);
+            })),
+            bell: Some(Box::new(move || {
+                bell_flag_cb.store(true, Ordering::Release);
+            })),
+            pwd_changed: Some(Box::new(move || {
+                pwd_flag.store(true, Ordering::Release);
+            })),
+            notification: Some(Box::new(move |title: &str, body: &str| {
+                let _ = notif_tx.try_send(VtEvent::Notification {
+                    title: title.to_string(),
+                    body: body.to_string(),
+                });
+            })),
+            semantic_prompt: Some(Box::new(move |mark: u8| {
+                let _ = prompt_tx.try_send(VtEvent::SemanticPrompt(mark));
+            })),
+            mode_changed: Some(Box::new(move |mode: u16, enabled: bool| {
+                let _ = mode_tx.try_send(VtEvent::ModeChanged { mode, enabled });
+            })),
+            kitty_keyboard_changed: Some(Box::new(move || {
+                let _ = kitty_tx.try_send(VtEvent::KittyKeyboardChanged);
+            })),
         };
-        Arc::new(Mutex::new(AlacrittyParser::new_with_listener(
+        Arc::new(Mutex::new(TerminalParser::new_with_callbacks(
             config.rows,
             config.cols,
             DEFAULT_SCROLLBACK_LINES,
-            listener,
+            callbacks,
         )))
     };
     let last_output_at = Arc::new(AtomicU64::new(0));
@@ -387,7 +402,11 @@ fn run_session(
     let last_output_reader = Arc::clone(&last_output_at);
     let tee_for_reader = Arc::clone(&tee);
     let shutdown_for_reader = Arc::clone(&shutdown);
-    let (output_tx, output_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
+    let title_flag_reader = Arc::clone(&title_changed_flag);
+    let bell_flag_reader = Arc::clone(&bell_flag);
+    let pwd_flag_reader = Arc::clone(&pwd_changed_flag);
+    let (output_tx, output_rx) = std::sync::mpsc::sync_channel::<SessionOutput>(256);
+    let output_tx_child = output_tx.clone();
     let _reader_thread = thread::Builder::new()
         .name("session-reader".to_string())
         .spawn(move || {
@@ -398,9 +417,32 @@ fn run_session(
                 tee_for_reader,
                 output_tx,
                 shutdown_for_reader,
+                title_flag_reader,
+                bell_flag_reader,
+                pwd_flag_reader,
+                event_rx,
             );
         })
         .context("spawn reader thread")?;
+
+    // Child-waiter thread: waits for child exit, sends FRAME_PROCESS_EXITED
+    let shutdown_for_child = Arc::clone(&shutdown);
+    let _child_thread = thread::Builder::new()
+        .name("session-child-waiter".to_string())
+        .spawn(move || {
+            let mut child = child;
+            let exit_code = match child.wait() {
+                Ok(status) => Some(status.exit_code() as i32),
+                Err(e) => {
+                    log::warn!("[session] child wait error: {e}");
+                    None
+                }
+            };
+            log::info!("[session] child exited (code={:?})", exit_code);
+            shutdown_for_child.store(true, Ordering::Release);
+            let _ = output_tx_child.try_send(SessionOutput::ChildExited(exit_code));
+        })
+        .context("spawn child waiter thread")?;
 
     // Socket-as-lease watcher
     let socket_path_owned = socket_path.to_owned();
@@ -460,9 +502,21 @@ fn run_session(
             break;
         }
 
-        // Forward PTY output to hub
-        while let Ok(data) = output_rx.try_recv() {
-            let frame = encode_frame(FRAME_PTY_OUTPUT, &data);
+        // Forward PTY output / child exit to hub
+        while let Ok(msg) = output_rx.try_recv() {
+            let frame = match msg {
+                SessionOutput::PtyData(data) => encode_frame(FRAME_PTY_OUTPUT, &data),
+                SessionOutput::ChildExited(code) => {
+                    match encode_json(
+                        FRAME_PROCESS_EXITED,
+                        &serde_json::json!({"exit_code": code}),
+                    ) {
+                        Ok(f) => f,
+                        Err(_) => encode_frame(FRAME_PROCESS_EXITED, b"{}"),
+                    }
+                }
+                SessionOutput::EventFrame(frame) => frame,
+            };
             if stream.write_all(&frame).is_err() {
                 // Hub disconnected
                 log::info!("[session] hub disconnected (write error)");
@@ -601,7 +655,7 @@ fn read_spawn_config(stream: &mut UnixStream, decoder: &mut FrameDecoder) -> Res
 fn handle_hub_frame(
     frame: &Frame,
     writer_tx: &std::sync::mpsc::SyncSender<PtyWriteCommand>,
-    parser: &Arc<Mutex<AlacrittyParser<SessionEventListener>>>,
+    parser: &Arc<Mutex<TerminalParser>>,
     resize_pending: &AtomicBool,
     tee: &SharedTee,
     stream: &mut UnixStream,
@@ -630,12 +684,37 @@ fn handle_hub_frame(
         }
 
         FRAME_GET_SNAPSHOT => {
-            // Never skip visible content — the session process's parser is
-            // always up-to-date (reader thread feeds it continuously).
-            // resize_pending is only relevant for the hub's shadow screen.
+            // Dual-screen snapshot: [u32 LE: primary_len][primary VT][alt VT or empty]
+            // Primary section always present. Alt section only when alt screen active.
+            use crate::ghostty_vt::GhosttyScreenKey;
+
             let snapshot = parser
                 .lock()
-                .map(|p| generate_ansi_snapshot(&p, false))
+                .map(|p| {
+                    let t = p.terminal();
+                    let alt_active = t.alt_screen_active();
+
+                    if alt_active {
+                        // Alt screen active: format both screens independently
+                        let primary = t.format_screen(GhosttyScreenKey::Primary)
+                            .unwrap_or_default();
+                        let alt = t.format_screen(GhosttyScreenKey::Alternate)
+                            .unwrap_or_default();
+
+                        let mut buf = Vec::with_capacity(4 + primary.len() + alt.len());
+                        buf.extend_from_slice(&(primary.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(&primary);
+                        buf.extend_from_slice(&alt);
+                        buf
+                    } else {
+                        // Primary active: full terminal snapshot (modes, cursor, etc.)
+                        let primary = generate_snapshot(&p, false);
+                        let mut buf = Vec::with_capacity(4 + primary.len());
+                        buf.extend_from_slice(&(primary.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(&primary);
+                        buf
+                    }
+                })
                 .unwrap_or_default();
             let response = encode_frame(FRAME_SNAPSHOT, &snapshot);
             let _ = stream.write_all(&response);
@@ -656,6 +735,8 @@ fn handle_hub_frame(
                     bracketed_paste: p.bracketed_paste(),
                     mouse_mode: p.mouse_mode(),
                     alt_screen: p.alt_screen_active(),
+                    focus_reporting: p.focus_reporting(),
+                    application_cursor: p.application_cursor(),
                 })
                 .unwrap_or_default();
             if let Ok(response) = encode_json(FRAME_MODE_FLAGS, &flags) {
@@ -705,14 +786,35 @@ fn handle_hub_frame(
 
 // ─── Reader loop ─────────────────────────────────────────────────────────────
 
+/// Convert a semantic prompt mark byte to its human-readable name.
+fn prompt_mark_name(mark: u8) -> &'static str {
+    match mark {
+        b'A' => "prompt_start",
+        b'B' => "command_start",
+        b'C' => "command_executed",
+        b'D' => "command_finished",
+        b'L' => "fresh_line",
+        b'N' => "new_command",
+        b'P' => "prompt_start",
+        b'I' => "command_start",
+        _ => "unknown",
+    }
+}
+
 /// Read PTY output, feed parser, forward to hub via channel.
+/// Terminal state change events are driven entirely by ghostty callbacks —
+/// no byte scanning or mode diffing in Rust.
 fn reader_loop(
     fd: RawFd,
-    parser: Arc<Mutex<AlacrittyParser<SessionEventListener>>>,
+    parser: Arc<Mutex<TerminalParser>>,
     last_output_at: Arc<AtomicU64>,
     tee: SharedTee,
-    output_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    output_tx: std::sync::mpsc::SyncSender<SessionOutput>,
     shutdown: Arc<AtomicBool>,
+    title_changed_flag: Arc<AtomicBool>,
+    bell_flag: Arc<AtomicBool>,
+    pwd_changed_flag: Arc<AtomicBool>,
+    event_rx: std::sync::mpsc::Receiver<VtEvent>,
 ) {
     let mut buf = [0u8; 4096];
     let mut file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
@@ -724,16 +826,88 @@ fn reader_loop(
 
         match file.read(&mut buf) {
             Ok(0) | Err(_) => {
-                // PTY closed — child exited
                 shutdown.store(true, Ordering::Release);
                 break;
             }
             Ok(n) => {
                 let data = &buf[..n];
 
-                // Feed parser for terminal state tracking
+                // Feed parser — ghostty callbacks fire during process()
                 if let Ok(mut p) = parser.lock() {
                     p.process(data);
+
+                    // Title changed (flag set by ghostty callback)
+                    if title_changed_flag.swap(false, Ordering::Acquire) {
+                        let title = p.terminal().title();
+                        let _ = output_tx.try_send(SessionOutput::EventFrame(
+                            encode_string(FRAME_TITLE_CHANGED, &title),
+                        ));
+                    }
+
+                    // PWD changed (flag set by ghostty OSC 7 callback)
+                    // ghostty stores the raw OSC 7 URI; extract the path portion.
+                    if pwd_changed_flag.swap(false, Ordering::Acquire) {
+                        let raw = p.terminal().pwd();
+                        let path = if let Some(rest) = raw.strip_prefix("file://") {
+                            rest.find('/').map(|i| &rest[i..]).unwrap_or(&raw)
+                        } else {
+                            &raw
+                        };
+                        if !path.is_empty() {
+                            let _ = output_tx.try_send(SessionOutput::EventFrame(
+                                encode_string(FRAME_CWD_CHANGED, path),
+                            ));
+                        }
+                    }
+                }
+
+                // Bell (flag set by ghostty callback)
+                if bell_flag.swap(false, Ordering::Acquire) {
+                    let _ = output_tx
+                        .try_send(SessionOutput::EventFrame(encode_empty(FRAME_BELL)));
+                }
+
+                // Drain events from ghostty callbacks (notification, prompt, mode)
+                while let Ok(event) = event_rx.try_recv() {
+                    let frame = match event {
+                        VtEvent::Notification { title, body } => {
+                            encode_json(FRAME_NOTIFICATION, &NotificationPayload { title, body })
+                        }
+                        VtEvent::SemanticPrompt(mark) => {
+                            encode_json(FRAME_PROMPT_MARK, &PromptMarkPayload {
+                                mark: prompt_mark_name(mark).to_string(),
+                                command: None,
+                                exit_code: None,
+                            })
+                        }
+                        VtEvent::KittyKeyboardChanged => {
+                            let kitty = parser.lock().map(|p| p.kitty_enabled()).unwrap_or(false);
+                            let mut changed = ModeChanged::default();
+                            changed.kitty_enabled = Some(kitty);
+                            encode_json(FRAME_MODE_CHANGED, &changed)
+                        }
+                        VtEvent::ModeChanged { mode, enabled } => {
+                            use crate::ghostty_vt::*;
+                            let mut changed = ModeChanged::default();
+                            match mode {
+                                MODE_CURSOR_VISIBLE => changed.cursor_visible = Some(enabled),
+                                MODE_ALT_SCREEN_SAVE => changed.alt_screen = Some(enabled),
+                                MODE_NORMAL_MOUSE | MODE_BUTTON_MOUSE | MODE_ANY_MOUSE => {
+                                    if let Ok(p) = parser.lock() {
+                                        changed.mouse_mode = Some(p.mouse_mode());
+                                    }
+                                }
+                                MODE_BRACKETED_PASTE => changed.bracketed_paste = Some(enabled),
+                                MODE_FOCUS_EVENT => changed.focus_reporting = Some(enabled),
+                                MODE_DECCKM => changed.application_cursor = Some(enabled),
+                                _ => continue,
+                            };
+                            encode_json(FRAME_MODE_CHANGED, &changed)
+                        }
+                    };
+                    if let Ok(frame) = frame {
+                        let _ = output_tx.try_send(SessionOutput::EventFrame(frame));
+                    }
                 }
 
                 // Update idle timestamp
@@ -753,7 +927,7 @@ fn reader_loop(
                 }
 
                 // Forward to hub (drop if channel full — continuous stream)
-                let _ = output_tx.try_send(data.to_vec());
+                let _ = output_tx.try_send(SessionOutput::PtyData(data.to_vec()));
             }
         }
     }
@@ -768,7 +942,7 @@ fn reader_loop(
 fn pty_writer_loop(
     mut writer: Box<dyn Write + Send>,
     master_pty: Box<dyn portable_pty::MasterPty + Send>,
-    parser: Arc<Mutex<AlacrittyParser<SessionEventListener>>>,
+    parser: Arc<Mutex<TerminalParser>>,
     current_dims: Arc<Mutex<(u16, u16)>>,
     resize_pending: Arc<AtomicBool>,
     init_commands: Vec<String>,

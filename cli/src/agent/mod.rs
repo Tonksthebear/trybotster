@@ -148,7 +148,6 @@ impl Agent {
             kitty,
             cursor_vis,
             resize,
-            true, // detect OSC notifications
             self.pty.port(),
         )
     }

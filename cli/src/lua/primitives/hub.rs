@@ -126,7 +126,7 @@ pub type SharedServerId = Arc<Mutex<Option<String>>>;
 ///
 /// Returns an error if Lua table or function creation fails.
 /// Shared color cache type for boot-probed terminal colors.
-pub type SharedColorCache = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, alacritty_terminal::vte::ansi::Rgb>>>;
+pub type SharedColorCache = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>;
 
 pub(crate) fn register(
     lua: &Lua,
@@ -185,6 +185,7 @@ pub(crate) fn register(
     //   }
     let cache2 = Arc::clone(&handle_cache);
     let register_event_tx = Arc::clone(&hub_event_tx);
+    let cc_register = color_cache.clone();
     let register_session_fn = lua
         .create_function(
             move |_, (session_uuid, session_ud, metadata): (String, LuaAnyUserData, LuaTable)| {
@@ -256,6 +257,15 @@ pub(crate) fn register(
                     index
                 );
 
+                // Apply cached terminal colors to the shadow screen so OSC 10/11/12
+                // queries from running processes are answered correctly.
+                {
+                    let session_handle = cache2.get_session(&session_uuid);
+                    if let Some(sh) = session_handle {
+                        sh.pty().apply_color_cache(&cc_register);
+                    }
+                }
+
                 // Session-process-backed handles: install reader thread.
                 // The reader feeds the shadow screen and broadcasts output directly.
                 // Guard: skip if a reader is already alive (e.g., workspace move re-registration).
@@ -278,19 +288,13 @@ pub(crate) fn register(
                                             &session_uuid[..session_uuid.len().min(16)]
                                         );
                                     } else {
-                                        let listener = pty.shadow_listener().unwrap_or_else(|| {
-                                            crate::agent::pty::HubEventListener::new(pty.event_tx_clone())
-                                        });
                                         if let Err(e) = session_conn.install_reader(
                                             session_uuid.clone(),
-                                            pty.shadow_screen(),
-                                            listener,
                                             pty.event_tx_clone(),
                                             pty.kitty_enabled_arc(),
                                             pty.cursor_visible_arc(),
                                             pty.resize_pending_arc(),
                                             pty.last_output_at_atomic().clone(),
-                                            session_type == SessionType::Agent,
                                             {
                                                 let g = register_event_tx
                                                     .lock()
@@ -304,28 +308,9 @@ pub(crate) fn register(
                                                 "[Lua] Failed to install session reader for '{}': {e}",
                                                 session_uuid
                                             );
-                                        } else {
-                                            // Reader installed — request initial snapshot to populate shadow screen.
-                                            // This gives the TUI immediate content on reconnect.
-                                            match session_conn.get_snapshot() {
-                                                Ok(snapshot) if !snapshot.is_empty() => {
-                                                    if let Ok(mut screen) = pty.shadow_screen().lock() {
-                                                        screen.process(&snapshot);
-                                                    }
-                                                    log::info!(
-                                                        "[Lua] Replayed {} bytes of session snapshot for '{}'",
-                                                        snapshot.len(),
-                                                        &session_uuid[..session_uuid.len().min(16)]
-                                                    );
-                                                }
-                                                Ok(_) => {
-                                                    log::debug!("[Lua] Empty snapshot for '{}'", &session_uuid[..session_uuid.len().min(16)]);
-                                                }
-                                                Err(e) => {
-                                                    log::warn!("[Lua] Snapshot replay failed for '{}': {e}", &session_uuid[..session_uuid.len().min(16)]);
-                                                }
-                                            }
                                         }
+                                        // No shadow screen replay needed — snapshots are fetched
+                                        // via RPC when clients attach.
                                     }
                                 }
                             }

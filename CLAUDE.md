@@ -103,12 +103,12 @@ No broker, no multiplexing, no demux thread.
 ```
 Hub spawns session process → session creates PTY + binds socket
 Hub connects to socket → handshake → sends spawn config
-Session reader thread → feeds hub shadow screen → broadcasts PtyEvent::Output
-Hub owns shadow screen (snapshot authority) → forwarders stream to clients
+Session reader thread → broadcasts PtyEvent::Output + structured events
+Hub routes events to clients → snapshots via RPC to session process
 ```
 
-**Session process owns:** PTY fd, alacritty parser (state tracking), socket, tee/logging, resize
-**Hub owns:** shadow screen (snapshots), client routing, byte scanning (OSC 7/133/notifications)
+**Session process owns:** PTY fd, ghostty parser (state tracking + 6 vendored callbacks), socket, tee/logging, resize, dual-screen snapshot generation, event frame emission
+**Hub owns:** client routing, event broadcasting, snapshot RPC dispatch
 **Socket-as-lease:** session process exits if its socket file is deleted
 **setsid:** session processes survive hub restart (own process group)
 **Recovery:** hub scans `/tmp/botster-{uid}/sessions/*.sock`, connects to live ones
@@ -116,7 +116,7 @@ Hub owns shadow screen (snapshot authority) → forwarders stream to clients
 Key paths:
 - `cli/src/session/mod.rs` — session process entry point
 - `cli/src/session/connection.rs` — hub-side connection + reader thread
-- `cli/src/session/protocol.rs` — wire protocol (15 frame types)
+- `cli/src/session/protocol.rs` — wire protocol (22 frame types incl. structured events 0x10-0x15)
 - `cli/lua/handlers/session_recovery.lua` — recovery handler
 
 ## Patterns

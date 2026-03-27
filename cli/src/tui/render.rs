@@ -241,8 +241,8 @@ pub(super) fn render_terminal_panel(
         let scrollback_depth = panel.scrollback_depth();
         let is_scrolled = panel.is_scrolled();
 
-        let term = panel.term();
-        let widget = crate::TerminalWidget::new(term, scroll_offset).block(block);
+        let rs = panel.render_state();
+        let widget = crate::TerminalWidget::new(rs).block(block);
         let widget = if is_scrolled {
             widget.hide_cursor()
         } else {

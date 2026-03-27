@@ -64,7 +64,8 @@ use crate::tui::layout::terminal_widget_inner_area;
 use super::actions::TuiAction;
 use super::layout_lua::{KeyContext, LayoutLua, LuaKeyAction};
 use super::qr::ConnectionCodeData;
-use super::raw_input::{InputEvent, MouseEventType, RawInputReader, ScrollDirection};
+use super::raw_input::{InputEvent, MouseEventType, RawInputReader};
+use super::smooth_scroll::SmoothScroll;
 
 /// Default scrollback lines for VT100 parser.
 
@@ -509,25 +510,11 @@ where
             self.stdin_dead = true;
         }
 
-        // Coalesce consecutive mouse scroll events with acceleration.
-        // Single notch = 1 line (fine control). When events batch up within
-        // a tick (fast scrolling), each additional event adds more lines,
-        // giving natural acceleration without sacrificing precision.
-        let mut pending_scroll: i64 = 0;
-        let mut scroll_event_count: i64 = 0;
-
         for event in events {
             match &event {
-                InputEvent::MouseScroll { direction, .. } if !self.has_overlay => {
+                InputEvent::MouseScroll { direction, x, y } if !self.has_overlay => {
                     self.dirty = true;
-                    scroll_event_count += 1;
-                    // Acceleration: first event = 1 line, then ramp up.
-                    // 1, 2, 3, 4... lines per successive event in the same tick.
-                    let lines = scroll_event_count;
-                    match direction {
-                        ScrollDirection::Up => pending_scroll += lines,
-                        ScrollDirection::Down => pending_scroll -= lines,
-                    }
+                    self.route_mouse_scroll(*direction, *x, *y);
                 }
                 InputEvent::MouseScroll { .. } => {
                     // Overlay active — swallow scroll events.
@@ -605,21 +592,14 @@ where
                     }
 
                     self.dirty = true;
-                    // Flush accumulated scroll before processing the key event,
-                    // so key handlers see the correct scroll position.
-                    if pending_scroll != 0 {
-                        self.apply_coalesced_scroll(pending_scroll);
-                        pending_scroll = 0;
-                        scroll_event_count = 0;
-                    }
                     self.handle_raw_input_event(event, layout_lua);
                 }
             }
         }
 
-        // Flush any trailing scroll events.
-        if pending_scroll != 0 {
-            self.apply_coalesced_scroll(pending_scroll);
+        // Reset scroll acceleration for next tick.
+        for panel in self.panel_pool.panels.values_mut() {
+            panel.reset_scroll_accel();
         }
         // Check SIGWINCH resize flag
         if self.resize_flag.swap(false, Ordering::SeqCst) {
@@ -630,21 +610,28 @@ where
         }
     }
 
-    /// Apply a coalesced scroll delta from batched mouse scroll events.
+    /// Route a mouse scroll event to the widget under the cursor.
     ///
-    /// Positive delta scrolls up (into history), negative scrolls down.
-    /// Batching N scroll events into one call prevents redundant mutex
-    /// acquisitions and makes boundaries feel instant.
-    fn apply_coalesced_scroll(&mut self, delta: i64) {
-        if delta > 0 {
-            #[expect(clippy::cast_sign_loss, reason = "delta is positive, checked above")]
-            self.handle_tui_action(TuiAction::ScrollUp(delta as usize));
-        } else {
-            #[expect(
-                clippy::cast_sign_loss,
-                reason = "delta is negative, negated to positive"
-            )]
-            self.handle_tui_action(TuiAction::ScrollDown((-delta) as usize));
+    /// Hit-tests `last_widget_areas` to find which widget contains (x, y),
+    /// then delegates to that widget's `mouse_scroll()`. If nothing
+    /// scrollable is under the cursor, the event is discarded.
+    fn route_mouse_scroll(
+        &mut self,
+        direction: super::raw_input::ScrollDirection,
+        x: u16,
+        y: u16,
+    ) {
+        let target_uuid = self
+            .last_widget_areas
+            .iter()
+            .find(|(_, area)| {
+                let r = &area.rect;
+                x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+            })
+            .map(|(id, _)| id.clone());
+
+        if let Some(panel) = target_uuid.and_then(|uuid| self.panel_pool.panels.get_mut(&uuid)) {
+            panel.mouse_scroll(direction);
         }
     }
 
@@ -1037,45 +1024,11 @@ where
 
     /// Forward pending color queries from a TUI panel to the outer terminal.
     ///
-    /// Alacritty fires `ColorRequest` when the inner PTY queries OSC 10/11/12.
-    /// We construct the raw query and write it to stdout so the outer terminal
-    /// responds. The response arrives on stdin and is intercepted by
-    /// `is_osc_color_response`, which routes it back to the PTY.
-    fn forward_panel_color_queries(panel: &super::terminal_panel::TerminalPanel) {
-        /// Foreground dynamic color index in alacritty's color table.
-        const IDX_FOREGROUND: usize = 256;
-        /// Background dynamic color index in alacritty's color table.
-        const IDX_BACKGROUND: usize = 257;
-        /// Cursor dynamic color index in alacritty's color table.
-        const IDX_CURSOR: usize = 258;
-
-        let queries = panel.drain_color_queries();
-        if queries.is_empty() {
-            return;
-        }
-
-        let mut buf = Vec::new();
-        for query in &queries {
-            let osc_code = match query.index {
-                IDX_FOREGROUND => "10",
-                IDX_BACKGROUND => "11",
-                IDX_CURSOR => "12",
-                _ => continue,
-            };
-            // OSC query: ESC ] <code> ; ? BEL
-            buf.extend_from_slice(b"\x1b]");
-            buf.extend_from_slice(osc_code.as_bytes());
-            buf.extend_from_slice(b";?\x07");
-        }
-
-        if !buf.is_empty() {
-            log::debug!(
-                "[PTY-PROBE] Forwarding {} color queries to outer terminal",
-                queries.len()
-            );
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), &buf);
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
+    /// With ghostty, color queries are handled internally when colors are set
+    /// on the terminal. This is now a no-op but kept for call-site compatibility.
+    fn forward_panel_color_queries(_panel: &super::terminal_panel::TerminalPanel) {
+        // Ghostty handles OSC 10/11/12 color queries internally via write_pty callback.
+        // No forwarding needed.
     }
 
     /// Detect OSC color response sequences (OSC 10/11/12 with rgb: or # values).

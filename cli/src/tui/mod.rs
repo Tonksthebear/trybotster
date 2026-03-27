@@ -31,6 +31,7 @@
 //! - [`render`] - Main rendering function
 //! - [`runner`] - TuiRunner struct, event loop, and `run_with_hub()`
 //! - [`runner_handlers`] - Scroll and quit action dispatch
+//! - [`smooth_scroll`] - Mouse-wheel acceleration trait for scrollable widgets
 //! - [`terminal_modes`] - Terminal mode mirroring (DECCKM, bracketed paste, kitty)
 
 // Rust guideline compliant 2026-02
@@ -49,6 +50,7 @@ pub mod render_tree;
 pub mod runner;
 mod runner_handlers;
 pub mod screen;
+pub mod smooth_scroll;
 pub mod terminal_modes;
 pub mod terminal_panel;
 pub mod widget_state;

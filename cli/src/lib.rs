@@ -38,6 +38,8 @@ pub mod ws;
 
 pub mod compat;
 pub mod config;
+#[allow(missing_docs, missing_debug_implementations)]
+pub mod ghostty_vt;
 pub mod constants;
 pub mod crypto;
 pub mod device;

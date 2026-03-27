@@ -225,7 +225,7 @@ impl TerminalProfileStore {
     /// Returns a shared `Arc<Mutex<HashMap>>` that all `HubEventListener`
     /// instances reference. When a `ColorRequest` fires, the listener looks
     /// up the cached RGB value and formats the response immediately.
-    pub(crate) fn shared_color_cache(&self) -> std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, alacritty_terminal::vte::ansi::Rgb>>> {
+    pub(crate) fn shared_color_cache(&self) -> std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>> {
         /// Foreground dynamic color index in alacritty's color table.
         const IDX_FOREGROUND: usize = 256;
         /// Background dynamic color index in alacritty's color table.
@@ -617,11 +617,11 @@ fn classify_osc_reply(seq: &[u8]) -> Option<(TerminalProbe, Vec<u8>)> {
     Some((probe, seq.to_vec()))
 }
 
-/// Parse `rgb:RRRR/GGGG/BBBB` from a cached OSC reply into alacritty's `Rgb`.
+/// Parse `rgb:RRRR/GGGG/BBBB` from a cached OSC reply.
 ///
 /// The cached reply is a full OSC sequence like `ESC]10;rgb:1010/0f0f/0f0f BEL`.
 /// Extracts the rgb: value and converts the 16-bit color components to 8-bit.
-fn parse_rgb_from_osc_reply(reply: &[u8]) -> Option<alacritty_terminal::vte::ansi::Rgb> {
+fn parse_rgb_from_osc_reply(reply: &[u8]) -> Option<crate::terminal::Rgb> {
     let payload = osc_payload(reply)?;
     let (_code, value) = payload.split_once_by(|b| *b == b';')?;
     let rgb_str = value.strip_prefix(b"rgb:")?;
@@ -631,7 +631,7 @@ fn parse_rgb_from_osc_reply(reply: &[u8]) -> Option<alacritty_terminal::vte::ans
     let g = u16::from_str_radix(parts.next()?, 16).ok()?;
     let b = u16::from_str_radix(parts.next()?, 16).ok()?;
     // Terminal colors use 16-bit components (RRRR); convert to 8-bit.
-    Some(alacritty_terminal::vte::ansi::Rgb {
+    Some(crate::terminal::Rgb {
         r: (r >> 8) as u8,
         g: (g >> 8) as u8,
         b: (b >> 8) as u8,

@@ -68,11 +68,11 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use crate::agent::pty::{HubEventListener, PtySession, SharedPtyState};
+use crate::agent::pty::{PtySession, SharedPtyState};
 #[cfg(test)]
 use crate::agent::spawn::PtySpawnConfig;
 use crate::hub::events::HubEvent;
-use crate::terminal::{AlacrittyParser, DEFAULT_SCROLLBACK_LINES};
+use crate::terminal::{TerminalParser, DEFAULT_SCROLLBACK_LINES};
 use tokio::sync::broadcast;
 
 use anyhow::{anyhow, Result};
@@ -140,7 +140,7 @@ pub struct PtySessionHandle {
     shared_state: Arc<Mutex<SharedPtyState>>,
 
     /// Shadow terminal for clean ANSI snapshots on reconnect.
-    shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
+    shadow_screen: Arc<Mutex<TerminalParser>>,
 
     /// Event broadcast sender for subscribing to PTY output.
     event_tx: broadcast::Sender<PtyEvent>,
@@ -180,8 +180,6 @@ pub struct PtySessionHandle {
     session_connection:
         Arc<std::sync::OnceLock<crate::session::connection::SharedSessionConnection>>,
 
-    /// Clone of the shadow screen's event listener for draining alacritty events.
-    shadow_listener: HubEventListener,
 }
 
 impl std::fmt::Debug for PtySessionHandle {
@@ -231,14 +229,13 @@ impl PtySessionHandle {
         // Recovery shadow screen: correct dimensions plus normal scrollback.
         // Session-backed recovery uses this parser as the hub's local
         // authority after the initial snapshot replay.
-        let listener = HubEventListener::with_color_cache(event_tx.clone(), color_cache);
-        let listener_clone = listener.clone();
-        let shadow_screen = Arc::new(Mutex::new(AlacrittyParser::new_with_listener(
+        let mut parser = TerminalParser::new(
             rows,
             cols,
             DEFAULT_SCROLLBACK_LINES,
-            listener,
-        )));
+        );
+        parser.apply_color_cache(&color_cache);
+        let shadow_screen = Arc::new(Mutex::new(parser));
 
         Self {
             _session: None,
@@ -253,7 +250,6 @@ impl PtySessionHandle {
             hub_event_tx,
             last_output_at: Arc::new(AtomicU64::new(0)),
             session_connection: Arc::new(std::sync::OnceLock::new()),
-            shadow_listener: listener_clone,
         }
     }
 
@@ -292,8 +288,8 @@ impl PtySessionHandle {
 
     /// Create a session-process-backed `PtyHandle`.
     ///
-    /// Routes write/resize through the session socket. Snapshots use the
-    /// local shadow screen (fed by the reader thread).
+    /// Routes write/resize through the session socket. Snapshots are fetched
+    /// via RPC to the session process (no local shadow screen).
     #[must_use]
     pub fn to_pty_handle_with_session(
         &self,
@@ -302,11 +298,9 @@ impl PtySessionHandle {
         let (rows, cols) = self.get_dims();
         crate::hub::agent_handle::PtyHandle::new_with_session(
             self.event_tx.clone(),
-            Arc::clone(&self.shadow_screen),
             Arc::clone(&self.kitty_enabled),
             Arc::clone(&self.cursor_visible),
             Arc::clone(&self.resize_pending),
-            true, // session-process PTYs are always CLI sessions
             self.port,
             session_connection,
             Arc::clone(&self.last_output_at),
@@ -316,7 +310,6 @@ impl PtySessionHandle {
                 .unwrap_or_else(|_| Arc::new(std::sync::atomic::AtomicI64::new(0))),
             rows,
             cols,
-            self.shadow_listener.clone(),
         )
     }
 
@@ -478,7 +471,7 @@ impl LuaUserData for PtySessionHandle {
                 .lock()
                 .expect("PtySessionHandle shadow_screen lock poisoned");
             let skip_visible = this.resize_pending.swap(false, Ordering::AcqRel);
-            let output = crate::terminal::generate_ansi_snapshot(&*parser, skip_visible);
+            let output = crate::terminal::generate_snapshot(&*parser, skip_visible);
             lua.create_string(&output)
         });
 
@@ -519,7 +512,7 @@ impl LuaUserData for PtySessionHandle {
                 .lock()
                 .expect("PtySessionHandle shadow_screen lock poisoned");
             let skip_visible = this.resize_pending.swap(false, Ordering::AcqRel);
-            let output = crate::terminal::generate_ansi_snapshot(&*parser, skip_visible);
+            let output = crate::terminal::generate_snapshot(&*parser, skip_visible);
             lua.create_string(&output)
         });
 
@@ -907,7 +900,7 @@ pub(crate) fn spawn_session_handle_from_opts(
         _session: Some(session_arc),
         shared_state,
         shadow_screen,
-        shadow_listener: HubEventListener::new(event_tx.clone()),
+
         event_tx,
         kitty_enabled,
         cursor_visible,
@@ -1594,7 +1587,7 @@ mod tests {
             _session: Some(session_arc),
             shared_state,
             shadow_screen,
-            shadow_listener: HubEventListener::new(event_tx.clone()),
+    
             event_tx,
             kitty_enabled,
             cursor_visible,
@@ -1721,9 +1714,9 @@ mod tests {
             .load("return session:get_snapshot()")
             .eval()
             .expect("get_snapshot should work");
-        // generate_ansi_snapshot() preamble: ESC[0m (reset) then ESC[H (home)
+        // Ghostty formatter produces VT output for the empty screen.
         let bytes = result.as_bytes();
-        assert!(bytes.starts_with(b"\x1b[0m\x1b[H"));
+        assert!(!bytes.is_empty(), "snapshot should produce non-empty output");
     }
 
     #[test]

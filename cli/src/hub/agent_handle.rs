@@ -42,11 +42,10 @@ use std::sync::{
 
 use tokio::sync::broadcast;
 
-use crate::agent::notification::AgentNotification;
-use crate::agent::pty::{HubEventListener, PtyEvent, SharedPtyState};
+use crate::agent::pty::{PtyEvent, SharedPtyState};
 #[cfg(test)]
 use crate::agent::pty::do_resize;
-use crate::terminal::{generate_ansi_snapshot, AlacrittyParser};
+use crate::terminal::TerminalParser;
 
 /// Session type distinguishing agents (AI-driven) from accessories (plain PTY).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -204,20 +203,20 @@ pub struct PtyHandle {
 
     /// Shadow terminal for clean ANSI snapshots on reconnect.
     ///
-    /// Shared with `PtySession` and the reader thread. On connect,
-    /// `get_snapshot()` produces clean ANSI output with correct cursor and SGR state.
-    shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
+    /// `Some` for local/test PTY handles (no session process).
+    /// `None` for session-backed handles — snapshots come via RPC to the session process.
+    shadow_screen: Option<Arc<Mutex<TerminalParser>>>,
 
     /// Whether the inner PTY has kitty keyboard protocol active.
     ///
-    /// Shared with the reader thread which updates this from raw PTY output.
-    /// Used by `get_snapshot()` to include the kitty push sequence.
+    /// Updated by session reader from `FRAME_MODE_CHANGED` events.
+    /// Read by `snapshot_and_subscribe()` for reconnect metadata.
     kitty_enabled: Arc<AtomicBool>,
 
     /// Whether the terminal cursor is currently visible (DECTCEM).
     ///
-    /// Updated by [`crate::agent::spawn::process_pty_bytes`] from the shadow
-    /// screen's cursor state. Readable without an RPC.
+    /// Updated by session reader from `FRAME_MODE_CHANGED` events.
+    /// Readable without an RPC.
     cursor_visible: Arc<AtomicBool>,
 
     /// Whether a resize happened without the application redrawing yet.
@@ -225,13 +224,6 @@ pub struct PtyHandle {
     /// Set by `resize_direct()`, checked by `get_snapshot()` to avoid
     /// capturing stale visible-screen content after a resize.
     resize_pending: Arc<AtomicBool>,
-
-    /// Whether OSC notification sequences should be detected and broadcast.
-    ///
-    /// `true` for agent PTYs, `false` for accessory PTYs.
-    /// Passed directly to [`crate::agent::spawn::process_pty_bytes`] by the
-    /// session reader path.
-    detect_notifs: bool,
 
     /// Epoch milliseconds of the last PTY output chunk.
     ///
@@ -250,43 +242,27 @@ pub struct PtyHandle {
     /// Routes I/O through the session process socket.
     session_connection: Option<crate::session::connection::SharedSessionConnection>,
 
-    /// Clone of the shadow screen's event listener for draining `ColorRequest`
-    /// events after each `process()` call.
-    shadow_listener: Option<HubEventListener>,
 }
 
 impl std::fmt::Debug for PtyHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PtyHandle")
-            .field("detect_notifs", &self.detect_notifs)
             .field("port", &self.port)
             .finish()
     }
 }
 
 impl PtyHandle {
-    /// Generate a snapshot from the local shadow screen.
-    ///
-    /// The shadow screen is fed by the session reader thread and is always
-    /// authoritative for snapshot generation.
-    #[must_use]
-    pub fn get_snapshot_cached(&self) -> Vec<u8> {
-        // `resize_pending` means the PTY was resized and we might not have a redraw yet.
-        // Test-only local PTY fixtures preserve the old behavior (blank visible grid)
-        // after resize. Session-backed sessions keep visible rows to preserve recovered
-        // scrollback on attach/reconnect.
-        let has_local_master = self
-            .shared_state
-            .lock()
-            .map(|state| state.master_pty.is_some())
-            .unwrap_or(false);
-        let skip_visible = self.resize_pending.swap(false, Ordering::AcqRel) && has_local_master;
-
-        let parser = self
-            .shadow_screen
-            .lock()
-            .expect("shadow_screen lock poisoned");
-        generate_ansi_snapshot(&*parser, skip_visible)
+    /// Apply cached terminal colors to the shadow screen (local handles only).
+    pub fn apply_color_cache(
+        &self,
+        cache: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>,
+    ) {
+        if let Some(ref screen) = self.shadow_screen {
+            if let Ok(mut screen) = screen.lock() {
+                screen.apply_color_cache(cache);
+            }
+        }
     }
 
     /// Create a new local PTY handle with direct sync access.
@@ -306,55 +282,48 @@ impl PtyHandle {
     /// * `shadow_screen` - Shadow terminal for ANSI snapshots
     /// * `kitty_enabled` - Shared kitty keyboard protocol state flag
     /// * `resize_pending` - Cleared when output arrives after a resize
-    /// * `detect_notifs` - Enable OSC notification detection
     /// * `port` - HTTP forwarding port, or `None`
     #[must_use]
     #[cfg(test)]
     pub fn new(
         event_tx: broadcast::Sender<PtyEvent>,
         shared_state: Arc<Mutex<SharedPtyState>>,
-        shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
+        shadow_screen: Arc<Mutex<TerminalParser>>,
         kitty_enabled: Arc<AtomicBool>,
         cursor_visible: Arc<AtomicBool>,
         resize_pending: Arc<AtomicBool>,
-        detect_notifs: bool,
         port: Option<u16>,
     ) -> Self {
         Self {
             event_tx,
             shared_state,
-            shadow_screen,
+            shadow_screen: Some(shadow_screen),
             kitty_enabled,
             cursor_visible,
             resize_pending,
-            detect_notifs,
             last_output_at: Arc::new(AtomicU64::new(0)),
             port,
             session_connection: None,
-            shadow_listener: None,
         }
     }
 
     /// Create a session-process-backed PTY handle.
     ///
-    /// The reader thread (installed on the session connection) feeds the shadow
-    /// screen and broadcasts output directly. This constructor just wires up
-    /// the connection for write/resize commands.
+    /// No shadow screen — the session process owns the terminal parser.
+    /// Snapshots are fetched via RPC (`FRAME_GET_SNAPSHOT`).
+    /// The reader thread broadcasts output and structured events directly.
     #[must_use]
     pub fn new_with_session(
         event_tx: broadcast::Sender<PtyEvent>,
-        shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
         kitty_enabled: Arc<AtomicBool>,
         cursor_visible: Arc<AtomicBool>,
         resize_pending: Arc<AtomicBool>,
-        detect_notifs: bool,
         port: Option<u16>,
         session_connection: crate::session::connection::SharedSessionConnection,
         last_output_at: Arc<AtomicU64>,
         last_human_input_ms: Arc<std::sync::atomic::AtomicI64>,
         initial_rows: u16,
         initial_cols: u16,
-        shadow_listener: HubEventListener,
     ) -> Self {
         Self {
             event_tx,
@@ -364,15 +333,13 @@ impl PtyHandle {
                 dimensions: (initial_rows, initial_cols),
                 last_human_input_ms,
             })),
-            shadow_screen,
+            shadow_screen: None,
             kitty_enabled,
             cursor_visible,
             resize_pending,
-            detect_notifs,
             last_output_at,
             port,
             session_connection: Some(session_connection),
-            shadow_listener: Some(shadow_listener),
         }
     }
 
@@ -401,11 +368,13 @@ impl PtyHandle {
 
     /// Subscribe and capture a snapshot for client attach.
     ///
-    /// Subscribes first, then generates a snapshot from the local shadow screen.
-    /// This ordering guarantees no output gap: any bytes emitted during
-    /// snapshot generation are captured by the subscription.
+    /// Subscribes first, then generates a snapshot. For session-backed handles,
+    /// this is an RPC to the session process. Subscribe-before-snapshot ordering
+    /// ensures no output gap: bytes emitted during RPC are captured by the
+    /// subscription (and are also in the session's snapshot, so duplicates are
+    /// harmless — terminal parsers are idempotent).
     #[must_use]
-    pub fn snapshot_and_subscribe_cached(
+    pub fn snapshot_and_subscribe(
         &self,
     ) -> (Vec<u8>, bool, u16, u16, broadcast::Receiver<PtyEvent>) {
         let kitty_enabled = self.kitty_enabled.load(Ordering::Relaxed);
@@ -413,7 +382,7 @@ impl PtyHandle {
 
         // Subscribe FIRST so no output is lost during snapshot generation.
         let rx = self.event_tx.subscribe();
-        let snapshot = self.get_snapshot_cached();
+        let snapshot = self.get_snapshot();
         (snapshot, kitty_enabled, rows, cols, rx)
     }
 
@@ -423,24 +392,6 @@ impl PtyHandle {
     /// into the PtyHandle broadcast channel.
     pub fn notify_process_exited(&self, exit_code: Option<i32>) {
         let _ = self.event_tx.send(PtyEvent::process_exited(exit_code));
-    }
-
-    /// Broadcast a `TitleChanged` event on this handle's channel.
-    ///
-    /// Used by session lifecycle handlers to bridge title changes into the
-    /// PtyHandle broadcast channel.
-    pub fn notify_title_changed(&self, title: String) {
-        let _ = self.event_tx.send(PtyEvent::title_changed(title));
-    }
-
-    /// Broadcast a bell `Notification` event on this handle's channel.
-    ///
-    /// Used by session lifecycle handlers to bridge BEL notifications into the
-    /// PtyHandle broadcast channel.
-    pub fn notify_bell(&self) {
-        let _ = self
-            .event_tx
-            .send(PtyEvent::notification(AgentNotification::Bell));
     }
 
     /// Get the HTTP forwarding port for this PTY.
@@ -460,17 +411,41 @@ impl PtyHandle {
         self.kitty_enabled.load(Ordering::Relaxed)
     }
 
-    /// Locks the shadow screen and delegates to
-    /// [`generate_ansi_snapshot`](crate::terminal::generate_ansi_snapshot).
+    /// Get an ANSI snapshot of the current terminal state.
     ///
-    /// Alt-screen entry, kitty keyboard restore, and SGR state are all handled
-    /// inside `generate_ansi_snapshot` — no post-processing needed here.
-    ///
-    /// When a resize is pending (shadow screen resized but app hasn't redrawn),
-    /// the snapshot clears the screen; the app redraws on SIGWINCH.
+    /// - **Local handles** (tests): generates from the local shadow screen.
+    /// - **Session-backed handles** (production): RPC to the session process.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
-        self.get_snapshot_cached()
+        // Local shadow screen path (test-only handles)
+        if let Some(ref screen) = self.shadow_screen {
+            let has_local_master = self
+                .shared_state
+                .lock()
+                .map(|state| state.master_pty.is_some())
+                .unwrap_or(false);
+            let skip_visible =
+                self.resize_pending.swap(false, Ordering::AcqRel) && has_local_master;
+
+            let parser = screen.lock().expect("shadow_screen lock poisoned");
+            return crate::terminal::generate_snapshot(&*parser, skip_visible);
+        }
+
+        // Session-process RPC path (production)
+        if let Some(ref conn) = self.session_connection {
+            if let Ok(mut guard) = conn.lock() {
+                if let Some(session) = guard.as_mut() {
+                    match session.get_snapshot() {
+                        Ok(snapshot) => return snapshot,
+                        Err(e) => {
+                            log::warn!("Failed to get snapshot via session RPC: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        Vec::new()
     }
 
     // =========================================================================
@@ -579,11 +554,6 @@ impl PtyHandle {
                     }
                 }
             }
-            // Resize the shadow screen parser in-place — alacritty reflows
-            // content instead of clearing. This preserves the snapshot.
-            if let Ok(mut p) = self.shadow_screen.lock() {
-                p.resize(rows, cols);
-            }
             // Update shared dimensions
             if let Ok(mut state) = self.shared_state.lock() {
                 state.dimensions = (rows, cols);
@@ -593,17 +563,19 @@ impl PtyHandle {
             return;
         }
 
-        // Test-only local PTY path
+        // Test-only local PTY path (has shadow screen)
         #[cfg(test)]
         {
-            do_resize(
-                rows,
-                cols,
-                &self.shared_state,
-                &self.shadow_screen,
-                &self.event_tx,
-                &self.resize_pending,
-            );
+            if let Some(ref screen) = self.shadow_screen {
+                do_resize(
+                    rows,
+                    cols,
+                    &self.shared_state,
+                    screen,
+                    &self.event_tx,
+                    &self.resize_pending,
+                );
+            }
             return;
         }
 
@@ -627,20 +599,14 @@ impl PtyHandle {
         &self.last_output_at
     }
 
-    /// Arc accessor for shadow screen (session reader thread needs this).
+    /// Arc accessor for shadow screen (local handles only; None for session-backed).
     #[must_use]
-    pub fn shadow_screen(&self) -> Arc<Mutex<AlacrittyParser<HubEventListener>>> {
-        Arc::clone(&self.shadow_screen)
+    pub fn shadow_screen(&self) -> Option<Arc<Mutex<TerminalParser>>> {
+        self.shadow_screen.as_ref().map(Arc::clone)
     }
 
     /// Clone of the shadow screen's event listener for the session reader.
     ///
-    /// Returns `None` for legacy (non-session-backed) handles.
-    #[must_use]
-    pub fn shadow_listener(&self) -> Option<HubEventListener> {
-        self.shadow_listener.clone()
-    }
-
     /// Clone the event broadcast sender.
     #[must_use]
     pub fn event_tx_clone(&self) -> broadcast::Sender<PtyEvent> {
@@ -683,7 +649,6 @@ mod tests {
             pty_session.get_direct_access();
         // Leak the session to keep the state alive for tests
         std::mem::forget(pty_session);
-        // detect_notifs=true: test PTYs use agent session behavior
         PtyHandle::new(
             event_tx,
             shared_state,
@@ -691,7 +656,6 @@ mod tests {
             kitty_enabled,
             cursor_visible,
             resize_pending,
-            true,
             port,
         )
     }

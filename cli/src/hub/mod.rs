@@ -436,7 +436,7 @@ pub struct Hub {
     ///
     /// Populated once at startup. `HubEventListener` references this Arc so
     /// `ColorRequest` events are answered immediately from cached values.
-    shared_color_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, alacritty_terminal::vte::ansi::Rgb>>>,
+    shared_color_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>,
     /// Focused terminal owner per session.
     ///
     /// Used to ensure OSC color queries are only forwarded to the active
@@ -1631,7 +1631,6 @@ mod tests {
                 kitty_enabled,
                 cursor_visible,
                 resize_pending,
-                false,
                 None,
             );
 
@@ -1642,7 +1641,7 @@ mod tests {
             // shadow screen, and broadcasts output — same as session reader.
             let stop_flag = Arc::new(AtomicBool::new(false));
             let stop_clone = Arc::clone(&stop_flag);
-            let reader_shadow = pty.shadow_screen();
+            let reader_shadow = pty.shadow_screen().expect("test PTY has shadow screen");
             let reader_event_tx = pty.event_tx_clone();
 
             // Get a reader from the master PTY FD

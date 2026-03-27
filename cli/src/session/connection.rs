@@ -3,7 +3,8 @@
 //! Each `SessionConnection` owns a Unix socket stream to one session process.
 //! After `install_reader()`, a dedicated thread reads all frames from the socket:
 //!
-//! - `PtyOutput` → fed into the shadow screen parser, broadcast as `PtyEvent::Output`
+//! - `PtyOutput` → broadcast as `PtyEvent::Output` (no shadow screen)
+//! - Structured events (0x10-0x15) → mapped to `PtyEvent` variants, atomics updated
 //! - `ProcessExited` → sent as `HubEvent::SessionProcessExited`
 //! - Control responses (Snapshot, Screen, ModeFlags, Pong) → routed to `response_rx`
 //!
@@ -17,15 +18,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alacritty_terminal::grid::Dimensions;
-
 use anyhow::{bail, Context, Result};
 use tokio::sync::broadcast;
 
-use crate::agent::notification::detect_notifications;
-use crate::agent::pty::{HubEventListener, PtyEvent};
-use crate::agent::spawn::{scan_cwd, scan_prompt_marks};
-use crate::terminal::AlacrittyParser;
+use crate::agent::notification::AgentNotification;
+use crate::agent::pty::{PtyEvent, PromptMark};
 
 use super::protocol::*;
 use super::SpawnConfig;
@@ -96,7 +93,8 @@ impl SessionConnection {
     /// Spawns a background thread that reads all frames from a dup of the
     /// session socket and routes them:
     ///
-    /// - `PtyOutput` → feeds shadow screen, broadcasts `PtyEvent::Output`
+    /// - `PtyOutput` → broadcasts `PtyEvent::Output` (no shadow screen parsing)
+    /// - Structured events (0x10-0x15) → mapped to `PtyEvent` variants
     /// - `ProcessExited` → `hub_event_tx` as `SessionProcessExited`
     /// - Control responses → `response_rx` for RPC callers
     ///
@@ -105,14 +103,11 @@ impl SessionConnection {
     pub(crate) fn install_reader(
         &mut self,
         session_uuid: String,
-        shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
-        shadow_listener: HubEventListener,
         event_tx: broadcast::Sender<PtyEvent>,
         kitty_enabled: Arc<AtomicBool>,
         cursor_visible: Arc<AtomicBool>,
         resize_pending: Arc<AtomicBool>,
         last_output_at: Arc<AtomicU64>,
-        detect_notifs: bool,
         hub_event_tx: crate::hub::events::HubEventTx,
     ) -> Result<()> {
         let reader_stream = self
@@ -133,14 +128,11 @@ impl SessionConnection {
                 session_reader(
                     reader_stream,
                     session_uuid,
-                    shadow_screen,
-                    shadow_listener,
                     event_tx,
                     kitty_enabled,
                     cursor_visible,
                     resize_pending,
                     last_output_at,
-                    detect_notifs,
                     response_tx,
                     hub_event_tx,
                 );
@@ -180,19 +172,26 @@ impl SessionConnection {
 
     /// Request and receive an ANSI snapshot from the session process.
     ///
-    /// Used on reconnect to populate the hub's shadow screen.
-    /// During normal operation, the hub generates snapshots locally.
+    /// The session process owns the terminal parser and generates snapshots
+    /// on demand. This is the sole snapshot path for session-backed handles.
+    ///
+    /// The wire format is a dual-screen envelope:
+    /// ```text
+    /// [u32 LE: primary_len][primary VT bytes][alt VT bytes (optional)]
+    /// ```
+    /// When alt screen is active, both sections are present. The returned
+    /// bytes are the combined VT output: primary + CSI ?1049h + alt.
     pub fn get_snapshot(&mut self) -> Result<Vec<u8>> {
         let req = encode_empty(FRAME_GET_SNAPSHOT);
         self.stream.write_all(&req).context("send GetSnapshot")?;
         self.stream.flush()?;
         let frame = self.read_response(FRAME_SNAPSHOT)?;
-        Ok(frame.payload)
+        Ok(decode_dual_screen_snapshot(&frame.payload))
     }
 
     /// Request terminal mode flags from the session process.
     ///
-    /// Used on reconnect to initialize the hub's shadow screen state.
+    /// Used on reconnect to initialize the hub's state.
     pub fn get_mode_flags(&mut self) -> Result<ModeFlags> {
         let req = encode_empty(FRAME_GET_MODE_FLAGS);
         self.stream.write_all(&req).context("send GetModeFlags")?;
@@ -261,6 +260,10 @@ impl SessionConnection {
                 {
                     continue;
                 }
+                // Skip proactive event frames during pre-reader phase
+                if (FRAME_TITLE_CHANGED..=FRAME_NOTIFICATION).contains(&frame.frame_type) {
+                    continue;
+                }
                 if frame.frame_type == expected_type {
                     return Ok(frame);
                 }
@@ -274,20 +277,18 @@ impl SessionConnection {
 /// Per-session reader thread.
 ///
 /// Reads all frames from the session socket and routes them:
-/// - PtyOutput → feed shadow screen, update state atomics, broadcast PtyEvent::Output
+/// - PtyOutput → broadcast as PtyEvent::Output (no shadow screen parsing)
+/// - Structured events (0x10-0x15) → map to PtyEvent variants, update atomics
 /// - ProcessExited → send HubEvent
-/// - Control responses → route to response_tx for RPC callers
+/// - Control responses (Snapshot, Screen, ModeFlags, Pong) → route to response_tx
 fn session_reader(
     stream: UnixStream,
     session_uuid: String,
-    shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
-    shadow_listener: HubEventListener,
     event_tx: broadcast::Sender<PtyEvent>,
     kitty_enabled: Arc<AtomicBool>,
     cursor_visible: Arc<AtomicBool>,
     resize_pending: Arc<AtomicBool>,
     last_output_at: Arc<AtomicU64>,
-    detect_notifs: bool,
     response_tx: std::sync::mpsc::Sender<Frame>,
     hub_event_tx: crate::hub::events::HubEventTx,
 ) {
@@ -295,9 +296,6 @@ fn session_reader(
     let mut stream = stream;
     let _ = stream.set_read_timeout(None); // block indefinitely
     let mut buf = [0u8; 8192];
-    let mut last_cursor_visible: Option<bool> = None;
-    let mut last_focus_reporting: Option<bool> = None;
-    let mut last_alt_screen: Option<bool> = None;
 
     log::info!(
         "[session-reader] started for {}",
@@ -321,82 +319,9 @@ fn session_reader(
             match frame.frame_type {
                 FRAME_PTY_OUTPUT => {
                     let data = &frame.payload;
-                    let probe_descriptions =
-                        crate::hub::terminal_profile::describe_probe_sequences(data);
-                    if !probe_descriptions.is_empty() {
-                        log::info!(
-                            "[session-reader][PTY-PROBE] session={} observed {}",
-                            session_uuid,
-                            probe_descriptions.join(", ")
-                        );
-                    }
 
-                    // Feed shadow screen — hub becomes terminal state authority
-                    let (new_kitty, new_visible, new_focus_reporting, new_alt_screen) =
-                        if let Ok(mut p) = shadow_screen.lock() {
-                            p.process(data);
-                            (
-                                p.kitty_enabled(),
-                                !p.cursor_hidden(),
-                                p.focus_reporting(),
-                                p.alt_screen_active(),
-                            )
-                        } else {
-                            (false, true, false, false)
-                        };
-
-                    // Drain color responses that the shadow screen's alacritty
-                    // produced from cached RGB values during process().
-                    for resp in shadow_listener.drain_color_responses() {
-                        let _ = hub_event_tx.send(
-                            crate::hub::events::HubEvent::ColorResponse {
-                                session_uuid: session_uuid.clone(),
-                                response: resp.response,
-                            },
-                        );
-                    }
-
-                    // Update state atomics
-                    let old_kitty = kitty_enabled.load(Ordering::Relaxed);
-                    if new_kitty != old_kitty {
-                        kitty_enabled.store(new_kitty, Ordering::Relaxed);
-                        let _ = event_tx.send(PtyEvent::kitty_changed(new_kitty));
-                    }
-                    if last_cursor_visible != Some(new_visible) {
-                        last_cursor_visible = Some(new_visible);
-                        cursor_visible.store(new_visible, Ordering::Relaxed);
-                        let _ = event_tx.send(PtyEvent::cursor_visibility_changed(new_visible));
-                    }
-                    if last_focus_reporting != Some(new_focus_reporting) {
-                        last_focus_reporting = Some(new_focus_reporting);
-                        let _ = event_tx.send(PtyEvent::focus_reporting_changed(new_focus_reporting));
-                    }
+                    // Clear resize_pending — the app has redrawn after resize
                     resize_pending.store(false, Ordering::Release);
-
-                    // Alt screen transition: prepare a scrollback refresh.
-                    // Sent AFTER PtyEvent::Output so the old parser handles the
-                    // raw bytes first (including CSI ?1049l), then gets replaced.
-                    let pending_alt_scrollback = if last_alt_screen != Some(new_alt_screen) {
-                        let was_alt = last_alt_screen.unwrap_or(false);
-                        last_alt_screen = Some(new_alt_screen);
-                        // Only on exit (alt → normal). On entry the alt screen
-                        // starts empty and the app redraws immediately.
-                        if was_alt && !new_alt_screen {
-                            if let Ok(p) = shadow_screen.lock() {
-                                let rows = p.term().grid().screen_lines() as u16;
-                                let cols = p.term().grid().columns() as u16;
-                                let snapshot =
-                                    crate::terminal::generate_ansi_snapshot(&*p, false);
-                                Some((snapshot, rows, cols))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
 
                     // Update idle timestamp
                     last_output_at.store(
@@ -407,44 +332,91 @@ fn session_reader(
                         Ordering::Relaxed,
                     );
 
-                    // OSC scanning (CWD, notifications, prompt marks)
-                    if detect_notifs {
-                        for notif in detect_notifications(data) {
-                            let _ = event_tx.send(PtyEvent::notification(notif));
-                        }
-                    }
-                    if let Some(cwd) = scan_cwd(data) {
-                        let _ = event_tx.send(PtyEvent::cwd_changed(cwd));
-                    }
-                    for mark in scan_prompt_marks(data) {
-                        let _ = event_tx.send(PtyEvent::prompt_mark(mark));
-                    }
-
-                    // Session-backed PTYs must emit raw output observations from
-                    // the reader itself so startup probe queries are not missed
-                    // before the Lua notification watcher subscribes.
+                    // Emit raw output observation for Lua hooks
                     let _ = hub_event_tx.send(crate::hub::events::HubEvent::PtyOutputObserved {
                         session_uuid: session_uuid.clone(),
                         data: data.to_vec(),
                     });
 
-                    // Broadcast raw bytes to subscribers (forwarders)
+                    // Broadcast raw bytes to subscribers (TUI, browser, socket forwarders)
                     let _ = event_tx.send(PtyEvent::output(data.to_vec()));
+                }
 
-                    // Send alt screen scrollback refresh AFTER Output so clients
-                    // process the raw bytes (on the old parser) before replacing it.
-                    if let Some((snap_data, snap_rows, snap_cols)) = pending_alt_scrollback {
-                        log::info!(
-                            "[session-reader] alt screen exited, sending {} byte scrollback refresh",
-                            snap_data.len()
-                        );
-                        let _ = event_tx.send(PtyEvent::AltScreenScrollback {
-                            data: snap_data,
-                            rows: snap_rows,
-                            cols: snap_cols,
-                        });
+                // ── Structured events from session process (0x10-0x15) ──────
+
+                FRAME_TITLE_CHANGED => {
+                    let title = String::from_utf8_lossy(&frame.payload).into_owned();
+                    let _ = event_tx.send(PtyEvent::title_changed(title));
+                }
+
+                FRAME_BELL => {
+                    let _ = event_tx.send(PtyEvent::notification(AgentNotification::Bell));
+                }
+
+                FRAME_MODE_CHANGED => {
+                    if let Ok(mode) = frame.json::<ModeChanged>() {
+                        if let Some(kitty) = mode.kitty_enabled {
+                            let old = kitty_enabled.load(Ordering::Relaxed);
+                            if kitty != old {
+                                kitty_enabled.store(kitty, Ordering::Relaxed);
+                                let _ = event_tx.send(PtyEvent::kitty_changed(kitty));
+                            }
+                        }
+                        if let Some(vis) = mode.cursor_visible {
+                            cursor_visible.store(vis, Ordering::Relaxed);
+                            let _ = event_tx.send(PtyEvent::cursor_visibility_changed(vis));
+                        }
+                        if let Some(focus) = mode.focus_reporting {
+                            let _ = event_tx.send(PtyEvent::focus_reporting_changed(focus));
+                        }
+                        // Alt screen transitions are handled by the raw output
+                        // stream — the TUI's parser processes CSI ?1049h/l directly.
                     }
                 }
+
+                FRAME_CWD_CHANGED => {
+                    let cwd = String::from_utf8_lossy(&frame.payload).into_owned();
+                    let _ = event_tx.send(PtyEvent::cwd_changed(cwd));
+                }
+
+                FRAME_PROMPT_MARK => {
+                    if let Ok(payload) = frame.json::<PromptMarkPayload>() {
+                        let mark = match payload.mark.as_str() {
+                            "prompt_start" => Some(PromptMark::PromptStart),
+                            "command_start" => Some(PromptMark::CommandStart),
+                            "command_executed" => {
+                                Some(PromptMark::CommandExecuted(payload.command))
+                            }
+                            "command_finished" => {
+                                Some(PromptMark::CommandFinished(payload.exit_code))
+                            }
+                            _ => None,
+                        };
+                        if let Some(m) = mark {
+                            let _ = event_tx.send(PtyEvent::prompt_mark(m));
+                        }
+                    }
+                }
+
+                FRAME_NOTIFICATION => {
+                    if let Ok(payload) = frame.json::<NotificationPayload>() {
+                        let notif = if payload.title.is_empty() {
+                            AgentNotification::Osc9(if payload.body.is_empty() {
+                                None
+                            } else {
+                                Some(payload.body)
+                            })
+                        } else {
+                            AgentNotification::Osc777 {
+                                title: payload.title,
+                                body: payload.body,
+                            }
+                        };
+                        let _ = event_tx.send(PtyEvent::notification(notif));
+                    }
+                }
+
+                // ── Existing control frames ─────────────────────────────────
 
                 FRAME_PROCESS_EXITED => {
                     let exit_code = frame
@@ -452,10 +424,11 @@ fn session_reader(
                         .ok()
                         .and_then(|v| v["exit_code"].as_i64())
                         .map(|c| c as i32);
-                    let _ = hub_event_tx.send(crate::hub::events::HubEvent::SessionProcessExited {
-                        session_uuid: session_uuid.clone(),
-                        exit_code,
-                    });
+                    let _ =
+                        hub_event_tx.send(crate::hub::events::HubEvent::SessionProcessExited {
+                            session_uuid: session_uuid.clone(),
+                            exit_code,
+                        });
                     log::info!("[session-reader] process exited (code={:?})", exit_code);
                 }
 
@@ -477,6 +450,45 @@ fn session_reader(
     });
 }
 
+/// Decode a dual-screen snapshot envelope into a single VT byte stream.
+///
+/// Wire format: `[u32 LE: primary_len][primary VT bytes][alt VT bytes]`
+///
+/// - Primary-only (no alt screen): returns primary bytes.
+/// - Dual-screen (alt active): returns primary + CSI ?1049h + alt bytes,
+///   which replays the normal screen then switches to alt and replays it.
+///
+/// Falls back to returning raw payload if the envelope is malformed
+/// (e.g., old session process that doesn't use the envelope format).
+fn decode_dual_screen_snapshot(payload: &[u8]) -> Vec<u8> {
+    if payload.len() < 4 {
+        return payload.to_vec();
+    }
+
+    let primary_len =
+        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+
+    if 4 + primary_len > payload.len() {
+        // Malformed envelope — treat as raw snapshot for backwards compatibility
+        return payload.to_vec();
+    }
+
+    let primary = &payload[4..4 + primary_len];
+    let alt = &payload[4 + primary_len..];
+
+    if alt.is_empty() {
+        // Primary screen only
+        primary.to_vec()
+    } else {
+        // Dual screen: primary + enter alt + alt content
+        let mut out = Vec::with_capacity(primary.len() + 8 + alt.len());
+        out.extend_from_slice(primary);
+        out.extend_from_slice(b"\x1b[?1049h");
+        out.extend_from_slice(alt);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,5 +496,43 @@ mod tests {
     #[test]
     fn shared_session_connection_type_compiles() {
         let _conn: SharedSessionConnection = Arc::new(Mutex::new(None));
+    }
+
+    #[test]
+    fn decode_primary_only_snapshot() {
+        let primary = b"hello world";
+        let mut payload = (primary.len() as u32).to_le_bytes().to_vec();
+        payload.extend_from_slice(primary);
+
+        let result = decode_dual_screen_snapshot(&payload);
+        assert_eq!(result, b"hello world");
+    }
+
+    #[test]
+    fn decode_dual_screen_snapshot_combines() {
+        let primary = b"normal screen";
+        let alt = b"alt screen";
+        let mut payload = (primary.len() as u32).to_le_bytes().to_vec();
+        payload.extend_from_slice(primary);
+        payload.extend_from_slice(alt);
+
+        let result = decode_dual_screen_snapshot(&payload);
+        assert!(result.starts_with(b"normal screen"));
+        assert!(result.windows(8).any(|w| w == b"\x1b[?1049h"));
+        assert!(result.ends_with(b"alt screen"));
+    }
+
+    #[test]
+    fn decode_empty_payload() {
+        let result = decode_dual_screen_snapshot(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn decode_malformed_falls_back_to_raw() {
+        // primary_len says 1000 but payload is only 10 bytes
+        let payload = [0xe8, 0x03, 0x00, 0x00, b'h', b'i'];
+        let result = decode_dual_screen_snapshot(&payload);
+        assert_eq!(result, payload);
     }
 }

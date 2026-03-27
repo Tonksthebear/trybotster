@@ -1,4 +1,4 @@
-/// Debug test to verify worktree path detection using git CLI.
+//! Debug test to verify worktree path detection using git CLI.
 use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;

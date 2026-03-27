@@ -409,6 +409,7 @@ impl WebRtcChannel {
         Some(Self::ice_servers_from_cached(&cached.ice_servers))
     }
 
+    #[allow(dead_code)]
     fn store_cached_ice_servers(&self, cache_key: String, ice_servers: Vec<CachedIceServerConfig>) {
         let mut cache = ice_config_cache()
             .lock()
