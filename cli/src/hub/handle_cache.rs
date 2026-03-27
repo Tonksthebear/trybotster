@@ -358,7 +358,6 @@ mod tests {
             kitty_enabled,
             cursor_visible,
             resize_pending,
-            true,
             None,
         );
         SessionHandle::new(uuid, label, Default::default(), workspace_id.map(String::from), pty)

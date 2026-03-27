@@ -1,4 +1,4 @@
-/// This test reproduces the EXACT bug the user is experiencing:
+//! Reproduces the exact "main working tree" worktree deletion bug.
 /// "Failed to remove worktree: fatal: '/Users/exampleuser/Rails/trybotster' is a main working tree"
 ///
 /// The issue is that delete_worktree_by_path is receiving the MAIN repo path instead of the worktree path

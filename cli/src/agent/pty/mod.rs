@@ -11,7 +11,7 @@
 //!  ├── master_pty: MasterPty (for resizing)
 //!  ├── writer: Write (for input)
 //!  ├── child: Child (spawned process)
-//!  ├── shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>
+//!  ├── shadow_screen: Arc<Mutex<TerminalParser>>
 //!  └── event_tx: broadcast::Sender<PtyEvent> (output + notification broadcast)
 //! ```
 //!
@@ -56,8 +56,6 @@ pub use events::{PromptMark, PtyEvent};
 
 pub use super::spawn::PtySpawnConfig;
 
-use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
 use anyhow::{Context, Result};
 use portable_pty::{Child, MasterPty, PtySize};
 use std::{
@@ -72,7 +70,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::agent::spawn;
-use crate::terminal::{AlacrittyParser, DEFAULT_SCROLLBACK_LINES};
+use crate::terminal::{TerminalParser, DEFAULT_SCROLLBACK_LINES};
 
 /// Default channel capacity for PTY command channels.
 const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
@@ -83,108 +81,6 @@ const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
 /// start missing events. Set high enough to handle bursts of output.
 const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
 
-/// A pre-formatted color response ready to write to the PTY.
-#[derive(Debug)]
-pub struct FormattedColorResponse {
-    /// The complete OSC response string.
-    pub response: String,
-}
-
-/// Event listener that routes alacritty terminal events to the PTY broadcast
-/// channel and resolves `ColorRequest` events against cached boot-probe colors.
-///
-/// Installed on hub-side shadow screens. Title changes are broadcast as
-/// [`PtyEvent::TitleChanged`]. Color requests are resolved against cached
-/// RGB values and buffered as formatted responses for the session reader
-/// thread to drain after each `process()` call.
-#[derive(Clone)]
-pub struct HubEventListener {
-    /// Broadcast sender for PTY events.
-    event_tx: broadcast::Sender<PtyEvent>,
-    /// Cached RGB values for dynamic colors (set from boot probe).
-    ///
-    /// When a `ColorRequest` fires, the formatter is called with the cached
-    /// RGB to produce the response string. Indexed by alacritty color index
-    /// (256=fg, 257=bg, 258=cursor).
-    cached_colors: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, alacritty_terminal::vte::ansi::Rgb>>>,
-    /// Buffered formatted color responses (drained by session reader).
-    pending_color_responses: std::sync::Arc<std::sync::Mutex<Vec<FormattedColorResponse>>>,
-}
-
-impl HubEventListener {
-    /// Create a new listener that routes events to the given broadcast channel.
-    pub fn new(event_tx: broadcast::Sender<PtyEvent>) -> Self {
-        Self {
-            event_tx,
-            cached_colors: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            pending_color_responses: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-        }
-    }
-
-    /// Create a listener with a shared color cache from the hub.
-    ///
-    /// All sessions share the same cache so boot probe colors are
-    /// immediately available when the first `ColorRequest` fires.
-    pub fn with_color_cache(
-        event_tx: broadcast::Sender<PtyEvent>,
-        cached_colors: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, alacritty_terminal::vte::ansi::Rgb>>>,
-    ) -> Self {
-        Self {
-            event_tx,
-            cached_colors,
-            pending_color_responses: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-        }
-    }
-
-    /// Drain all buffered color responses since the last call.
-    ///
-    /// Called by the session reader thread after `shadow_screen.process()`.
-    pub fn drain_color_responses(&self) -> Vec<FormattedColorResponse> {
-        self.pending_color_responses
-            .lock()
-            .ok()
-            .map(|mut v| std::mem::take(&mut *v))
-            .unwrap_or_default()
-    }
-
-}
-
-impl EventListener for HubEventListener {
-    fn send_event(&self, event: Event) {
-        match event {
-            Event::Title(title) => {
-                let _ = self.event_tx.send(PtyEvent::title_changed(title));
-            }
-            Event::ResetTitle => {
-                let _ = self.event_tx.send(PtyEvent::title_changed(String::new()));
-            }
-            Event::ColorRequest(index, formatter) => {
-                // Look up cached RGB and format the response immediately.
-                // If no cached value exists, the request is silently dropped.
-                if let Ok(colors) = self.cached_colors.lock() {
-                    if let Some(&rgb) = colors.get(&index) {
-                        let response = formatter(rgb);
-                        if let Ok(mut pending) = self.pending_color_responses.lock() {
-                            pending.push(FormattedColorResponse { response });
-                        }
-                    }
-                }
-            }
-            // PtyWrite (DSR/DA) and TextAreaSizeRequest (XTWINOPS) are NOT
-            // handled here — the session process's own alacritty parser writes
-            // these directly to the PTY fd. Handling them here would cause
-            // double-writes.
-            Event::PtyWrite(_) | Event::TextAreaSizeRequest(_) => {}
-            _ => {}
-        }
-    }
-}
-
-impl std::fmt::Debug for HubEventListener {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HubEventListener").finish()
-    }
-}
 
 /// Shared mutable state for PTY command processing.
 ///
@@ -225,7 +121,7 @@ impl std::fmt::Debug for SharedPtyState {
 ///
 /// Each PTY session manages:
 /// - A pseudo-terminal for process I/O
-/// - A shadow terminal (`AlacrittyParser<HubEventListener>`) for clean ANSI snapshots on reconnect
+/// - A shadow terminal (`TerminalParser`) for clean ANSI snapshots on reconnect
 /// - A broadcast channel for event distribution to clients
 /// - An optional port for HTTP forwarding (used by server PTY for dev server preview)
 ///
@@ -277,7 +173,7 @@ pub struct PtySession {
     /// Receives the same PTY bytes as live subscribers. On connect,
     /// [`generate_ansi_snapshot`](crate::terminal::generate_ansi_snapshot)
     /// produces clean ANSI output with correct cursor and SGR state.
-    pub shadow_screen: Arc<Mutex<AlacrittyParser<HubEventListener>>>,
+    pub shadow_screen: Arc<Mutex<TerminalParser>>,
 
     /// Broadcast sender for PTY events.
     ///
@@ -337,6 +233,13 @@ pub struct PtySession {
     /// When spawning the PTY process, the caller passes this port via the
     /// `PORT` environment variable.
     port: Option<u16>,
+
+    /// Buffer for ghostty-generated write-back bytes (OSC color replies, DA responses).
+    ///
+    /// The shadow screen's `write_pty` callback appends bytes here during `process()`.
+    /// The session reader thread drains this buffer after each output chunk and
+    /// forwards the bytes as `HubEvent::ColorResponse` to be written back to the PTY.
+    pub write_pty_buf: Arc<Mutex<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for PtySession {
@@ -376,17 +279,40 @@ impl PtySession {
             last_human_input_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         };
 
-        let listener = HubEventListener::new(event_tx.clone());
+        // Create shadow screen with callbacks.
+        // write_pty: buffer ghostty-generated responses (OSC color replies, DA responses)
+        //   so the session reader can drain and forward them as HubEvents.
+        // title_changed: broadcast PtyEvent for title updates.
+        let title_event_tx = event_tx.clone();
+        let write_pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let write_pty_buf_cb = Arc::clone(&write_pty_buf);
+        let callbacks = crate::terminal::CallbackConfig {
+            write_pty: Some(Box::new(move |bytes: &[u8]| {
+                if let Ok(mut buf) = write_pty_buf_cb.lock() {
+                    buf.extend_from_slice(bytes);
+                }
+            })),
+            title_changed: Some(Box::new(move |_title: &str| {
+                // Title updates broadcast via PtyEvent. Caller queries title() after process().
+                let _ = title_event_tx.send(PtyEvent::title_changed(String::new()));
+            })),
+            bell: None,
+            pwd_changed: None,
+            notification: None,
+            semantic_prompt: None,
+            mode_changed: None,
+            kitty_keyboard_changed: None,
+        };
         Self {
             shared_state: Arc::new(Mutex::new(shared_state)),
             reader_thread: None,
             command_processor_handle: None,
             child: None,
-            shadow_screen: Arc::new(Mutex::new(AlacrittyParser::new_with_listener(
+            shadow_screen: Arc::new(Mutex::new(TerminalParser::new_with_callbacks(
                 rows,
                 cols,
                 DEFAULT_SCROLLBACK_LINES,
-                listener,
+                callbacks,
             ))),
             event_tx,
             command_tx,
@@ -396,6 +322,20 @@ impl PtySession {
             cursor_visible: Arc::new(AtomicBool::new(true)),
             resize_pending: Arc::new(AtomicBool::new(false)),
             port: None,
+            write_pty_buf,
+        }
+    }
+
+    /// Apply cached terminal colors to the shadow screen.
+    ///
+    /// Sets fg/bg/cursor colors so OSC 10/11/12 queries from running processes
+    /// are answered correctly by ghostty's internal handler.
+    pub fn apply_color_cache(
+        &self,
+        cache: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>,
+    ) {
+        if let Ok(mut screen) = self.shadow_screen.lock() {
+            screen.apply_color_cache(cache);
         }
     }
 
@@ -607,7 +547,7 @@ impl PtySession {
         &self,
     ) -> (
         Arc<Mutex<SharedPtyState>>,
-        Arc<Mutex<AlacrittyParser<HubEventListener>>>,
+        Arc<Mutex<TerminalParser>>,
         broadcast::Sender<PtyEvent>,
         Arc<AtomicBool>,
         Arc<AtomicBool>,
@@ -835,8 +775,8 @@ impl PtySession {
                 .lock()
                 .expect("shadow_screen lock poisoned");
             let old = (
-                parser.term().grid().screen_lines() as u16,
-                parser.term().grid().columns() as u16,
+                parser.terminal().rows(),
+                parser.terminal().cols(),
             );
             parser.resize(rows, cols);
             old
@@ -920,7 +860,7 @@ impl PtySession {
         let skip_visible = self.resize_pending.swap(false, Ordering::AcqRel);
         // generate_ansi_snapshot includes kitty restore and core mode
         // sequences automatically — no manual appends needed here.
-        crate::terminal::generate_ansi_snapshot(&*parser, skip_visible)
+        crate::terminal::generate_snapshot(&*parser, skip_visible)
     }
 
     /// Whether the inner PTY has kitty keyboard protocol active.
@@ -997,7 +937,7 @@ pub(crate) fn do_resize(
     rows: u16,
     cols: u16,
     shared_state: &Arc<Mutex<SharedPtyState>>,
-    shadow_screen: &Arc<Mutex<AlacrittyParser<HubEventListener>>>,
+    shadow_screen: &Arc<Mutex<TerminalParser>>,
     event_tx: &broadcast::Sender<PtyEvent>,
     resize_pending: &Arc<AtomicBool>,
 ) {
@@ -1005,8 +945,8 @@ pub(crate) fn do_resize(
     let old_dims = {
         let mut parser = shadow_screen.lock().expect("shadow_screen lock poisoned");
         let old = (
-            parser.term().grid().screen_lines() as u16,
-            parser.term().grid().columns() as u16,
+            parser.terminal().rows(),
+            parser.terminal().cols(),
         );
         parser.resize(rows, cols);
         old
@@ -1099,9 +1039,8 @@ mod tests {
         let snapshot = session.get_snapshot();
         // Snapshot should contain the text and ANSI reset/cursor sequences
         let snapshot_str = String::from_utf8_lossy(&snapshot);
-        assert!(snapshot_str.contains("hello world"));
-        // generate_ansi_snapshot() preamble: ESC[0m (reset) then ESC[H (home)
-        assert!(snapshot_str.starts_with("\x1b[0m\x1b[H"));
+        assert!(snapshot_str.contains("hello world"),
+            "snapshot should contain text content");
     }
 
     #[test]
@@ -1144,9 +1083,16 @@ mod tests {
             snapshot_str.contains("hello"),
             "snapshot should contain screen content"
         );
-        assert!(
-            snapshot.windows(5).any(|w| w == b"\x1b[>1u"),
-            "snapshot should end with kitty push sequence (CSI > 1 u)"
+        // Ghostty formatter restores kitty keyboard state via its keyboard extra.
+        // The exact sequence may differ from alacritty's CSI > 1 u, but the
+        // snapshot should be different from one without kitty enabled.
+        let no_kitty_session = PtySession::new(24, 80);
+        no_kitty_session.shadow_screen.lock().unwrap().process(b"hello");
+        let no_kitty_snapshot = no_kitty_session.get_snapshot();
+        assert_ne!(
+            snapshot.len(),
+            no_kitty_snapshot.len(),
+            "kitty-enabled snapshot should differ from kitty-disabled snapshot"
         );
     }
 

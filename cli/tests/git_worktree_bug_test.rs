@@ -1,4 +1,4 @@
-/// This test reproduces the exact bug: "reference already exists"
+//! Reproduces the "reference already exists" git worktree bug.
 /// This happens when:
 /// 1. A worktree was created before
 /// 2. The worktree directory was removed BUT the git reference remains

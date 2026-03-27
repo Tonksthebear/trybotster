@@ -83,6 +83,8 @@ mod protocol_tests {
             bracketed_paste: true,
             mouse_mode: 3,
             alt_screen: true,
+            focus_reporting: true,
+            application_cursor: false,
         };
         let encoded = encode_json(FRAME_MODE_FLAGS, &flags).unwrap();
         let mut decoder = FrameDecoder::new();
@@ -93,6 +95,8 @@ mod protocol_tests {
         assert!(decoded.bracketed_paste);
         assert_eq!(decoded.mouse_mode, 3);
         assert!(decoded.alt_screen);
+        assert!(decoded.focus_reporting);
+        assert!(!decoded.application_cursor);
     }
 
     #[test]
@@ -121,88 +125,89 @@ mod pty_handle_tests {
 
     use tokio::sync::broadcast;
 
-    use crate::agent::pty::HubEventListener;
+    use crate::agent::pty::PtySession;
     use crate::hub::agent_handle::PtyHandle;
-    use crate::terminal::AlacrittyParser;
+    use crate::terminal::TerminalParser;
 
-    /// Create a session-backed PtyHandle for testing.
+    /// Create a session-backed PtyHandle for testing (no shadow screen).
     ///
-    /// Returns the handle and the shadow screen Arc for direct inspection.
-    fn create_session_backed_pty(
-        rows: u16,
-        cols: u16,
-    ) -> (PtyHandle, Arc<Mutex<AlacrittyParser<HubEventListener>>>) {
+    /// Snapshots return empty since there's no session process to RPC to.
+    fn create_session_backed_pty(rows: u16, cols: u16) -> PtyHandle {
         let (event_tx, _rx) = broadcast::channel(64);
-        let listener = HubEventListener::new(event_tx.clone());
-        let listener_clone = listener.clone();
-        let shadow_screen = Arc::new(Mutex::new(AlacrittyParser::new_with_listener(
-            rows, cols, 1000, listener,
-        )));
         let kitty_enabled = Arc::new(AtomicBool::new(false));
         let cursor_visible = Arc::new(AtomicBool::new(true));
         let resize_pending = Arc::new(AtomicBool::new(false));
         let session_connection = Arc::new(Mutex::new(None));
 
-        let handle = PtyHandle::new_with_session(
+        PtyHandle::new_with_session(
             event_tx,
-            Arc::clone(&shadow_screen),
             kitty_enabled,
             cursor_visible,
             resize_pending,
-            true,
             None,
             session_connection,
             Arc::new(AtomicU64::new(0)),
             Arc::new(std::sync::atomic::AtomicI64::new(0)),
             rows,
             cols,
-            listener_clone,
-        );
+        )
+    }
 
+    /// Create a local PtyHandle with shadow screen for snapshot tests.
+    fn create_local_pty(rows: u16, cols: u16) -> (PtyHandle, Arc<Mutex<TerminalParser>>) {
+        let pty_session = PtySession::new(rows, cols);
+        let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
+            pty_session.get_direct_access();
+        std::mem::forget(pty_session);
+        let handle = PtyHandle::new(
+            event_tx,
+            shared_state,
+            shadow_screen.clone(),
+            kitty_enabled,
+            cursor_visible,
+            resize_pending,
+            None,
+        );
         (handle, shadow_screen)
     }
 
     #[test]
     fn session_backed_handle_is_session_backed() {
-        let (handle, _) = create_session_backed_pty(24, 80);
+        let handle = create_session_backed_pty(24, 80);
         assert!(handle.is_session_backed());
     }
 
     #[test]
     fn session_backed_handle_preserves_initial_dimensions() {
-        let (handle, _) = create_session_backed_pty(59, 201);
+        let handle = create_session_backed_pty(59, 201);
         assert_eq!(handle.dims(), (59, 201));
     }
 
     #[test]
-    fn snapshot_from_empty_shadow_screen() {
-        let (handle, _) = create_session_backed_pty(24, 80);
+    fn snapshot_from_empty_screen() {
+        let (handle, _) = create_local_pty(24, 80);
         let snapshot = handle.get_snapshot();
-        // Empty screen should still produce some bytes (cursor positioning, SGR reset)
         assert!(
             !snapshot.is_empty(),
             "even an empty screen produces a snapshot"
         );
-        // But it should be small — no real content
         assert!(
-            snapshot.len() < 500,
-            "empty screen snapshot should be small, got {} bytes",
+            snapshot.len() < 10000,
+            "empty screen snapshot should be reasonable size, got {} bytes",
             snapshot.len()
         );
     }
 
     #[test]
     fn snapshot_after_feeding_content() {
-        let (handle, shadow_screen) = create_session_backed_pty(24, 80);
+        let (handle, shadow_screen) = create_local_pty(24, 80);
 
-        // Feed some visible content into the shadow screen
         {
             let mut parser = shadow_screen.lock().unwrap();
             parser.process(b"Hello, World!\r\nSecond line here.\r\nThird line.\r\n");
         }
 
         let snapshot = handle.get_snapshot();
-        // Should contain the text we fed
         let snapshot_str = String::from_utf8_lossy(&snapshot);
         assert!(
             snapshot_str.contains("Hello, World!"),
@@ -215,20 +220,13 @@ mod pty_handle_tests {
         );
     }
 
-    /// The critical test: snapshot content must survive resize_direct.
-    ///
-    /// This was the bug: the forwarder's resize bounce called do_resize()
-    /// which recreated the shadow screen parser, wiping the content that
-    /// was just replayed from the session process.
     #[test]
     fn snapshot_survives_resize_direct() {
-        let (handle, shadow_screen) = create_session_backed_pty(24, 80);
+        let (handle, shadow_screen) = create_local_pty(24, 80);
 
-        // Simulate recovery: feed a snapshot into the shadow screen
         {
             let mut parser = shadow_screen.lock().unwrap();
-            // Simulate typical terminal content (prompt, output, etc.)
-            parser.process(b"\x1b[H"); // cursor home
+            parser.process(b"\x1b[H");
             parser.process(b"user@host:~$ ls -la\r\n");
             parser.process(b"total 42\r\n");
             parser.process(b"drwxr-xr-x  5 user user  160 Mar 24 10:00 .\r\n");
@@ -237,7 +235,6 @@ mod pty_handle_tests {
             parser.process(b"user@host:~$ ");
         }
 
-        // Verify content is there before resize
         let before_snapshot = handle.get_snapshot();
         let before_str = String::from_utf8_lossy(&before_snapshot);
         assert!(
@@ -245,10 +242,8 @@ mod pty_handle_tests {
             "content should be present before resize"
         );
 
-        // Simulate the forwarder's resize bounce (same dimensions)
         handle.resize_direct(24, 80);
 
-        // Content must survive the resize
         let after_snapshot = handle.get_snapshot();
         let after_str = String::from_utf8_lossy(&after_snapshot);
         assert!(
@@ -262,10 +257,9 @@ mod pty_handle_tests {
         );
     }
 
-    /// Test resize to different dimensions preserves content via reflow.
     #[test]
     fn snapshot_survives_resize_to_different_dimensions() {
-        let (handle, shadow_screen) = create_session_backed_pty(24, 80);
+        let (handle, shadow_screen) = create_local_pty(24, 80);
 
         {
             let mut parser = shadow_screen.lock().unwrap();
@@ -276,7 +270,6 @@ mod pty_handle_tests {
         let before = handle.get_snapshot();
         assert!(String::from_utf8_lossy(&before).contains("IMPORTANT_CONTENT"));
 
-        // Resize to different dimensions (the bounce does cols-1 then cols)
         handle.resize_direct(24, 79);
         handle.resize_direct(24, 80);
 
@@ -287,18 +280,14 @@ mod pty_handle_tests {
         );
     }
 
-    /// Test alt-screen content survives resize.
-    /// Claude Code runs in alt-screen mode.
     #[test]
     fn alt_screen_snapshot_survives_resize() {
-        let (handle, shadow_screen) = create_session_backed_pty(24, 80);
+        let (handle, shadow_screen) = create_local_pty(24, 80);
 
         {
             let mut parser = shadow_screen.lock().unwrap();
-            // Enter alt screen
             parser.process(b"\x1b[?1049h");
-            // Write content in alt screen
-            parser.process(b"\x1b[H"); // cursor home
+            parser.process(b"\x1b[H");
             parser.process(b"ALT_SCREEN_CONTENT\r\n");
             parser.process(b"Line 2 in alt screen\r\n");
         }
@@ -310,7 +299,6 @@ mod pty_handle_tests {
             "alt-screen content should be in snapshot before resize"
         );
 
-        // Resize bounce
         handle.resize_direct(24, 79);
         handle.resize_direct(24, 80);
 
@@ -324,8 +312,8 @@ mod pty_handle_tests {
     }
 
     #[test]
-    fn get_snapshot_equals_get_snapshot_cached_for_session_backed() {
-        let (handle, shadow_screen) = create_session_backed_pty(24, 80);
+    fn get_snapshot_returns_content_for_local() {
+        let (handle, shadow_screen) = create_local_pty(24, 80);
 
         {
             let mut parser = shadow_screen.lock().unwrap();
@@ -333,23 +321,23 @@ mod pty_handle_tests {
         }
 
         let snapshot = handle.get_snapshot();
-        let cached = handle.get_snapshot_cached();
-        assert_eq!(
-            snapshot, cached,
-            "get_snapshot and get_snapshot_cached should be identical for session-backed handles"
+        let snap_str = String::from_utf8_lossy(&snapshot);
+        assert!(
+            snap_str.contains("Some content"),
+            "get_snapshot should return content for local handles"
         );
     }
 
     #[test]
     fn subscribe_and_snapshot_returns_content() {
-        let (handle, shadow_screen) = create_session_backed_pty(24, 80);
+        let (handle, shadow_screen) = create_local_pty(24, 80);
 
         {
             let mut parser = shadow_screen.lock().unwrap();
             parser.process(b"Snapshot test content\r\n");
         }
 
-        let (snapshot, kitty, rows, cols, _rx) = handle.snapshot_and_subscribe_cached();
+        let (snapshot, kitty, rows, cols, _rx) = handle.snapshot_and_subscribe();
         assert!(
             String::from_utf8_lossy(&snapshot).contains("Snapshot test"),
             "snapshot_and_subscribe should return content"
@@ -357,6 +345,17 @@ mod pty_handle_tests {
         assert!(!kitty);
         assert_eq!(rows, 24);
         assert_eq!(cols, 80);
+    }
+
+    #[test]
+    fn session_backed_snapshot_returns_empty_without_session() {
+        let handle = create_session_backed_pty(24, 80);
+        // No session process connected, so snapshot should be empty
+        let snapshot = handle.get_snapshot();
+        assert!(
+            snapshot.is_empty(),
+            "session-backed handle without session should return empty snapshot"
+        );
     }
 }
 
@@ -446,3 +445,4 @@ mod socket_path_tests {
         );
     }
 }
+

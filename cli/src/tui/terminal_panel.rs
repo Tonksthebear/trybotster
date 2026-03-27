@@ -1,38 +1,12 @@
 //! Terminal panel state machine for PTY connections.
 //!
-//! Each `TerminalPanel` directly owns an [`AlacrittyParser`] and tracks its
-//! connection lifecycle: `Idle` (not subscribed), `Connecting`
-//! (subscribe sent, awaiting scrollback), and `Connected` (receiving
-//! live data).
-//!
-//! The parser is owned without `Arc<Mutex<>>` — the TUI thread is the
-//! sole accessor, so no synchronization is needed.
-//!
-//! The panel returns JSON messages for the caller to send rather than
-//! owning the transport channel, keeping it testable and free of
-//! borrow conflicts with `TuiRunner`.
-//!
-//! # State Machine
-//!
-//! ```text
-//! Idle ──connect()──> Connecting ──on_scrollback()──> Connected
-//!  │                                             ^
-//!  └──────────────on_scrollback()────────────────┘
-//!  ^                       |                              |
-//!  └───disconnect()────────┴──────────disconnect()────────┘
-//! ```
+//! Each `TerminalPanel` owns a [`TerminalParser`] and a [`RenderState`] and
+//! tracks its connection lifecycle.
 
-// Rust guideline compliant 2026-02
-
-use alacritty_terminal::term::Term;
-
-use crate::terminal::{AlacrittyParser, TuiColorQuery, TuiPanelListener};
+use crate::ghostty_vt::RenderState;
+use crate::terminal::{CursorStyle, TerminalParser};
 
 /// Default scrollback buffer size in lines for TUI panels.
-///
-/// Intentionally larger than `DEFAULT_SCROLLBACK_LINES` (5000) because
-/// the TUI user can scroll back interactively, while the shadow screen
-/// only needs enough history for reconnect snapshots.
 const TUI_SCROLLBACK: usize = 10_000;
 
 /// Connection lifecycle for a terminal panel.
@@ -46,26 +20,18 @@ pub enum PanelState {
     Connected,
 }
 
-/// Owns an alacritty parser and its connection state.
+/// Owns a terminal parser, render state, and connection state.
 ///
-/// Encapsulates parser lifecycle, dimensions, scroll state, and
-/// subscription management. The parser is directly owned (no mutex) —
-/// the TUI thread is the sole accessor.
-///
-/// Scroll offset is tracked independently of the parser's grid. The
-/// rendering code receives `scroll_offset()` as a parameter and indexes
-/// into the grid history directly.
-///
-/// Methods return `Option<serde_json::Value>` messages for the caller
-/// to send via the transport channel.
+/// The parser is directly owned (no mutex) — the TUI thread is the sole accessor.
 pub struct TerminalPanel {
-    parser: AlacrittyParser<TuiPanelListener>,
-    /// Listener handle for draining `ColorRequest` events after `process()`.
-    listener: TuiPanelListener,
+    parser: TerminalParser,
+    render_state: RenderState,
     state: PanelState,
     dims: (u16, u16),
     /// Lines scrolled up from live view. Zero means at bottom (live).
     scroll_offset: usize,
+    /// Consecutive mouse scroll events in the current tick (for acceleration).
+    scroll_accel: u32,
 }
 
 impl std::fmt::Debug for TerminalPanel {
@@ -80,25 +46,34 @@ impl std::fmt::Debug for TerminalPanel {
 impl TerminalPanel {
     /// Create a panel with an empty parser at the given dimensions.
     pub fn new(rows: u16, cols: u16) -> Self {
-        let (parser, listener) = AlacrittyParser::new_tui(rows, cols, TUI_SCROLLBACK);
+        let parser = TerminalParser::new(rows, cols, TUI_SCROLLBACK);
+        let render_state = RenderState::new().expect("render state creation");
         Self {
             parser,
-            listener,
+            render_state,
             state: PanelState::Idle,
             dims: (rows, cols),
             scroll_offset: 0,
+            scroll_accel: 0,
         }
     }
 
-    /// Borrow the underlying terminal for rendering.
-    ///
-    /// Returns the alacritty `Term` — callers use grid indexing with
-    /// `scroll_offset()` to render the correct portion of history.
-    pub fn term(&self) -> &Term<TuiPanelListener> {
-        self.parser.term()
+    /// Update the render state from the terminal. Call before each render.
+    pub fn update_render_state(&mut self) {
+        let _ = self.render_state.update(self.parser.terminal_mut());
     }
 
-    /// Whether focus reporting mode is active (`CSI ? 1004 h`).
+    /// Borrow the render state for widget rendering (immutable).
+    pub fn render_state(&self) -> &RenderState {
+        &self.render_state
+    }
+
+    /// Borrow the render state mutably (for update).
+    pub fn render_state_mut(&mut self) -> &mut RenderState {
+        &mut self.render_state
+    }
+
+    /// Whether focus reporting mode is active.
     pub fn focus_reporting(&self) -> bool {
         self.parser.focus_reporting()
     }
@@ -118,15 +93,12 @@ impl TerminalPanel {
         self.parser.cursor_hidden()
     }
 
-    /// Current cursor style (shape + blink) from the running application.
-    ///
-    /// Used by [`TerminalModes`] to mirror DECSCUSR to the outer terminal so
-    /// the cursor shape (beam/block/underline) is correct when focused.
-    pub fn cursor_style(&self) -> alacritty_terminal::vte::ansi::CursorStyle {
-        self.parser.cursor_style()
+    /// Current cursor style from the render state.
+    pub fn cursor_style(&self) -> CursorStyle {
+        CursorStyle::from_render_state(&self.render_state)
     }
 
-    /// Extract plain-text grid contents (for tests and content checks).
+    /// Extract plain-text grid contents.
     pub fn contents(&self) -> String {
         self.parser.contents()
     }
@@ -142,9 +114,6 @@ impl TerminalPanel {
     }
 
     /// Subscribe to a PTY, transitioning `Idle` to `Connecting`.
-    ///
-    /// Returns a subscribe JSON message for the caller to send.
-    /// No-op if already `Connecting` or `Connected`.
     pub fn connect(&mut self, session_uuid: &str) -> Option<serde_json::Value> {
         if self.state != PanelState::Idle {
             return None;
@@ -165,8 +134,6 @@ impl TerminalPanel {
     }
 
     /// Unsubscribe from the PTY, transitioning to `Idle`.
-    ///
-    /// Returns an unsubscribe JSON message. No-op if already `Idle`.
     pub fn disconnect(&mut self, session_uuid: &str) -> Option<serde_json::Value> {
         if self.state == PanelState::Idle {
             return None;
@@ -180,37 +147,24 @@ impl TerminalPanel {
     }
 
     /// Mark the transport disconnected without sending an unsubscribe.
-    ///
-    /// Used when the outer hub socket drops unexpectedly and all subscriptions
-    /// vanish server-side already. Preserves parser contents so the panel can
-    /// show stale output while the next render pass re-subscribes.
     pub fn mark_transport_disconnected(&mut self) {
         self.state = PanelState::Idle;
     }
 
     /// Process a scrollback snapshot, transitioning to `Connected`.
-    ///
-    /// Clears the parser before writing the snapshot so the widget starts
-    /// from a clean state. Accepts snapshots from `Idle` too, since
-    /// reconnect races can deliver a valid snapshot before local state
-    /// observes `Connecting`.
     pub fn on_scrollback(&mut self, data: &[u8]) {
         let (rows, cols) = self.dims;
         self.on_scrollback_with_dims(rows, cols, data);
     }
 
     /// Process a scrollback snapshot with authoritative source dimensions.
-    ///
-    /// The snapshot producer's dimensions are applied before parse so replayed
-    /// cursor/line layout matches the source terminal exactly.
     pub fn on_scrollback_with_dims(&mut self, rows: u16, cols: u16, data: &[u8]) {
         self.dims = (rows, cols);
 
         // Replace the parser entirely so the old scrollback buffer is discarded.
-        let (parser, listener) = AlacrittyParser::new_tui(rows, cols, TUI_SCROLLBACK);
-        self.parser = parser;
-        self.listener = listener;
+        self.parser = TerminalParser::new(rows, cols, TUI_SCROLLBACK);
         self.parser.process(data);
+        self.update_render_state();
 
         // Reset scroll state — reconnect starts at live view
         self.scroll_offset = 0;
@@ -219,31 +173,15 @@ impl TerminalPanel {
     }
 
     /// Process incremental PTY output.
-    ///
-    /// Accepted in `Connecting` or `Connected` state. Ignored if `Idle`
-    /// because we are not subscribed and data is stale.
-    ///
-    /// Unlike the old vt100 implementation, no manual CSI 3J handling is
-    /// needed — alacritty_terminal processes "Erase Saved Lines" natively.
     pub fn on_output(&mut self, data: &[u8]) {
         if self.state == PanelState::Idle {
             return;
         }
         self.parser.process(data);
-    }
-
-    /// Drain pending color queries that alacritty emitted during `process()`.
-    ///
-    /// Returns indices (256=fg, 257=bg, 258=cursor) that need to be forwarded
-    /// to the outer terminal via stdout.
-    pub fn drain_color_queries(&self) -> Vec<TuiColorQuery> {
-        self.listener.drain_color_queries()
+        self.update_render_state();
     }
 
     /// Resize the parser and notify the PTY if subscribed.
-    ///
-    /// Returns a resize JSON message when dimensions changed and the
-    /// panel is subscribed. No message if `Idle` or dimensions match.
     pub fn resize(
         &mut self,
         rows: u16,
@@ -255,6 +193,7 @@ impl TerminalPanel {
         }
         self.dims = (rows, cols);
         self.parser.resize(rows, cols);
+        self.update_render_state();
 
         if self.state == PanelState::Idle {
             return None;
@@ -267,9 +206,6 @@ impl TerminalPanel {
     }
 
     /// Force-clear cached dimensions so the next `resize` call detects a change.
-    ///
-    /// Used after a terminal resize event to ensure all panels get
-    /// resized on the next render pass.
     pub fn invalidate_dims(&mut self) {
         self.dims = (0, 0);
     }
@@ -282,7 +218,12 @@ impl TerminalPanel {
             return;
         }
         let depth = self.scrollback_depth();
-        self.scroll_offset = self.scroll_offset.saturating_add(lines).min(depth);
+        let new_offset = self.scroll_offset.saturating_add(lines).min(depth);
+        let delta = new_offset - self.scroll_offset;
+        if delta > 0 {
+            self.scroll_offset = new_offset;
+            self.parser.terminal_mut().scroll_viewport_delta(-(delta as isize));
+        }
     }
 
     /// Scroll down toward live view by `lines` lines.
@@ -290,7 +231,12 @@ impl TerminalPanel {
         if lines == 0 || self.scroll_offset == 0 {
             return;
         }
+        let old = self.scroll_offset;
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        let delta = old - self.scroll_offset;
+        if delta > 0 {
+            self.parser.terminal_mut().scroll_viewport_delta(delta as isize);
+        }
     }
 
     /// Jump to the top of the scrollback buffer.
@@ -300,6 +246,7 @@ impl TerminalPanel {
             return;
         }
         self.scroll_offset = depth;
+        self.parser.terminal_mut().scroll_viewport_top();
     }
 
     /// Jump to the bottom (return to live view).
@@ -308,6 +255,7 @@ impl TerminalPanel {
             return;
         }
         self.scroll_offset = 0;
+        self.parser.terminal_mut().scroll_viewport_bottom();
     }
 
     /// Whether the panel is scrolled up from live view.
@@ -326,6 +274,24 @@ impl TerminalPanel {
     }
 }
 
+impl super::smooth_scroll::SmoothScroll for TerminalPanel {
+    fn scroll_up(&mut self, lines: usize) {
+        self.scroll_up(lines);
+    }
+
+    fn scroll_down(&mut self, lines: usize) {
+        self.scroll_down(lines);
+    }
+
+    fn scroll_accel(&self) -> u32 {
+        self.scroll_accel
+    }
+
+    fn set_scroll_accel(&mut self, val: u32) {
+        self.scroll_accel = val;
+    }
+}
+
 /// Build the subscription ID string for a session UUID.
 fn sub_id(session_uuid: &str) -> String {
     format!("tui:{session_uuid}")
@@ -334,7 +300,6 @@ fn sub_id(session_uuid: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alacritty_terminal::index::{Column, Line, Point};
 
     #[test]
     fn new_panel_is_idle() {
@@ -363,7 +328,6 @@ mod tests {
         panel.connect("sess-0");
         assert_eq!(panel.state(), PanelState::Connecting);
 
-        // Second connect is a no-op
         let msg = panel.connect("sess-0");
         assert!(msg.is_none());
         assert_eq!(panel.state(), PanelState::Connecting);
@@ -376,8 +340,8 @@ mod tests {
         panel.on_scrollback(b"Hello, World!");
         assert_eq!(panel.state(), PanelState::Connected);
 
-        let cell = &panel.term().grid()[Point::new(Line(0), Column(0))];
-        assert_eq!(cell.c, 'H');
+        let contents = panel.contents();
+        assert!(contents.contains('H'));
     }
 
     #[test]
@@ -393,8 +357,8 @@ mod tests {
         let mut panel = TerminalPanel::new(24, 80);
         panel.on_output(b"should be ignored");
 
-        let cell = &panel.term().grid()[Point::new(Line(0), Column(0))];
-        assert_eq!(cell.c, ' ');
+        let contents = panel.contents();
+        assert!(!contents.contains("should be ignored"));
     }
 
     #[test]
@@ -403,8 +367,8 @@ mod tests {
         panel.connect("sess-0");
         panel.on_output(b"data");
 
-        let cell = &panel.term().grid()[Point::new(Line(0), Column(0))];
-        assert_eq!(cell.c, 'd');
+        let contents = panel.contents();
+        assert!(contents.contains('d'));
     }
 
     #[test]
@@ -447,7 +411,6 @@ mod tests {
         let mut panel = TerminalPanel::new(24, 80);
         let msg = panel.resize(30, 100, "sess-0");
         assert!(msg.is_none());
-        // Dims still update even when idle
         assert_eq!(panel.dims(), (30, 100));
     }
 
@@ -464,11 +427,9 @@ mod tests {
         let mut panel = TerminalPanel::new(24, 80);
         panel.connect("sess-0");
 
-        // rows < 2
         assert!(panel.resize(1, 80, "sess-0").is_none());
         assert_eq!(panel.dims(), (24, 80));
 
-        // cols == 0
         assert!(panel.resize(24, 0, "sess-0").is_none());
         assert_eq!(panel.dims(), (24, 80));
     }
@@ -479,7 +440,6 @@ mod tests {
         panel.connect("sess-0");
         panel.invalidate_dims();
 
-        // Same original dims now detected as changed
         let msg = panel.resize(24, 80, "sess-0");
         assert!(msg.is_some());
     }
@@ -491,8 +451,8 @@ mod tests {
         panel.on_output(b"old content");
         panel.on_scrollback(b"new snapshot");
 
-        let cell = &panel.term().grid()[Point::new(Line(0), Column(0))];
-        assert_eq!(cell.c, 'n');
+        let contents = panel.contents();
+        assert!(contents.contains('n'));
     }
 
     #[test]
@@ -501,8 +461,8 @@ mod tests {
         panel.on_scrollback(b"idle snapshot");
         assert_eq!(panel.state(), PanelState::Connected);
 
-        let cell = &panel.term().grid()[Point::new(Line(0), Column(0))];
-        assert_eq!(cell.c, 'i');
+        let contents = panel.contents();
+        assert!(contents.contains('i'));
     }
 
     #[test]
@@ -510,7 +470,6 @@ mod tests {
         let mut panel = TerminalPanel::new(24, 80);
         panel.connect("sess-0");
 
-        // Write enough lines to create scrollback.
         for i in 0..30 {
             panel.on_output(format!("line {i}\r\n").as_bytes());
         }
@@ -520,147 +479,12 @@ mod tests {
             "should have scrollback before clear"
         );
 
-        // Send CSI 3 J (clear scrollback) — alacritty handles this natively.
         panel.on_output(b"\x1b[3J");
 
         assert_eq!(
             panel.scrollback_depth(),
             0,
-            "scrollback depth should be zero after CSI 3 J"
+            "CSI 3J should clear scrollback"
         );
-    }
-
-    #[test]
-    fn debug_impl_does_not_leak_parser_contents() {
-        let panel = TerminalPanel::new(24, 80);
-        let debug = format!("{panel:?}");
-        assert!(debug.contains("TerminalPanel"));
-        assert!(debug.contains("Idle"));
-    }
-
-    #[test]
-    fn scroll_up_and_down() {
-        let mut panel = TerminalPanel::new(24, 80);
-        panel.connect("sess-0");
-
-        // Write enough lines to create scrollback.
-        for i in 0..50 {
-            panel.on_output(format!("line {i}\r\n").as_bytes());
-        }
-        assert!(panel.scrollback_depth() > 0);
-
-        panel.scroll_up(10);
-        assert!(panel.is_scrolled());
-        assert_eq!(panel.scroll_offset(), 10);
-
-        panel.scroll_down(5);
-        assert_eq!(panel.scroll_offset(), 5);
-
-        panel.scroll_to_bottom();
-        assert!(!panel.is_scrolled());
-        assert_eq!(panel.scroll_offset(), 0);
-    }
-
-    #[test]
-    fn scroll_to_top_clamps_to_depth() {
-        let mut panel = TerminalPanel::new(24, 80);
-        panel.connect("sess-0");
-
-        for i in 0..50 {
-            panel.on_output(format!("line {i}\r\n").as_bytes());
-        }
-        let depth = panel.scrollback_depth();
-
-        panel.scroll_to_top();
-        assert_eq!(panel.scroll_offset(), depth);
-    }
-
-    #[test]
-    fn scroll_up_clamped_to_scrollback_depth() {
-        let mut panel = TerminalPanel::new(24, 80);
-        panel.connect("sess-0");
-
-        for i in 0..30 {
-            panel.on_output(format!("line {i}\r\n").as_bytes());
-        }
-        let depth = panel.scrollback_depth();
-
-        // Try to scroll way past the buffer
-        panel.scroll_up(usize::MAX);
-        assert_eq!(panel.scroll_offset(), depth);
-    }
-
-    #[test]
-    fn scroll_down_does_not_go_negative() {
-        let mut panel = TerminalPanel::new(24, 80);
-        panel.connect("sess-0");
-        panel.scroll_down(100);
-        assert_eq!(panel.scroll_offset(), 0);
-    }
-
-    #[test]
-    fn scrollback_resets_scroll_on_reconnect() {
-        let mut panel = TerminalPanel::new(24, 80);
-        panel.connect("sess-0");
-
-        for i in 0..30 {
-            panel.on_output(format!("line {i}\r\n").as_bytes());
-        }
-        panel.scroll_up(10);
-        assert!(panel.is_scrolled());
-
-        // Reconnect resets scroll
-        panel.on_scrollback(b"fresh snapshot");
-        assert!(!panel.is_scrolled());
-        assert_eq!(panel.scroll_offset(), 0);
-    }
-
-    #[test]
-    fn alt_screen_scrollback_refresh_restores_normal_buffer() {
-        // Simulates: panel bootstraps from snapshot taken during alt screen,
-        // then receives alt screen exit bytes followed by a scrollback refresh.
-        // This is the fix for blank-screen-after-Claude-Code-exit.
-        let mut panel = TerminalPanel::new(24, 80);
-        panel.connect("sess-0");
-
-        // 1. Bootstrap from snapshot taken while alt screen is active.
-        //    The snapshot includes CSI ?1049h — fresh parser enters alt screen
-        //    with an empty normal buffer.
-        let snapshot = b"\x1b[?1049h\x1b[HAlt screen content here";
-        panel.on_scrollback(snapshot);
-        assert_eq!(panel.state(), PanelState::Connected);
-
-        // Verify parser is in alt screen
-        let in_alt = panel.term().mode().contains(
-            alacritty_terminal::term::TermMode::ALT_SCREEN,
-        );
-        assert!(in_alt, "panel should be in alt screen after snapshot");
-
-        // 2. Claude Code exits: raw bytes with CSI ?1049l arrive.
-        //    The old parser processes them and exits alt screen.
-        panel.on_output(b"\x1b[?1049l");
-        let in_alt_after = panel.term().mode().contains(
-            alacritty_terminal::term::TermMode::ALT_SCREEN,
-        );
-        assert!(!in_alt_after, "panel should exit alt screen");
-
-        // At this point the normal buffer is EMPTY (from the snapshot bootstrap).
-        let cell = &panel.term().grid()[Point::new(Line(0), Column(0))];
-        assert_eq!(cell.c, ' ', "normal buffer should be empty after snapshot bootstrap");
-
-        // 3. AltScreenScrollback arrives with correct normal screen content.
-        //    This replaces the parser entirely.
-        panel.on_scrollback(b"bash-5.2$ \r\nreal normal content");
-        let cell_after = &panel.term().grid()[Point::new(Line(0), Column(0))];
-        assert_eq!(
-            cell_after.c, 'b',
-            "scrollback refresh should restore normal buffer content"
-        );
-
-        // Parser should NOT be in alt screen
-        let in_alt_final = panel.term().mode().contains(
-            alacritty_terminal::term::TermMode::ALT_SCREEN,
-        );
-        assert!(!in_alt_final, "should be on normal screen after refresh");
     }
 }

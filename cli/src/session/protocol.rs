@@ -26,7 +26,7 @@ use anyhow::{bail, Context, Result};
 // ─── Protocol version ────────────────────────────────────────────────────────
 
 /// Current protocol version. Bump on breaking wire changes.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Magic bytes for hub → session hello.
 pub const HELLO_MAGIC: &[u8; 4] = b"SPH1";
@@ -81,6 +81,26 @@ pub const FRAME_GET_SCREEN: u8 = 0x0E;
 /// Session → Hub: plain text screen response.
 pub const FRAME_SCREEN: u8 = 0x0F;
 
+// ─── Proactive state change frames (session → hub) ─────────────────────
+
+/// Session → Hub: window title changed (string payload: new title).
+pub const FRAME_TITLE_CHANGED: u8 = 0x10;
+
+/// Session → Hub: bell character received (empty payload).
+pub const FRAME_BELL: u8 = 0x11;
+
+/// Session → Hub: terminal mode changed (JSON payload: only changed fields).
+pub const FRAME_MODE_CHANGED: u8 = 0x12;
+
+/// Session → Hub: working directory changed (string payload: new CWD path).
+pub const FRAME_CWD_CHANGED: u8 = 0x13;
+
+/// Session → Hub: shell prompt mark detected (JSON payload: `{"mark": str}`).
+pub const FRAME_PROMPT_MARK: u8 = 0x14;
+
+/// Session → Hub: OSC notification detected (JSON payload: `{"title": str, "body": str}`).
+pub const FRAME_NOTIFICATION: u8 = 0x15;
+
 // ─── Handshake metadata ──────────────────────────────────────────────────────
 
 /// Session metadata sent in the welcome handshake.
@@ -111,6 +131,63 @@ pub struct ModeFlags {
     pub mouse_mode: u8,
     /// Alternate screen buffer active.
     pub alt_screen: bool,
+    /// Focus reporting mode enabled (DECSET 1004).
+    #[serde(default)]
+    pub focus_reporting: bool,
+    /// Application cursor keys mode (DECCKM, mode 1).
+    #[serde(default)]
+    pub application_cursor: bool,
+}
+
+/// Incremental mode change pushed proactively by the session.
+///
+/// Only changed fields are present (None = unchanged). This avoids the hub
+/// needing to re-parse PTY output to detect mode transitions.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ModeChanged {
+    /// Kitty keyboard protocol toggled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kitty_enabled: Option<bool>,
+    /// Cursor visibility changed (DECTCEM).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_visible: Option<bool>,
+    /// Alternate screen buffer toggled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt_screen: Option<bool>,
+    /// Mouse tracking mode changed (0=off, 1000/1002/1003/1006).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mouse_mode: Option<u8>,
+    /// Bracketed paste mode toggled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bracketed_paste: Option<bool>,
+    /// Focus reporting mode toggled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_reporting: Option<bool>,
+    /// Application cursor keys mode toggled (DECCKM).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub application_cursor: Option<bool>,
+}
+
+/// OSC notification payload.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NotificationPayload {
+    /// Notification title (empty for OSC 9).
+    pub title: String,
+    /// Notification body text.
+    pub body: String,
+}
+
+/// Prompt mark payload.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PromptMarkPayload {
+    /// One of: "prompt_start", "command_start", "command_executed", "command_finished".
+    pub mark: String,
+    /// Optional command text (for command_executed marks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Optional exit code (for command_finished marks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 
 // ─── Frame encoding ──────────────────────────────────────────────────────────
@@ -128,6 +205,11 @@ pub fn encode_frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
 /// Encode a frame with no payload.
 pub fn encode_empty(frame_type: u8) -> Vec<u8> {
     encode_frame(frame_type, &[])
+}
+
+/// Encode a frame with a UTF-8 string payload.
+pub fn encode_string(frame_type: u8, s: &str) -> Vec<u8> {
+    encode_frame(frame_type, s.as_bytes())
 }
 
 /// Encode a frame with JSON payload.
@@ -346,6 +428,90 @@ mod tests {
         assert_eq!(frames.len(), 1);
         let decoded: Resize = frames[0].json().unwrap();
         assert_eq!(decoded, resize);
+    }
+
+    #[test]
+    fn mode_changed_sparse_json() {
+        let mode = ModeChanged {
+            kitty_enabled: Some(true),
+            alt_screen: Some(false),
+            ..Default::default()
+        };
+        let encoded = encode_json(FRAME_MODE_CHANGED, &mode).unwrap();
+        let mut decoder = FrameDecoder::new();
+        let frames = decoder.feed(&encoded);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame_type, FRAME_MODE_CHANGED);
+        let decoded: ModeChanged = frames[0].json().unwrap();
+        assert_eq!(decoded.kitty_enabled, Some(true));
+        assert_eq!(decoded.alt_screen, Some(false));
+        assert!(decoded.cursor_visible.is_none());
+        assert!(decoded.mouse_mode.is_none());
+        assert!(decoded.bracketed_paste.is_none());
+        assert!(decoded.focus_reporting.is_none());
+        assert!(decoded.application_cursor.is_none());
+    }
+
+    #[test]
+    fn string_frame_roundtrip() {
+        let encoded = encode_string(FRAME_TITLE_CHANGED, "My Terminal");
+        let mut decoder = FrameDecoder::new();
+        let frames = decoder.feed(&encoded);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame_type, FRAME_TITLE_CHANGED);
+        assert_eq!(std::str::from_utf8(&frames[0].payload).unwrap(), "My Terminal");
+    }
+
+    #[test]
+    fn notification_payload_roundtrip() {
+        let notif = NotificationPayload {
+            title: "Build".to_string(),
+            body: "Done".to_string(),
+        };
+        let encoded = encode_json(FRAME_NOTIFICATION, &notif).unwrap();
+        let mut decoder = FrameDecoder::new();
+        let frames = decoder.feed(&encoded);
+        let decoded: NotificationPayload = frames[0].json().unwrap();
+        assert_eq!(decoded.title, "Build");
+        assert_eq!(decoded.body, "Done");
+    }
+
+    #[test]
+    fn prompt_mark_payload_roundtrip() {
+        let mark = PromptMarkPayload {
+            mark: "command_finished".to_string(),
+            command: None,
+            exit_code: Some(0),
+        };
+        let encoded = encode_json(FRAME_PROMPT_MARK, &mark).unwrap();
+        let mut decoder = FrameDecoder::new();
+        let frames = decoder.feed(&encoded);
+        let decoded: PromptMarkPayload = frames[0].json().unwrap();
+        assert_eq!(decoded.mark, "command_finished");
+        assert!(decoded.command.is_none());
+        assert_eq!(decoded.exit_code, Some(0));
+    }
+
+    #[test]
+    fn bell_frame() {
+        let encoded = encode_empty(FRAME_BELL);
+        let mut decoder = FrameDecoder::new();
+        let frames = decoder.feed(&encoded);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].frame_type, FRAME_BELL);
+        assert!(frames[0].payload.is_empty());
+    }
+
+    #[test]
+    fn cwd_changed_frame() {
+        let encoded = encode_string(FRAME_CWD_CHANGED, "/home/user/project");
+        let mut decoder = FrameDecoder::new();
+        let frames = decoder.feed(&encoded);
+        assert_eq!(frames[0].frame_type, FRAME_CWD_CHANGED);
+        assert_eq!(
+            std::str::from_utf8(&frames[0].payload).unwrap(),
+            "/home/user/project"
+        );
     }
 
     #[test]

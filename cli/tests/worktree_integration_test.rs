@@ -1,3 +1,5 @@
+//! Worktree + PTY spawn integration tests.
+
 use botster::agent::spawn::PtySpawnConfig;
 use botster::Agent;
 use std::collections::HashMap;

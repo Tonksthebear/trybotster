@@ -1,5 +1,6 @@
-// Integration tests for CLI commands
-// Run with: cargo test --test cli_commands_test
+//! Integration tests for CLI commands.
+//!
+//! Run with: `cargo test --test cli_commands_test`
 
 use std::process::Command;
 use tempfile::TempDir;

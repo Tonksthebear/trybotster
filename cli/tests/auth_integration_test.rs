@@ -3,8 +3,6 @@
 //! These tests verify the CLI correctly handles various authentication scenarios.
 
 use std::env;
-use std::fs;
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::Once;
 use tempfile::TempDir;
@@ -49,47 +47,7 @@ fn setup_test_env() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
     (temp_dir, guard)
 }
 
-/// Helper to create a config file with a token
-fn create_config_with_token(config_dir: &PathBuf, server_url: &str, token: &str) {
-    let config = serde_json::json!({
-        "server_url": server_url,
-        "poll_interval": 5,
-        "agent_timeout": 3600,
-        "max_sessions": 20,
-        "worktree_base": "/tmp/botster-sessions"
-    });
-    fs::create_dir_all(config_dir).unwrap();
-    fs::write(
-        config_dir.join("config.json"),
-        serde_json::to_string_pretty(&config).unwrap(),
-    )
-    .unwrap();
-
-    // Token would be stored via keyring or env var, not in config file
-    if !token.is_empty() {
-        env::set_var("BOTSTER_TOKEN", token);
-    }
-}
-
-/// Helper to create an empty config file
-fn create_empty_config(config_dir: &PathBuf, server_url: &str) {
-    let config = serde_json::json!({
-        "server_url": server_url,
-        "poll_interval": 5,
-        "agent_timeout": 3600,
-        "max_sessions": 20,
-        "worktree_base": "/tmp/botster-sessions"
-    });
-    fs::create_dir_all(config_dir).unwrap();
-    fs::write(
-        config_dir.join("config.json"),
-        serde_json::to_string_pretty(&config).unwrap(),
-    )
-    .unwrap();
-}
-
 mod validate_token_tests {
-    use super::*;
     use botster::auth;
 
     #[test]

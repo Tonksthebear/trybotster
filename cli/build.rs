@@ -1,7 +1,8 @@
 //! Build script for botster CLI.
 //!
-//! Embeds all Lua files from the `lua/` directory into the binary at compile time.
-//! This allows the CLI to run without external Lua files in release mode.
+//! Two responsibilities:
+//! 1. Embeds Lua files from `lua/` into the binary (release builds only).
+//! 2. Builds libghostty-vt from `vendor/ghostty/` via Zig and links it.
 //!
 //! Generated file: `$OUT_DIR/embedded_lua.rs`
 //!
@@ -13,6 +14,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -24,6 +26,8 @@ fn main() {
     } else {
         generate_stub_lua(&dest_path);
     }
+
+    build_ghostty_vt();
 }
 
 /// Generate embedded Lua module with all files inlined via include_str!().
@@ -160,6 +164,79 @@ fn watch_lua_directory(dir: &Path) {
             }
         }
     }
+}
+
+/// Build libghostty-vt from the vendored Ghostty source using Zig.
+///
+/// Runs `mise exec -- zig build -Demit-lib-vt` in `vendor/ghostty/` and tells
+/// Cargo to link the resulting static library. Uses DEVELOPER_DIR to point at
+/// the Command Line Tools SDK to work around a zig 0.15 + Xcode 26.4 TBD
+/// architecture mismatch bug (Codeberg #31658).
+fn build_ghostty_vt() {
+    let ghostty_dir = Path::new("vendor/ghostty");
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let repacked_lib = Path::new(&out_dir).join("libghostty-vt.a");
+
+    // Only rebuild if the repacked library doesn't exist yet. The zig build
+    // takes ~30s and the vendored source rarely changes. Force a rebuild by
+    // deleting the target dir or touching build.rs.
+    if !repacked_lib.exists() {
+        let zig_lib_path = ghostty_dir.join("zig-out/lib/libghostty-vt.a");
+
+        if !zig_lib_path.exists() {
+            let status = Command::new("mise")
+                .args([
+                    "exec", "--", "zig", "build", "-Demit-lib-vt",
+                    "-Doptimize=ReleaseFast", "-Dsimd=false",
+                ])
+                .current_dir(ghostty_dir)
+                .env("DEVELOPER_DIR", "/Library/Developer/CommandLineTools")
+                .status()
+                .expect("failed to run `mise exec -- zig build` — is mise installed with zig?");
+
+            assert!(
+                status.success(),
+                "zig build -Demit-lib-vt failed with exit code {:?}",
+                status.code()
+            );
+
+            assert!(
+                zig_lib_path.exists(),
+                "zig build succeeded but {} not found",
+                zig_lib_path.display()
+            );
+        }
+
+        // Zig's archive has misaligned members that macOS ld rejects
+        // ("not 8-byte aligned"). Repack with libtool to fix alignment.
+        let status = Command::new("libtool")
+            .args(["-static", "-o"])
+            .arg(&repacked_lib)
+            .arg(&zig_lib_path)
+            .status()
+            .expect("failed to run libtool");
+
+        assert!(
+            status.success(),
+            "libtool repack failed with exit code {:?}",
+            status.code()
+        );
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir);
+    println!("cargo:rustc-link-lib=static=ghostty-vt");
+
+    // libghostty-vt (without SIMD) only needs libc, which Rust links by default.
+    // On macOS, also link the C++ runtime for Zig's compiler-rt.
+    if cfg!(target_os = "macos") {
+        println!("cargo:rustc-link-lib=c++");
+    }
+
+    // Rerun if ghostty source changes.
+    println!("cargo:rerun-if-changed=vendor/ghostty/build.zig");
+    println!("cargo:rerun-if-changed=vendor/ghostty/build.zig.zon");
+    println!("cargo:rerun-if-changed=vendor/ghostty/src");
+    println!("cargo:rerun-if-changed=vendor/ghostty/include");
 }
 
 /// Recursively collect all .lua files from a directory.

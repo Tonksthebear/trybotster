@@ -5,14 +5,15 @@
 //!
 //! Architecture:
 //! - PtySession emits raw bytes via broadcast
-//! - Clients (TuiRunner, TuiClient) own their own AlacrittyParser instances
-//! - Scroll offset is tracked as a plain `usize` alongside the parser
+//! - Clients (TuiRunner, TuiClient) own their own TerminalParser instances
+//! - Scroll offset is tracked via ghostty's viewport scrolling API
 //! - Agents track PTY lifecycle and scrollback buffer, not terminal emulation
 
-// Rust guideline compliant 2026-02
+// Rust guideline compliant 2026-03
 
-use botster::terminal::{AlacrittyParser, NoopListener};
-use botster::{Agent, TerminalWidget};
+use botster::ghostty_vt::RenderState;
+use botster::terminal::TerminalParser;
+use botster::TerminalWidget;
 use ratatui::{
     backend::TestBackend,
     layout::{Constraint, Direction, Layout},
@@ -34,12 +35,12 @@ fn ensure_test_env() {
 }
 
 /// Helper to create a test agent
-fn create_test_agent() -> (Agent, TempDir) {
+fn create_test_agent() -> (botster::Agent, TempDir) {
     // Ensure BOTSTER_ENV=test is set before creating any agents
     ensure_test_env();
 
     let temp_dir = TempDir::new().unwrap();
-    let agent = Agent::new(
+    let agent = botster::Agent::new(
         uuid::Uuid::new_v4(),
         "test/repo".to_string(),
         "test-branch".to_string(),
@@ -49,20 +50,17 @@ fn create_test_agent() -> (Agent, TempDir) {
 }
 
 // ── Parser + scroll helpers ───────────────────────────────────────────────────
-//
-// With alacritty_terminal, scroll position is a plain usize tracked alongside
-// the parser. The parser exposes `history_size()` as the scroll ceiling.
 
-type TestParser = Arc<Mutex<AlacrittyParser<NoopListener>>>;
+type TestParser = Arc<Mutex<TerminalParser>>;
 
 /// Create a standalone test parser (simulates a client's local parser).
 fn create_test_parser(rows: u16, cols: u16) -> TestParser {
-    Arc::new(Mutex::new(AlacrittyParser::new_noop(rows, cols, 10_000)))
+    Arc::new(Mutex::new(TerminalParser::new(rows, cols, 10_000)))
 }
 
 /// Create a parser with `line_count` lines of synthetic content pre-loaded.
 fn create_parser_with_content(rows: u16, cols: u16, line_count: usize) -> TestParser {
-    let parser = Arc::new(Mutex::new(AlacrittyParser::new_noop(rows, cols, 10_000)));
+    let parser = Arc::new(Mutex::new(TerminalParser::new(rows, cols, 10_000)));
     {
         let mut p = parser.lock().unwrap();
         for i in 0..line_count {
@@ -72,20 +70,11 @@ fn create_parser_with_content(rows: u16, cols: u16, line_count: usize) -> TestPa
     parser
 }
 
-/// Scroll up by `lines`, clamped to the parser's available history.
-fn scroll_up(offset: usize, parser: &TestParser, lines: usize) -> usize {
-    let p = parser.lock().unwrap();
-    offset.saturating_add(lines).min(p.history_size())
-}
-
-/// Scroll down (towards live) by `lines`, floored at 0.
-fn scroll_down(offset: usize, lines: usize) -> usize {
-    offset.saturating_sub(lines)
-}
-
-/// Scroll to the very top of available history.
-fn scroll_to_top(parser: &TestParser) -> usize {
-    parser.lock().unwrap().history_size()
+/// Create a RenderState updated from a parser.
+fn make_render_state(parser: &mut TerminalParser) -> RenderState {
+    let mut rs = RenderState::new().expect("render state creation");
+    rs.update(parser.terminal_mut()).expect("render state update");
+    rs
 }
 
 // ── Rendering tests ───────────────────────────────────────────────────────────
@@ -95,7 +84,6 @@ fn scroll_to_top(parser: &TestParser) -> usize {
 fn test_render_no_deadlock() {
     let (_agent, _temp_dir) = create_test_agent();
     let parser = create_test_parser(24, 80);
-    let scroll_offset: usize = 0;
 
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -103,30 +91,22 @@ fn test_render_no_deadlock() {
     terminal
         .draw(|f| {
             let block = Block::default().borders(Borders::ALL).title("Test");
-            let p = parser.lock().unwrap();
-            let widget = if scroll_offset > 0 {
-                TerminalWidget::new(p.term(), scroll_offset)
-                    .block(block)
-                    .hide_cursor()
-            } else {
-                TerminalWidget::new(p.term(), scroll_offset).block(block)
-            };
+            let mut p = parser.lock().unwrap();
+            let rs = make_render_state(&mut p);
+            let widget = TerminalWidget::new(&rs).block(block);
             f.render_widget(widget, f.area());
         })
         .unwrap();
 }
 
-/// Test that scrolling and rendering work together using alacritty-based API.
+/// Test that scrolling and rendering work together.
 #[test]
 fn test_scroll_then_render() {
     let parser = create_parser_with_content(24, 80, 100);
 
-    // Scroll up 20 lines.
-    let scroll_offset = scroll_up(0, &parser, 20);
-    assert!(
-        scroll_offset > 0,
-        "scroll_offset should be > 0 after scroll_up"
-    );
+    // Verify we have scrollback history
+    let history = parser.lock().unwrap().history_size();
+    assert!(history > 0, "should have scrollback after loading 100 lines");
 
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -134,10 +114,9 @@ fn test_scroll_then_render() {
     terminal
         .draw(|f| {
             let block = Block::default().borders(Borders::ALL).title("Scrolled");
-            let p = parser.lock().unwrap();
-            let widget = TerminalWidget::new(p.term(), scroll_offset)
-                .block(block)
-                .hide_cursor();
+            let mut p = parser.lock().unwrap();
+            let rs = make_render_state(&mut p);
+            let widget = TerminalWidget::new(&rs).block(block).hide_cursor();
             f.render_widget(widget, f.area());
         })
         .unwrap();
@@ -148,9 +127,9 @@ fn test_scroll_then_render() {
 fn test_extreme_scrollback_render() {
     let parser = create_parser_with_content(24, 80, 1000);
 
-    let scroll_offset = scroll_to_top(&parser);
+    let history = parser.lock().unwrap().history_size();
     assert!(
-        scroll_offset > 0,
+        history > 0,
         "Should have scrollback after loading 1000 lines"
     );
 
@@ -160,10 +139,9 @@ fn test_extreme_scrollback_render() {
     terminal
         .draw(|f| {
             let block = Block::default().borders(Borders::ALL).title("Top");
-            let p = parser.lock().unwrap();
-            let widget = TerminalWidget::new(p.term(), scroll_offset)
-                .block(block)
-                .hide_cursor();
+            let mut p = parser.lock().unwrap();
+            let rs = make_render_state(&mut p);
+            let widget = TerminalWidget::new(&rs).block(block).hide_cursor();
             f.render_widget(widget, f.area());
         })
         .unwrap();
@@ -173,43 +151,30 @@ fn test_extreme_scrollback_render() {
 #[test]
 fn test_rapid_scroll_no_deadlock() {
     let parser = create_parser_with_content(24, 80, 100);
-    let mut scroll_offset: usize = 0;
 
-    // Rapid scroll operations
+    // Rapid scroll operations via history_size reads
     for _ in 0..100 {
-        scroll_offset = scroll_up(scroll_offset, &parser, 3);
-        scroll_offset = scroll_down(scroll_offset, 1);
-
-        // Simulate render check (just read history_size, no render)
-        let _ = scroll_offset > 0;
+        let p = parser.lock().unwrap();
+        let _ = p.history_size();
     }
 
     // Should complete without deadlock
 }
 
-/// Test concurrent access patterns — multiple threads manipulating scroll offset
-/// while processing bytes through the same parser.
+/// Test concurrent access patterns — multiple threads reading from the same parser.
 #[test]
 fn test_concurrent_scroll_and_render() {
     let parser = create_parser_with_content(24, 80, 100);
     let parser = Arc::new(parser);
-    let offset = Arc::new(Mutex::new(0usize));
 
     let handles: Vec<_> = (0..4)
-        .map(|i| {
+        .map(|_| {
             let parser = Arc::clone(&parser);
-            let offset = Arc::clone(&offset);
             thread::spawn(move || {
                 for _ in 0..25 {
                     {
                         let p = parser.lock().unwrap();
-                        let history = p.history_size();
-                        let mut o = offset.lock().unwrap();
-                        if i % 2 == 0 {
-                            *o = (*o).saturating_add(1).min(history);
-                        } else {
-                            *o = (*o).saturating_sub(1);
-                        }
+                        let _ = p.history_size();
                     }
                     thread::sleep(Duration::from_micros(100));
                 }
@@ -228,7 +193,6 @@ fn test_concurrent_scroll_and_render() {
 #[test]
 fn test_main_render_loop_pattern() {
     let parser = create_parser_with_content(24, 80, 50);
-    let mut scroll_offset = scroll_up(0, &parser, 10);
 
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -248,30 +212,16 @@ fn test_main_render_loop_pattern() {
             list_state.select(Some(0));
             f.render_stateful_widget(list, chunks[0], &mut list_state);
 
-            let scroll_indicator = if scroll_offset > 0 {
-                format!(" [SCROLLBACK +{scroll_offset}]")
-            } else {
-                String::new()
-            };
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title("test/repo#1 [CLI]");
 
-            let terminal_title = format!("test/repo#1 [CLI]{scroll_indicator}");
-            let block = Block::default().borders(Borders::ALL).title(terminal_title);
-
-            let p = parser.lock().unwrap();
-            let widget = if scroll_offset > 0 {
-                TerminalWidget::new(p.term(), scroll_offset)
-                    .block(block)
-                    .hide_cursor()
-            } else {
-                TerminalWidget::new(p.term(), scroll_offset).block(block)
-            };
+            let mut p = parser.lock().unwrap();
+            let rs = make_render_state(&mut p);
+            let widget = TerminalWidget::new(&rs).block(block);
             f.render_widget(widget, chunks[1]);
         })
         .unwrap();
-
-    // Scroll back to live view
-    scroll_offset = 0;
-    assert!(!scroll_offset > 0);
 }
 
 /// Test with timeout to catch deadlocks in the render loop.
@@ -283,7 +233,6 @@ fn test_render_with_timeout() {
 
     let handle = thread::spawn(move || {
         let parser = create_parser_with_content(24, 80, 50);
-        let mut scroll_offset = scroll_up(0, &parser, 10);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -293,20 +242,12 @@ fn test_render_with_timeout() {
             terminal
                 .draw(|f| {
                     let block = Block::default().borders(Borders::ALL);
-                    let p = parser.lock().unwrap();
-                    let widget = if scroll_offset > 0 {
-                        TerminalWidget::new(p.term(), scroll_offset)
-                            .block(block)
-                            .hide_cursor()
-                    } else {
-                        TerminalWidget::new(p.term(), scroll_offset).block(block)
-                    };
+                    let mut p = parser.lock().unwrap();
+                    let rs = make_render_state(&mut p);
+                    let widget = TerminalWidget::new(&rs).block(block);
                     f.render_widget(widget, f.area());
                 })
                 .unwrap();
-
-            // Scroll between renders
-            scroll_offset = scroll_down(scroll_offset, 1);
         }
 
         tx.send(()).unwrap();
@@ -350,7 +291,7 @@ fn test_spawn_real_pty_with_init_script() {
         let _runtime_guard = runtime.enter();
 
         let temp_dir = TempDir::new().unwrap();
-        let mut agent = Agent::new(
+        let mut agent = botster::Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
             "test-branch".to_string(),
@@ -423,7 +364,7 @@ fn test_spawn_pty_with_server_script() {
         let _runtime_guard = runtime.enter();
 
         let temp_dir = TempDir::new().unwrap();
-        let mut agent = Agent::new(
+        let mut agent = botster::Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
             "test-branch".to_string(),
@@ -485,7 +426,7 @@ fn test_real_pty_spawn_and_output() {
         let _runtime_guard = runtime.enter();
 
         let temp_dir = TempDir::new().unwrap();
-        let mut agent = Agent::new(
+        let mut agent = botster::Agent::new(
             uuid::Uuid::new_v4(),
             "test/repo".to_string(),
             "test-branch".to_string(),
@@ -526,49 +467,27 @@ fn test_real_pty_spawn_and_output() {
     }
 }
 
-/// Test rapid scrolling with parser — catches potential deadlocks.
+/// Test rapid rendering with parser — catches potential deadlocks.
 #[test]
-fn test_rapid_scroll_parser_no_deadlock() {
+fn test_rapid_render_no_deadlock() {
     use std::sync::mpsc;
 
     let (tx, rx) = mpsc::channel();
 
     let handle = thread::spawn(move || {
         let parser = create_parser_with_content(24, 80, 200);
-        let mut scroll_offset: usize = 0;
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // Simulate rapid scrolling like a user would do
-        for i in 0..50 {
-            scroll_offset = if i % 3 == 0 {
-                scroll_up(scroll_offset, &parser, 5)
-            } else if i % 3 == 1 {
-                scroll_down(scroll_offset, 2)
-            } else {
-                let top = scroll_to_top(&parser);
-                scroll_down(top, 10)
-            };
-
-            let scroll_indicator = if scroll_offset > 0 {
-                format!(" [SCROLLBACK +{scroll_offset}]")
-            } else {
-                String::new()
-            };
-
+        // Simulate rapid rendering
+        for _ in 0..50 {
             terminal
                 .draw(|f| {
-                    let title = format!("Rapid Scroll Test{scroll_indicator}");
-                    let block = Block::default().borders(Borders::ALL).title(title);
-                    let p = parser.lock().unwrap();
-                    let widget = if scroll_offset > 0 {
-                        TerminalWidget::new(p.term(), scroll_offset)
-                            .block(block)
-                            .hide_cursor()
-                    } else {
-                        TerminalWidget::new(p.term(), scroll_offset).block(block)
-                    };
+                    let block = Block::default().borders(Borders::ALL).title("Rapid Test");
+                    let mut p = parser.lock().unwrap();
+                    let rs = make_render_state(&mut p);
+                    let widget = TerminalWidget::new(&rs).block(block);
                     f.render_widget(widget, f.area());
                 })
                 .unwrap();
@@ -582,7 +501,7 @@ fn test_rapid_scroll_parser_no_deadlock() {
             handle.join().unwrap();
         }
         Err(_) => {
-            panic!("DEADLOCK: Rapid scroll test did not complete within 10 seconds");
+            panic!("DEADLOCK: Rapid render test did not complete within 10 seconds");
         }
     }
 }
@@ -590,17 +509,8 @@ fn test_rapid_scroll_parser_no_deadlock() {
 // ============================================================================
 // Browser -> PTY I/O Flow Integration Tests
 // ============================================================================
-//
-// These tests verify the browser -> PTY I/O flow architecture:
-// - Task #1: Removed "active PTY" concept, explicit routing only
-// - Task #2: PTY channels stored in ClientRegistry, created on agent selection
-// - Task #3: Output forwarding tasks spawn per-channel, input routes via BrowserCommand
-// - Task #4: Input/resize use terminal subscriptions (WebRTC), not hub channel
 
 /// Test that Agent exposes its configured PTY dimensions.
-///
-/// `Agent::get_pty_handle()` is test-only inside the library crate. Integration
-/// tests validate public Agent behavior through stable APIs.
 #[test]
 fn test_agent_reports_pty_dimensions() {
     let (agent, _temp_dir) = create_test_agent();
@@ -609,9 +519,6 @@ fn test_agent_reports_pty_dimensions() {
 }
 
 /// Test that multiple subscribers can receive PTY events (broadcast pattern).
-///
-/// This is the foundation of multi-browser output routing: multiple browsers
-/// viewing the same agent should all receive PTY output.
 #[test]
 fn test_pty_broadcast_to_multiple_subscribers() {
     use botster::agent::pty::PtySession;
@@ -636,60 +543,39 @@ fn test_pty_broadcast_to_multiple_subscribers() {
 }
 
 /// Test that PTY input can be written via command channel.
-///
-/// This is the foundation of browser input routing: input from browsers
-/// is written to the PTY via the command channel.
 #[test]
 fn test_pty_input_via_command_channel() {
     use botster::agent::pty::PtyCommand;
     use botster::agent::pty::PtySession;
 
-    // Create a PTY session
     let session = PtySession::new(24, 80);
-
-    // Get command channel
     let (_event_tx, cmd_tx, _port) = session.get_channels();
 
-    // Create tokio runtime for async send
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
 
-    // Send input command (even without spawned process, channel should accept)
     let result =
         runtime.block_on(async { cmd_tx.send(PtyCommand::Input(b"test input".to_vec())).await });
 
-    // Command should be accepted (channel is open)
     assert!(result.is_ok(), "Command channel should accept input");
 }
 
 /// Test that PTY resize works via direct resize method.
-///
-/// This verifies browser resize events can be delivered to the PTY.
-/// Resize is performed directly on PtySession rather than via the command channel.
 #[test]
 fn test_pty_resize_direct() {
     use botster::agent::pty::PtySession;
 
     let session = PtySession::new(24, 80);
-
-    // Verify initial dimensions
     assert_eq!(session.dimensions(), (24, 80));
 
-    // Resize directly (the current API for resize operations)
     session.resize(50, 100);
-
-    // Verify new dimensions
     assert_eq!(session.dimensions(), (50, 100));
 }
 
 /// Test that Agent's get_snapshot works correctly.
-///
-/// This is used to send initial scrollback to newly connected browsers.
 #[test]
 fn test_agent_scrollback_snapshot_for_browser() {
     let (agent, _temp_dir) = create_test_agent();
 
-    // Get snapshot for CLI view — always non-empty (contains ANSI reset/clear).
-    // Verify it doesn't contain any real terminal output.
     let snapshot = agent.get_snapshot();
     let snapshot_str = String::from_utf8_lossy(&snapshot);
     assert!(

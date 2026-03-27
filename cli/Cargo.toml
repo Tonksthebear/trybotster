@@ -13,10 +13,8 @@ path = "src/main.rs"
 # TUI framework
 ratatui = "0.30"
 crossterm = "0.29"
-# Terminal emulation - alacritty_terminal is battle-tested (Zed, iced_term),
-# handles all sequences vt100 silently drops, and gives direct cell-array access
-# for generating accurate ANSI snapshots on browser reconnect.
-alacritty_terminal = "0.25.1"
+# Terminal emulation - libghostty-vt C API via cli/vendor/ghostty.
+# See ghostty_vt.rs for the safe Rust wrapper.
 
 # PTY handling
 portable-pty = "0.9"

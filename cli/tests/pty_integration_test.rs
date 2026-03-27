@@ -1,9 +1,9 @@
-// PTY-based integration tests for TUI behavior
-//
-// These tests spawn the CLI inside a pseudo-TTY, allowing us to test
-// interactive behavior that requires a real terminal.
-//
-// IMPORTANT: Run `cargo build --release` before running these tests!
+//! PTY-based integration tests for TUI behavior.
+//!
+//! These tests spawn the CLI inside a pseudo-TTY, allowing us to test
+//! interactive behavior that requires a real terminal.
+//!
+//! IMPORTANT: Run `cargo build --release` before running these tests!
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};

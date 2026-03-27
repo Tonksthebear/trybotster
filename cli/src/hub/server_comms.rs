@@ -2579,7 +2579,7 @@ impl Hub {
                     std::thread::sleep(std::time::Duration::from_millis(125));
                 }
                 let (snapshot, _kitty_enabled, _rows, _cols, pty_rx) =
-                    pty_for_snapshot.snapshot_and_subscribe_cached();
+                    pty_for_snapshot.snapshot_and_subscribe();
                 (snapshot, pty_rx)
             })
             .await
@@ -2917,22 +2917,40 @@ impl Hub {
                 continue;
             }
 
-            let snapshot = session_handle.pty().get_snapshot_cached();
-            if snapshot.is_empty() {
-                continue;
-            }
-
-            log::info!(
-                "[WebRTC] Sending backpressure recovery snapshot ({} bytes) to {} for session {}",
-                snapshot.len(),
-                &entry.browser_identity[..entry.browser_identity.len().min(8)],
-                &entry.session_uuid[..entry.session_uuid.len().min(8)]
-            );
-
-            // Chunk and send directly through the per-peer channel,
-            // bypassing the output queue to avoid re-triggering backpressure.
+            // Snapshot via RPC — run on blocking thread to avoid stalling the event loop.
+            let pty_handle = session_handle.pty().clone();
+            let subscription_id = entry.subscription_id.clone();
+            let browser_identity = entry.browser_identity.clone();
+            let session_uuid = entry.session_uuid.clone();
             let peer_tx = peer_state.unwrap().tx.clone();
-            Self::send_snapshot_to_peer(&peer_tx, &entry.subscription_id, &snapshot);
+            tokio::spawn(async move {
+                let snapshot = match tokio::task::spawn_blocking(move || pty_handle.get_snapshot())
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!(
+                            "[WebRTC] Backpressure recovery snapshot task failed for session {}: {}",
+                            &session_uuid[..session_uuid.len().min(8)],
+                            e
+                        );
+                        return;
+                    }
+                };
+
+                if snapshot.is_empty() {
+                    return;
+                }
+
+                log::info!(
+                    "[WebRTC] Sending backpressure recovery snapshot ({} bytes) to {} for session {}",
+                    snapshot.len(),
+                    &browser_identity[..browser_identity.len().min(8)],
+                    &session_uuid[..session_uuid.len().min(8)]
+                );
+
+                Self::send_snapshot_to_peer(&peer_tx, &subscription_id, &snapshot);
+            });
         }
     }
 
@@ -3179,7 +3197,7 @@ impl Hub {
                         // cursor state include that redraw.
                         std::thread::sleep(std::time::Duration::from_millis(125));
                     }
-                    pty_for_snapshot.snapshot_and_subscribe_cached()
+                    pty_for_snapshot.snapshot_and_subscribe()
                 })
                 .await
                 {
@@ -3322,18 +3340,6 @@ impl Hub {
                                         super::wake_tui_pipe(fd);
                                     }
                                 }
-                                PtyEvent::AltScreenScrollback { data, rows, cols } => {
-                                    let _ = sink.send(TuiOutput::Scrollback {
-                                        session_uuid: session_uuid.clone(),
-                                        rows,
-                                        cols,
-                                        data,
-                                        kitty_enabled: false,
-                                    });
-                                    if let Some(fd) = wake_fd {
-                                        super::wake_tui_pipe(fd);
-                                    }
-                                }
                                 PtyEvent::Output(_) => unreachable!("output handled above"),
                                 _ => {} // Resized, Notification, etc. — not forwarded to TUI
                             }
@@ -3373,18 +3379,6 @@ impl Hub {
                             "enabled": enabled,
                             "session_uuid": session_uuid,
                         })));
-                        if let Some(fd) = wake_fd {
-                            super::wake_tui_pipe(fd);
-                        }
-                    }
-                    Ok(PtyEvent::AltScreenScrollback { data, rows, cols }) => {
-                        let _ = sink.send(TuiOutput::Scrollback {
-                            session_uuid: session_uuid.clone(),
-                            rows,
-                            cols,
-                            data,
-                            kitty_enabled: false,
-                        });
                         if let Some(fd) = wake_fd {
                             super::wake_tui_pipe(fd);
                         }
@@ -3512,7 +3506,7 @@ impl Hub {
                         // cursor state include that redraw.
                         std::thread::sleep(std::time::Duration::from_millis(125));
                     }
-                    pty_for_snapshot.snapshot_and_subscribe_cached()
+                    pty_for_snapshot.snapshot_and_subscribe()
                 })
                 .await
                 {
@@ -3654,16 +3648,6 @@ impl Hub {
                             "enabled": enabled,
                             "session_uuid": session_uuid,
                         }));
-                        let _ = frame_tx.try_send(frame.encode());
-                    }
-                    Ok(PtyEvent::AltScreenScrollback { data, rows, cols }) => {
-                        let frame = Frame::Scrollback {
-                            session_uuid: session_uuid.clone(),
-                            rows,
-                            cols,
-                            kitty_enabled: false,
-                            data,
-                        };
                         let _ = frame_tx.try_send(frame.encode());
                     }
                     Ok(_) => {}
@@ -5436,7 +5420,6 @@ mod tests {
             kitty_enabled,
             cursor_visible,
             resize_pending,
-            true,
             None,
         );
         SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
@@ -5482,10 +5465,9 @@ mod tests {
             kitty_enabled,
             cursor_visible,
             resize_pending,
-            true,
             None,
         );
-        // Seed shadow state so cached snapshot is non-empty.
+        // Seed shadow state so snapshot is non-empty.
         if let Ok(mut screen) = shadow_screen.lock() {
             screen.process(seed_output);
         }

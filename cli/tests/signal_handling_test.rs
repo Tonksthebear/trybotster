@@ -1,17 +1,17 @@
-// Integration tests for CLI behavior and process management
-//
-// These tests verify that:
-// 1. CLI commands that don't require a TTY work correctly
-// 2. The CLI properly handles missing TTY gracefully
-// 3. Basic CLI operations complete in reasonable time
-// 4. Process cleanup works correctly
-//
-// Note: Tests that require the interactive TUI (start command) cannot run
-// without a real TTY. Signal handling for interactive mode is tested manually.
-//
-// Run with: cargo test --test signal_handling_test -- --test-threads=1
-//
-// IMPORTANT: Run `cargo build --release` before running these tests!
+//! Integration tests for CLI behavior and process management.
+//!
+//! These tests verify that:
+//! 1. CLI commands that don't require a TTY work correctly
+//! 2. The CLI properly handles missing TTY gracefully
+//! 3. Basic CLI operations complete in reasonable time
+//! 4. Process cleanup works correctly
+//!
+//! Note: Tests that require the interactive TUI (start command) cannot run
+//! without a real TTY. Signal handling for interactive mode is tested manually.
+//!
+//! Run with: `cargo test --test signal_handling_test -- --test-threads=1`
+//!
+//! IMPORTANT: Run `cargo build --release` before running these tests!
 
 use std::process::{Command, Stdio};
 use std::sync::Once;

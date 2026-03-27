@@ -85,10 +85,10 @@ pub(crate) enum HubEvent {
     ///
     /// The response string is pre-formatted by the alacritty formatter using
     /// the hub's cached RGB value. The hub just needs to write it to the PTY.
+    /// Legacy — ghostty handles color queries internally via write_pty callback.
+    #[allow(dead_code)]
     ColorResponse {
-        /// Session UUID whose PTY emitted the query.
         session_uuid: String,
-        /// Pre-formatted OSC response string to write to the PTY.
         response: String,
     },
 

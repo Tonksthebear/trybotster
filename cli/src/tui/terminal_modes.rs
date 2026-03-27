@@ -2,53 +2,26 @@
 //!
 //! Tracks whether the outer terminal has application cursor (DECCKM),
 //! bracketed paste, kitty keyboard protocol, and cursor shape (DECSCUSR)
-//! pushed, and syncs these to match the focused PTY's state. Also tracks
-//! whether the outer terminal window has OS-level focus for synthetic focus
-//! events.
+//! pushed, and syncs these to match the focused PTY's state.
 
-// Rust guideline compliant 2026-02
-
-use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle};
+use crate::terminal::{CursorShape, CursorStyle};
 
 use super::terminal_panel::TerminalPanel;
 
 /// Mirrors terminal modes from the focused PTY to the outer terminal.
-///
-/// The outer terminal (Ghostty, iTerm, etc.) needs to match the inner PTY's
-/// modes so that keyboard input is encoded correctly. This struct owns the
-/// mirroring state and writes escape sequences to stdout when modes change.
-///
-/// Synced modes: DECCKM, bracketed paste, kitty keyboard protocol, DECSCUSR
-/// (cursor shape). When focus shifts away from a panel or the panel is
-/// unselected, cursor shape is reset to the terminal default (`\x1b[0q`).
-///
-/// Also tracks OS-level terminal focus for synthetic focus-in/focus-out
-/// events forwarded to the PTY on mode or panel switches.
 #[derive(Debug)]
 pub struct TerminalModes {
-    /// Whether DECCKM (application cursor) is pushed to the outer terminal.
     outer_app_cursor: bool,
-    /// Whether bracketed paste mode is pushed to the outer terminal.
     outer_bracketed_paste: bool,
-    /// Whether the focused PTY has kitty keyboard protocol enabled.
     inner_kitty_enabled: bool,
-    /// Whether kitty keyboard protocol is pushed to the outer terminal.
     outer_kitty_enabled: bool,
-    /// Last cursor shape pushed to the outer terminal via DECSCUSR.
-    ///
-    /// `None` means the default has not been set yet — next sync will
-    /// always emit the sequence to establish a known baseline.
     outer_cursor_style: Option<CursorStyle>,
-    /// Whether the outer terminal cursor is currently visible.
-    ///
-    /// Mirrored from the focused PTY's DECTCEM state via `CSI ? 25 h/l`.
     outer_cursor_visible: Option<bool>,
-    /// Whether the outer terminal window has OS-level focus.
     terminal_focused: bool,
 }
 
 impl TerminalModes {
-    /// Create with default state (no modes pushed, terminal assumed focused).
+    /// Create with all modes at default (off/unset).
     pub fn new() -> Self {
         Self {
             outer_app_cursor: false,
@@ -62,16 +35,6 @@ impl TerminalModes {
     }
 
     /// Sync outer terminal modes to match the focused panel's PTY state.
-    ///
-    /// Reads DECCKM, bracketed paste, and DECSCUSR cursor shape from the
-    /// panel's AlacrittyParser. Kitty keyboard protocol is gated on
-    /// `has_overlay` — overlays use traditional key encoding for keybinding
-    /// dispatch.
-    ///
-    /// Writes escape sequences directly to stdout when modes change.
-    /// See [`sync_terminal_modes` doc on Ghostty workaround][ghostty].
-    ///
-    /// [ghostty]: https://github.com/ghostty-org/ghostty/discussions/7780
     pub fn sync(&mut self, focused_panel: Option<&TerminalPanel>, has_overlay: bool) {
         let (app_cursor, bp, desired_cursor_style, desired_cursor_visible) = focused_panel
             .map(|panel| {
@@ -96,8 +59,6 @@ impl TerminalModes {
             let _ = std::io::Write::write_all(&mut std::io::stdout(), seq);
         }
 
-        // Kitty: only push when PTY wants it AND there's no overlay.
-        // In modal modes (menu, input, etc.) we want traditional bytes for keybindings.
         let desired_kitty = self.inner_kitty_enabled && !has_overlay;
         if desired_kitty != self.outer_kitty_enabled {
             log::info!(
@@ -108,16 +69,11 @@ impl TerminalModes {
                 self.outer_kitty_enabled
             );
             self.outer_kitty_enabled = desired_kitty;
-            // Write raw bytes via libc to bypass any buffering. Push = CSI > 1 u,
-            // Pop = CSI < u (flag 1 = DISAMBIGUATE_ESCAPE_CODES).
             let seq: &[u8] = if desired_kitty {
                 b"\x1b[>1u"
             } else {
                 b"\x1b[<u"
             };
-            // SAFETY: writing a short byte sequence to stdout fd. This is the
-            // standard pattern for terminal escape sequences that must bypass
-            // Rust's buffered I/O.
             unsafe {
                 libc::write(
                     libc::STDOUT_FILENO,
@@ -127,18 +83,11 @@ impl TerminalModes {
             }
         }
 
-        // Cursor shape (DECSCUSR): mirror the focused PTY's cursor style to the
-        // outer terminal so the user sees the correct cursor shape (beam in vim
-        // insert mode, etc.). Reset to default when no panel is focused.
-        //
-        // `\x1b[0q` resets DECSCUSR to the terminal's configured default.
-        // Compares by shape+blink so any change triggers an update.
         let effective_cursor_style = desired_cursor_style.unwrap_or_default();
         let needs_update = self.outer_cursor_style != Some(effective_cursor_style);
         if needs_update {
             self.outer_cursor_style = Some(effective_cursor_style);
             let seq: &[u8] = if desired_cursor_style.is_none() {
-                // No focused panel — reset to terminal default.
                 b"\x1b[0q"
             } else {
                 cursor_style_to_decscusr(effective_cursor_style)
@@ -157,27 +106,27 @@ impl TerminalModes {
         }
     }
 
-    /// Update inner kitty state when the focused PTY's kitty mode changes.
+    /// Update inner kitty keyboard protocol state from a PtyEvent.
     pub fn on_kitty_changed(&mut self, enabled: bool) {
         self.inner_kitty_enabled = enabled;
     }
 
-    /// Handle OS-level focus gained event.
+    /// Mark the terminal as focused.
     pub fn on_focus_gained(&mut self) {
         self.terminal_focused = true;
     }
 
-    /// Handle OS-level focus lost event.
+    /// Mark the terminal as unfocused.
     pub fn on_focus_lost(&mut self) {
         self.terminal_focused = false;
     }
 
-    /// Clear inner kitty state (e.g. when PTY process exits or focus clears).
+    /// Reset inner kitty state (e.g., on session disconnect).
     pub fn clear_inner_kitty(&mut self) {
         self.inner_kitty_enabled = false;
     }
 
-    /// Whether the outer terminal window has OS-level focus.
+    /// Whether the outer terminal currently has focus.
     pub fn terminal_focused(&self) -> bool {
         self.terminal_focused
     }
@@ -187,7 +136,7 @@ impl TerminalModes {
         self.outer_kitty_enabled
     }
 
-    /// Whether the inner PTY has kitty keyboard protocol enabled.
+    /// Whether the focused panel's PTY has kitty keyboard protocol active.
     pub fn inner_kitty_enabled(&self) -> bool {
         self.inner_kitty_enabled
     }
@@ -204,11 +153,6 @@ mod tests {
     }
 }
 
-/// Map a [`CursorStyle`] to the corresponding DECSCUSR escape sequence bytes.
-///
-/// The DECSCUSR parameter encodes both shape and blink state:
-/// 1 blinking block, 2 steady block, 3 blinking underline, 4 steady underline,
-/// 5 blinking beam (bar), 6 steady beam (bar).
 fn cursor_style_to_decscusr(style: CursorStyle) -> &'static [u8] {
     match (style.shape, style.blinking) {
         (CursorShape::Block, true) => b"\x1b[1q",
@@ -217,9 +161,7 @@ fn cursor_style_to_decscusr(style: CursorStyle) -> &'static [u8] {
         (CursorShape::Underline, false) => b"\x1b[4q",
         (CursorShape::Beam, true) => b"\x1b[5q",
         (CursorShape::Beam, false) => b"\x1b[6q",
-        // HollowBlock is a vi-mode variant; treat as steady block.
         (CursorShape::HollowBlock, _) => b"\x1b[2q",
-        // Hidden is handled separately via DECTCEM — default to steady block.
         (CursorShape::Hidden, _) => b"\x1b[2q",
     }
 }

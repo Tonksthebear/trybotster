@@ -128,23 +128,6 @@ pub enum PtyEvent {
     /// `false` = cursor hidden (generation, selection UI, no input expected).
     /// Emitted only on transitions, not on every occurrence.
     CursorVisibilityChanged(bool),
-
-    /// Alt screen mode changed — fresh scrollback for the now-active buffer.
-    ///
-    /// When alt screen transitions (enter or exit), clients that bootstrapped
-    /// from a snapshot may have an empty inactive buffer. This event carries
-    /// a fresh ANSI snapshot of the now-active screen so clients can replace
-    /// their parser and show correct content.
-    ///
-    /// `rows` and `cols` are the shadow screen dimensions at snapshot time.
-    AltScreenScrollback {
-        /// ANSI snapshot bytes of the now-active screen.
-        data: Vec<u8>,
-        /// Shadow screen rows at snapshot time.
-        rows: u16,
-        /// Shadow screen columns at snapshot time.
-        cols: u16,
-    },
 }
 
 impl PtyEvent {
