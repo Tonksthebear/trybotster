@@ -186,8 +186,13 @@ fn build_ghostty_vt() {
         if !zig_lib_path.exists() {
             let status = Command::new("mise")
                 .args([
-                    "exec", "--", "zig", "build", "-Demit-lib-vt",
-                    "-Doptimize=ReleaseFast", "-Dsimd=false",
+                    "exec",
+                    "--",
+                    "zig",
+                    "build",
+                    "-Demit-lib-vt",
+                    "-Doptimize=ReleaseFast",
+                    "-Dsimd=false",
                 ])
                 .current_dir(ghostty_dir)
                 .env("DEVELOPER_DIR", "/Library/Developer/CommandLineTools")

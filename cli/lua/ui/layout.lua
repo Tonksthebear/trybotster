@@ -211,25 +211,15 @@ local function build_list_items()
 
         local item = { text = text }
 
-        -- Indent secondary/tertiary lines to align under name text.
-        local sub_indent
-        if agent.session_type == "agent" then
-          sub_indent = "   "
-        elseif agent.notification then
-          sub_indent = "  "
-        else
-          sub_indent = " "
-        end
-
-        -- Line 2: title (optional, only if present and different from primary)
+        -- Line 2: label (optional, only if different from primary name)
         local tert = session_title_text(agent, using_label)
         if tert then
-          item.secondary = sub_line(sub_indent, tert)
+          item.secondary = sub_line("  ", tert)
         end
         -- Line 3: spawn info (always)
         local spawn_parts = session_spawn_parts(agent)
         if #spawn_parts > 0 then
-          item.tertiary = sub_line(sub_indent, table.concat(spawn_parts, " · "))
+          item.tertiary = sub_line("  ", table.concat(spawn_parts, " · "))
         end
         items[#items+1] = item
       else

@@ -22,7 +22,7 @@ use anyhow::{bail, Context, Result};
 use tokio::sync::broadcast;
 
 use crate::agent::notification::AgentNotification;
-use crate::agent::pty::{PtyEvent, PromptMark};
+use crate::agent::pty::{PromptMark, PtyEvent};
 
 use super::protocol::*;
 use super::SpawnConfig;
@@ -343,7 +343,6 @@ fn session_reader(
                 }
 
                 // ── Structured events from session process (0x10-0x15) ──────
-
                 FRAME_TITLE_CHANGED => {
                     let title = String::from_utf8_lossy(&frame.payload).into_owned();
                     let _ = event_tx.send(PtyEvent::title_changed(title));
@@ -417,18 +416,16 @@ fn session_reader(
                 }
 
                 // ── Existing control frames ─────────────────────────────────
-
                 FRAME_PROCESS_EXITED => {
                     let exit_code = frame
                         .json::<serde_json::Value>()
                         .ok()
                         .and_then(|v| v["exit_code"].as_i64())
                         .map(|c| c as i32);
-                    let _ =
-                        hub_event_tx.send(crate::hub::events::HubEvent::SessionProcessExited {
-                            session_uuid: session_uuid.clone(),
-                            exit_code,
-                        });
+                    let _ = hub_event_tx.send(crate::hub::events::HubEvent::SessionProcessExited {
+                        session_uuid: session_uuid.clone(),
+                        exit_code,
+                    });
                     log::info!("[session-reader] process exited (code={:?})", exit_code);
                 }
 
@@ -465,8 +462,7 @@ fn decode_dual_screen_snapshot(payload: &[u8]) -> Vec<u8> {
         return payload.to_vec();
     }
 
-    let primary_len =
-        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let primary_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
 
     if 4 + primary_len > payload.len() {
         // Malformed envelope — treat as raw snapshot for backwards compatibility

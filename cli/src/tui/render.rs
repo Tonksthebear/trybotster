@@ -242,7 +242,15 @@ pub(super) fn render_terminal_panel(
         let is_scrolled = panel.is_scrolled();
 
         let rs = panel.render_state();
-        let widget = crate::TerminalWidget::new(rs).block(block);
+        let default_fg = panel
+            .foreground_color()
+            .unwrap_or(crate::terminal::Rgb::new(255, 255, 255));
+        let default_bg = panel
+            .background_color()
+            .unwrap_or(crate::terminal::Rgb::new(0, 0, 0));
+        let widget = crate::TerminalWidget::new(rs)
+            .default_colors(default_fg.into(), default_bg.into())
+            .block(block);
         let widget = if is_scrolled {
             widget.hide_cursor()
         } else {

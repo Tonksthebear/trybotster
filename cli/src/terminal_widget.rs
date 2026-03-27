@@ -11,7 +11,7 @@ use ratatui::{
 };
 
 use crate::ghostty_vt::{
-    self, GhosttyColorRgb, GhosttyCellWide, GhosttyRenderStateCursorVisualStyle, RenderState,
+    self, GhosttyCellWide, GhosttyColorRgb, GhosttyRenderStateCursorVisualStyle, RenderState,
 };
 
 /// Configuration for cursor rendering.
@@ -40,6 +40,8 @@ pub struct TerminalWidget<'a> {
     render_state: &'a RenderState,
     block: Option<Block<'a>>,
     cursor: CursorConfig,
+    default_fg: Option<GhosttyColorRgb>,
+    default_bg: Option<GhosttyColorRgb>,
 }
 
 impl std::fmt::Debug for TerminalWidget<'_> {
@@ -61,6 +63,8 @@ impl<'a> TerminalWidget<'a> {
             render_state,
             block: None,
             cursor: CursorConfig::default(),
+            default_fg: None,
+            default_bg: None,
         }
     }
 
@@ -73,6 +77,13 @@ impl<'a> TerminalWidget<'a> {
     /// Override cursor rendering configuration.
     pub fn cursor(mut self, cursor: CursorConfig) -> Self {
         self.cursor = cursor;
+        self
+    }
+
+    /// Override the terminal default foreground/background colors.
+    pub fn default_colors(mut self, fg: GhosttyColorRgb, bg: GhosttyColorRgb) -> Self {
+        self.default_fg = Some(fg);
+        self.default_bg = Some(bg);
         self
     }
 
@@ -93,8 +104,13 @@ impl Widget for TerminalWidget<'_> {
             area
         };
 
-        let default_fg = self.render_state.foreground_color();
-        let default_bg = self.render_state.background_color();
+        let default_fg = self
+            .default_fg
+            .unwrap_or_else(|| self.render_state.foreground_color());
+        let default_bg = self
+            .default_bg
+            .unwrap_or_else(|| self.render_state.background_color());
+        fill_area(inner_area, buf, default_fg, default_bg);
 
         if let Ok(mut iter) = self.render_state.iterator() {
             render_grid(&mut iter, inner_area, buf, default_fg, default_bg);
@@ -102,6 +118,25 @@ impl Widget for TerminalWidget<'_> {
 
         if self.cursor.show {
             render_cursor(self.render_state, inner_area, buf, &self.cursor);
+        }
+    }
+}
+
+fn fill_area(
+    area: Rect,
+    buf: &mut Buffer,
+    default_fg: GhosttyColorRgb,
+    default_bg: GhosttyColorRgb,
+) {
+    let style = Style::default()
+        .fg(ghostty_rgb_to_ratatui(default_fg))
+        .bg(ghostty_rgb_to_ratatui(default_bg));
+
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            let cell = &mut buf[(x, y)];
+            cell.set_symbol(" ");
+            cell.set_style(style);
         }
     }
 }
@@ -183,12 +218,7 @@ fn render_grid(
     }
 }
 
-fn render_cursor(
-    rs: &RenderState,
-    area: Rect,
-    buf: &mut Buffer,
-    cursor_config: &CursorConfig,
-) {
+fn render_cursor(rs: &RenderState, area: Rect, buf: &mut Buffer, cursor_config: &CursorConfig) {
     if !rs.cursor_visible() || !rs.cursor_in_viewport() {
         return;
     }
@@ -246,11 +276,13 @@ mod tests {
     use super::*;
     use crate::terminal::TerminalParser;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
     use ratatui::Terminal;
 
     fn make_render_state(parser: &mut TerminalParser) -> RenderState {
         let mut rs = RenderState::new().expect("render state creation");
-        rs.update(parser.terminal_mut()).expect("render state update");
+        rs.update(parser.terminal_mut())
+            .expect("render state update");
         rs
     }
 
@@ -293,6 +325,41 @@ mod tests {
                 f.render_widget(widget, f.area());
             })
             .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn test_render_empty_screen_uses_terminal_default_background() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut parser = TerminalParser::new(24, 80, 1000);
+        parser.terminal_mut().set_color_background(GhosttyColorRgb {
+            r: 0xF0,
+            g: 0xE0,
+            b: 0xD0,
+        });
+        let rs = make_render_state(&mut parser);
+        let default_fg = parser
+            .foreground_color()
+            .unwrap_or(crate::terminal::Rgb::new(255, 255, 255));
+        let default_bg = parser
+            .background_color()
+            .unwrap_or(crate::terminal::Rgb::new(0, 0, 0));
+
+        terminal
+            .draw(|f| {
+                let widget =
+                    TerminalWidget::new(&rs).default_colors(default_fg.into(), default_bg.into());
+                f.render_widget(widget, f.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(0xF0, 0xE0, 0xD0));
+        assert_eq!(buffer[(40, 12)].bg, Color::Rgb(0xF0, 0xE0, 0xD0));
     }
 
     #[test]

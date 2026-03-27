@@ -36,6 +36,10 @@
 
 // Rust guideline compliant 2026-02
 
+/// Shared cache of default terminal colors used to seed libghostty parsers.
+pub type ColorCache =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>;
+
 pub mod actions;
 pub mod guard;
 pub mod hot_reload;
@@ -68,6 +72,6 @@ pub use raw_input::{InputEvent, RawInputReader};
 #[doc(inline)]
 pub use render::{render, RenderContext, RenderResult};
 #[doc(inline)]
-pub use runner::{run_with_hub, TuiRunner};
+pub use runner::{probe_spawning_terminal_colors, run_with_hub, TuiRunner};
 #[doc(inline)]
 pub use screen::ScreenInfo;

@@ -555,9 +555,7 @@ impl WebRtcChannel {
                 if let Some(cached) =
                     self.cached_ice_servers(&cache_key, Self::ICE_CONFIG_STALE_FALLBACK_TTL)
                 {
-                    log::warn!(
-                        "[WebRTC] ICE config fetch failed, using stale cache: {e:#}"
-                    );
+                    log::warn!("[WebRTC] ICE config fetch failed, using stale cache: {e:#}");
                     Ok(cached)
                 } else {
                     Err(e)

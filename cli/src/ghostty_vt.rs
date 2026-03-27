@@ -41,6 +41,14 @@ pub struct GhosttyColorRgb {
     pub b: u8,
 }
 
+/// Color scheme value returned for CSI ? 996 n queries.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhosttyColorScheme {
+    Light = 0,
+    Dark = 1,
+}
+
 // ── Terminal options / creation ─────────────────────────────────────────────
 
 #[repr(C)]
@@ -110,6 +118,10 @@ enum GhosttyTerminalData {
     ColorBackground = 19,
     ColorCursor = 20,
     ColorPalette = 21,
+    ColorForegroundDefault = 22,
+    ColorBackgroundDefault = 23,
+    ColorCursorDefault = 24,
+    ColorPaletteDefault = 25,
 }
 
 #[repr(i32)]
@@ -150,11 +162,25 @@ enum GhosttyTerminalOption {
 
 // ── Callback function pointer types ────────────────────────────────────────
 
-type GhosttyTerminalWritePtyFn =
-    Option<unsafe extern "C" fn(terminal: GhosttyTerminalPtr, userdata: *mut c_void, data: *const u8, len: usize)>;
+type GhosttyTerminalWritePtyFn = Option<
+    unsafe extern "C" fn(
+        terminal: GhosttyTerminalPtr,
+        userdata: *mut c_void,
+        data: *const u8,
+        len: usize,
+    ),
+>;
 
 type GhosttyTerminalBellFn =
     Option<unsafe extern "C" fn(terminal: GhosttyTerminalPtr, userdata: *mut c_void)>;
+
+type GhosttyTerminalColorSchemeFn = Option<
+    unsafe extern "C" fn(
+        terminal: GhosttyTerminalPtr,
+        userdata: *mut c_void,
+        out_scheme: *mut GhosttyColorScheme,
+    ) -> bool,
+>;
 
 type GhosttyTerminalTitleChangedFn =
     Option<unsafe extern "C" fn(terminal: GhosttyTerminalPtr, userdata: *mut c_void)>;
@@ -162,14 +188,28 @@ type GhosttyTerminalTitleChangedFn =
 type GhosttyTerminalPwdChangedFn =
     Option<unsafe extern "C" fn(terminal: GhosttyTerminalPtr, userdata: *mut c_void)>;
 
-type GhosttyTerminalNotificationFn =
-    Option<unsafe extern "C" fn(terminal: GhosttyTerminalPtr, userdata: *mut c_void, title: *const u8, title_len: usize, body: *const u8, body_len: usize)>;
+type GhosttyTerminalNotificationFn = Option<
+    unsafe extern "C" fn(
+        terminal: GhosttyTerminalPtr,
+        userdata: *mut c_void,
+        title: *const u8,
+        title_len: usize,
+        body: *const u8,
+        body_len: usize,
+    ),
+>;
 
 type GhosttyTerminalSemanticPromptFn =
     Option<unsafe extern "C" fn(terminal: GhosttyTerminalPtr, userdata: *mut c_void, mark: u8)>;
 
-type GhosttyTerminalModeChangedFn =
-    Option<unsafe extern "C" fn(terminal: GhosttyTerminalPtr, userdata: *mut c_void, mode: u16, enabled: bool)>;
+type GhosttyTerminalModeChangedFn = Option<
+    unsafe extern "C" fn(
+        terminal: GhosttyTerminalPtr,
+        userdata: *mut c_void,
+        mode: u16,
+        enabled: bool,
+    ),
+>;
 
 type GhosttyTerminalKittyKeyboardChangedFn =
     Option<unsafe extern "C" fn(terminal: GhosttyTerminalPtr, userdata: *mut c_void)>;
@@ -617,11 +657,7 @@ extern "C" {
         data: GhosttyCellData,
         out: *mut c_void,
     ) -> GhosttyResult;
-    fn ghostty_row_get(
-        row: GhosttyRow,
-        data: GhosttyRowData,
-        out: *mut c_void,
-    ) -> GhosttyResult;
+    fn ghostty_row_get(row: GhosttyRow, data: GhosttyRowData, out: *mut c_void) -> GhosttyResult;
 
     // Render state
     fn ghostty_render_state_new(
@@ -673,10 +709,7 @@ extern "C" {
     ) -> GhosttyResult;
     fn ghostty_render_state_row_cells_free(cells: GhosttyRowCellsPtr);
     fn ghostty_render_state_row_cells_next(cells: GhosttyRowCellsPtr) -> bool;
-    fn ghostty_render_state_row_cells_select(
-        cells: GhosttyRowCellsPtr,
-        x: u16,
-    ) -> GhosttyResult;
+    fn ghostty_render_state_row_cells_select(cells: GhosttyRowCellsPtr, x: u16) -> GhosttyResult;
     fn ghostty_render_state_row_cells_get(
         cells: GhosttyRowCellsPtr,
         data: GhosttyRenderStateRowCellsData,
@@ -739,6 +772,54 @@ impl std::fmt::Debug for Terminal {
 // the handle, and we enforce &mut self for mutations.
 unsafe impl Send for Terminal {}
 
+unsafe extern "C" fn builtin_color_scheme_trampoline(
+    terminal: GhosttyTerminalPtr,
+    _userdata: *mut c_void,
+    out_scheme: *mut GhosttyColorScheme,
+) -> bool {
+    if out_scheme.is_null() {
+        return false;
+    }
+
+    let mut background = GhosttyColorRgb { r: 0, g: 0, b: 0 };
+    let background_ptr = &mut background as *mut GhosttyColorRgb as *mut c_void;
+    let result = unsafe {
+        ghostty_terminal_get(
+            terminal,
+            GhosttyTerminalData::ColorBackgroundDefault,
+            background_ptr,
+        )
+    };
+    let result = if result == GhosttyResult::Success {
+        result
+    } else {
+        unsafe {
+            ghostty_terminal_get(
+                terminal,
+                GhosttyTerminalData::ColorBackground,
+                background_ptr,
+            )
+        }
+    };
+
+    if result != GhosttyResult::Success {
+        return false;
+    }
+
+    let luma = (u32::from(background.r) * 299)
+        + (u32::from(background.g) * 587)
+        + (u32::from(background.b) * 114);
+    let scheme = if luma / 1000 >= 128 {
+        GhosttyColorScheme::Light
+    } else {
+        GhosttyColorScheme::Dark
+    };
+    unsafe {
+        *out_scheme = scheme;
+    }
+    true
+}
+
 impl Terminal {
     /// Create a new terminal with the given dimensions.
     pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Result<Self, &'static str> {
@@ -774,8 +855,7 @@ impl Terminal {
 
     /// Resize the terminal to new dimensions.
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), &'static str> {
-        let result =
-            unsafe { ghostty_terminal_resize(self.handle, cols, rows, 0, 0) };
+        let result = unsafe { ghostty_terminal_resize(self.handle, cols, rows, 0, 0) };
         match result {
             GhosttyResult::Success => Ok(()),
             _ => Err("ghostty_terminal_resize: failed"),
@@ -792,8 +872,7 @@ impl Terminal {
     /// Query a terminal mode by its packed GhosttyMode constant.
     pub fn mode_get(&self, mode: GhosttyMode) -> bool {
         let mut out = false;
-        let result =
-            unsafe { ghostty_terminal_mode_get(self.handle, mode, &mut out) };
+        let result = unsafe { ghostty_terminal_mode_get(self.handle, mode, &mut out) };
         result == GhosttyResult::Success && out
     }
 
@@ -944,6 +1023,36 @@ impl Terminal {
         self.get_string(GhosttyTerminalData::Pwd)
     }
 
+    /// Effective foreground color (override or default), if set.
+    pub fn foreground_color(&self) -> Option<GhosttyColorRgb> {
+        self.get_color(GhosttyTerminalData::ColorForeground)
+    }
+
+    /// Effective background color (override or default), if set.
+    pub fn background_color(&self) -> Option<GhosttyColorRgb> {
+        self.get_color(GhosttyTerminalData::ColorBackground)
+    }
+
+    /// Default foreground color, ignoring OSC overrides, if set.
+    pub fn foreground_color_default(&self) -> Option<GhosttyColorRgb> {
+        self.get_color(GhosttyTerminalData::ColorForegroundDefault)
+    }
+
+    /// Default background color, ignoring OSC overrides, if set.
+    pub fn background_color_default(&self) -> Option<GhosttyColorRgb> {
+        self.get_color(GhosttyTerminalData::ColorBackgroundDefault)
+    }
+
+    /// Effective cursor color (override or default), if set.
+    pub fn cursor_color(&self) -> Option<GhosttyColorRgb> {
+        self.get_color(GhosttyTerminalData::ColorCursor)
+    }
+
+    /// Default cursor color, ignoring OSC overrides, if set.
+    pub fn cursor_color_default(&self) -> Option<GhosttyColorRgb> {
+        self.get_color(GhosttyTerminalData::ColorCursorDefault)
+    }
+
     /// Read a string data field from the terminal.
     fn get_string(&self, data: GhosttyTerminalData) -> String {
         let mut s = GhosttyString {
@@ -962,6 +1071,19 @@ impl Terminal {
         }
         let bytes = unsafe { std::slice::from_raw_parts(s.ptr, s.len) };
         String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    /// Read a color data field from the terminal.
+    fn get_color(&self, data: GhosttyTerminalData) -> Option<GhosttyColorRgb> {
+        let mut color = GhosttyColorRgb { r: 0, g: 0, b: 0 };
+        let result = unsafe {
+            ghostty_terminal_get(
+                self.handle,
+                data,
+                &mut color as *mut GhosttyColorRgb as *mut c_void,
+            )
+        };
+        (result == GhosttyResult::Success).then_some(color)
     }
 
     // ── Effect callbacks ───────────────────────────────────────────────
@@ -1005,6 +1127,27 @@ impl Terminal {
                 GhosttyTerminalOption::Bell,
                 cb.map_or(ptr::null(), |f| f as *const c_void),
             );
+        }
+    }
+
+    /// Set the color-scheme callback (CSI ? 996 n).
+    ///
+    /// # Safety
+    /// The function pointer must be valid and the userdata must be set.
+    pub unsafe fn set_color_scheme_callback(&mut self, cb: GhosttyTerminalColorSchemeFn) {
+        unsafe {
+            ghostty_terminal_set(
+                self.handle,
+                GhosttyTerminalOption::ColorScheme,
+                cb.map_or(ptr::null(), |f| f as *const c_void),
+            );
+        }
+    }
+
+    /// Answer Ghostty color-scheme queries from the terminal's default background.
+    pub unsafe fn enable_builtin_color_scheme_callback(&mut self) {
+        unsafe {
+            self.set_color_scheme_callback(Some(builtin_color_scheme_trampoline));
         }
     }
 
@@ -1082,7 +1225,10 @@ impl Terminal {
     ///
     /// # Safety
     /// The function pointer must be valid and the userdata must be set.
-    pub unsafe fn set_kitty_keyboard_changed_callback(&mut self, cb: GhosttyTerminalKittyKeyboardChangedFn) {
+    pub unsafe fn set_kitty_keyboard_changed_callback(
+        &mut self,
+        cb: GhosttyTerminalKittyKeyboardChangedFn,
+    ) {
         unsafe {
             ghostty_terminal_set(
                 self.handle,
@@ -1178,8 +1324,7 @@ impl Terminal {
             },
         };
         let mut gref = GhosttyGridRef::new_sized();
-        let result =
-            unsafe { ghostty_terminal_grid_ref(self.handle, point, &mut gref) };
+        let result = unsafe { ghostty_terminal_grid_ref(self.handle, point, &mut gref) };
         if result == GhosttyResult::Success {
             Some(gref)
         } else {
@@ -1196,8 +1341,7 @@ impl Terminal {
             },
         };
         let mut gref = GhosttyGridRef::new_sized();
-        let result =
-            unsafe { ghostty_terminal_grid_ref(self.handle, point, &mut gref) };
+        let result = unsafe { ghostty_terminal_grid_ref(self.handle, point, &mut gref) };
         if result == GhosttyResult::Success {
             Some(gref)
         } else {
@@ -1397,8 +1541,7 @@ impl RenderState {
 
     /// Update from a terminal. Call this before reading render data.
     pub fn update(&mut self, terminal: &mut Terminal) -> Result<(), &'static str> {
-        let result =
-            unsafe { ghostty_render_state_update(self.handle, terminal.handle()) };
+        let result = unsafe { ghostty_render_state_update(self.handle, terminal.handle()) };
         match result {
             GhosttyResult::Success => Ok(()),
             _ => Err("ghostty_render_state_update: failed"),
@@ -1415,11 +1558,13 @@ impl RenderState {
         let mut rows: u16 = 0;
         unsafe {
             ghostty_render_state_get(
-                self.handle, GhosttyRenderStateData::Cols,
+                self.handle,
+                GhosttyRenderStateData::Cols,
                 &mut cols as *mut u16 as *mut c_void,
             );
             ghostty_render_state_get(
-                self.handle, GhosttyRenderStateData::Rows,
+                self.handle,
+                GhosttyRenderStateData::Rows,
                 &mut rows as *mut u16 as *mut c_void,
             );
         }
@@ -1431,7 +1576,8 @@ impl RenderState {
         let mut style = GhosttyRenderStateCursorVisualStyle::Block;
         unsafe {
             ghostty_render_state_get(
-                self.handle, GhosttyRenderStateData::CursorVisualStyle,
+                self.handle,
+                GhosttyRenderStateData::CursorVisualStyle,
                 &mut style as *mut GhosttyRenderStateCursorVisualStyle as *mut c_void,
             );
         }
@@ -1443,7 +1589,8 @@ impl RenderState {
         let mut visible = false;
         unsafe {
             ghostty_render_state_get(
-                self.handle, GhosttyRenderStateData::CursorVisible,
+                self.handle,
+                GhosttyRenderStateData::CursorVisible,
                 &mut visible as *mut bool as *mut c_void,
             );
         }
@@ -1455,7 +1602,8 @@ impl RenderState {
         let mut has_value = false;
         unsafe {
             ghostty_render_state_get(
-                self.handle, GhosttyRenderStateData::CursorViewportHasValue,
+                self.handle,
+                GhosttyRenderStateData::CursorViewportHasValue,
                 &mut has_value as *mut bool as *mut c_void,
             );
         }
@@ -1468,11 +1616,13 @@ impl RenderState {
         let mut y: u16 = 0;
         unsafe {
             ghostty_render_state_get(
-                self.handle, GhosttyRenderStateData::CursorViewportX,
+                self.handle,
+                GhosttyRenderStateData::CursorViewportX,
                 &mut x as *mut u16 as *mut c_void,
             );
             ghostty_render_state_get(
-                self.handle, GhosttyRenderStateData::CursorViewportY,
+                self.handle,
+                GhosttyRenderStateData::CursorViewportY,
                 &mut y as *mut u16 as *mut c_void,
             );
         }
@@ -1481,10 +1631,15 @@ impl RenderState {
 
     /// Default foreground color.
     pub fn foreground_color(&self) -> GhosttyColorRgb {
-        let mut color = GhosttyColorRgb { r: 255, g: 255, b: 255 };
+        let mut color = GhosttyColorRgb {
+            r: 255,
+            g: 255,
+            b: 255,
+        };
         unsafe {
             ghostty_render_state_get(
-                self.handle, GhosttyRenderStateData::ColorForeground,
+                self.handle,
+                GhosttyRenderStateData::ColorForeground,
                 &mut color as *mut GhosttyColorRgb as *mut c_void,
             );
         }
@@ -1496,7 +1651,8 @@ impl RenderState {
         let mut color = GhosttyColorRgb { r: 0, g: 0, b: 0 };
         unsafe {
             ghostty_render_state_get(
-                self.handle, GhosttyRenderStateData::ColorBackground,
+                self.handle,
+                GhosttyRenderStateData::ColorBackground,
                 &mut color as *mut GhosttyColorRgb as *mut c_void,
             );
         }
@@ -1536,8 +1692,7 @@ impl RenderIterator {
         }
 
         let mut row_cells: GhosttyRowCellsPtr = ptr::null_mut();
-        let result =
-            unsafe { ghostty_render_state_row_cells_new(ptr::null(), &mut row_cells) };
+        let result = unsafe { ghostty_render_state_row_cells_new(ptr::null(), &mut row_cells) };
         if result != GhosttyResult::Success {
             unsafe { ghostty_render_state_row_iterator_free(row_iterator) };
             return Err("ghostty_render_state_row_cells_new: failed");
@@ -1553,7 +1708,10 @@ impl RenderIterator {
             );
         }
 
-        Ok(RenderIterator { row_iterator, row_cells })
+        Ok(RenderIterator {
+            row_iterator,
+            row_cells,
+        })
     }
 
     /// Advance to the next row. Returns false when past the last row.
@@ -1566,7 +1724,8 @@ impl RenderIterator {
         let mut row: GhosttyRow = 0;
         unsafe {
             ghostty_render_state_row_get(
-                self.row_iterator, GhosttyRenderStateRowData::Raw,
+                self.row_iterator,
+                GhosttyRenderStateRowData::Raw,
                 &mut row as *mut GhosttyRow as *mut c_void,
             );
         }
@@ -1577,7 +1736,8 @@ impl RenderIterator {
     pub fn begin_cells(&mut self) {
         unsafe {
             ghostty_render_state_row_get(
-                self.row_iterator, GhosttyRenderStateRowData::Cells,
+                self.row_iterator,
+                GhosttyRenderStateRowData::Cells,
                 &mut self.row_cells as *mut GhosttyRowCellsPtr as *mut c_void,
             );
         }
@@ -1593,7 +1753,8 @@ impl RenderIterator {
         let mut cell: GhosttyCell = 0;
         unsafe {
             ghostty_render_state_row_cells_get(
-                self.row_cells, GhosttyRenderStateRowCellsData::Raw,
+                self.row_cells,
+                GhosttyRenderStateRowCellsData::Raw,
                 &mut cell as *mut GhosttyCell as *mut c_void,
             );
         }
@@ -1605,7 +1766,8 @@ impl RenderIterator {
         let mut style = GhosttyStyle::default_sized();
         unsafe {
             ghostty_render_state_row_cells_get(
-                self.row_cells, GhosttyRenderStateRowCellsData::Style,
+                self.row_cells,
+                GhosttyRenderStateRowCellsData::Style,
                 &mut style as *mut GhosttyStyle as *mut c_void,
             );
         }
@@ -1617,7 +1779,8 @@ impl RenderIterator {
         let mut len: u32 = 0;
         unsafe {
             ghostty_render_state_row_cells_get(
-                self.row_cells, GhosttyRenderStateRowCellsData::GraphemesLen,
+                self.row_cells,
+                GhosttyRenderStateRowCellsData::GraphemesLen,
                 &mut len as *mut u32 as *mut c_void,
             );
         }
@@ -1627,7 +1790,8 @@ impl RenderIterator {
         let mut buf = vec![0u32; len as usize];
         unsafe {
             ghostty_render_state_row_cells_get(
-                self.row_cells, GhosttyRenderStateRowCellsData::GraphemesBuf,
+                self.row_cells,
+                GhosttyRenderStateRowCellsData::GraphemesBuf,
                 buf.as_mut_ptr() as *mut c_void,
             );
         }
@@ -1641,11 +1805,16 @@ impl RenderIterator {
         let mut color = GhosttyColorRgb { r: 0, g: 0, b: 0 };
         let result = unsafe {
             ghostty_render_state_row_cells_get(
-                self.row_cells, GhosttyRenderStateRowCellsData::FgColor,
+                self.row_cells,
+                GhosttyRenderStateRowCellsData::FgColor,
                 &mut color as *mut GhosttyColorRgb as *mut c_void,
             )
         };
-        if result == GhosttyResult::Success { Some(color) } else { None }
+        if result == GhosttyResult::Success {
+            Some(color)
+        } else {
+            None
+        }
     }
 
     /// Get the resolved background color for the current cell.
@@ -1653,11 +1822,16 @@ impl RenderIterator {
         let mut color = GhosttyColorRgb { r: 0, g: 0, b: 0 };
         let result = unsafe {
             ghostty_render_state_row_cells_get(
-                self.row_cells, GhosttyRenderStateRowCellsData::BgColor,
+                self.row_cells,
+                GhosttyRenderStateRowCellsData::BgColor,
                 &mut color as *mut GhosttyColorRgb as *mut c_void,
             )
         };
-        if result == GhosttyResult::Success { Some(color) } else { None }
+        if result == GhosttyResult::Success {
+            Some(color)
+        } else {
+            None
+        }
     }
 }
 
@@ -1802,22 +1976,40 @@ mod tests {
 
         // Default state: cursor visible, no alt screen, no bracketed paste
         assert!(!term.cursor_hidden(), "cursor should be visible by default");
-        assert!(!term.alt_screen_active(), "alt screen should be off by default");
-        assert!(!term.bracketed_paste(), "bracketed paste should be off by default");
+        assert!(
+            !term.alt_screen_active(),
+            "alt screen should be off by default"
+        );
+        assert!(
+            !term.bracketed_paste(),
+            "bracketed paste should be off by default"
+        );
         assert!(!term.kitty_enabled(), "kitty should be off by default");
-        assert!(!term.focus_reporting(), "focus reporting should be off by default");
+        assert!(
+            !term.focus_reporting(),
+            "focus reporting should be off by default"
+        );
 
         // Enable bracketed paste
         term.write(b"\x1b[?2004h");
-        assert!(term.bracketed_paste(), "bracketed paste should be on after CSI ?2004h");
+        assert!(
+            term.bracketed_paste(),
+            "bracketed paste should be on after CSI ?2004h"
+        );
 
         // Enter alt screen
         term.write(b"\x1b[?1049h");
-        assert!(term.alt_screen_active(), "alt screen should be on after CSI ?1049h");
+        assert!(
+            term.alt_screen_active(),
+            "alt screen should be on after CSI ?1049h"
+        );
 
         // Hide cursor
         term.write(b"\x1b[?25l");
-        assert!(term.cursor_hidden(), "cursor should be hidden after CSI ?25l");
+        assert!(
+            term.cursor_hidden(),
+            "cursor should be hidden after CSI ?25l"
+        );
     }
 
     #[test]
@@ -1838,7 +2030,11 @@ mod tests {
 
         // Enable normal mouse tracking
         term.write(b"\x1b[?1000h");
-        assert_ne!(term.mouse_mode(), 0, "mouse mode should be non-zero after enable");
+        assert_ne!(
+            term.mouse_mode(),
+            0,
+            "mouse mode should be non-zero after enable"
+        );
         assert!(term.mouse_tracking(), "mouse_tracking should be true");
     }
 

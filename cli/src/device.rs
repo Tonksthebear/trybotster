@@ -357,7 +357,6 @@ impl Device {
 
         Ok(())
     }
-
 }
 
 #[cfg(test)]

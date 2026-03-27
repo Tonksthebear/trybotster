@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 const MAX_BUFFER_BYTES: usize = 512;
@@ -55,7 +54,6 @@ impl TerminalProfile {
             && self.default_background.is_some()
             && self.default_cursor_color.is_some()
     }
-
 }
 
 #[derive(Debug, Default)]
@@ -81,7 +79,10 @@ impl TerminalProfileStore {
             "fg={} bg={} cursor={} complete={}",
             format_optional_seq(self.hub_profile.get_reply(TerminalProbe::DefaultForeground)),
             format_optional_seq(self.hub_profile.get_reply(TerminalProbe::DefaultBackground)),
-            format_optional_seq(self.hub_profile.get_reply(TerminalProbe::DefaultCursorColor)),
+            format_optional_seq(
+                self.hub_profile
+                    .get_reply(TerminalProbe::DefaultCursorColor)
+            ),
             self.hub_profile.is_complete()
         )
     }
@@ -97,7 +98,10 @@ impl TerminalProfileStore {
 
     pub(crate) fn observe_peer_input(&mut self, peer_id: &str, data: &[u8]) -> Vec<Vec<u8>> {
         let should_parse = {
-            let buffer = self.peer_input_buffers.entry(peer_id.to_string()).or_default();
+            let buffer = self
+                .peer_input_buffers
+                .entry(peer_id.to_string())
+                .or_default();
             if buffer.is_empty() && !data.iter().any(|byte| *byte == ESC) {
                 false
             } else {
@@ -191,11 +195,7 @@ impl TerminalProfileStore {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn observe_output(
-        &mut self,
-        session_uuid: &str,
-        data: &[u8],
-    ) -> Vec<ObservedProbe> {
+    pub(crate) fn observe_output(&mut self, session_uuid: &str, data: &[u8]) -> Vec<ObservedProbe> {
         let buffer = self
             .output_buffers
             .entry(session_uuid.to_string())
@@ -225,7 +225,10 @@ impl TerminalProfileStore {
     /// Returns a shared `Arc<Mutex<HashMap>>` that all `HubEventListener`
     /// instances reference. When a `ColorRequest` fires, the listener looks
     /// up the cached RGB value and formats the response immediately.
-    pub(crate) fn shared_color_cache(&self) -> std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>> {
+    pub(crate) fn shared_color_cache(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>
+    {
         /// Foreground dynamic color index in alacritty's color table.
         const IDX_FOREGROUND: usize = 256;
         /// Background dynamic color index in alacritty's color table.
@@ -246,6 +249,36 @@ impl TerminalProfileStore {
             }
         }
         std::sync::Arc::new(std::sync::Mutex::new(colors))
+    }
+
+    /// Refresh an existing shared color cache from the current hub profile.
+    pub(crate) fn refresh_shared_color_cache(
+        &self,
+        cache: &std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>,
+        >,
+    ) {
+        /// Foreground dynamic color index in alacritty's color table.
+        const IDX_FOREGROUND: usize = 256;
+        /// Background dynamic color index in alacritty's color table.
+        const IDX_BACKGROUND: usize = 257;
+        /// Cursor dynamic color index in alacritty's color table.
+        const IDX_CURSOR: usize = 258;
+
+        if let Ok(mut colors) = cache.lock() {
+            colors.clear();
+            for (probe, index) in [
+                (TerminalProbe::DefaultForeground, IDX_FOREGROUND),
+                (TerminalProbe::DefaultBackground, IDX_BACKGROUND),
+                (TerminalProbe::DefaultCursorColor, IDX_CURSOR),
+            ] {
+                if let Some(reply) = self.hub_profile.get_reply(probe) {
+                    if let Some(rgb) = parse_rgb_from_osc_reply(reply) {
+                        colors.insert(index, rgb);
+                    }
+                }
+            }
+        }
     }
 
     /// Returns OSC probe bytes to inject into a client's output stream if the
@@ -401,7 +434,6 @@ impl TerminalProfileStore {
         self.input_buffers
             .retain(|key, _| !key.starts_with(&prefix));
     }
-
 }
 
 impl TerminalProbe {
@@ -562,18 +594,10 @@ pub(crate) fn describe_probe_sequences(data: &[u8]) -> Vec<String> {
         .into_iter()
         .filter_map(|seq| {
             if let Some(probe) = classify_osc_query(&seq) {
-                return Some(format!(
-                    "query:{}:{}",
-                    probe.label(),
-                    format_seq(&seq)
-                ));
+                return Some(format!("query:{}:{}", probe.label(), format_seq(&seq)));
             }
             if let Some((probe, reply)) = classify_osc_reply(&seq) {
-                return Some(format!(
-                    "reply:{}:{}",
-                    probe.label(),
-                    format_seq(&reply)
-                ));
+                return Some(format!("reply:{}:{}", probe.label(), format_seq(&reply)));
             }
             None
         })
@@ -581,8 +605,7 @@ pub(crate) fn describe_probe_sequences(data: &[u8]) -> Vec<String> {
 }
 
 fn format_optional_seq(data: Option<&[u8]>) -> String {
-    data.map(format_seq)
-        .unwrap_or_else(|| "<none>".to_string())
+    data.map(format_seq).unwrap_or_else(|| "<none>".to_string())
 }
 
 fn format_seq(data: &[u8]) -> String {
@@ -686,9 +709,7 @@ mod tests {
     fn extracts_split_osc_queries_from_output() {
         let mut store = TerminalProfileStore::default();
 
-        assert!(store
-            .observe_output("sess-1", b"\x1b]10;?")
-            .is_empty());
+        assert!(store.observe_output("sess-1", b"\x1b]10;?").is_empty());
 
         let probes = store.observe_output("sess-1", b"\x07hello");
         assert_eq!(probes.len(), 1);
@@ -726,10 +747,7 @@ mod tests {
     fn observe_peer_input_updates_hub_fallback() {
         let mut store = TerminalProfileStore::default();
 
-        let learned = store.observe_peer_input(
-            "browser-a",
-            b"\x1b]11;rgb:1111/2222/3333\x07",
-        );
+        let learned = store.observe_peer_input("browser-a", b"\x1b]11;rgb:1111/2222/3333\x07");
 
         assert_eq!(learned, vec![b"\x1b]11;rgb:1111/2222/3333\x07".to_vec()]);
         assert_eq!(
@@ -743,7 +761,10 @@ mod tests {
         let mut store = TerminalProfileStore::default();
 
         store.observe_output("sess-1", b"\x1b]11;?\x07");
-        assert!(store.output_buffers.get("sess-1").is_none() || store.output_buffers.get("sess-1").unwrap().is_empty());
+        assert!(
+            store.output_buffers.get("sess-1").is_none()
+                || store.output_buffers.get("sess-1").unwrap().is_empty()
+        );
 
         store.clear_session("sess-1");
 
