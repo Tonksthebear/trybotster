@@ -1,7 +1,7 @@
 //! Tests for the per-session process architecture.
 //!
-//! Covers: protocol encode/decode, snapshot survival across resize,
-//! PtyHandle session-backed paths, and recovery flows.
+//! Covers: protocol encode/decode, session-backed PtyHandle paths,
+//! hub manifest serialization, and socket path formatting.
 
 #[cfg(test)]
 mod protocol_tests {
@@ -125,11 +125,9 @@ mod pty_handle_tests {
 
     use tokio::sync::broadcast;
 
-    use crate::agent::pty::PtySession;
     use crate::hub::agent_handle::PtyHandle;
-    use crate::terminal::TerminalParser;
 
-    /// Create a session-backed PtyHandle for testing (no shadow screen).
+    /// Create a session-backed PtyHandle for testing.
     ///
     /// Snapshots return empty since there's no session process to RPC to.
     fn create_session_backed_pty(rows: u16, cols: u16) -> PtyHandle {
@@ -153,24 +151,6 @@ mod pty_handle_tests {
         )
     }
 
-    /// Create a local PtyHandle with shadow screen for snapshot tests.
-    fn create_local_pty(rows: u16, cols: u16) -> (PtyHandle, Arc<Mutex<TerminalParser>>) {
-        let pty_session = PtySession::new(rows, cols);
-        let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
-            pty_session.get_direct_access();
-        std::mem::forget(pty_session);
-        let handle = PtyHandle::new(
-            event_tx,
-            shared_state,
-            shadow_screen.clone(),
-            kitty_enabled,
-            cursor_visible,
-            resize_pending,
-            None,
-        );
-        (handle, shadow_screen)
-    }
-
     #[test]
     fn session_backed_handle_is_session_backed() {
         let handle = create_session_backed_pty(24, 80);
@@ -184,163 +164,22 @@ mod pty_handle_tests {
     }
 
     #[test]
-    fn snapshot_from_empty_screen() {
-        let (handle, _) = create_local_pty(24, 80);
+    fn session_backed_snapshot_returns_empty_without_session() {
+        let handle = create_session_backed_pty(24, 80);
         let snapshot = handle.get_snapshot();
         assert!(
-            !snapshot.is_empty(),
-            "even an empty screen produces a snapshot"
-        );
-        assert!(
-            snapshot.len() < 10000,
-            "empty screen snapshot should be reasonable size, got {} bytes",
-            snapshot.len()
+            snapshot.is_empty(),
+            "session-backed handle without session should return empty snapshot"
         );
     }
 
     #[test]
-    fn snapshot_after_feeding_content() {
-        let (handle, shadow_screen) = create_local_pty(24, 80);
-
-        {
-            let mut parser = shadow_screen.lock().unwrap();
-            parser.process(b"Hello, World!\r\nSecond line here.\r\nThird line.\r\n");
-        }
-
-        let snapshot = handle.get_snapshot();
-        let snapshot_str = String::from_utf8_lossy(&snapshot);
-        assert!(
-            snapshot_str.contains("Hello, World!"),
-            "snapshot should contain fed content, got: {}",
-            snapshot_str
-        );
-        assert!(
-            snapshot_str.contains("Second line"),
-            "snapshot should contain second line"
-        );
-    }
-
-    #[test]
-    fn snapshot_survives_resize_direct() {
-        let (handle, shadow_screen) = create_local_pty(24, 80);
-
-        {
-            let mut parser = shadow_screen.lock().unwrap();
-            parser.process(b"\x1b[H");
-            parser.process(b"user@host:~$ ls -la\r\n");
-            parser.process(b"total 42\r\n");
-            parser.process(b"drwxr-xr-x  5 user user  160 Mar 24 10:00 .\r\n");
-            parser.process(b"drwxr-xr-x 30 user user  960 Mar 24 09:00 ..\r\n");
-            parser.process(b"-rw-r--r--  1 user user 1234 Mar 24 10:00 file.txt\r\n");
-            parser.process(b"user@host:~$ ");
-        }
-
-        let before_snapshot = handle.get_snapshot();
-        let before_str = String::from_utf8_lossy(&before_snapshot);
-        assert!(
-            before_str.contains("file.txt"),
-            "content should be present before resize"
-        );
-
-        handle.resize_direct(24, 80);
-
-        let after_snapshot = handle.get_snapshot();
-        let after_str = String::from_utf8_lossy(&after_snapshot);
-        assert!(
-            after_str.contains("file.txt"),
-            "content must survive resize_direct! Got: {}",
-            after_str
-        );
-        assert!(
-            after_str.contains("ls -la"),
-            "command must survive resize_direct"
-        );
-    }
-
-    #[test]
-    fn snapshot_survives_resize_to_different_dimensions() {
-        let (handle, shadow_screen) = create_local_pty(24, 80);
-
-        {
-            let mut parser = shadow_screen.lock().unwrap();
-            parser.process(b"IMPORTANT_CONTENT\r\n");
-            parser.process(b"MORE_DATA_HERE\r\n");
-        }
-
-        let before = handle.get_snapshot();
-        assert!(String::from_utf8_lossy(&before).contains("IMPORTANT_CONTENT"));
-
-        handle.resize_direct(24, 79);
-        handle.resize_direct(24, 80);
-
-        let after = handle.get_snapshot();
-        assert!(
-            String::from_utf8_lossy(&after).contains("IMPORTANT_CONTENT"),
-            "content must survive resize bounce to different dimensions"
-        );
-    }
-
-    #[test]
-    fn alt_screen_snapshot_survives_resize() {
-        let (handle, shadow_screen) = create_local_pty(24, 80);
-
-        {
-            let mut parser = shadow_screen.lock().unwrap();
-            parser.process(b"\x1b[?1049h");
-            parser.process(b"\x1b[H");
-            parser.process(b"ALT_SCREEN_CONTENT\r\n");
-            parser.process(b"Line 2 in alt screen\r\n");
-        }
-
-        let before = handle.get_snapshot();
-        let before_str = String::from_utf8_lossy(&before);
-        assert!(
-            before_str.contains("ALT_SCREEN_CONTENT"),
-            "alt-screen content should be in snapshot before resize"
-        );
-
-        handle.resize_direct(24, 79);
-        handle.resize_direct(24, 80);
-
-        let after = handle.get_snapshot();
-        let after_str = String::from_utf8_lossy(&after);
-        assert!(
-            after_str.contains("ALT_SCREEN_CONTENT"),
-            "alt-screen content must survive resize! Got: {}",
-            after_str
-        );
-    }
-
-    #[test]
-    fn get_snapshot_returns_content_for_local() {
-        let (handle, shadow_screen) = create_local_pty(24, 80);
-
-        {
-            let mut parser = shadow_screen.lock().unwrap();
-            parser.process(b"Some content\r\n");
-        }
-
-        let snapshot = handle.get_snapshot();
-        let snap_str = String::from_utf8_lossy(&snapshot);
-        assert!(
-            snap_str.contains("Some content"),
-            "get_snapshot should return content for local handles"
-        );
-    }
-
-    #[test]
-    fn subscribe_and_snapshot_returns_content() {
-        let (handle, shadow_screen) = create_local_pty(24, 80);
-
-        {
-            let mut parser = shadow_screen.lock().unwrap();
-            parser.process(b"Snapshot test content\r\n");
-        }
-
+    fn session_backed_snapshot_and_subscribe() {
+        let handle = create_session_backed_pty(24, 80);
         let (snapshot, kitty, rows, cols, _rx) = handle.snapshot_and_subscribe();
         assert!(
-            String::from_utf8_lossy(&snapshot).contains("Snapshot test"),
-            "snapshot_and_subscribe should return content"
+            snapshot.is_empty(),
+            "no session process means empty snapshot"
         );
         assert!(!kitty);
         assert_eq!(rows, 24);
@@ -348,14 +187,13 @@ mod pty_handle_tests {
     }
 
     #[test]
-    fn session_backed_snapshot_returns_empty_without_session() {
+    fn session_backed_resize_without_connection() {
         let handle = create_session_backed_pty(24, 80);
-        // No session process connected, so snapshot should be empty
-        let snapshot = handle.get_snapshot();
-        assert!(
-            snapshot.is_empty(),
-            "session-backed handle without session should return empty snapshot"
-        );
+        // Resize with no session connection should not panic
+        handle.resize_direct(30, 120);
+        // Shared dimensions are updated even without a session connection
+        // (the session RPC fails silently, but dims track the requested size)
+        assert_eq!(handle.dims(), (30, 120));
     }
 }
 
@@ -445,4 +283,3 @@ mod socket_path_tests {
         );
     }
 }
-

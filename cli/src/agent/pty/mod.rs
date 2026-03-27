@@ -1,8 +1,8 @@
 //! PTY session management with event-driven broadcasting.
 //!
 //! This module provides pseudo-terminal (PTY) session handling with a pub/sub
-//! architecture. PTY sessions broadcast events to connected clients, and each
-//! client maintains its own terminal state.
+//! architecture. All PTY sessions are backed by a per-session process that
+//! owns the terminal parser and provides snapshots via RPC.
 //!
 //! # Architecture
 //!
@@ -11,22 +11,13 @@
 //!  ├── master_pty: MasterPty (for resizing)
 //!  ├── writer: Write (for input)
 //!  ├── child: Child (spawned process)
-//!  ├── shadow_screen: Arc<Mutex<TerminalParser>>
 //!  └── event_tx: broadcast::Sender<PtyEvent> (output + notification broadcast)
 //! ```
 //!
 //! Output reaches the Hub via per-session processes: each session process
-//! holds its PTY master FD, reads raw bytes, and forwards them over its
-//! Unix socket. The session reader thread feeds the Hub's shadow screen
-//! and broadcasts `PtyEvent::Output` to subscribers.
-//!
-//! # Shadow Terminal (zmx pattern)
-//!
-//! Each PTY session maintains an [`AlacrittyParser`] shadow screen that
-//! receives the same bytes as live subscribers. On browser connect/reconnect,
-//! [`generate_ansi_snapshot`] produces clean ANSI output with correct cursor
-//! and SGR state — eliminating escape sequence garbling and cursor desync.
-//! Live streaming still uses raw PTY bytes for efficiency.
+//! holds its PTY master FD, reads raw bytes, owns the terminal parser,
+//! and forwards structured events over its Unix socket. The Hub is a router
+//! — it does not maintain any local terminal parser state.
 //!
 //! # Event Broadcasting
 //!
@@ -39,12 +30,7 @@
 //!
 //! Client connection tracking and size ownership are managed by Lua.
 //! Rust PTY sessions provide only the I/O primitives (resize, write,
-//! subscribe, snapshot).
-//!
-//! # Thread Safety
-//!
-//! The shadow screen is wrapped in `Arc<Mutex<>>` to allow concurrent
-//! access from the PTY reader thread and snapshot requests.
+//! subscribe).
 
 // Rust guideline compliant 2026-02
 
@@ -60,17 +46,13 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, MasterPty, PtySize};
 use std::{
     io::Write,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{atomic::AtomicBool, Arc, Mutex},
     thread,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::agent::spawn;
-use crate::terminal::{TerminalParser, DEFAULT_SCROLLBACK_LINES};
 
 /// Default channel capacity for PTY command channels.
 const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
@@ -80,7 +62,6 @@ const PTY_COMMAND_CHANNEL_CAPACITY: usize = 64;
 /// This determines how many events can be buffered before slow receivers
 /// start missing events. Set high enough to handle bursts of output.
 const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
-
 
 /// Shared mutable state for PTY command processing.
 ///
@@ -121,16 +102,11 @@ impl std::fmt::Debug for SharedPtyState {
 ///
 /// Each PTY session manages:
 /// - A pseudo-terminal for process I/O
-/// - A shadow terminal (`TerminalParser`) for clean ANSI snapshots on reconnect
 /// - A broadcast channel for event distribution to clients
 /// - An optional port for HTTP forwarding (used by server PTY for dev server preview)
 ///
-/// # Shadow Terminal
-///
-/// The shadow screen receives the same raw bytes as live subscribers and
-/// maintains parsed terminal state. On browser connect/reconnect,
-/// `get_snapshot()` returns clean ANSI output via `contents_formatted()`
-/// instead of replaying raw bytes — no garbling, correct cursor position.
+/// All terminal parsing and snapshot generation is owned by the per-session
+/// process. The hub is a router — no local parser state.
 ///
 /// # Event Broadcasting
 ///
@@ -140,19 +116,13 @@ impl std::fmt::Debug for SharedPtyState {
 /// # Client Tracking
 ///
 /// Client connection tracking and size ownership are managed by Lua.
-/// Rust provides only the I/O primitives (resize, write, subscribe, snapshot).
+/// Rust provides only the I/O primitives (resize, write, subscribe).
 ///
 /// # Command Processing
 ///
 /// After spawning, call [`spawn_command_processor()`](Self::spawn_command_processor)
 /// to start the background task that processes commands from `PtyHandle` clients.
 /// The processor handles Input commands.
-///
-/// # Thread Safety
-///
-/// The shadow screen and shared state are wrapped in `Arc<Mutex<>>` to allow
-/// concurrent access from the PTY reader thread, command processor task, and main
-/// event loop.
 pub struct PtySession {
     /// Shared mutable state accessed by the command processor task.
     ///
@@ -167,13 +137,6 @@ pub struct PtySession {
 
     /// Child process handle - stored so we can kill it on drop.
     child: Option<Box<dyn Child + Send>>,
-
-    /// Shadow terminal for clean ANSI snapshots on reconnect.
-    ///
-    /// Receives the same PTY bytes as live subscribers. On connect,
-    /// [`generate_ansi_snapshot`](crate::terminal::generate_ansi_snapshot)
-    /// produces clean ANSI output with correct cursor and SGR state.
-    pub shadow_screen: Arc<Mutex<TerminalParser>>,
 
     /// Broadcast sender for PTY events.
     ///
@@ -201,27 +164,18 @@ pub struct PtySession {
 
     /// Whether the inner PTY application has pushed kitty keyboard protocol.
     ///
-    /// Set by the reader thread when it detects `CSI > flags u` (push) or
-    /// `CSI < u` (pop) in the PTY output stream. Used by `get_snapshot()`
-    /// to include the kitty push sequence so browser terminals enter kitty
-    /// mode on connect/reconnect.
+    /// Updated by the session reader from `FRAME_MODE_CHANGED` events.
     kitty_enabled: Arc<AtomicBool>,
 
     /// Whether the terminal cursor is currently visible (DECTCEM).
     ///
-    /// Updated by the reader thread from `parser.cursor_hidden()` after
-    /// processing each output chunk. Read by `PtySessionHandle::cursor_visible()`
-    /// and `PtyHandle` without requiring any round-trip to the session process.
+    /// Updated by the session reader from `FRAME_MODE_CHANGED` events.
     cursor_visible: Arc<AtomicBool>,
 
-    /// Whether the shadow screen was resized without the application redrawing.
+    /// Whether a resize happened without the application redrawing yet.
     ///
-    /// Set by `do_resize()` when the shadow screen dimensions change. Checked
-    /// by `get_snapshot()` to avoid capturing stale visible-screen content
-    /// (the application hasn't had time to redraw for the new dimensions).
-    /// When true, the snapshot emits scrollback + clear screen instead of
-    /// drawing stale `contents_formatted()`. The live forwarder carries the
-    /// application's actual redraw.
+    /// Set by resize operations. Session-backed snapshots handle this
+    /// via the session process.
     resize_pending: Arc<AtomicBool>,
 
     /// Allocated port for HTTP forwarding.
@@ -233,13 +187,6 @@ pub struct PtySession {
     /// When spawning the PTY process, the caller passes this port via the
     /// `PORT` environment variable.
     port: Option<u16>,
-
-    /// Buffer for ghostty-generated write-back bytes (OSC color replies, DA responses).
-    ///
-    /// The shadow screen's `write_pty` callback appends bytes here during `process()`.
-    /// The session reader thread drains this buffer after each output chunk and
-    /// forwards the bytes as `HubEvent::ColorResponse` to be written back to the PTY.
-    pub write_pty_buf: Arc<Mutex<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for PtySession {
@@ -279,41 +226,11 @@ impl PtySession {
             last_human_input_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         };
 
-        // Create shadow screen with callbacks.
-        // write_pty: buffer ghostty-generated responses (OSC color replies, DA responses)
-        //   so the session reader can drain and forward them as HubEvents.
-        // title_changed: broadcast PtyEvent for title updates.
-        let title_event_tx = event_tx.clone();
-        let write_pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let write_pty_buf_cb = Arc::clone(&write_pty_buf);
-        let callbacks = crate::terminal::CallbackConfig {
-            write_pty: Some(Box::new(move |bytes: &[u8]| {
-                if let Ok(mut buf) = write_pty_buf_cb.lock() {
-                    buf.extend_from_slice(bytes);
-                }
-            })),
-            title_changed: Some(Box::new(move |_title: &str| {
-                // Title updates broadcast via PtyEvent. Caller queries title() after process().
-                let _ = title_event_tx.send(PtyEvent::title_changed(String::new()));
-            })),
-            bell: None,
-            pwd_changed: None,
-            notification: None,
-            semantic_prompt: None,
-            mode_changed: None,
-            kitty_keyboard_changed: None,
-        };
         Self {
             shared_state: Arc::new(Mutex::new(shared_state)),
             reader_thread: None,
             command_processor_handle: None,
             child: None,
-            shadow_screen: Arc::new(Mutex::new(TerminalParser::new_with_callbacks(
-                rows,
-                cols,
-                DEFAULT_SCROLLBACK_LINES,
-                callbacks,
-            ))),
             event_tx,
             command_tx,
             command_rx: Some(command_rx),
@@ -322,20 +239,6 @@ impl PtySession {
             cursor_visible: Arc::new(AtomicBool::new(true)),
             resize_pending: Arc::new(AtomicBool::new(false)),
             port: None,
-            write_pty_buf,
-        }
-    }
-
-    /// Apply cached terminal colors to the shadow screen.
-    ///
-    /// Sets fg/bg/cursor colors so OSC 10/11/12 queries from running processes
-    /// are answered correctly by ghostty's internal handler.
-    pub fn apply_color_cache(
-        &self,
-        cache: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>,
-    ) {
-        if let Ok(mut screen) = self.shadow_screen.lock() {
-            screen.apply_color_cache(cache);
         }
     }
 
@@ -541,13 +444,12 @@ impl PtySession {
     ///
     /// # Returns
     ///
-    /// Tuple of (shared_state, shadow_screen, event_tx, kitty_enabled, resize_pending) for direct access.
+    /// Tuple of (shared_state, event_tx, kitty_enabled, cursor_visible, resize_pending).
     #[must_use]
     pub fn get_direct_access(
         &self,
     ) -> (
         Arc<Mutex<SharedPtyState>>,
-        Arc<Mutex<TerminalParser>>,
         broadcast::Sender<PtyEvent>,
         Arc<AtomicBool>,
         Arc<AtomicBool>,
@@ -555,7 +457,6 @@ impl PtySession {
     ) {
         (
             Arc::clone(&self.shared_state),
-            Arc::clone(&self.shadow_screen),
             self.event_tx.clone(),
             Arc::clone(&self.kitty_enabled),
             Arc::clone(&self.cursor_visible),
@@ -761,55 +662,31 @@ impl PtySession {
 
     /// Resize the PTY to new dimensions.
     ///
-    /// Resizes the shadow screen *before* the PTY so that when the inner
-    /// application redraws for the new size, the reader thread's
-    /// `parser.process()` already targets the correct dimensions.
-    /// Resizing in the opposite order (PTY first) creates a race where
-    /// redraw output is parsed against stale dimensions, corrupting
-    /// cursor tracking — especially visible on Linux.
+    /// Updates shared dimensions and resizes the PTY master. The session
+    /// process owns the terminal parser and handles its own resize.
     pub fn resize(&self, rows: u16, cols: u16) {
-        // 1. Shadow screen first — ready for new-size output.
-        let old_dims = {
-            let mut parser = self
-                .shadow_screen
-                .lock()
-                .expect("shadow_screen lock poisoned");
-            let old = (
-                parser.terminal().rows(),
-                parser.terminal().cols(),
-            );
-            parser.resize(rows, cols);
-            old
-        };
+        let mut state = self
+            .shared_state
+            .lock()
+            .expect("shared_state lock poisoned");
 
-        // 2. PTY resize — triggers application redraw.
-        {
-            let mut state = self
-                .shared_state
-                .lock()
-                .expect("shared_state lock poisoned");
+        let old_dims = state.dimensions;
+        state.dimensions = (rows, cols);
 
-            state.dimensions = (rows, cols);
-
-            if let Some(master_pty) = &state.master_pty {
-                if let Err(e) = master_pty.resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                }) {
-                    log::warn!("Failed to resize PTY: {e}");
-                    // Revert shadow screen to match the actual PTY dimensions.
-                    let mut parser = self
-                        .shadow_screen
-                        .lock()
-                        .expect("shadow_screen lock poisoned");
-                    parser.resize(old_dims.0, old_dims.1);
-                    state.dimensions = (old_dims.0, old_dims.1);
-                    return;
-                }
+        if let Some(master_pty) = &state.master_pty {
+            if let Err(e) = master_pty.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) {
+                log::warn!("Failed to resize PTY: {e}");
+                state.dimensions = old_dims;
+                return;
             }
         }
+
+        drop(state);
 
         // Broadcast resize event
         self.broadcast(PtyEvent::resized(rows, cols));
@@ -839,28 +716,6 @@ impl PtySession {
     /// Returns an error if the write fails.
     pub fn write_input_str(&self, input: &str) -> Result<()> {
         self.write_input(input.as_bytes())
-    }
-
-    // =========================================================================
-    // Shadow Terminal Snapshot
-    // =========================================================================
-
-    /// Get a clean ANSI snapshot of the current terminal state.
-    ///
-    /// Locks the shadow screen and delegates to
-    /// [`generate_ansi_snapshot`](crate::terminal::generate_ansi_snapshot).
-    /// Alt-screen entry, kitty keyboard restore, and SGR state are all handled
-    /// inside `generate_ansi_snapshot` — no post-processing needed here.
-    #[must_use]
-    pub fn get_snapshot(&self) -> Vec<u8> {
-        let parser = self
-            .shadow_screen
-            .lock()
-            .expect("shadow_screen lock poisoned");
-        let skip_visible = self.resize_pending.swap(false, Ordering::AcqRel);
-        // generate_ansi_snapshot includes kitty restore and core mode
-        // sequences automatically — no manual appends needed here.
-        crate::terminal::generate_snapshot(&*parser, skip_visible)
     }
 
     /// Whether the inner PTY has kitty keyboard protocol active.
@@ -925,67 +780,6 @@ fn process_single_command(cmd: PtyCommand, shared_state: &Arc<Mutex<SharedPtySta
     }
 }
 
-/// Perform PTY resize operation.
-///
-/// Resizes shadow screen before PTY to avoid the race where the reader
-/// thread processes new-size output against stale shadow screen dimensions.
-/// See `PtySession::resize` for detailed rationale.
-///
-/// Exposed as `pub(crate)` for direct sync resize from `PtyHandle`.
-#[cfg(test)]
-pub(crate) fn do_resize(
-    rows: u16,
-    cols: u16,
-    shared_state: &Arc<Mutex<SharedPtyState>>,
-    shadow_screen: &Arc<Mutex<TerminalParser>>,
-    event_tx: &broadcast::Sender<PtyEvent>,
-    resize_pending: &Arc<AtomicBool>,
-) {
-    // 1. Shadow screen first — ready for new-size output.
-    let old_dims = {
-        let mut parser = shadow_screen.lock().expect("shadow_screen lock poisoned");
-        let old = (
-            parser.terminal().rows(),
-            parser.terminal().cols(),
-        );
-        parser.resize(rows, cols);
-        old
-    };
-
-    // 2. PTY resize — triggers application redraw.
-    {
-        let mut state = shared_state.lock().expect("shared_state lock poisoned");
-
-        state.dimensions = (rows, cols);
-
-        if let Some(master_pty) = &state.master_pty {
-            if let Err(e) = master_pty.resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            }) {
-                log::warn!("Failed to resize PTY: {e}");
-                // Revert shadow screen to match the actual PTY dimensions.
-                let mut parser = shadow_screen.lock().expect("shadow_screen lock poisoned");
-                parser.resize(old_dims.0, old_dims.1);
-                state.dimensions = (old_dims.0, old_dims.1);
-                return;
-            }
-        }
-    }
-
-    // Only mark resize_pending when dimensions actually changed.
-    // Same-size "resizes" (e.g. browser reconnect at same dimensions)
-    // don't invalidate the visible screen content.
-    if (rows, cols) != (old_dims.0, old_dims.1) {
-        resize_pending.store(true, Ordering::Release);
-    }
-
-    // Broadcast resize event
-    let _ = event_tx.send(PtyEvent::resized(rows, cols));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1025,110 +819,7 @@ mod tests {
         // Multiple subscriptions should work without error
     }
 
-    #[test]
-    fn test_pty_session_snapshot() {
-        let session = PtySession::new(24, 80);
-
-        // Feed some output to the shadow screen
-        session
-            .shadow_screen
-            .lock()
-            .unwrap()
-            .process(b"hello world");
-
-        let snapshot = session.get_snapshot();
-        // Snapshot should contain the text and ANSI reset/cursor sequences
-        let snapshot_str = String::from_utf8_lossy(&snapshot);
-        assert!(snapshot_str.contains("hello world"),
-            "snapshot should contain text content");
-    }
-
-    #[test]
-    fn test_pty_session_snapshot_with_colors() {
-        let session = PtySession::new(24, 80);
-
-        // Feed colored output (green text)
-        session
-            .shadow_screen
-            .lock()
-            .unwrap()
-            .process(b"\x1b[32mgreen text\x1b[0m");
-
-        let snapshot = session.get_snapshot();
-        let snapshot_str = String::from_utf8_lossy(&snapshot);
-        assert!(snapshot_str.contains("green text"));
-    }
-
-    // =========================================================================
-    // Kitty Keyboard Protocol in Snapshots
-    // =========================================================================
-
-    #[test]
-    fn test_snapshot_includes_kitty_push_when_enabled() {
-        let session = PtySession::new(24, 80);
-
-        // Feed hello text then a kitty push sequence.
-        // The push sequence sets TermMode::KITTY_KEYBOARD_PROTOCOL which
-        // get_snapshot() reads via parser.kitty_enabled() — not the external AtomicBool.
-        {
-            let mut p = session.shadow_screen.lock().unwrap();
-            p.process(b"hello");
-            p.process(b"\x1b[>1u"); // CSI > 1 u — kitty push (DISAMBIGUATE_ESC_CODES)
-        }
-
-        let snapshot = session.get_snapshot();
-        let snapshot_str = String::from_utf8_lossy(&snapshot);
-
-        assert!(
-            snapshot_str.contains("hello"),
-            "snapshot should contain screen content"
-        );
-        // Ghostty formatter restores kitty keyboard state via its keyboard extra.
-        // The exact sequence may differ from alacritty's CSI > 1 u, but the
-        // snapshot should be different from one without kitty enabled.
-        let no_kitty_session = PtySession::new(24, 80);
-        no_kitty_session.shadow_screen.lock().unwrap().process(b"hello");
-        let no_kitty_snapshot = no_kitty_session.get_snapshot();
-        assert_ne!(
-            snapshot.len(),
-            no_kitty_snapshot.len(),
-            "kitty-enabled snapshot should differ from kitty-disabled snapshot"
-        );
-    }
-
-    #[test]
-    fn test_snapshot_excludes_kitty_when_disabled() {
-        let session = PtySession::new(24, 80);
-
-        session.shadow_screen.lock().unwrap().process(b"hello");
-
-        // kitty_enabled defaults to false
-        let snapshot = session.get_snapshot();
-
-        assert!(
-            !snapshot.windows(5).any(|w| w == b"\x1b[>1u"),
-            "snapshot should NOT contain kitty push when kitty is disabled"
-        );
-    }
-
-    #[test]
-    fn test_snapshot_excludes_kitty_after_pop() {
-        let session = PtySession::new(24, 80);
-
-        // Feed push then pop — TermMode ends with kitty disabled.
-        {
-            let mut p = session.shadow_screen.lock().unwrap();
-            p.process(b"\x1b[>1u"); // push
-            p.process(b"\x1b[<u"); // pop
-        }
-
-        let snapshot = session.get_snapshot();
-
-        assert!(
-            !snapshot.windows(5).any(|w| w == b"\x1b[>1u"),
-            "snapshot should NOT contain kitty push after pop"
-        );
-    }
+    // Shadow screen / snapshot tests removed — session process owns terminal parsing.
 
     #[test]
     fn test_pty_session_broadcast() {

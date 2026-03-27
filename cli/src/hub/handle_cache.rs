@@ -348,19 +348,24 @@ mod tests {
     fn create_test_session(uuid: &str, label: &str, workspace_id: Option<&str>) -> SessionHandle {
         use crate::agent::pty::PtySession;
         let pty_session = PtySession::new(24, 80);
-        let (shared_state, shadow_screen, event_tx, kitty_enabled, cursor_visible, resize_pending) =
+        let (shared_state, event_tx, kitty_enabled, cursor_visible, resize_pending) =
             pty_session.get_direct_access();
         std::mem::forget(pty_session);
         let pty = super::super::agent_handle::PtyHandle::new(
             event_tx,
             shared_state,
-            shadow_screen,
             kitty_enabled,
             cursor_visible,
             resize_pending,
             None,
         );
-        SessionHandle::new(uuid, label, Default::default(), workspace_id.map(String::from), pty)
+        SessionHandle::new(
+            uuid,
+            label,
+            Default::default(),
+            workspace_id.map(String::from),
+            pty,
+        )
     }
 
     #[test]
@@ -380,8 +385,7 @@ mod tests {
         let cache = HandleCache::new();
         cache.add_session(create_test_session("sess-1", "label", None));
 
-        let updated =
-            cache.update_session_metadata("sess-1", None, Some(Some("ws-new")));
+        let updated = cache.update_session_metadata("sess-1", None, Some(Some("ws-new")));
 
         assert!(updated);
         let handle = cache.get_session("sess-1").unwrap();

@@ -139,12 +139,10 @@ impl Agent {
     #[must_use]
     #[cfg(test)]
     pub fn get_pty_handle(&self) -> crate::hub::agent_handle::PtyHandle {
-        let (shared_state, shadow_screen, event_tx, kitty, cursor_vis, resize) =
-            self.pty.get_direct_access();
+        let (shared_state, event_tx, kitty, cursor_vis, resize) = self.pty.get_direct_access();
         crate::hub::agent_handle::PtyHandle::new(
             event_tx,
             shared_state,
-            shadow_screen,
             kitty,
             cursor_vis,
             resize,
@@ -194,17 +192,8 @@ impl Agent {
     }
 
     // =========================================================================
-    // Screen & Scrollback
+    // Screen Info
     // =========================================================================
-
-    /// Get a clean ANSI snapshot of the terminal state.
-    ///
-    /// Returns parsed screen contents as clean ANSI escape sequences with
-    /// correct cursor positioning. Used for browser connect/reconnect.
-    #[must_use]
-    pub fn get_snapshot(&self) -> Vec<u8> {
-        self.pty.get_snapshot()
-    }
 
     /// Get the current screen dimensions.
     #[must_use]
@@ -258,21 +247,7 @@ mod tests {
         assert_eq!(agent.agent_id(), "owner-repo-botster-issue-42");
     }
 
-    #[test]
-    fn test_scrollback_snapshot() {
-        let temp_dir = TempDir::new().unwrap();
-        let agent = Agent::new(
-            uuid::Uuid::new_v4(),
-            "test/repo".to_string(),
-            "issue-1".to_string(),
-            temp_dir.path().to_path_buf(),
-        );
-
-        // Snapshot contains reset sequences even when empty
-        let snapshot = agent.get_snapshot();
-        // Should contain at least the ANSI reset/clear prefix
-        assert!(!snapshot.is_empty());
-    }
+    // test_scrollback_snapshot removed — session process owns snapshot generation.
 
     #[test]
     fn test_agent_age() {
