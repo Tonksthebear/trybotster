@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use super::render::WidgetArea;
 use super::render_tree::RenderNode;
 use super::terminal_panel::{PanelState, TerminalPanel};
+use super::ColorCache;
 
 /// Messages to send to Hub, collected and forwarded by the runner.
 pub type OutMessages = Vec<serde_json::Value>;
@@ -49,6 +50,8 @@ pub struct FocusEffects {
 pub struct PanelPool {
     /// Terminal panels keyed by `session_uuid`.
     pub(super) panels: HashMap<String, TerminalPanel>,
+    /// Default terminal colors for new/rebuilt panels.
+    color_cache: ColorCache,
     /// Terminal dimensions (rows, cols) — used as default for new panels.
     pub(super) terminal_dims: (u16, u16),
     /// Currently selected agent session key (agent_id).
@@ -62,8 +65,17 @@ pub struct PanelPool {
 impl PanelPool {
     /// Create an empty pool with initial terminal dimensions.
     pub fn new(terminal_dims: (u16, u16)) -> Self {
+        Self::new_with_color_cache(
+            terminal_dims,
+            std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        )
+    }
+
+    /// Create an empty pool with an explicit terminal color cache.
+    pub fn new_with_color_cache(terminal_dims: (u16, u16), color_cache: ColorCache) -> Self {
         Self {
             panels: HashMap::new(),
+            color_cache,
             terminal_dims,
             selected_agent: None,
             current_session_uuid: None,
@@ -76,9 +88,10 @@ impl PanelPool {
     /// Get or create a panel for the given session UUID.
     pub fn resolve_panel(&mut self, session_uuid: &str) -> &mut TerminalPanel {
         let (rows, cols) = self.terminal_dims;
+        let color_cache = self.color_cache.clone();
         self.panels
             .entry(session_uuid.to_string())
-            .or_insert_with(|| TerminalPanel::new(rows, cols))
+            .or_insert_with(|| TerminalPanel::new_with_color_cache(rows, cols, color_cache))
     }
 
     /// Immutable reference to the focused panel.
@@ -142,10 +155,11 @@ impl PanelPool {
                 continue;
             };
             let (rows, cols) = (area.rect.height, area.rect.width);
+            let color_cache = self.color_cache.clone();
             let panel = self
                 .panels
                 .entry(uuid.clone())
-                .or_insert_with(|| TerminalPanel::new(rows, cols));
+                .or_insert_with(|| TerminalPanel::new_with_color_cache(rows, cols, color_cache));
 
             // Critical on reconnect: stale idle panels may keep old cached dims
             // from the pre-restart frame. Refresh parser/panel dims before

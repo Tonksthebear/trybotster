@@ -38,13 +38,13 @@ pub mod ws;
 
 pub mod compat;
 pub mod config;
-#[allow(missing_docs, missing_debug_implementations)]
-pub mod ghostty_vt;
 pub mod constants;
 pub mod crypto;
 pub mod device;
 pub mod env;
 pub mod file_watcher;
+#[allow(missing_docs, missing_debug_implementations)]
+pub mod ghostty_vt;
 pub mod git;
 pub mod keyring;
 pub mod notifications;

@@ -393,6 +393,7 @@ fn run_with_tui() -> Result<()> {
     hub.start_socket_server()?;
 
     println!("Starting TUI...");
+    let tui_color_cache = tui::probe_spawning_terminal_colors();
 
     // NOW setup terminal (after all initialization that could fail)
     enable_raw_mode()?;
@@ -415,7 +416,7 @@ fn run_with_tui() -> Result<()> {
     log::info!("Botster Hub v{} started with TUI", VERSION);
 
     // Run the event loop - TUI module now owns TuiRunner instantiation
-    tui::run_with_hub(&mut hub, terminal, &*SHUTDOWN_FLAG)?;
+    tui::run_with_hub(&mut hub, terminal, &*SHUTDOWN_FLAG, tui_color_cache)?;
 
     // Shutdown
     let should_restart = hub.exec_restart;
@@ -760,6 +761,7 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
 
     // Create wake pipe for TuiRunner (RAII guard ensures cleanup on any exit path)
     let pipe = WakePipe::new();
+    let tui_color_cache = tui::probe_spawning_terminal_colors();
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -793,13 +795,14 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
 
     // Create TuiRunner with bridge channels (same as run_with_hub)
     let tui_shutdown = Arc::clone(&shutdown);
-    let mut tui_runner = tui::TuiRunner::new(
+    let mut tui_runner = tui::TuiRunner::new_with_color_cache(
         terminal,
         channels.request_tx,
         channels.output_rx,
         tui_shutdown,
         (inner_rows, inner_cols),
         pipe.read_fd(),
+        tui_color_cache,
     );
     tui_runner.set_lua_bootstrap(tui::hot_reload::LuaBootstrap::load());
 

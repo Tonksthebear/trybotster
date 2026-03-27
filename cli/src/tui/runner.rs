@@ -44,7 +44,6 @@
 
 // Rust guideline compliant 2026-02
 
-
 use std::io::Stdout;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -66,6 +65,7 @@ use super::layout_lua::{KeyContext, LayoutLua, LuaKeyAction};
 use super::qr::ConnectionCodeData;
 use super::raw_input::{InputEvent, MouseEventType, RawInputReader};
 use super::smooth_scroll::SmoothScroll;
+use super::ColorCache;
 
 /// Default scrollback lines for VT100 parser.
 
@@ -147,6 +147,9 @@ pub struct TuiRunner<B: Backend> {
     /// from including stdin in `libc::poll`, which would cause a tight spin
     /// loop since `POLLERR` triggers immediate readiness.
     stdin_dead: bool,
+
+    /// Partial OSC color response bytes buffered across stdin reads.
+    osc_color_response_buf: Vec<u8>,
 
     /// SIGWINCH flag for terminal resize detection.
     pub(super) resize_flag: Arc<AtomicBool>,
@@ -247,6 +250,13 @@ where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    /// Probe the spawning terminal for default colors used to seed libghostty.
+    pub fn probe_spawning_terminal_colors() -> ColorCache {
+        let mut store = crate::hub::terminal_profile::TerminalProfileStore::default();
+        store.probe_spawning_terminal();
+        store.shared_color_cache()
+    }
+
     /// Create a new TuiRunner.
     ///
     /// # Arguments
@@ -268,8 +278,32 @@ where
         terminal_dims: (u16, u16),
         wake_fd: Option<std::os::unix::io::RawFd>,
     ) -> Self {
+        Self::new_with_color_cache(
+            terminal,
+            request_tx,
+            output_rx,
+            shutdown,
+            terminal_dims,
+            wake_fd,
+            Self::probe_spawning_terminal_colors(),
+        )
+    }
+
+    /// Create a new TuiRunner with an explicit libghostty color cache.
+    pub fn new_with_color_cache(
+        terminal: Terminal<B>,
+        request_tx: tokio::sync::mpsc::UnboundedSender<TuiRequest>,
+        output_rx: tokio::sync::mpsc::UnboundedReceiver<TuiOutput>,
+        shutdown: Arc<AtomicBool>,
+        terminal_dims: (u16, u16),
+        wake_fd: Option<std::os::unix::io::RawFd>,
+        color_cache: ColorCache,
+    ) -> Self {
         Self {
-            panel_pool: super::panel_pool::PanelPool::new(terminal_dims),
+            panel_pool: super::panel_pool::PanelPool::new_with_color_cache(
+                terminal_dims,
+                color_cache,
+            ),
             terminal,
             mode: String::new(),
             connection_code: None,
@@ -282,6 +316,7 @@ where
             lua_bootstrap: None,
             raw_reader: RawInputReader::new(),
             stdin_dead: false,
+            osc_color_response_buf: Vec::new(),
             resize_flag: Arc::new(AtomicBool::new(false)),
             terminal_modes: super::terminal_modes::TerminalModes::new(),
             overlay_list_actions: Vec::new(),
@@ -579,15 +614,27 @@ where
                     }
                 }
                 InputEvent::Key { ref raw_bytes, .. } => {
-                    // Intercept OSC color responses from the outer terminal.
-                    // These arrive when we forwarded a probe from PTY output
-                    // to stdout. Route them back to the PTY that asked.
-                    if Self::is_osc_color_response(raw_bytes) {
+                    if Self::is_color_scheme_response(raw_bytes) {
                         log::debug!(
-                            "[PTY-PROBE] Intercepted terminal color response ({} bytes), routing to PTY",
+                            "[PTY-PROBE] Intercepted terminal color-scheme response ({} bytes), routing to PTY",
                             raw_bytes.len()
                         );
                         self.handle_pty_input(raw_bytes);
+                        continue;
+                    }
+
+                    // Intercept OSC color responses from the outer terminal.
+                    // These may arrive split across multiple stdin reads, so
+                    // buffer until we have complete OSC 10/11/12 replies.
+                    let responses = self.take_osc_color_responses(raw_bytes);
+                    if !responses.is_empty() {
+                        for response in responses {
+                            log::debug!(
+                                "[PTY-PROBE] Intercepted terminal color response ({} bytes), routing to PTY",
+                                response.len()
+                            );
+                            self.handle_pty_input(&response);
+                        }
                         continue;
                     }
 
@@ -615,12 +662,7 @@ where
     /// Hit-tests `last_widget_areas` to find which widget contains (x, y),
     /// then delegates to that widget's `mouse_scroll()`. If nothing
     /// scrollable is under the cursor, the event is discarded.
-    fn route_mouse_scroll(
-        &mut self,
-        direction: super::raw_input::ScrollDirection,
-        x: u16,
-        y: u16,
-    ) {
+    fn route_mouse_scroll(&mut self, direction: super::raw_input::ScrollDirection, x: u16, y: u16) {
         let target_uuid = self
             .last_widget_areas
             .iter()
@@ -687,32 +729,28 @@ where
                     None
                 }
             }
-            MouseEventType::Drag => {
-                self.mouse_capture.as_ref().map(|capture| {
-                    let local_x = x.saturating_sub(capture.origin_rect.x);
-                    let local_y = y.saturating_sub(capture.origin_rect.y);
-                    (
-                        capture.widget_id.clone(),
-                        capture.widget_type.clone(),
-                        capture.origin_rect,
-                        local_x,
-                        local_y,
-                    )
-                })
-            }
-            MouseEventType::Release => {
-                self.mouse_capture.take().map(|capture| {
-                    let local_x = x.saturating_sub(capture.origin_rect.x);
-                    let local_y = y.saturating_sub(capture.origin_rect.y);
-                    (
-                        capture.widget_id,
-                        capture.widget_type,
-                        capture.origin_rect,
-                        local_x,
-                        local_y,
-                    )
-                })
-            }
+            MouseEventType::Drag => self.mouse_capture.as_ref().map(|capture| {
+                let local_x = x.saturating_sub(capture.origin_rect.x);
+                let local_y = y.saturating_sub(capture.origin_rect.y);
+                (
+                    capture.widget_id.clone(),
+                    capture.widget_type.clone(),
+                    capture.origin_rect,
+                    local_x,
+                    local_y,
+                )
+            }),
+            MouseEventType::Release => self.mouse_capture.take().map(|capture| {
+                let local_x = x.saturating_sub(capture.origin_rect.x);
+                let local_y = y.saturating_sub(capture.origin_rect.y);
+                (
+                    capture.widget_id,
+                    capture.widget_type,
+                    capture.origin_rect,
+                    local_x,
+                    local_y,
+                )
+            }),
         };
 
         let Some((widget_id, widget_type, _rect, local_x, local_y)) = target else {
@@ -1054,6 +1092,98 @@ where
         value.starts_with(b"rgb:") || value.starts_with(b"#")
     }
 
+    /// Detect Ghostty color-scheme responses (CSI ? 997 ; {1|2} n).
+    fn is_color_scheme_response(data: &[u8]) -> bool {
+        matches!(data, b"\x1b[?997;1n" | b"\x1b[?997;2n")
+    }
+
+    /// Extract complete OSC color responses from the current stdin chunk.
+    ///
+    /// Replies can be split across multiple reads, so we buffer when a chunk
+    /// begins an OSC sequence and only return fully terminated responses.
+    fn take_osc_color_responses(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+        const MAX_OSC_BUFFER_BYTES: usize = 512;
+
+        let should_buffer = !self.osc_color_response_buf.is_empty() || data.starts_with(b"\x1b]");
+        if !should_buffer {
+            return if Self::is_osc_color_response(data) {
+                vec![data.to_vec()]
+            } else {
+                Vec::new()
+            };
+        }
+
+        if data.len() >= MAX_OSC_BUFFER_BYTES {
+            self.osc_color_response_buf
+                .extend_from_slice(&data[data.len() - MAX_OSC_BUFFER_BYTES..]);
+        } else {
+            let overflow = self
+                .osc_color_response_buf
+                .len()
+                .saturating_add(data.len())
+                .saturating_sub(MAX_OSC_BUFFER_BYTES);
+            if overflow > 0 {
+                self.osc_color_response_buf.drain(..overflow);
+            }
+            self.osc_color_response_buf.extend_from_slice(data);
+        }
+
+        Self::extract_complete_osc_sequences(&mut self.osc_color_response_buf)
+            .into_iter()
+            .filter(|seq| Self::is_osc_color_response(seq))
+            .collect()
+    }
+
+    fn extract_complete_osc_sequences(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+        let mut sequences = Vec::new();
+        let mut idx = 0usize;
+        let mut remainder_start = None;
+
+        while idx + 1 < buffer.len() {
+            if buffer[idx] == 0x1b && buffer[idx + 1] == b']' {
+                let start = idx;
+                let mut scan = idx + 2;
+                let mut end = None;
+
+                while scan < buffer.len() {
+                    if buffer[scan] == 0x07 {
+                        end = Some(scan + 1);
+                        break;
+                    }
+                    if buffer[scan] == 0x1b && scan + 1 < buffer.len() && buffer[scan + 1] == b'\\'
+                    {
+                        end = Some(scan + 2);
+                        break;
+                    }
+                    scan += 1;
+                }
+
+                if let Some(end_idx) = end {
+                    sequences.push(buffer[start..end_idx].to_vec());
+                    idx = end_idx;
+                    continue;
+                }
+
+                remainder_start = Some(start);
+                break;
+            }
+
+            idx += 1;
+        }
+
+        let remainder = if let Some(start) = remainder_start {
+            buffer[start..].to_vec()
+        } else if buffer.last() == Some(&0x1b) {
+            vec![0x1b]
+        } else {
+            Vec::new()
+        };
+
+        buffer.clear();
+        buffer.extend_from_slice(&remainder);
+        sequences
+    }
+
     /// Send raw PTY input bytes directly to the PTY writer.
     ///
     /// Bypasses Lua entirely — no JSON serialization, no `from_utf8_lossy`.
@@ -1273,7 +1403,10 @@ where
         // Handle focus_reporting_changed — PTY toggled focus reporting mode.
         // When newly enabled and the session is focused, send immediate focus state.
         if event_type == "focus_reporting_changed" {
-            let enabled = msg.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            let enabled = msg
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let msg_uuid = msg.get("session_uuid").and_then(|v| v.as_str());
             if enabled {
                 if msg_uuid == self.panel_pool.current_session_uuid() {
@@ -1284,7 +1417,11 @@ where
                     };
                     log::debug!(
                         "[FOCUS] Focus reporting enabled, responding with {}",
-                        if self.terminal_modes.terminal_focused() { "focused" } else { "unfocused" }
+                        if self.terminal_modes.terminal_focused() {
+                            "focused"
+                        } else {
+                            "unfocused"
+                        }
                     );
                     self.handle_pty_input(seq);
                 }
@@ -1489,7 +1626,9 @@ where
                     if self.terminal_modes.terminal_focused() && was_terminal != now_terminal {
                         if self.focus_reporting_enabled_for_current_session() {
                             if now_terminal {
-                                log::debug!("[FOCUS] synthetic focus-in on mode change to terminal");
+                                log::debug!(
+                                    "[FOCUS] synthetic focus-in on mode change to terminal"
+                                );
                                 self.handle_pty_input(b"\x1b[I");
                             } else {
                                 log::debug!(
@@ -1590,7 +1729,9 @@ where
                 session_uuid: input.session_uuid.clone(),
                 focused,
             });
-            let focus_reporting = self.panel_pool.panels()
+            let focus_reporting = self
+                .panel_pool
+                .panels()
                 .get(&input.session_uuid)
                 .map(|p| p.focus_reporting())
                 .unwrap_or(false);
@@ -1737,6 +1878,7 @@ pub fn run_with_hub(
     hub: &mut Hub,
     terminal: Terminal<CrosstermBackend<Stdout>>,
     shutdown_flag: &AtomicBool,
+    color_cache: ColorCache,
 ) -> Result<()> {
     log::info!("Hub event loop starting (TUI mode)");
 
@@ -1789,13 +1931,14 @@ pub fn run_with_hub(
     let shutdown = Arc::new(AtomicBool::new(false));
     let tui_shutdown = Arc::clone(&shutdown);
 
-    let mut tui_runner = TuiRunner::new(
+    let mut tui_runner = TuiRunner::new_with_color_cache(
         terminal,
         request_tx,
         output_rx,
         tui_shutdown,
         terminal_dims,
         wake_read_fd,
+        color_cache,
     );
 
     // Load all Lua sources and create bootstrap (consumed once by run()).
@@ -1850,6 +1993,11 @@ pub fn run_with_hub(
 
     log::info!("Hub event loop exiting");
     Ok(())
+}
+
+/// Probe the current outer terminal for colors that should seed TUI libghostty parsers.
+pub fn probe_spawning_terminal_colors() -> ColorCache {
+    TuiRunner::<CrosstermBackend<Stdout>>::probe_spawning_terminal_colors()
 }
 
 #[cfg(test)]
@@ -1925,6 +2073,42 @@ mod tests {
         runner.terminal_modes.on_focus_lost();
 
         (runner, request_rx)
+    }
+
+    #[test]
+    fn split_osc_color_response_is_buffered_until_complete() {
+        let (mut runner, _request_rx) = create_test_runner();
+
+        assert!(runner
+            .take_osc_color_responses(b"\x1b]11;rgb:ffff/")
+            .is_empty());
+        let responses = runner.take_osc_color_responses(b"fcfc/f0f0\x07");
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0], b"\x1b]11;rgb:ffff/fcfc/f0f0\x07");
+    }
+
+    #[test]
+    fn non_osc_input_is_not_buffered_as_color_response() {
+        let (mut runner, _request_rx) = create_test_runner();
+
+        let responses = runner.take_osc_color_responses(b"\x1b[A");
+
+        assert!(responses.is_empty());
+        assert!(runner.osc_color_response_buf.is_empty());
+    }
+
+    #[test]
+    fn color_scheme_response_is_detected() {
+        assert!(TuiRunner::<TestBackend>::is_color_scheme_response(
+            b"\x1b[?997;1n"
+        ));
+        assert!(TuiRunner::<TestBackend>::is_color_scheme_response(
+            b"\x1b[?997;2n"
+        ));
+        assert!(!TuiRunner::<TestBackend>::is_color_scheme_response(
+            b"\x1b[?996n"
+        ));
     }
 
     /// Creates a `TuiRunner` with a mock Hub responder for testing.
@@ -3456,10 +3640,13 @@ mod tests {
             )),
         };
         let mut areas = std::collections::HashMap::new();
-        areas.insert("sess-1".to_string(), crate::tui::render::WidgetArea {
-            rect: ratatui::layout::Rect::new(0, 0, 60, 20),
-            widget_type: "terminal".to_string(),
-        });
+        areas.insert(
+            "sess-1".to_string(),
+            crate::tui::render::WidgetArea {
+                rect: ratatui::layout::Rect::new(0, 0, 60, 20),
+                widget_type: "terminal".to_string(),
+            },
+        );
         let msgs = runner.panel_pool.sync_subscriptions(&tree, &areas);
         for msg in msgs {
             runner.send_msg(msg);
@@ -3732,10 +3919,13 @@ mod tests {
         };
 
         let mut areas = std::collections::HashMap::new();
-        areas.insert("sess-0".to_string(), crate::tui::render::WidgetArea {
-            rect: ratatui::layout::Rect::new(0, 0, 80, 24),
-            widget_type: "terminal".to_string(),
-        });
+        areas.insert(
+            "sess-0".to_string(),
+            crate::tui::render::WidgetArea {
+                rect: ratatui::layout::Rect::new(0, 0, 80, 24),
+                widget_type: "terminal".to_string(),
+            },
+        );
         let msgs = runner.panel_pool.sync_subscriptions(&tree, &areas);
         for msg in msgs {
             runner.send_msg(msg);
@@ -3796,10 +3986,13 @@ mod tests {
         };
 
         let mut areas = std::collections::HashMap::new();
-        areas.insert("sess-0".to_string(), crate::tui::render::WidgetArea {
-            rect: ratatui::layout::Rect::new(0, 0, 148, 57),
-            widget_type: "terminal".to_string(),
-        });
+        areas.insert(
+            "sess-0".to_string(),
+            crate::tui::render::WidgetArea {
+                rect: ratatui::layout::Rect::new(0, 0, 148, 57),
+                widget_type: "terminal".to_string(),
+            },
+        );
 
         let msgs = runner.panel_pool.sync_subscriptions(&tree, &areas);
         for msg in msgs {

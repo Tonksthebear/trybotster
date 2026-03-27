@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::ghostty_vt::RenderState;
-use crate::terminal::{CursorStyle, TerminalParser};
+use crate::terminal::{CursorStyle, Rgb, TerminalParser};
 
 use super::ColorCache;
 
@@ -109,6 +109,16 @@ impl TerminalPanel {
     /// Current cursor style from the render state.
     pub fn cursor_style(&self) -> CursorStyle {
         CursorStyle::from_render_state(&self.render_state)
+    }
+
+    /// Effective foreground color for the panel terminal.
+    pub fn foreground_color(&self) -> Option<Rgb> {
+        self.parser.foreground_color()
+    }
+
+    /// Effective background color for the panel terminal.
+    pub fn background_color(&self) -> Option<Rgb> {
+        self.parser.background_color()
     }
 
     /// Extract plain-text grid contents.

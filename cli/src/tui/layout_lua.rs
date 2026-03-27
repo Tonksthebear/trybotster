@@ -382,8 +382,7 @@ impl LayoutLua {
                 // Each op must have an "op" field: { op = "send_msg", data = {...} }
                 let mut ops = Vec::new();
                 for pair in table.sequence_values::<mlua::Table>() {
-                    let op_table =
-                        pair.map_err(|e| anyhow!("Invalid op in mouse result: {e}"))?;
+                    let op_table = pair.map_err(|e| anyhow!("Invalid op in mouse result: {e}"))?;
                     let json_val = lua_table_to_json(&self.lua, &op_table)?;
                     ops.push(json_val);
                 }
@@ -1950,10 +1949,7 @@ mod tests {
         }
     }
 
-    fn extract_sidebar_field(
-        tree: &RenderNode,
-        field: &str,
-    ) -> Vec<Option<String>> {
+    fn extract_sidebar_field(tree: &RenderNode, field: &str) -> Vec<Option<String>> {
         use crate::tui::render_tree::{ListProps, StyledContent, WidgetProps};
         match tree {
             RenderNode::HSplit { children, .. } => match &children[0] {
@@ -2164,7 +2160,9 @@ mod tests {
         // Tertiary = spawn info (target · branch · config) — always present
         let tertiary_text = tertiary[0].as_deref().unwrap_or("");
         assert!(
-            tertiary_text.contains("trybotster") && tertiary_text.contains("feature-auth") && tertiary_text.contains("claude"),
+            tertiary_text.contains("trybotster")
+                && tertiary_text.contains("feature-auth")
+                && tertiary_text.contains("claude"),
             "Tertiary should contain spawn info (target · branch · config), got: {}",
             tertiary_text
         );

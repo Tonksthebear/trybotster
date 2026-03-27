@@ -44,7 +44,9 @@ use std::{mem::ManuallyDrop, thread};
 
 use anyhow::{bail, Context, Result};
 
-use crate::terminal::{generate_snapshot, CallbackConfig, TerminalParser, DEFAULT_SCROLLBACK_LINES};
+use crate::terminal::{
+    generate_snapshot, CallbackConfig, TerminalParser, DEFAULT_SCROLLBACK_LINES,
+};
 
 use protocol::*;
 
@@ -162,6 +164,15 @@ pub struct SpawnConfig {
     pub tee_path: Option<String>,
     /// Maximum tee log file size in bytes.
     pub tee_cap: u64,
+    /// Boot-probed default foreground color for the session's libghostty parser.
+    #[serde(default)]
+    pub default_foreground: Option<crate::terminal::Rgb>,
+    /// Boot-probed default background color for the session's libghostty parser.
+    #[serde(default)]
+    pub default_background: Option<crate::terminal::Rgb>,
+    /// Boot-probed default cursor color for the session's libghostty parser.
+    #[serde(default)]
+    pub default_cursor: Option<crate::terminal::Rgb>,
 }
 
 /// Run the session process.
@@ -328,10 +339,8 @@ fn run_session(
         let kitty_tx = event_tx;
 
         let callbacks = CallbackConfig {
-            write_pty: Some(Box::new(move |data: &[u8]| {
-                unsafe {
-                    libc::write(write_fd, data.as_ptr().cast(), data.len());
-                }
+            write_pty: Some(Box::new(move |data: &[u8]| unsafe {
+                libc::write(write_fd, data.as_ptr().cast(), data.len());
             })),
             title_changed: Some(Box::new(move |_title: &str| {
                 title_flag.store(true, Ordering::Release);
@@ -358,12 +367,22 @@ fn run_session(
                 let _ = kitty_tx.try_send(VtEvent::KittyKeyboardChanged);
             })),
         };
-        Arc::new(Mutex::new(TerminalParser::new_with_callbacks(
+        let mut parser = TerminalParser::new_with_callbacks(
             config.rows,
             config.cols,
             DEFAULT_SCROLLBACK_LINES,
             callbacks,
-        )))
+        );
+        if let Some(color) = config.default_foreground {
+            parser.terminal_mut().set_color_foreground(color.into());
+        }
+        if let Some(color) = config.default_background {
+            parser.terminal_mut().set_color_background(color.into());
+        }
+        if let Some(color) = config.default_cursor {
+            parser.terminal_mut().set_color_cursor(color.into());
+        }
+        Arc::new(Mutex::new(parser))
     };
     let last_output_at = Arc::new(AtomicU64::new(0));
     let resize_pending = Arc::new(AtomicBool::new(false));
@@ -463,10 +482,7 @@ fn run_session(
                 let parent_contents = socket_path_owned.parent().and_then(|p| {
                     std::fs::read_dir(p).ok().map(|entries| {
                         let names: Vec<_> = entries
-                            .filter_map(|e| {
-                                e.ok()
-                                    .and_then(|e| e.file_name().into_string().ok())
-                            })
+                            .filter_map(|e| e.ok().and_then(|e| e.file_name().into_string().ok()))
                             .take(20)
                             .collect();
                         let count = names.len();
@@ -696,9 +712,11 @@ fn handle_hub_frame(
 
                     if alt_active {
                         // Alt screen active: format both screens independently
-                        let primary = t.format_screen(GhosttyScreenKey::Primary)
+                        let primary = t
+                            .format_screen(GhosttyScreenKey::Primary)
                             .unwrap_or_default();
-                        let alt = t.format_screen(GhosttyScreenKey::Alternate)
+                        let alt = t
+                            .format_screen(GhosttyScreenKey::Alternate)
                             .unwrap_or_default();
 
                         let mut buf = Vec::with_capacity(4 + primary.len() + alt.len());
@@ -839,9 +857,10 @@ fn reader_loop(
                     // Title changed (flag set by ghostty callback)
                     if title_changed_flag.swap(false, Ordering::Acquire) {
                         let title = p.terminal().title();
-                        let _ = output_tx.try_send(SessionOutput::EventFrame(
-                            encode_string(FRAME_TITLE_CHANGED, &title),
-                        ));
+                        let _ = output_tx.try_send(SessionOutput::EventFrame(encode_string(
+                            FRAME_TITLE_CHANGED,
+                            &title,
+                        )));
                     }
 
                     // PWD changed (flag set by ghostty OSC 7 callback)
@@ -854,17 +873,17 @@ fn reader_loop(
                             &raw
                         };
                         if !path.is_empty() {
-                            let _ = output_tx.try_send(SessionOutput::EventFrame(
-                                encode_string(FRAME_CWD_CHANGED, path),
-                            ));
+                            let _ = output_tx.try_send(SessionOutput::EventFrame(encode_string(
+                                FRAME_CWD_CHANGED,
+                                path,
+                            )));
                         }
                     }
                 }
 
                 // Bell (flag set by ghostty callback)
                 if bell_flag.swap(false, Ordering::Acquire) {
-                    let _ = output_tx
-                        .try_send(SessionOutput::EventFrame(encode_empty(FRAME_BELL)));
+                    let _ = output_tx.try_send(SessionOutput::EventFrame(encode_empty(FRAME_BELL)));
                 }
 
                 // Drain events from ghostty callbacks (notification, prompt, mode)
@@ -873,13 +892,14 @@ fn reader_loop(
                         VtEvent::Notification { title, body } => {
                             encode_json(FRAME_NOTIFICATION, &NotificationPayload { title, body })
                         }
-                        VtEvent::SemanticPrompt(mark) => {
-                            encode_json(FRAME_PROMPT_MARK, &PromptMarkPayload {
+                        VtEvent::SemanticPrompt(mark) => encode_json(
+                            FRAME_PROMPT_MARK,
+                            &PromptMarkPayload {
                                 mark: prompt_mark_name(mark).to_string(),
                                 command: None,
                                 exit_code: None,
-                            })
-                        }
+                            },
+                        ),
                         VtEvent::KittyKeyboardChanged => {
                             let kitty = parser.lock().map(|p| p.kitty_enabled()).unwrap_or(false);
                             let mut changed = ModeChanged::default();

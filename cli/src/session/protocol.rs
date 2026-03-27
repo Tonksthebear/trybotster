@@ -459,7 +459,10 @@ mod tests {
         let frames = decoder.feed(&encoded);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].frame_type, FRAME_TITLE_CHANGED);
-        assert_eq!(std::str::from_utf8(&frames[0].payload).unwrap(), "My Terminal");
+        assert_eq!(
+            std::str::from_utf8(&frames[0].payload).unwrap(),
+            "My Terminal"
+        );
     }
 
     #[test]
