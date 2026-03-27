@@ -336,13 +336,11 @@ impl PtyHandle {
         self.event_tx.subscribe()
     }
 
-    /// Subscribe and capture a snapshot for client attach.
+    /// Subscribe and capture a binary page snapshot for client attach.
     ///
-    /// Subscribes first, then generates a snapshot. For session-backed handles,
-    /// this is an RPC to the session process. Subscribe-before-snapshot ordering
-    /// ensures no output gap: bytes emitted during RPC are captured by the
-    /// subscription (and are also in the session's snapshot, so duplicates are
-    /// harmless — terminal parsers are idempotent).
+    /// Subscribes first, then generates a snapshot. Subscribe-before-snapshot
+    /// ordering ensures no output gap: bytes emitted during RPC are captured
+    /// by the subscription.
     #[must_use]
     pub fn snapshot_and_subscribe(
         &self,
@@ -381,10 +379,11 @@ impl PtyHandle {
         self.kitty_enabled.load(Ordering::Relaxed)
     }
 
-    /// Get an ANSI snapshot of the current terminal state via session RPC.
+    /// Get a binary page snapshot of the current terminal state via session RPC.
     ///
-    /// All PTYs are session-backed. Snapshots are fetched via RPC
-    /// (`FRAME_GET_SNAPSHOT`) to the session process.
+    /// Returns raw binary snapshot blob (page data + terminal state).
+    /// All clients decode this via `decode_binary_snapshot()` and load
+    /// pages directly into their local terminal parser.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
         if let Some(ref conn) = self.session_connection {

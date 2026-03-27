@@ -116,9 +116,19 @@ impl TerminalPanel {
         self.parser.foreground_color()
     }
 
+    /// Default foreground color for the panel terminal.
+    pub fn foreground_color_default(&self) -> Option<Rgb> {
+        self.parser.foreground_color_default()
+    }
+
     /// Effective background color for the panel terminal.
     pub fn background_color(&self) -> Option<Rgb> {
         self.parser.background_color()
+    }
+
+    /// Default background color for the panel terminal.
+    pub fn background_color_default(&self) -> Option<Rgb> {
+        self.parser.background_color_default()
     }
 
     /// Extract plain-text grid contents.
@@ -174,20 +184,58 @@ impl TerminalPanel {
         self.state = PanelState::Idle;
     }
 
-    /// Process a scrollback snapshot, transitioning to `Connected`.
+    /// Process a binary scrollback snapshot, transitioning to `Connected`.
+    ///
+    /// The data must be in binary snapshot format (version 1). Pages are
+    /// loaded directly into the terminal — no VT replay.
     pub fn on_scrollback(&mut self, data: &[u8]) {
         let (rows, cols) = self.dims;
         self.on_scrollback_with_dims(rows, cols, data);
     }
 
-    /// Process a scrollback snapshot with authoritative source dimensions.
+    /// Process a binary scrollback snapshot with authoritative source dimensions.
     pub fn on_scrollback_with_dims(&mut self, rows: u16, cols: u16, data: &[u8]) {
+        use crate::session::protocol::decode_binary_snapshot;
+
         self.dims = (rows, cols);
 
         // Replace the parser entirely so the old scrollback buffer is discarded.
         self.parser = TerminalParser::new(rows, cols, TUI_SCROLLBACK);
         self.parser.apply_color_cache(&self.color_cache);
-        self.parser.process(data);
+
+        if !data.is_empty() {
+            match decode_binary_snapshot(data) {
+                Ok(snapshot) => {
+                    let terminal = self.parser.terminal_mut();
+
+                    for (screen_idx, screen) in snapshot.screens.iter().enumerate() {
+                        let screen_key = if screen_idx == 0 {
+                            crate::ghostty_vt::GhosttyScreenKey::Primary
+                        } else {
+                            crate::ghostty_vt::GhosttyScreenKey::Alternate
+                        };
+                        for page in &screen.pages {
+                            let _ = terminal.page_load(
+                                screen_key,
+                                &page.data,
+                                page.capacity,
+                                page.used_cols,
+                                page.used_rows,
+                            );
+                        }
+                    }
+
+                    if !snapshot.state_blob.is_empty() {
+                        let _ = terminal.state_import(&snapshot.state_blob);
+                    }
+                    let _ = terminal.state_finalize();
+                }
+                Err(e) => {
+                    log::error!("[terminal_panel] failed to decode binary snapshot: {e}");
+                }
+            }
+        }
+
         self.update_render_state();
 
         // Reset scroll state — reconnect starts at live view
@@ -369,11 +417,9 @@ mod tests {
     fn on_scrollback_transitions_to_connected() {
         let mut panel = TerminalPanel::new(24, 80);
         panel.connect("sess-0");
-        panel.on_scrollback(b"Hello, World!");
+        // Empty snapshot still transitions to Connected
+        panel.on_scrollback(b"");
         assert_eq!(panel.state(), PanelState::Connected);
-
-        let contents = panel.contents();
-        assert!(contents.contains('H'));
     }
 
     #[test]
@@ -407,7 +453,7 @@ mod tests {
     fn disconnect_transitions_to_idle() {
         let mut panel = TerminalPanel::new(24, 80);
         panel.connect("sess-0");
-        panel.on_scrollback(b"data");
+        panel.on_scrollback(b"");
         assert_eq!(panel.state(), PanelState::Connected);
 
         let msg = panel.disconnect("sess-0");
@@ -481,20 +527,18 @@ mod tests {
         let mut panel = TerminalPanel::new(24, 80);
         panel.connect("sess-0");
         panel.on_output(b"old content");
-        panel.on_scrollback(b"new snapshot");
+        // Empty binary snapshot replaces parser, clearing old content
+        panel.on_scrollback(b"");
 
         let contents = panel.contents();
-        assert!(contents.contains('n'));
+        assert!(!contents.contains("old content"));
     }
 
     #[test]
     fn on_scrollback_connects_from_idle() {
         let mut panel = TerminalPanel::new(24, 80);
-        panel.on_scrollback(b"idle snapshot");
+        panel.on_scrollback(b"");
         assert_eq!(panel.state(), PanelState::Connected);
-
-        let contents = panel.contents();
-        assert!(contents.contains('i'));
     }
 
     #[test]

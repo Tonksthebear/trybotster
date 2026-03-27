@@ -3524,7 +3524,7 @@ mod tests {
         runner.panel_pool.current_terminal_sub_id = Some("tui:sess-0".to_string());
         let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect("sess-0");
-        panel.on_scrollback(b"already connected");
+        panel.on_scrollback(b"");
         runner.panel_pool.panels.insert("sess-0".to_string(), panel);
 
         // Action: focus same agent+session (Lua provides session_uuid)
@@ -3553,7 +3553,7 @@ mod tests {
 
         let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect("sess-0");
-        panel.on_scrollback(b"stale");
+        panel.on_scrollback(b"");
         panel.mark_transport_disconnected();
         runner.panel_pool.panels.insert("sess-0".to_string(), panel);
 
@@ -3584,12 +3584,13 @@ mod tests {
     fn test_focus_terminal_preserves_stale_parser() {
         let (mut runner, _request_rx) = create_test_runner();
 
-        // Setup: pre-populate panel with stale content for agent 1.
-        // Panel must be Connected for on_output to be accepted, then
-        // disconnect so it's Idle when focus_terminal runs.
+        // Setup: pre-populate panel for agent 1.
+        // Panel must be Connected, then disconnect so it's Idle when focus_terminal runs.
         let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect("sess-1");
-        panel.on_scrollback(b"stale content from previous session");
+        panel.on_scrollback(b"");
+        // Feed VT output so the parser has content
+        panel.on_output(b"stale content");
         panel.disconnect("sess-1");
         runner.panel_pool.panels.insert("sess-1".to_string(), panel);
         // Simulate already viewing this agent (prevents stale-panel eviction)
@@ -3602,7 +3603,7 @@ mod tests {
             "session_uuid": "sess-1",
         }));
 
-        // Verify: stale content is preserved in the panel (not blanked)
+        // Verify: panel is preserved (not blanked) — it retains its parser state
         let panel = runner.panel_pool.panels.get("sess-1").unwrap();
         let contents = panel.contents();
         assert!(
@@ -3681,7 +3682,7 @@ mod tests {
         {
             let panel = runner.panel_pool.resolve_panel("sess-0");
             let _ = panel.connect("sess-0");
-            panel.on_scrollback(b"boot");
+            panel.on_scrollback(b"");
             assert_eq!(panel.state(), PanelState::Connected);
         }
 
@@ -3726,7 +3727,7 @@ mod tests {
         runner.panel_pool.panels.insert("sess-0".to_string(), panel);
         runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
 
-        // Deliver scrollback event with fresh content
+        // Deliver empty scrollback (binary snapshot with no data replaces parser)
         runner.output_rx.close();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         runner.output_rx = rx;
@@ -3734,7 +3735,7 @@ mod tests {
             session_uuid: "sess-0".into(),
             rows: 24,
             cols: 80,
-            data: b"fresh snapshot\r\n".to_vec(),
+            data: vec![],
             kitty_enabled: false,
         })
         .unwrap();
@@ -3742,18 +3743,18 @@ mod tests {
         // Process the event
         runner.poll_pty_events(None);
 
-        // Verify: old content gone, scroll reset, new content present
+        // Verify: old content gone, scroll reset, state transitions to Connected
         let panel = runner.panel_pool.panels.get("sess-0").unwrap();
         let contents = panel.contents();
         assert!(
             !contents.contains("old line"),
             "Old content should be cleared, got: {contents:?}"
         );
-        assert!(
-            contents.contains("fresh snapshot"),
-            "Snapshot should be processed, got: {contents:?}"
-        );
         assert!(!panel.is_scrolled(), "Scroll should be reset to bottom");
+        assert_eq!(
+            panel.state(),
+            crate::tui::terminal_panel::PanelState::Connected
+        );
     }
 
     #[test]
@@ -3772,16 +3773,20 @@ mod tests {
             session_uuid: "sess-0".into(),
             rows: 0,
             cols: 0,
-            data: b"legacy snapshot\r\n".to_vec(),
+            data: vec![],
             kitty_enabled: false,
         })
         .unwrap();
 
         runner.poll_pty_events(None);
 
+        // When rows/cols are 0, panel falls back to its own cached dims
         let panel = runner.panel_pool.panels.get("sess-0").unwrap();
         assert_eq!(panel.dims(), (24, 80));
-        assert!(panel.contents().contains("legacy snapshot"));
+        assert_eq!(
+            panel.state(),
+            crate::tui::terminal_panel::PanelState::Connected
+        );
     }
 
     /// Verifies `handle_resize()` invalidates panel dims for next render.

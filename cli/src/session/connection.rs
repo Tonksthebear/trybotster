@@ -170,23 +170,17 @@ impl SessionConnection {
         Ok(())
     }
 
-    /// Request and receive an ANSI snapshot from the session process.
+    /// Request and receive a binary page snapshot from the session process.
     ///
-    /// The session process owns the terminal parser and generates snapshots
-    /// on demand. This is the sole snapshot path for session-backed handles.
-    ///
-    /// The wire format is a dual-screen envelope:
-    /// ```text
-    /// [u32 LE: primary_len][primary VT bytes][alt VT bytes (optional)]
-    /// ```
-    /// When alt screen is active, both sections are present. The returned
-    /// bytes are the combined VT output: primary + CSI ?1049h + alt.
+    /// Returns the raw binary snapshot blob (page data + terminal state).
+    /// All clients (TUI, browser, socket) decode this via
+    /// `decode_binary_snapshot()` and load pages directly.
     pub fn get_snapshot(&mut self) -> Result<Vec<u8>> {
         let req = encode_empty(FRAME_GET_SNAPSHOT);
         self.stream.write_all(&req).context("send GetSnapshot")?;
         self.stream.flush()?;
         let frame = self.read_response(FRAME_SNAPSHOT)?;
-        Ok(decode_dual_screen_snapshot(&frame.payload))
+        Ok(frame.payload)
     }
 
     /// Request terminal mode flags from the session process.
@@ -447,44 +441,6 @@ fn session_reader(
     });
 }
 
-/// Decode a dual-screen snapshot envelope into a single VT byte stream.
-///
-/// Wire format: `[u32 LE: primary_len][primary VT bytes][alt VT bytes]`
-///
-/// - Primary-only (no alt screen): returns primary bytes.
-/// - Dual-screen (alt active): returns primary + CSI ?1049h + alt bytes,
-///   which replays the normal screen then switches to alt and replays it.
-///
-/// Falls back to returning raw payload if the envelope is malformed
-/// (e.g., old session process that doesn't use the envelope format).
-fn decode_dual_screen_snapshot(payload: &[u8]) -> Vec<u8> {
-    if payload.len() < 4 {
-        return payload.to_vec();
-    }
-
-    let primary_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-
-    if 4 + primary_len > payload.len() {
-        // Malformed envelope — treat as raw snapshot for backwards compatibility
-        return payload.to_vec();
-    }
-
-    let primary = &payload[4..4 + primary_len];
-    let alt = &payload[4 + primary_len..];
-
-    if alt.is_empty() {
-        // Primary screen only
-        primary.to_vec()
-    } else {
-        // Dual screen: primary + enter alt + alt content
-        let mut out = Vec::with_capacity(primary.len() + 8 + alt.len());
-        out.extend_from_slice(primary);
-        out.extend_from_slice(b"\x1b[?1049h");
-        out.extend_from_slice(alt);
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,43 +448,5 @@ mod tests {
     #[test]
     fn shared_session_connection_type_compiles() {
         let _conn: SharedSessionConnection = Arc::new(Mutex::new(None));
-    }
-
-    #[test]
-    fn decode_primary_only_snapshot() {
-        let primary = b"hello world";
-        let mut payload = (primary.len() as u32).to_le_bytes().to_vec();
-        payload.extend_from_slice(primary);
-
-        let result = decode_dual_screen_snapshot(&payload);
-        assert_eq!(result, b"hello world");
-    }
-
-    #[test]
-    fn decode_dual_screen_snapshot_combines() {
-        let primary = b"normal screen";
-        let alt = b"alt screen";
-        let mut payload = (primary.len() as u32).to_le_bytes().to_vec();
-        payload.extend_from_slice(primary);
-        payload.extend_from_slice(alt);
-
-        let result = decode_dual_screen_snapshot(&payload);
-        assert!(result.starts_with(b"normal screen"));
-        assert!(result.windows(8).any(|w| w == b"\x1b[?1049h"));
-        assert!(result.ends_with(b"alt screen"));
-    }
-
-    #[test]
-    fn decode_empty_payload() {
-        let result = decode_dual_screen_snapshot(&[]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn decode_malformed_falls_back_to_raw() {
-        // primary_len says 1000 but payload is only 10 bytes
-        let payload = [0xe8, 0x03, 0x00, 0x00, b'h', b'i'];
-        let result = decode_dual_screen_snapshot(&payload);
-        assert_eq!(result, payload);
     }
 }

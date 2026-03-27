@@ -385,6 +385,41 @@ mod tests {
     }
 
     #[test]
+    fn test_render_with_content_keeps_terminal_default_background() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut parser = TerminalParser::new(24, 80, 1000);
+        parser.terminal_mut().set_color_background(GhosttyColorRgb {
+            r: 0xF0,
+            g: 0xE0,
+            b: 0xD0,
+        });
+        parser.process(b"Hello, World!");
+        let rs = make_render_state(&mut parser);
+        let default_fg = parser
+            .foreground_color_default()
+            .or_else(|| parser.foreground_color())
+            .unwrap_or(crate::terminal::Rgb::new(255, 255, 255));
+        let default_bg = parser
+            .background_color_default()
+            .or_else(|| parser.background_color())
+            .unwrap_or(crate::terminal::Rgb::new(0, 0, 0));
+
+        terminal
+            .draw(|f| {
+                let widget =
+                    TerminalWidget::new(&rs).default_colors(default_fg.into(), default_bg.into());
+                f.render_widget(widget, f.area());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(20, 0)].bg, Color::Rgb(0xF0, 0xE0, 0xD0));
+        assert_eq!(buffer[(40, 12)].bg, Color::Rgb(0xF0, 0xE0, 0xD0));
+    }
+
+    #[test]
     fn test_render_with_bold() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();

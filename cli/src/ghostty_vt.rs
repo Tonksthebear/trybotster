@@ -572,6 +572,36 @@ struct GhosttyFormatterOpaque {
 }
 type GhosttyFormatterPtr = *mut GhosttyFormatterOpaque;
 
+// ── Binary page transfer types ─────────────────────────────────────────────
+
+/// Page capacity hints — matches the C struct for page allocation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyPageCapacity {
+    pub cols: u16,
+    pub rows: u16,
+    pub styles: u16,
+    pub grapheme_bytes: u32,
+    pub hyperlink_bytes: u16,
+    pub string_bytes: u32,
+}
+
+/// Page metadata returned by page_info.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyPageInfo {
+    pub memory_len: usize,
+    pub used_cols: u16,
+    pub used_rows: u16,
+    pub cap: GhosttyPageCapacity,
+}
+
+// Compile-time layout assertions — catch padding mismatches with Zig.
+// GhosttyPageCapacity: u16 + u16 + u16 + (2 pad) + u32 + u16 + (2 pad) + u32 = 20
+const _: () = assert!(std::mem::size_of::<GhosttyPageCapacity>() == 20);
+// GhosttyPageInfo: usize(8) + u16 + u16 + GhosttyPageCapacity(20) = 32
+const _: () = assert!(std::mem::size_of::<GhosttyPageInfo>() == 32);
+
 // ── Extern C functions ─────────────────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -747,6 +777,53 @@ extern "C" {
     // Style
     fn ghostty_style_default(style: *mut GhosttyStyle);
     fn ghostty_style_is_default(style: *const GhosttyStyle) -> bool;
+
+    // ── Binary page transfer (snapshot API) ────────────────────────────
+    fn ghostty_snapshot_page_count(
+        terminal: GhosttyTerminalPtr,
+        screen_key: GhosttyScreenKey,
+        out_count: *mut usize,
+    ) -> GhosttyResult;
+
+    fn ghostty_snapshot_page_info(
+        terminal: GhosttyTerminalPtr,
+        screen_key: GhosttyScreenKey,
+        index: usize,
+        out_info: *mut GhosttyPageInfo,
+    ) -> GhosttyResult;
+
+    fn ghostty_snapshot_page_read(
+        terminal: GhosttyTerminalPtr,
+        screen_key: GhosttyScreenKey,
+        index: usize,
+        buf: *mut u8,
+        buf_len: usize,
+    ) -> GhosttyResult;
+
+    fn ghostty_snapshot_page_load(
+        terminal: GhosttyTerminalPtr,
+        screen_key: GhosttyScreenKey,
+        data: *const u8,
+        data_len: usize,
+        capacity: GhosttyPageCapacity,
+        used_cols: u16,
+        used_rows: u16,
+    ) -> GhosttyResult;
+
+    fn ghostty_snapshot_state_export(
+        terminal: GhosttyTerminalPtr,
+        allocator: *const c_void,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+
+    fn ghostty_snapshot_state_import(
+        terminal: GhosttyTerminalPtr,
+        data: *const u8,
+        data_len: usize,
+    ) -> GhosttyResult;
+
+    fn ghostty_snapshot_state_finalize(terminal: GhosttyTerminalPtr) -> GhosttyResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -1458,6 +1535,108 @@ impl Terminal {
         };
 
         self.format_with_opts(opts)
+    }
+
+    // ── Binary page transfer (snapshot API) ────────────────────────────
+
+    /// Number of pages in the given screen.
+    pub fn page_count(&self, screen_key: GhosttyScreenKey) -> usize {
+        let mut count: usize = 0;
+        let result =
+            unsafe { ghostty_snapshot_page_count(self.handle, screen_key, &mut count) };
+        if result == GhosttyResult::Success {
+            count
+        } else {
+            0
+        }
+    }
+
+    /// Metadata for a page at the given index.
+    pub fn page_info(&self, screen_key: GhosttyScreenKey, index: usize) -> Option<GhosttyPageInfo> {
+        let mut info = unsafe { std::mem::zeroed::<GhosttyPageInfo>() };
+        let result =
+            unsafe { ghostty_snapshot_page_info(self.handle, screen_key, index, &mut info) };
+        if result == GhosttyResult::Success {
+            Some(info)
+        } else {
+            None
+        }
+    }
+
+    /// Read raw page memory into a caller-provided buffer.
+    /// Returns the page data as a Vec, or None on failure.
+    pub fn page_read(&self, screen_key: GhosttyScreenKey, index: usize, size: usize) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; size];
+        let result = unsafe {
+            ghostty_snapshot_page_read(self.handle, screen_key, index, buf.as_mut_ptr(), size)
+        };
+        if result == GhosttyResult::Success {
+            Some(buf)
+        } else {
+            None
+        }
+    }
+
+    /// Load raw page memory into the given screen.
+    pub fn page_load(
+        &mut self,
+        screen_key: GhosttyScreenKey,
+        data: &[u8],
+        capacity: GhosttyPageCapacity,
+        used_cols: u16,
+        used_rows: u16,
+    ) -> Result<(), &'static str> {
+        let result = unsafe {
+            ghostty_snapshot_page_load(
+                self.handle,
+                screen_key,
+                data.as_ptr(),
+                data.len(),
+                capacity,
+                used_cols,
+                used_rows,
+            )
+        };
+        match result {
+            GhosttyResult::Success => Ok(()),
+            _ => Err("ghostty_snapshot_page_load: failed"),
+        }
+    }
+
+    /// Export all non-page terminal state (modes, cursor, colors, etc.).
+    pub fn state_export(&self) -> Option<Vec<u8>> {
+        let mut ptr: *mut u8 = ptr::null_mut();
+        let mut len: usize = 0;
+        let result = unsafe {
+            ghostty_snapshot_state_export(self.handle, ptr::null(), &mut ptr, &mut len)
+        };
+        if result == GhosttyResult::Success && !ptr.is_null() && len > 0 {
+            let data = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+            unsafe { ghostty_free(ptr::null(), ptr, len) };
+            Some(data)
+        } else {
+            None
+        }
+    }
+
+    /// Import non-page terminal state.
+    pub fn state_import(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        let result = unsafe {
+            ghostty_snapshot_state_import(self.handle, data.as_ptr(), data.len())
+        };
+        match result {
+            GhosttyResult::Success => Ok(()),
+            _ => Err("ghostty_snapshot_state_import: failed"),
+        }
+    }
+
+    /// Finalize state after page_load + state_import (recomputes derived state).
+    pub fn state_finalize(&mut self) -> Result<(), &'static str> {
+        let result = unsafe { ghostty_snapshot_state_finalize(self.handle) };
+        match result {
+            GhosttyResult::Success => Ok(()),
+            _ => Err("ghostty_snapshot_state_finalize: failed"),
+        }
     }
 
     fn format_with_opts(
