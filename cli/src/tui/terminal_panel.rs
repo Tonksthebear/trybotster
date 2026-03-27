@@ -3,8 +3,13 @@
 //! Each `TerminalPanel` owns a [`TerminalParser`] and a [`RenderState`] and
 //! tracks its connection lifecycle.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use crate::ghostty_vt::RenderState;
 use crate::terminal::{CursorStyle, TerminalParser};
+
+use super::ColorCache;
 
 /// Default scrollback buffer size in lines for TUI panels.
 const TUI_SCROLLBACK: usize = 10_000;
@@ -26,6 +31,7 @@ pub enum PanelState {
 pub struct TerminalPanel {
     parser: TerminalParser,
     render_state: RenderState,
+    color_cache: ColorCache,
     state: PanelState,
     dims: (u16, u16),
     /// Lines scrolled up from live view. Zero means at bottom (live).
@@ -46,11 +52,18 @@ impl std::fmt::Debug for TerminalPanel {
 impl TerminalPanel {
     /// Create a panel with an empty parser at the given dimensions.
     pub fn new(rows: u16, cols: u16) -> Self {
-        let parser = TerminalParser::new(rows, cols, TUI_SCROLLBACK);
+        Self::new_with_color_cache(rows, cols, Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    /// Create a panel seeded with terminal default colors.
+    pub fn new_with_color_cache(rows: u16, cols: u16, color_cache: ColorCache) -> Self {
+        let mut parser = TerminalParser::new(rows, cols, TUI_SCROLLBACK);
+        parser.apply_color_cache(&color_cache);
         let render_state = RenderState::new().expect("render state creation");
         Self {
             parser,
             render_state,
+            color_cache,
             state: PanelState::Idle,
             dims: (rows, cols),
             scroll_offset: 0,
@@ -163,6 +176,7 @@ impl TerminalPanel {
 
         // Replace the parser entirely so the old scrollback buffer is discarded.
         self.parser = TerminalParser::new(rows, cols, TUI_SCROLLBACK);
+        self.parser.apply_color_cache(&self.color_cache);
         self.parser.process(data);
         self.update_render_state();
 
@@ -222,7 +236,10 @@ impl TerminalPanel {
         let delta = new_offset - self.scroll_offset;
         if delta > 0 {
             self.scroll_offset = new_offset;
-            self.parser.terminal_mut().scroll_viewport_delta(-(delta as isize));
+            self.parser
+                .terminal_mut()
+                .scroll_viewport_delta(-(delta as isize));
+            self.update_render_state();
         }
     }
 
@@ -235,7 +252,10 @@ impl TerminalPanel {
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
         let delta = old - self.scroll_offset;
         if delta > 0 {
-            self.parser.terminal_mut().scroll_viewport_delta(delta as isize);
+            self.parser
+                .terminal_mut()
+                .scroll_viewport_delta(delta as isize);
+            self.update_render_state();
         }
     }
 
@@ -247,6 +267,7 @@ impl TerminalPanel {
         }
         self.scroll_offset = depth;
         self.parser.terminal_mut().scroll_viewport_top();
+        self.update_render_state();
     }
 
     /// Jump to the bottom (return to live view).
@@ -256,6 +277,7 @@ impl TerminalPanel {
         }
         self.scroll_offset = 0;
         self.parser.terminal_mut().scroll_viewport_bottom();
+        self.update_render_state();
     }
 
     /// Whether the panel is scrolled up from live view.
