@@ -215,13 +215,28 @@ impl TerminalPanel {
                             crate::ghostty_vt::GhosttyScreenKey::Alternate
                         };
                         for page in &screen.pages {
-                            let _ = terminal.page_load(
+                            match terminal.page_load(
                                 screen_key,
                                 &page.data,
                                 page.capacity,
                                 page.used_cols,
                                 page.used_rows,
-                            );
+                            ) {
+                                Ok(()) => {}
+                                Err(e) if screen_key == crate::ghostty_vt::GhosttyScreenKey::Alternate => {
+                                    // Alt screen not yet initialized is a valid state
+                                    // (it's lazy-allocated). Skip remaining alt pages.
+                                    log::debug!(
+                                        "[terminal_panel] skipping alt screen page_load (not initialized): {e}"
+                                    );
+                                    break;
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "[terminal_panel] primary screen page_load failed: {e}"
+                                    );
+                                }
+                            }
                         }
                     }
 
@@ -232,6 +247,8 @@ impl TerminalPanel {
                 }
                 Err(e) => {
                     log::error!("[terminal_panel] failed to decode binary snapshot: {e}");
+                    // Don't transition to Connected — snapshot is malformed
+                    return;
                 }
             }
         }
@@ -538,6 +555,58 @@ mod tests {
     fn on_scrollback_connects_from_idle() {
         let mut panel = TerminalPanel::new(24, 80);
         panel.on_scrollback(b"");
+        assert_eq!(panel.state(), PanelState::Connected);
+    }
+
+    #[test]
+    fn on_scrollback_with_alt_screen_pages_transitions_to_connected() {
+        use crate::ghostty_vt::{GhosttyPageCapacity, GhosttyScreenKey};
+        use crate::session::protocol::{
+            encode_binary_snapshot, SnapshotPage, SnapshotScreen,
+        };
+
+        // Build a snapshot with primary screen pages and an alt screen with
+        // a dummy page. The alt screen may not be initialized on the receiving
+        // parser, so page_load for it can fail — this must not prevent the
+        // panel from reaching Connected state.
+        let primary_page = SnapshotPage {
+            capacity: GhosttyPageCapacity {
+                cols: 80,
+                rows: 24,
+                styles: 128,
+                grapheme_bytes: 1024,
+                hyperlink_bytes: 0,
+                string_bytes: 512,
+            },
+            used_cols: 80,
+            used_rows: 24,
+            // Intentionally invalid page data — will fail to load but
+            // should not crash or block transition.
+            data: vec![0xFF; 64],
+        };
+        let alt_page = SnapshotPage {
+            capacity: primary_page.capacity,
+            used_cols: 80,
+            used_rows: 24,
+            data: vec![0xFF; 64],
+        };
+
+        let screens = vec![
+            SnapshotScreen {
+                pages: vec![primary_page],
+            },
+            SnapshotScreen {
+                pages: vec![alt_page],
+            },
+        ];
+
+        let encoded = encode_binary_snapshot(GhosttyScreenKey::Primary, &screens, &[]);
+
+        let mut panel = TerminalPanel::new(24, 80);
+        panel.connect("sess-0");
+        panel.on_scrollback(&encoded);
+
+        // Must still transition to Connected even if page loads fail
         assert_eq!(panel.state(), PanelState::Connected);
     }
 

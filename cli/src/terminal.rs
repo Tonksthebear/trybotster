@@ -2,10 +2,8 @@
 //!
 //! Provides [`TerminalParser`] — a monomorphic wrapper around ghostty's terminal
 //! with effect callbacks for write_pty, title_changed, and bell events.
-//!
-//! Also provides [`generate_snapshot`] which produces clean ANSI/VT output using
-//! ghostty's built-in formatter — replacing the old hand-rolled serializer.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::pin::Pin;
 
@@ -281,6 +279,7 @@ pub struct TerminalParser {
     terminal: ghostty_vt::Terminal,
     _callback_state: Option<Pin<Box<CallbackState>>>,
     osc_query_buffer: Vec<u8>,
+    color_cache: HashMap<usize, Rgb>,
 }
 
 impl std::fmt::Debug for TerminalParser {
@@ -305,6 +304,7 @@ impl TerminalParser {
             terminal,
             _callback_state: None,
             osc_query_buffer: Vec::new(),
+            color_cache: HashMap::new(),
         }
     }
 
@@ -368,6 +368,7 @@ impl TerminalParser {
             terminal,
             _callback_state: Some(state),
             osc_query_buffer: Vec::new(),
+            color_cache: HashMap::new(),
         }
     }
 
@@ -456,40 +457,34 @@ impl TerminalParser {
 
     /// Apply cached terminal colors from the hub's boot probe.
     ///
-    /// Sets the default foreground, background, and cursor colors on the ghostty
-    /// terminal so OSC 10/11/12 queries from running processes are answered
-    /// correctly via the `write_pty` callback.
+    /// Sets the default foreground/background/cursor and indexed palette colors on
+    /// the ghostty terminal so OSC 4/10/11/12 queries from running processes are
+    /// answered correctly via the `write_pty` callback.
     pub fn apply_color_cache(
         &mut self,
         cache: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, Rgb>>>,
     ) {
         if let Ok(colors) = cache.lock() {
-            // OSC 10 = foreground (index 256 in alacritty convention)
-            if let Some(fg) = colors.get(&256) {
-                self.terminal
-                    .set_color_foreground(ghostty_vt::GhosttyColorRgb {
-                        r: fg.r,
-                        g: fg.g,
-                        b: fg.b,
-                    });
-            }
-            // OSC 11 = background (index 257)
-            if let Some(bg) = colors.get(&257) {
-                self.terminal
-                    .set_color_background(ghostty_vt::GhosttyColorRgb {
-                        r: bg.r,
-                        g: bg.g,
-                        b: bg.b,
-                    });
-            }
-            // OSC 12 = cursor (index 258)
-            if let Some(cursor) = colors.get(&258) {
-                self.terminal.set_color_cursor(ghostty_vt::GhosttyColorRgb {
-                    r: cursor.r,
-                    g: cursor.g,
-                    b: cursor.b,
-                });
-            }
+            self.apply_color_cache_map(&colors);
+        }
+    }
+
+    /// Apply a plain color cache map keyed by terminal color index.
+    pub fn apply_color_cache_map(&mut self, colors: &HashMap<usize, Rgb>) {
+        self.color_cache = colors.clone();
+
+        if let Some(fg) = colors.get(&256) {
+            self.terminal.set_color_foreground((*fg).into());
+        }
+        if let Some(bg) = colors.get(&257) {
+            self.terminal.set_color_background((*bg).into());
+        }
+        if let Some(cursor) = colors.get(&258) {
+            self.terminal.set_color_cursor((*cursor).into());
+        }
+
+        if let Some(palette) = complete_palette(colors) {
+            self.terminal.set_color_palette(&palette);
         }
     }
 
@@ -528,26 +523,35 @@ impl TerminalParser {
     }
 
     fn format_osc_color_query_response(&self, query: &[u8]) -> Option<Vec<u8>> {
-        let (code, terminator) = parse_osc_color_query(query)?;
-        let color = match code {
-            10 => self
+        let (query, terminator) = parse_osc_color_query(query)?;
+        let color = match query {
+            OscColorQuery::DefaultForeground => self
                 .terminal
                 .foreground_color_default()
-                .or_else(|| self.terminal.foreground_color())?,
-            11 => self
+                .or_else(|| self.terminal.foreground_color())
+                .map(Into::into)?,
+            OscColorQuery::DefaultBackground => self
                 .terminal
                 .background_color_default()
-                .or_else(|| self.terminal.background_color())?,
-            12 => self
+                .or_else(|| self.terminal.background_color())
+                .map(Into::into)?,
+            OscColorQuery::DefaultCursor => self
                 .terminal
                 .cursor_color_default()
-                .or_else(|| self.terminal.cursor_color())?,
-            _ => return None,
+                .or_else(|| self.terminal.cursor_color())
+                .map(Into::into)?,
+            OscColorQuery::Palette(index) => *self.color_cache.get(&(index as usize))?,
         };
 
         let mut response = format!(
-            "\x1b]{code};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}",
-            color.r, color.r, color.g, color.g, color.b, color.b
+            "\x1b]{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}",
+            query.response_code(),
+            color.r,
+            color.r,
+            color.g,
+            color.g,
+            color.b,
+            color.b
         )
         .into_bytes();
         response.extend_from_slice(terminator);
@@ -624,7 +628,26 @@ fn extract_complete_osc_color_queries(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
     sequences
 }
 
-fn parse_osc_color_query(seq: &[u8]) -> Option<(u8, &'static [u8])> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OscColorQuery {
+    DefaultForeground,
+    DefaultBackground,
+    DefaultCursor,
+    Palette(u8),
+}
+
+impl OscColorQuery {
+    fn response_code(self) -> String {
+        match self {
+            Self::DefaultForeground => "10".to_string(),
+            Self::DefaultBackground => "11".to_string(),
+            Self::DefaultCursor => "12".to_string(),
+            Self::Palette(index) => format!("4;{index}"),
+        }
+    }
+}
+
+fn parse_osc_color_query(seq: &[u8]) -> Option<(OscColorQuery, &'static [u8])> {
     if seq.len() < 6 || seq[0] != ESC || seq[1] != b']' {
         return None;
     }
@@ -637,44 +660,46 @@ fn parse_osc_color_query(seq: &[u8]) -> Option<(u8, &'static [u8])> {
         return None;
     };
 
-    let separator = payload.iter().position(|byte| *byte == b';')?;
-    let code = &payload[..separator];
-    let value = &payload[separator + 1..];
-    if value != b"?" {
-        return None;
-    }
-
-    let code = match code {
-        b"10" => 10,
-        b"11" => 11,
-        b"12" => 12,
+    let (code, value) = payload.split_once_by(|byte| *byte == b';')?;
+    let query = match code {
+        b"10" if value == b"?" => OscColorQuery::DefaultForeground,
+        b"11" if value == b"?" => OscColorQuery::DefaultBackground,
+        b"12" if value == b"?" => OscColorQuery::DefaultCursor,
+        b"4" => {
+            let (index, value) = value.split_once_by(|byte| *byte == b';')?;
+            if value != b"?" {
+                return None;
+            }
+            let index = std::str::from_utf8(index).ok()?.parse::<u8>().ok()?;
+            OscColorQuery::Palette(index)
+        }
         _ => return None,
     };
-    Some((code, terminator))
+    Some((query, terminator))
 }
 
-// ── Snapshot generation ───────────────────────────────────────────────────────
-
-/// Generate an ANSI snapshot from the terminal for browser reconnect.
-///
-/// Uses ghostty's built-in formatter which handles SGR, hyperlinks, modes,
-/// cursor, kitty keyboard, scrolling regions, and all other terminal state.
-pub fn generate_snapshot(parser: &TerminalParser, skip_visible: bool) -> Vec<u8> {
-    if skip_visible {
-        let mut out = Vec::new();
-        if parser.alt_screen_active() {
-            out.extend_from_slice(b"\x1b[?1049h");
-        }
-        out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J\x1b[H");
-        if parser.cursor_hidden() {
-            out.extend_from_slice(b"\x1b[?25l");
-        }
-        if parser.kitty_enabled() {
-            out.extend_from_slice(b"\x1b[>1u");
-        }
-        return out;
+fn complete_palette(colors: &HashMap<usize, Rgb>) -> Option<[ghostty_vt::GhosttyColorRgb; 256]> {
+    let mut palette = [ghostty_vt::GhosttyColorRgb { r: 0, g: 0, b: 0 }; 256];
+    for (index, slot) in palette.iter_mut().enumerate() {
+        *slot = (*colors.get(&index)?).into();
     }
-    parser.terminal().format_vt_full().unwrap_or_default()
+    Some(palette)
+}
+
+trait SplitOnceBytes {
+    fn split_once_by<P>(&self, pred: P) -> Option<(&[u8], &[u8])>
+    where
+        P: FnMut(&u8) -> bool;
+}
+
+impl SplitOnceBytes for [u8] {
+    fn split_once_by<P>(&self, mut pred: P) -> Option<(&[u8], &[u8])>
+    where
+        P: FnMut(&u8) -> bool,
+    {
+        let idx = self.iter().position(&mut pred)?;
+        Some((&self[..idx], &self[idx + 1..]))
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -812,6 +837,32 @@ mod tests {
     }
 
     #[test]
+    fn osc_palette_query_reports_seeded_palette_color() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writes_cb = std::sync::Arc::clone(&writes);
+        let callbacks = CallbackConfig {
+            write_pty: Some(Box::new(move |data: &[u8]| {
+                writes_cb
+                    .lock()
+                    .expect("write buffer poisoned")
+                    .extend_from_slice(data);
+            })),
+            ..CallbackConfig::default()
+        };
+        let mut parser = TerminalParser::new_with_callbacks(24, 80, 100, callbacks);
+        let mut colors = HashMap::new();
+        colors.insert(7usize, Rgb::new(0xaa, 0xbb, 0xcc));
+        parser.apply_color_cache_map(&colors);
+
+        parser.process(b"\x1b]4;7;?\x07");
+
+        assert_eq!(
+            writes.lock().expect("write buffer poisoned").as_slice(),
+            b"\x1b]4;7;rgb:aaaa/bbbb/cccc\x07"
+        );
+    }
+
+    #[test]
     fn osc_query_split_across_chunks_is_answered_once_complete() {
         let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let writes_cb = std::sync::Arc::clone(&writes);
@@ -841,6 +892,35 @@ mod tests {
     }
 
     #[test]
+    fn osc_palette_query_split_across_chunks_is_answered_once_complete() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writes_cb = std::sync::Arc::clone(&writes);
+        let callbacks = CallbackConfig {
+            write_pty: Some(Box::new(move |data: &[u8]| {
+                writes_cb
+                    .lock()
+                    .expect("write buffer poisoned")
+                    .extend_from_slice(data);
+            })),
+            ..CallbackConfig::default()
+        };
+        let mut parser = TerminalParser::new_with_callbacks(24, 80, 100, callbacks);
+        let mut colors = HashMap::new();
+        colors.insert(7usize, Rgb::new(0xaa, 0xbb, 0xcc));
+        parser.apply_color_cache_map(&colors);
+
+        parser.process(b"\x1b]4;7;");
+        assert!(writes.lock().expect("write buffer poisoned").is_empty());
+
+        parser.process(b"?\x07");
+
+        assert_eq!(
+            writes.lock().expect("write buffer poisoned").as_slice(),
+            b"\x1b]4;7;rgb:aaaa/bbbb/cccc\x07"
+        );
+    }
+
+    #[test]
     fn cursor_shown_by_default() {
         let p = TerminalParser::new(24, 80, 100);
         assert!(!p.cursor_hidden());
@@ -853,29 +933,6 @@ mod tests {
         assert!(p.cursor_hidden());
         p.process(b"\x1b[?25h");
         assert!(!p.cursor_hidden());
-    }
-
-    #[test]
-    fn snapshot_non_empty() {
-        let p = TerminalParser::new(24, 80, 100);
-        let snap = generate_snapshot(&p, false);
-        assert!(!snap.is_empty());
-    }
-
-    #[test]
-    fn snapshot_skip_visible() {
-        let p = TerminalParser::new(24, 80, 100);
-        let snap = generate_snapshot(&p, true);
-        assert!(snap.windows(4).any(|w| w == b"\x1b[2J"));
-    }
-
-    #[test]
-    fn snapshot_contains_content() {
-        let mut p = TerminalParser::new(24, 80, 100);
-        p.process(b"hello world");
-        let snap = generate_snapshot(&p, false);
-        let snap_str = String::from_utf8_lossy(&snap);
-        assert!(snap_str.contains("hello world"));
     }
 
     #[test]

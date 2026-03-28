@@ -74,58 +74,9 @@ use crate::agent::spawn::PtySpawnConfig;
 use crate::hub::events::HubEvent;
 use tokio::sync::broadcast;
 
-/// Strip ANSI escape sequences from bytes, returning plain text.
-///
-/// Handles CSI (ESC [ ... final), OSC (ESC ] ... ST/BEL), and simple
-/// ESC sequences. Used by `get_screen()` to convert ANSI snapshots
-/// to plain text for agent/LLM consumption.
-fn strip_ansi_escapes(input: &[u8]) -> String {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        if input[i] == 0x1b {
-            i += 1;
-            if i >= input.len() {
-                break;
-            }
-            match input[i] {
-                b'[' => {
-                    // CSI sequence: skip until final byte (0x40..=0x7E)
-                    i += 1;
-                    while i < input.len() && !(0x40..=0x7E).contains(&input[i]) {
-                        i += 1;
-                    }
-                    if i < input.len() {
-                        i += 1; // skip final byte
-                    }
-                }
-                b']' => {
-                    // OSC sequence: skip until ST (ESC \) or BEL (0x07)
-                    i += 1;
-                    while i < input.len() {
-                        if input[i] == 0x07 {
-                            i += 1;
-                            break;
-                        }
-                        if input[i] == 0x1b && i + 1 < input.len() && input[i + 1] == b'\\' {
-                            i += 2;
-                            break;
-                        }
-                        i += 1;
-                    }
-                }
-                _ => {
-                    // Simple ESC sequence (e.g., ESC M, ESC =): skip one byte
-                    i += 1;
-                }
-            }
-        } else {
-            out.push(input[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
+// strip_ansi_escapes removed — get_screen() now uses the dedicated
+// FRAME_GET_SCREEN RPC which returns plain text directly from the
+// session process. No client-side ANSI stripping needed.
 
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
@@ -497,15 +448,16 @@ impl LuaUserData for PtySessionHandle {
             Ok(())
         });
 
-        // session:get_snapshot() -> string (clean ANSI bytes)
-        // Also aliased as get_scrollback for backwards compatibility.
-        // Routes through session process RPC (FRAME_GET_SNAPSHOT).
+        // session:get_snapshot() -> string (plain text)
+        // Returns plain text screen contents via FRAME_GET_SCREEN RPC.
+        // Binary page snapshots are for internal Rust use (TUI/browser reconnect),
+        // not useful to Lua consumers.
         methods.add_method("get_snapshot", |lua, this, ()| {
             if let Some(conn) = this.session_connection.get() {
                 if let Ok(mut guard) = conn.lock() {
                     if let Some(session) = guard.as_mut() {
-                        match session.get_snapshot() {
-                            Ok(snapshot) => return lua.create_string(&snapshot),
+                        match session.get_screen() {
+                            Ok(text) => return lua.create_string(text.as_bytes()),
                             Err(e) => {
                                 log::warn!("get_snapshot RPC failed: {e}");
                             }
@@ -518,18 +470,14 @@ impl LuaUserData for PtySessionHandle {
 
         // session:get_screen() -> string (plain text, visible screen only)
         //
-        // Fetches ANSI snapshot via session RPC, then strips escape sequences
-        // to produce plain text. A dedicated text-only RPC would be more
-        // efficient but requires a new session protocol frame.
+        // Uses the dedicated FRAME_GET_SCREEN RPC which returns plain text
+        // directly from the session process parser.
         methods.add_method("get_screen", |lua, this, ()| {
             if let Some(conn) = this.session_connection.get() {
                 if let Ok(mut guard) = conn.lock() {
                     if let Some(session) = guard.as_mut() {
-                        match session.get_snapshot() {
-                            Ok(snapshot) => {
-                                let text = strip_ansi_escapes(&snapshot);
-                                return lua.create_string(text.as_bytes());
-                            }
+                        match session.get_screen() {
+                            Ok(text) => return lua.create_string(text.as_bytes()),
                             Err(e) => {
                                 log::warn!("get_screen RPC failed: {e}");
                             }
@@ -546,13 +494,13 @@ impl LuaUserData for PtySessionHandle {
         // process owns all terminal parsing. Retained for API compatibility.
         methods.add_method("feed_output", |_, _this, _data: LuaString| Ok(()));
 
-        // Backwards-compatible alias for get_snapshot.
+        // Backwards-compatible alias for get_snapshot (plain text).
         methods.add_method("get_scrollback", |lua, this, ()| {
             if let Some(conn) = this.session_connection.get() {
                 if let Ok(mut guard) = conn.lock() {
                     if let Some(session) = guard.as_mut() {
-                        match session.get_snapshot() {
-                            Ok(snapshot) => return lua.create_string(&snapshot),
+                        match session.get_screen() {
+                            Ok(text) => return lua.create_string(text.as_bytes()),
                             Err(e) => {
                                 log::warn!("get_scrollback RPC failed: {e}");
                             }

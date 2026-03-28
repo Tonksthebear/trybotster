@@ -1542,8 +1542,7 @@ impl Terminal {
     /// Number of pages in the given screen.
     pub fn page_count(&self, screen_key: GhosttyScreenKey) -> usize {
         let mut count: usize = 0;
-        let result =
-            unsafe { ghostty_snapshot_page_count(self.handle, screen_key, &mut count) };
+        let result = unsafe { ghostty_snapshot_page_count(self.handle, screen_key, &mut count) };
         if result == GhosttyResult::Success {
             count
         } else {
@@ -1565,7 +1564,12 @@ impl Terminal {
 
     /// Read raw page memory into a caller-provided buffer.
     /// Returns the page data as a Vec, or None on failure.
-    pub fn page_read(&self, screen_key: GhosttyScreenKey, index: usize, size: usize) -> Option<Vec<u8>> {
+    pub fn page_read(
+        &self,
+        screen_key: GhosttyScreenKey,
+        index: usize,
+        size: usize,
+    ) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; size];
         let result = unsafe {
             ghostty_snapshot_page_read(self.handle, screen_key, index, buf.as_mut_ptr(), size)
@@ -1607,9 +1611,8 @@ impl Terminal {
     pub fn state_export(&self) -> Option<Vec<u8>> {
         let mut ptr: *mut u8 = ptr::null_mut();
         let mut len: usize = 0;
-        let result = unsafe {
-            ghostty_snapshot_state_export(self.handle, ptr::null(), &mut ptr, &mut len)
-        };
+        let result =
+            unsafe { ghostty_snapshot_state_export(self.handle, ptr::null(), &mut ptr, &mut len) };
         if result == GhosttyResult::Success && !ptr.is_null() && len > 0 {
             let data = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
             unsafe { ghostty_free(ptr::null(), ptr, len) };
@@ -1621,9 +1624,8 @@ impl Terminal {
 
     /// Import non-page terminal state.
     pub fn state_import(&mut self, data: &[u8]) -> Result<(), &'static str> {
-        let result = unsafe {
-            ghostty_snapshot_state_import(self.handle, data.as_ptr(), data.len())
-        };
+        let result =
+            unsafe { ghostty_snapshot_state_import(self.handle, data.as_ptr(), data.len()) };
         match result {
             GhosttyResult::Success => Ok(()),
             _ => Err("ghostty_snapshot_state_import: failed"),

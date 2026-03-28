@@ -625,7 +625,7 @@ where
 
                     // Intercept OSC color responses from the outer terminal.
                     // These may arrive split across multiple stdin reads, so
-                    // buffer until we have complete OSC 10/11/12 replies.
+                    // buffer until we have complete OSC 4/10/11/12 replies.
                     let responses = self.take_osc_color_responses(raw_bytes);
                     if !responses.is_empty() {
                         for response in responses {
@@ -1065,11 +1065,11 @@ where
     /// With ghostty, color queries are handled internally when colors are set
     /// on the terminal. This is now a no-op but kept for call-site compatibility.
     fn forward_panel_color_queries(_panel: &super::terminal_panel::TerminalPanel) {
-        // Ghostty handles OSC 10/11/12 color queries internally via write_pty callback.
+        // Ghostty color queries are answered locally by the parser/write_pty path.
         // No forwarding needed.
     }
 
-    /// Detect OSC color response sequences (OSC 10/11/12 with rgb: or # values).
+    /// Detect OSC color response sequences (OSC 4/10/11/12 with rgb: or # values).
     ///
     /// These arrive on stdin when the outer terminal responds to a probe we
     /// forwarded. They are routed back to the focused PTY as input.
@@ -1078,17 +1078,38 @@ where
         if data.len() < 7 || data[0] != 0x1b || data[1] != b']' {
             return false;
         }
-        // Check for OSC 10, 11, or 12 followed by semicolon
-        let after_osc = &data[2..];
-        let is_color_code = after_osc.starts_with(b"10;")
-            || after_osc.starts_with(b"11;")
-            || after_osc.starts_with(b"12;");
-        if !is_color_code {
+        let seq = if data.ends_with(b"\x07") {
+            &data[..data.len() - 1]
+        } else if data.ends_with(b"\x1b\\") {
+            &data[..data.len() - 2]
+        } else {
+            data
+        };
+        let payload = &seq[2..];
+        let Some(first_sep) = payload.iter().position(|byte| *byte == b';') else {
             return false;
-        }
-        // The value after the semicolon must be a color (rgb: or #), not a query (?)
-        // All color codes (10, 11, 12) are 2 digits + semicolon = 3 bytes
-        let value = &after_osc[3..];
+        };
+        let code = &payload[..first_sep];
+        let value = &payload[first_sep + 1..];
+        let value = if code == b"4" {
+            let Some(second_sep) = value.iter().position(|byte| *byte == b';') else {
+                return false;
+            };
+            let index = &value[..second_sep];
+            if std::str::from_utf8(index)
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok())
+                .is_none()
+            {
+                return false;
+            }
+            &value[second_sep + 1..]
+        } else if matches!(code, b"10" | b"11" | b"12") {
+            value
+        } else {
+            return false;
+        };
+
         value.starts_with(b"rgb:") || value.starts_with(b"#")
     }
 
@@ -2086,6 +2107,19 @@ mod tests {
 
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0], b"\x1b]11;rgb:ffff/fcfc/f0f0\x07");
+    }
+
+    #[test]
+    fn split_osc_palette_response_is_buffered_until_complete() {
+        let (mut runner, _request_rx) = create_test_runner();
+
+        assert!(runner
+            .take_osc_color_responses(b"\x1b]4;7;rgb:aaaa/")
+            .is_empty());
+        let responses = runner.take_osc_color_responses(b"bbbb/cccc\x07");
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0], b"\x1b]4;7;rgb:aaaa/bbbb/cccc\x07");
     }
 
     #[test]

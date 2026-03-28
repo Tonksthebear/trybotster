@@ -465,14 +465,23 @@ pub fn decode_binary_snapshot(data: &[u8]) -> Result<BinarySnapshot> {
 
     let screen_count = data[pos] as usize;
     pos += 1;
+    if screen_count == 0 || screen_count > 2 {
+        bail!("invalid screen_count: {screen_count} (must be 1 or 2)");
+    }
 
     let active_key = data[pos];
     pos += 1;
+    if active_key > 1 {
+        bail!("invalid active_screen key: {active_key} (must be 0 or 1)");
+    }
     let active_screen = if active_key == 1 {
         GhosttyScreenKey::Alternate
     } else {
         GhosttyScreenKey::Primary
     };
+
+    /// Maximum pages per screen to prevent OOM from malformed input.
+    const MAX_PAGES_PER_SCREEN: usize = 1000;
 
     let mut screens = Vec::with_capacity(screen_count);
     for _ in 0..screen_count {
@@ -482,6 +491,9 @@ pub fn decode_binary_snapshot(data: &[u8]) -> Result<BinarySnapshot> {
         let page_count =
             u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
+        if page_count > MAX_PAGES_PER_SCREEN {
+            bail!("page_count {page_count} exceeds maximum {MAX_PAGES_PER_SCREEN}");
+        }
 
         let mut pages = Vec::with_capacity(page_count);
         for _ in 0..page_count {
@@ -810,13 +822,10 @@ mod tests {
                     },
                 ],
             },
-            SnapshotScreen {
-                pages: vec![],
-            },
+            SnapshotScreen { pages: vec![] },
         ];
 
-        let encoded =
-            encode_binary_snapshot(GhosttyScreenKey::Alternate, &screens, &state_blob);
+        let encoded = encode_binary_snapshot(GhosttyScreenKey::Alternate, &screens, &state_blob);
         let decoded = decode_binary_snapshot(&encoded).expect("decode failed");
 
         // Header
@@ -849,15 +858,14 @@ mod tests {
     }
 
     #[test]
-    fn binary_snapshot_empty_roundtrip() {
+    fn binary_snapshot_empty_screens_rejected() {
         use crate::ghostty_vt::GhosttyScreenKey;
 
         let encoded = encode_binary_snapshot(GhosttyScreenKey::Primary, &[], &[]);
-        let decoded = decode_binary_snapshot(&encoded).expect("decode failed");
-
-        assert_eq!(decoded.active_screen, GhosttyScreenKey::Primary);
-        assert!(decoded.screens.is_empty());
-        assert!(decoded.state_blob.is_empty());
+        assert!(
+            decode_binary_snapshot(&encoded).is_err(),
+            "screen_count=0 should be rejected"
+        );
     }
 
     #[test]
@@ -866,5 +874,32 @@ mod tests {
         assert!(decode_binary_snapshot(&[1]).is_err());
         // Version + screen_count but no active_screen
         assert!(decode_binary_snapshot(&[1, 1]).is_err());
+    }
+
+    #[test]
+    fn binary_snapshot_invalid_screen_count_rejects() {
+        // screen_count=0
+        assert!(decode_binary_snapshot(&[1, 0, 0]).is_err());
+        // screen_count=3
+        assert!(decode_binary_snapshot(&[1, 3, 0]).is_err());
+    }
+
+    #[test]
+    fn binary_snapshot_invalid_active_key_rejects() {
+        // active_key=2 with screen_count=1
+        let mut data = vec![1, 1, 2];
+        // page_count=0
+        data.extend_from_slice(&0u32.to_le_bytes());
+        // state_blob_len=0
+        data.extend_from_slice(&0u32.to_le_bytes());
+        assert!(decode_binary_snapshot(&data).is_err());
+    }
+
+    #[test]
+    fn binary_snapshot_excessive_page_count_rejects() {
+        // screen_count=1, active_key=0, page_count=2000 (exceeds 1000 limit)
+        let mut data = vec![1, 1, 0];
+        data.extend_from_slice(&2000u32.to_le_bytes());
+        assert!(decode_binary_snapshot(&data).is_err());
     }
 }

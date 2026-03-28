@@ -183,6 +183,19 @@ impl SessionConnection {
         Ok(frame.payload)
     }
 
+    /// Request plain text screen contents from the session process.
+    ///
+    /// Uses the dedicated FRAME_GET_SCREEN/FRAME_SCREEN RPC which returns
+    /// plain text directly from the session's parser — no binary snapshot
+    /// decoding or ANSI stripping needed.
+    pub fn get_screen(&mut self) -> Result<String> {
+        let req = encode_empty(FRAME_GET_SCREEN);
+        self.stream.write_all(&req).context("send GetScreen")?;
+        self.stream.flush()?;
+        let frame = self.read_response(FRAME_SCREEN)?;
+        String::from_utf8(frame.payload).context("FRAME_SCREEN payload is not valid UTF-8")
+    }
+
     /// Request terminal mode flags from the session process.
     ///
     /// Used on reconnect to initialize the hub's state.

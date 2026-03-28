@@ -751,15 +751,23 @@ pub(crate) fn register(
                 })?;
 
                 // Send spawn config
-                let (default_foreground, default_background, default_cursor) =
+                let (default_foreground, default_background, default_cursor, palette_colors) =
                     if let Ok(colors) = cc_spawn.lock() {
                         (
                             colors.get(&256).copied(),
                             colors.get(&257).copied(),
                             colors.get(&258).copied(),
+                            (0usize..=255)
+                                .filter_map(|index| {
+                                    colors
+                                        .get(&index)
+                                        .copied()
+                                        .map(|color| (index as u8, color))
+                                })
+                                .collect(),
                         )
                     } else {
-                        (None, None, None)
+                        (None, None, None, Vec::new())
                     };
                 let spawn_config = SpawnConfig {
                     command,
@@ -774,6 +782,7 @@ pub(crate) fn register(
                     default_foreground,
                     default_background,
                     default_cursor,
+                    palette_colors,
                 };
                 conn.send_spawn_config(&spawn_config).map_err(|e| {
                     LuaError::runtime(format!("spawn_session: send config failed: {e}"))

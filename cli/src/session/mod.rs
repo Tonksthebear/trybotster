@@ -12,7 +12,7 @@
 //! - **Writer thread**: receives input from Hub → writes to PTY master fd
 //! - **Terminal state**: ghostty parser tracks mode flags (kitty, cursor, mouse, etc.)
 //! - **Event emission**: detects state changes and emits event frames to the Hub
-//! - **Snapshot generation**: generates ANSI snapshots from parser state on request
+//! - **Snapshot generation**: generates binary page snapshots and plain text screen dumps on request
 //! - **Tee/logging**: optional file tee with rotation
 //! - **Lifecycle**: exits when socket file is deleted or child process dies
 //!
@@ -171,6 +171,9 @@ pub struct SpawnConfig {
     /// Boot-probed default cursor color for the session's libghostty parser.
     #[serde(default)]
     pub default_cursor: Option<crate::terminal::Rgb>,
+    /// Boot-probed palette entries for OSC 4 queries and indexed color rendering.
+    #[serde(default)]
+    pub palette_colors: Vec<(u8, crate::terminal::Rgb)>,
 }
 
 /// Run the session process.
@@ -371,15 +374,20 @@ fn run_session(
             DEFAULT_SCROLLBACK_LINES,
             callbacks,
         );
+        let mut color_cache = std::collections::HashMap::new();
         if let Some(color) = config.default_foreground {
-            parser.terminal_mut().set_color_foreground(color.into());
+            color_cache.insert(256usize, color);
         }
         if let Some(color) = config.default_background {
-            parser.terminal_mut().set_color_background(color.into());
+            color_cache.insert(257usize, color);
         }
         if let Some(color) = config.default_cursor {
-            parser.terminal_mut().set_color_cursor(color.into());
+            color_cache.insert(258usize, color);
         }
+        for (index, color) in config.palette_colors {
+            color_cache.insert(index as usize, color);
+        }
+        parser.apply_color_cache_map(&color_cache);
         Arc::new(Mutex::new(parser))
     };
     let last_output_at = Arc::new(AtomicU64::new(0));
