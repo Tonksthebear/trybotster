@@ -213,34 +213,107 @@ export default class extends Controller {
         fontSources: [
           // Primary font — JetBrains Mono with Nerd Font glyphs (~9.5MB for all 4 variants)
           // Tries local install first, falls back to CDN
-          { type: "local", matchers: ["jetbrainsmono nerd font", "jetbrains mono nerd font", "jetbrains mono"], label: "JetBrains Mono (Local)" },
-          { type: "url", url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/JetBrainsMono/NoLigatures/Regular/JetBrainsMonoNLNerdFontMono-Regular.ttf", label: "JetBrains Mono Nerd Font Regular" },
-          { type: "url", url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/JetBrainsMono/NoLigatures/Bold/JetBrainsMonoNLNerdFontMono-Bold.ttf", label: "JetBrains Mono Nerd Font Bold" },
-          { type: "url", url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/JetBrainsMono/NoLigatures/Italic/JetBrainsMonoNLNerdFontMono-Italic.ttf", label: "JetBrains Mono Nerd Font Italic" },
-          { type: "url", url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/JetBrainsMono/NoLigatures/BoldItalic/JetBrainsMonoNLNerdFontMono-BoldItalic.ttf", label: "JetBrains Mono Nerd Font Bold Italic" },
+          {
+            type: "local",
+            matchers: [
+              "jetbrainsmono nerd font",
+              "jetbrains mono nerd font",
+              "jetbrains mono",
+            ],
+            label: "JetBrains Mono (Local)",
+          },
+          {
+            type: "url",
+            url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/JetBrainsMono/NoLigatures/Regular/JetBrainsMonoNLNerdFontMono-Regular.ttf",
+            label: "JetBrains Mono Nerd Font Regular",
+          },
+          {
+            type: "url",
+            url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/JetBrainsMono/NoLigatures/Bold/JetBrainsMonoNLNerdFontMono-Bold.ttf",
+            label: "JetBrains Mono Nerd Font Bold",
+          },
+          {
+            type: "url",
+            url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/JetBrainsMono/NoLigatures/Italic/JetBrainsMonoNLNerdFontMono-Italic.ttf",
+            label: "JetBrains Mono Nerd Font Italic",
+          },
+          {
+            type: "url",
+            url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/JetBrainsMono/NoLigatures/BoldItalic/JetBrainsMonoNLNerdFontMono-BoldItalic.ttf",
+            label: "JetBrains Mono Nerd Font Bold Italic",
+          },
           // Nerd Font symbols — powerline, devicons, etc. (~2.5MB)
-          { type: "local", matchers: ["symbols nerd font mono", "symbols nerd font"], label: "Symbols Nerd Font (Local)" },
-          { type: "url", url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/NerdFontsSymbolsOnly/SymbolsNerdFontMono-Regular.ttf" },
+          {
+            type: "local",
+            matchers: ["symbols nerd font mono", "symbols nerd font"],
+            label: "Symbols Nerd Font (Local)",
+          },
+          {
+            type: "url",
+            url: "https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@v3.4.0/patched-fonts/NerdFontsSymbolsOnly/SymbolsNerdFontMono-Regular.ttf",
+          },
           // Symbol fallbacks — misc Unicode symbols, arrows, box drawing, etc.
-          { type: "local", matchers: ["apple symbols", "applesymbols", "apple symbols regular"], label: "Apple Symbols (Local)" },
-          { type: "url", url: "https://cdn.jsdelivr.net/gh/notofonts/noto-fonts@main/unhinted/ttf/NotoSansSymbols2/NotoSansSymbols2-Regular.ttf" },
-          { type: "url", url: "https://cdn.jsdelivr.net/gh/ChiefMikeK/ttf-symbola@master/Symbola.ttf" },
+          {
+            type: "local",
+            matchers: [
+              "apple symbols",
+              "applesymbols",
+              "apple symbols regular",
+            ],
+            label: "Apple Symbols (Local)",
+          },
+          {
+            type: "url",
+            url: "https://cdn.jsdelivr.net/gh/notofonts/noto-fonts@main/unhinted/ttf/NotoSansSymbols2/NotoSansSymbols2-Regular.ttf",
+          },
+          {
+            type: "url",
+            url: "https://cdn.jsdelivr.net/gh/ChiefMikeK/ttf-symbola@master/Symbola.ttf",
+          },
           // Canadian Aboriginal syllabics
-          { type: "local", matchers: ["noto sans canadian aboriginal", "notosanscanadianaboriginal", "euphemia ucas", "euphemiaucas"], label: "Noto Sans Canadian Aboriginal / Euphemia UCAS" },
-          { type: "url", url: "https://cdn.jsdelivr.net/gh/notofonts/noto-fonts@main/unhinted/ttf/NotoSansCanadianAboriginal/NotoSansCanadianAboriginal-Regular.ttf", label: "Noto Sans Canadian Aboriginal" },
+          {
+            type: "local",
+            matchers: [
+              "noto sans canadian aboriginal",
+              "notosanscanadianaboriginal",
+              "euphemia ucas",
+              "euphemiaucas",
+            ],
+            label: "Noto Sans Canadian Aboriginal / Euphemia UCAS",
+          },
+          {
+            type: "url",
+            url: "https://cdn.jsdelivr.net/gh/notofonts/noto-fonts@main/unhinted/ttf/NotoSansCanadianAboriginal/NotoSansCanadianAboriginal-Regular.ttf",
+            label: "Noto Sans Canadian Aboriginal",
+          },
           // Emoji
-          { type: "local", matchers: ["apple color emoji", "applecoloremoji"], label: "Apple Color Emoji" },
-          { type: "url", url: "https://cdn.jsdelivr.net/gh/googlefonts/noto-emoji@main/fonts/NotoColorEmoji.ttf" },
-          { type: "url", url: "https://cdn.jsdelivr.net/gh/hfg-gmuend/openmoji@master/font/OpenMoji-black-glyf/OpenMoji-black-glyf.ttf" },
+          {
+            type: "local",
+            matchers: ["apple color emoji", "applecoloremoji"],
+            label: "Apple Color Emoji",
+          },
+          {
+            type: "url",
+            url: "https://cdn.jsdelivr.net/gh/googlefonts/noto-emoji@main/fonts/NotoColorEmoji.ttf",
+          },
+          {
+            type: "url",
+            url: "https://cdn.jsdelivr.net/gh/hfg-gmuend/openmoji@master/font/OpenMoji-black-glyf/OpenMoji-black-glyf.ttf",
+          },
           // CJK
-          { type: "url", url: "https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf" },
+          {
+            type: "url",
+            url: "https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+          },
         ],
         maxScrollbackBytes: 10_000_000, // 10MB — ~7,000 lines at 175 cols
         touchSelectionMode: "long-press",
         callbacks: {
           onLog: (line) => {
             if (line.includes("StringAllocOutOfMemory")) {
-              console.warn("[terminal] WASM OOM detected (should not happen with patched ghostty-vt)");
+              console.warn(
+                "[terminal] WASM OOM detected (should not happen with patched ghostty-vt)",
+              );
             }
           },
           onBackend: () => {
@@ -261,7 +334,8 @@ export default class extends Controller {
   }
 
   #onTermSize(cols, rows) {
-    if (this.#connectPtyRequested || this.#disconnected || !this.#backendReady) return;
+    if (this.#connectPtyRequested || this.#disconnected || !this.#backendReady)
+      return;
 
     this.#pendingSize = { cols, rows };
     if (this.#connectPtyTimer) {
@@ -270,7 +344,12 @@ export default class extends Controller {
 
     this.#connectPtyTimer = setTimeout(() => {
       this.#connectPtyTimer = null;
-      if (this.#connectPtyRequested || this.#disconnected || !this.#backendReady) return;
+      if (
+        this.#connectPtyRequested ||
+        this.#disconnected ||
+        !this.#backendReady
+      )
+        return;
       const size = this.#pendingSize;
       if (!size || size.cols <= 1 || size.rows <= 1) return;
 
@@ -311,7 +390,7 @@ export default class extends Controller {
     // Text-only paste (no files) falls through to Restty normally.
     const onPaste = async (e) => {
       const items = [...(e.clipboardData?.items || [])];
-      const fileItem = items.find(i => i.kind === "file");
+      const fileItem = items.find((i) => i.kind === "file");
       if (!fileItem) return;
 
       e.preventDefault();
@@ -329,20 +408,23 @@ export default class extends Controller {
     const onDragOver = (e) => {
       if (!e.dataTransfer?.types?.includes("Files")) return;
       e.preventDefault();
-      if (this.hasDropZoneTarget) this.dropZoneTarget.toggleAttribute("data-visible", true);
+      if (this.hasDropZoneTarget)
+        this.dropZoneTarget.toggleAttribute("data-visible", true);
     };
     this.#listen(container, "dragover", onDragOver, { capture: true });
 
     const onDragLeave = (e) => {
       if (!container.contains(e.relatedTarget)) {
-        if (this.hasDropZoneTarget) this.dropZoneTarget.removeAttribute("data-visible");
+        if (this.hasDropZoneTarget)
+          this.dropZoneTarget.removeAttribute("data-visible");
       }
     };
     this.#listen(container, "dragleave", onDragLeave, { capture: true });
 
     // Drop: extract files (capture phase to beat canvas)
     const onDrop = async (e) => {
-      if (this.hasDropZoneTarget) this.dropZoneTarget.removeAttribute("data-visible");
+      if (this.hasDropZoneTarget)
+        this.dropZoneTarget.removeAttribute("data-visible");
       const files = [...(e.dataTransfer?.files || [])];
       if (!files.length) return;
 
@@ -444,7 +526,8 @@ export default class extends Controller {
     const onPointerMove = (e) => {
       if (e.pointerType !== "touch" || !this.#touchStart) return;
       velocitySamples.push({ y: e.clientY, t: e.timeStamp });
-      if (velocitySamples.length > VELOCITY_MAX_SAMPLES) velocitySamples.shift();
+      if (velocitySamples.length > VELOCITY_MAX_SAMPLES)
+        velocitySamples.shift();
     };
     this.#listen(canvas, "pointermove", onPointerMove);
 
@@ -508,12 +591,14 @@ export default class extends Controller {
    * scroll feel — fast flicks coast far, gentle swipes stop quickly.
    */
   #startMomentum(canvas, initialVelocity) {
-    const DECEL_RATE = 1.8;        // Exponential decay constant (higher = stops faster)
-    const MAX_VELOCITY = 20.0;     // Cap px/ms to prevent absurd scroll speeds
-    const MIN_VELOCITY_PX = 0.15;  // Stop threshold in px/ms
+    const DECEL_RATE = 1.8; // Exponential decay constant (higher = stops faster)
+    const MAX_VELOCITY = 20.0; // Cap px/ms to prevent absurd scroll speeds
+    const MIN_VELOCITY_PX = 0.15; // Stop threshold in px/ms
 
     // Clamp initial velocity to prevent extreme scroll from fast flicks
-    const v0 = Math.sign(initialVelocity) * Math.min(Math.abs(initialVelocity), MAX_VELOCITY);
+    const v0 =
+      Math.sign(initialVelocity) *
+      Math.min(Math.abs(initialVelocity), MAX_VELOCITY);
     const startTime = performance.now();
 
     const tick = (now) => {
@@ -531,13 +616,15 @@ export default class extends Controller {
       // then 6x to compensate for shiftKey's 0.5x speed modifier.
       const deltaY = currentVelocity * 16 * 6;
 
-      canvas.dispatchEvent(new WheelEvent("wheel", {
-        deltaY,
-        deltaMode: 0,
-        shiftKey: true,  // Bypass mouse mode → viewport scroll
-        bubbles: true,
-        cancelable: true,
-      }));
+      canvas.dispatchEvent(
+        new WheelEvent("wheel", {
+          deltaY,
+          deltaMode: 0,
+          shiftKey: true, // Bypass mouse mode → viewport scroll
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
 
       this.#momentumRafId = requestAnimationFrame(tick);
     };
@@ -547,10 +634,13 @@ export default class extends Controller {
 
   #showOverlay() {
     if (!this.#overlay) {
-      const container = this.hasContainerTarget ? this.containerTarget : this.element;
+      const container = this.hasContainerTarget
+        ? this.containerTarget
+        : this.element;
       container.style.position = "relative";
       this.#overlay = document.createElement("div");
-      this.#overlay.className = "absolute inset-0 flex items-center justify-center bg-black/70 z-10 pointer-events-none";
+      this.#overlay.className =
+        "absolute inset-0 flex items-center justify-center bg-black/70 z-10 pointer-events-none";
       this.#overlay.innerHTML = `
         <div class="flex items-center gap-2.5 text-zinc-400 text-sm font-medium">
           <svg class="animate-spin size-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -597,16 +687,36 @@ export default class extends Controller {
   // Public actions for touch control buttons
   // sendKeyInput routes directly to ptyTransport.sendInput() (same path as keyboard events).
   // sendInput() writes to WASM as "program" input which doesn't produce PTY output for control chars.
-  sendCtrlC() { this.#restty?.sendKeyInput("\x03"); }
-  sendEnter() { this.#restty?.sendKeyInput("\r"); }
-  sendEscape() { this.#restty?.sendKeyInput("\x1b"); }
-  sendTab() { this.#restty?.sendKeyInput("\t"); }
-  sendArrowUp() { this.#restty?.sendKeyInput("\x1b[A"); }
-  sendArrowDown() { this.#restty?.sendKeyInput("\x1b[B"); }
-  sendArrowLeft() { this.#restty?.sendKeyInput("\x1b[D"); }
-  sendArrowRight() { this.#restty?.sendKeyInput("\x1b[C"); }
+  sendCtrlC() {
+    this.#restty?.sendKeyInput("\x03");
+  }
+  sendEnter() {
+    this.#restty?.sendKeyInput("\r");
+  }
+  sendEscape() {
+    this.#restty?.sendKeyInput("\x1b");
+  }
+  sendTab() {
+    this.#restty?.sendKeyInput("\t");
+  }
+  sendArrowUp() {
+    this.#restty?.sendKeyInput("\x1b[A");
+  }
+  sendArrowDown() {
+    this.#restty?.sendKeyInput("\x1b[B");
+  }
+  sendArrowLeft() {
+    this.#restty?.sendKeyInput("\x1b[D");
+  }
+  sendArrowRight() {
+    this.#restty?.sendKeyInput("\x1b[C");
+  }
 
   // Public API
-  clear() { this.#restty?.clearScreen(); }
-  focus() { this.#restty?.focus(); }
+  clear() {
+    this.#restty?.clearScreen();
+  }
+  focus() {
+    this.#restty?.focus();
+  }
 }

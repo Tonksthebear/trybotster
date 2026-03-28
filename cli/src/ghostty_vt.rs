@@ -810,6 +810,34 @@ extern "C" {
         used_rows: u16,
     ) -> GhosttyResult;
 
+    fn ghostty_snapshot_terminal_export(
+        terminal: GhosttyTerminalPtr,
+        allocator: *const c_void,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+
+    fn ghostty_snapshot_terminal_import(
+        terminal: GhosttyTerminalPtr,
+        data: *const u8,
+        data_len: usize,
+    ) -> GhosttyResult;
+
+    fn ghostty_snapshot_screen_export(
+        terminal: GhosttyTerminalPtr,
+        screen_key: GhosttyScreenKey,
+        allocator: *const c_void,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+
+    fn ghostty_snapshot_screen_import(
+        terminal: GhosttyTerminalPtr,
+        screen_key: GhosttyScreenKey,
+        data: *const u8,
+        data_len: usize,
+    ) -> GhosttyResult;
+
     fn ghostty_snapshot_state_export(
         terminal: GhosttyTerminalPtr,
         allocator: *const c_void,
@@ -1569,6 +1597,76 @@ impl Terminal {
         match result {
             GhosttyResult::Success => Ok(()),
             _ => Err("ghostty_snapshot_page_load: failed"),
+        }
+    }
+
+    /// Export the entire terminal state as one opaque blob.
+    /// Includes all initialized screens (pages + cursor + charset + kitty) plus
+    /// terminal-level state (modes, colors, tabstops, etc.).
+    pub fn snapshot_export(&self) -> Option<Vec<u8>> {
+        let mut ptr: *mut u8 = ptr::null_mut();
+        let mut len: usize = 0;
+        let result = unsafe {
+            ghostty_snapshot_terminal_export(self.handle, ptr::null(), &mut ptr, &mut len)
+        };
+        if result == GhosttyResult::Success && !ptr.is_null() && len > 0 {
+            let data = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+            unsafe { ghostty_free(ptr::null(), ptr, len) };
+            Some(data)
+        } else {
+            None
+        }
+    }
+
+    /// Import an entire terminal state from an opaque blob produced by
+    /// `snapshot_export()`. Clears existing pages, initializes screens as
+    /// needed, restores all state, and finalizes cursor pins.
+    pub fn snapshot_import(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        let result = unsafe {
+            ghostty_snapshot_terminal_import(self.handle, data.as_ptr(), data.len())
+        };
+        match result {
+            GhosttyResult::Success => Ok(()),
+            _ => Err("ghostty_snapshot_terminal_import: failed"),
+        }
+    }
+
+    /// Export an entire screen (pages + cursor/charset/kitty state) as one blob.
+    /// Returns None if the screen is not initialized (e.g. lazy alt screen).
+    pub fn screen_export(&self, screen_key: GhosttyScreenKey) -> Option<Vec<u8>> {
+        let mut ptr: *mut u8 = ptr::null_mut();
+        let mut len: usize = 0;
+        let result = unsafe {
+            ghostty_snapshot_screen_export(
+                self.handle,
+                screen_key,
+                ptr::null(),
+                &mut ptr,
+                &mut len,
+            )
+        };
+        if result == GhosttyResult::Success && !ptr.is_null() && len > 0 {
+            let data = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+            unsafe { ghostty_free(ptr::null(), ptr, len) };
+            Some(data)
+        } else {
+            None
+        }
+    }
+
+    /// Import a screen blob. Handles alt screen lazy-init, clears existing
+    /// pages before loading, restores cursor state, and finalizes pins.
+    pub fn screen_import(
+        &mut self,
+        screen_key: GhosttyScreenKey,
+        data: &[u8],
+    ) -> Result<(), &'static str> {
+        let result = unsafe {
+            ghostty_snapshot_screen_import(self.handle, screen_key, data.as_ptr(), data.len())
+        };
+        match result {
+            GhosttyResult::Success => Ok(()),
+            _ => Err("ghostty_snapshot_screen_import: failed"),
         }
     }
 

@@ -706,28 +706,14 @@ fn handle_hub_frame(
         }
 
         FRAME_GET_SNAPSHOT => {
-            // Binary page transfer: raw page memory + terminal state blob.
-            use crate::ghostty_vt::GhosttyScreenKey;
-
+            // Single-call terminal snapshot: one opaque blob with everything.
             let snapshot = parser
                 .lock()
                 .map(|p| {
-                    let t = p.terminal();
-                    let alt_active = t.alt_screen_active();
-                    let active_screen = if alt_active {
-                        GhosttyScreenKey::Alternate
-                    } else {
-                        GhosttyScreenKey::Primary
-                    };
-
-                    let primary_screen = dump_screen_pages(t, GhosttyScreenKey::Primary);
-                    let mut screens = vec![primary_screen];
-                    if alt_active {
-                        screens.push(dump_screen_pages(t, GhosttyScreenKey::Alternate));
-                    }
-
-                    let state_blob = t.state_export().unwrap_or_default();
-                    encode_binary_snapshot(active_screen, &screens, &state_blob)
+                    p.terminal().snapshot_export().unwrap_or_else(|| {
+                        log::error!("[session] snapshot_export failed");
+                        Vec::new()
+                    })
                 })
                 .unwrap_or_default();
             let response = encode_frame(FRAME_SNAPSHOT, &snapshot);
@@ -796,30 +782,6 @@ fn handle_hub_frame(
             log::debug!("[session] unknown frame type 0x{:02x}", frame.frame_type);
         }
     }
-}
-
-// ─── Binary snapshot helpers ─────────────────────────────────────────────────
-
-/// Dump all pages from a screen into SnapshotScreen.
-fn dump_screen_pages(
-    terminal: &crate::ghostty_vt::Terminal,
-    screen_key: crate::ghostty_vt::GhosttyScreenKey,
-) -> protocol::SnapshotScreen {
-    let count = terminal.page_count(screen_key);
-    let mut pages = Vec::with_capacity(count);
-    for i in 0..count {
-        if let Some(info) = terminal.page_info(screen_key, i) {
-            if let Some(data) = terminal.page_read(screen_key, i, info.memory_len) {
-                pages.push(protocol::SnapshotPage {
-                    capacity: info.cap,
-                    used_cols: info.used_cols,
-                    used_rows: info.used_rows,
-                    data,
-                });
-            }
-        }
-    }
-    protocol::SnapshotScreen { pages }
 }
 
 // ─── Reader loop ─────────────────────────────────────────────────────────────

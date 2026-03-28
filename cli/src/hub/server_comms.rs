@@ -2501,6 +2501,21 @@ impl Hub {
         }
     }
 
+    fn should_force_snapshot_redraw(
+        pty_handle: &crate::hub::agent_handle::PtyHandle,
+        target_rows: u16,
+        target_cols: u16,
+    ) -> bool {
+        if pty_handle.dims() != (target_rows, target_cols) {
+            return false;
+        }
+
+        pty_handle
+            .get_mode_flags()
+            .map(|flags| flags.alt_screen)
+            .unwrap_or(false)
+    }
+
     /// Try to attach a terminal forwarder immediately.
     ///
     /// Returns `true` when attached, `false` when the session is not yet
@@ -2552,10 +2567,16 @@ impl Hub {
 
             let (snapshot, mut pty_rx) = match tokio::task::spawn_blocking(move || {
                 if pty_for_snapshot.is_session_backed() {
-                    let (current_rows, current_cols) = pty_for_snapshot.dims();
-                    if (current_rows, current_cols) == (target_rows, target_cols) {
+                    if Self::should_force_snapshot_redraw(
+                        &pty_for_snapshot,
+                        target_rows,
+                        target_cols,
+                    ) {
                         // Force a redraw pulse for full-screen TUIs. Resizing to the
                         // same dimensions often does not trigger a redraw path.
+                        // Normal-screen sessions keep real scrollback in the primary
+                        // buffer, so bouncing them by one column can reflow and
+                        // inflate restored history on resume.
                         let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
                         pty_for_snapshot.resize_direct(target_rows, bounce_cols);
                         std::thread::sleep(std::time::Duration::from_millis(25));
@@ -2728,8 +2749,7 @@ impl Hub {
         tokio::spawn(async move {
             let snapshot = match tokio::task::spawn_blocking(move || {
                 if pty_handle.is_session_backed() {
-                    let (current_rows, current_cols) = pty_handle.dims();
-                    if (current_rows, current_cols) == (target_rows, target_cols) {
+                    if Self::should_force_snapshot_redraw(&pty_handle, target_rows, target_cols) {
                         let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
                         pty_handle.resize_direct(target_rows, bounce_cols);
                         std::thread::sleep(std::time::Duration::from_millis(25));
@@ -3171,10 +3191,16 @@ impl Hub {
             let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, mut pty_rx) =
                 match tokio::task::spawn_blocking(move || {
                     if pty_for_snapshot.is_session_backed() {
-                        let (current_rows, current_cols) = pty_for_snapshot.dims();
-                        if (current_rows, current_cols) == (target_rows, target_cols) {
+                        if Self::should_force_snapshot_redraw(
+                            &pty_for_snapshot,
+                            target_rows,
+                            target_cols,
+                        ) {
                             // Force a redraw pulse for full-screen TUIs. Resizing to the
                             // same dimensions often does not trigger a redraw path.
+                            // Normal-screen sessions keep real scrollback in the primary
+                            // buffer, so bouncing them by one column can reflow and
+                            // inflate restored history on resume.
                             let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
                             pty_for_snapshot.resize_direct(target_rows, bounce_cols);
                             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -3481,10 +3507,16 @@ impl Hub {
             let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, mut pty_rx) =
                 match tokio::task::spawn_blocking(move || {
                     if pty_for_snapshot.is_session_backed() {
-                        let (current_rows, current_cols) = pty_for_snapshot.dims();
-                        if (current_rows, current_cols) == (target_rows, target_cols) {
+                        if Self::should_force_snapshot_redraw(
+                            &pty_for_snapshot,
+                            target_rows,
+                            target_cols,
+                        ) {
                             // Force a redraw pulse for full-screen TUIs. Resizing to the
                             // same dimensions often does not trigger a redraw path.
+                            // Normal-screen sessions keep real scrollback in the primary
+                            // buffer, so bouncing them by one column can reflow and
+                            // inflate restored history on resume.
                             let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
                             pty_for_snapshot.resize_direct(target_rows, bounce_cols);
                             std::thread::sleep(std::time::Duration::from_millis(25));
@@ -6287,5 +6319,4 @@ mod tests {
             "socket forwarder should start after prerequisites are available"
         );
     }
-
 }
