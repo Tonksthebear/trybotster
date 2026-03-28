@@ -163,6 +163,9 @@ export default class extends Controller {
       sessionUuid: this.sessionUuidValue,
     });
     this.#transport.onReconnect = () => this.#restty?.clearScreen();
+    this.#transport.onBinarySnapshot = (data) => {
+      this.#restty?.loadBinarySnapshot(data);
+    };
     this.#transport.onConnect = () => {
       // Force recalculate grid dimensions. Restty's init() calls updateSize()
       // before the canvas is in the DOM (getBoundingClientRect returns 0x0).
