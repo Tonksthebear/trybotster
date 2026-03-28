@@ -13,6 +13,8 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -213,19 +215,50 @@ fn build_ghostty_vt() {
         }
 
         // Zig's archive has misaligned members that macOS ld rejects
-        // ("not 8-byte aligned"). Repack with libtool to fix alignment.
-        let status = Command::new("libtool")
-            .args(["-static", "-o"])
-            .arg(&repacked_lib)
-            .arg(&zig_lib_path)
-            .status()
-            .expect("failed to run libtool");
+        // ("not 8-byte aligned"). Extract objects and repack with `ar` to
+        // fix alignment. (libtool -static strips the main object with zig 0.15.)
+        let tmp_dir = Path::new(&out_dir).join("ghostty-repack");
+        let _ = std::fs::create_dir_all(&tmp_dir);
 
-        assert!(
-            status.success(),
-            "libtool repack failed with exit code {:?}",
-            status.code()
-        );
+        // Extract .o files from the zig archive (use canonical path since
+        // current_dir is set to the temp extraction directory).
+        let zig_lib_abs = std::fs::canonicalize(&zig_lib_path)
+            .unwrap_or_else(|_| panic!("{} not found", zig_lib_path.display()));
+        let status = Command::new("ar")
+            .args(["x", &zig_lib_abs.to_string_lossy()])
+            .current_dir(&tmp_dir)
+            .status()
+            .expect("failed to run `ar x`");
+        assert!(status.success(), "ar x failed");
+
+        // Collect all .o files and fix permissions (zig's ar extracts with 0000 mode)
+        let mut objects: Vec<_> = std::fs::read_dir(&tmp_dir)
+            .expect("read repack dir")
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                if p.extension().is_some_and(|ext| ext == "o") {
+                    // Fix permissions — zig archives extract with mode 0000
+                    #[cfg(unix)]
+                    let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o644));
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        objects.sort();
+
+        // Repack with ar (produces properly aligned archive)
+        let mut ar_cmd = Command::new("ar");
+        ar_cmd.args(["rcs"]).arg(&repacked_lib);
+        for obj in &objects {
+            ar_cmd.arg(obj);
+        }
+        let status = ar_cmd.status().expect("failed to run `ar rcs`");
+        assert!(status.success(), "ar rcs repack failed");
+
+        // Clean up temp dir
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     println!("cargo:rustc-link-search=native={}", out_dir);

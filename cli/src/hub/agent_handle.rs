@@ -377,11 +377,10 @@ impl PtyHandle {
         self.kitty_enabled.load(Ordering::Relaxed)
     }
 
-    /// Get a binary page snapshot of the current terminal state via session RPC.
+    /// Get a binary snapshot of the current terminal state via session RPC.
     ///
-    /// Returns raw binary snapshot blob (page data + terminal state).
-    /// All clients decode this via `decode_binary_snapshot()` and load
-    /// pages directly into their local terminal parser.
+    /// Returns an opaque blob from `ghostty_snapshot_terminal_export`.
+    /// Clients import it via `terminal.snapshot_import()`.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
         if let Some(ref conn) = self.session_connection {
@@ -398,6 +397,28 @@ impl PtyHandle {
         }
 
         Vec::new()
+    }
+
+    /// Read the current terminal mode flags from the session process.
+    ///
+    /// Used by snapshot callers to distinguish normal-shell scrollback from
+    /// alternate-screen TUIs that may need a redraw pulse before capture.
+    #[must_use]
+    pub fn get_mode_flags(&self) -> Option<crate::session::protocol::ModeFlags> {
+        if let Some(ref conn) = self.session_connection {
+            if let Ok(mut guard) = conn.lock() {
+                if let Some(session) = guard.as_mut() {
+                    match session.get_mode_flags() {
+                        Ok(flags) => return Some(flags),
+                        Err(e) => {
+                            log::warn!("Failed to get mode flags via session RPC: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     // =========================================================================

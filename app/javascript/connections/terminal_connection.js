@@ -35,6 +35,9 @@ export class TerminalConnection extends HubRoute {
   // Backlog output that can arrive before transport wires onOutput().
   #earlyOutputBuffer = [];
   #earlyOutputBytes = 0;
+  // Initial/recovery snapshot can arrive before transport wires snapshot listeners.
+  // Keep the latest one and replay it atomically once onBinarySnapshot() attaches.
+  #earlyBinarySnapshot = null;
   static #EARLY_OUTPUT_MAX_BYTES = 2 * 1024 * 1024;
   static #EARLY_OUTPUT_MAX_ITEMS = 512;
 
@@ -147,6 +150,7 @@ export class TerminalConnection extends HubRoute {
   destroy() {
     this.#earlyOutputBuffer = [];
     this.#earlyOutputBytes = 0;
+    this.#earlyBinarySnapshot = null;
     super.destroy();
   }
 
@@ -166,9 +170,13 @@ export class TerminalConnection extends HubRoute {
     if (data.length === 0) return;
 
     console.debug(`[TerminalConnection] Binary snapshot: ${data.byteLength} bytes`);
-    this.emit("snapshotStart", { byteLength: data.byteLength });
-    this.emit("binarySnapshot", data);
-    this.emit("snapshotComplete", { byteLength: data.byteLength });
+    const listeners = this.subscribers.get("binarySnapshot");
+    if (listeners && listeners.size > 0) {
+      this.#emitSnapshot(data);
+      return;
+    }
+
+    this.#earlyBinarySnapshot = data;
   }
 
   // ========== Event helpers ==========
@@ -207,7 +215,9 @@ export class TerminalConnection extends HubRoute {
   }
 
   onBinarySnapshot(callback) {
-    return this.on("binarySnapshot", callback);
+    const unsubscribe = this.on("binarySnapshot", callback);
+    this.#flushEarlyBinarySnapshot();
+    return unsubscribe;
   }
 
   // ========== Static helper ==========
@@ -244,6 +254,19 @@ export class TerminalConnection extends HubRoute {
     for (const chunk of buffered) {
       this.emit("output", chunk);
     }
+  }
+
+  #flushEarlyBinarySnapshot() {
+    const data = this.#earlyBinarySnapshot;
+    if (!data) return;
+    this.#earlyBinarySnapshot = null;
+    this.#emitSnapshot(data);
+  }
+
+  #emitSnapshot(data) {
+    this.emit("snapshotStart", { byteLength: data.byteLength });
+    this.emit("binarySnapshot", data);
+    this.emit("snapshotComplete", { byteLength: data.byteLength });
   }
 
   #outputByteLength(data) {

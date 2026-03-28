@@ -170,11 +170,10 @@ impl SessionConnection {
         Ok(())
     }
 
-    /// Request and receive a binary page snapshot from the session process.
+    /// Request and receive a binary snapshot from the session process.
     ///
-    /// Returns the raw binary snapshot blob (page data + terminal state).
-    /// All clients (TUI, browser, socket) decode this via
-    /// `decode_binary_snapshot()` and load pages directly.
+    /// Returns an opaque blob produced by `ghostty_snapshot_terminal_export`.
+    /// Clients import it via `terminal.snapshot_import()`.
     pub fn get_snapshot(&mut self) -> Result<Vec<u8>> {
         let req = encode_empty(FRAME_GET_SNAPSHOT);
         self.stream.write_all(&req).context("send GetSnapshot")?;

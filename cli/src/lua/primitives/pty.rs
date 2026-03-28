@@ -1672,7 +1672,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_pty_session_handle_port_nil() {
         let lua = Lua::new();
