@@ -1438,41 +1438,6 @@ impl Terminal {
         self.format(GhosttyFormatterFormat::Plain, false, true)
     }
 
-    /// Format with full terminal state restoration (modes, cursor, styles, etc.).
-    ///
-    /// Use this for browser reconnect snapshots where the remote terminal needs
-    /// to be restored to the exact state.
-    pub fn format_vt_full(&self) -> Result<Vec<u8>, &'static str> {
-        let screen_extra = GhosttyFormatterScreenExtra {
-            size: std::mem::size_of::<GhosttyFormatterScreenExtra>(),
-            cursor: true,
-            style: true,
-            hyperlink: true,
-            protection: true,
-            kitty_keyboard: true,
-            charsets: true,
-        };
-        let terminal_extra = GhosttyFormatterTerminalExtra {
-            size: std::mem::size_of::<GhosttyFormatterTerminalExtra>(),
-            palette: true,
-            modes: true,
-            scrolling_region: true,
-            tabstops: true,
-            pwd: true,
-            keyboard: true,
-            screen: screen_extra,
-        };
-        let opts = GhosttyFormatterTerminalOptions {
-            size: std::mem::size_of::<GhosttyFormatterTerminalOptions>(),
-            emit: GhosttyFormatterFormat::Vt,
-            unwrap: false,
-            trim: false,
-            extra: terminal_extra,
-        };
-
-        self.format_with_opts(opts)
-    }
-
     /// Format a specific screen (primary or alternate) as VT sequences.
     /// Returns None if the screen is not initialized.
     pub fn format_screen(&self, key: GhosttyScreenKey) -> Option<Vec<u8>> {
@@ -2134,15 +2099,6 @@ mod tests {
         term.write(b"after resize");
         let plain = term.format_plain().expect("format_plain failed");
         assert!(String::from_utf8_lossy(&plain).contains("after resize"));
-    }
-
-    #[test]
-    fn full_vt_format_includes_state() {
-        let mut term = Terminal::new(80, 24, 0).expect("terminal creation failed");
-        term.write(b"state test");
-
-        let full = term.format_vt_full().expect("format_vt_full failed");
-        assert!(!full.is_empty(), "full VT format should produce output");
     }
 
     #[test]

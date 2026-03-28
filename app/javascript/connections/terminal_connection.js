@@ -94,11 +94,6 @@ export class TerminalConnection extends HubRoute {
         }
         break;
 
-      case "output":
-      case "scrollback":
-        this.#emitDecodedOutput(message.data, message.compressed);
-        break;
-
       case "pty_closed":
         this.emit("ptyClosed", message);
         break;
@@ -174,32 +169,6 @@ export class TerminalConnection extends HubRoute {
     this.emit("snapshotStart", { byteLength: data.byteLength });
     this.emit("binarySnapshot", data);
     this.emit("snapshotComplete", { byteLength: data.byteLength });
-  }
-
-  // ========== Private helpers ==========
-
-  async #emitDecodedOutput(data, compressed) {
-    if (!data) return;
-
-    try {
-      const text = compressed ? await this.#decompress(data) : data;
-      this.#emitOutput(text);
-    } catch (error) {
-      console.error("[TerminalConnection] Failed to decompress:", error);
-      this.#emitOutput(data);
-    }
-  }
-
-  async #decompress(base64Data) {
-    const binaryString = atob(base64Data);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
-    }
-    const stream = new Blob([bytes])
-      .stream()
-      .pipeThrough(new DecompressionStream("gzip"));
-    return new Response(stream).text();
   }
 
   // ========== Event helpers ==========

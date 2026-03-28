@@ -1,4 +1,4 @@
-// restty@0.1.33 downloaded from https://cdn.jsdelivr.net/npm/restty@0.1.33/dist/restty.js
+// restty (vendored build with binary snapshot support)
 
 import {
   RESTTY_PLUGIN_API_VERSION,
@@ -10,7 +10,7 @@ import {
   isBuiltinThemeName,
   listBuiltinThemeNames,
   parseGhosttyTheme,
-} from "chunk-p8wzkwjt";
+} from "chunk-4h0kdh0e";
 export {
   parseGhosttyTheme,
   listBuiltinThemeNames,
