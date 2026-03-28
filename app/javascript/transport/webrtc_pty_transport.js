@@ -82,6 +82,7 @@ export class WebRtcPtyTransport {
       this.#pendingResize = null;
     }
     this.#awaitingReconnectSnapshot = false;
+    this.#decoder = new TextDecoder();
     this.#unsubscribers.forEach((unsub) => unsub());
     this.#unsubscribers = [];
     this.#callbacks = null;

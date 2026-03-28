@@ -6288,21 +6288,4 @@ mod tests {
         );
     }
 
-    // Legacy TUI forwarder tests removed during the session-process migration.
-    // Session-backed forwarders use session RPC snapshots.
-    // Removed: test_tui_forwarder_snapshot_is_prompt
-    // Removed: test_tui_forwarder_no_duplicate_output_during_snapshot_window
-    // Removed: test_tui_forwarder_same_dims_issues_resize_pulse_before_snapshot
 }
-
-// Legacy test module removed — these tests targeted code paths that no longer
-// exist after the session-process migration.
-//
-// Removed tests:
-// - test_tui_forwarder_snapshot_is_prompt
-// - test_tui_forwarder_no_duplicate_output_during_snapshot_window
-// - test_tui_forwarder_same_dims_issues_resize_pulse_before_snapshot
-// - test_headless_probe_replays_cached_osc_color_reply
-// - test_tui_client_forwards_probe_instead_of_cache_reply
-// - test_browser_client_suppresses_cached_probe_reply
-// - test_backpressure_recovery_fetches_snapshot
