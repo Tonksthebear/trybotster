@@ -924,8 +924,7 @@ function constrainGlyphBox(glyph, constraint, metrics, constraintWidth) {
       heightFactor = Math.max(1, singleScale);
       widthFactor = heightFactor;
     }
-  } else if (sizeMode === "stretch") {
-  } else {
+  } else if (sizeMode === "stretch") {} else {
     widthFactor = 1;
     heightFactor = 1;
   }
@@ -12338,10 +12337,8 @@ function handleOscSequence(seq, handlers) {
         try {
           const encoded = encodeBase64Bytes(bytes2);
           handlers.sendReply(`\x1B]52;${target};${encoded}\x07`);
-        } catch {
-        }
-      }).catch(() => {
-      });
+        } catch {}
+      }).catch(() => {});
       return true;
     }
     if (!handlers.onClipboardWrite)
@@ -12349,11 +12346,9 @@ function handleOscSequence(seq, handlers) {
     let bytes = new Uint8Array(0);
     try {
       bytes = decodeBase64Bytes(payload);
-    } catch {
-    }
+    } catch {}
     const text = textDecoder3.decode(bytes);
-    Promise.resolve(handlers.onClipboardWrite(text)).catch(() => {
-    });
+    Promise.resolve(handlers.onClipboardWrite(text)).catch(() => {});
     return true;
   }
   const param = parts[1];
@@ -12754,8 +12749,7 @@ class OutputFilter {
 function createInputHandler(options = {}) {
   const config = options.config || {};
   const cursorProvider = options.getCursorPosition || (() => ({ row: 1, col: 1 }));
-  const replySink = options.sendReply || (() => {
-  });
+  const replySink = options.sendReply || (() => {});
   const positionToCell = options.positionToCell || (() => ({ row: 0, col: 0 }));
   const positionToPixel = options.positionToPixel || null;
   const mouse = new MouseController({
@@ -13169,8 +13163,7 @@ async function tryFetchFontBuffer(url) {
     const response = await fetch(url);
     if (response.ok)
       return response.arrayBuffer();
-  } catch {
-  }
+  } catch {}
   return null;
 }
 async function tryLocalFontBuffer(matchers) {
@@ -13188,8 +13181,7 @@ async function tryLocalFontBuffer(matchers) {
       const status = await queryPermission({ name: "local-fonts" });
       if (status?.state === "denied")
         return null;
-    } catch {
-    }
+    } catch {}
   }
   try {
     const fonts = await queryLocalFonts();
@@ -18244,8 +18236,7 @@ function connectPty(state2, options, callbacks) {
     if (state2.connectId !== connectId) {
       try {
         ws.close();
-      } catch {
-      }
+      } catch {}
       return;
     }
     if (state2.socket !== ws)
@@ -18364,8 +18355,7 @@ function handleServerMessage(payload, callbacks) {
       callbacks.onExit?.(msg.code ?? 0);
       return true;
     }
-  } catch {
-  }
+  } catch {}
   return false;
 }
 function isPtyConnected(state2) {
@@ -30473,8 +30463,7 @@ function createSplitDividerFactory(options) {
         return;
       try {
         divider.releasePointerCapture(splitResizeState.pointerId);
-      } catch {
-      }
+      } catch {}
       divider.removeEventListener("pointermove", onPointerMove);
       divider.removeEventListener("pointerup", onPointerEnd);
       divider.removeEventListener("pointercancel", onPointerEnd);
@@ -32541,8 +32530,7 @@ function aQ($) {
   }
   $.error = "ELSE: missing EIF";
 }
-function tQ($) {
-}
+function tQ($) {}
 function eQ($) {
   let Q = $.stack[--$.stackTop];
   if (Q === undefined) {
@@ -40610,8 +40598,7 @@ async function a_($) {
     try {
       let Z = new DecompressionStream("brotli"), q = new Blob([$.buffer]).stream().pipeThrough(Z), J = await new Response(q).arrayBuffer();
       return new Uint8Array(J);
-    } catch {
-    }
+    } catch {}
   let { decompress: Q } = await Promise.resolve().then(() => (zJ(), XJ));
   return Q($);
 }
@@ -46788,8 +46775,7 @@ class p1 {
             let W = Q.slice(U.offset, U.length), H = V5(W);
             q.fullName = x6(H, u6.FullName) ?? undefined, q.family = x6(H, u6.FontFamily) ?? undefined, q.subfamily = x6(H, u6.FontSubfamily) ?? undefined, q.postScriptName = x6(H, u6.PostScriptName) ?? undefined;
           }
-        } catch {
-        }
+        } catch {}
       $.push(q);
     }
     return this.namesCache = $, $;
@@ -54252,8 +54238,7 @@ function openLink(uri) {
     const win = window.open(url.toString(), "_blank", "noopener,noreferrer");
     if (win)
       win.opener = null;
-  } catch {
-  }
+  } catch {}
 }
 function sourceLabelFromUrl(url, index) {
   const trimmed = url.trim();
@@ -54547,8 +54532,7 @@ async function tryLoadLocalFontBuffer(matchers, label) {
       const status = await queryPermission({ name: LOCAL_FONTS_PERMISSION_NAME });
       if (status?.state === "denied")
         return null;
-    } catch {
-    }
+    } catch {}
   }
   try {
     const fonts = await queryLocalFonts();
@@ -54615,8 +54599,7 @@ async function parseFontFacesFromBuffer(buffer) {
           metadataLabel: info.fullName || info.family || info.postScriptName || undefined,
           index: info.index
         });
-      } catch {
-      }
+      } catch {}
     }
     return parsed;
   }
@@ -54671,8 +54654,7 @@ function createResttyFontResourceStore(options = {}) {
         }
         return buffer;
       }
-    } catch {
-    }
+    } catch {}
     return await urlByteCache.getStale(sourceKey);
   };
   const defaultLoadSourceBuffer = async (source, sourceKey) => {
@@ -56526,8 +56508,7 @@ function createShaderStageRuntime(options) {
     console.warn(text2);
     try {
       stage.onError?.(text2);
-    } catch {
-    }
+    } catch {}
   }
   function parseShaderStages(stages) {
     return sortShaderStages(normalizeShaderStages(cloneShaderStages(stages)));
@@ -56558,8 +56539,7 @@ function createShaderStageRuntime(options) {
     for (let i3 = 0;i3 < compiledWebGPUShaderStages.length; i3 += 1) {
       try {
         compiledWebGPUShaderStages[i3].uniformBuffer.destroy();
-      } catch {
-      }
+      } catch {}
     }
     compiledWebGPUShaderStages = [];
   }
@@ -56581,8 +56561,7 @@ function createShaderStageRuntime(options) {
       webgpuStageTargets.sceneTexture.destroy();
       webgpuStageTargets.pingTexture.destroy();
       webgpuStageTargets.pongTexture.destroy();
-    } catch {
-    }
+    } catch {}
     webgpuStageTargets = null;
   }
   function destroyWebGLStageTargets(state2) {
@@ -57729,8 +57708,7 @@ function createPointerAuxHandlers(options) {
   const {
     inputHandler,
     shouldRoutePointerToAppMouse,
-    scrollViewportByWheel = () => {
-    },
+    scrollViewportByWheel = () => {},
     getWasmReady,
     getWasmHandle,
     getGridState,
@@ -57896,8 +57874,7 @@ function bindPointerEvents(options) {
     clearPendingDesktopSelection,
     tryActivatePendingTouchSelection,
     beginSelectionDrag,
-    scrollViewportByWheel = () => {
-    },
+    scrollViewportByWheel = () => {},
     normalizeSelectionCell: normalizeSelectionCell2,
     positionToCell: positionToCell2,
     scrollViewportByLines,
@@ -58191,23 +58168,17 @@ function createNativeScrollbarHost(options) {
   const { canvas, getGridState, noteScrollActivity, setViewportScrollOffset } = options;
   if (typeof document === "undefined") {
     return {
-      flash: () => {
-      },
-      sync: () => {
-      },
-      destroy: () => {
-      }
+      flash: () => {},
+      sync: () => {},
+      destroy: () => {}
     };
   }
   const parent = canvas.parentElement;
   if (!parent) {
     return {
-      flash: () => {
-      },
-      sync: () => {
-      },
-      destroy: () => {
-      }
+      flash: () => {},
+      sync: () => {},
+      destroy: () => {}
     };
   }
   ensureNativeScrollbarStyles();
@@ -58867,8 +58838,7 @@ function createKittyImageCache(options) {
     if (source && typeof source.close === "function") {
       try {
         source.close();
-      } catch {
-      }
+      } catch {}
     }
   };
   const decodeRawKittyImage = (placement, key, bytes) => {
@@ -59059,16 +59029,14 @@ function createKittyRenderRuntime(options) {
       return;
     try {
       entry.gl.deleteTexture(entry.texture);
-    } catch {
-    }
+    } catch {}
   };
   const releaseWebGPUTexture = (entry) => {
     if (!entry)
       return;
     try {
       entry.texture.destroy();
-    } catch {
-    }
+    } catch {}
   };
   const pruneWebGLTextures = (activeImageIds) => {
     for (const [imageId, entry] of webglTextures.entries()) {
@@ -60800,8 +60768,7 @@ function populateWebGLOverlays(ctx) {
       return shapeClusterWithFont(preeditEntry, value).advance * preeditScale;
     });
     const visiblePreeditText = fittedPreedit.text;
-    if (!visiblePreeditText) {
-    } else {
+    if (!visiblePreeditText) {} else {
       const shaped = shapeClusterWithFont(preeditEntry, visiblePreeditText);
       noteColorGlyphText(preeditEntry, visiblePreeditText, shaped);
       const glyphSet = getGlyphSet(preeditFontIndex);
@@ -63923,8 +63890,7 @@ function createRuntimeAppApi(options) {
     if (shared.wasm && shared.wasmHandle) {
       try {
         shared.wasm.destroy(shared.wasmHandle);
-      } catch {
-      }
+      } catch {}
       writeState({ wasmHandle: 0 });
     }
     clearWebGPUShaderStages();
@@ -66037,8 +66003,7 @@ function teardownPluginRuntime(runtime) {
   for (let i3 = 0;i3 < runtime.disposers.length; i3 += 1) {
     try {
       runtime.disposers[i3].dispose();
-    } catch {
-    }
+    } catch {}
   }
   runtime.disposers.length = 0;
   const cleanup = runtime.cleanup;
