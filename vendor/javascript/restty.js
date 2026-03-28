@@ -1,5 +1,3 @@
-// restty (vendored build with binary snapshot support)
-
 import {
   RESTTY_PLUGIN_API_VERSION,
   Restty,
@@ -10,7 +8,7 @@ import {
   isBuiltinThemeName,
   listBuiltinThemeNames,
   parseGhosttyTheme,
-} from "chunk-4h0kdh0e";
+} from "chunk-gsx0571v";
 export {
   parseGhosttyTheme,
   listBuiltinThemeNames,
