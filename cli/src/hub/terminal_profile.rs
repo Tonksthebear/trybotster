@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 const MAX_BUFFER_BYTES: usize = 512;
+const PALETTE_INDEX_COUNT: usize = 256;
 
 #[allow(dead_code)]
 const ALL_PROBES: [TerminalProbe; 3] = [
@@ -16,6 +17,7 @@ pub(crate) enum TerminalProbe {
     DefaultForeground,
     DefaultBackground,
     DefaultCursorColor,
+    Palette(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +32,7 @@ struct TerminalProfile {
     default_foreground: Option<Vec<u8>>,
     default_background: Option<Vec<u8>>,
     default_cursor_color: Option<Vec<u8>>,
+    palette: HashMap<u8, Vec<u8>>,
 }
 
 impl TerminalProfile {
@@ -38,6 +41,9 @@ impl TerminalProfile {
             TerminalProbe::DefaultForeground => self.default_foreground = Some(reply),
             TerminalProbe::DefaultBackground => self.default_background = Some(reply),
             TerminalProbe::DefaultCursorColor => self.default_cursor_color = Some(reply),
+            TerminalProbe::Palette(index) => {
+                self.palette.insert(index, reply);
+            }
         }
     }
 
@@ -46,6 +52,7 @@ impl TerminalProfile {
             TerminalProbe::DefaultForeground => self.default_foreground.as_deref(),
             TerminalProbe::DefaultBackground => self.default_background.as_deref(),
             TerminalProbe::DefaultCursorColor => self.default_cursor_color.as_deref(),
+            TerminalProbe::Palette(index) => self.palette.get(&index).map(Vec::as_slice),
         }
     }
 
@@ -76,13 +83,15 @@ impl TerminalProfileStore {
 
     pub(crate) fn describe_hub_profile(&self) -> String {
         format!(
-            "fg={} bg={} cursor={} complete={}",
+            "fg={} bg={} cursor={} palette={}/{} complete={}",
             format_optional_seq(self.hub_profile.get_reply(TerminalProbe::DefaultForeground)),
             format_optional_seq(self.hub_profile.get_reply(TerminalProbe::DefaultBackground)),
             format_optional_seq(
                 self.hub_profile
                     .get_reply(TerminalProbe::DefaultCursorColor)
             ),
+            self.hub_profile.palette.len(),
+            PALETTE_INDEX_COUNT,
             self.hub_profile.is_complete()
         )
     }
@@ -91,7 +100,7 @@ impl TerminalProfileStore {
         self.hub_profile.store_reply(probe, reply);
         log::info!(
             "[PTY-PROBE] Updated hub cache from {}: {}",
-            probe.label(),
+            probe.describe(),
             self.describe_hub_profile()
         );
     }
@@ -248,6 +257,16 @@ impl TerminalProfileStore {
                 }
             }
         }
+        for index in 0usize..PALETTE_INDEX_COUNT {
+            if let Some(reply) = self
+                .hub_profile
+                .get_reply(TerminalProbe::Palette(index as u8))
+            {
+                if let Some(rgb) = parse_rgb_from_osc_reply(reply) {
+                    colors.insert(index, rgb);
+                }
+            }
+        }
         std::sync::Arc::new(std::sync::Mutex::new(colors))
     }
 
@@ -278,6 +297,16 @@ impl TerminalProfileStore {
                     }
                 }
             }
+            for index in 0usize..PALETTE_INDEX_COUNT {
+                if let Some(reply) = self
+                    .hub_profile
+                    .get_reply(TerminalProbe::Palette(index as u8))
+                {
+                    if let Some(rgb) = parse_rgb_from_osc_reply(reply) {
+                        colors.insert(index, rgb);
+                    }
+                }
+            }
         }
     }
 
@@ -291,7 +320,7 @@ impl TerminalProfileStore {
             return None;
         }
         // Clear stale pending probes from a previous client that disconnected
-        // without replying. Re-probing is cheap (21 bytes) and idempotent.
+        // without replying. Re-probing is cheap and idempotent.
         self.hub_pending.clear();
 
         let missing: Vec<TerminalProbe> = ALL_PROBES
@@ -306,14 +335,7 @@ impl TerminalProfileStore {
 
         let mut bytes = Vec::new();
         for probe in &missing {
-            let code: &[u8] = match probe {
-                TerminalProbe::DefaultForeground => b"10",
-                TerminalProbe::DefaultBackground => b"11",
-                TerminalProbe::DefaultCursorColor => b"12",
-            };
-            bytes.extend_from_slice(&[ESC, b']']);
-            bytes.extend_from_slice(code);
-            bytes.extend_from_slice(&[b';', b'?', BEL]);
+            bytes.extend_from_slice(&probe.query_bytes());
         }
 
         for probe in missing {
@@ -327,7 +349,8 @@ impl TerminalProfileStore {
     ///
     /// Called at hub startup before the TUI takes over stdin/stdout.
     /// Writes OSC 10/11/12 queries to stdout, reads responses from stdin
-    /// with a short timeout. Updates the hub profile and persists to disk.
+    /// with a short timeout. Updates the hub profile.
+    /// Palette colors (OSC 4) are learned passively from peer inputs, not boot probed.
     ///
     /// Skipped in test mode and when stdin is not a TTY.
     pub(crate) fn probe_spawning_terminal(&mut self) {
@@ -350,8 +373,8 @@ impl TerminalProfileStore {
             let _ = crossterm::terminal::enable_raw_mode();
         }
 
-        // Send OSC 10/11/12 queries
-        let probes = b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07";
+        // Send OSC 10/11/12 queries (palette learned passively from peer inputs).
+        let probes = boot_probe_bytes();
         if std::io::stdout().write_all(probes).is_err() {
             if !was_raw {
                 let _ = crossterm::terminal::disable_raw_mode();
@@ -390,10 +413,10 @@ impl TerminalProfileStore {
             }
             response.extend_from_slice(&buf[..n as usize]);
 
-            // Check if we have all 3 responses
+            // Early exit once we have all expected responses (count OSC terminators)
             let osc_count = response.iter().filter(|&&b| b == 0x07).count()
                 + response.windows(2).filter(|w| w == &[0x1b, b'\\']).count();
-            if osc_count >= 3 {
+            if osc_count >= ALL_PROBES.len() {
                 break;
             }
         }
@@ -442,8 +465,41 @@ impl TerminalProbe {
             Self::DefaultForeground => "foreground",
             Self::DefaultBackground => "background",
             Self::DefaultCursorColor => "cursor",
+            Self::Palette(_) => "palette",
         }
     }
+
+    pub(crate) fn describe(self) -> String {
+        match self {
+            Self::Palette(index) => format!("palette[{index}]"),
+            _ => self.label().to_string(),
+        }
+    }
+}
+
+impl TerminalProbe {
+    pub(crate) fn query_bytes(self) -> Vec<u8> {
+        match self {
+            Self::DefaultForeground => b"\x1b]10;?\x07".to_vec(),
+            Self::DefaultBackground => b"\x1b]11;?\x07".to_vec(),
+            Self::DefaultCursorColor => b"\x1b]12;?\x07".to_vec(),
+            Self::Palette(index) => format!("\x1b]4;{index};?\x07").into_bytes(),
+        }
+    }
+}
+
+fn boot_probe_bytes() -> &'static [u8] {
+    static PROBES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    PROBES.get_or_init(|| {
+        let mut bytes = Vec::new();
+        for probe in ALL_PROBES {
+            bytes.extend_from_slice(&probe.query_bytes());
+        }
+        for index in 0usize..PALETTE_INDEX_COUNT {
+            bytes.extend_from_slice(&TerminalProbe::Palette(index as u8).query_bytes());
+        }
+        bytes
+    })
 }
 
 fn append_with_limit(buffer: &mut Vec<u8>, data: &[u8]) {
@@ -594,10 +650,10 @@ pub(crate) fn describe_probe_sequences(data: &[u8]) -> Vec<String> {
         .into_iter()
         .filter_map(|seq| {
             if let Some(probe) = classify_osc_query(&seq) {
-                return Some(format!("query:{}:{}", probe.label(), format_seq(&seq)));
+                return Some(format!("query:{}:{}", probe.describe(), format_seq(&seq)));
             }
             if let Some((probe, reply)) = classify_osc_reply(&seq) {
-                return Some(format!("reply:{}:{}", probe.label(), format_seq(&reply)));
+                return Some(format!("reply:{}:{}", probe.describe(), format_seq(&reply)));
             }
             None
         })
@@ -618,16 +674,31 @@ fn format_seq(data: &[u8]) -> String {
 fn classify_osc_query(seq: &[u8]) -> Option<TerminalProbe> {
     let payload = osc_payload(seq)?;
     let (code, value) = payload.split_once_by(|b| *b == b';')?;
-    if value != b"?" {
-        return None;
+    match code {
+        b"4" => {
+            let (index, value) = value.split_once_by(|b| *b == b';')?;
+            if value != b"?" {
+                return None;
+            }
+            let index = std::str::from_utf8(index).ok()?.parse::<u8>().ok()?;
+            Some(TerminalProbe::Palette(index))
+        }
+        _ if value == b"?" => probe_from_code(code),
+        _ => None,
     }
-    probe_from_code(code)
 }
 
 fn classify_osc_reply(seq: &[u8]) -> Option<(TerminalProbe, Vec<u8>)> {
     let payload = osc_payload(seq)?;
     let (code, value) = payload.split_once_by(|b| *b == b';')?;
-    let probe = probe_from_code(code)?;
+    let (probe, value) = match code {
+        b"4" => {
+            let (index, value) = value.split_once_by(|b| *b == b';')?;
+            let index = std::str::from_utf8(index).ok()?.parse::<u8>().ok()?;
+            (TerminalProbe::Palette(index), value)
+        }
+        _ => (probe_from_code(code)?, value),
+    };
 
     if value == b"?" || value.is_empty() {
         return None;
@@ -646,8 +717,15 @@ fn classify_osc_reply(seq: &[u8]) -> Option<(TerminalProbe, Vec<u8>)> {
 /// Extracts the rgb: value and converts the 16-bit color components to 8-bit.
 fn parse_rgb_from_osc_reply(reply: &[u8]) -> Option<crate::terminal::Rgb> {
     let payload = osc_payload(reply)?;
-    let (_code, value) = payload.split_once_by(|b| *b == b';')?;
-    let rgb_str = value.strip_prefix(b"rgb:")?;
+    let (code, value) = payload.split_once_by(|b| *b == b';')?;
+    let rgb_value = match code {
+        b"4" => {
+            let (_index, value) = value.split_once_by(|b| *b == b';')?;
+            value
+        }
+        _ => value,
+    };
+    let rgb_str = rgb_value.strip_prefix(b"rgb:")?;
     let rgb_str = std::str::from_utf8(rgb_str).ok()?;
     let mut parts = rgb_str.split('/');
     let r = u16::from_str_radix(parts.next()?, 16).ok()?;
@@ -753,6 +831,26 @@ mod tests {
         assert_eq!(
             store.headless_reply("any-session", TerminalProbe::DefaultBackground),
             Some(b"\x1b]11;rgb:1111/2222/3333\x07".as_slice())
+        );
+    }
+
+    #[test]
+    fn observe_peer_input_updates_palette_cache() {
+        let mut store = TerminalProfileStore::default();
+
+        let learned = store.observe_peer_input("browser-a", b"\x1b]4;7;rgb:aaaa/bbbb/cccc\x07");
+
+        assert_eq!(learned, vec![b"\x1b]4;7;rgb:aaaa/bbbb/cccc\x07".to_vec()]);
+        assert_eq!(
+            store.headless_reply("any-session", TerminalProbe::Palette(7)),
+            Some(b"\x1b]4;7;rgb:aaaa/bbbb/cccc\x07".as_slice())
+        );
+
+        let cache = store.shared_color_cache();
+        let colors = cache.lock().expect("shared cache poisoned");
+        assert_eq!(
+            colors.get(&7),
+            Some(&crate::terminal::Rgb::new(0xaa, 0xbb, 0xcc))
         );
     }
 
@@ -877,6 +975,15 @@ mod tests {
         );
 
         assert_eq!(output, b"beforeafter\x1b]9;not-a-probe\x07");
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn strip_osc_palette_queries_preserves_other_output() {
+        let mut buffer = Vec::new();
+        let output = strip_osc_queries_from_output(&mut buffer, b"before\x1b]4;7;?\x07after");
+
+        assert_eq!(output, b"beforeafter");
         assert!(buffer.is_empty());
     }
 

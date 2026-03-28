@@ -1,6 +1,4 @@
 //! Screen dimension types for terminal output.
-//!
-//! ANSI snapshot generation has moved to [`crate::terminal::generate_ansi_snapshot`].
 
 /// Information about screen dimensions.
 ///

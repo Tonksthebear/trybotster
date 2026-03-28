@@ -163,7 +163,7 @@ impl SessionHandle {
 /// - `subscribe()` to receive PTY events (output, resize, exit)
 /// - `write_input()` to send input to the PTY
 /// - `resize()` to notify PTY of client resize
-/// - `get_snapshot()` to get clean ANSI snapshot for reconnect
+/// - `get_snapshot()` to get binary page snapshot for reconnect
 /// - `port()` to get the HTTP forwarding port (if assigned)
 ///
 /// # Example
@@ -371,8 +371,6 @@ impl PtyHandle {
         self.port
     }
 
-    /// Get a clean ANSI snapshot of the current terminal state.
-    ///
     /// Whether the inner PTY has kitty keyboard protocol active.
     #[must_use]
     pub fn kitty_enabled(&self) -> bool {
