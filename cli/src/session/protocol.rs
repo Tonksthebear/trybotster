@@ -255,6 +255,10 @@ impl FrameDecoder {
         }
     }
 
+    /// Maximum frame payload size (16 MiB) to reject obviously malformed input
+    /// before allocating.
+    const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
     /// Feed raw bytes, return any complete frames.
     pub fn feed(&mut self, data: &[u8]) -> Vec<Frame> {
         self.buf.extend_from_slice(data);
@@ -266,7 +270,13 @@ impl FrameDecoder {
             }
             let len =
                 u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
-            if len == 0 || self.buf.len() < 4 + len {
+            if len == 0 || len > Self::MAX_FRAME_SIZE {
+                // Consume the bad 4-byte header so the decoder doesn't wedge.
+                log::warn!("FrameDecoder: bad frame length {len}, discarding header");
+                self.buf.drain(..4);
+                continue;
+            }
+            if self.buf.len() < 4 + len {
                 break;
             }
             let frame_type = self.buf[4];
@@ -561,6 +571,14 @@ pub fn decode_binary_snapshot(data: &[u8]) -> Result<BinarySnapshot> {
         bail!("binary snapshot truncated at state_blob data");
     }
     let state_blob = data[pos..pos + state_len].to_vec();
+    pos += state_len;
+
+    if pos != data.len() {
+        bail!(
+            "binary snapshot has {} trailing bytes (expected exact end)",
+            data.len() - pos
+        );
+    }
 
     Ok(BinarySnapshot {
         active_screen,

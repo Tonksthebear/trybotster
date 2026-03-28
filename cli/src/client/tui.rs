@@ -79,13 +79,13 @@ pub enum TuiOutput {
         rows: u16,
         /// Authoritative terminal columns used to build this snapshot.
         cols: u16,
-        /// Raw scrollback data.
+        /// Binary page snapshot data.
         data: Vec<u8>,
         /// Whether the inner PTY has kitty keyboard protocol active.
         ///
-        /// Carried alongside scrollback because the snapshot bytes are
-        /// ANSI output — the TUI needs to know the kitty state explicitly
-        /// to push the protocol to the outer terminal on agent switch.
+        /// Carried alongside the snapshot because the TUI needs to know
+        /// the kitty state explicitly to push the protocol to the outer
+        /// terminal on agent switch.
         kitty_enabled: bool,
     },
 

@@ -2561,9 +2561,9 @@ impl Hub {
                         std::thread::sleep(std::time::Duration::from_millis(25));
                     }
                     pty_for_snapshot.resize_direct(target_rows, target_cols);
-                    // Broker-backed sessions redraw asynchronously after SIGWINCH.
-                    // Let a short settle window pass so replayed snapshot and
-                    // cursor state include that redraw.
+                    // Sessions redraw asynchronously after SIGWINCH.
+                    // Let a short settle window pass so the binary snapshot
+                    // includes the post-resize redraw.
                     std::thread::sleep(std::time::Duration::from_millis(125));
                 }
                 let (snapshot, _kitty_enabled, _rows, _cols, pty_rx) =
@@ -2815,8 +2815,8 @@ impl Hub {
     /// Send recovery snapshots for peers that experienced backpressure drops.
     ///
     /// When PTY frames are dropped because the per-peer send channel is full,
-    /// the browser's terminal parser loses VTE state (a dropped frame containing
-    /// the start of an ANSI escape corrupts parsing of all subsequent frames).
+    /// the browser's terminal state diverges (a dropped frame causes the local
+    /// parser to miss output, corrupting rendering of all subsequent frames).
     ///
     /// After a cooldown period (letting the burst subside), this method fetches
     /// a fresh snapshot from the session process and sends it directly through
@@ -2863,7 +2863,7 @@ impl Hub {
             let pty_handle = session_handle.pty().clone();
 
             if pty_handle.is_session_backed() {
-                // Broker snapshot requires blocking I/O — spawn off the tick loop.
+                // Session snapshot requires blocking I/O — spawn off the tick loop.
                 // Clone the per-peer sender so the task can deliver chunks directly,
                 // bypassing the output queue to avoid re-triggering backpressure.
                 let peer_tx = peer_state.unwrap().tx.clone();

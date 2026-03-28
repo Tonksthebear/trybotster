@@ -448,26 +448,6 @@ impl LuaUserData for PtySessionHandle {
             Ok(())
         });
 
-        // session:get_snapshot() -> string (plain text)
-        // Returns plain text screen contents via FRAME_GET_SCREEN RPC.
-        // Binary page snapshots are for internal Rust use (TUI/browser reconnect),
-        // not useful to Lua consumers.
-        methods.add_method("get_snapshot", |lua, this, ()| {
-            if let Some(conn) = this.session_connection.get() {
-                if let Ok(mut guard) = conn.lock() {
-                    if let Some(session) = guard.as_mut() {
-                        match session.get_screen() {
-                            Ok(text) => return lua.create_string(text.as_bytes()),
-                            Err(e) => {
-                                log::warn!("get_snapshot RPC failed: {e}");
-                            }
-                        }
-                    }
-                }
-            }
-            lua.create_string(b"" as &[u8])
-        });
-
         // session:get_screen() -> string (plain text, visible screen only)
         //
         // Uses the dedicated FRAME_GET_SCREEN RPC which returns plain text
@@ -480,29 +460,6 @@ impl LuaUserData for PtySessionHandle {
                             Ok(text) => return lua.create_string(text.as_bytes()),
                             Err(e) => {
                                 log::warn!("get_screen RPC failed: {e}");
-                            }
-                        }
-                    }
-                }
-            }
-            lua.create_string(b"" as &[u8])
-        });
-
-        // session:feed_output(bytes) - No-op.
-        //
-        // Previously fed raw bytes into a local shadow screen. Now the session
-        // process owns all terminal parsing. Retained for API compatibility.
-        methods.add_method("feed_output", |_, _this, _data: LuaString| Ok(()));
-
-        // Backwards-compatible alias for get_snapshot (plain text).
-        methods.add_method("get_scrollback", |lua, this, ()| {
-            if let Some(conn) = this.session_connection.get() {
-                if let Ok(mut guard) = conn.lock() {
-                    if let Some(session) = guard.as_mut() {
-                        match session.get_screen() {
-                            Ok(text) => return lua.create_string(text.as_bytes()),
-                            Err(e) => {
-                                log::warn!("get_scrollback RPC failed: {e}");
                             }
                         }
                     }
@@ -1691,8 +1648,11 @@ mod tests {
         assert!(result, "Cursor should be visible after show sequence");
     }
 
+    // get_snapshot/get_scrollback/feed_output removed — snapshots are binary page
+    // transfer via session RPC, not exposed as Lua string methods.
+
     #[test]
-    fn test_pty_session_handle_get_snapshot_without_session() {
+    fn test_pty_session_handle_get_screen_without_session() {
         let lua = Lua::new();
         let handle = create_test_session_handle();
 
@@ -1700,38 +1660,18 @@ mod tests {
             .set("session", handle)
             .expect("Failed to set session");
 
-        // Without a session process connection, snapshot returns empty
+        // Without a session process connection, get_screen returns empty
         let result: LuaString = lua
-            .load("return session:get_snapshot()")
+            .load("return session:get_screen()")
             .eval()
-            .expect("get_snapshot should work");
+            .expect("get_screen should work");
         let bytes = result.as_bytes();
         assert!(
             bytes.is_empty(),
-            "snapshot without session process should be empty"
+            "screen without session process should be empty"
         );
     }
 
-    #[test]
-    fn test_pty_session_handle_get_scrollback_without_session() {
-        let lua = Lua::new();
-        let handle = create_test_session_handle();
-
-        lua.globals()
-            .set("session", handle)
-            .expect("Failed to set session");
-
-        // get_scrollback is an alias for get_snapshot — also empty without session
-        let result: LuaString = lua
-            .load("return session:get_scrollback()")
-            .eval()
-            .expect("get_scrollback alias should work");
-        let bytes = result.as_bytes();
-        assert!(
-            bytes.is_empty(),
-            "scrollback without session process should be empty"
-        );
-    }
 
     #[test]
     fn test_pty_session_handle_port_nil() {
@@ -2097,18 +2037,6 @@ mod tests {
 
         // Give the PTY a moment to process
         std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Snapshot requires session process RPC — pty.spawn() creates a local
-        // PTY without a session process, so snapshot returns empty.
-        let snapshot: LuaString = lua
-            .load("return session:get_snapshot()")
-            .eval()
-            .expect("get_snapshot should work");
-        assert!(
-            snapshot.as_bytes().is_empty(),
-            "snapshot without session process should be empty (got {} bytes)",
-            snapshot.as_bytes().len()
-        );
 
         // Kill the session
         lua.load("session:kill()").exec().expect("kill should work");
