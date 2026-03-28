@@ -74,7 +74,7 @@ export class TerminalConnection extends HubRoute {
         // Raw bytes from CLI with prefix byte routing:
         //   0x00 = JSON control message
         //   0x01 = live PTY output (immediate passthrough)
-        //   0x02 = complete snapshot (atomic replacement)
+        //   0x02 = binary page snapshot (raw page memory + state blob)
         if (message.data && message.data.length > 0) {
           const prefix = message.data[0];
           if (prefix === 0x01) {
@@ -126,8 +126,7 @@ export class TerminalConnection extends HubRoute {
   }
 
   sendResize(cols, rows) {
-    // Keep local geometry in sync with live terminal size so snapshot cursor
-    // validation uses current bounds instead of stale subscribe-time values.
+    // Keep local geometry in sync so requestSnapshot() sends current bounds.
     this.options.cols = cols;
     this.options.rows = rows;
     return this.send("resize", { cols, rows });
@@ -161,51 +160,23 @@ export class TerminalConnection extends HubRoute {
   /**
    * Handle a complete snapshot (prefix 0x02).
    *
+   * Binary page snapshots start with [version=0x01][screen_count][active_screen].
+   * The hub sends raw binary page data — pages + terminal state blob — which
+   * restty loads directly via page_load/state_import/state_finalize.
+   *
    * The snapshot is a single atomic message — no chunking, no reassembly.
    * WebRTC SCTP handles message fragmentation at the transport layer.
    */
   #handleSnapshot(data) {
     if (data.length === 0) return;
 
-    console.debug(`[TerminalConnection] Snapshot complete: ${data.byteLength} bytes`);
+    console.debug(`[TerminalConnection] Binary snapshot: ${data.byteLength} bytes`);
     this.emit("snapshotStart", { byteLength: data.byteLength });
-    const validated = this.#validateSnapshotCursor(data);
-    this.#emitOutput(validated);
-    this.emit("snapshotComplete", { byteLength: validated.byteLength });
+    this.emit("binarySnapshot", data);
+    this.emit("snapshotComplete", { byteLength: data.byteLength });
   }
 
   // ========== Private helpers ==========
-
-  /**
-   * Validate the trailing cursor-position escape in a snapshot byte array.
-   *
-   * snapshot_with_scrollback() always ends with \x1b[ROW;COLH. If the row
-   * or col is out of bounds (e.g., due to vt100 cursor tracking lag during
-   * scrollback manipulation), strip the escape and let the live forwarder
-   * correct the cursor position instead.
-   *
-   * Uses latin1 decoding on the tail so every byte maps 1:1 to a char,
-   * avoiding multi-byte edge cases in the pattern search.
-   */
-  #validateSnapshotCursor(data) {
-    const tailLen = Math.min(30, data.length);
-    const tail = new TextDecoder("latin1").decode(data.subarray(data.length - tailLen));
-    const match = tail.match(/\x1b\[(\d+);(\d+)H$/);
-    if (!match) return data;
-
-    const row = parseInt(match[1], 10);
-    const col = parseInt(match[2], 10);
-    const maxRows = this.options.rows ?? 24;
-    const maxCols = this.options.cols ?? 80;
-
-    if (row < 1 || col < 1 || row > maxRows || col > maxCols) {
-      console.warn(`[TerminalConnection] Snapshot cursor ${row};${col} out of bounds (${maxRows}x${maxCols}), stripping`);
-      const escLen = new TextEncoder().encode(match[0]).length;
-      return data.slice(0, data.length - escLen);
-    }
-
-    return data;
-  }
 
   async #emitDecodedOutput(data, compressed) {
     if (!data) return;
@@ -264,6 +235,10 @@ export class TerminalConnection extends HubRoute {
 
   onSnapshotComplete(callback) {
     return this.on("snapshotComplete", callback);
+  }
+
+  onBinarySnapshot(callback) {
+    return this.on("binarySnapshot", callback);
   }
 
   // ========== Static helper ==========

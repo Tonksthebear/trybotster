@@ -30,6 +30,7 @@ export class WebRtcPtyTransport {
   #onReconnect = null;
   #onConnect = null;
   #onDisconnect = null;
+  #onBinarySnapshot = null;
   #pendingResize = null; // { cols, rows }
   #pendingResizeTimer = null;
 
@@ -128,12 +129,14 @@ export class WebRtcPtyTransport {
   set onReconnect(callback) { this.#onReconnect = callback; }
   set onConnect(callback) { this.#onConnect = callback; }
   set onDisconnect(callback) { this.#onDisconnect = callback; }
+  set onBinarySnapshot(callback) { this.#onBinarySnapshot = callback; }
 
   destroy() {
     this.disconnect();
     this.#onReconnect = null;
     this.#onConnect = null;
     this.#onDisconnect = null;
+    this.#onBinarySnapshot = null;
     this.#terminalConn?.release();
     this.#terminalConn = null;
   }
@@ -164,6 +167,12 @@ export class WebRtcPtyTransport {
     this.#unsubscribers.push(
       this.#terminalConn.onSnapshotComplete(() => {
         this.#awaitingReconnectSnapshot = false;
+      }),
+    );
+
+    this.#unsubscribers.push(
+      this.#terminalConn.onBinarySnapshot((data) => {
+        this.#onBinarySnapshot?.(data);
       }),
     );
 
