@@ -810,14 +810,14 @@ extern "C" {
         used_rows: u16,
     ) -> GhosttyResult;
 
-    fn ghostty_snapshot_terminal_export(
+    fn ghostty_terminal_snapshot_export(
         terminal: GhosttyTerminalPtr,
         allocator: *const c_void,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> GhosttyResult;
 
-    fn ghostty_snapshot_terminal_import(
+    fn ghostty_terminal_snapshot_import(
         terminal: GhosttyTerminalPtr,
         data: *const u8,
         data_len: usize,
@@ -1607,7 +1607,7 @@ impl Terminal {
         let mut ptr: *mut u8 = ptr::null_mut();
         let mut len: usize = 0;
         let result = unsafe {
-            ghostty_snapshot_terminal_export(self.handle, ptr::null(), &mut ptr, &mut len)
+            ghostty_terminal_snapshot_export(self.handle, ptr::null(), &mut ptr, &mut len)
         };
         if result == GhosttyResult::Success && !ptr.is_null() && len > 0 {
             let data = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
@@ -1623,7 +1623,7 @@ impl Terminal {
     /// needed, restores all state, and finalizes cursor pins.
     pub fn snapshot_import(&mut self, data: &[u8]) -> Result<(), &'static str> {
         let result = unsafe {
-            ghostty_snapshot_terminal_import(self.handle, data.as_ptr(), data.len())
+            ghostty_terminal_snapshot_import(self.handle, data.as_ptr(), data.len())
         };
         match result {
             GhosttyResult::Success => Ok(()),
