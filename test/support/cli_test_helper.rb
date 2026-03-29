@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
+require "base64"
 require "digest"
+require "ed25519"
 require "json"
 require_relative "wait_helper"
 
@@ -239,14 +241,10 @@ module CliTestHelper
 
     # Create temp directory for CLI data
     temp_dir = options[:temp_dir] || Dir.mktmpdir("cli_test_")
-    # The CLI generates its own hub identifier from its device fingerprint
-    # (format: "device-{fingerprint_hex}"). We can't predict this before startup,
-    # so we create the token on the provided hub and let the CLI register.
-    # After startup, the CLI's hub may be different from the passed-in hub
-    # if the identifier doesn't match — use cli.hub to get the actual hub.
+    device_identity = prepare_cli_identity!(hub, temp_dir)
     hub_token = create_hub_token_for_hub(hub)
-    api_key = hub_token.token
-    Rails.logger.info "[CliTestHelper] Created HubToken id=#{hub_token.id} token=#{api_key[0..15]}..."
+    write_cli_credentials!(temp_dir, hub_token:, device_identity:)
+    Rails.logger.info "[CliTestHelper] Created HubToken id=#{hub_token.id} token=#{hub_token.token[0..15]}..."
     Rails.logger.info "[CliTestHelper] HubToken user_id=#{hub_token.user&.id}"
 
     # Set up environment
@@ -258,15 +256,13 @@ module CliTestHelper
       "BOTSTER_ENV" => "system_test",
       "BOTSTER_CONFIG_DIR" => temp_dir,
       "BOTSTER_SERVER_URL" => server_url,
-      "BOTSTER_TOKEN" => api_key,  # Use BOTSTER_TOKEN (takes precedence over BOTSTER_API_KEY)
       "BOTSTER_REPO" => "test/repo",  # Optional — used for GitHub event subscription
       "RUST_LOG" => options[:log_level] || "info,botster=debug"
     }
 
     Rails.logger.info "[CliTestHelper] Starting CLI for hub #{hub.identifier}"
     Rails.logger.info "[CliTestHelper] Server URL: #{env['BOTSTER_SERVER_URL']}"
-    Rails.logger.info "[CliTestHelper] BOTSTER_TOKEN set to: #{env['BOTSTER_TOKEN']&.slice(0, 20)}..."
-    Rails.logger.debug "[CliTestHelper] Environment: #{env.except('BOTSTER_TOKEN')}"
+    Rails.logger.debug "[CliTestHelper] Environment: #{env}"
 
     # Start CLI process
     stdout_r, stdout_w = IO.pipe
@@ -392,6 +388,96 @@ module CliTestHelper
     # Create a hub token for the CLI to authenticate
     # Returns the HubToken record (not just the token string) for cleanup
     hub.hub_token || hub.create_hub_token!(name: "CLI Test Token #{SecureRandom.hex(4)}")
+  end
+
+  def prepare_cli_identity!(hub, temp_dir)
+    device_identity = load_or_create_cli_device_identity(temp_dir)
+    target_identifier = device_hub_identifier(device_identity[:fingerprint])
+
+    stale_hub = hub.user.hubs.where(identifier: target_identifier).where.not(id: hub.id).first
+    if stale_hub
+      Rails.logger.warn "[CliTestHelper] Removing stale hub #{stale_hub.id} for identifier #{target_identifier}"
+      stale_hub.destroy!
+    end
+
+    return device_identity if hub.identifier == target_identifier && hub.fingerprint == device_identity[:fingerprint]
+
+    hub.update!(
+      identifier: target_identifier,
+      fingerprint: device_identity[:fingerprint],
+      last_seen_at: Time.current
+    )
+    device_identity
+  end
+
+  def load_or_create_cli_device_identity(temp_dir)
+    device_path = File.join(temp_dir, "device.json")
+    credentials_path = File.join(temp_dir, "credentials.json")
+    credentials = read_json_file(credentials_path)
+
+    if File.exist?(device_path)
+      device = JSON.parse(File.read(device_path))
+      fingerprint = device["fingerprint"]
+      signing_key_b64 = credentials["signing_key"]
+      if fingerprint.present? && signing_key_b64.present?
+        return {
+          fingerprint: fingerprint,
+          signing_key_b64: signing_key_b64,
+          verifying_key_b64: device["verifying_key"],
+          name: device["name"]
+        }
+      end
+    end
+
+    signing_key = Ed25519::SigningKey.generate
+    verifying_key = signing_key.verify_key
+    fingerprint = cli_device_fingerprint(verifying_key.to_bytes)
+    name = "Botster CLI"
+
+    stored_device = {
+      verifying_key: Base64.strict_encode64(verifying_key.to_bytes),
+      fingerprint: fingerprint,
+      name: name
+    }
+
+    File.write(device_path, JSON.pretty_generate(stored_device))
+    File.chmod(0o600, device_path)
+
+    {
+      fingerprint: fingerprint,
+      signing_key_b64: Base64.strict_encode64(signing_key.to_bytes),
+      verifying_key_b64: stored_device[:verifying_key],
+      name: name
+    }
+  end
+
+  def write_cli_credentials!(temp_dir, hub_token:, device_identity:)
+    credentials_path = File.join(temp_dir, "credentials.json")
+    credentials = read_json_file(credentials_path)
+
+    credentials["api_token"] = hub_token.token
+    credentials["signing_key"] = device_identity[:signing_key_b64]
+    credentials["fingerprint"] = device_identity[:fingerprint]
+    credentials["version"] ||= 1
+
+    File.write(credentials_path, JSON.pretty_generate(credentials))
+    File.chmod(0o600, credentials_path)
+  end
+
+  def read_json_file(path)
+    return {} unless File.exist?(path)
+
+    JSON.parse(File.read(path))
+  rescue JSON::ParserError
+    {}
+  end
+
+  def device_hub_identifier(fingerprint)
+    "device-#{fingerprint.delete(':')}"
+  end
+
+  def cli_device_fingerprint(verifying_key_bytes)
+    Digest::SHA256.digest(verifying_key_bytes)[0, 8].bytes.map { |byte| "%02x" % byte }.join(":")
   end
 
   def local_hub_id_for_path(path)
