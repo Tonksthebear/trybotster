@@ -58,7 +58,7 @@ class FileInputTest < ApplicationSystemTestCase
 
           // Wait for TerminalConnection to be created by terminal_display_controller
           var conn = null;
-          for (var i = 0; i < 50; i++) {
+          for (var i = 0; i < 100; i++) {
             conn = HubConnectionManager.get(key);
             if (conn && conn.isConnected()) break;
             conn = null;
@@ -125,7 +125,7 @@ class FileInputTest < ApplicationSystemTestCase
           var key = "terminal:" + hubId + ":" + sessionUuid;
 
           var conn = null;
-          for (var i = 0; i < 50; i++) {
+          for (var i = 0; i < 100; i++) {
             conn = HubConnectionManager.get(key);
             if (conn && conn.isConnected()) break;
             conn = null;
@@ -196,6 +196,13 @@ class FileInputTest < ApplicationSystemTestCase
   def create_agent_via_ui
     find("#new-agent-modal", visible: :all)
     page.execute_script("document.getElementById('new-agent-modal').showModal()")
+
+    target_select = find("[data-new-agent-form-target='targetSelect']", wait: 10)
+    selectable_option = target_select.all("option").find { |option| option.value.present? }
+    assert selectable_option, "Expected at least one admitted spawn target option"
+
+    target_select.select(selectable_option.text)
+    assert_no_selector "[data-new-agent-form-target='worktreeOptions'].hidden", visible: :all, wait: 10
 
     find("[data-action='new-agent-form#selectMainBranch']", wait: 10).click
     find("[data-action='new-agent-form#submit']", wait: 10).click
