@@ -1,3 +1,4 @@
 [submodule "cli/vendor/ghostty"]
 	path = cli/vendor/ghostty
-	url = https://github.com/ghostty-org/ghostty.git
+	url = https://github.com/Tonksthebear/ghostty.git
+	branch = binary-terminal-snapshot
