@@ -57,11 +57,20 @@ class HubStateFlowsTest < ApplicationSystemTestCase
 
     open_new_session_chooser
 
-    target_select = find("[data-new-session-chooser-target='targetSelect']", wait: 10)
-    selectable_option = target_select.all("option").find { |option| option.value.present? }
-    assert selectable_option, "Expected at least one admitted spawn target option"
+    # Wait for async spawn target load — options may re-render after initial mount.
+    selected_value = nil
+    selected_text = nil
+    assert wait_until?(timeout: 15, poll: 0.3) {
+      target_select = find("[data-new-session-chooser-target='targetSelect']", wait: 2)
+      option = target_select.all("option").find { |o| o.value.present? rescue false }
+      if option
+        selected_value = option.value
+        selected_text = option.text
+        true
+      end
+    }, "Expected at least one admitted spawn target option"
 
-    target_select.select(selectable_option.text)
+    find("[data-new-session-chooser-target='targetSelect']", wait: 5).select(selected_text)
     find("[data-new-session-chooser-target='agentButton']", wait: 10).click
 
     assert_selector "dialog#new-agent-modal[open]", wait: 10
@@ -69,7 +78,7 @@ class HubStateFlowsTest < ApplicationSystemTestCase
     assert_no_selector "[data-new-agent-form-target='worktreeOptions'].hidden", visible: :all, wait: 10
 
     modal_target_select = find("[data-new-agent-form-target='targetSelect']", wait: 10)
-    assert_equal selectable_option.value, modal_target_select.value
+    assert_equal selected_value, modal_target_select.value
   end
 
   test "quick setup hides the no-agent-config banner after installing the template" do
