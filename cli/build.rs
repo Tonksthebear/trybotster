@@ -180,20 +180,27 @@ fn build_ghostty_vt() {
     let repacked_lib = Path::new(&out_dir).join("libghostty-vt.a");
     let zig_lib_path = ghostty_dir.join("zig-out/lib/libghostty-vt.a");
 
+    let zig_args = [
+        "build",
+        "-Demit-lib-vt",
+        "-Doptimize=ReleaseFast",
+        "-Dsimd=false",
+    ];
+
+    // Try mise first (local dev), fall back to bare zig (CI).
     let status = Command::new("mise")
-        .args([
-            "exec",
-            "--",
-            "zig",
-            "build",
-            "-Demit-lib-vt",
-            "-Doptimize=ReleaseFast",
-            "-Dsimd=false",
-        ])
+        .args(["exec", "--", "zig"])
+        .args(&zig_args)
         .current_dir(ghostty_dir)
         .env("DEVELOPER_DIR", "/Library/Developer/CommandLineTools")
         .status()
-        .expect("failed to run `mise exec -- zig build` — is mise installed with zig?");
+        .or_else(|_| {
+            Command::new("zig")
+                .args(&zig_args)
+                .current_dir(ghostty_dir)
+                .status()
+        })
+        .expect("failed to run zig build — is zig or mise installed?");
 
     assert!(
         status.success(),
