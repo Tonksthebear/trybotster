@@ -275,9 +275,12 @@ fn render_cursor(rs: &RenderState, area: Rect, buf: &mut Buffer, cursor_config: 
 mod tests {
     use super::*;
     use crate::terminal::TerminalParser;
+    use crate::tui::terminal_panel::TerminalPanel;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
     use ratatui::Terminal;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     fn make_render_state(parser: &mut TerminalParser) -> RenderState {
         let mut rs = RenderState::new().expect("render state creation");
@@ -417,6 +420,126 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(20, 0)].bg, Color::Rgb(0xF0, 0xE0, 0xD0));
         assert_eq!(buffer[(40, 12)].bg, Color::Rgb(0xF0, 0xE0, 0xD0));
+    }
+
+    #[test]
+    fn panel_refresh_repaints_terminal_widget_background() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let color_cache = Arc::new(Mutex::new(HashMap::from([(
+            257usize,
+            crate::terminal::Rgb::new(0xF0, 0xE0, 0xD0),
+        )])));
+        let mut panel = TerminalPanel::new_with_color_cache(24, 80, Arc::clone(&color_cache));
+        panel.connect("sess-0");
+        panel.on_scrollback(b"");
+        panel.on_output(b"Hello, World!");
+
+        terminal
+            .draw(|f| {
+                let default_fg = panel
+                    .foreground_color_default()
+                    .or_else(|| panel.foreground_color())
+                    .unwrap_or(crate::terminal::Rgb::new(255, 255, 255));
+                let default_bg = panel
+                    .background_color_default()
+                    .or_else(|| panel.background_color())
+                    .unwrap_or(crate::terminal::Rgb::new(0, 0, 0));
+                let widget =
+                    TerminalWidget::new(panel.render_state()).default_colors(default_fg.into(), default_bg.into());
+                f.render_widget(widget, f.area());
+            })
+            .unwrap();
+
+        let before = terminal.backend().buffer()[(40, 12)].bg;
+        assert_eq!(before, Color::Rgb(0xF0, 0xE0, 0xD0));
+
+        color_cache
+            .lock()
+            .expect("color cache lock")
+            .insert(257usize, crate::terminal::Rgb::new(0x10, 0x0F, 0x0F));
+        panel.refresh_color_cache();
+
+        terminal
+            .draw(|f| {
+                let default_fg = panel
+                    .foreground_color_default()
+                    .or_else(|| panel.foreground_color())
+                    .unwrap_or(crate::terminal::Rgb::new(255, 255, 255));
+                let default_bg = panel
+                    .background_color_default()
+                    .or_else(|| panel.background_color())
+                    .unwrap_or(crate::terminal::Rgb::new(0, 0, 0));
+                let widget =
+                    TerminalWidget::new(panel.render_state()).default_colors(default_fg.into(), default_bg.into());
+                f.render_widget(widget, f.area());
+            })
+            .unwrap();
+
+        let after = terminal.backend().buffer()[(40, 12)].bg;
+        assert_eq!(after, Color::Rgb(0x10, 0x0F, 0x0F));
+    }
+
+    #[test]
+    fn panel_refresh_repaints_palette_backed_cell_background() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut initial_colors = HashMap::new();
+        for index in 0usize..256usize {
+            initial_colors.insert(index, crate::terminal::Rgb::new(0, 0, 0));
+        }
+        initial_colors.insert(4usize, crate::terminal::Rgb::new(0xF0, 0xE0, 0xD0));
+        let color_cache = Arc::new(Mutex::new(initial_colors));
+        let mut panel = TerminalPanel::new_with_color_cache(24, 80, Arc::clone(&color_cache));
+        panel.connect("sess-0");
+        panel.on_scrollback(b"");
+        panel.on_output(b"\x1b[44mX\x1b[0m");
+
+        terminal
+            .draw(|f| {
+                let default_fg = panel
+                    .foreground_color_default()
+                    .or_else(|| panel.foreground_color())
+                    .unwrap_or(crate::terminal::Rgb::new(255, 255, 255));
+                let default_bg = panel
+                    .background_color_default()
+                    .or_else(|| panel.background_color())
+                    .unwrap_or(crate::terminal::Rgb::new(0, 0, 0));
+                let widget = TerminalWidget::new(panel.render_state())
+                    .default_colors(default_fg.into(), default_bg.into());
+                f.render_widget(widget, f.area());
+            })
+            .unwrap();
+
+        let before = terminal.backend().buffer()[(0, 0)].bg;
+        assert_eq!(before, Color::Rgb(0xF0, 0xE0, 0xD0));
+
+        color_cache
+            .lock()
+            .expect("color cache lock")
+            .insert(4usize, crate::terminal::Rgb::new(0x10, 0x0F, 0x0F));
+        panel.refresh_color_cache();
+
+        terminal
+            .draw(|f| {
+                let default_fg = panel
+                    .foreground_color_default()
+                    .or_else(|| panel.foreground_color())
+                    .unwrap_or(crate::terminal::Rgb::new(255, 255, 255));
+                let default_bg = panel
+                    .background_color_default()
+                    .or_else(|| panel.background_color())
+                    .unwrap_or(crate::terminal::Rgb::new(0, 0, 0));
+                let widget = TerminalWidget::new(panel.render_state())
+                    .default_colors(default_fg.into(), default_bg.into());
+                f.render_widget(widget, f.area());
+            })
+            .unwrap();
+
+        let after = terminal.backend().buffer()[(0, 0)].bg;
+        assert_eq!(after, Color::Rgb(0x10, 0x0F, 0x0F));
     }
 
     #[test]
