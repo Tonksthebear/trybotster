@@ -199,8 +199,26 @@ type GhosttyTerminalNotificationFn = Option<
     ),
 >;
 
-type GhosttyTerminalSemanticPromptFn =
-    Option<unsafe extern "C" fn(terminal: GhosttyTerminalPtr, userdata: *mut c_void, mark: u8)>;
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhosttySemanticPromptAction {
+    FreshLine = 0,
+    FreshLineNewPrompt = 1,
+    NewCommand = 2,
+    PromptStart = 3,
+    EndPromptStartInput = 4,
+    EndPromptStartInputTerminateEol = 5,
+    EndInputStartOutput = 6,
+    EndCommand = 7,
+}
+
+type GhosttyTerminalSemanticPromptFn = Option<
+    unsafe extern "C" fn(
+        terminal: GhosttyTerminalPtr,
+        userdata: *mut c_void,
+        action: GhosttySemanticPromptAction,
+    ),
+>;
 
 type GhosttyTerminalModeChangedFn = Option<
     unsafe extern "C" fn(
@@ -514,14 +532,6 @@ enum GhosttyFormatterFormat {
     Html = 2,
 }
 
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum GhosttyScreenKey {
-    Primary = 0,
-    Alternate = 1,
-}
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GhosttyFormatterScreenExtra {
@@ -571,36 +581,6 @@ struct GhosttyFormatterOpaque {
     _opaque: [u8; 0],
 }
 type GhosttyFormatterPtr = *mut GhosttyFormatterOpaque;
-
-// ── Binary page transfer types ─────────────────────────────────────────────
-
-/// Page capacity hints — matches the C struct for page allocation.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct GhosttyPageCapacity {
-    pub cols: u16,
-    pub rows: u16,
-    pub styles: u16,
-    pub grapheme_bytes: u32,
-    pub hyperlink_bytes: u16,
-    pub string_bytes: u32,
-}
-
-/// Page metadata returned by page_info.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct GhosttyPageInfo {
-    pub memory_len: usize,
-    pub used_cols: u16,
-    pub used_rows: u16,
-    pub cap: GhosttyPageCapacity,
-}
-
-// Compile-time layout assertions — catch padding mismatches with Zig.
-// GhosttyPageCapacity: u16 + u16 + u16 + (2 pad) + u32 + u16 + (2 pad) + u32 = 20
-const _: () = assert!(std::mem::size_of::<GhosttyPageCapacity>() == 20);
-// GhosttyPageInfo: usize(8) + u16 + u16 + GhosttyPageCapacity(20) = 32
-const _: () = assert!(std::mem::size_of::<GhosttyPageInfo>() == 32);
 
 // ── Extern C functions ─────────────────────────────────────────────────────
 
@@ -761,16 +741,6 @@ extern "C" {
     ) -> GhosttyResult;
     fn ghostty_formatter_free(formatter: GhosttyFormatterPtr);
 
-    // Screen-specific formatter
-    fn ghostty_formatter_screen_alloc(
-        allocator: *const c_void,
-        terminal: GhosttyTerminalPtr,
-        screen_key: GhosttyScreenKey,
-        emit: GhosttyFormatterFormat,
-        out_ptr: *mut *mut u8,
-        out_len: *mut usize,
-    ) -> GhosttyResult;
-
     // Memory
     fn ghostty_free(allocator: *const c_void, ptr: *mut u8, len: usize);
 
@@ -778,38 +748,7 @@ extern "C" {
     fn ghostty_style_default(style: *mut GhosttyStyle);
     fn ghostty_style_is_default(style: *const GhosttyStyle) -> bool;
 
-    // ── Binary page transfer (snapshot API) ────────────────────────────
-    fn ghostty_snapshot_page_count(
-        terminal: GhosttyTerminalPtr,
-        screen_key: GhosttyScreenKey,
-        out_count: *mut usize,
-    ) -> GhosttyResult;
-
-    fn ghostty_snapshot_page_info(
-        terminal: GhosttyTerminalPtr,
-        screen_key: GhosttyScreenKey,
-        index: usize,
-        out_info: *mut GhosttyPageInfo,
-    ) -> GhosttyResult;
-
-    fn ghostty_snapshot_page_read(
-        terminal: GhosttyTerminalPtr,
-        screen_key: GhosttyScreenKey,
-        index: usize,
-        buf: *mut u8,
-        buf_len: usize,
-    ) -> GhosttyResult;
-
-    fn ghostty_snapshot_page_load(
-        terminal: GhosttyTerminalPtr,
-        screen_key: GhosttyScreenKey,
-        data: *const u8,
-        data_len: usize,
-        capacity: GhosttyPageCapacity,
-        used_cols: u16,
-        used_rows: u16,
-    ) -> GhosttyResult;
-
+    // ── Opaque terminal snapshot transfer ───────────────────────────────
     fn ghostty_terminal_snapshot_export(
         terminal: GhosttyTerminalPtr,
         allocator: *const c_void,
@@ -822,36 +761,6 @@ extern "C" {
         data: *const u8,
         data_len: usize,
     ) -> GhosttyResult;
-
-    fn ghostty_snapshot_screen_export(
-        terminal: GhosttyTerminalPtr,
-        screen_key: GhosttyScreenKey,
-        allocator: *const c_void,
-        out_ptr: *mut *mut u8,
-        out_len: *mut usize,
-    ) -> GhosttyResult;
-
-    fn ghostty_snapshot_screen_import(
-        terminal: GhosttyTerminalPtr,
-        screen_key: GhosttyScreenKey,
-        data: *const u8,
-        data_len: usize,
-    ) -> GhosttyResult;
-
-    fn ghostty_snapshot_state_export(
-        terminal: GhosttyTerminalPtr,
-        allocator: *const c_void,
-        out_ptr: *mut *mut u8,
-        out_len: *mut usize,
-    ) -> GhosttyResult;
-
-    fn ghostty_snapshot_state_import(
-        terminal: GhosttyTerminalPtr,
-        data: *const u8,
-        data_len: usize,
-    ) -> GhosttyResult;
-
-    fn ghostty_snapshot_state_finalize(terminal: GhosttyTerminalPtr) -> GhosttyResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -1466,34 +1375,6 @@ impl Terminal {
         self.format(GhosttyFormatterFormat::Plain, false, true)
     }
 
-    /// Format a specific screen (primary or alternate) as VT sequences.
-    /// Returns None if the screen is not initialized.
-    pub fn format_screen(&self, key: GhosttyScreenKey) -> Option<Vec<u8>> {
-        let mut out_ptr: *mut u8 = ptr::null_mut();
-        let mut out_len: usize = 0;
-
-        let result = unsafe {
-            ghostty_formatter_screen_alloc(
-                ptr::null(),
-                self.handle,
-                key,
-                GhosttyFormatterFormat::Vt,
-                &mut out_ptr,
-                &mut out_len,
-            )
-        };
-
-        match result {
-            GhosttyResult::Success if !out_ptr.is_null() && out_len > 0 => {
-                let bytes = unsafe { std::slice::from_raw_parts(out_ptr, out_len) }.to_vec();
-                unsafe { ghostty_free(ptr::null(), out_ptr, out_len) };
-                Some(bytes)
-            }
-            GhosttyResult::NoValue => None, // Screen not initialized
-            _ => None,
-        }
-    }
-
     fn format(
         &self,
         emit: GhosttyFormatterFormat,
@@ -1530,79 +1411,9 @@ impl Terminal {
         self.format_with_opts(opts)
     }
 
-    // ── Binary page transfer (snapshot API) ────────────────────────────
-
-    /// Number of pages in the given screen.
-    pub fn page_count(&self, screen_key: GhosttyScreenKey) -> usize {
-        let mut count: usize = 0;
-        let result = unsafe { ghostty_snapshot_page_count(self.handle, screen_key, &mut count) };
-        if result == GhosttyResult::Success {
-            count
-        } else {
-            0
-        }
-    }
-
-    /// Metadata for a page at the given index.
-    pub fn page_info(&self, screen_key: GhosttyScreenKey, index: usize) -> Option<GhosttyPageInfo> {
-        let mut info = unsafe { std::mem::zeroed::<GhosttyPageInfo>() };
-        let result =
-            unsafe { ghostty_snapshot_page_info(self.handle, screen_key, index, &mut info) };
-        if result == GhosttyResult::Success {
-            Some(info)
-        } else {
-            None
-        }
-    }
-
-    /// Read raw page memory into a caller-provided buffer.
-    /// Returns the page data as a Vec, or None on failure.
-    pub fn page_read(
-        &self,
-        screen_key: GhosttyScreenKey,
-        index: usize,
-        size: usize,
-    ) -> Option<Vec<u8>> {
-        let mut buf = vec![0u8; size];
-        let result = unsafe {
-            ghostty_snapshot_page_read(self.handle, screen_key, index, buf.as_mut_ptr(), size)
-        };
-        if result == GhosttyResult::Success {
-            Some(buf)
-        } else {
-            None
-        }
-    }
-
-    /// Load raw page memory into the given screen.
-    pub fn page_load(
-        &mut self,
-        screen_key: GhosttyScreenKey,
-        data: &[u8],
-        capacity: GhosttyPageCapacity,
-        used_cols: u16,
-        used_rows: u16,
-    ) -> Result<(), &'static str> {
-        let result = unsafe {
-            ghostty_snapshot_page_load(
-                self.handle,
-                screen_key,
-                data.as_ptr(),
-                data.len(),
-                capacity,
-                used_cols,
-                used_rows,
-            )
-        };
-        match result {
-            GhosttyResult::Success => Ok(()),
-            _ => Err("ghostty_snapshot_page_load: failed"),
-        }
-    }
+    // ── Opaque terminal snapshot transfer ───────────────────────────────
 
     /// Export the entire terminal state as one opaque blob.
-    /// Includes all initialized screens (pages + cursor + charset + kitty) plus
-    /// terminal-level state (modes, colors, tabstops, etc.).
     pub fn snapshot_export(&self) -> Option<Vec<u8>> {
         let mut ptr: *mut u8 = ptr::null_mut();
         let mut len: usize = 0;
@@ -1619,88 +1430,13 @@ impl Terminal {
     }
 
     /// Import an entire terminal state from an opaque blob produced by
-    /// `snapshot_export()`. Clears existing pages, initializes screens as
-    /// needed, restores all state, and finalizes cursor pins.
+    /// `snapshot_export()`.
     pub fn snapshot_import(&mut self, data: &[u8]) -> Result<(), &'static str> {
-        let result = unsafe {
-            ghostty_terminal_snapshot_import(self.handle, data.as_ptr(), data.len())
-        };
-        match result {
-            GhosttyResult::Success => Ok(()),
-            _ => Err("ghostty_snapshot_terminal_import: failed"),
-        }
-    }
-
-    /// Export an entire screen (pages + cursor/charset/kitty state) as one blob.
-    /// Returns None if the screen is not initialized (e.g. lazy alt screen).
-    pub fn screen_export(&self, screen_key: GhosttyScreenKey) -> Option<Vec<u8>> {
-        let mut ptr: *mut u8 = ptr::null_mut();
-        let mut len: usize = 0;
-        let result = unsafe {
-            ghostty_snapshot_screen_export(
-                self.handle,
-                screen_key,
-                ptr::null(),
-                &mut ptr,
-                &mut len,
-            )
-        };
-        if result == GhosttyResult::Success && !ptr.is_null() && len > 0 {
-            let data = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
-            unsafe { ghostty_free(ptr::null(), ptr, len) };
-            Some(data)
-        } else {
-            None
-        }
-    }
-
-    /// Import a screen blob. Handles alt screen lazy-init, clears existing
-    /// pages before loading, restores cursor state, and finalizes pins.
-    pub fn screen_import(
-        &mut self,
-        screen_key: GhosttyScreenKey,
-        data: &[u8],
-    ) -> Result<(), &'static str> {
-        let result = unsafe {
-            ghostty_snapshot_screen_import(self.handle, screen_key, data.as_ptr(), data.len())
-        };
-        match result {
-            GhosttyResult::Success => Ok(()),
-            _ => Err("ghostty_snapshot_screen_import: failed"),
-        }
-    }
-
-    /// Export all non-page terminal state (modes, cursor, colors, etc.).
-    pub fn state_export(&self) -> Option<Vec<u8>> {
-        let mut ptr: *mut u8 = ptr::null_mut();
-        let mut len: usize = 0;
         let result =
-            unsafe { ghostty_snapshot_state_export(self.handle, ptr::null(), &mut ptr, &mut len) };
-        if result == GhosttyResult::Success && !ptr.is_null() && len > 0 {
-            let data = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
-            unsafe { ghostty_free(ptr::null(), ptr, len) };
-            Some(data)
-        } else {
-            None
-        }
-    }
-
-    /// Import non-page terminal state.
-    pub fn state_import(&mut self, data: &[u8]) -> Result<(), &'static str> {
-        let result =
-            unsafe { ghostty_snapshot_state_import(self.handle, data.as_ptr(), data.len()) };
+            unsafe { ghostty_terminal_snapshot_import(self.handle, data.as_ptr(), data.len()) };
         match result {
             GhosttyResult::Success => Ok(()),
-            _ => Err("ghostty_snapshot_state_import: failed"),
-        }
-    }
-
-    /// Finalize state after page_load + state_import (recomputes derived state).
-    pub fn state_finalize(&mut self) -> Result<(), &'static str> {
-        let result = unsafe { ghostty_snapshot_state_finalize(self.handle) };
-        match result {
-            GhosttyResult::Success => Ok(()),
-            _ => Err("ghostty_snapshot_state_finalize: failed"),
+            _ => Err("ghostty_terminal_snapshot_import: failed"),
         }
     }
 
@@ -2284,6 +2020,70 @@ mod tests {
         let (cols, rows) = rs.dimensions();
         assert_eq!(cols, 80);
         assert_eq!(rows, 24);
+    }
+
+    #[test]
+    fn render_state_re_resolves_palette_backed_cells_after_palette_change() {
+        let mut term = Terminal::new(80, 24, 0).expect("terminal creation failed");
+
+        let mut palette =
+            [GhosttyColorRgb { r: 0, g: 0, b: 0 }; 256];
+        palette[4] = GhosttyColorRgb {
+            r: 0xF0,
+            g: 0xE0,
+            b: 0xD0,
+        };
+        term.set_color_palette(&palette);
+        term.write(b"\x1b[44mX\x1b[0m");
+
+        let mut rs = RenderState::new().expect("render state creation failed");
+        rs.update(&mut term).expect("render state update failed");
+
+        let mut iter = rs.iterator().expect("iterator");
+        assert!(iter.next_row(), "first row");
+        iter.begin_cells();
+        assert!(iter.next_cell(), "first cell");
+        let initial_style = iter.current_cell_style();
+        let initial_bg = iter.current_cell_bg().expect("initial bg");
+
+        assert_eq!(initial_style.bg_color.tag, GhosttyStyleColorTag::Palette);
+        let initial_palette_index = unsafe { initial_style.bg_color.value.palette };
+        assert_eq!(initial_palette_index, 4);
+        assert_eq!(
+            initial_bg,
+            GhosttyColorRgb {
+                r: 0xF0,
+                g: 0xE0,
+                b: 0xD0
+            }
+        );
+
+        palette[4] = GhosttyColorRgb {
+            r: 0x10,
+            g: 0x0F,
+            b: 0x0F,
+        };
+        term.set_color_palette(&palette);
+        rs.update(&mut term).expect("render state update failed");
+
+        let mut iter = rs.iterator().expect("iterator");
+        assert!(iter.next_row(), "first row");
+        iter.begin_cells();
+        assert!(iter.next_cell(), "first cell");
+        let updated_style = iter.current_cell_style();
+        let updated_bg = iter.current_cell_bg().expect("updated bg");
+
+        assert_eq!(updated_style.bg_color.tag, GhosttyStyleColorTag::Palette);
+        let updated_palette_index = unsafe { updated_style.bg_color.value.palette };
+        assert_eq!(updated_palette_index, 4);
+        assert_eq!(
+            updated_bg,
+            GhosttyColorRgb {
+                r: 0x10,
+                g: 0x0F,
+                b: 0x0F
+            }
+        );
     }
 
     #[test]

@@ -66,6 +66,7 @@ fn detect_running_target_dir(current_exe: &Path) -> Option<std::path::PathBuf> {
 impl Hub {
     /// How long a terminal attach intent can stay pending before `not_found`.
     const TERMINAL_ATTACH_NOT_FOUND_TIMEOUT: Duration = Duration::from_secs(10);
+    const RESTTY_FIXTURE_LIVE_CHUNK_LIMIT: usize = 8;
 
     /// Build a single-line preview for ICE candidate logging.
     fn ice_candidate_preview(candidate: &str) -> String {
@@ -79,22 +80,362 @@ impl Hub {
         format!("{truncated}...<truncated,len={char_count}>")
     }
 
-    fn set_active_terminal_peer(&self, session_uuid: &str, peer_id: &str, focused: bool) {
+    fn restty_fixture_dump_dir() -> Option<std::path::PathBuf> {
+        let raw = std::env::var("BOTSTER_DUMP_RESTTY_FIXTURES").ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed == "0"
+            || trimmed.eq_ignore_ascii_case("false")
+            || trimmed.eq_ignore_ascii_case("off")
+        {
+            return None;
+        }
+
+        if trimmed == "1" || trimmed.eq_ignore_ascii_case("true") {
+            return Some(std::env::temp_dir());
+        }
+
+        Some(std::path::PathBuf::from(trimmed))
+    }
+
+    fn restty_fixture_stem(session_uuid: &str) -> String {
+        let sanitized: String = session_uuid
+            .chars()
+            .map(|ch| match ch {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+                _ => '_',
+            })
+            .collect();
+        format!("botster-restty-{sanitized}")
+    }
+
+    fn restty_fixture_preview_hex(data: &[u8]) -> String {
+        const LIMIT: usize = 24;
+        let preview = data
+            .iter()
+            .take(LIMIT)
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join("");
+        if data.len() > LIMIT {
+            format!("{preview}...")
+        } else {
+            preview
+        }
+    }
+
+    fn write_restty_fixture_file(path: &std::path::Path, data: &[u8]) {
+        use std::io::Write;
+
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!(
+                "[ResttyFixture] Failed to create dump dir {}: {}",
+                parent.display(),
+                e
+            );
+            return;
+        }
+
+        match std::fs::File::create(path) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(data) {
+                    log::warn!("[ResttyFixture] Failed to write {}: {}", path.display(), e);
+                }
+            }
+            Err(e) => {
+                log::warn!("[ResttyFixture] Failed to create {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    fn reset_restty_fixture_capture(
+        session_uuid: &str,
+        peer_id: &str,
+        subscription_id: &str,
+        rows: u16,
+        cols: u16,
+        snapshot_len: usize,
+    ) {
+        let Some(dir) = Self::restty_fixture_dump_dir() else {
+            return;
+        };
+
+        let stem = Self::restty_fixture_stem(session_uuid);
+        for index in 1..=Self::RESTTY_FIXTURE_LIVE_CHUNK_LIMIT {
+            let _ = std::fs::remove_file(dir.join(format!("{stem}-live-{index:04}.bin")));
+        }
+
+        let manifest = format!(
+            "session_uuid={session_uuid}\npeer_id={peer_id}\nsubscription_id={subscription_id}\nrows={rows}\ncols={cols}\nsnapshot_len={snapshot_len}\nsnapshot_file={stem}-snapshot.bin\nlive_chunk_files={stem}-live-0001.bin..{stem}-live-{limit:04}.bin\nlive_chunk_format=raw post-snapshot PTY bytes after query filtering, before WebRTC prefix/encryption\n",
+            limit = Self::RESTTY_FIXTURE_LIVE_CHUNK_LIMIT,
+        );
+        let manifest_path = dir.join(format!("{stem}-manifest.txt"));
+        Self::write_restty_fixture_file(&manifest_path, manifest.as_bytes());
+        log::info!(
+            "[ResttyFixture] Reset capture for session {} in {}",
+            session_uuid,
+            dir.display()
+        );
+    }
+
+    fn dump_restty_snapshot_fixture(session_uuid: &str, snapshot: &[u8]) {
+        let Some(dir) = Self::restty_fixture_dump_dir() else {
+            return;
+        };
+
+        let stem = Self::restty_fixture_stem(session_uuid);
+        let path = dir.join(format!("{stem}-snapshot.bin"));
+        Self::write_restty_fixture_file(&path, snapshot);
+        log::info!(
+            "[ResttyFixture] Wrote snapshot fixture {} ({} bytes, hex={})",
+            path.display(),
+            snapshot.len(),
+            Self::restty_fixture_preview_hex(snapshot)
+        );
+    }
+
+    fn dump_restty_live_fixture_chunk(session_uuid: &str, chunk_index: usize, data: &[u8]) {
+        let Some(dir) = Self::restty_fixture_dump_dir() else {
+            return;
+        };
+        if chunk_index >= Self::RESTTY_FIXTURE_LIVE_CHUNK_LIMIT {
+            return;
+        }
+
+        let stem = Self::restty_fixture_stem(session_uuid);
+        let path = dir.join(format!("{stem}-live-{:04}.bin", chunk_index + 1));
+        Self::write_restty_fixture_file(&path, data);
+        log::info!(
+            "[ResttyFixture] Wrote live chunk {} for session {} ({} bytes, hex={})",
+            chunk_index + 1,
+            session_uuid,
+            data.len(),
+            Self::restty_fixture_preview_hex(data)
+        );
+    }
+
+    fn boot_terminal_colors(&self) -> std::collections::HashMap<usize, crate::terminal::Rgb> {
+        self.shared_color_cache
+            .lock()
+            .map(|colors| colors.clone())
+            .unwrap_or_default()
+    }
+
+    fn pick_replacement_terminal_peer(
+        &self,
+        session_uuid: &str,
+        excluding_peer_id: &str,
+    ) -> Option<String> {
+        self.terminal_session_peers
+            .get(session_uuid)
+            .into_iter()
+            .flat_map(|peers| peers.iter())
+            .filter(|peer_id| peer_id.as_str() != excluding_peer_id)
+            .filter(|peer_id| self.terminal_client_profiles.contains_key(*peer_id))
+            .min()
+            .cloned()
+    }
+
+    fn effective_terminal_colors(
+        &self,
+        session_uuid: &str,
+    ) -> std::collections::HashMap<usize, crate::terminal::Rgb> {
+        let active_peer = self
+            .active_terminal_peers
+            .lock()
+            .ok()
+            .and_then(|active| active.get(session_uuid).cloned());
+
+        if let Some(peer_id) = active_peer {
+            if let Some(colors) = self.terminal_client_profiles.get(&peer_id) {
+                return colors.clone();
+            }
+        }
+
+        self.boot_terminal_colors()
+    }
+
+    fn sync_session_terminal_profile(&mut self, session_uuid: &str) {
+        let Some(session_handle) = self.handle_cache.get_session(session_uuid) else {
+            return;
+        };
+
+        let colors = self.effective_terminal_colors(session_uuid);
+        if colors.is_empty() {
+            return;
+        }
+
+        log::debug!(
+            "[PTY-PROFILE] syncing session profile session={} colors={} active_peer={:?}",
+            &session_uuid[..session_uuid.len().min(16)],
+            colors.len(),
+            self.active_terminal_peers
+                .lock()
+                .ok()
+                .and_then(|active| active.get(session_uuid).cloned())
+        );
+
+        if let Err(error) = session_handle.pty().set_color_profile(&colors) {
+            log::warn!(
+                "[PTY-PROFILE] Failed to sync session {} color profile: {}",
+                &session_uuid[..session_uuid.len().min(16)],
+                error
+            );
+        }
+    }
+
+    fn sync_active_sessions_for_terminal_peer(&mut self, peer_id: &str) {
+        let session_ids: Vec<String> = self
+            .active_terminal_peers
+            .lock()
+            .ok()
+            .into_iter()
+            .flat_map(|active| {
+                active
+                    .iter()
+                    .filter_map(|(session_uuid, active_peer)| {
+                        (active_peer == peer_id).then(|| session_uuid.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for session_uuid in session_ids {
+            self.sync_session_terminal_profile(&session_uuid);
+        }
+    }
+
+    fn update_terminal_client_profile(
+        &mut self,
+        peer_id: &str,
+        colors: std::collections::HashMap<usize, crate::terminal::Rgb>,
+    ) {
+        self.terminal_client_profiles
+            .insert(peer_id.to_string(), colors);
+        self.sync_active_sessions_for_terminal_peer(peer_id);
+    }
+
+    fn register_terminal_forwarder_peer(
+        &mut self,
+        forwarder_id: &str,
+        session_uuid: &str,
+        peer_id: &str,
+    ) {
+        self.terminal_forwarder_peers.insert(
+            forwarder_id.to_string(),
+            (session_uuid.to_string(), peer_id.to_string()),
+        );
+        self.terminal_session_peers
+            .entry(session_uuid.to_string())
+            .or_default()
+            .insert(peer_id.to_string());
+    }
+
+    fn unregister_terminal_forwarder_peer(&mut self, forwarder_id: &str, promote_next: bool) {
+        let Some((session_uuid, peer_id)) = self.terminal_forwarder_peers.remove(forwarder_id)
+        else {
+            return;
+        };
+
+        let mut remove_session_entry = false;
+        if let Some(peers) = self.terminal_session_peers.get_mut(&session_uuid) {
+            peers.remove(&peer_id);
+            remove_session_entry = peers.is_empty();
+        }
+        if remove_session_entry {
+            self.terminal_session_peers.remove(&session_uuid);
+        }
+
+        let mut should_sync = false;
+        if let Ok(mut active) = self.active_terminal_peers.lock() {
+            if active
+                .get(&session_uuid)
+                .is_some_and(|current| current == &peer_id)
+            {
+                active.remove(&session_uuid);
+                if promote_next {
+                    if let Some(next_peer) =
+                        self.pick_replacement_terminal_peer(&session_uuid, &peer_id)
+                    {
+                        active.insert(session_uuid.clone(), next_peer);
+                    }
+                }
+                should_sync = true;
+            }
+        }
+
+        if should_sync {
+            self.sync_session_terminal_profile(&session_uuid);
+        }
+    }
+
+    fn unregister_terminal_client_peer(&mut self, peer_id: &str, promote_next: bool) {
+        self.terminal_client_profiles.remove(peer_id);
+
+        let forwarder_ids: Vec<String> = self
+            .terminal_forwarder_peers
+            .iter()
+            .filter_map(|(forwarder_id, (_, owner_peer))| {
+                (owner_peer == peer_id).then(|| forwarder_id.clone())
+            })
+            .collect();
+
+        for forwarder_id in forwarder_ids {
+            self.unregister_terminal_forwarder_peer(&forwarder_id, promote_next);
+        }
+    }
+
+    fn handle_terminal_color_profile_message(
+        &mut self,
+        peer_id: &str,
+        msg: &serde_json::Value,
+    ) -> bool {
+        if msg.get("type").and_then(|value| value.as_str()) != Some("terminal_color_profile") {
+            return false;
+        }
+
+        let colors: std::collections::HashMap<usize, crate::terminal::Rgb> = msg
+            .get("colors")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let session_uuid = msg
+            .get("session_uuid")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        let bg = colors.get(&257usize).copied();
+        log::debug!(
+            "[PTY-PROFILE] learned client profile peer={} session={} colors={} bg={:?}",
+            peer_id,
+            session_uuid,
+            colors.len(),
+            bg
+        );
+        self.update_terminal_client_profile(peer_id, colors);
+        true
+    }
+
+    fn set_active_terminal_peer(&mut self, session_uuid: &str, peer_id: &str, focused: bool) {
         let Ok(mut active) = self.active_terminal_peers.lock() else {
             return;
         };
 
         if focused {
             active.insert(session_uuid.to_string(), peer_id.to_string());
-            return;
-        }
-
-        if active
+        } else if active
             .get(session_uuid)
             .is_some_and(|current| current == peer_id)
         {
             active.remove(session_uuid);
+        } else {
+            return;
         }
+
+        drop(active);
+        self.sync_session_terminal_profile(session_uuid);
     }
 
     fn learn_terminal_probe_replies(&mut self, session_uuid: &str, peer_id: &str, data: &[u8]) {
@@ -109,8 +450,6 @@ impl Hub {
         }
         self.terminal_profiles
             .observe_input(session_uuid, peer_id, data);
-        self.terminal_profiles
-            .refresh_shared_color_cache(&self.shared_color_cache);
     }
 
     /// Legacy polling entrypoint — calls all poll functions + flush.
@@ -485,9 +824,7 @@ impl Hub {
                 if let Some(conn) = self.socket_clients.remove(&client_id) {
                     conn.disconnect();
                 }
-                if let Ok(mut active) = self.active_terminal_peers.lock() {
-                    active.retain(|_, peer_id| peer_id != &client_id);
-                }
+                self.unregister_terminal_client_peer(&client_id, true);
                 let client_prefix = format!("{client_id}:");
                 self.pty_forwarders.retain(|key, task| {
                     if key.starts_with(&client_prefix) {
@@ -524,6 +861,8 @@ impl Hub {
                         self.set_active_terminal_peer(session_uuid, &client_id, focused);
                         self.lua.set_pty_focused(session_uuid, &client_id, focused);
                     }
+                } else if self.handle_terminal_color_profile_message(&client_id, &msg) {
+                    // Handled above — do not route client profile updates through Lua.
                 } else if let Err(e) = self.lua.call_socket_message(&client_id, msg) {
                     log::error!("[Socket] Lua message handling error for {}: {e}", client_id);
                 }
@@ -540,9 +879,6 @@ impl Hub {
                     self.set_active_terminal_peer(&session_uuid, &client_id, false);
                     self.lua.set_pty_focused(&session_uuid, &client_id, false);
                 }
-                self.terminal_profiles.observe_peer_input(&client_id, &data);
-                self.terminal_profiles
-                    .refresh_shared_color_cache(&self.shared_color_cache);
                 self.learn_terminal_probe_replies(&session_uuid, &client_id, &data);
                 self.lua.notify_pty_input(&session_uuid);
 
@@ -741,88 +1077,8 @@ impl Hub {
                             }
                         });
                     }
-                    HubRequest::HandleWebrtcOffer {
-                        browser_identity,
-                        sdp,
-                    } => {
-                        log::info!(
-                            "[Lua] Processing WebRTC offer from {}",
-                            &browser_identity[..browser_identity.len().min(8)]
-                        );
-                        self.handle_webrtc_offer(&sdp, &browser_identity);
-                    }
-                    HubRequest::HandleIceCandidate {
-                        browser_identity,
-                        candidate,
-                    } => {
-                        const MAX_QUEUED_ICE_PER_BROWSER: usize = 128;
-                        let candidate_str = candidate
-                            .get("candidate")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("");
-                        if candidate_str.is_empty() {
-                            // Browser "end-of-candidates" marker. Not an ICE candidate.
-                            log::debug!(
-                                "[Lua] Ignoring empty ICE candidate for {}",
-                                &browser_identity[..browser_identity.len().min(8)]
-                            );
-                            return;
-                        }
-                        let sdp_mid = candidate.get("sdpMid").and_then(|m| m.as_str());
-                        let sdp_mline_index = candidate
-                            .get("sdpMLineIndex")
-                            .and_then(|i| i.as_u64())
-                            .map(|i| i as u16);
-
-                        if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
-                            if let Err(e) = tokio::task::block_in_place(|| {
-                                self.tokio_runtime.block_on(channel.handle_ice_candidate(
-                                    candidate_str,
-                                    sdp_mid,
-                                    sdp_mline_index,
-                                ))
-                            }) {
-                                log::warn!(
-                                    "[Lua] Failed to add ICE candidate for {}: {} (mid={:?}, mline={:?}, candidate='{}')",
-                                    &browser_identity[..browser_identity.len().min(8)],
-                                    e,
-                                    sdp_mid,
-                                    sdp_mline_index,
-                                    Self::ice_candidate_preview(candidate_str),
-                                );
-                            }
-                        } else if self.webrtc_offer_generation.contains_key(&browser_identity) {
-                            let current_generation = self
-                                .webrtc_offer_generation
-                                .get(&browser_identity)
-                                .copied()
-                                .unwrap_or(0);
-                            let queue = self
-                                .webrtc_pending_ice_candidates
-                                .entry(browser_identity.clone())
-                                .or_default();
-                            queue.push((current_generation, candidate));
-                            if queue.len() > MAX_QUEUED_ICE_PER_BROWSER {
-                                let dropped = queue.len() - MAX_QUEUED_ICE_PER_BROWSER;
-                                queue.drain(..dropped);
-                            }
-                            log::debug!(
-                                "[Lua] Queued ICE candidate while offer in flight for {} (queued={})",
-                                &browser_identity[..browser_identity.len().min(8)],
-                                queue.len()
-                            );
-                        } else {
-                            log::warn!(
-                                "[Lua] ICE candidate for unknown browser {}",
-                                &browser_identity[..browser_identity.len().min(8)]
-                            );
-                        }
-                    }
-                    HubRequest::RatchetRestart { browser_identity } => {
-                        self.try_ratchet_restart(&browser_identity);
-                    }
-                    HubRequest::SendFreshBundle { browser_identity } => {
-                        self.send_ratchet_restart(&browser_identity);
+                    HubRequest::HandleSignalingMessage { message } => {
+                        self.handle_signaling_message(message);
                     }
                 }
             }
@@ -991,6 +1247,9 @@ impl Hub {
 
             HubEvent::SessionUnregistered { session_uuid } => {
                 self.terminal_profiles.clear_session(&session_uuid);
+                self.terminal_session_peers.remove(&session_uuid);
+                self.terminal_forwarder_peers
+                    .retain(|_, (tracked_session, _)| tracked_session != &session_uuid);
                 if let Ok(mut active) = self.active_terminal_peers.lock() {
                     active.remove(&session_uuid);
                 }
@@ -1115,13 +1374,7 @@ impl Hub {
 
                 let envelope_value =
                     encrypted_answer.expect("encrypted_answer checked above to be present");
-                let data = serde_json::json!({
-                    "browser_identity": browser_identity,
-                    "envelope": envelope_value,
-                });
-                if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
-                    log::error!("[WebRTC] Failed to fire outgoing_signal for answer: {e}");
-                } else {
+                if self.emit_outgoing_signal(&browser_identity, envelope_value, "answer") {
                     log::info!("[WebRTC] Encrypted answer sent via Lua relay (async)");
                 }
             }
@@ -1137,6 +1390,9 @@ impl Hub {
         use crate::client::TuiRequest;
         match request {
             TuiRequest::LuaMessage(msg) => {
+                if self.handle_terminal_color_profile_message("tui", &msg) {
+                    return;
+                }
                 if let Err(e) = self.lua.call_tui_message(msg) {
                     log::error!("[TUI] Lua message handling error: {}", e);
                 }
@@ -1149,7 +1405,6 @@ impl Hub {
                 self.lua.set_pty_focused(&session_uuid, "tui", focused);
             }
             TuiRequest::PtyInput { session_uuid, data } => {
-                self.learn_terminal_probe_replies(&session_uuid, "tui", &data);
                 self.lua.notify_pty_input(&session_uuid);
                 if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
                     if let Err(e) = session_handle.pty().write_input_direct(&data) {
@@ -1177,10 +1432,6 @@ impl Hub {
             self.lua
                 .set_pty_focused(&input.session_uuid, &input.browser_identity, false);
         }
-        self.terminal_profiles
-            .observe_peer_input(&input.browser_identity, &input.data);
-        self.terminal_profiles
-            .refresh_shared_color_cache(&self.shared_color_cache);
         self.learn_terminal_probe_replies(
             &input.session_uuid,
             &input.browser_identity,
@@ -1285,18 +1536,182 @@ impl Hub {
                 browser_identity,
                 envelope,
             } => {
-                let data = serde_json::json!({
-                    "browser_identity": browser_identity,
-                    "envelope": envelope,
-                });
-                if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
-                    log::error!("Failed to fire outgoing_signal event: {e}");
-                }
+                self.emit_outgoing_signal(&browser_identity, envelope, "ICE candidate");
                 log::debug!(
                     "[Crypto] Relayed ICE candidate to browser {}",
                     &browser_identity[..browser_identity.len().min(8)]
                 );
             }
+        }
+    }
+
+    fn emit_outgoing_signal(
+        &self,
+        browser_identity: &str,
+        envelope: serde_json::Value,
+        signal_kind: &str,
+    ) -> bool {
+        let data = serde_json::json!({
+            "browser_identity": browser_identity,
+            "envelope": envelope,
+        });
+        if let Err(error) = self.lua.fire_json_event("outgoing_signal", &data) {
+            log::error!("[WebRTC] Failed to fire outgoing_signal for {signal_kind}: {error}");
+            return false;
+        }
+        true
+    }
+
+    fn handle_signaling_message(&mut self, message: serde_json::Value) {
+        let msg_type = message.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let browser_identity = message
+            .get("browser_identity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        match msg_type {
+            "signal" => {
+                if browser_identity.is_empty() {
+                    log::warn!("[Lua] Signal message missing browser_identity");
+                    return;
+                }
+
+                if message
+                    .get("decrypt_failed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    log::warn!(
+                        "Signal decryption failed for browser {}, requesting ratchet restart",
+                        browser_identity
+                    );
+                    self.try_ratchet_restart(browser_identity);
+                    return;
+                }
+
+                let Some(signal_data) = message.get("envelope") else {
+                    log::warn!(
+                        "[Lua] Signal message missing envelope for {}",
+                        &browser_identity[..browser_identity.len().min(8)]
+                    );
+                    return;
+                };
+                let signal_type = signal_data
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                match signal_type {
+                    "offer" => {
+                        let Some(sdp) = signal_data.get("sdp").and_then(|v| v.as_str()) else {
+                            log::warn!(
+                                "[Lua] Offer missing sdp for {}",
+                                &browser_identity[..browser_identity.len().min(8)]
+                            );
+                            return;
+                        };
+                        log::info!(
+                            "[Lua] Processing WebRTC offer from {}",
+                            &browser_identity[..browser_identity.len().min(8)]
+                        );
+                        self.handle_webrtc_offer(sdp, browser_identity);
+                    }
+                    "ice" => {
+                        let candidate = signal_data
+                            .get("candidate")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        self.handle_browser_ice_candidate(browser_identity, candidate);
+                    }
+                    other => {
+                        log::warn!(
+                            "[Lua] Unknown signal type for {}: {}",
+                            &browser_identity[..browser_identity.len().min(8)],
+                            other
+                        );
+                    }
+                }
+            }
+            "bundle_request" => {
+                if browser_identity.is_empty() {
+                    log::warn!("[Lua] bundle_request missing browser_identity");
+                    return;
+                }
+                self.send_ratchet_restart(browser_identity);
+            }
+            other => {
+                log::warn!("[Lua] Unsupported signaling message type: {}", other);
+            }
+        }
+    }
+
+    fn handle_browser_ice_candidate(
+        &mut self,
+        browser_identity: &str,
+        candidate: serde_json::Value,
+    ) {
+        const MAX_QUEUED_ICE_PER_BROWSER: usize = 128;
+
+        let candidate_str = candidate
+            .get("candidate")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        if candidate_str.is_empty() {
+            log::debug!(
+                "[Lua] Ignoring empty ICE candidate for {}",
+                &browser_identity[..browser_identity.len().min(8)]
+            );
+            return;
+        }
+
+        let sdp_mid = candidate.get("sdpMid").and_then(|m| m.as_str());
+        let sdp_mline_index = candidate
+            .get("sdpMLineIndex")
+            .and_then(|i| i.as_u64())
+            .map(|i| i as u16);
+
+        if let Some(channel) = self.webrtc_channels.get(browser_identity) {
+            if let Err(error) = tokio::task::block_in_place(|| {
+                self.tokio_runtime.block_on(channel.handle_ice_candidate(
+                    candidate_str,
+                    sdp_mid,
+                    sdp_mline_index,
+                ))
+            }) {
+                log::warn!(
+                    "[Lua] Failed to add ICE candidate for {}: {} (mid={:?}, mline={:?}, candidate='{}')",
+                    &browser_identity[..browser_identity.len().min(8)],
+                    error,
+                    sdp_mid,
+                    sdp_mline_index,
+                    Self::ice_candidate_preview(candidate_str),
+                );
+            }
+        } else if self.webrtc_offer_generation.contains_key(browser_identity) {
+            let current_generation = self
+                .webrtc_offer_generation
+                .get(browser_identity)
+                .copied()
+                .unwrap_or(0);
+            let queue = self
+                .webrtc_pending_ice_candidates
+                .entry(browser_identity.to_string())
+                .or_default();
+            queue.push((current_generation, candidate));
+            if queue.len() > MAX_QUEUED_ICE_PER_BROWSER {
+                let dropped = queue.len() - MAX_QUEUED_ICE_PER_BROWSER;
+                queue.drain(..dropped);
+            }
+            log::debug!(
+                "[Lua] Queued ICE candidate while offer in flight for {} (queued={})",
+                &browser_identity[..browser_identity.len().min(8)],
+                queue.len()
+            );
+        } else {
+            log::warn!(
+                "[Lua] ICE candidate for unknown browser {}",
+                &browser_identity[..browser_identity.len().min(8)]
+            );
         }
     }
 
@@ -1694,13 +2109,7 @@ impl Hub {
             "b": base64::engine::general_purpose::STANDARD_NO_PAD
                 .encode(&bundle_bytes),
         });
-        let data = serde_json::json!({
-            "browser_identity": browser_identity,
-            "envelope": envelope,
-        });
-        if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
-            log::warn!("[RatchetRestart] Failed to send bundle refresh via AC: {e}");
-        }
+        self.emit_outgoing_signal(&browser_identity, envelope, "bundle refresh");
 
         log::info!(
             "[RatchetRestart] Sent fresh bundle to {}",
@@ -1875,9 +2284,7 @@ impl Hub {
                 true
             }
         });
-        if let Ok(mut active) = self.active_terminal_peers.lock() {
-            active.retain(|_, peer_id| peer_id != browser_identity);
-        }
+        self.unregister_terminal_client_peer(browser_identity, true);
 
         // Notify Lua of peer disconnection (Lua handles subscription cleanup)
         if let Err(e) = self.lua.call_peer_disconnected(browser_identity) {
@@ -2532,6 +2939,7 @@ impl Hub {
         // Abort any existing forwarder for this key.
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
+            self.unregister_terminal_forwarder_peer(&forwarder_key, false);
             log::debug!("[Lua] Aborted existing PTY forwarder for {}", forwarder_key);
         }
 
@@ -2564,6 +2972,7 @@ impl Hub {
                 session_uuid
             );
             let mut query_filter_buffer = Vec::new();
+            let mut dumped_live_chunks = 0usize;
 
             let (snapshot, mut pty_rx) = match tokio::task::spawn_blocking(move || {
                 if pty_for_snapshot.is_session_backed() {
@@ -2611,6 +3020,18 @@ impl Hub {
                 snapshot.len()
             );
 
+            Self::reset_restty_fixture_capture(
+                &session_uuid,
+                &peer_id,
+                &subscription_id,
+                target_rows,
+                target_cols,
+                snapshot.len(),
+            );
+            if !snapshot.is_empty() {
+                Self::dump_restty_snapshot_fixture(&session_uuid, &snapshot);
+            }
+
             if !Self::queue_webrtc_terminal_snapshot(
                 &output_tx,
                 &hub_event_tx,
@@ -2653,6 +3074,15 @@ impl Hub {
 
                         if filtered.is_empty() {
                             continue;
+                        }
+
+                        if dumped_live_chunks < Self::RESTTY_FIXTURE_LIVE_CHUNK_LIMIT {
+                            Self::dump_restty_live_fixture_chunk(
+                                &session_uuid,
+                                dumped_live_chunks,
+                                &filtered,
+                            );
+                            dumped_live_chunks += 1;
                         }
 
                         // Send raw bytes with prefix.
@@ -2723,6 +3153,7 @@ impl Hub {
             );
         });
 
+        self.register_terminal_forwarder_peer(&forwarder_key, &req.session_uuid, &req.peer_id);
         self.pty_forwarders.insert(forwarder_key, task);
         true
     }
@@ -3156,13 +3587,14 @@ impl Hub {
 
         let pty_handle = session_handle.pty().clone();
 
-        let Some(ref output_tx) = self.tui_output_tx else {
+        let Some(output_tx) = self.tui_output_tx.clone() else {
             return false;
         };
 
         // Abort any existing forwarder for this key
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
+            self.unregister_terminal_forwarder_peer(&forwarder_key, false);
             log::debug!(
                 "[Lua-TUI] Aborted existing PTY forwarder for {}",
                 forwarder_key
@@ -3173,7 +3605,7 @@ impl Hub {
         // the forwarder task so this handler never blocks the Hub event loop.
         let pty_for_snapshot = pty_handle.clone();
 
-        let sink = output_tx.clone();
+        let sink = output_tx;
         let session_uuid = req.session_uuid.clone();
         let target_rows = req.rows;
         let target_cols = req.cols;
@@ -3237,6 +3669,24 @@ impl Hub {
                 session_uuid,
                 snapshot.len()
             );
+
+            if snapshot.is_empty()
+                && pty_handle.is_session_backed()
+                && !pty_handle.session_connection_alive()
+            {
+                log::warn!(
+                    "[Lua-TUI] Session RPC died before snapshot for {}; sending ProcessExited instead of empty scrollback",
+                    session_uuid
+                );
+                let _ = sink.send(TuiOutput::ProcessExited {
+                    session_uuid: session_uuid.clone(),
+                    exit_code: None,
+                });
+                if let Some(fd) = wake_fd {
+                    super::wake_tui_pipe(fd);
+                }
+                return;
+            }
 
             // Always send a scrollback frame (even empty) so the TUI panel
             // can transition out of Connecting and begin live streaming.
@@ -3424,6 +3874,7 @@ impl Hub {
             );
         });
 
+        self.register_terminal_forwarder_peer(&forwarder_key, &req.session_uuid, "tui");
         self.pty_forwarders.insert(forwarder_key, task);
         true
     }
@@ -3465,13 +3916,18 @@ impl Hub {
 
         let pty_handle = session_handle.pty().clone();
 
-        let Some(conn) = self.socket_clients.get(&req.client_id) else {
+        let Some(frame_tx) = self
+            .socket_clients
+            .get(&req.client_id)
+            .map(crate::socket::client_conn::SocketClientConn::frame_sender)
+        else {
             return false;
         };
 
         // Abort any existing forwarder for this key
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
+            self.unregister_terminal_forwarder_peer(&forwarder_key, false);
             log::debug!(
                 "[Lua-Socket] Aborted existing PTY forwarder for {}",
                 forwarder_key
@@ -3484,8 +3940,6 @@ impl Hub {
         // the forwarder task so this handler never blocks the Hub event loop.
         let pty_for_snapshot = pty_handle.clone();
 
-        // Clone the frame sender from the connection — we only need to send encoded frames.
-        let frame_tx = conn.frame_sender();
         let session_uuid = req.session_uuid.clone();
         let target_rows = req.rows;
         let target_cols = req.cols;
@@ -3555,6 +4009,23 @@ impl Hub {
                 session_uuid,
                 snapshot.len()
             );
+
+            if snapshot.is_empty()
+                && pty_handle.is_session_backed()
+                && !pty_handle.session_connection_alive()
+            {
+                log::warn!(
+                    "[Lua-Socket] Session RPC died before snapshot for {} session {}; sending ProcessExited instead of empty scrollback",
+                    client_id,
+                    session_uuid
+                );
+                let frame = Frame::ProcessExited {
+                    session_uuid: session_uuid.clone(),
+                    exit_code: None,
+                };
+                let _ = frame_tx.try_send(frame.encode());
+                return;
+            }
 
             // Always send a scrollback frame (even empty) so clients can
             // deterministically leave connecting state after subscribe.
@@ -3702,6 +4173,7 @@ impl Hub {
             );
         });
 
+        self.register_terminal_forwarder_peer(&forwarder_key, &req.session_uuid, &req.client_id);
         self.pty_forwarders.insert(forwarder_key, task);
         true
     }
@@ -3713,6 +4185,7 @@ impl Hub {
         }
         if let Some(task) = self.pty_forwarders.remove(forwarder_id) {
             task.abort();
+            self.unregister_terminal_forwarder_peer(forwarder_id, true);
             log::debug!("[Lua] Stopped PTY forwarder {}", forwarder_id);
         }
     }
@@ -4224,28 +4697,7 @@ impl Hub {
         let requests: Vec<TuiRequest> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
 
         for request in requests {
-            match request {
-                TuiRequest::LuaMessage(msg) => {
-                    if let Err(e) = self.lua.call_tui_message(msg) {
-                        log::error!("[TUI] Lua message handling error: {}", e);
-                    }
-                }
-                TuiRequest::FocusChanged {
-                    session_uuid,
-                    focused,
-                } => {
-                    self.lua.set_pty_focused(&session_uuid, "tui", focused);
-                }
-                TuiRequest::PtyInput { session_uuid, data } => {
-                    if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
-                        if let Err(e) = session_handle.pty().write_input_direct(&data) {
-                            log::error!("[PTY-INPUT] Write failed: {e}");
-                        }
-                    } else {
-                        log::warn!("[PTY-INPUT] No session for UUID {}", session_uuid);
-                    }
-                }
-            }
+            self.handle_tui_request(request);
         }
     }
 
@@ -4267,13 +4719,7 @@ impl Hub {
                     browser_identity,
                     envelope,
                 } => {
-                    let data = serde_json::json!({
-                        "browser_identity": browser_identity,
-                        "envelope": envelope,
-                    });
-                    if let Err(e) = self.lua.fire_json_event("outgoing_signal", &data) {
-                        log::error!("Failed to fire outgoing_signal event: {e}");
-                    }
+                    self.emit_outgoing_signal(&browser_identity, envelope, "ICE candidate");
                     log::debug!(
                         "[Crypto] Relayed ICE candidate to browser {}",
                         &browser_identity[..browser_identity.len().min(8)]
@@ -5760,6 +6206,28 @@ mod tests {
             .expect("active peers mutex")
             .get(session_uuid)
             .is_none());
+    }
+
+    #[test]
+    fn test_tui_terminal_color_profile_updates_client_cache() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+
+        let mut colors = std::collections::HashMap::new();
+        colors.insert(257usize, crate::terminal::Rgb::new(17, 34, 51));
+
+        hub.handle_tui_request(TuiRequest::LuaMessage(serde_json::json!({
+            "type": "terminal_color_profile",
+            "session_uuid": "sess-color-profile",
+            "colors": colors,
+        })));
+
+        assert_eq!(
+            hub.terminal_client_profiles
+                .get("tui")
+                .and_then(|colors| colors.get(&257usize))
+                .copied(),
+            Some(crate::terminal::Rgb::new(17, 34, 51))
+        );
     }
 
     // test_backpressure_recovery_fetches_snapshot removed during the migration.

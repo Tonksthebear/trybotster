@@ -178,88 +178,82 @@ fn build_ghostty_vt() {
     let ghostty_dir = Path::new("vendor/ghostty");
     let out_dir = env::var("OUT_DIR").unwrap();
     let repacked_lib = Path::new(&out_dir).join("libghostty-vt.a");
+    let zig_lib_path = ghostty_dir.join("zig-out/lib/libghostty-vt.a");
 
-    // Only rebuild if the repacked library doesn't exist yet. The zig build
-    // takes ~30s and the vendored source rarely changes. Force a rebuild by
-    // deleting the target dir or touching build.rs.
-    if !repacked_lib.exists() {
-        let zig_lib_path = ghostty_dir.join("zig-out/lib/libghostty-vt.a");
+    let status = Command::new("mise")
+        .args([
+            "exec",
+            "--",
+            "zig",
+            "build",
+            "-Demit-lib-vt",
+            "-Doptimize=ReleaseFast",
+            "-Dsimd=false",
+        ])
+        .current_dir(ghostty_dir)
+        .env("DEVELOPER_DIR", "/Library/Developer/CommandLineTools")
+        .status()
+        .expect("failed to run `mise exec -- zig build` — is mise installed with zig?");
 
-        if !zig_lib_path.exists() {
-            let status = Command::new("mise")
-                .args([
-                    "exec",
-                    "--",
-                    "zig",
-                    "build",
-                    "-Demit-lib-vt",
-                    "-Doptimize=ReleaseFast",
-                    "-Dsimd=false",
-                ])
-                .current_dir(ghostty_dir)
-                .env("DEVELOPER_DIR", "/Library/Developer/CommandLineTools")
-                .status()
-                .expect("failed to run `mise exec -- zig build` — is mise installed with zig?");
+    assert!(
+        status.success(),
+        "zig build -Demit-lib-vt failed with exit code {:?}",
+        status.code()
+    );
 
-            assert!(
-                status.success(),
-                "zig build -Demit-lib-vt failed with exit code {:?}",
-                status.code()
-            );
+    assert!(
+        zig_lib_path.exists(),
+        "zig build succeeded but {} not found",
+        zig_lib_path.display()
+    );
 
-            assert!(
-                zig_lib_path.exists(),
-                "zig build succeeded but {} not found",
-                zig_lib_path.display()
-            );
-        }
+    // Zig's archive has misaligned members that macOS ld rejects
+    // ("not 8-byte aligned"). Extract objects and repack with `ar` to
+    // fix alignment. (libtool -static strips the main object with zig 0.15.)
+    let tmp_dir = Path::new(&out_dir).join("ghostty-repack");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let _ = std::fs::remove_file(&repacked_lib);
 
-        // Zig's archive has misaligned members that macOS ld rejects
-        // ("not 8-byte aligned"). Extract objects and repack with `ar` to
-        // fix alignment. (libtool -static strips the main object with zig 0.15.)
-        let tmp_dir = Path::new(&out_dir).join("ghostty-repack");
-        let _ = std::fs::create_dir_all(&tmp_dir);
+    // Extract .o files from the zig archive (use canonical path since
+    // current_dir is set to the temp extraction directory).
+    let zig_lib_abs = std::fs::canonicalize(&zig_lib_path)
+        .unwrap_or_else(|_| panic!("{} not found", zig_lib_path.display()));
+    let status = Command::new("ar")
+        .args(["x", &zig_lib_abs.to_string_lossy()])
+        .current_dir(&tmp_dir)
+        .status()
+        .expect("failed to run `ar x`");
+    assert!(status.success(), "ar x failed");
 
-        // Extract .o files from the zig archive (use canonical path since
-        // current_dir is set to the temp extraction directory).
-        let zig_lib_abs = std::fs::canonicalize(&zig_lib_path)
-            .unwrap_or_else(|_| panic!("{} not found", zig_lib_path.display()));
-        let status = Command::new("ar")
-            .args(["x", &zig_lib_abs.to_string_lossy()])
-            .current_dir(&tmp_dir)
-            .status()
-            .expect("failed to run `ar x`");
-        assert!(status.success(), "ar x failed");
+    // Collect all .o files and fix permissions (zig's ar extracts with 0000 mode)
+    let mut objects: Vec<_> = std::fs::read_dir(&tmp_dir)
+        .expect("read repack dir")
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            if p.extension().is_some_and(|ext| ext == "o") {
+                // Fix permissions — zig archives extract with mode 0000
+                #[cfg(unix)]
+                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o644));
+                Some(p)
+            } else {
+                None
+            }
+        })
+        .collect();
+    objects.sort();
 
-        // Collect all .o files and fix permissions (zig's ar extracts with 0000 mode)
-        let mut objects: Vec<_> = std::fs::read_dir(&tmp_dir)
-            .expect("read repack dir")
-            .filter_map(|e| {
-                let p = e.ok()?.path();
-                if p.extension().is_some_and(|ext| ext == "o") {
-                    // Fix permissions — zig archives extract with mode 0000
-                    #[cfg(unix)]
-                    let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o644));
-                    Some(p)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        objects.sort();
-
-        // Repack with ar (produces properly aligned archive)
-        let mut ar_cmd = Command::new("ar");
-        ar_cmd.args(["rcs"]).arg(&repacked_lib);
-        for obj in &objects {
-            ar_cmd.arg(obj);
-        }
-        let status = ar_cmd.status().expect("failed to run `ar rcs`");
-        assert!(status.success(), "ar rcs repack failed");
-
-        // Clean up temp dir
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+    // Repack with ar (produces properly aligned archive)
+    let mut ar_cmd = Command::new("ar");
+    ar_cmd.args(["rcs"]).arg(&repacked_lib);
+    for obj in &objects {
+        ar_cmd.arg(obj);
     }
+    let status = ar_cmd.status().expect("failed to run `ar rcs`");
+    assert!(status.success(), "ar rcs repack failed");
+
+    // Clean up temp dir
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 
     println!("cargo:rustc-link-search=native={}", out_dir);
     println!("cargo:rustc-link-lib=static=ghostty-vt");

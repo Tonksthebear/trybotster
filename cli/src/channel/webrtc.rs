@@ -991,22 +991,24 @@ impl WebRtcChannel {
 
         // Parse the candidate SDP string (browser sends "candidate:..." format)
         let sdp_str = candidate.trim_start_matches("candidate:");
-        let ice_candidate = match IceCandidate::from_sdp(sdp_str) {
+        let normalized_sdp = Self::normalize_candidate_sdp(sdp_str).await;
+        let candidate_for_parse = normalized_sdp.as_deref().unwrap_or(sdp_str);
+
+        let ice_candidate = match IceCandidate::from_sdp(candidate_for_parse) {
             Ok(parsed) => parsed,
             Err(parse_err) => {
-                // Retry with hostname->IP rewrite for mDNS host candidates
-                // (e.g. "xxxx.local"), which some parsers reject.
-                if let Some(rewritten) = Self::rewrite_hostname_candidate_to_ip(sdp_str).await {
-                    match IceCandidate::from_sdp(&rewritten) {
+                // Retry the original SDP if a proactive rewrite made parsing worse.
+                if normalized_sdp.is_some() {
+                    match IceCandidate::from_sdp(sdp_str) {
                         Ok(parsed) => {
                             log::debug!(
-                                "[WebRTC] Rewrote hostname ICE candidate to IP for parser compatibility"
+                                "[WebRTC] Falling back to original hostname ICE candidate after rewritten parse failure"
                             );
                             parsed
                         }
-                        Err(rewrite_err) => {
+                        Err(original_err) => {
                             return Err(ChannelError::ConnectionFailed(format!(
-                                "Failed to parse ICE candidate: {parse_err}; rewrite parse failed: {rewrite_err}"
+                                "Failed to parse ICE candidate: rewritten={parse_err}; original={original_err}"
                             )));
                         }
                     }
@@ -1023,6 +1025,15 @@ impl WebRtcChannel {
         })?;
 
         Ok(())
+    }
+
+    /// Normalize an ICE candidate SDP string before passing it into rustrtc.
+    ///
+    /// Chrome can emit mDNS host candidates (`*.local`) for privacy. Those are
+    /// fine in browser-to-browser flows, but the Rust side needs a numeric IP
+    /// candidate to guarantee parser and transport compatibility.
+    async fn normalize_candidate_sdp(candidate_sdp: &str) -> Option<String> {
+        Self::rewrite_hostname_candidate_to_ip(candidate_sdp).await
     }
 
     /// Rewrite a hostname ICE candidate to an IP candidate when possible.
@@ -1050,6 +1061,10 @@ impl WebRtcChannel {
         let mut resolved = tokio::net::lookup_host((host.as_str(), port)).await.ok()?;
         let ip = resolved.next()?.ip().to_string();
         parts[4] = ip;
+        log::debug!(
+            "[WebRTC] Rewrote hostname ICE candidate {host} -> {}",
+            parts[4]
+        );
         Some(parts.join(" "))
     }
 
@@ -1058,6 +1073,34 @@ impl WebRtcChannel {
         self.peer_olm_key.lock().await.clone().ok_or_else(|| {
             ChannelError::EncryptionError("No peer Olm key (SDP offer not yet handled)".into())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WebRtcChannel;
+
+    #[tokio::test]
+    async fn rewrite_hostname_candidate_to_ip_skips_numeric_addresses() {
+        let candidate = "1 1 udp 2122260223 127.0.0.1 54872 typ host";
+        assert_eq!(
+            WebRtcChannel::rewrite_hostname_candidate_to_ip(candidate).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_hostname_candidate_to_ip_resolves_localhost() {
+        let candidate = "1 1 udp 2122260223 localhost 54872 typ host";
+        let rewritten = WebRtcChannel::rewrite_hostname_candidate_to_ip(candidate)
+            .await
+            .expect("expected localhost candidate to resolve");
+
+        assert!(!rewritten.contains("localhost"));
+        assert!(
+            rewritten.contains("127.0.0.1") || rewritten.contains("::1"),
+            "expected localhost to resolve to loopback, got {rewritten}"
+        );
     }
 }
 

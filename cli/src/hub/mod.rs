@@ -427,10 +427,10 @@ pub struct Hub {
     /// atomically (idempotent reattach) across all transport clients.
     pending_terminal_attaches: std::collections::HashMap<String, PendingTerminalAttach>,
 
-    /// Cached terminal theme replies learned from live attached clients.
+    /// Cached fallback terminal theme replies seeded at boot.
     ///
-    /// Used only as a headless fallback when a PTY emits startup probes before
-    /// any terminal client is attached to answer them live.
+    /// Used only as a fallback when a PTY emits startup probes before any
+    /// active terminal client is attached to answer them live.
     terminal_profiles: terminal_profile::TerminalProfileStore,
     /// Shared color cache from boot probe, shared with all `HubEventListener` instances.
     ///
@@ -438,6 +438,25 @@ pub struct Hub {
     /// `ColorRequest` events are answered immediately from cached values.
     shared_color_cache:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>,
+    /// Last known terminal color profile per client peer.
+    ///
+    /// Used to push the active client's colors into the session parser so
+    /// OSC 4/10/11/12 queries are answered from the active client rather than
+    /// stale boot defaults.
+    terminal_client_profiles:
+        std::collections::HashMap<String, std::collections::HashMap<usize, crate::terminal::Rgb>>,
+    /// Connected terminal peers per session.
+    ///
+    /// Tracks which peers currently have a terminal forwarder attached for a
+    /// given session so disconnect/unsubscribe can promote another client or
+    /// fall back to the boot profile deterministically.
+    terminal_session_peers:
+        std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Reverse lookup for terminal forwarder ownership.
+    ///
+    /// Keyed by forwarder ID (`peer:session`, `tui:session`) so forwarder
+    /// teardown can cleanly remove session peer registrations.
+    terminal_forwarder_peers: std::collections::HashMap<String, (String, String)>,
     /// Focused terminal owner per session.
     ///
     /// Used to ensure OSC color queries are only forwarded to the active
@@ -672,7 +691,7 @@ impl Hub {
         // threads can send events directly instead of pushing to shared vecs.
         lua.set_hub_event_tx(hub_event_tx.clone(), tokio_runtime.handle().clone());
 
-        let mut hub = Self {
+        let hub = Self {
             state,
             config,
             client,
@@ -697,15 +716,13 @@ impl Hub {
             pty_forwarders: std::collections::HashMap::new(),
             webrtc_backpressure_recovery: std::collections::HashMap::new(),
             pending_terminal_attaches: std::collections::HashMap::new(),
-            terminal_profiles: {
-                let mut store = terminal_profile::TerminalProfileStore::default();
-                store.probe_spawning_terminal();
-                store
-            },
-            // Populated below after terminal_profiles is available.
+            terminal_profiles: terminal_profile::TerminalProfileStore::default(),
             shared_color_cache: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            terminal_client_profiles: std::collections::HashMap::new(),
+            terminal_session_peers: std::collections::HashMap::new(),
+            terminal_forwarder_peers: std::collections::HashMap::new(),
             active_terminal_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             webrtc_outgoing_signal_tx,
             webrtc_outgoing_signal_rx: Some(webrtc_outgoing_signal_rx),
@@ -742,17 +759,34 @@ impl Hub {
             hub_event_metrics_last_log: Instant::now(),
             hub_event_rx: Some(hub_event_rx),
         };
+        Ok(hub)
+    }
 
-        // Populate shared color cache from boot probe results.
-        hub.shared_color_cache = hub.terminal_profiles.shared_color_cache();
-        if let Ok(cache) = hub.shared_color_cache.lock() {
+    /// Seed the hub fallback terminal profile from a boot-time color cache.
+    pub fn seed_boot_color_cache(
+        &mut self,
+        cache: &std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>,
+        >,
+    ) {
+        let Ok(colors) = cache.lock() else {
+            log::warn!("[PTY-PROBE] Failed to lock boot color cache for hub seed");
+            return;
+        };
+
+        self.terminal_profiles.seed_hub_profile_from_colors(&colors);
+        drop(colors);
+
+        self.terminal_profiles
+            .refresh_shared_color_cache(&self.shared_color_cache);
+
+        if let Ok(shared) = self.shared_color_cache.lock() {
             log::info!(
-                "[PTY-PROBE] Shared color cache populated with {} entries",
-                cache.len()
+                "[PTY-PROBE] Seeded hub fallback cache with {} entries ({})",
+                shared.len(),
+                self.terminal_profiles.describe_hub_profile()
             );
         }
-
-        Ok(hub)
     }
 
     /// Get the hub ID to use for server communication.

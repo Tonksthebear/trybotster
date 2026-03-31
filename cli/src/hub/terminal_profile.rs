@@ -66,6 +66,7 @@ impl TerminalProfile {
 #[derive(Debug, Default)]
 pub(crate) struct TerminalProfileStore {
     input_buffers: HashMap<String, Vec<u8>>,
+    #[cfg(test)]
     peer_input_buffers: HashMap<String, Vec<u8>>,
     output_buffers: HashMap<String, Vec<u8>>,
     /// Hub-wide terminal profile learned from the boot probe or first client.
@@ -105,6 +106,34 @@ impl TerminalProfileStore {
         );
     }
 
+    pub(crate) fn seed_hub_profile_from_colors(
+        &mut self,
+        colors: &std::collections::HashMap<usize, crate::terminal::Rgb>,
+    ) {
+        self.hub_profile = TerminalProfile::default();
+
+        for (probe, index) in [
+            (TerminalProbe::DefaultForeground, 256usize),
+            (TerminalProbe::DefaultBackground, 257usize),
+            (TerminalProbe::DefaultCursorColor, 258usize),
+        ] {
+            if let Some(color) = colors.get(&index).copied() {
+                self.hub_profile
+                    .store_reply(probe, format_osc_reply(probe, color));
+            }
+        }
+
+        for index in 0usize..PALETTE_INDEX_COUNT {
+            if let Some(color) = colors.get(&index).copied() {
+                self.hub_profile.store_reply(
+                    TerminalProbe::Palette(index as u8),
+                    format_osc_reply(TerminalProbe::Palette(index as u8), color),
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn observe_peer_input(&mut self, peer_id: &str, data: &[u8]) -> Vec<Vec<u8>> {
         let should_parse = {
             let buffer = self
@@ -345,12 +374,10 @@ impl TerminalProfileStore {
         Some(bytes)
     }
 
-    /// Probe the spawning terminal directly for color information.
+    /// Probe the spawning terminal directly for full color information.
     ///
-    /// Called at hub startup before the TUI takes over stdin/stdout.
-    /// Writes OSC 10/11/12 queries to stdout, reads responses from stdin
-    /// with a short timeout. Updates the hub profile.
-    /// Palette colors (OSC 4) are learned passively from peer inputs, not boot probed.
+    /// Writes OSC 4/10/11/12 queries to stdout, reads responses from stdin
+    /// with a short timeout, and updates the hub profile.
     ///
     /// Skipped in test mode and when stdin is not a TTY.
     pub(crate) fn probe_spawning_terminal(&mut self) {
@@ -373,7 +400,7 @@ impl TerminalProfileStore {
             let _ = crossterm::terminal::enable_raw_mode();
         }
 
-        // Send OSC 10/11/12 queries (palette learned passively from peer inputs).
+        // Send the full OSC 4/10/11/12 query set.
         let probes = boot_probe_bytes();
         if std::io::stdout().write_all(probes).is_err() {
             if !was_raw {
@@ -488,7 +515,7 @@ impl TerminalProbe {
     }
 }
 
-fn boot_probe_bytes() -> &'static [u8] {
+pub(crate) fn full_probe_bytes() -> &'static [u8] {
     static PROBES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     PROBES.get_or_init(|| {
         let mut bytes = Vec::new();
@@ -500,6 +527,23 @@ fn boot_probe_bytes() -> &'static [u8] {
         }
         bytes
     })
+}
+
+fn boot_probe_bytes() -> &'static [u8] {
+    full_probe_bytes()
+}
+
+fn format_osc_reply(probe: TerminalProbe, color: crate::terminal::Rgb) -> Vec<u8> {
+    let rgb = format!(
+        "rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}",
+        color.r, color.r, color.g, color.g, color.b, color.b
+    );
+    match probe {
+        TerminalProbe::DefaultForeground => format!("\x1b]10;{rgb}\x07").into_bytes(),
+        TerminalProbe::DefaultBackground => format!("\x1b]11;{rgb}\x07").into_bytes(),
+        TerminalProbe::DefaultCursorColor => format!("\x1b]12;{rgb}\x07").into_bytes(),
+        TerminalProbe::Palette(index) => format!("\x1b]4;{index};{rgb}\x07").into_bytes(),
+    }
 }
 
 fn append_with_limit(buffer: &mut Vec<u8>, data: &[u8]) {

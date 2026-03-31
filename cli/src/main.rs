@@ -393,7 +393,6 @@ fn run_with_tui() -> Result<()> {
     hub.start_socket_server()?;
 
     println!("Starting TUI...");
-    let tui_color_cache = tui::probe_spawning_terminal_colors();
 
     // NOW setup terminal (after all initialization that could fail)
     enable_raw_mode()?;
@@ -409,6 +408,9 @@ fn run_with_tui() -> Result<()> {
     // from the inner PTY's state by sync_terminal_modes() in the event loop.
 
     let _terminal_guard = tui::TerminalGuard::new();
+
+    let tui_color_cache = tui::probe_spawning_terminal_colors();
+    hub.seed_boot_color_cache(&tui_color_cache);
 
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
@@ -761,7 +763,6 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
 
     // Create wake pipe for TuiRunner (RAII guard ensures cleanup on any exit path)
     let pipe = WakePipe::new();
-    let tui_color_cache = tui::probe_spawning_terminal_colors();
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -785,6 +786,8 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
         EnableMouseCapture,
         crossterm::event::EnableFocusChange
     )?;
+
+    let tui_color_cache = tui::probe_spawning_terminal_colors();
 
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;

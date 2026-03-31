@@ -51,10 +51,10 @@ pub const FRAME_RESIZE: u8 = 0x03;
 /// Hub → Session: arm tee log (JSON payload: `{"log_path": str, "cap_bytes": u64}`).
 pub const FRAME_ARM_TEE: u8 = 0x04;
 
-/// Hub → Session: request binary page snapshot of current terminal state.
+/// Hub → Session: request an opaque terminal snapshot of current state.
 pub const FRAME_GET_SNAPSHOT: u8 = 0x05;
 
-/// Session → Hub: binary page snapshot response.
+/// Session → Hub: opaque terminal snapshot response.
 pub const FRAME_SNAPSHOT: u8 = 0x06;
 
 /// Session → Hub: child process exited (JSON payload: `{"exit_code": i32|null}`).
@@ -98,11 +98,14 @@ pub const FRAME_MODE_CHANGED: u8 = 0x12;
 /// Session → Hub: working directory changed (string payload: new CWD path).
 pub const FRAME_CWD_CHANGED: u8 = 0x13;
 
-/// Session → Hub: shell prompt mark detected (JSON payload: `{"mark": str}`).
+/// Session → Hub: semantic prompt action detected (JSON payload: `{"mark": str}`).
 pub const FRAME_PROMPT_MARK: u8 = 0x14;
 
 /// Session → Hub: OSC notification detected (JSON payload: `{"title": str, "body": str}`).
 pub const FRAME_NOTIFICATION: u8 = 0x15;
+
+/// Hub → Session: replace the parser's terminal color profile (JSON payload).
+pub const FRAME_SET_COLOR_PROFILE: u8 = 0x16;
 
 // ─── Handshake metadata ──────────────────────────────────────────────────────
 
@@ -180,17 +183,20 @@ pub struct NotificationPayload {
     pub body: String,
 }
 
-/// Prompt mark payload.
+/// Semantic prompt payload.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PromptMarkPayload {
-    /// One of: "prompt_start", "command_start", "command_executed", "command_finished".
+    /// Ghostty semantic prompt action name.
     pub mark: String,
-    /// Optional command text (for command_executed marks).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    /// Optional exit code (for command_finished marks).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
+}
+
+/// Full terminal color profile pushed from an active client into a session.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TerminalColorProfile {
+    /// Colors keyed by Ghostty color index:
+    /// 0..=255 palette, 256 fg, 257 bg, 258 cursor.
+    #[serde(default)]
+    pub colors: std::collections::HashMap<usize, crate::terminal::Rgb>,
 }
 
 // ─── Frame encoding ──────────────────────────────────────────────────────────
@@ -506,17 +512,13 @@ mod tests {
     #[test]
     fn prompt_mark_payload_roundtrip() {
         let mark = PromptMarkPayload {
-            mark: "command_finished".to_string(),
-            command: None,
-            exit_code: Some(0),
+            mark: "end_command".to_string(),
         };
         let encoded = encode_json(FRAME_PROMPT_MARK, &mark).unwrap();
         let mut decoder = FrameDecoder::new();
         let frames = decoder.feed(&encoded);
         let decoded: PromptMarkPayload = frames[0].json().unwrap();
-        assert_eq!(decoded.mark, "command_finished");
-        assert!(decoded.command.is_none());
-        assert_eq!(decoded.exit_code, Some(0));
+        assert_eq!(decoded.mark, "end_command");
     }
 
     #[test]
@@ -595,5 +597,4 @@ mod tests {
         assert_eq!(decoded.rows, 24);
         assert_eq!(decoded.cols, 80);
     }
-
 }
