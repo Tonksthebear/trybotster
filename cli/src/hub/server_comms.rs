@@ -313,6 +313,11 @@ impl Hub {
         peer_id: &str,
         colors: std::collections::HashMap<usize, crate::terminal::Rgb>,
     ) {
+        // Update the shared boot cache so newly spawned sessions inherit
+        // the latest client colors instead of stale boot-time values.
+        if let Ok(mut shared) = self.shared_color_cache.lock() {
+            shared.clone_from(&colors);
+        }
         self.terminal_client_profiles
             .insert(peer_id.to_string(), colors);
         self.sync_active_sessions_for_terminal_peer(peer_id);
@@ -374,6 +379,7 @@ impl Hub {
 
     fn unregister_terminal_client_peer(&mut self, peer_id: &str, promote_next: bool) {
         self.terminal_client_profiles.remove(peer_id);
+        self.browser_color_probes.remove(peer_id);
 
         let forwarder_ids: Vec<String> = self
             .terminal_forwarder_peers
@@ -436,6 +442,90 @@ impl Hub {
 
         drop(active);
         self.sync_session_terminal_profile(session_uuid);
+    }
+
+    /// Send OSC color probes to a browser peer's terminal.
+    ///
+    /// Injects full probe bytes (OSC 4/10/11/12 queries) as PTY output so
+    /// restty's ghostty WASM processes them and responds via write_pty.
+    fn send_browser_color_probe(&mut self, browser_identity: &str, session_uuid: &str) {
+        let subscription_id = format!("terminal_{session_uuid}");
+        let probe_bytes = crate::hub::terminal_profile::full_probe_bytes();
+
+        // Prefix with 0x01 (live PTY output) for the browser terminal framing.
+        let mut data = Vec::with_capacity(1 + probe_bytes.len());
+        data.push(0x01);
+        data.extend_from_slice(probe_bytes);
+
+        let output = super::WebRtcPtyOutput {
+            subscription_id,
+            browser_identity: browser_identity.to_string(),
+            data,
+            session_uuid: session_uuid.to_string(),
+        };
+
+        if self.webrtc_pty_output_tx.try_send(output).is_ok() {
+            // Set up tracking state for expected responses.
+            let mut pending = std::collections::HashSet::new();
+            for index in 0usize..256 {
+                pending.insert(index);
+            }
+            pending.insert(256); // fg
+            pending.insert(257); // bg
+            pending.insert(258); // cursor
+            self.browser_color_probes.insert(
+                browser_identity.to_string(),
+                super::BrowserColorProbeState {
+                    pending,
+                    colors: std::collections::HashMap::new(),
+                },
+            );
+            log::debug!(
+                "[PTY-PROBE] Sent color probes to browser {}",
+                &browser_identity[..browser_identity.len().min(8)]
+            );
+        }
+    }
+
+    /// Consume OSC color probe responses from a browser peer.
+    ///
+    /// Accumulates colors from the response. When fg/bg/cursor are all
+    /// received, publishes the complete profile via `update_terminal_client_profile`.
+    fn consume_browser_color_response(&mut self, browser_identity: &str, data: &[u8]) {
+        let entries = crate::hub::terminal_profile::extract_color_entries(data);
+        if entries.is_empty() {
+            return;
+        }
+
+        let Some(state) = self.browser_color_probes.get_mut(browser_identity) else {
+            return;
+        };
+
+        for (index, color) in &entries {
+            if state.pending.remove(index) {
+                state.colors.insert(*index, *color);
+            }
+        }
+
+        let fg_done = !state.pending.contains(&256);
+        let bg_done = !state.pending.contains(&257);
+        let cursor_done = !state.pending.contains(&258);
+
+        if fg_done && bg_done && cursor_done {
+            let colors = self
+                .browser_color_probes
+                .remove(browser_identity)
+                .expect("just checked")
+                .colors;
+            let bg = colors.get(&257usize).copied();
+            log::info!(
+                "[PTY-PROBE] Browser {} color profile complete: {} colors, bg={:?}",
+                &browser_identity[..browser_identity.len().min(8)],
+                colors.len(),
+                bg
+            );
+            self.update_terminal_client_profile(browser_identity, colors);
+        }
     }
 
     fn learn_terminal_probe_replies(&mut self, session_uuid: &str, peer_id: &str, data: &[u8]) {
@@ -1306,12 +1396,22 @@ impl Hub {
                     });
                 }
 
+                let envelope_value =
+                    encrypted_answer.expect("encrypted_answer checked above to be present");
+                // Send the answer first. Queued browser ICE can be applied
+                // afterward; invalid or slow candidates must not delay the
+                // browser receiving the answer and beginning ICE checks.
+                if self.emit_outgoing_signal(&browser_identity, envelope_value, "answer") {
+                    log::info!("[WebRTC] Encrypted answer sent via Lua relay (async)");
+                }
+
                 if let Some(candidates) =
                     self.webrtc_pending_ice_candidates.remove(&browser_identity)
                 {
                     if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
-                        // Collect valid candidates, then apply all in a single
-                        // block_in_place call to reduce event loop blocking.
+                        // Apply any queued browser ICE after the answer is already
+                        // on the wire. Slow or invalid candidates must not delay
+                        // the browser receiving the answer and starting ICE.
                         let valid: Vec<_> = candidates
                             .into_iter()
                             .filter_map(|(candidate_generation, candidate)| {
@@ -1371,12 +1471,6 @@ impl Hub {
                         }
                     }
                 }
-
-                let envelope_value =
-                    encrypted_answer.expect("encrypted_answer checked above to be present");
-                if self.emit_outgoing_signal(&browser_identity, envelope_value, "answer") {
-                    log::info!("[WebRTC] Encrypted answer sent via Lua relay (async)");
-                }
             }
         }
 
@@ -1427,11 +1521,24 @@ impl Hub {
             self.set_active_terminal_peer(&input.session_uuid, &input.browser_identity, true);
             self.lua
                 .set_pty_focused(&input.session_uuid, &input.browser_identity, true);
+            self.send_browser_color_probe(&input.browser_identity, &input.session_uuid);
         } else if input.data == b"\x1b[O" {
             self.set_active_terminal_peer(&input.session_uuid, &input.browser_identity, false);
             self.lua
                 .set_pty_focused(&input.session_uuid, &input.browser_identity, false);
         }
+
+        // Intercept OSC color probe responses from browser terminal.
+        // These are generated by restty's ghostty WASM in response to the
+        // probe bytes we injected on focus-in. Consume them instead of
+        // forwarding to the session PTY.
+        if self.browser_color_probes.contains_key(&input.browser_identity)
+            && crate::hub::terminal_profile::contains_osc_color_reply(&input.data)
+        {
+            self.consume_browser_color_response(&input.browser_identity, &input.data);
+            return;
+        }
+
         self.learn_terminal_probe_replies(
             &input.session_uuid,
             &input.browser_identity,
@@ -2363,6 +2470,10 @@ impl Hub {
                         "[WebRTC] dc_pong from {}",
                         &browser_identity[..browser_identity.len().min(8)]
                     );
+                    return;
+                }
+                "terminal_color_profile" => {
+                    self.handle_terminal_color_profile_message(browser_identity, &msg);
                     return;
                 }
                 _ => {}

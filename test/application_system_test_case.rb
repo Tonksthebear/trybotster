@@ -51,7 +51,7 @@ class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
           try {
             var workerUrl = document.querySelector('meta[name="crypto-worker-url"]');
             if (!workerUrl || !workerUrl.content) { resolve(); return; }
-            var worker = new SharedWorker(workerUrl.content, { type: "module", name: "vodozemac-crypto" });
+            var worker = new SharedWorker(workerUrl.content, { name: "vodozemac-crypto" });
             worker.port.onmessage = function(e) { if (e.data.id === 999999) resolve(); };
             worker.port.start();
             worker.port.postMessage({ id: 999999, action: "clearAllSessions" });

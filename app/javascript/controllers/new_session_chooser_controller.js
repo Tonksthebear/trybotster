@@ -23,11 +23,12 @@ export default class extends Controller {
 
     HubManager.acquire(this.hubIdValue).then((hub) => {
       this.hub = hub;
-      this.spawnTargets = Array.isArray(hub.spawnTargets) ? hub.spawnTargets : [];
+      this.spawnTargets = hub.spawnTargets.current();
+      hub.spawnTargets.load().catch(() => {});
       this.#renderTargetSelect();
 
       this.unsubscribers.push(
-        this.hub.onSpawnTargetList((targets) => {
+        this.hub.spawnTargets.onChange((targets) => {
           this.spawnTargets = Array.isArray(targets) ? targets : [];
           this.#renderTargetSelect();
         }),

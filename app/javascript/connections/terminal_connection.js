@@ -77,7 +77,7 @@ export class TerminalConnection extends HubRoute {
         // Raw bytes from CLI with prefix byte routing:
         //   0x00 = JSON control message
         //   0x01 = live PTY output (immediate passthrough)
-        //   0x02 = binary page snapshot (raw page memory + state blob)
+        //   0x02 = opaque terminal snapshot blob
         if (message.data && message.data.length > 0) {
           const prefix = message.data[0];
           if (prefix === 0x01) {
@@ -159,9 +159,8 @@ export class TerminalConnection extends HubRoute {
   /**
    * Handle a complete snapshot (prefix 0x02).
    *
-   * Binary page snapshots start with [version=0x01][screen_count][active_screen].
-   * The hub sends raw binary page data — pages + terminal state blob — which
-   * restty loads directly via page_load/state_import/state_finalize.
+   * The payload is an opaque terminal snapshot blob exported by ghostty.
+   * The hub routes it unchanged and the client imports it in one call.
    *
    * The snapshot is a single atomic message — no chunking, no reassembly.
    * WebRTC SCTP handles message fragmentation at the transport layer.
@@ -169,13 +168,19 @@ export class TerminalConnection extends HubRoute {
   #handleSnapshot(data) {
     if (data.length === 0) return;
 
-    console.debug(`[TerminalConnection] Binary snapshot: ${data.byteLength} bytes`);
+    const listenerCount = this.subscribers.get("binarySnapshot")?.size ?? 0;
+    console.debug(
+      `[TerminalConnection] Binary snapshot: ${data.byteLength} bytes listeners=${listenerCount}`,
+    );
     const listeners = this.subscribers.get("binarySnapshot");
     if (listeners && listeners.size > 0) {
       this.#emitSnapshot(data);
       return;
     }
 
+    console.debug(
+      `[TerminalConnection] Buffering early binary snapshot: ${data.byteLength} bytes`,
+    );
     this.#earlyBinarySnapshot = data;
   }
 
@@ -259,11 +264,18 @@ export class TerminalConnection extends HubRoute {
   #flushEarlyBinarySnapshot() {
     const data = this.#earlyBinarySnapshot;
     if (!data) return;
+    console.debug(
+      `[TerminalConnection] Flushing early binary snapshot: ${data.byteLength} bytes`,
+    );
     this.#earlyBinarySnapshot = null;
     this.#emitSnapshot(data);
   }
 
   #emitSnapshot(data) {
+    const listenerCount = this.subscribers.get("binarySnapshot")?.size ?? 0;
+    console.debug(
+      `[TerminalConnection] Emitting binary snapshot: ${data.byteLength} bytes listeners=${listenerCount}`,
+    );
     this.emit("snapshotStart", { byteLength: data.byteLength });
     this.emit("binarySnapshot", data);
     this.emit("snapshotComplete", { byteLength: data.byteLength });

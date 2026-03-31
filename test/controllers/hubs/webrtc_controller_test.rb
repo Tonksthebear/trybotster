@@ -109,9 +109,32 @@ class Hubs::WebrtcControllerTest < ActionDispatch::IntegrationTest
     # Username format: timestamp:hub_id
     assert_match(/\d+:#{@hub.id}/, turn["username"])
 
-    # External STUN should NOT be included when TURN is configured
+    # LAN requests should not add extra STUN when host candidates are enough.
     stun_servers = json["ice_servers"].select { |s| s["urls"]&.include?("stun:") }
-    assert_empty stun_servers, "Should not include external STUN when TURN handles STUN natively"
+    assert_empty stun_servers, "LAN requests should not include extra STUN when TURN is configured"
+  ensure
+    ENV.delete("TURN_SERVER_URL")
+    ENV.delete("TURN_SECRET")
+  end
+
+  test "returns matching STUN and TURN for WAN client when TURN is configured" do
+    sign_in @user
+
+    ENV.delete("METERED_DOMAIN")
+    ENV.delete("METERED_SECRET_KEY")
+    ENV["TURN_SERVER_URL"] = "turn:turn.example.com:3478"
+    ENV["TURN_SECRET"] = "test_secret"
+
+    get hub_webrtc_path(@hub), headers: { "REMOTE_ADDR" => "8.8.8.8" }
+
+    assert_response :success
+    json = JSON.parse(response.body)
+
+    stun_servers = json["ice_servers"].select { |s| s["urls"]&.include?("stun:") }
+    turn_servers = json["ice_servers"].select { |s| s["urls"]&.include?("turn:") }
+
+    assert_includes stun_servers.map { |s| s["urls"] }, "stun:turn.example.com:3478"
+    assert turn_servers.any?, "WAN requests should still include TURN relay credentials"
   ensure
     ENV.delete("TURN_SERVER_URL")
     ENV.delete("TURN_SECRET")

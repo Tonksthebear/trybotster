@@ -1,1570 +1,620 @@
-/**
- * Connection - Base class for typed connection wrappers.
- *
- * Provides common functionality:
- *   - WorkerBridge communication for encrypted channels
- *   - Olm session lifecycle (via SharedWorker)
- *   - Event subscription (typed subclasses add domain-specific events)
- *   - State tracking
- *
- * Lifecycle:
- *   - initialize()/reacquire() bootstrap signaling (ActionCable + Olm)
- *   - #ensureConnected() is the idempotent entry point for peer + subscribe (not signaling)
- *   - Health events call #ensureConnected(); offline calls #disconnectPeer()
- *   - destroy() tears down everything (signaling + peer)
- *
- * Subclasses implement:
- *   - channelName() - Virtual channel name for CLI routing (e.g., "TerminalRelayChannel")
- *   - channelParams() - Subscription params
- *   - handleMessage(msg) - Domain-specific message routing
- */
+import bridge from "workers/bridge";
+import { ensureMatrixReady } from "matrix/bundle";
+import { observeBrowserSocketState } from "transport/hub_signaling_client";
+import { ConnectionState, BrowserStatus, CliStatus, ConnectionMode } from "connections/constants";
 
-import bridge from "workers/bridge"
-import { ensureMatrixReady } from "matrix/bundle"
-import { HandshakeManager } from "connections/handshake_manager"
-import { HealthTracker } from "connections/health_tracker"
-import { setupHubEventListeners } from "connections/hub_event_handlers"
-import { ConnectionState, BrowserStatus, CliStatus, ConnectionMode } from "connections/constants"
+export { ConnectionState, BrowserStatus, CliStatus, ConnectionMode };
 
-// Re-export constants so existing consumers (controllers, subclasses) keep working
-export { ConnectionState, BrowserStatus, CliStatus, ConnectionMode }
+const TAB_ID = crypto.randomUUID();
+const RECONNECT_DELAY_MS = 1000;
+const SESSION_TIMEOUT_MS = 5000;
 
-// Tab-unique identifier (generated once per page load).
-// Used to distinguish multiple browser tabs sharing the same Olm session.
-const TAB_ID = crypto.randomUUID()
+const HEALTH_STATUS_MAP = {
+  offline: CliStatus.OFFLINE,
+  online: CliStatus.ONLINE,
+  notified: CliStatus.ONLINE,
+  connecting: CliStatus.ONLINE,
+  connected: CliStatus.ONLINE,
+  disconnected: CliStatus.OFFLINE,
+};
 
 export class HubRoute {
-  // Static tab identifier shared by all connections in this tab
-  static tabId = TAB_ID
-  static SUBSCRIPTION_IDLE_UNSUBSCRIBE_MS = 3000
-  static #sharedSubscriptions = new Map() // leaseKey -> { hubId, subscriptionId, refCount, idleTimer, promise }
-  #unsubscribers = []
-  #subscriptionUnsubscribers = []
-  #subscriptionLeaseKey = null
-  #hubConnected = false
-  #subscribing = false      // Lock to prevent concurrent subscribe/unsubscribe
-  #subscribeLock = null     // Promise-based lock (resolves when subscribe/unsubscribe finishes)
-  #subscribeLockResolve = null
-  #subscribeAborted = false // Abort flag: lets #disconnectPeer() break out of in-flight subscribe
-  #initRetryCount = 0       // Retry counter for failed initialize()
-  #initRetryTimer = null    // Pending retry timer
-  #peerReconnectTimer = null  // Pending peer reconnect timer
-  #peerReconnectAttempts = 0  // Retry counter for peer reconnection
-  #nuclearReconnectTimer = null // Fallback reconnect when normal attempts exhausted
-  #reacquirePromise = null    // Serializes concurrent reacquire() calls
-  #sessionPreparationPromise = null // Serializes fresh-bundle session setup
-  #handshake = null           // HandshakeManager instance
-  #health = null              // HealthTracker instance
-  #dcPingTimer = null         // DataChannel heartbeat timer
-  #dcMissedPings = 0          // Consecutive unanswered DC pings
-  #ensureConnectedDebounceTimer = null // Debounce for #setBrowserStatus → ensureConnected
-  #visibilityHandler = null   // visibilitychange listener for phone unlock detection
-  #visibilityProbeTimer = null // One-shot pong timeout after visibility probe ping
-  #visibilityPongReceived = false // Cleared on probe send, set on any dc_pong
-  #lastDcPongAt = 0           // Last observed dc_pong timestamp (ms epoch)
-  #hiddenAt = null            // Timestamp when document became hidden
+  static tabId = TAB_ID;
 
-  constructor(key, options, manager) {
-    this.key = key
-    this.options = options
-    this.manager = manager
+  #hubConnected = false;
+  #listenersBound = false;
+  #subscriptionListeners = [];
+  #unsubscribers = [];
+  #signalingConnected = false;
+  #subscriptionPending = null;
+  #sessionPending = null;
+  #connectPending = null;
+  #reconnectTimer = null;
+  #destroyed = false;
+  #browserSocketObserverCleanup = null;
 
-    this.subscriptionId = null      // Worker subscription ID
-    this.identityKey = null         // E2E identity key (shared across tabs)
-    this.browserIdentity = null     // Tab-unique identity for routing (identityKey:tabId)
-    this.state = ConnectionState.DISCONNECTED
-    this.errorCode = null
-    this.errorReason = null
+  constructor(key, options = {}, manager) {
+    this.key = key;
+    this.options = options;
+    this.manager = manager;
 
-    // Two-sided status tracking
-    this.browserStatus = BrowserStatus.DISCONNECTED
-    this.connectionMode = ConnectionMode.UNKNOWN
-
-    // Event subscribers: Map<eventName, Set<callback>>
-    this.subscribers = new Map()
-
-    // Handshake protocol (E2E encryption verification)
-    const log = (msg) => console.debug(`[${this.constructor.name}] ${msg}`)
-    this.#handshake = new HandshakeManager({
-      sendEncrypted: (msg) => this.#sendEncrypted(msg),
-      emit: (event, data) => this.emit(event, data),
-      onComplete: () => this.#onHandshakeComplete(),
-      onTimeout: () => this.#disconnectPeer().then(() => this.#schedulePeerReconnect()),
-      log,
-    })
-
-    // CLI status tracking + health event processing
-    this.#health = new HealthTracker({
-      emit: (event, data) => this.emit(event, data),
-      ensureConnected: () => this.#ensureConnected().catch(() => {}),
-      disconnectPeer: () => this.#disconnectPeer(),
-      setState: (s) => this.#setState(s),
-      sendHandshake: () => this.#handshake.send(),
-      resetHandshake: () => this.#handshake.reset(),
-      resetPeerReconnect: () => { this.#peerReconnectAttempts = 0 },
-      getSubscriptionId: () => this.subscriptionId,
-      getErrorCode: () => this.errorCode,
-      getBrowserStatus: () => this.browserStatus,
-      notifyManager: (data) => this.manager.notifySubscribers(this.key, { ...data, state: this.state }),
-      log,
-    })
-
+    this.subscriptionId = null;
+    this.identityKey = null;
+    this.browserIdentity = null;
+    this.state = ConnectionState.DISCONNECTED;
+    this.browserSocketState = "disconnected";
+    this.cliStatus = CliStatus.UNKNOWN;
+    this.connectionMode = ConnectionMode.UNKNOWN;
+    this.errorCode = null;
+    this.errorReason = null;
+    this.lastError = null;
+    this.subscribers = new Map();
   }
 
-  // ========== Lifecycle (called by HubConnectionManager) ==========
-
-  /**
-   * Initialize the connection. Called by HubConnectionManager.acquire().
-   * Sets up crypto + signaling; #connectSignaling() calls #ensureConnected() at the end.
-   */
   async initialize() {
-    if (this.#isLivenessOwner()) {
-    // Phone unlock / tab-switch recovery: when the page becomes visible after
-    // being hidden (screen lock, tab switch, app backgrounding), call
-    // #ensureConnected() immediately. connectPeer() already handles the dead
-    // peer cases — PC in terminal state, or connected PC with closed DC (iOS
-    // sleep quirk) — so this fires reconnect as soon as the screen turns on
-    // rather than waiting up to 15s for the ICE disconnected safety-net timer.
-    this.#visibilityHandler = () => {
-      if (document.hidden) {
-        this.#hiddenAt = Date.now()
-      } else {
-        const hiddenForMs = this.#hiddenAt ? (Date.now() - this.#hiddenAt) : 0
-        this.#hiddenAt = null
-        console.debug(`[${this.constructor.name}] Page visible — probing connection`)
-        this.#probeOnVisibility(hiddenForMs)
+    if (this.#destroyed) return;
+
+    this.#setState(ConnectionState.LOADING);
+    await this.#ensureMatrix();
+    await this.#refreshIdentity();
+    this.#bindBridgeListeners();
+    await this.#connectSignaling();
+    await this.#ensureConnected();
+  }
+
+  async reacquire() {
+    if (this.#destroyed) return;
+
+    if (!this.#listenersBound) {
+      this.#bindBridgeListeners();
+    }
+
+    await this.#refreshIdentity();
+    await this.#connectSignaling();
+    await this.#ensureConnected();
+  }
+
+  destroy() {
+    this.#destroyed = true;
+    this.#clearReconnectTimer();
+    this.#clearSubscription();
+    this.#browserSocketObserverCleanup?.();
+    this.#browserSocketObserverCleanup = null;
+
+    for (const unsubscribe of this.#unsubscribers) {
+      unsubscribe();
+    }
+    this.#unsubscribers = [];
+    this.#listenersBound = false;
+
+    this.subscriptionId = null;
+    this.identityKey = null;
+    this.browserIdentity = null;
+    this.#hubConnected = false;
+    this.#signalingConnected = false;
+    this.browserSocketState = "disconnected";
+    this.cliStatus = CliStatus.UNKNOWN;
+    this.connectionMode = ConnectionMode.UNKNOWN;
+    this.state = ConnectionState.DISCONNECTED;
+
+    const hubId = this.getHubId();
+    if (hubId && !this.manager.hasActiveConnectionForHub(hubId)) {
+      bridge.send("disconnect", { hubId }).catch(() => {});
+    }
+
+    this.emit("destroyed");
+    this.subscribers.clear();
+  }
+
+  release() {
+    this.manager.release(this.key);
+  }
+
+  notifyIdle() {
+    this.#clearReconnectTimer();
+    this.#clearSubscription();
+
+    const hubId = this.getHubId();
+    if (!hubId) return;
+    if (this.manager.hasActiveConnectionForHub(hubId)) return;
+
+    bridge.send("disconnect", { hubId }).catch(() => {});
+  }
+
+  on(event, callback) {
+    if (!this.subscribers.has(event)) {
+      this.subscribers.set(event, new Set());
+    }
+    this.subscribers.get(event).add(callback);
+    return () => this.off(event, callback);
+  }
+
+  off(event, callback) {
+    this.subscribers.get(event)?.delete(callback);
+  }
+
+  emit(event, data) {
+    const callbacks = this.subscribers.get(event);
+    if (!callbacks) return;
+
+    for (const callback of callbacks) {
+      try {
+        callback(data);
+      } catch (error) {
+        console.error(`[${this.constructor.name}] Event handler error:`, error);
       }
     }
-      document.addEventListener("visibilitychange", this.#visibilityHandler)
+  }
+
+  getHubId() {
+    return this.options.hubId;
+  }
+
+  getError() {
+    return this.errorReason;
+  }
+
+  isConnected() {
+    return this.state === ConnectionState.CONNECTED;
+  }
+
+  isHubConnected() {
+    return this.#hubConnected;
+  }
+
+  processMessage(message) {
+    if (!message?.type) return false;
+
+    if (message.type === "connected") {
+      this.#sendEncrypted({ type: "ack", timestamp: Date.now() }).catch(() => {});
+      return true;
     }
+
+    if (message.type === "ack") {
+      return true;
+    }
+
+    if (message.type === "dc_ping") {
+      this.send("dc_pong").catch(() => {});
+      return true;
+    }
+
+    if (message.type === "dc_pong") {
+      return true;
+    }
+
+    if (message.type === "cli_disconnected") {
+      this.#clearSubscription();
+      if (this.state === ConnectionState.CONNECTED) {
+        this.emit("disconnected", this);
+      }
+      this.#setState(ConnectionState.CLI_DISCONNECTED);
+      return true;
+    }
+
+    return false;
+  }
+
+  async send(type, data = {}) {
+    await this.#ensureConnected();
+    if (!this.subscriptionId) return false;
 
     try {
-      this.#setState(ConnectionState.LOADING)
-
-      const cryptoWorkerUrl = document.querySelector('meta[name="crypto-worker-url"]')?.content
-      const wasmJsUrl = document.querySelector('meta[name="crypto-wasm-js-url"]')?.content
-      const wasmBinaryUrl = document.querySelector('meta[name="crypto-wasm-binary-url"]')?.content
-      await ensureMatrixReady(cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl)
-
-      await this.#connectSignaling()
+      await this.#sendEncrypted({ type, ...data });
+      return true;
     } catch (error) {
-      console.error(`[${this.constructor.name}] Initialize failed:`, error)
-      // Don't overwrite session_invalid — it's already showing "Scan Code"
-      if (this.errorCode !== "session_invalid") {
-        // No crypto session means user needs to scan QR code, not a generic init error.
-        // Use lightweight errorCode (not #setError) to keep browserStatus/state intact —
-        // browser signaling may still be functional, only crypto is missing.
-        if (!this.identityKey) {
-          this.errorCode = "unpaired"
-          this.errorReason = "Scan connection code"
-          this.emit("error", { reason: "unpaired", message: "Scan connection code" })
-        } else {
-          // Retry transient failures (WASM timeout, ActionCable timeout) with backoff.
-          // Non-retryable errors (unpaired, session_invalid) are handled above.
-          this.#scheduleInitRetry(error)
-        }
-      }
+      console.error(`[${this.constructor.name}] Send failed:`, error);
+      this.#scheduleReconnect();
+      return false;
     }
   }
 
-  /**
-   * Schedule a retry of initialize() with exponential backoff.
-   * Retries up to 3 times: 2s, 4s, 8s.
-   */
-  #scheduleInitRetry(error) {
-    const MAX_RETRIES = 3
-    if (this.#initRetryCount >= MAX_RETRIES) {
-      console.error(`[${this.constructor.name}] Init failed after ${MAX_RETRIES} retries`)
-      this.#setError("init_failed", error.message)
-      return
-    }
+  async sendBinaryPty(data) {
+    await this.#ensureConnected();
+    if (!this.subscriptionId) return false;
 
-    this.#initRetryCount++
-    const delay = 2000 * Math.pow(2, this.#initRetryCount - 1) // 2s, 4s, 8s
-    console.debug(`[${this.constructor.name}] Retrying init in ${delay}ms (attempt ${this.#initRetryCount}/${MAX_RETRIES})`)
-
-    this.#initRetryTimer = setTimeout(() => {
-      this.#initRetryTimer = null
-      this.initialize()
-    }, delay)
-  }
-
-  /**
-   * Connect ActionCable signaling (WebSocket + Olm session).
-   * Fast path: if a sibling Connection already has signaling for this hub,
-   * inherit hub state and skip full setup. Otherwise, full signaling flow.
-   */
-  async #connectSignaling() {
-    if (this.#hubConnected) return
-
-    // Fast path: sibling Connection already has signaling for this hub.
-    // Inherit hub state, set up listeners, proceed to peer + subscribe.
-    // No BrowserStatus.CONNECTING → no status flicker during Turbo navigation.
-    const sibling = this.manager.findHubConnectedSibling(this.getHubId())
-    if (sibling && sibling !== this) {
-      this.identityKey = sibling.identityKey
-      this.browserIdentity = sibling.browserIdentity
-      this.cliStatus = sibling.cliStatus
-      this.connectionMode = sibling.connectionMode
-
-      this.#setupHubEventListeners()
-
-      // Ping transport to cancel any grace period
-      await bridge.send("connectSignaling", {
+    try {
+      await bridge.send("sendPtyInput", {
         hubId: this.getHubId(),
-        browserIdentity: this.browserIdentity,
-      })
-
-      this.#hubConnected = true
-      this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
-
-      await this.#ensureConnected()
-      return
-    }
-
-    // Full signaling setup (first connection to this hub)
-    this.#setBrowserStatus(BrowserStatus.CONNECTING)
-    this.#setState(ConnectionState.CONNECTING)
-
-    const hubId = this.getHubId()
-
-    // 1. Check for an existing trusted pairing (created on /pairing page).
-    // The active Olm session itself may be absent because it is memory-only.
-    const { hasPairing } = await bridge.hasPairing(hubId)
-    if (!hasPairing) {
-      console.debug(`[${this.constructor.name}] No trusted pairing — WebRTC disabled until pairing`)
-    }
-
-    // Get the browser's long-term identity key whenever pairing exists. The
-    // live Olm session may be recreated later from a fresh signed bundle.
-    if (hasPairing) {
-      try {
-        const keyResult = await bridge.getIdentityKey(hubId)
-        this.identityKey = keyResult.identityKey
-      } catch {
-        this.identityKey = null
-      }
-    } else {
-      this.identityKey = null
-    }
-
-    // Browser identity: crypto key when available, anonymous for health-only
-    this.browserIdentity = this.identityKey
-      ? `${this.identityKey}:${HubRoute.tabId}`
-      : `anon:${HubRoute.tabId}`
-
-    // Set up hub-level event listeners BEFORE connecting transport
-    // so we catch the initial health transmit from HubSignalingChannel
-    this.#setupHubEventListeners()
-
-    // 2. Connect ActionCable signaling (health + WebRTC signal relay)
-    // Always connects — browser status tracks WebSocket, not crypto state.
-    const result = await bridge.send("connectSignaling", {
-      hubId,
-      browserIdentity: this.browserIdentity
-    })
-
-    this.#hubConnected = true
-    this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
-
-    // Transport reports peer already connected (grace period cancelled, peer alive).
-    // Seed cliStatus so #ensureConnected() can proceed without waiting for a health
-    // event that won't re-fire (ActionCable channel wasn't re-subscribed).
-    if (result?.state === "connected" && this.cliStatus === CliStatus.UNKNOWN) {
-      this.cliStatus = CliStatus.ONLINE
-    }
-
-    await this.#ensureConnected()  // continues to peer+subscribe if CLI online + pairing exists
-
-    // No trusted pairing — WebRTC unavailable, user must scan connection code.
-    // Use lightweight errorCode (not #setError) to keep browserStatus SUBSCRIBED —
-    // signaling IS connected, only crypto is missing.
-    if (!this.identityKey) {
-      this.errorCode = "unpaired"
-      this.emit("error", { reason: "unpaired", message: "Scan connection code" })
+        subscriptionId: this.subscriptionId,
+        data,
+      });
+      return true;
+    } catch (error) {
+      console.error(`[${this.constructor.name}] PTY send failed:`, error);
+      this.#scheduleReconnect();
+      return false;
     }
   }
 
-  /**
-   * Idempotent entry point for establishing peer + subscription.
-   * Assumes signaling is already connected (or in progress).
-   * Safe to call from any code path: health events, reacquire, send, connectSignaling.
-   *
-   * Does NOT bootstrap signaling — that's initialize()/reacquire()'s job.
-   * If signaling isn't ready yet, this is a no-op; the in-progress
-   * connectSignaling() will call us again when it completes.
-   */
-  async #ensureConnected() {
-    if (this.state === ConnectionState.ERROR) return
-    if (!this.#hubConnected) return  // signaling not ready, nothing to do yet
-    if (!this.identityKey) return    // no trusted pairing/account, WebRTC unavailable
-    if (this.browserStatus !== BrowserStatus.SUBSCRIBED) return  // browser not connected
+  async sendBinaryFile(data, filename) {
+    await this.#ensureConnected();
+    if (!this.subscriptionId) return false;
 
-    const hubId = this.getHubId()
-    const hasActiveSession = await this.#ensureActiveSession()
-    if (!hasActiveSession) return
+    try {
+      await bridge.send("sendFileInput", {
+        hubId: this.getHubId(),
+        subscriptionId: this.subscriptionId,
+        data,
+        filename,
+      });
+      return true;
+    } catch (error) {
+      console.error(`[${this.constructor.name}] File send failed:`, error);
+      this.#scheduleReconnect();
+      return false;
+    }
+  }
 
-    // Step 1: Peer (only if CLI is reachable)
-    if (this.#health.isCliReachable()) {
-      try {
-        await bridge.send("connectPeer", { hubId })  // idempotent + deduped in transport
-      } catch (e) {
-        // Signaling not ready (e.g., ActionCable reconnecting after iOS wake).
-        // The signaling connected callback will trigger health events → retry.
-        if (e.message?.includes("Signaling not connected")) {
-          console.debug(`[${this.constructor.name}] connectPeer deferred (signaling not ready)`)
-          return
-        }
-        throw e
-      }
+  async #ensureMatrix() {
+    const cryptoWorkerUrl = document.querySelector('meta[name="crypto-worker-url"]')?.content;
+    const wasmJsUrl = document.querySelector('meta[name="crypto-wasm-js-url"]')?.content;
+    const wasmBinaryUrl = document.querySelector('meta[name="crypto-wasm-binary-url"]')?.content;
+    await ensureMatrixReady(cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl);
+  }
+
+  async #refreshIdentity() {
+    const hubId = this.getHubId();
+    const { hasPairing } = await bridge.hasPairing(hubId);
+
+    if (!hasPairing) {
+      this.identityKey = null;
+      this.browserIdentity = `anon:${HubRoute.tabId}`;
+      this.errorCode = "unpaired";
+      this.errorReason = "Scan connection code";
+      this.lastError = this.errorReason;
+      this.emit("error", { reason: this.errorCode, message: this.errorReason });
+      return;
     }
 
-    // Step 2: Subscribe virtual channel
-    if (this.#health.isCliReachable() && !this.subscriptionId) {
-      try {
-        await this.subscribe()  // has its own lock, early-returns if subscribed
-      } catch (e) {
-        // Transport failures are retriable. Probe peer health before deciding:
-        // - Peer alive (DC open) but CLI didn't respond → genuinely stale, tear down
-        // - Peer connecting (DC not open yet) → defer, DC onopen will retry
-        // - Peer dead → handlePeerDisconnected will fire naturally
-        if (e.message?.includes("timeout") || e.message?.includes("stale")) {
-          try {
-            const hubId = this.getHubId()
-            const { dcState } = await bridge.send("probePeerHealth", { hubId })
-            if (dcState === "open") {
-              // DC is open but CLI didn't respond — genuinely stale (iOS sleep etc.)
-              console.debug(`[${this.constructor.name}] Peer stale (DC open, CLI unresponsive), tearing down`)
-              await this.#disconnectPeer()
-              this.#schedulePeerReconnect()
-            } else {
-              // DC still connecting — defer, DC onopen will trigger ensureConnected → subscribe
-              console.debug(`[${this.constructor.name}] Subscribe timed out (dc=${dcState}), deferring to DC open`)
-            }
-          } catch {
-            // Worker bridge down — assume peer is dead, tear down
-            console.debug(`[${this.constructor.name}] Probe failed, tearing down peer`)
-            await this.#disconnectPeer()
-            this.#schedulePeerReconnect()
-          }
-          return
-        }
-        if (e.message?.includes("DataChannel") || e.message?.includes("No connection")) {
-          console.debug(`[${this.constructor.name}] Subscribe deferred (peer not ready): ${e.message}`)
-          return
-        }
-        throw e  // Re-throw non-transport errors (auth, crypto, etc.)
+    const keyResult = await bridge.getIdentityKey(hubId);
+    this.identityKey = keyResult.identityKey;
+    this.browserIdentity = `${this.identityKey}:${HubRoute.tabId}`;
+
+    if (this.errorCode === "unpaired" || this.errorCode === "session_invalid") {
+      this.errorCode = null;
+      this.errorReason = null;
+      this.lastError = null;
+    }
+  }
+
+  #bindBridgeListeners() {
+    if (this.#listenersBound) return;
+    this.#listenersBound = true;
+
+    const hubId = this.getHubId();
+
+    // Route gating must use the same browser-socket source as the UI badge.
+    // Otherwise the page can look "browser connected" while ensureConnected()
+    // still believes signaling is unavailable and never attempts WebRTC.
+    observeBrowserSocketState((state) => {
+      if (this.#destroyed) return;
+      this.#setBrowserSocketState(state);
+      if (state === "connected") {
+        this.#ensureConnected().catch(() => {});
+      } else if (!this.isConnected()) {
+        this.#setState(ConnectionState.DISCONNECTED);
       }
+    }).then((cleanup) => {
+      if (this.#destroyed) {
+        cleanup?.();
+        return;
+      }
+      this.#browserSocketObserverCleanup = cleanup;
+    }).catch((error) => {
+      console.error(`[${this.constructor.name}] Failed to observe browser socket state:`, error);
+    });
+
+    this.#unsubscribers.push(
+      bridge.on("signaling:state", (event) => {
+        if (event.hubId !== hubId) return;
+        this.#signalingConnected = event.state === "connected";
+        if (this.#signalingConnected) {
+          this.#ensureConnected().catch(() => {});
+        }
+      }),
+      bridge.on("health", (event) => {
+        if (event.hubId !== hubId) return;
+        // A live health payload can only arrive over an active signaling
+        // subscription, so treat it as proof that signaling is up even if the
+        // ActionCable "connected" callback was missed or delayed.
+        this.#signalingConnected = true;
+        const status = HEALTH_STATUS_MAP[event.cli] || CliStatus.UNKNOWN;
+        this.#setCliStatus(status);
+        if (status === CliStatus.ONLINE) {
+          this.#ensureConnected().catch(() => {});
+        } else if (!this.isConnected()) {
+          this.#setState(ConnectionState.CLI_DISCONNECTED);
+        }
+      }),
+      bridge.on("connection:state", (event) => {
+        if (event.hubId !== hubId) return;
+        if (event.state === "connected") {
+          this.#clearReconnectTimer();
+          if (event.mode) this.#setConnectionMode(event.mode);
+          this.#ensureSubscribed().catch((error) => {
+            console.error(`[${this.constructor.name}] Subscribe failed after peer connect:`, error);
+            this.#scheduleReconnect();
+          });
+        } else {
+          const wasConnected = this.state === ConnectionState.CONNECTED;
+          this.#clearSubscription();
+          this.#setState(ConnectionState.DISCONNECTED);
+          if (wasConnected) {
+            this.emit("disconnected", this);
+          }
+          if (this.browserSocketState === "connected" && this.cliStatus === CliStatus.ONLINE) {
+            this.#scheduleReconnect();
+          }
+        }
+      }),
+      bridge.on("connection:mode", (event) => {
+        if (event.hubId !== hubId) return;
+        this.#setConnectionMode(event.mode || ConnectionMode.UNKNOWN);
+      }),
+      bridge.on("session:invalid", (event) => {
+        if (event.hubId !== hubId) return;
+        this.errorCode = "session_invalid";
+        this.errorReason = event.message || "Session invalid";
+        this.lastError = this.errorReason;
+        this.#clearSubscription();
+        this.#setState(ConnectionState.ERROR);
+        this.emit("error", { reason: this.errorCode, message: this.errorReason });
+      }),
+      bridge.on("session:refreshed", (event) => {
+        if (event.hubId !== hubId) return;
+        if (this.errorCode === "session_invalid") {
+          this.errorCode = null;
+          this.errorReason = null;
+          this.lastError = null;
+          this.#setState(ConnectionState.DISCONNECTED);
+        }
+        this.#ensureConnected().catch(() => {});
+      }),
+    );
+  }
+
+  async #connectSignaling() {
+    if (this.#destroyed) return;
+
+    this.#setState(ConnectionState.CONNECTING);
+
+    const result = await bridge.send("connectSignaling", {
+      hubId: this.getHubId(),
+      browserIdentity: this.browserIdentity,
+    });
+
+    this.#hubConnected = true;
+    this.#setBrowserSocketState(result?.browserSocketState || "disconnected");
+
+    if (result?.state === "connected") {
+      this.#signalingConnected = true;
+      this.#setConnectionMode(result?.mode || this.connectionMode);
+    }
+  }
+
+  async #ensureConnected() {
+    if (this.#destroyed) return;
+    if (this.errorCode === "session_invalid") return;
+    if (!this.#hubConnected) return;
+    if (!this.identityKey) return;
+    // WebRTC is gated only by the raw browser->Rails socket plus live hub
+    // health. If both are ready, attempt the peer even if prior callbacks were
+    // delayed or missed.
+    if (this.browserSocketState !== "connected") return;
+    if (this.cliStatus !== CliStatus.ONLINE) return;
+
+    if (this.subscriptionId) {
+      this.#setState(ConnectionState.CONNECTED);
+      return;
+    }
+
+    if (this.#connectPending) {
+      return this.#connectPending;
+    }
+
+    this.#connectPending = (async () => {
+      this.#setState(ConnectionState.CONNECTING);
+      await this.#ensureActiveSession();
+      await bridge.send("connectPeer", { hubId: this.getHubId() });
+      // Reused shared peers may already be connected and therefore not emit a
+      // fresh connection:state event for this route. Ensure the route's
+      // subscription exists even when connectPeer() is effectively a no-op.
+      await this.#ensureSubscribed();
+    })();
+
+    try {
+      await this.#connectPending;
+    } finally {
+      this.#connectPending = null;
     }
   }
 
   async #ensureActiveSession() {
-    if (this.#sessionPreparationPromise) {
-      return this.#sessionPreparationPromise
+    if (this.#sessionPending) {
+      return this.#sessionPending;
     }
 
-    this.#sessionPreparationPromise = this.#doEnsureActiveSession()
-    try {
-      return await this.#sessionPreparationPromise
-    } finally {
-      this.#sessionPreparationPromise = null
-    }
-  }
+    this.#sessionPending = (async () => {
+      const hubId = this.getHubId();
+      const hasSession = await bridge.hasSession(hubId, this.browserIdentity);
+      if (hasSession.hasSession) return true;
 
-  async #doEnsureActiveSession() {
-    const hubId = this.getHubId()
-    const startedAt = performance.now()
-    const { hasSession } = await bridge.hasSession(hubId, this.browserIdentity)
-    if (hasSession) return true
-    if (!this.#health.isCliReachable()) return false
-
-    const bundleArrived = await bridge.send("awaitFreshBundle", { hubId, timeoutMs: 750 })
-    if (bundleArrived?.refreshed) {
-      const refreshed = await bridge.hasSession(hubId, this.browserIdentity)
-      if (refreshed.hasSession) {
-        console.debug(
-          `[${this.constructor.name}] Fresh session auto-prepared for hub ${hubId} in ${Math.round(performance.now() - startedAt)}ms`,
-        )
+      const bundleArrived = await bridge.send("awaitFreshBundle", {
+        hubId,
+        timeoutMs: 750,
+      });
+      if (!bundleArrived?.refreshed) {
+        await bridge.send("requestFreshBundle", { hubId });
       }
-      return refreshed.hasSession
-    }
 
-    console.debug(`[${this.constructor.name}] No active Olm session after subscribe — requesting fresh bundle`)
-    await bridge.send("requestFreshBundle", { hubId })
+      const refreshed = await bridge.hasSession(hubId, this.browserIdentity);
+      if (!refreshed.hasSession) {
+        throw new Error("No active session");
+      }
+      return true;
+    })();
 
-    const refreshed = await bridge.hasSession(hubId, this.browserIdentity)
-    if (refreshed.hasSession) {
-      console.debug(
-        `[${this.constructor.name}] Fresh session ready for hub ${hubId} in ${Math.round(performance.now() - startedAt)}ms`,
-      )
+    try {
+      return await this.#sessionPending;
+    } finally {
+      this.#sessionPending = null;
     }
-    return refreshed.hasSession
   }
 
-  /**
-   * Tear down WebRTC peer connection (hub went offline).
-   * Keeps ActionCable signaling alive for health events.
-   */
-  async #disconnectPeer() {
-    const hubId = this.getHubId()
-
-    // Abort any in-flight subscribe immediately
-    this.#subscribeAborted = true
-
-    // Stop DC heartbeat
-    this.#stopDcHeartbeat()
-
-    // Unsubscribe virtual channel first
+  async #ensureSubscribed() {
     if (this.subscriptionId) {
-      await this.unsubscribe()
+      this.#setState(ConnectionState.CONNECTED);
+      return;
     }
 
-    // Close WebRTC peer only from the hub-liveness owner.
-    // Other typed connections share the same transport and should only
-    // clear their own subscription state.
-    if (this.#isLivenessOwner()) {
-      bridge.send("disconnectPeer", { hubId }).catch(() => {})
+    if (this.#subscriptionPending) {
+      return this.#subscriptionPending;
     }
 
-    this.#handshake.reset()
+    this.subscriptionId = this.computeSubscriptionId();
+    this.#setupSubscriptionListeners();
 
-    // Cancel any pending peer reconnect so next online transition starts fresh
-    if (this.#peerReconnectTimer) {
-      clearTimeout(this.#peerReconnectTimer)
-      this.#peerReconnectTimer = null
-    }
-  }
-
-  /**
-   * Subscribe to the channel. Creates a new subscription in the worker,
-   * which triggers Rails subscribed callback and CLI handshake.
-   *
-   * @param {Object} options
-   * @param {boolean} options.force - If true, unsubscribe existing subscription first
-   *                                  to get fresh handshake. Default false.
-   */
-  async subscribe({ force = false } = {}) {
-    if (!this.#hubConnected) {
-      this.#logHubSubscribe("blocked", "hub_not_connected", { force })
-      throw new Error("Cannot subscribe: hub not connected")
-    }
-
-    // If already subscribed and not forcing refresh, ensure status is correct and return
-    if (this.subscriptionId && !force) {
-      this.#logHubSubscribe("blocked", "already_subscribed", {
-        force,
-        subscriptionId: this.subscriptionId,
-      })
-      if (this.browserStatus !== BrowserStatus.SUBSCRIBED) this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
-      this.#health.emitHealthChange()
-      return
-    }
-
-    // Wait for any in-progress subscribe/unsubscribe
-    if (this.#subscribing) {
-      this.#logHubSubscribe("blocked", "subscribe_lock_wait", { force })
-      await this.#subscribeLock
-      // Re-check after waiting - another caller might have subscribed
-      if (this.subscriptionId && !force) {
-        this.#logHubSubscribe("blocked", "already_subscribed_after_wait", {
-          force,
-          subscriptionId: this.subscriptionId,
-        })
-        if (this.browserStatus !== BrowserStatus.SUBSCRIBED) this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
-        this.#health.emitHealthChange()
-        return
-      }
-    }
-
-    this.#subscribing = true
-    this.#subscribeAborted = false
-    this.#subscribeLock = new Promise(resolve => { this.#subscribeLockResolve = resolve })
-
-    try {
-      // Unsubscribe first if forcing refresh
-      if (this.subscriptionId && force) {
-        await this.#doUnsubscribe()
-      }
-
-      // Reset handshake state for fresh connection.
-      // Don't reset cliStatus — it's managed by HealthTracker via health events.
-      this.#handshake.reset()
-
-      const hubId = this.getHubId()
-
-      // Compute semantic subscription ID from channel + params
-      // This allows both sides to derive the same ID independently
-      const subscriptionId = this.computeSubscriptionId()
-      const params = this.channelParams()
-      this.#logHubSubscribe("sending", "subscribe_request", { force, subscriptionId })
-
-      // Register listener BEFORE sending subscribe so scrollback chunks
-      // that arrive immediately after CLI confirms aren't dropped.
-      // Without this, the CLI can send snapshot data between the
-      // "subscribed" confirmation and listener registration — a race
-      // that causes missing scrollback on slow clients (phones).
-      this.subscriptionId = subscriptionId
-      this.#setupSubscriptionEventListeners()
-
-      await this.#acquireSharedSubscription({
-        hubId,
-        channel: this.channelName(),
-        params,
-        subscriptionId,
-      })
-
-      // WebRTC: DataChannel open = ready, complete handshake FIRST
-      // so input isn't buffered when listeners fire
-      this.#onHandshakeComplete()
-      this.#logHubSubscribe("sent", "subscribe_confirmed", { force, subscriptionId })
-
-      this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
-      this.#setState(ConnectionState.CONNECTED)
-      this.emit("subscribed", this)
-    } catch (e) {
-      this.#logHubSubscribe("error", "subscribe_failed", {
-        force,
-        error: e?.message || String(e),
-      })
-      // Subscribe failed — clean up the listener we registered eagerly
-      this.#clearSubscriptionEventListeners()
-      this.subscriptionId = null
-      await this.#releaseSharedSubscription({ immediate: true, keepRemote: true })
-      throw e
-    } finally {
-      this.#subscribing = false
-      this.#subscribeLockResolve?.()
-    }
-  }
-
-  /**
-   * Unsubscribe from the channel. Keeps the shared hub transport alive.
-   * Call this when controller disconnects during navigation.
-   */
-  async unsubscribe() {
-    // Wait for any in-progress subscribe to complete
-    if (this.#subscribing) {
-      await this.#subscribeLock
-    }
-
-    if (!this.subscriptionId) return
-
-    this.#subscribing = true
-    this.#subscribeLock = new Promise(resolve => { this.#subscribeLockResolve = resolve })
-    try {
-      await this.#doUnsubscribe()
-    } finally {
-      this.#subscribing = false
-      this.#subscribeLockResolve?.()
-    }
-  }
-
-  /**
-   * Internal unsubscribe implementation (no locking).
-   */
-  async #doUnsubscribe() {
-    if (!this.subscriptionId) return
-
-    // Capture and clear subscriptionId FIRST to prevent race conditions
-    // where send() tries to use it while we're unsubscribing
-    const oldSubscriptionId = this.subscriptionId
-    this.#logHubSubscribe("sending", "unsubscribe_request", { subscriptionId: oldSubscriptionId })
-    this.subscriptionId = null
-
-    // Back to CONNECTING state (hub still connected, but not subscribed)
-    // Browser status stays green — WebSocket is still up
-    this.#setState(ConnectionState.CONNECTING)
-
-    // Clean up subscription event listeners
-    this.#clearSubscriptionEventListeners()
-
-    await this.#releaseSharedSubscription({ immediate: true })
-    this.#logHubSubscribe("sent", "unsubscribe_released", { subscriptionId: oldSubscriptionId })
-  }
-
-  async #acquireSharedSubscription({ hubId, channel, params, subscriptionId }) {
-    const leaseKey = `${hubId}:${subscriptionId}`
-    let entry = HubRoute.#sharedSubscriptions.get(leaseKey)
-    const created = !entry
-
-    if (!entry) {
-      entry = {
-        hubId,
-        channel,
-        params,
-        subscriptionId,
-        refCount: 0,
-        idleTimer: null,
-        promise: null,
-      }
-      HubRoute.#sharedSubscriptions.set(leaseKey, entry)
-    }
-
-    entry.refCount += 1
-    if (entry.idleTimer) {
-      clearTimeout(entry.idleTimer)
-      entry.idleTimer = null
-    }
-    this.#subscriptionLeaseKey = leaseKey
-
-    if (created) {
-      console.debug(`[${this.constructor.name}] Shared sub acquire new: ${leaseKey}`)
-      entry.promise = this.#sendSubscribeRequest({ hubId, channel, params, subscriptionId })
-        .finally(() => {
-          if (HubRoute.#sharedSubscriptions.get(leaseKey) === entry) {
-            entry.promise = null
-          }
-        })
-    } else {
-      console.debug(`[${this.constructor.name}] Shared sub acquire reuse: ${leaseKey} refs=${entry.refCount}`)
-    }
-
-    if (entry.promise) {
-      try {
-        await entry.promise
-      } catch (e) {
-        // Roll back this lease acquisition on subscribe failure.
-        this.#subscriptionLeaseKey = null
-        entry.refCount = Math.max(0, entry.refCount - 1)
-        if (entry.refCount === 0) {
-          HubRoute.#sharedSubscriptions.delete(leaseKey)
-        }
-        throw e
-      }
-    }
-  }
-
-  async #sendSubscribeRequest({ hubId, channel, params, subscriptionId }) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        // On timeout, check DC state immediately — if DC is closed,
-        // reject fast instead of waiting for the probe cycle.
-        reject(new Error("Subscribe timeout — peer may be stale"))
-      }, 3000)
-
-      // Check abort flag periodically so #disconnectPeer() can break
-      // us out without waiting for the full timeout.
-      const abortCheck = setInterval(() => {
-        if (this.#subscribeAborted) {
-          clearInterval(abortCheck)
-          clearTimeout(timer)
-          reject(new Error("Subscribe aborted — peer disconnecting"))
-        }
-      }, 100)
-
-      bridge.send("subscribe", {
-        hubId,
-        channel,
-        params,
-        subscriptionId,
-      }).then(
-        (v) => { clearInterval(abortCheck); clearTimeout(timer); resolve(v) },
-        (e) => { clearInterval(abortCheck); clearTimeout(timer); reject(e) },
-      )
-    })
-  }
-
-  async #releaseSharedSubscription({ immediate = false, keepRemote = false } = {}) {
-    const leaseKey = this.#subscriptionLeaseKey
-    this.#subscriptionLeaseKey = null
-    if (!leaseKey) return
-
-    const entry = HubRoute.#sharedSubscriptions.get(leaseKey)
-    if (!entry) return
-
-    entry.refCount = Math.max(0, entry.refCount - 1)
-    if (entry.refCount > 0) return
-
-    const finalize = async () => {
-      if (HubRoute.#sharedSubscriptions.get(leaseKey) !== entry) return
-      if (entry.refCount > 0) return
-
-      HubRoute.#sharedSubscriptions.delete(leaseKey)
-      if (!keepRemote) {
-        try {
-          await bridge.send("unsubscribe", { subscriptionId: entry.subscriptionId })
-          console.debug(`[${this.constructor.name}] Shared sub released: ${leaseKey}`)
-        } catch (e) {
-          console.warn(`[${this.constructor.name}] Unsubscribe error (ignored):`, e)
-        }
-      } else {
-        console.debug(`[${this.constructor.name}] Shared sub dropped local: ${leaseKey}`)
-      }
-      bridge.clearSubscriptionListeners(entry.subscriptionId)
-    }
-
-    if (immediate) {
-      if (entry.idleTimer) {
-        clearTimeout(entry.idleTimer)
-        entry.idleTimer = null
-      }
-      await finalize()
-      return
-    }
-
-    if (entry.idleTimer) return
-    console.debug(
-      `[${this.constructor.name}] Shared sub idle timer start: ${leaseKey} (${HubRoute.SUBSCRIPTION_IDLE_UNSUBSCRIBE_MS}ms)`,
-    )
-    entry.idleTimer = setTimeout(() => {
-      entry.idleTimer = null
-      finalize().catch(() => {})
-    }, HubRoute.SUBSCRIPTION_IDLE_UNSUBSCRIBE_MS)
-  }
-
-  /**
-   * Set up listeners for hub-level events (connection state, session invalid).
-   * These persist across subscribe/unsubscribe cycles.
-   */
-  #setupHubEventListeners() {
-    const hubId = this.getHubId()
-    const unsubs = setupHubEventListeners(bridge, hubId, {
-      // Event system
-      emit: (event, data) => this.emit(event, data),
-      log: (msg) => console.debug(`[${this.constructor.name}] ${msg}`),
-
-      // State queries
-      isSessionInvalid: () => this.state === ConnectionState.ERROR && this.errorCode === "session_invalid",
-      isCliReachable: () => this.#health.isCliReachable(),
-      hasSubscription: () => !!this.subscriptionId,
-      getErrorCode: () => this.errorCode,
-      getBrowserStatus: () => this.browserStatus,
-
-      // Subscription cleanup
-      clearStaleSubscription: () => {
-        if (this.subscriptionId) {
-          this.#releaseSharedSubscription({ immediate: true, keepRemote: true }).catch(() => {})
-          this.#clearSubscriptionEventListeners()
-          this.subscriptionId = null
-          this.#handshake.reset()
-        }
-      },
-
-      // Peer reconnection
-      schedulePeerReconnect: () => this.#schedulePeerReconnect(),
-      cancelPeerReconnect: () => this.#cancelPeerReconnect(),
-
-      // State setters
-      setConnectionMode: (m) => this.#setConnectionMode(m),
-      setBrowserStatus: (s) => this.#setBrowserStatus(s),
-
-      // Health probe
-      probePeerHealth: () => bridge.send("probePeerHealth", { hubId }),
-
-      // Lifecycle
-      ensureConnected: () => this.#ensureConnected().catch(() => {}),
-      ensureConnectedAsync: () => this.#ensureConnected(),
-      disconnectPeer: () => this.#disconnectPeer(),
-      handleHealthMessage: (msg) => this.#health.handleHealthMessage(msg),
-      probeOnVisibility: (opts = {}) => this.#probeOnVisibility(0, opts),
-
-      // Session errors
-      clearIdentity: () => { this.identityKey = null },
-      setError: (code, msg) => {
-        this.errorCode = code
-        this.errorReason = msg
-        this.#setState(ConnectionState.ERROR)
-        this.emit("error", { reason: code, message: msg })
-      },
-      clearSessionError: async () => {
-        if (this.errorCode !== "session_invalid") return
-        this.errorCode = null
-        this.errorReason = null
-        // Restore identity key from SharedWorker (still persisted in IDB)
-        try {
-          const hubId = this.getHubId()
-          const keyResult = await bridge.getIdentityKey(hubId)
-          this.identityKey = keyResult.identityKey
-          this.browserIdentity = `${this.identityKey}:${HubRoute.tabId}`
-          this.#setState(ConnectionState.DISCONNECTED)
-          this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
-        } catch {
-          // Identity key not recoverable — user must re-pair
-        }
-      },
-    })
-    this.#unsubscribers.push(...unsubs)
-  }
-
-  /** Schedule peer reconnect with exponential backoff. */
-  #schedulePeerReconnect() {
-    if (!this.#isLivenessOwner()) return
-    if (this.#peerReconnectTimer) return
-    this.#peerReconnectAttempts++
-
-    if (this.#peerReconnectAttempts > 5) {
-      console.debug(`[${this.constructor.name}] Peer reconnect exhausted after ${this.#peerReconnectAttempts} attempts, scheduling nuclear fallback`)
-      this.#scheduleNuclearReconnect()
-      return
-    }
-
-    const delay = Math.min(2000 * Math.pow(1.5, this.#peerReconnectAttempts - 1), 15000)
-    this.#peerReconnectTimer = setTimeout(() => {
-      this.#peerReconnectTimer = null
-      if (!this.#handshake.complete) {
-        console.debug(`[${this.constructor.name}] Peer lost but hub online, reconnecting peer (attempt ${this.#peerReconnectAttempts})...`)
-        this.#ensureConnected().catch(() => {})
-      }
-    }, delay)
-  }
-
-  /**
-   * Nuclear fallback: when normal reconnect attempts are exhausted,
-   * schedule a full teardown + reconnect every 30s. Recovers from
-   * states where health events stop arriving (frozen WebRTC, etc.).
-   */
-  #scheduleNuclearReconnect() {
-    if (this.#nuclearReconnectTimer) return
-
-    this.#nuclearReconnectTimer = setTimeout(() => {
-      this.#nuclearReconnectTimer = null
-      if (this.#handshake.complete) return // already recovered
-
-      console.debug(`[${this.constructor.name}] Nuclear reconnect: full teardown + reconnect`)
-      this.#peerReconnectAttempts = 0
-      this.#disconnectPeer().then(() => this.#ensureConnected()).catch(() => {})
-    }, 30000)
-  }
-
-  /** Cancel pending peer reconnect timer. */
-  #cancelPeerReconnect() {
-    if (this.#peerReconnectTimer) {
-      clearTimeout(this.#peerReconnectTimer)
-      this.#peerReconnectTimer = null
-    }
-    if (this.#nuclearReconnectTimer) {
-      clearTimeout(this.#nuclearReconnectTimer)
-      this.#nuclearReconnectTimer = null
-    }
-    this.#peerReconnectAttempts = 0
-  }
-
-  /**
-   * Set up listeners for subscription-specific events.
-   * These are cleared on unsubscribe().
-   */
-  #setupSubscriptionEventListeners() {
-    // Listen for subscription messages
-    // Transport layer handles decryption - we receive plaintext here
-    const unsubMsg = bridge.onSubscriptionMessage(this.subscriptionId, async (message) => {
-      // Raw binary data (Uint8Array) from PTY output
-      if (message instanceof Uint8Array) {
-        this.handleMessage({ type: "raw_output", data: message })
-        return
-      }
-
-      // Decrypted message from transport
-      this.handleMessage(message)
-    })
-    this.#subscriptionUnsubscribers.push(unsubMsg)
-
-    // Listen for subscription rejected
-    const unsubRejected = bridge.on("subscription:rejected", (event) => {
-      if (event.subscriptionId !== this.subscriptionId) return
-      this.#setError("subscription_rejected", event.reason || "Subscription rejected")
-    })
-    this.#subscriptionUnsubscribers.push(unsubRejected)
-  }
-
-  #clearSubscriptionEventListeners() {
-    for (const unsub of this.#subscriptionUnsubscribers) {
-      unsub()
-    }
-    this.#subscriptionUnsubscribers = []
-  }
-
-  #logHubSubscribe(stage, reason, extra = {}) {
-    if (this.channelName() !== "hub") return
-    console.debug(`[${this.constructor.name}] Hub subscribe ${stage}: ${reason}`, {
-      key: this.key,
+    this.#subscriptionPending = bridge.send("subscribe", {
+      hubId: this.getHubId(),
+      channel: this.channelName(),
+      params: this.channelParams(),
       subscriptionId: this.subscriptionId,
-      state: this.state,
-      browserStatus: this.browserStatus,
-      ...extra,
-    })
+    }).then(() => {
+      this.#setState(ConnectionState.CONNECTED);
+      this.emit("connected", this);
+    }).catch((error) => {
+      this.#clearSubscription();
+      throw error;
+    }).finally(() => {
+      this.#subscriptionPending = null;
+    });
+
+    return this.#subscriptionPending;
   }
 
-  /**
-   * Destroy the connection. Called by HubConnectionManager.destroy().
-   * Unsubscribes from channel, disconnects hub, cleans up everything.
-   * NOTE: Cleanup is done asynchronously to avoid blocking other operations.
-   */
-  destroy() {
-    // Remove visibility handler and cancel any pending probe
-    if (this.#visibilityHandler) {
-      document.removeEventListener("visibilitychange", this.#visibilityHandler)
-      this.#visibilityHandler = null
+  #setupSubscriptionListeners() {
+    this.#clearSubscriptionListeners();
+
+    const subscriptionId = this.subscriptionId;
+    if (!subscriptionId) return;
+
+    this.#subscriptionListeners.push(
+      bridge.onSubscriptionMessage(subscriptionId, (message) => {
+        if (message instanceof Uint8Array) {
+          this.handleMessage({ type: "raw_output", data: message });
+          return;
+        }
+
+        if (this.processMessage(message)) return;
+        this.handleMessage(message);
+      }),
+    );
+  }
+
+  #clearSubscriptionListeners() {
+    for (const unsubscribe of this.#subscriptionListeners) {
+      unsubscribe();
     }
-    if (this.#visibilityProbeTimer) {
-      clearTimeout(this.#visibilityProbeTimer)
-      this.#visibilityProbeTimer = null
-    }
+    this.#subscriptionListeners = [];
+  }
 
-    // Cancel any pending init retry
-    if (this.#initRetryTimer) {
-      clearTimeout(this.#initRetryTimer)
-      this.#initRetryTimer = null
-    }
-
-    // Cancel any pending peer reconnect
-    if (this.#peerReconnectTimer) {
-      clearTimeout(this.#peerReconnectTimer)
-      this.#peerReconnectTimer = null
-    }
-
-    // Cancel nuclear reconnect timer
-    if (this.#nuclearReconnectTimer) {
-      clearTimeout(this.#nuclearReconnectTimer)
-      this.#nuclearReconnectTimer = null
-    }
-
-    // Stop DC heartbeat
-    this.#stopDcHeartbeat()
-
-    // Cancel debounced ensureConnected
-    if (this.#ensureConnectedDebounceTimer) {
-      clearTimeout(this.#ensureConnectedDebounceTimer)
-      this.#ensureConnectedDebounceTimer = null
-    }
-
-    // Clear state immediately to prevent any new operations
-    const oldSubscriptionId = this.subscriptionId
-    const hubId = this.getHubId()
-    const wasHubConnected = this.#hubConnected
-
-    this.subscriptionId = null
-    this.#hubConnected = false
-    this.identityKey = null
-    this.browserIdentity = null
-
-    // Cleanup hub event listeners
-    for (const unsub of this.#unsubscribers) {
-      unsub()
-    }
-    this.#unsubscribers = []
-    this.#clearSubscriptionEventListeners()
-
-    this.browserStatus = BrowserStatus.DISCONNECTED
-    this.cliStatus = CliStatus.UNKNOWN
-    this.#setState(ConnectionState.DISCONNECTED)
-    this.emit("destroyed")
-    this.subscribers.clear()
-
-    // Async cleanup - fire and forget to avoid blocking.
-    // Shared subscription lease handles refcount + delayed unsubscribe.
-    if (oldSubscriptionId) {
-      this.#releaseSharedSubscription({ immediate: true }).catch(() => {})
-    }
-
-    if (hubId && wasHubConnected) {
-      // Only disconnect shared transport if no other active connection for
-      // this hub remains. HubTransport/TerminalConnection/PreviewConnection
-      // all share one transport-level WebRTC connection.
-      if (!this.manager.hasActiveConnectionForHub(hubId)) {
-        bridge.send("disconnect", { hubId }).catch(() => {})
-      }
+  #clearSubscription() {
+    const subscriptionId = this.subscriptionId;
+    this.subscriptionId = null;
+    this.#clearSubscriptionListeners();
+    if (subscriptionId) {
+      bridge.clearSubscriptionListeners(subscriptionId);
+      bridge.send("unsubscribe", { subscriptionId }).catch(() => {});
     }
   }
 
-  /**
-   * Release this connection (decrement ref count).
-   * Called by controllers in their disconnect().
-   */
-  release() {
-    this.manager.release(this.key)
-  }
-
-  /**
-   * Notify transport that this connection is idle (refCount hit 0).
-   * Starts a grace period - connection closes after ~3s if not reacquired.
-   * Called by HubConnectionManager.release() when refCount becomes 0.
-   */
-  notifyIdle() {
-    const hubId = this.getHubId()
-    if (hubId && this.#hubConnected) {
-      // Don't start a grace period if another connection sharing this hubId
-      // is still active. Multiple connection types (HubTransport,
-      // TerminalConnection) share the same transport-level WebRTC connection.
-      // Without this check, a stale TerminalConnection's notifyIdle can start
-      // a NEW grace period after a HubTransport reacquire already cancelled
-      // the previous one, causing the shared connection to close.
-      if (this.manager.hasActiveConnectionForHub(hubId)) return
-
-      // Tell transport to start the grace period for this shared hub transport.
-      // If reacquired before grace period expires, connection is reused.
-      bridge.send("disconnect", { hubId }).catch(() => {})
-    }
-  }
-
-  /**
-   * Notify worker that this connection is being reacquired.
-   * Cancels any pending grace period in the worker.
-   * Called by HubConnectionManager.acquire() when reusing a wrapper.
-   *
-   * Serialized: if multiple controllers call acquire() concurrently,
-   * they share the same reacquire work instead of each clearing
-   * and re-creating the subscription.
-   */
-  async reacquire() {
-    if (this.#reacquirePromise) {
-      return this.#reacquirePromise
-    }
-    this.#reacquirePromise = this.#doReacquire()
-    try {
-      return await this.#reacquirePromise
-    } finally {
-      this.#reacquirePromise = null
-    }
-  }
-
-  async #doReacquire() {
-    const hubId = this.getHubId()
-    if (!hubId) return
-
-    const hadRecoverablePairingError =
-      this.state === ConnectionState.ERROR &&
-      (this.errorCode === "unpaired" || this.errorCode === "session_invalid")
-
-    // Cancel grace period FIRST by touching signaling, before any async
-    // SharedWorker calls. connectSignaling is idempotent — returns existing
-    // state if connected, creates a new channel if the grace timer already
-    // destroyed it. This prevents the 3s grace timer from racing with the
-    // paired-state round-trip to the crypto SharedWorker.
-    const result = await bridge.send("connectSignaling", {
-      hubId,
-      browserIdentity: this.browserIdentity
-    })
-    this.#hubConnected = true
-
-    const { hasPairing } = await bridge.hasPairing(hubId)
-
-    if (!hasPairing) {
-      this.#hubConnected = false
-      this.#releaseSharedSubscription({ immediate: true, keepRemote: true }).catch(() => {})
-      this.subscriptionId = null
-      this.identityKey = null
-      this.#setError("unpaired", "Scan connection code")
-      return
-    }
-
-    try {
-      const keyResult = await bridge.getIdentityKey(hubId)
-      this.identityKey = keyResult.identityKey
-      this.browserIdentity = `${this.identityKey}:${HubRoute.tabId}`
-    } catch {
-      this.#hubConnected = false
-      this.#releaseSharedSubscription({ immediate: true, keepRemote: true }).catch(() => {})
-      this.subscriptionId = null
-      this.identityKey = null
-      this.#setError("unpaired", "Scan connection code")
-      return
-    }
-
-    // Seed cliStatus from transport if no health event has updated it yet
-    if (result?.state === "connected" && this.cliStatus === CliStatus.UNKNOWN) {
-      this.cliStatus = CliStatus.ONLINE
-    }
-
-    if (hadRecoverablePairingError) {
-      this.#setState(ConnectionState.DISCONNECTED)
-      this.#setBrowserStatus(BrowserStatus.SUBSCRIBED)
-    }
-
-    // Keep subscription across quick reacquire cycles so Turbo navigation can
-    // reuse active routes without churn; peer disconnect events still clear
-    // stale subscriptions via clearStaleSubscription().
-    await this.#ensureConnected()
-  }
-
-  // ========== Abstract methods (override in subclasses) ==========
-
-  /**
-   * Virtual channel name for CLI routing (e.g., "TerminalRelayChannel", "HubChannel").
-   * @returns {string}
-   */
-  channelName() {
-    throw new Error("Subclass must implement channelName()")
-  }
-
-  /**
-   * Subscription params for the channel.
-   * @returns {Object}
-   */
-  channelParams() {
-    throw new Error("Subclass must implement channelParams()")
-  }
-
-  /**
-   * Compute semantic subscription ID from channel + params.
-   * Override in subclasses for domain-specific IDs.
-   * Default: channel name (works for singleton subscriptions like hub).
-   * @returns {string}
-   */
-  computeSubscriptionId() {
-    return this.channelName()
-  }
-
-  /**
-   * Extract hubId from options. Override if hubId comes from elsewhere.
-   * @returns {string}
-   */
-  getHubId() {
-    return this.options.hubId
-  }
-
-  /**
-   * Handle a decrypted message. Subclasses route to domain-specific events.
-   * Base class handles handshake protocol; subclasses handle domain-specific messages.
-   * @param {Object} message
-   */
-  handleMessage(message) {
-    // Handle handshake/health messages first
-    if (this.processMessage(message)) {
-      return
-    }
-    // Default: emit as generic message
-    this.emit("message", message)
-  }
-
-  // ========== Public API ==========
-
-  /**
-   * Send an Olm-encrypted message through the transport worker.
-   * Encrypts via crypto worker, then sends as binary on DataChannel.
-   * @private
-   */
   async #sendEncrypted(message) {
-    const hubId = this.getHubId()
-    const fullMessage = { subscriptionId: this.subscriptionId, ...message }
-
-    // Binary inner: [0x00][JSON bytes] (control message)
-    const jsonBytes = new TextEncoder().encode(JSON.stringify(fullMessage))
-    const plaintext = new Uint8Array(1 + jsonBytes.length)
-    plaintext[0] = 0x00 // CONTENT_MSG
-    plaintext.set(jsonBytes, 1)
-
-    const { data: encrypted } = await bridge.encryptBinary(hubId, plaintext)
-    await bridge.send("sendEncrypted", { hubId, encrypted })
-  }
-
-  /**
-   * Send a message through the secure channel.
-   * Auto-resubscribes if subscription is stale (e.g., after wake from sleep).
-   * @param {string} type - Message type
-   * @param {Object} data - Message payload
-   * @returns {Promise<boolean>}
-   */
-  async send(type, data = {}) {
-    // Auto-heal: if not subscribed, try to connect
     if (!this.subscriptionId) {
-      await this.#ensureConnected()
-      if (!this.subscriptionId) return false  // still no luck
+      throw new Error("No subscription");
     }
 
-    try {
-      await this.#sendEncrypted({ type, ...data })
-      return true
-    } catch (error) {
-      // Stale subscription (e.g., SharedWorker restarted during sleep).
-      // Clear it and reconnect — #ensureConnected() will re-subscribe.
-      if (error.message?.includes("not found") && this.subscriptionId) {
-        console.debug(`[${this.constructor.name}] Subscription stale, reconnecting`)
-        this.#releaseSharedSubscription({ immediate: true, keepRemote: true }).catch(() => {})
-        this.subscriptionId = null
-        this.#clearSubscriptionEventListeners()
+    const fullMessage = {
+      subscriptionId: this.subscriptionId,
+      ...message,
+    };
 
-        await this.#ensureConnected()
-        if (!this.subscriptionId) return false
+    const jsonBytes = new TextEncoder().encode(JSON.stringify(fullMessage));
+    const plaintext = new Uint8Array(1 + jsonBytes.length);
+    plaintext[0] = 0x00;
+    plaintext.set(jsonBytes, 1);
 
-        // Retry the send once after reconnecting
-        try {
-          await this.#sendEncrypted({ type, ...data })
-          return true
-        } catch (retryError) {
-          return false
-        }
-      }
-
-      console.error(`[${this.constructor.name}] Send failed:`, error)
-      return false
-    }
+    const { data: encrypted } = await bridge.encryptBinary(this.getHubId(), plaintext);
+    await bridge.send("sendEncrypted", { hubId: this.getHubId(), encrypted });
   }
 
-  /**
-   * Send binary PTY data through the encrypted channel.
-   * Bypasses JSON serialization for the keystroke hot path.
-   * @param {string|Uint8Array} data - Raw PTY input data
-   * @returns {Promise<boolean>}
-   */
-  async sendBinaryPty(data) {
-    if (!this.subscriptionId) {
-      await this.#ensureConnected()
-      if (!this.subscriptionId) return false
-    }
+  #scheduleReconnect() {
+    if (this.#reconnectTimer || this.#destroyed) return;
 
-    try {
-      const hubId = this.getHubId()
-      await bridge.send("sendPtyInput", {
-        hubId,
-        subscriptionId: this.subscriptionId,
-        data,
-      })
-      return true
-    } catch (error) {
-      console.error(`[${this.constructor.name}] sendBinaryPty failed:`, error)
-      return false
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = null;
+      this.#ensureConnected().catch(() => {});
+    }, RECONNECT_DELAY_MS);
+  }
+
+  #clearReconnectTimer() {
+    if (this.#reconnectTimer) {
+      clearTimeout(this.#reconnectTimer);
+      this.#reconnectTimer = null;
     }
   }
 
-  /**
-   * Send a file (image paste/drop) through the encrypted channel.
-   * @param {Uint8Array} data - Raw file bytes
-   * @param {string} filename - Original filename
-   * @returns {Promise<boolean>}
-   */
-  async sendBinaryFile(data, filename) {
-    if (!this.subscriptionId) {
-      await this.#ensureConnected()
-      if (!this.subscriptionId) return false
+  #setState(nextState) {
+    const prevState = this.state;
+    if (nextState === prevState) return;
+
+    this.state = nextState;
+    if (nextState !== ConnectionState.ERROR) {
+      this.lastError = this.errorReason;
     }
 
-    try {
-      const hubId = this.getHubId()
-      await bridge.send("sendFileInput", {
-        hubId,
-        subscriptionId: this.subscriptionId,
-        data,
-        filename,
-      })
-      return true
-    } catch (error) {
-      console.error(`[${this.constructor.name}] sendBinaryFile failed:`, error)
-      return false
-    }
+    const stateInfo = { state: nextState, prevState, error: this.errorReason };
+    this.emit("stateChange", stateInfo);
+    this.manager.notifySubscribers(this.key, stateInfo);
   }
 
-  /**
-   * Process incoming message, handling health/status/handshake messages before subclass routing.
-   * Subclasses should call super.processMessage(message) or handle these themselves.
-   * @param {Object} message - Decrypted message
-   * @returns {boolean} - True if message was handled, false otherwise
-   */
-  processMessage(message) {
-    if (message.type === "health") {
-      console.debug(`[${this.constructor.name}] Received health message:`, message)
-      this.#health.handleHealthMessage(message)
-      return true
-    }
-    if (message.type === "connected") {
-      console.debug(`[${this.constructor.name}] Received handshake from CLI:`, message.device_name)
-      this.#handshake.handleIncoming(message)
-      return true
-    }
-    if (message.type === "ack") {
-      this.#handshake.handleAck(message)
-      return true
-    }
-    if (message.type === "cli_disconnected") {
-      this.#health.handleCliDisconnected()
-      return true
-    }
-    // DC heartbeat: respond to CLI pings, track CLI pongs
-    if (message.type === "dc_ping") {
-      if (this.#isLivenessOwner()) {
-        this.send("dc_pong").catch(() => {})
-      }
-      return true
-    }
-    if (message.type === "dc_pong") {
-      if (this.#isLivenessOwner()) {
-        this.#dcMissedPings = 0
-        this.#lastDcPongAt = Date.now()
-        this.#visibilityPongReceived = true
-        if (this.#visibilityProbeTimer) {
-          clearTimeout(this.#visibilityProbeTimer)
-          this.#visibilityProbeTimer = null
-        }
-      }
-      return true
-    }
-    return false
+  #setBrowserSocketState(nextState) {
+    const prevState = this.browserSocketState;
+    if (nextState === prevState) return;
+    this.browserSocketState = nextState;
+    this.emit("browserSocketStateChange", { status: nextState, prevStatus: prevState });
   }
 
-  // ========== Handshake Callback ==========
-
-  /**
-   * Called by HandshakeManager when handshake completes (via onComplete callback).
-   * Also called directly from subscribe() since DataChannel is already open.
-   */
-  #onHandshakeComplete() {
-    // Update CLI status to CONNECTED — definitive "CLI is talking to us" signal.
-    // Health messages via ActionCable may lag behind actual WebRTC state.
-    this.cliStatus = CliStatus.CONNECTED
-    this.#setState(ConnectionState.CONNECTED)
-    this.#health.emitHealthChange()
-    this.emit("connected", this)
-
-    // Start hub-level liveness checks from the owner only.
-    this.#startDcHeartbeat()
+  #setCliStatus(nextStatus) {
+    const prevStatus = this.cliStatus;
+    if (nextStatus === prevStatus) return;
+    this.cliStatus = nextStatus;
+    this.emit("cliStatusChange", { status: nextStatus, prevStatus });
   }
 
-  // ========== DataChannel Heartbeat ==========
-
-  /**
-   * Probe the DataChannel immediately on page-visibility restore.
-   *
-   * iOS (and some Android) browsers report PC/DC as "connected/open" for
-   * several seconds after phone unlock even when the ICE path is dead. A
-   * regular #ensureConnected() call sees a healthy-looking peer and returns
-   * early. This method sends an immediate ping and waits 2s for a pong —
-   * if none arrives the connection is torn down for a fresh reconnect.
-   *
-   * Falls back to #ensureConnected() when not in CONNECTED state (cold start,
-   * already disconnected, etc.).
-   */
-  #probeOnVisibility(hiddenForMs = 0, options = {}) {
-    const force = options.force === true
-    const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 2000
-    const reason = options.reason || "visibility"
-
-    if (!this.#isLivenessOwner()) return
-    if (this.state !== ConnectionState.CONNECTED) {
-      this.#ensureConnected().catch(() => {})
-      return
-    }
-
-    // Ignore quick tab-switch visibility flips. We only need this probe after
-    // meaningful background time (phone unlock, app resume, long tab idle).
-    if (!force && hiddenForMs < 5000) {
-      return
-    }
-
-    // Recent heartbeat pong means DC is healthy; avoid extra probe traffic and
-    // false reconnects when users bounce between hub/pty views.
-    const sinceLastPong = Date.now() - this.#lastDcPongAt
-    if (!force && this.#lastDcPongAt > 0 && sinceLastPong < 12000) {
-      return
-    }
-
-    // Cancel any previous probe that hasn't resolved yet.
-    if (this.#visibilityProbeTimer) {
-      clearTimeout(this.#visibilityProbeTimer)
-      this.#visibilityProbeTimer = null
-    }
-
-    this.#visibilityPongReceived = false
-
-    this.#sendEncrypted({ type: "dc_ping" }).then(() => {
-      this.#dcMissedPings++
-      this.#visibilityProbeTimer = setTimeout(() => {
-        this.#visibilityProbeTimer = null
-        if (!this.#visibilityPongReceived) {
-          console.debug(
-            `[${this.constructor.name}] ${reason} probe: no pong in ${timeoutMs}ms — reconnecting`,
-          )
-          this.#stopDcHeartbeat()
-          this.#disconnectPeer().then(() => this.#schedulePeerReconnect())
-        }
-      }, timeoutMs)
-    }).catch(() => {
-      // dc.send() threw — DC is already closed
-      console.debug(`[${this.constructor.name}] ${reason} probe: ping send failed — reconnecting`)
-      this.#stopDcHeartbeat()
-      this.#disconnectPeer().then(() => this.#schedulePeerReconnect())
-    })
+  #setConnectionMode(nextMode) {
+    const prevMode = this.connectionMode;
+    if (nextMode === prevMode) return;
+    this.connectionMode = nextMode || ConnectionMode.UNKNOWN;
+    this.emit("connectionModeChange", {
+      mode: this.connectionMode,
+      prevMode,
+    });
   }
 
-  /**
-   * Start periodic DataChannel ping. Detects silently stalled connections
-   * where ICE reports "connected" but no application data flows.
-   */
-  #startDcHeartbeat() {
-    if (!this.#isLivenessOwner()) return
-    this.#stopDcHeartbeat()
-    this.#dcMissedPings = 0
-
-    this.#dcPingTimer = setInterval(() => {
-      // Check if previous pings went unanswered BEFORE sending next one.
-      // This way we send 3 pings, wait for any pong, then declare stalled.
-      if (this.#dcMissedPings >= 3) {
-        console.debug(`[${this.constructor.name}] DC heartbeat: ${this.#dcMissedPings} pings unanswered — connection stalled, reconnecting`)
-        this.#stopDcHeartbeat()
-        this.#disconnectPeer().then(() => this.#schedulePeerReconnect())
-        return
-      }
-
-      // Use #sendEncrypted directly to bypass send()'s auto-heal logic.
-      // A heartbeat on a broken channel should fail and trigger teardown,
-      // not attempt to re-subscribe (which would be re-entrant).
-      this.#sendEncrypted({ type: "dc_ping" }).then(() => {
-        this.#dcMissedPings++
-      }).catch(() => {
-        // Send failed — DC is definitely broken
-        console.debug(`[${this.constructor.name}] DC heartbeat: ping send failed, reconnecting`)
-        this.#stopDcHeartbeat()
-        this.#disconnectPeer().then(() => this.#schedulePeerReconnect())
-      })
-    }, 10000)
+  channelName() {
+    throw new Error("channelName() must be implemented by subclass");
   }
 
-  /** Stop DC heartbeat timer. */
-  #stopDcHeartbeat() {
-    if (this.#dcPingTimer) {
-      clearInterval(this.#dcPingTimer)
-      this.#dcPingTimer = null
-    }
-    this.#dcMissedPings = 0
+  computeSubscriptionId() {
+    throw new Error("computeSubscriptionId() must be implemented by subclass");
   }
 
-  /**
-   * Shared WebRTC peer liveness owner.
-   * Exactly one logical connection per hub should control reconnect/heartbeat.
-   */
-  #isLivenessOwner() {
-    return this.channelName() === "hub"
+  channelParams() {
+    return {};
   }
 
-  /** Proxy cliStatus through HealthTracker for external access. */
-  get cliStatus() { return this.#health.cliStatus }
-  set cliStatus(value) { this.#health.cliStatus = value }
-
-  isConnected() {
-    return this.state === ConnectionState.CONNECTED
+  handleMessage(message) {
+    this.emit("message", message);
   }
-
-  /**
-   * Check if hub is connected (WebRTC DataChannel open, can subscribe).
-   * @returns {boolean}
-   */
-  isHubConnected() {
-    return this.#hubConnected
-  }
-
-  /**
-   * Check if subscribed to channel.
-   * @returns {boolean}
-   */
-  isSubscribed() {
-    return this.subscriptionId !== null
-  }
-
-  /**
-   * Get current state.
-   * @returns {string}
-   */
-  getState() {
-    return this.state
-  }
-
-  /**
-   * Get error reason if in error state.
-   * @returns {string|null}
-   */
-  getError() {
-    return this.errorReason
-  }
-
-  // ========== Event System ==========
-
-  /**
-   * Subscribe to an event.
-   * @param {string} event - Event name
-   * @param {Function} callback - Event handler
-   * @returns {Function} - Unsubscribe function
-   */
-  on(event, callback) {
-    if (!this.subscribers.has(event)) {
-      this.subscribers.set(event, new Set())
-    }
-    this.subscribers.get(event).add(callback)
-
-    // Return unsubscribe function
-    return () => this.off(event, callback)
-  }
-
-  /**
-   * Unsubscribe from an event.
-   * @param {string} event - Event name
-   * @param {Function} callback - Event handler
-   */
-  off(event, callback) {
-    this.subscribers.get(event)?.delete(callback)
-  }
-
-  /**
-   * Emit an event to all subscribers.
-   * @param {string} event - Event name
-   * @param {*} data - Event data
-   */
-  emit(event, data) {
-    const callbacks = this.subscribers.get(event)
-    if (!callbacks) return
-
-    for (const callback of callbacks) {
-      try {
-        callback(data)
-      } catch (error) {
-        console.error(`[${this.constructor.name}] Event handler error:`, error)
-      }
-    }
-  }
-
-  // ========== Private ==========
-
-  #setState(newState) {
-    const prevState = this.state
-    this.state = newState
-
-    if (newState !== ConnectionState.ERROR) {
-      this.errorCode = null
-      this.errorReason = null
-    }
-
-    const stateInfo = { state: newState, prevState, error: this.errorReason }
-    this.emit("stateChange", stateInfo)
-
-    // Notify HubConnectionManager subscribers (passive observers)
-    this.manager.notifySubscribers(this.key, stateInfo)
-  }
-
-  #setError(reason, message) {
-    this.errorCode = reason
-    this.errorReason = message
-    this.#setBrowserStatus(BrowserStatus.ERROR)
-    this.#setState(ConnectionState.ERROR)
-    this.emit("error", { reason, message })
-  }
-
-  #setBrowserStatus(newStatus) {
-    const prevStatus = this.browserStatus
-    if (newStatus === prevStatus) return
-
-    this.browserStatus = newStatus
-    console.debug(`[${this.constructor.name}] Browser status: ${prevStatus} → ${newStatus}`)
-
-    this.emit("browserStatusChange", { status: newStatus, prevStatus })
-    this.#health.emitHealthChange()
-
-    // Reactive readiness: when browser health changes, re-evaluate connection.
-    // Debounced (100ms) so rapid AC flapping collapses into one evaluation
-    // instead of cascading reconnect loops.
-    if (this.#ensureConnectedDebounceTimer) {
-      clearTimeout(this.#ensureConnectedDebounceTimer)
-    }
-    this.#ensureConnectedDebounceTimer = setTimeout(() => {
-      this.#ensureConnectedDebounceTimer = null
-      this.#ensureConnected().catch(() => {})
-    }, 100)
-  }
-
-  #setConnectionMode(newMode) {
-    const prevMode = this.connectionMode
-    if (newMode === prevMode) return
-
-    this.connectionMode = newMode
-    console.debug(`[${this.constructor.name}] Connection mode: ${prevMode} → ${newMode}`)
-
-    this.emit("connectionModeChange", { mode: newMode, prevMode })
-  }
-
 }

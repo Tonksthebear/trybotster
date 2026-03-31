@@ -31,6 +31,7 @@ export class WebRtcPtyTransport {
   #onConnect = null;
   #onDisconnect = null;
   #onBinarySnapshot = null;
+  #onFocusReportingChanged = null;
   #pendingResize = null; // { cols, rows }
   #pendingResizeTimer = null;
 
@@ -51,6 +52,8 @@ export class WebRtcPtyTransport {
     );
 
     const termKey = TerminalConnection.key(this.#hubId, this.#sessionUuid);
+    const existingConn = HubConnectionManager.get(termKey);
+    const hadSubscription = existingConn?.hasSubscription?.() ?? false;
 
     this.#terminalConn = await HubConnectionManager.acquire(
       TerminalConnection,
@@ -63,9 +66,7 @@ export class WebRtcPtyTransport {
       },
     );
 
-    const hadSubscription = this.#terminalConn.hasSubscription();
     this.#awaitingReconnectSnapshot = hadSubscription;
-    await this.#terminalConn.subscribe();
     this.#wireEvents();
     if (hadSubscription) {
       await this.#terminalConn.requestSnapshot();
@@ -131,6 +132,7 @@ export class WebRtcPtyTransport {
   set onConnect(callback) { this.#onConnect = callback; }
   set onDisconnect(callback) { this.#onDisconnect = callback; }
   set onBinarySnapshot(callback) { this.#onBinarySnapshot = callback; }
+  set onFocusReportingChanged(callback) { this.#onFocusReportingChanged = callback; }
 
   destroy() {
     this.disconnect();
@@ -138,6 +140,7 @@ export class WebRtcPtyTransport {
     this.#onConnect = null;
     this.#onDisconnect = null;
     this.#onBinarySnapshot = null;
+    this.#onFocusReportingChanged = null;
     this.#terminalConn?.release();
     this.#terminalConn = null;
   }
@@ -147,15 +150,6 @@ export class WebRtcPtyTransport {
     // its own state machine and handles partial sequences correctly.
     // Ghostty batches renders internally via its own frame scheduling,
     // so transport-level batching is unnecessary and can interfere.
-
-    this.#unsubscribers.push(
-      this.#terminalConn.onOutput((data) => {
-        const text = data instanceof Uint8Array
-          ? this.#decoder.decode(data, { stream: true })
-          : data;
-        this.#callbacks?.onData?.(text);
-      }),
-    );
 
     this.#unsubscribers.push(
       this.#terminalConn.onSnapshotStart(() => {
@@ -173,7 +167,27 @@ export class WebRtcPtyTransport {
 
     this.#unsubscribers.push(
       this.#terminalConn.onBinarySnapshot((data) => {
+        console.debug(
+          `[WebRtcPtyTransport] binary snapshot hub=${this.#hubId} session=${this.#sessionUuid} bytes=${data?.byteLength ?? 0}`,
+        );
         this.#onBinarySnapshot?.(data);
+      }),
+    );
+
+    this.#unsubscribers.push(
+      this.#terminalConn.on("message", (message) => {
+        if (message?.type === "focus_reporting_changed") {
+          this.#onFocusReportingChanged?.(!!message.enabled);
+        }
+      }),
+    );
+
+    this.#unsubscribers.push(
+      this.#terminalConn.onOutput((data) => {
+        const text = data instanceof Uint8Array
+          ? this.#decoder.decode(data, { stream: true })
+          : data;
+        this.#callbacks?.onData?.(text);
       }),
     );
 

@@ -117,10 +117,23 @@ hub.register_agent(key, handles)
 hub.unregister_agent(key)
 hub.quit()
 hub.detect_repo() -> string
-hub.handle_webrtc_offer(identity, sdp)
-hub.handle_ice_candidate(identity, candidate)
-hub.request_ratchet_restart(identity)
+hub.handle_signaling_message(message)
 ```
+
+`hub.handle_signaling_message(message)` forwards a decrypted ActionCable
+signaling/control payload to the Rust hub for routing. Example:
+
+```lua
+hub.handle_signaling_message({
+    type = "signal",
+    browser_identity = browser_identity,
+    envelope = { type = "offer", sdp = "v=0 ..." },
+})
+```
+
+Supported messages:
+- `type = "signal"` with `envelope.type = "offer"` or `"ice"`
+- `type = "bundle_request"` with `browser_identity`
 
 ### `connection`
 ```lua

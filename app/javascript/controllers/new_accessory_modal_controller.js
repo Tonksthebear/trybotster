@@ -44,8 +44,10 @@ export default class extends Controller {
 
     HubManager.acquire(this.hubIdValue).then((hub) => {
       this.hub = hub;
-      this.spawnTargets = Array.isArray(hub.spawnTargets) ? hub.spawnTargets : [];
-      this.workspaces = Array.isArray(hub.openWorkspaces) ? hub.openWorkspaces : [];
+      this.spawnTargets = hub.spawnTargets.current();
+      this.workspaces = hub.openWorkspaces.current();
+      hub.spawnTargets.load().catch(() => {});
+      hub.openWorkspaces.load().catch(() => {});
       this.#renderTargetSelect();
       this.#renderWorkspaceSelect();
       this.#updateFlowVisibility();
@@ -60,7 +62,7 @@ export default class extends Controller {
       }
 
       this.unsubscribers.push(
-        this.hub.onSpawnTargetList((targets) => {
+        this.hub.spawnTargets.onChange((targets) => {
           this.spawnTargets = Array.isArray(targets) ? targets : [];
           this.#renderTargetSelect();
           this.#updateFlowVisibility();
@@ -76,7 +78,7 @@ export default class extends Controller {
       );
 
       this.unsubscribers.push(
-        this.hub.onOpenWorkspaceList((workspaces) => {
+        this.hub.openWorkspaces.onChange((workspaces) => {
           this.workspaces = Array.isArray(workspaces) ? workspaces : [];
           this.#renderWorkspaceSelect();
         }),
@@ -284,6 +286,7 @@ export default class extends Controller {
     if (!this.hasWorkspaceSelectTarget || !this.hasWorkspaceSectionTarget) return;
 
     const select = this.workspaceSelectTarget;
+    const previousValue = select.value;
     select.innerHTML = "";
 
     const workspaces = this.workspaces.filter(
@@ -308,6 +311,8 @@ export default class extends Controller {
       option.textContent = ws.name || ws.id;
       select.appendChild(option);
     });
+
+    if (previousValue) select.value = previousValue;
   }
 
   #reset() {

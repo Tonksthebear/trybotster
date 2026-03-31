@@ -162,9 +162,26 @@ export default class extends Controller {
       hubId: this.hubIdValue,
       sessionUuid: this.sessionUuidValue,
     });
-    this.#transport.onReconnect = () => this.#restty?.clearScreen();
+    this.#transport.onReconnect = () => {
+      // Snapshot import is authoritative. Do not call restty.clearScreen()
+      // here because that sends ESC[2J to the remote PTY.
+    };
     this.#transport.onBinarySnapshot = (data) => {
-      this.#restty?.loadBinarySnapshot(data);
+      console.debug(
+        `[terminal_display] applying binary snapshot session=${this.sessionUuidValue} bytes=${data?.byteLength ?? 0} backendReady=${this.#backendReady}`,
+      );
+      const loaded = this.#restty?.loadBinarySnapshot(data) ?? false;
+      console.debug(
+        `[terminal_display] loadBinarySnapshot result session=${this.sessionUuidValue} loaded=${loaded}`,
+      );
+      if (!loaded) {
+        console.warn(
+          `[terminal_display] loadBinarySnapshot failed session=${this.sessionUuidValue} bytes=${data?.byteLength ?? 0} backendReady=${this.#backendReady}`,
+        );
+      }
+    };
+    this.#transport.onFocusReportingChanged = (_enabled) => {
+      this.#sendCurrentFocusState();
     };
     this.#transport.onConnect = () => {
       // Force recalculate grid dimensions. Restty's init() calls updateSize()
@@ -674,14 +691,18 @@ export default class extends Controller {
     const shouldFocus = this.#connected && this.#present;
     if (shouldFocus === this.#focused) return;
     this.#focused = shouldFocus;
-    this.#transport?.sendInput(shouldFocus ? "\x1b[I" : "\x1b[O");
+    this.#sendCurrentFocusState();
   }
 
   #sendFocusOut() {
     if (this.#focused) {
       this.#focused = false;
-      this.#transport?.sendInput("\x1b[O");
+      this.#sendCurrentFocusState();
     }
+  }
+
+  #sendCurrentFocusState() {
+    this.#transport?.sendInput(this.#focused ? "\x1b[I" : "\x1b[O");
   }
 
   // Public actions for touch control buttons

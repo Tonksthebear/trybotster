@@ -25,5 +25,5 @@ pin_all_from "app/javascript/transport", under: "transport"
 pin_all_from "app/javascript/preview", under: "preview"
 pin_all_from "app/javascript/channels", under: "channels"
 pin "@tailwindplus/elements", to: "@tailwindplus--elements.js" # @1.0.22
-pin "chunk-gsx0571v", to: "chunk-gsx0571v.js"
+pin "chunk-kymnzdjs", to: "chunk-kymnzdjs.js"
 pin "restty", to: "restty.js"
