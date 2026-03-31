@@ -365,10 +365,11 @@ impl PanelPool {
             .and_then(|k| self.panels.get(k))
             .map(|p| p.dims())
             .unwrap_or(self.terminal_dims);
+        let color_cache = self.color_cache.clone();
         let panel = self
             .panels
             .entry(uuid.to_string())
-            .or_insert_with(|| TerminalPanel::new(widget_dims.0, widget_dims.1));
+            .or_insert_with(|| TerminalPanel::new_with_color_cache(widget_dims.0, widget_dims.1, color_cache));
         // Defer subscribe to `sync_subscriptions()`, which runs after render and
         // has accurate widget areas for this session.
         panel.mark_transport_disconnected();
@@ -418,6 +419,36 @@ impl PanelPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_terminal_panel_shares_pool_color_cache() {
+        let color_cache: ColorCache = std::sync::Arc::new(std::sync::Mutex::new(
+            HashMap::from([(257usize, crate::terminal::Rgb::new(0xF0, 0xE0, 0xD0))]),
+        ));
+        let mut pool = PanelPool::new_with_color_cache((24, 80), color_cache.clone());
+
+        let _ = pool.focus_terminal(Some("agent-1"), Some("sess-1"), false);
+        let panel = pool.panels.get("sess-1").expect("panel exists after focus");
+        assert_eq!(
+            panel.background_color_default(),
+            Some(crate::terminal::Rgb::new(0xF0, 0xE0, 0xD0)),
+            "panel created by focus_terminal must inherit pool color cache"
+        );
+
+        // Mutate the shared cache — panel must see the update after refresh.
+        color_cache
+            .lock()
+            .expect("lock")
+            .insert(257, crate::terminal::Rgb::new(0x10, 0x0F, 0x0F));
+        pool.refresh_panel_colors();
+
+        let panel = pool.panels.get("sess-1").expect("panel still exists");
+        assert_eq!(
+            panel.background_color_default(),
+            Some(crate::terminal::Rgb::new(0x10, 0x0F, 0x0F)),
+            "panel must see updated pool color cache after refresh"
+        );
+    }
 
     #[test]
     fn focus_same_session_while_connecting_does_not_force_resubscribe() {
