@@ -262,7 +262,7 @@ class ConfigEditingTest < ApplicationSystemTestCase
   # Navigate to settings via Turbo by clicking the Settings link on the hub page.
   # The link is enabled by requires-connection controller once DataChannel is up.
   def click_settings_link
-    find("a[href='#{hub_settings_path(@hub)}']", wait: 10).click
+    find("a[href='#{hub_settings_path(@hub)}']", match: :first, wait: 10).click
     assert_selector "[data-hub-settings-target='treePanel']", wait: 10
   end
 

@@ -198,8 +198,14 @@ class FileInputTest < ApplicationSystemTestCase
     page.execute_script("document.getElementById('new-agent-modal').showModal()")
 
     target_select = find("[data-new-agent-form-target='targetSelect']", wait: 10)
-    selectable_option = target_select.all("option").find { |option| option.value.present? }
-    assert selectable_option, "Expected at least one admitted spawn target option"
+
+    # Spawn targets are loaded asynchronously from the CLI via WebRTC.
+    # Wait for at least one option with a non-empty value to appear.
+    selectable_option = nil
+    assert wait_until?(timeout: 15, poll: 0.3) {
+      selectable_option = target_select.all("option").find { |option| option.value.present? }
+      selectable_option.present?
+    }, "Expected at least one admitted spawn target option"
 
     target_select.select(selectable_option.text)
     assert_no_selector "[data-new-agent-form-target='worktreeOptions'].hidden", visible: :all, wait: 10
