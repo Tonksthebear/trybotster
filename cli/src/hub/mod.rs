@@ -322,6 +322,7 @@ pub struct BrowserColorProbeState {
     pub colors: std::collections::HashMap<usize, crate::terminal::Rgb>,
 }
 
+/// Central orchestrator that owns all hub state and runs the event loop.
 pub struct Hub {
     // === Core State ===
     /// Core agent and worktree state (shared for thread-safe access).
