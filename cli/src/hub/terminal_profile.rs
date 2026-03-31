@@ -783,38 +783,73 @@ fn parse_rgb_from_osc_reply(reply: &[u8]) -> Option<crate::terminal::Rgb> {
     })
 }
 
-/// Extract `(color_index, Rgb)` pairs from raw bytes containing OSC color replies.
+/// Split raw bytes into color probe responses and remaining data.
 ///
-/// Indices: 0-255 palette, 256 foreground, 257 background, 258 cursor.
-/// Used by the hub to parse browser probe responses from PTY input.
-pub(crate) fn extract_color_entries(
+/// Returns `(color_entries, remainder)` where color_entries are
+/// `(index, Rgb)` pairs (0-255 palette, 256 fg, 257 bg, 258 cursor)
+/// and remainder is the non-color-reply bytes that should still be
+/// forwarded to the session PTY.
+pub(crate) fn split_color_replies(
     data: &[u8],
-) -> Vec<(usize, crate::terminal::Rgb)> {
+) -> (Vec<(usize, crate::terminal::Rgb)>, Vec<u8>) {
+    // Fast path: no ESC byte means no OSC sequences at all.
+    if !data.contains(&ESC) {
+        return (Vec::new(), data.to_vec());
+    }
+
     let mut buffer = data.to_vec();
     let sequences = extract_complete_osc_sequences(&mut buffer);
-    sequences
-        .iter()
-        .filter_map(|seq| {
-            let (probe, reply) = classify_osc_reply(seq)?;
-            let color = parse_rgb_from_osc_reply(&reply)?;
-            let index = match probe {
-                TerminalProbe::DefaultForeground => 256,
-                TerminalProbe::DefaultBackground => 257,
-                TerminalProbe::DefaultCursorColor => 258,
-                TerminalProbe::Palette(i) => i as usize,
-            };
-            Some((index, color))
-        })
-        .collect()
+
+    if sequences.is_empty() {
+        return (Vec::new(), data.to_vec());
+    }
+
+    let mut colors = Vec::new();
+    let mut consumed_ranges: Vec<(usize, usize)> = Vec::new();
+
+    for seq in &sequences {
+        if let Some((probe, reply)) = classify_osc_reply(seq) {
+            if let Some(color) = parse_rgb_from_osc_reply(&reply) {
+                let index = match probe {
+                    TerminalProbe::DefaultForeground => 256,
+                    TerminalProbe::DefaultBackground => 257,
+                    TerminalProbe::DefaultCursorColor => 258,
+                    TerminalProbe::Palette(i) => i as usize,
+                };
+                colors.push((index, color));
+                // Find this sequence in the original data to mark for removal.
+                if let Some(pos) = find_subsequence(data, seq) {
+                    consumed_ranges.push((pos, pos + seq.len()));
+                }
+            }
+        }
+    }
+
+    if colors.is_empty() {
+        return (Vec::new(), data.to_vec());
+    }
+
+    // Build remainder by skipping consumed ranges.
+    consumed_ranges.sort_by_key(|r| r.0);
+    let mut remainder = Vec::with_capacity(data.len());
+    let mut cursor = 0;
+    for (start, end) in &consumed_ranges {
+        if *start > cursor {
+            remainder.extend_from_slice(&data[cursor..*start]);
+        }
+        cursor = *end;
+    }
+    if cursor < data.len() {
+        remainder.extend_from_slice(&data[cursor..]);
+    }
+
+    (colors, remainder)
 }
 
-/// Returns `true` if the data contains at least one complete OSC color reply.
-pub(crate) fn contains_osc_color_reply(data: &[u8]) -> bool {
-    let mut buffer = data.to_vec();
-    let sequences = extract_complete_osc_sequences(&mut buffer);
-    sequences
-        .iter()
-        .any(|seq| classify_osc_reply(seq).is_some())
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn probe_from_code(code: &[u8]) -> Option<TerminalProbe> {
