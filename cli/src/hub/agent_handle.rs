@@ -163,7 +163,7 @@ impl SessionHandle {
 /// - `subscribe()` to receive PTY events (output, resize, exit)
 /// - `write_input()` to send input to the PTY
 /// - `resize()` to notify PTY of client resize
-/// - `get_snapshot()` to get binary page snapshot for reconnect
+/// - `get_snapshot()` to get an opaque terminal snapshot for reconnect
 /// - `port()` to get the HTTP forwarding port (if assigned)
 ///
 /// # Example
@@ -336,7 +336,7 @@ impl PtyHandle {
         self.event_tx.subscribe()
     }
 
-    /// Subscribe and capture a binary page snapshot for client attach.
+    /// Subscribe and capture an opaque terminal snapshot for client attach.
     ///
     /// Subscribes first, then generates a snapshot. Subscribe-before-snapshot
     /// ordering ensures no output gap: bytes emitted during RPC are captured
@@ -352,6 +352,24 @@ impl PtyHandle {
         let rx = self.event_tx.subscribe();
         let snapshot = self.get_snapshot();
         (snapshot, kitty_enabled, rows, cols, rx)
+    }
+
+    /// Whether the backing session RPC connection still has a live reader.
+    ///
+    /// Non-session-backed handles always report `true`.
+    #[must_use]
+    pub fn session_connection_alive(&self) -> bool {
+        let Some(ref conn) = self.session_connection else {
+            return true;
+        };
+
+        let Ok(guard) = conn.lock() else {
+            return false;
+        };
+
+        guard
+            .as_ref()
+            .is_some_and(crate::session::connection::SessionConnection::is_reader_alive)
     }
 
     /// Broadcast a `ProcessExited` event on this handle's channel.
@@ -377,9 +395,9 @@ impl PtyHandle {
         self.kitty_enabled.load(Ordering::Relaxed)
     }
 
-    /// Get a binary snapshot of the current terminal state via session RPC.
+    /// Get an opaque terminal snapshot of the current state via session RPC.
     ///
-    /// Returns an opaque blob from `ghostty_snapshot_terminal_export`.
+    /// Returns an opaque blob from `ghostty_terminal_snapshot_export`.
     /// Clients import it via `terminal.snapshot_import()`.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
@@ -389,7 +407,7 @@ impl PtyHandle {
                     match session.get_snapshot() {
                         Ok(snapshot) => return snapshot,
                         Err(e) => {
-                            log::warn!("Failed to get snapshot via session RPC: {e}");
+                            log::warn!("Failed to get snapshot via session RPC: {e:#}");
                         }
                     }
                 }
@@ -411,7 +429,7 @@ impl PtyHandle {
                     match session.get_mode_flags() {
                         Ok(flags) => return Some(flags),
                         Err(e) => {
-                            log::warn!("Failed to get mode flags via session RPC: {e}");
+                            log::warn!("Failed to get mode flags via session RPC: {e:#}");
                         }
                     }
                 }
@@ -419,6 +437,26 @@ impl PtyHandle {
         }
 
         None
+    }
+
+    /// Replace the current session parser's color profile.
+    pub fn set_color_profile(
+        &self,
+        colors: &std::collections::HashMap<usize, crate::terminal::Rgb>,
+    ) -> Result<(), String> {
+        let Some(ref conn) = self.session_connection else {
+            return Err("session connection not available".to_string());
+        };
+
+        let mut guard = conn
+            .lock()
+            .map_err(|_| "session connection lock poisoned".to_string())?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| "Session connection not available".to_string())?;
+        session
+            .set_color_profile(colors)
+            .map_err(|e| format!("Failed to set session color profile: {e:#}"))
     }
 
     // =========================================================================

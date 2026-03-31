@@ -125,7 +125,7 @@ struct CallbackState {
     bell: Option<Box<dyn FnMut() + Send>>,
     pwd_changed: Option<Box<dyn FnMut() + Send>>,
     notification: Option<Box<dyn FnMut(&str, &str) + Send>>,
-    semantic_prompt: Option<Box<dyn FnMut(u8) + Send>>,
+    semantic_prompt: Option<Box<dyn FnMut(ghostty_vt::GhosttySemanticPromptAction) + Send>>,
     mode_changed: Option<Box<dyn FnMut(u16, bool) + Send>>,
     kitty_keyboard_changed: Option<Box<dyn FnMut() + Send>>,
 }
@@ -201,11 +201,11 @@ unsafe extern "C" fn notification_trampoline(
 unsafe extern "C" fn semantic_prompt_trampoline(
     _terminal: *mut ghostty_vt::GhosttyTerminalOpaque,
     userdata: *mut c_void,
-    mark: u8,
+    action: ghostty_vt::GhosttySemanticPromptAction,
 ) {
     let state = unsafe { &mut *(userdata as *mut CallbackState) };
     if let Some(ref mut cb) = state.semantic_prompt {
-        cb(mark);
+        cb(action);
     }
 }
 
@@ -246,8 +246,8 @@ pub struct CallbackConfig {
     pub pwd_changed: Option<Box<dyn FnMut() + Send>>,
     /// Called when an OSC notification is received (title, body).
     pub notification: Option<Box<dyn FnMut(&str, &str) + Send>>,
-    /// Called on shell prompt marks (OSC 133/633). Argument is the mark byte (A/B/C/D).
-    pub semantic_prompt: Option<Box<dyn FnMut(u8) + Send>>,
+    /// Called when Ghostty reports a semantic prompt action via OSC 133.
+    pub semantic_prompt: Option<Box<dyn FnMut(ghostty_vt::GhosttySemanticPromptAction) + Send>>,
     /// Called when a terminal mode changes (mode_id, enabled).
     pub mode_changed: Option<Box<dyn FnMut(u16, bool) + Send>>,
     /// Called when kitty keyboard protocol state changes.
@@ -947,6 +947,96 @@ mod tests {
 
         p.process(b"\x1b[?1049h");
         assert!(p.alt_screen_active());
+    }
+
+    #[test]
+    fn notification_callback_smoke_test() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_cb = std::sync::Arc::clone(&calls);
+        let callbacks = CallbackConfig {
+            notification: Some(Box::new(move |title: &str, body: &str| {
+                calls_cb
+                    .lock()
+                    .expect("notification calls poisoned")
+                    .push((title.to_string(), body.to_string()));
+            })),
+            ..CallbackConfig::default()
+        };
+        let mut parser = TerminalParser::new_with_callbacks(24, 80, 100, callbacks);
+
+        parser.process(b"\x1b]9;Hello world\x07");
+
+        let calls = calls.lock().expect("notification calls poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], (String::new(), "Hello world".to_string()));
+    }
+
+    #[test]
+    fn semantic_prompt_callback_smoke_test() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_cb = std::sync::Arc::clone(&calls);
+        let callbacks = CallbackConfig {
+            semantic_prompt: Some(Box::new(move |action| {
+                calls_cb
+                    .lock()
+                    .expect("semantic calls poisoned")
+                    .push(action);
+            })),
+            ..CallbackConfig::default()
+        };
+        let mut parser = TerminalParser::new_with_callbacks(24, 80, 100, callbacks);
+
+        parser.process(b"\x1b]133;A\x07");
+
+        let calls = calls.lock().expect("semantic calls poisoned");
+        assert_eq!(
+            calls.as_slice(),
+            &[crate::ghostty_vt::GhosttySemanticPromptAction::FreshLineNewPrompt]
+        );
+    }
+
+    #[test]
+    fn mode_changed_callback_smoke_test() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_cb = std::sync::Arc::clone(&calls);
+        let callbacks = CallbackConfig {
+            mode_changed: Some(Box::new(move |mode: u16, enabled: bool| {
+                calls_cb
+                    .lock()
+                    .expect("mode calls poisoned")
+                    .push((mode, enabled));
+            })),
+            ..CallbackConfig::default()
+        };
+        let mut parser = TerminalParser::new_with_callbacks(24, 80, 100, callbacks);
+
+        parser.process(b"\x1b[?2004h");
+
+        let calls = calls.lock().expect("mode calls poisoned");
+        assert!(
+            calls.iter().any(
+                |(mode, enabled)| *mode == crate::ghostty_vt::MODE_BRACKETED_PASTE && *enabled
+            ),
+            "expected bracketed paste mode change, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_changed_callback_smoke_test() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let calls_cb = std::sync::Arc::clone(&calls);
+        let callbacks = CallbackConfig {
+            kitty_keyboard_changed: Some(Box::new(move || {
+                let mut count = calls_cb.lock().expect("kitty calls poisoned");
+                *count += 1;
+            })),
+            ..CallbackConfig::default()
+        };
+        let mut parser = TerminalParser::new_with_callbacks(24, 80, 100, callbacks);
+
+        parser.process(b"\x1b[>3u");
+
+        assert_eq!(*calls.lock().expect("kitty calls poisoned"), 1);
     }
 
     #[test]

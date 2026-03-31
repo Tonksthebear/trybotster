@@ -121,6 +121,13 @@ impl PanelPool {
         &self.panels
     }
 
+    /// Reapply the shared terminal color cache to all live panels.
+    pub fn refresh_panel_colors(&mut self) {
+        for panel in self.panels.values_mut() {
+            panel.refresh_color_cache();
+        }
+    }
+
     /// Check if a panel exists for the given key.
     pub fn contains_key(&self, key: &str) -> bool {
         self.panels.contains_key(key)

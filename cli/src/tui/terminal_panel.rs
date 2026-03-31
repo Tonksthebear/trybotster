@@ -76,6 +76,12 @@ impl TerminalPanel {
         let _ = self.render_state.update(self.parser.terminal_mut());
     }
 
+    /// Reapply the shared terminal color cache to this panel.
+    pub fn refresh_color_cache(&mut self) {
+        self.parser.apply_color_cache(&self.color_cache);
+        self.update_render_state();
+    }
+
     /// Borrow the render state for widget rendering (immutable).
     pub fn render_state(&self) -> &RenderState {
         &self.render_state
@@ -184,32 +190,33 @@ impl TerminalPanel {
         self.state = PanelState::Idle;
     }
 
-    /// Process a binary scrollback snapshot, transitioning to `Connected`.
+    /// Process an opaque terminal snapshot, transitioning to `Connected`.
     ///
-    /// The data must be in binary snapshot format (version 1). Pages are
-    /// loaded directly into the terminal — no VT replay.
+    /// The data is imported directly into ghostty — no VT replay.
     pub fn on_scrollback(&mut self, data: &[u8]) {
         let (rows, cols) = self.dims;
         self.on_scrollback_with_dims(rows, cols, data);
     }
 
-    /// Process a binary scrollback snapshot with authoritative source dimensions.
+    /// Process an opaque terminal snapshot with authoritative source dimensions.
     pub fn on_scrollback_with_dims(&mut self, rows: u16, cols: u16, data: &[u8]) {
         self.dims = (rows, cols);
 
         // Replace the parser entirely so the old scrollback buffer is discarded.
         self.parser = TerminalParser::new(rows, cols, TUI_SCROLLBACK);
-        self.parser.apply_color_cache(&self.color_cache);
 
         if !data.is_empty() {
-            // Single-call import: clears existing pages, loads all screens +
-            // terminal state, finalizes cursor pins.
+            // Single-call import: one opaque blob restores the whole terminal.
             if let Err(e) = self.parser.terminal_mut().snapshot_import(data) {
                 log::error!("[terminal_panel] snapshot_import failed: {e}");
                 // Don't transition to Connected — snapshot is malformed
                 return;
             }
         }
+
+        // Client-local defaults should win over the serialized session
+        // defaults so each TUI attach can render with its own theme.
+        self.parser.apply_color_cache(&self.color_cache);
 
         self.update_render_state();
 
@@ -403,6 +410,42 @@ mod tests {
         panel.connect("sess-0");
         panel.on_scrollback(b"");
         assert_eq!(panel.state(), PanelState::Connected);
+    }
+
+    #[test]
+    fn scrollback_import_reapplies_local_default_background() {
+        let color_cache = Arc::new(Mutex::new(HashMap::from([(257usize, Rgb::new(1, 2, 3))])));
+        let mut panel = TerminalPanel::new_with_color_cache(24, 80, Arc::clone(&color_cache));
+
+        let mut source = crate::terminal::TerminalParser::new(24, 80, TUI_SCROLLBACK);
+        source
+            .terminal_mut()
+            .set_color_background(Rgb::new(240, 241, 242).into());
+        let snapshot = source
+            .terminal()
+            .snapshot_export()
+            .expect("source snapshot export");
+
+        panel.connect("sess-0");
+        panel.on_scrollback(&snapshot);
+
+        assert_eq!(panel.background_color_default(), Some(Rgb::new(1, 2, 3)));
+    }
+
+    #[test]
+    fn refresh_color_cache_reapplies_updated_shared_background() {
+        let color_cache = Arc::new(Mutex::new(HashMap::from([(257usize, Rgb::new(1, 2, 3))])));
+        let mut panel = TerminalPanel::new_with_color_cache(24, 80, Arc::clone(&color_cache));
+
+        assert_eq!(panel.background_color_default(), Some(Rgb::new(1, 2, 3)));
+
+        color_cache
+            .lock()
+            .expect("color cache lock")
+            .insert(257usize, Rgb::new(9, 8, 7));
+        panel.refresh_color_cache();
+
+        assert_eq!(panel.background_color_default(), Some(Rgb::new(9, 8, 7)));
     }
 
     #[test]

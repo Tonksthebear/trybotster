@@ -1883,7 +1883,7 @@ impl LuaRuntime {
     /// Maps `PtyEvent` variants to distinct hook names:
     /// - `TitleChanged` → `"pty_title_changed"` with `{ session_uuid, session_name, title }`
     /// - `CwdChanged` → `"pty_cwd_changed"` with `{ session_uuid, session_name, cwd }`
-    /// - `PromptMark` → `"pty_prompt"` with `{ session_uuid, session_name, mark, exit_code?, command? }`
+    /// - `PromptMark` → `"pty_prompt"` with `{ session_uuid, session_name, mark }`
     ///
     /// Other PtyEvent variants are ignored (they use different dispatch paths).
     pub fn notify_pty_osc_event(
@@ -1892,7 +1892,7 @@ impl LuaRuntime {
         session_name: &str,
         event: &crate::agent::pty::PtyEvent,
     ) {
-        use crate::agent::pty::{PromptMark, PtyEvent};
+        use crate::agent::pty::PtyEvent;
 
         let result: mlua::Result<()> = (|| {
             let data = self.lua.create_table()?;
@@ -1909,26 +1909,7 @@ impl LuaRuntime {
                     "pty_cwd_changed"
                 }
                 PtyEvent::PromptMark(mark) => {
-                    match mark {
-                        PromptMark::PromptStart => {
-                            data.set("mark", "prompt_start")?;
-                        }
-                        PromptMark::CommandStart => {
-                            data.set("mark", "command_start")?;
-                        }
-                        PromptMark::CommandExecuted(cmd) => {
-                            data.set("mark", "command_executed")?;
-                            if let Some(c) = cmd {
-                                data.set("command", c.as_str())?;
-                            }
-                        }
-                        PromptMark::CommandFinished(code) => {
-                            data.set("mark", "command_finished")?;
-                            if let Some(c) = code {
-                                data.set("exit_code", *c)?;
-                            }
-                        }
-                    }
+                    data.set("mark", mark.name())?;
                     "pty_prompt"
                 }
                 PtyEvent::CursorVisibilityChanged(visible) => {

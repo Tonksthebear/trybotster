@@ -45,10 +45,11 @@
 // Rust guideline compliant 2026-02
 
 use std::io::Stdout;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::backend::Backend;
@@ -92,6 +93,12 @@ use super::ColorCache;
 /// go through Lua `client.lua`, PTY keyboard input goes directly to the PTY.
 pub struct TuiRunner<B: Backend> {
     // === Subsystems ===
+    /// TUI-local terminal color cache learned from the outer terminal.
+    ///
+    /// Seeded from the boot probe, then updated only from this client's own
+    /// color replies so hub-global fallback state stays separate.
+    color_cache: ColorCache,
+
     /// Terminal panel pool — owns panels, focus state, and subscriptions.
     pub(super) panel_pool: super::panel_pool::PanelPool,
 
@@ -150,6 +157,32 @@ pub struct TuiRunner<B: Backend> {
 
     /// Partial OSC color response bytes buffered across stdin reads.
     osc_color_response_buf: Vec<u8>,
+
+    /// Outstanding TUI-local color probes by dynamic color index.
+    ///
+    /// Used to consume our own OSC 4/10/11/12 replies locally after focus
+    /// regain without forwarding unsolicited responses into the PTY.
+    local_color_probe_pending: std::collections::HashMap<usize, usize>,
+
+    /// Whether the local terminal profile changed during the current input batch.
+    ///
+    /// Flushed to the hub once after input processing so a burst of local
+    /// probe replies does not spam one JSON profile update per response.
+    local_color_profile_dirty: bool,
+
+    /// Session awaiting deferred focus-in passthrough after a local probe.
+    ///
+    /// When the TUI regains focus, we first probe the outer terminal and sync
+    /// the resulting profile into the session. Only after that completes do we
+    /// pass `ESC[I` through to the child PTY, so focus-triggered color queries
+    /// see the updated session profile.
+    pending_focus_in_session: Option<String>,
+
+    /// Last time the TUI actively reprobed the outer terminal profile.
+    ///
+    /// Used to keep long-lived focused sessions in sync with outer-terminal
+    /// theme changes even when there is no focus transition.
+    last_local_color_probe_at: Option<Instant>,
 
     /// SIGWINCH flag for terminal resize detection.
     pub(super) resize_flag: Arc<AtomicBool>,
@@ -250,6 +283,9 @@ where
     B: Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    const PERIODIC_LOCAL_COLOR_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+    const FOCUS_SYNC_COLOR_INDICES: [usize; 3] = [256usize, 257usize, 258usize];
+
     /// Probe the spawning terminal for default colors used to seed libghostty.
     pub fn probe_spawning_terminal_colors() -> ColorCache {
         let mut store = crate::hub::terminal_profile::TerminalProfileStore::default();
@@ -300,6 +336,7 @@ where
         color_cache: ColorCache,
     ) -> Self {
         Self {
+            color_cache: Arc::clone(&color_cache),
             panel_pool: super::panel_pool::PanelPool::new_with_color_cache(
                 terminal_dims,
                 color_cache,
@@ -317,6 +354,10 @@ where
             raw_reader: RawInputReader::new(),
             stdin_dead: false,
             osc_color_response_buf: Vec::new(),
+            local_color_probe_pending: std::collections::HashMap::new(),
+            local_color_profile_dirty: false,
+            pending_focus_in_session: None,
+            last_local_color_probe_at: None,
             resize_flag: Arc::new(AtomicBool::new(false)),
             terminal_modes: super::terminal_modes::TerminalModes::new(),
             overlay_list_actions: Vec::new(),
@@ -424,6 +465,8 @@ where
             if hot_reloader.poll(&mut layout_lua) {
                 self.dirty = true;
             }
+
+            self.maybe_periodic_local_color_probe();
 
             // 4. Render only when something changed
             if self.dirty {
@@ -568,6 +611,7 @@ where
                 }
                 InputEvent::FocusGained => {
                     self.terminal_modes.on_focus_gained();
+                    self.request_local_color_probe();
                     log::debug!(
                         "[FOCUS] terminal gained focus, mode={} overlay={}",
                         self.mode,
@@ -576,16 +620,15 @@ where
                     self.sync_notification_focus();
                     if self.mode == "terminal" && !self.has_overlay {
                         if self.focus_reporting_enabled_for_current_session() {
-                            log::debug!(
-                                "[FOCUS] forwarding \\x1b[I to PTY session={:?}",
-                                self.panel_pool.current_session_uuid()
-                            );
-                            self.handle_pty_input(b"\x1b[I");
+                            self.pending_focus_in_session =
+                                self.panel_pool.current_session_uuid().map(str::to_string);
+                            self.flush_pending_focus_in();
                         }
                     }
                 }
                 InputEvent::FocusLost => {
                     self.terminal_modes.on_focus_lost();
+                    self.pending_focus_in_session = None;
                     log::debug!(
                         "[FOCUS] terminal lost focus, mode={} overlay={}",
                         self.mode,
@@ -629,12 +672,20 @@ where
                     let responses = self.take_osc_color_responses(raw_bytes);
                     if !responses.is_empty() {
                         for response in responses {
+                            let Some((index, color)) = Self::parse_color_cache_entry(&response) else {
+                                continue;
+                            };
+                            if self.consume_local_color_probe(index) {
+                                self.observe_terminal_color_response(index, color);
+                                continue;
+                            }
                             log::debug!(
                                 "[PTY-PROBE] Intercepted terminal color response ({} bytes), routing to PTY",
                                 response.len()
                             );
                             self.handle_pty_input(&response);
                         }
+                        self.dirty = true;
                         continue;
                     }
 
@@ -645,6 +696,7 @@ where
         }
 
         // Reset scroll acceleration for next tick.
+        self.flush_terminal_color_profile_updates();
         for panel in self.panel_pool.panels.values_mut() {
             panel.reset_scroll_accel();
         }
@@ -1155,6 +1207,204 @@ where
             .collect()
     }
 
+    fn observe_terminal_color_response(
+        &mut self,
+        index: usize,
+        color: crate::terminal::Rgb,
+    ) -> usize {
+        if let Ok(mut cache) = self.color_cache.lock() {
+            cache.insert(index, color);
+        }
+        self.local_color_profile_dirty = true;
+        index
+    }
+
+    fn enqueue_local_color_probe(&mut self) {
+        for index in [256usize, 257usize, 258usize] {
+            *self.local_color_probe_pending.entry(index).or_insert(0) += 1;
+        }
+        for index in 0usize..256usize {
+            *self.local_color_probe_pending.entry(index).or_insert(0) += 1;
+        }
+    }
+
+    fn request_local_color_probe(&mut self) {
+        self.enqueue_local_color_probe();
+        let mut stdout = std::io::stdout();
+        if let Err(e) = stdout.write_all(crate::hub::terminal_profile::full_probe_bytes()) {
+            log::warn!("[PTY-PROBE] failed to write local color probe: {e}");
+            self.local_color_probe_pending.clear();
+            self.flush_pending_focus_in();
+            return;
+        }
+        if let Err(e) = stdout.flush() {
+            log::warn!("[PTY-PROBE] failed to flush local color probe: {e}");
+            self.local_color_probe_pending.clear();
+            self.flush_pending_focus_in();
+            return;
+        }
+        self.last_local_color_probe_at = Some(Instant::now());
+    }
+
+    fn consume_local_color_probe(&mut self, index: usize) -> bool {
+        let Some(count) = self.local_color_probe_pending.get_mut(&index) else {
+            return false;
+        };
+        if *count == 0 {
+            self.local_color_probe_pending.remove(&index);
+            return false;
+        }
+        *count -= 1;
+        if *count == 0 {
+            self.local_color_probe_pending.remove(&index);
+        }
+        true
+    }
+
+    fn has_pending_focus_sync_probe(&self) -> bool {
+        Self::FOCUS_SYNC_COLOR_INDICES
+            .iter()
+            .any(|index| self.local_color_probe_pending.get(index).copied().unwrap_or(0) > 0)
+    }
+
+    fn current_color_profile_message(&self) -> Option<serde_json::Value> {
+        let session_uuid = self.panel_pool.current_session_uuid()?.to_string();
+        let colors = self.color_cache.lock().ok()?.clone();
+        Some(serde_json::json!({
+            "type": "terminal_color_profile",
+            "session_uuid": session_uuid,
+            "colors": colors,
+        }))
+    }
+
+    fn publish_terminal_color_profile_for_current_session(&self) {
+        let Some(msg) = self.current_color_profile_message() else {
+            return;
+        };
+        let session_uuid = msg
+            .get("session_uuid")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        let colors: std::collections::HashMap<usize, crate::terminal::Rgb> = msg
+            .get("colors")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+        let color_count = colors.len();
+        let bg = colors
+            .get(&257usize)
+            .map(|rgb| serde_json::json!({"r": rgb.r, "g": rgb.g, "b": rgb.b}))
+            .unwrap_or(serde_json::Value::Null);
+        log::debug!(
+            "[PTY-PROFILE] publishing local profile session={} colors={} bg={}",
+            session_uuid,
+            color_count,
+            bg
+        );
+        if let Err(error) = self.request_tx.send(TuiRequest::LuaMessage(msg)) {
+            log::error!("Failed to send terminal color profile: {error}");
+        }
+    }
+
+    fn flush_terminal_color_profile_updates(&mut self) {
+        if !self.local_color_profile_dirty {
+            self.flush_pending_focus_in();
+            return;
+        }
+
+        self.local_color_profile_dirty = false;
+        self.publish_terminal_color_profile_for_current_session();
+        self.flush_pending_focus_in();
+    }
+
+    fn flush_pending_focus_in(&mut self) {
+        let Some(session_uuid) = self.pending_focus_in_session.clone() else {
+            return;
+        };
+        if self.has_pending_focus_sync_probe() {
+            return;
+        }
+        if self.panel_pool.current_session_uuid() != Some(session_uuid.as_str()) {
+            self.pending_focus_in_session = None;
+            return;
+        }
+        if !(self.mode == "terminal"
+            && !self.has_overlay
+            && self.terminal_modes.terminal_focused()
+            && self.focus_reporting_enabled_for_current_session())
+        {
+            return;
+        }
+
+        self.pending_focus_in_session = None;
+        log::debug!("[FOCUS] forwarding deferred \\x1b[I to PTY session={session_uuid}");
+        self.handle_pty_input(b"\x1b[I");
+    }
+
+    fn maybe_periodic_local_color_probe(&mut self) {
+        if !self.terminal_modes.terminal_focused() {
+            return;
+        }
+        if self.panel_pool.current_session_uuid().is_none() {
+            return;
+        }
+        if !self.local_color_probe_pending.is_empty() {
+            return;
+        }
+        if self
+            .last_local_color_probe_at
+            .is_some_and(|last| last.elapsed() < Self::PERIODIC_LOCAL_COLOR_PROBE_INTERVAL)
+        {
+            return;
+        }
+
+        self.request_local_color_probe();
+    }
+
+    fn parse_color_cache_entry(data: &[u8]) -> Option<(usize, crate::terminal::Rgb)> {
+        let payload = Self::osc_payload(data)?;
+        let first_sep = payload.iter().position(|byte| *byte == b';')?;
+        let (code, value) = (&payload[..first_sep], &payload[first_sep + 1..]);
+        let (index, rgb_value) = match code {
+            b"4" => {
+                let second_sep = value.iter().position(|byte| *byte == b';')?;
+                let (palette_index, rgb_value) = (&value[..second_sep], &value[second_sep + 1..]);
+                let index = std::str::from_utf8(palette_index)
+                    .ok()?
+                    .parse::<usize>()
+                    .ok()?;
+                (index, rgb_value)
+            }
+            b"10" => (256usize, value),
+            b"11" => (257usize, value),
+            b"12" => (258usize, value),
+            _ => return None,
+        };
+        let rgb_str = rgb_value.strip_prefix(b"rgb:")?;
+        let rgb_str = std::str::from_utf8(rgb_str).ok()?;
+        let mut parts = rgb_str.split('/');
+        let r = u16::from_str_radix(parts.next()?, 16).ok()?;
+        let g = u16::from_str_radix(parts.next()?, 16).ok()?;
+        let b = u16::from_str_radix(parts.next()?, 16).ok()?;
+        Some((
+            index,
+            crate::terminal::Rgb::new((r >> 8) as u8, (g >> 8) as u8, (b >> 8) as u8),
+        ))
+    }
+
+    fn osc_payload(seq: &[u8]) -> Option<&[u8]> {
+        if seq.len() < 4 || seq[0] != 0x1b || seq[1] != b']' {
+            return None;
+        }
+        if seq.ends_with(&[0x07]) {
+            return Some(&seq[2..seq.len() - 1]);
+        }
+        if seq.len() >= 4 && seq.ends_with(&[0x1b, b'\\']) {
+            return Some(&seq[2..seq.len() - 2]);
+        }
+        None
+    }
+
     fn extract_complete_osc_sequences(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
         let mut sequences = Vec::new();
         let mut idx = 0usize;
@@ -1479,6 +1729,8 @@ where
     /// Render the TUI.
     fn render(&mut self, layout_lua: Option<&LayoutLua>, layout_error: Option<&str>) -> Result<()> {
         use super::render::{render, RenderContext};
+
+        self.panel_pool.refresh_panel_colors();
 
         // Read scroll state from the focused panel (no mutex needed)
         let (scroll_offset, is_scrolled) = self
@@ -2120,6 +2372,269 @@ mod tests {
 
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0], b"\x1b]4;7;rgb:aaaa/bbbb/cccc\x07");
+    }
+
+    #[test]
+    fn osc_color_response_updates_local_color_cache() {
+        let (mut runner, _request_rx) = create_test_runner();
+
+        let (index, color) =
+            TuiRunner::<TestBackend>::parse_color_cache_entry(b"\x1b]11;rgb:1111/2222/3333\x07")
+                .expect("color response parsed");
+        let index = runner.observe_terminal_color_response(index, color);
+
+        let cache = runner.color_cache.lock().expect("runner color cache");
+        assert_eq!(index, 257usize);
+        assert_eq!(
+            cache.get(&257usize).copied(),
+            Some(crate::terminal::Rgb::new(0x11, 0x22, 0x33))
+        );
+    }
+
+    #[test]
+    fn local_color_probe_responses_are_consumed_locally() {
+        let (mut runner, _request_rx) = create_test_runner();
+        runner.local_color_probe_pending.insert(257usize, 1);
+
+        assert!(runner.consume_local_color_probe(257usize));
+        assert!(!runner.local_color_probe_pending.contains_key(&257usize));
+        assert!(!runner.consume_local_color_probe(257usize));
+    }
+
+    #[test]
+    fn local_palette_probe_responses_are_consumed_locally() {
+        let (mut runner, _request_rx) = create_test_runner();
+        runner.local_color_probe_pending.insert(7usize, 1);
+
+        assert!(runner.consume_local_color_probe(7usize));
+        assert!(!runner.local_color_probe_pending.contains_key(&7usize));
+        assert!(!runner.consume_local_color_probe(7usize));
+    }
+
+    #[test]
+    fn completed_local_probe_publishes_profile_update() {
+        let (mut runner, mut request_rx) = create_test_runner();
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.mode = "terminal".to_string();
+        runner.local_color_probe_pending.insert(257usize, 1);
+
+        let (index, color) =
+            TuiRunner::<TestBackend>::parse_color_cache_entry(b"\x1b]11;rgb:1111/2222/3333\x07")
+                .expect("color response parsed");
+        runner.observe_terminal_color_response(index, color);
+        assert!(runner.consume_local_color_probe(257usize));
+        runner.flush_terminal_color_profile_updates();
+
+        let first = request_rx.try_recv().expect("terminal profile publish");
+
+        let msg = match first {
+            TuiRequest::LuaMessage(msg) => msg,
+            other => panic!("expected LuaMessage, got {other:?}"),
+        };
+        assert_eq!(
+            msg.get("type").and_then(|value| value.as_str()),
+            Some("terminal_color_profile")
+        );
+        assert_eq!(
+            msg.get("session_uuid").and_then(|value| value.as_str()),
+            Some("sess-0")
+        );
+        let colors: std::collections::HashMap<usize, crate::terminal::Rgb> =
+            serde_json::from_value(msg.get("colors").cloned().expect("colors payload"))
+                .expect("decode colors");
+        assert_eq!(
+            colors.get(&257usize).copied(),
+            Some(crate::terminal::Rgb::new(0x11, 0x22, 0x33))
+        );
+    }
+
+    #[test]
+    fn local_probe_publishes_incrementally_while_palette_probe_is_still_pending() {
+        let (mut runner, mut request_rx) = create_test_runner();
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.mode = "terminal".to_string();
+        runner.local_color_probe_pending.insert(257usize, 1);
+        runner.local_color_probe_pending.insert(7usize, 1);
+
+        let (index, color) =
+            TuiRunner::<TestBackend>::parse_color_cache_entry(b"\x1b]11;rgb:1111/2222/3333\x07")
+                .expect("color response parsed");
+        runner.observe_terminal_color_response(index, color);
+        assert!(runner.consume_local_color_probe(257usize));
+        runner.flush_terminal_color_profile_updates();
+
+        let first = request_rx.try_recv().expect("terminal profile publish");
+        let msg = match first {
+            TuiRequest::LuaMessage(msg) => msg,
+            other => panic!("expected LuaMessage, got {other:?}"),
+        };
+        assert_eq!(
+            msg.get("session_uuid").and_then(|value| value.as_str()),
+            Some("sess-0")
+        );
+        assert!(runner.local_color_probe_pending.contains_key(&7usize));
+    }
+
+    #[test]
+    fn deferred_focus_in_waits_only_for_default_colors() {
+        let (mut runner, mut request_rx) = create_test_runner();
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.mode = "terminal".to_string();
+        runner.pending_focus_in_session = Some("sess-0".to_string());
+        runner.terminal_modes.on_focus_gained();
+        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        panel.connect("sess-0");
+        panel.on_scrollback(b"");
+        panel.on_output(b"\x1b[?1004h");
+        runner.panel_pool.panels.insert("sess-0".to_string(), panel);
+        runner.local_color_probe_pending.insert(256usize, 1);
+        runner.local_color_probe_pending.insert(257usize, 1);
+        runner.local_color_probe_pending.insert(258usize, 1);
+        runner.local_color_probe_pending.insert(7usize, 1);
+
+        runner.flush_pending_focus_in();
+        assert!(request_rx.try_recv().is_err());
+
+        let (fg_index, fg_color) =
+            TuiRunner::<TestBackend>::parse_color_cache_entry(b"\x1b]10;rgb:cece/cdcd/c3c3\x07")
+                .expect("fg parsed");
+        assert!(runner.consume_local_color_probe(fg_index));
+        runner.observe_terminal_color_response(fg_index, fg_color);
+
+        let (bg_index, bg_color) =
+            TuiRunner::<TestBackend>::parse_color_cache_entry(b"\x1b]11;rgb:1010/0f0f/0f0f\x07")
+                .expect("bg parsed");
+        assert!(runner.consume_local_color_probe(bg_index));
+        runner.observe_terminal_color_response(bg_index, bg_color);
+
+        let (cursor_index, cursor_color) =
+            TuiRunner::<TestBackend>::parse_color_cache_entry(b"\x1b]12;rgb:cece/cdcd/c3c3\x07")
+                .expect("cursor parsed");
+        assert!(runner.consume_local_color_probe(cursor_index));
+        runner.observe_terminal_color_response(cursor_index, cursor_color);
+
+        runner.flush_terminal_color_profile_updates();
+
+        let profile_msg = request_rx.try_recv().expect("terminal profile publish");
+        let msg = match profile_msg {
+            TuiRequest::LuaMessage(msg) => msg,
+            other => panic!("expected LuaMessage, got {other:?}"),
+        };
+        assert_eq!(
+            msg.get("session_uuid").and_then(|value| value.as_str()),
+            Some("sess-0")
+        );
+
+        let focus_msg = request_rx.try_recv().expect("deferred focus input");
+        match focus_msg {
+            TuiRequest::PtyInput { session_uuid, data } => {
+                assert_eq!(session_uuid, "sess-0");
+                assert_eq!(data, b"\x1b[I");
+            }
+            other => panic!("expected PtyInput, got {other:?}"),
+        }
+        assert!(runner.local_color_probe_pending.contains_key(&7usize));
+    }
+
+    #[test]
+    fn local_probe_publish_happens_before_deferred_focus_in() {
+        let (mut runner, mut request_rx) = create_test_runner();
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.mode = "terminal".to_string();
+        runner.pending_focus_in_session = Some("sess-0".to_string());
+        runner.terminal_modes.on_focus_gained();
+        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        panel.connect("sess-0");
+        panel.on_scrollback(b"");
+        panel.on_output(b"\x1b[?1004h");
+        runner.panel_pool.panels.insert("sess-0".to_string(), panel);
+        runner.local_color_probe_pending.insert(256usize, 1);
+        runner.local_color_probe_pending.insert(257usize, 1);
+        runner.local_color_probe_pending.insert(258usize, 1);
+
+        let (fg_index, fg_color) =
+            TuiRunner::<TestBackend>::parse_color_cache_entry(b"\x1b]10;rgb:cece/cdcd/c3c3\x07")
+                .expect("fg parsed");
+        assert!(runner.consume_local_color_probe(fg_index));
+        runner.observe_terminal_color_response(fg_index, fg_color);
+
+        let (bg_index, bg_color) =
+            TuiRunner::<TestBackend>::parse_color_cache_entry(b"\x1b]11;rgb:1010/0f0f/0f0f\x07")
+                .expect("bg parsed");
+        assert!(runner.consume_local_color_probe(bg_index));
+        runner.observe_terminal_color_response(bg_index, bg_color);
+
+        let (cursor_index, cursor_color) =
+            TuiRunner::<TestBackend>::parse_color_cache_entry(b"\x1b]12;rgb:cece/cdcd/c3c3\x07")
+                .expect("cursor parsed");
+        assert!(runner.consume_local_color_probe(cursor_index));
+        runner.observe_terminal_color_response(cursor_index, cursor_color);
+
+        runner.flush_terminal_color_profile_updates();
+
+        let first = request_rx.try_recv().expect("first request");
+        let msg = match first {
+            TuiRequest::LuaMessage(msg) => msg,
+            other => panic!("expected LuaMessage first, got {other:?}"),
+        };
+        assert_eq!(
+            msg.get("session_uuid").and_then(|value| value.as_str()),
+            Some("sess-0")
+        );
+        let colors: std::collections::HashMap<usize, crate::terminal::Rgb> =
+            serde_json::from_value(msg.get("colors").cloned().expect("colors payload"))
+                .expect("decode colors");
+        assert_eq!(
+            colors.get(&257usize).copied(),
+            Some(crate::terminal::Rgb::new(16, 15, 15))
+        );
+
+        let second = request_rx.try_recv().expect("second request");
+        match second {
+            TuiRequest::PtyInput { session_uuid, data } => {
+                assert_eq!(session_uuid, "sess-0");
+                assert_eq!(data, b"\x1b[I");
+            }
+            other => panic!("expected PtyInput second, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_local_osc_color_response_does_not_update_local_color_cache() {
+        let (mut runner, _request_rx) = create_test_runner();
+        if let Ok(mut cache) = runner.color_cache.lock() {
+            cache.insert(257usize, crate::terminal::Rgb::new(0xff, 0xfc, 0xf0));
+        }
+
+        let response = b"\x1b]11;rgb:1010/0f0f/0f0f\x07";
+        let (index, color) = TuiRunner::<TestBackend>::parse_color_cache_entry(response)
+            .expect("color response parsed");
+
+        assert!(!runner.consume_local_color_probe(index));
+
+        let cache = runner.color_cache.lock().expect("runner color cache");
+        assert_eq!(
+            cache.get(&257usize).copied(),
+            Some(crate::terminal::Rgb::new(0xff, 0xfc, 0xf0))
+        );
+        drop(cache);
+        let _ = color;
+    }
+
+    #[test]
+    fn local_probe_enqueues_full_palette_but_focus_sync_depends_only_on_defaults() {
+        let (mut runner, _request_rx) = create_test_runner();
+        runner.enqueue_local_color_probe();
+
+        assert_eq!(runner.local_color_probe_pending.len(), 259);
+        assert!(runner.has_pending_focus_sync_probe());
+
+        for index in [256usize, 257usize, 258usize] {
+            assert!(runner.consume_local_color_probe(index));
+        }
+
+        assert!(!runner.has_pending_focus_sync_probe());
+        assert!(runner.local_color_probe_pending.contains_key(&7usize));
     }
 
     #[test]

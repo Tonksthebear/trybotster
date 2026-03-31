@@ -9,7 +9,7 @@
 //! - **State queries** (`get_worktrees`, `server_id`, `detect_repo`)
 //!   read directly from shared state or environment
 //! - **Registration** (`register_session`, `unregister_session`) manages PTY handles
-//! - **Operations** (`quit`, `handle_webrtc_offer`, `handle_ice_candidate`)
+//! - **Operations** (`quit`, `handle_signaling_message`)
 //!   send events to the Hub event loop via `HubEventSender`
 //!
 //! # Usage in Lua
@@ -30,9 +30,12 @@
 //! -- Detect current repo (owner/name format)
 //! local repo = hub.detect_repo()
 //!
-//! -- Handle WebRTC signaling
-//! hub.handle_webrtc_offer(browser_identity, sdp)
-//! hub.handle_ice_candidate(browser_identity, candidate_data)
+//! -- Handle ActionCable signaling / WebRTC control messages
+//! hub.handle_signaling_message({
+//!   type = "signal",
+//!   browser_identity = browser_identity,
+//!   envelope = { type = "offer", sdp = "v=0 ..." },
+//! })
 //!
 //! -- Request Hub shutdown
 //! hub.quit()
@@ -70,29 +73,10 @@ pub enum HubRequest {
     /// On build failure the Hub logs an error and keeps running — no agents
     /// are disrupted.  Intended for development iteration only.
     DevRebuild,
-    /// Handle an incoming WebRTC SDP offer from a browser.
-    HandleWebrtcOffer {
-        /// Browser identity key (e.g., `identityKey:tabId`).
-        browser_identity: String,
-        /// SDP offer string.
-        sdp: String,
-    },
-    /// Add an ICE candidate to an existing WebRTC peer connection.
-    HandleIceCandidate {
-        /// Browser identity key (e.g., `identityKey:tabId`).
-        browser_identity: String,
-        /// ICE candidate data as JSON value.
-        candidate: serde_json::Value,
-    },
-    /// Initiate Olm ratchet restart for a browser whose session is desynced.
-    RatchetRestart {
-        /// Browser identity key (e.g., `identityKey:tabId`).
-        browser_identity: String,
-    },
-    /// Send a fresh signed bundle to a browser without ratchet-restart dedupe.
-    SendFreshBundle {
-        /// Browser identity key (e.g., `identityKey:tabId`).
-        browser_identity: String,
+    /// Handle an incoming ActionCable signaling/control message for WebRTC.
+    HandleSignalingMessage {
+        /// Full message payload from the Lua ActionCable adapter.
+        message: serde_json::Value,
     },
 }
 
@@ -109,8 +93,7 @@ pub type SharedServerId = Arc<Mutex<Option<String>>>;
 /// - `hub.server_id()` - Get server-assigned hub ID
 /// - `hub.detect_repo()` - Detect current repo name
 /// - `hub.api_token()` - Get hub's API bearer token for authenticated requests
-/// - `hub.handle_webrtc_offer(browser_identity, sdp)` - Send WebRTC offer event
-/// - `hub.handle_ice_candidate(browser_identity, candidate)` - Send ICE candidate event
+/// - `hub.handle_signaling_message(message)` - Send WebRTC signaling/control event
 /// - `hub.quit()` - Request Hub shutdown
 ///
 /// # Arguments
@@ -523,97 +506,27 @@ pub(crate) fn register(
     hub.set("api_token", api_token_fn)
         .map_err(|e| anyhow!("Failed to set hub.api_token: {e}"))?;
 
-    // hub.handle_webrtc_offer(browser_identity, sdp) - Send a WebRTC SDP offer event.
+    // hub.handle_signaling_message(message) - Route an ActionCable WebRTC/control message.
     let tx = hub_event_tx.clone();
-    let handle_webrtc_offer_fn = lua
-        .create_function(move |_, (browser_identity, sdp): (String, String)| {
+    let handle_signaling_message_fn = lua
+        .create_function(move |lua, message: LuaValue| {
+            let message: serde_json::Value = lua.from_value(message)?;
             let guard = tx.lock().expect("HubEventSender mutex poisoned");
             if let Some(ref sender) = *guard {
-                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::HandleWebrtcOffer {
-                    browser_identity,
-                    sdp,
-                }));
+                let _ = sender.send(HubEvent::LuaHubRequest(
+                    HubRequest::HandleSignalingMessage { message },
+                ));
             } else {
                 ::log::warn!(
-                    "[Hub] handle_webrtc_offer called before hub_event_tx set — event dropped"
+                    "[Hub] handle_signaling_message called before hub_event_tx set — event dropped"
                 );
             }
             Ok(())
         })
-        .map_err(|e| anyhow!("Failed to create hub.handle_webrtc_offer function: {e}"))?;
+        .map_err(|e| anyhow!("Failed to create hub.handle_signaling_message function: {e}"))?;
 
-    hub.set("handle_webrtc_offer", handle_webrtc_offer_fn)
-        .map_err(|e| anyhow!("Failed to set hub.handle_webrtc_offer: {e}"))?;
-
-    // hub.handle_ice_candidate(browser_identity, candidate_data) - Send an ICE candidate event.
-    //
-    // `candidate_data` is a Lua table with `candidate`, `sdpMid`, and `sdpMLineIndex` fields,
-    // matching the JSON structure from browser WebRTC signaling.
-    let tx = hub_event_tx.clone();
-    let handle_ice_candidate_fn = lua
-        .create_function(
-            move |lua, (browser_identity, candidate_data): (String, LuaValue)| {
-                let candidate: serde_json::Value = lua.from_value(candidate_data)?;
-                let guard = tx.lock().expect("HubEventSender mutex poisoned");
-                if let Some(ref sender) = *guard {
-                    let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::HandleIceCandidate {
-                        browser_identity,
-                        candidate,
-                    }));
-                } else {
-                    ::log::warn!(
-                        "[Hub] handle_ice_candidate called before hub_event_tx set — event dropped"
-                    );
-                }
-                Ok(())
-            },
-        )
-        .map_err(|e| anyhow!("Failed to create hub.handle_ice_candidate function: {e}"))?;
-
-    hub.set("handle_ice_candidate", handle_ice_candidate_fn)
-        .map_err(|e| anyhow!("Failed to set hub.handle_ice_candidate: {e}"))?;
-
-    // hub.request_ratchet_restart(browser_identity) - Initiate Olm ratchet restart for a peer.
-    let tx = hub_event_tx.clone();
-    let request_ratchet_restart_fn = lua
-        .create_function(move |_, browser_identity: String| {
-            let guard = tx.lock().expect("HubEventSender mutex poisoned");
-            if let Some(ref sender) = *guard {
-                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::RatchetRestart {
-                    browser_identity,
-                }));
-            } else {
-                ::log::warn!(
-                    "[Hub] request_ratchet_restart called before hub_event_tx set — event dropped"
-                );
-            }
-            Ok(())
-        })
-        .map_err(|e| anyhow!("Failed to create hub.request_ratchet_restart function: {e}"))?;
-
-    hub.set("request_ratchet_restart", request_ratchet_restart_fn)
-        .map_err(|e| anyhow!("Failed to set hub.request_ratchet_restart: {e}"))?;
-
-    // hub.send_fresh_bundle(browser_identity) - Push a fresh signed bundle for a new session.
-    let tx = hub_event_tx.clone();
-    let send_fresh_bundle_fn = lua
-        .create_function(move |_, browser_identity: String| {
-            let guard = tx.lock().expect("HubEventSender mutex poisoned");
-            if let Some(ref sender) = *guard {
-                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::SendFreshBundle {
-                    browser_identity,
-                }));
-            } else {
-                ::log::warn!(
-                    "[Hub] send_fresh_bundle called before hub_event_tx set — event dropped"
-                );
-            }
-            Ok(())
-        })
-        .map_err(|e| anyhow!("Failed to create hub.send_fresh_bundle function: {e}"))?;
-
-    hub.set("send_fresh_bundle", send_fresh_bundle_fn)
-        .map_err(|e| anyhow!("Failed to set hub.send_fresh_bundle: {e}"))?;
+    hub.set("handle_signaling_message", handle_signaling_message_fn)
+        .map_err(|e| anyhow!("Failed to set hub.handle_signaling_message: {e}"))?;
 
     // hub.spawn_session(opts, session_uuid) → PtySessionHandle
     //
@@ -1037,8 +950,7 @@ mod tests {
         assert!(hub.contains_key("hub_id").unwrap());
         assert!(hub.contains_key("server_id").unwrap());
         assert!(hub.contains_key("detect_repo").unwrap());
-        assert!(hub.contains_key("handle_webrtc_offer").unwrap());
-        assert!(hub.contains_key("handle_ice_candidate").unwrap());
+        assert!(hub.contains_key("handle_signaling_message").unwrap());
         assert!(hub.contains_key("quit").unwrap());
         assert!(hub.contains_key("graceful_restart").unwrap());
         assert!(hub.contains_key("exec_restart").unwrap());
@@ -1339,33 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_webrtc_offer_sends_event() {
-        let lua = Lua::new();
-        let (tx, cache, hid, sid, state, cc) = create_test_deps();
-
-        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        *tx.lock().unwrap() = Some(sender.into());
-
-        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
-
-        lua.load(r#"hub.handle_webrtc_offer("browser-123", "v=0 test-sdp")"#)
-            .exec()
-            .expect("Should send offer event");
-
-        match rx.try_recv() {
-            Ok(HubEvent::LuaHubRequest(HubRequest::HandleWebrtcOffer {
-                browser_identity,
-                sdp,
-            })) => {
-                assert_eq!(browser_identity, "browser-123");
-                assert_eq!(sdp, "v=0 test-sdp");
-            }
-            other => panic!("Expected LuaHubRequest(HandleWebrtcOffer), got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_handle_ice_candidate_sends_event() {
+    fn test_handle_signaling_message_sends_event() {
         let lua = Lua::new();
         let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
@@ -1375,24 +1261,88 @@ mod tests {
         register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
 
         lua.load(
-            r#"hub.handle_ice_candidate("browser-456", {candidate = "candidate:...", sdpMid = "0"})"#,
+            r#"hub.handle_signaling_message({
+                type = "signal",
+                browser_identity = "browser-123",
+                envelope = { type = "offer", sdp = "v=0 test-sdp" }
+            })"#,
         )
         .exec()
-        .expect("Should send ICE candidate event");
+        .expect("Should send signaling event");
 
         match rx.try_recv() {
-            Ok(HubEvent::LuaHubRequest(HubRequest::HandleIceCandidate {
-                browser_identity,
-                candidate,
-            })) => {
-                assert_eq!(browser_identity, "browser-456");
+            Ok(HubEvent::LuaHubRequest(HubRequest::HandleSignalingMessage { message })) => {
                 assert_eq!(
-                    candidate.get("candidate").and_then(|v| v.as_str()),
+                    message.get("browser_identity").and_then(|v| v.as_str()),
+                    Some("browser-123")
+                );
+                assert_eq!(message.get("type").and_then(|v| v.as_str()), Some("signal"));
+                assert_eq!(
+                    message
+                        .get("envelope")
+                        .and_then(|v| v.get("type"))
+                        .and_then(|v| v.as_str()),
+                    Some("offer")
+                );
+                assert_eq!(
+                    message
+                        .get("envelope")
+                        .and_then(|v| v.get("sdp"))
+                        .and_then(|v| v.as_str()),
+                    Some("v=0 test-sdp")
+                );
+            }
+            other => panic!("Expected LuaHubRequest(HandleSignalingMessage), got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_handle_signaling_message_preserves_candidate_payload() {
+        let lua = Lua::new();
+        let (tx, cache, hid, sid, state, cc) = create_test_deps();
+
+        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender.into());
+
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
+
+        lua.load(
+            r#"hub.handle_signaling_message({
+                type = "signal",
+                browser_identity = "browser-456",
+                envelope = {
+                    type = "ice",
+                    candidate = {
+                        candidate = "candidate:...",
+                        sdpMid = "0"
+                    }
+                }
+            })"#,
+        )
+        .exec()
+        .expect("Should send signaling event");
+
+        match rx.try_recv() {
+            Ok(HubEvent::LuaHubRequest(HubRequest::HandleSignalingMessage { message })) => {
+                assert_eq!(
+                    message.get("browser_identity").and_then(|v| v.as_str()),
+                    Some("browser-456")
+                );
+                let candidate = message.get("envelope").and_then(|v| v.get("candidate"));
+                assert_eq!(
+                    candidate
+                        .and_then(|v| v.get("candidate"))
+                        .and_then(|v| v.as_str()),
                     Some("candidate:...")
                 );
-                assert_eq!(candidate.get("sdpMid").and_then(|v| v.as_str()), Some("0"));
+                assert_eq!(
+                    candidate
+                        .and_then(|v| v.get("sdpMid"))
+                        .and_then(|v| v.as_str()),
+                    Some("0")
+                );
             }
-            other => panic!("Expected LuaHubRequest(HandleIceCandidate), got: {other:?}"),
+            other => panic!("Expected LuaHubRequest(HandleSignalingMessage), got: {other:?}"),
         }
     }
 

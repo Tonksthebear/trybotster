@@ -1,7 +1,7 @@
 -- Hub Command Channel (Lua plugin)
 --
 -- Manages the HubCommandChannel subscription:
---   - Routes decrypted signals to WebRTC primitives
+--   - Forwards decrypted signaling/control messages to the Rust Hub
 --   - Routes command messages to Lua event system
 --   - Acks commands by sequence number
 --   - Sends application-level heartbeat every 30s (agent status sync)
@@ -67,41 +67,8 @@ handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
     function(message, channel_id)
         local msg_type = message.type
 
-        if msg_type == "signal" then
-            -- If Rust couldn't decrypt the envelope (Olm session mismatch),
-            -- tell the browser its session is stale so it can re-pair.
-            if message.decrypt_failed then
-                log.warn("Signal decryption failed for browser " ..
-                    tostring(message.browser_identity) .. ", requesting ratchet restart")
-                hub.request_ratchet_restart(message.browser_identity)
-                return
-            end
-
-            -- Primitive already decrypted the OlmEnvelope.
-            -- message.envelope is now the decrypted plaintext JSON:
-            --   { type = "offer"|"ice"|"answer", sdp = ..., candidate = ... }
-            local signal_data = message.envelope
-            local signal_type = signal_data and signal_data.type
-
-            if signal_type == "offer" then
-                hub.handle_webrtc_offer(
-                    message.browser_identity,
-                    signal_data.sdp
-                )
-            elseif signal_type == "ice" then
-                hub.handle_ice_candidate(
-                    message.browser_identity,
-                    signal_data.candidate
-                )
-            else
-                log.warn("Unknown signal type: " .. tostring(signal_type))
-            end
-
-        elseif msg_type == "bundle_request" then
-            if message.browser_identity then
-                hub.send_fresh_bundle(message.browser_identity)
-            end
-
+        if msg_type == "signal" or msg_type == "bundle_request" then
+            hub.handle_signaling_message(message)
         elseif msg_type == "message" then
             local event_type = message.event_type or ""
 

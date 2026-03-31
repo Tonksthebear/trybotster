@@ -170,9 +170,9 @@ impl SessionConnection {
         Ok(())
     }
 
-    /// Request and receive a binary snapshot from the session process.
+    /// Request and receive an opaque terminal snapshot from the session process.
     ///
-    /// Returns an opaque blob produced by `ghostty_snapshot_terminal_export`.
+    /// Returns an opaque blob produced by `ghostty_terminal_snapshot_export`.
     /// Clients import it via `terminal.snapshot_import()`.
     pub fn get_snapshot(&mut self) -> Result<Vec<u8>> {
         let req = encode_empty(FRAME_GET_SNAPSHOT);
@@ -204,6 +204,21 @@ impl SessionConnection {
         self.stream.flush()?;
         let frame = self.read_response(FRAME_MODE_FLAGS)?;
         frame.json()
+    }
+
+    /// Replace the session parser's current terminal color profile.
+    pub fn set_color_profile(&mut self, colors: &std::collections::HashMap<usize, crate::terminal::Rgb>) -> Result<()> {
+        let frame = encode_json(
+            FRAME_SET_COLOR_PROFILE,
+            &TerminalColorProfile {
+                colors: colors.clone(),
+            },
+        )?;
+        self.stream
+            .write_all(&frame)
+            .context("send SetColorProfile")?;
+        self.stream.flush().context("flush SetColorProfile")?;
+        Ok(())
     }
 
     /// Send a ping and wait for pong.
@@ -386,17 +401,7 @@ fn session_reader(
 
                 FRAME_PROMPT_MARK => {
                     if let Ok(payload) = frame.json::<PromptMarkPayload>() {
-                        let mark = match payload.mark.as_str() {
-                            "prompt_start" => Some(PromptMark::PromptStart),
-                            "command_start" => Some(PromptMark::CommandStart),
-                            "command_executed" => {
-                                Some(PromptMark::CommandExecuted(payload.command))
-                            }
-                            "command_finished" => {
-                                Some(PromptMark::CommandFinished(payload.exit_code))
-                            }
-                            _ => None,
-                        };
+                        let mark = PromptMark::from_name(payload.mark.as_str());
                         if let Some(m) = mark {
                             let _ = event_tx.send(PtyEvent::prompt_mark(m));
                         }

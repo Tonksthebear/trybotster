@@ -203,15 +203,13 @@ fn percent_decode(input: &str) -> String {
     result
 }
 
-/// Scan PTY output for OSC 133/633 shell integration prompt marks.
+/// Scan PTY output for OSC 133/633 shell integration markers.
 ///
-/// Returns all prompt marks found in the buffer. These sequences mark
-/// command boundaries:
-/// - `A` — Prompt start (shell is about to display prompt)
-/// - `B` — Command start (user finished typing, prompt ended)
-/// - `C` — Command executed (output begins)
-/// - `D` [; exitcode] — Command finished
-/// - `E` ; commandline — (OSC 633 only) Command text
+/// Returns semantic prompt actions found in the buffer.
+///
+/// This scanner normalizes raw OSC markers into the same action model used by
+/// Ghostty's semantic prompt callback. Extra VS Code payloads like command text
+/// or exit codes are ignored.
 ///
 /// Supports both OSC 133 (FinalTerm/iTerm2) and OSC 633 (VS Code).
 pub fn scan_prompt_marks(data: &[u8]) -> Vec<super::pty::PromptMark> {
@@ -254,26 +252,15 @@ pub fn scan_prompt_marks(data: &[u8]) -> Vec<super::pty::PromptMark> {
 
                 let mark = if !content.is_empty() {
                     match content[0] {
-                        b'A' => Some(PromptMark::PromptStart),
-                        b'B' => Some(PromptMark::CommandStart),
-                        b'C' => Some(PromptMark::CommandExecuted(None)),
-                        b'D' => {
-                            // Optional exit code after ;
-                            let exit_code = if content.len() > 2 && content[1] == b';' {
-                                String::from_utf8_lossy(&content[2..])
-                                    .trim()
-                                    .parse::<i32>()
-                                    .ok()
-                            } else {
-                                None
-                            };
-                            Some(PromptMark::CommandFinished(exit_code))
-                        }
-                        b'E' if is_vscode && content.len() > 2 && content[1] == b';' => {
-                            // VS Code command text: OSC 633;E;command_text BEL
-                            let cmd = String::from_utf8_lossy(&content[2..]).to_string();
-                            Some(PromptMark::CommandExecuted(Some(cmd)))
-                        }
+                        b'A' => Some(PromptMark::FreshLineNewPrompt),
+                        b'B' => Some(PromptMark::EndPromptStartInput),
+                        b'C' => Some(PromptMark::EndInputStartOutput),
+                        b'D' => Some(PromptMark::EndCommand),
+                        b'P' => Some(PromptMark::PromptStart),
+                        b'I' => Some(PromptMark::EndPromptStartInput),
+                        b'L' => Some(PromptMark::FreshLine),
+                        b'N' => Some(PromptMark::NewCommand),
+                        b'E' if is_vscode && content.len() > 2 && content[1] == b';' => None,
                         _ => None,
                     }
                 } else {
@@ -366,7 +353,7 @@ mod tests {
         use super::super::pty::PromptMark;
         let data = b"\x1b]133;A\x07";
         let marks = scan_prompt_marks(data);
-        assert_eq!(marks, vec![PromptMark::PromptStart]);
+        assert_eq!(marks, vec![PromptMark::FreshLineNewPrompt]);
     }
 
     #[test]
@@ -374,38 +361,34 @@ mod tests {
         use super::super::pty::PromptMark;
         let data = b"\x1b]633;A\x07";
         let marks = scan_prompt_marks(data);
-        assert_eq!(marks, vec![PromptMark::PromptStart]);
+        assert_eq!(marks, vec![PromptMark::FreshLineNewPrompt]);
     }
 
     #[test]
     fn test_scan_prompt_marks_all_types() {
         use super::super::pty::PromptMark;
         let mut data = Vec::new();
-        data.extend(b"\x1b]133;A\x07"); // prompt start
-        data.extend(b"\x1b]133;B\x07"); // command start
-        data.extend(b"\x1b]133;C\x07"); // command executed
-        data.extend(b"\x1b]133;D;0\x07"); // command finished (exit 0)
+        data.extend(b"\x1b]133;A\x07");
+        data.extend(b"\x1b]133;B\x07");
+        data.extend(b"\x1b]133;C\x07");
+        data.extend(b"\x1b]133;D;0\x07");
         let marks = scan_prompt_marks(&data);
         assert_eq!(
             marks,
             vec![
-                PromptMark::PromptStart,
-                PromptMark::CommandStart,
-                PromptMark::CommandExecuted(None),
-                PromptMark::CommandFinished(Some(0)),
+                PromptMark::FreshLineNewPrompt,
+                PromptMark::EndPromptStartInput,
+                PromptMark::EndInputStartOutput,
+                PromptMark::EndCommand,
             ]
         );
     }
 
     #[test]
     fn test_scan_prompt_marks_633_e_command_text() {
-        use super::super::pty::PromptMark;
         let data = b"\x1b]633;E;ls -la\x07";
         let marks = scan_prompt_marks(data);
-        assert_eq!(
-            marks,
-            vec![PromptMark::CommandExecuted(Some("ls -la".to_string()))]
-        );
+        assert!(marks.is_empty());
     }
 
     #[test]
@@ -413,7 +396,7 @@ mod tests {
         use super::super::pty::PromptMark;
         let data = b"\x1b]133;D;1\x07";
         let marks = scan_prompt_marks(data);
-        assert_eq!(marks, vec![PromptMark::CommandFinished(Some(1))]);
+        assert_eq!(marks, vec![PromptMark::EndCommand]);
     }
 
     #[test]
@@ -421,7 +404,7 @@ mod tests {
         use super::super::pty::PromptMark;
         let data = b"\x1b]133;D\x07";
         let marks = scan_prompt_marks(data);
-        assert_eq!(marks, vec![PromptMark::CommandFinished(None)]);
+        assert_eq!(marks, vec![PromptMark::EndCommand]);
     }
 
     #[test]

@@ -32,22 +32,61 @@
 
 use super::super::notification::AgentNotification;
 
-/// Shell integration prompt marks detected from OSC 133/633 sequences.
+/// Semantic prompt actions detected from OSC 133 shell integration sequences.
 ///
-/// These sequences are emitted by shells with prompt integration (bash, zsh, fish)
-/// and VS Code's terminal shell integration. They mark command boundaries in the
-/// terminal output stream.
+/// These actions are reported natively by Ghostty and represent prompt/input/output
+/// boundaries in the terminal stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptMark {
-    /// Prompt is about to be displayed (OSC 133;A / 633;A).
+    /// A fresh line was emitted without beginning a new prompt.
+    FreshLine,
+    /// A fresh line was emitted and a new prompt is about to begin.
+    FreshLineNewPrompt,
+    /// A new command boundary was reported.
+    NewCommand,
+    /// Prompt rendering began.
     PromptStart,
-    /// User has entered a command, prompt ended (OSC 133;B / 633;B).
-    CommandStart,
-    /// Command has been executed, output begins (OSC 133;C / 633;C).
-    /// The optional string carries the command text from OSC 633;E.
-    CommandExecuted(Option<String>),
-    /// Command finished with an exit code (OSC 133;D / 633;D).
-    CommandFinished(Option<i32>),
+    /// Prompt rendering ended and input began.
+    EndPromptStartInput,
+    /// Prompt rendering ended, input began, and the line was terminated.
+    EndPromptStartInputTerminateEol,
+    /// Input ended and command output began.
+    EndInputStartOutput,
+    /// The command boundary ended.
+    EndCommand,
+}
+
+impl PromptMark {
+    /// Canonical transport name for this semantic prompt action.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::FreshLine => "fresh_line",
+            Self::FreshLineNewPrompt => "fresh_line_new_prompt",
+            Self::NewCommand => "new_command",
+            Self::PromptStart => "prompt_start",
+            Self::EndPromptStartInput => "end_prompt_start_input",
+            Self::EndPromptStartInputTerminateEol => "end_prompt_start_input_terminate_eol",
+            Self::EndInputStartOutput => "end_input_start_output",
+            Self::EndCommand => "end_command",
+        }
+    }
+
+    /// Parse a transport name into a semantic prompt action.
+    #[must_use]
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "fresh_line" => Some(Self::FreshLine),
+            "fresh_line_new_prompt" => Some(Self::FreshLineNewPrompt),
+            "new_command" => Some(Self::NewCommand),
+            "prompt_start" => Some(Self::PromptStart),
+            "end_prompt_start_input" => Some(Self::EndPromptStartInput),
+            "end_prompt_start_input_terminate_eol" => Some(Self::EndPromptStartInputTerminateEol),
+            "end_input_start_output" => Some(Self::EndInputStartOutput),
+            "end_command" => Some(Self::EndCommand),
+            _ => None,
+        }
+    }
 }
 
 /// Events broadcast by PTY sessions to connected clients.
@@ -103,10 +142,7 @@ pub enum PtyEvent {
     /// The string contains the decoded path (not the full URI).
     CwdChanged(String),
 
-    /// Shell integration prompt mark detected (OSC 133/633).
-    ///
-    /// Marks command boundaries in the terminal output stream.
-    /// Used for tracking command lifecycle in agent sessions.
+    /// Semantic prompt action detected via OSC 133.
     PromptMark(PromptMark),
 
     /// Kitty keyboard protocol state changed.
