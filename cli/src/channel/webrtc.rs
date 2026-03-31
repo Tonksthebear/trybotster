@@ -993,10 +993,22 @@ impl WebRtcChannel {
         let sdp_str = candidate.trim_start_matches("candidate:");
         let normalized_sdp = Self::normalize_candidate_sdp(sdp_str).await;
         let candidate_for_parse = normalized_sdp.as_deref().unwrap_or(sdp_str);
+        let is_mdns_hostname = Self::is_mdns_hostname_candidate(sdp_str);
 
         let ice_candidate = match IceCandidate::from_sdp(candidate_for_parse) {
             Ok(parsed) => parsed,
             Err(parse_err) => {
+                // Browser mDNS host candidates are only useful if the Rust side
+                // can resolve them. If not, drop them and keep moving rather
+                // than stalling the answer path on an unparseable candidate.
+                if is_mdns_hostname {
+                    log::debug!(
+                        "[WebRTC] Ignoring unresolved mDNS ICE candidate from browser: {}",
+                        Self::candidate_preview(sdp_str)
+                    );
+                    return Ok(());
+                }
+
                 // Retry the original SDP if a proactive rewrite made parsing worse.
                 if normalized_sdp.is_some() {
                     match IceCandidate::from_sdp(sdp_str) {
@@ -1058,6 +1070,10 @@ impl WebRtcChannel {
             return None;
         }
 
+        if host.ends_with(".local") {
+            return None;
+        }
+
         let mut resolved = tokio::net::lookup_host((host.as_str(), port)).await.ok()?;
         let ip = resolved.next()?.ip().to_string();
         parts[4] = ip;
@@ -1066,6 +1082,27 @@ impl WebRtcChannel {
             parts[4]
         );
         Some(parts.join(" "))
+    }
+
+    fn is_mdns_hostname_candidate(candidate_sdp: &str) -> bool {
+        let parts: Vec<&str> = candidate_sdp.split_whitespace().collect();
+        if parts.len() < 6 {
+            return false;
+        }
+
+        let host = parts[4];
+        host.ends_with(".local")
+    }
+
+    fn candidate_preview(candidate_sdp: &str) -> String {
+        const MAX: usize = 180;
+        let count = candidate_sdp.chars().count();
+        if count <= MAX {
+            return candidate_sdp.to_string();
+        }
+
+        let truncated: String = candidate_sdp.chars().take(MAX).collect();
+        format!("{truncated}...<truncated,len={count}>")
     }
 
     /// Get the peer's Olm identity key for encrypting messages.
@@ -1101,6 +1138,13 @@ mod tests {
             rewritten.contains("127.0.0.1") || rewritten.contains("::1"),
             "expected localhost to resolve to loopback, got {rewritten}"
         );
+    }
+
+    #[test]
+    fn mdns_hostname_candidates_are_detected() {
+        let candidate =
+            "1 1 udp 2122260223 a4b9c343-f925-4558-b2ce-76521f4bc787.local 54872 typ host";
+        assert!(WebRtcChannel::is_mdns_hostname_candidate(candidate));
     }
 }
 

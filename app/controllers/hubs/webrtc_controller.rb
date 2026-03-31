@@ -58,11 +58,12 @@ module Hubs
       turn = turn_credentials
       turn = filter_tcp_turn(Array(turn))
 
-      # When TURN is configured, skip external Google STUN — TURN servers
-      # handle STUN natively, and unreachable external STUN adds a 5s timeout
-      # per server (rustrtc stun_timeout default).
+      # When TURN is configured, avoid external Google STUN. For WAN clients,
+      # derive a matching stun: URL from the same TURN host so the browser/CLI
+      # can gather srflx candidates quickly without depending on extra public
+      # endpoints. LAN clients can rely on host candidates alone.
       if turn.any?
-        turn
+        lan_request? ? turn : augment_with_matching_stun(turn)
       elsif lan_request?
         # LAN clients only need host candidates — skip external STUN to avoid
         # 5s timeout probes to Google servers that add no value on local networks.
@@ -144,6 +145,34 @@ module Hubs
           server
         end
       end
+    end
+
+    def augment_with_matching_stun(servers)
+      existing_stun_urls = servers.flat_map do |server|
+        Array(server[:urls] || server["urls"]).filter_map do |url|
+          url if url.is_a?(String) && url.match?(/\Astuns?:/i)
+        end
+      end
+
+      derived_stun_urls = servers.flat_map do |server|
+        Array(server[:urls] || server["urls"]).filter_map do |url|
+          derive_stun_url(url)
+        end
+      end.uniq - existing_stun_urls
+
+      return servers if derived_stun_urls.empty?
+
+      derived_stun_urls.map { |url| { urls: url } } + servers
+    end
+
+    def derive_stun_url(url)
+      return unless url.is_a?(String)
+
+      clean = url.sub(/\?.*\z/, "")
+      return clean.sub(/\Aturn:/i, "stun:") if clean.match?(/\Aturn:/i)
+      return clean.sub(/\Aturns:/i, "stuns:") if clean.match?(/\Aturns:/i)
+
+      nil
     end
 
     # Fetch temporary TURN credentials from metered.co API

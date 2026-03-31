@@ -30,9 +30,10 @@ export default class extends Controller {
 
     HubManager.acquire(this.hubIdValue).then((hub) => {
       this.hub = hub;
+      hub.spawnTargets.load().catch(() => {});
 
       this.unsubscribers.push(
-        this.hub.onSpawnTargetList((targets) => {
+        this.hub.spawnTargets.onChange((targets) => {
           const admittedTargets = Array.isArray(targets) ? targets : [];
           this.selectedTargetId = admittedTargets.length === 1 ? admittedTargets[0].id : null;
           this.targetConfigState = new Map();

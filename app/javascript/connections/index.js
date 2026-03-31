@@ -34,7 +34,7 @@
 
 export { HubConnectionManager } from "connections/hub_connection_manager";
 export { HubManager } from "connections/hub_manager";
-export { Hub } from "connections/hub";
+export { Hub, HubSession } from "connections/hub";
 export { HubRoute, ConnectionState, BrowserStatus, CliStatus, ConnectionMode } from "connections/hub_route";
 export { HubTransport } from "connections/hub_connection";
 export { TerminalConnection } from "connections/terminal_connection";

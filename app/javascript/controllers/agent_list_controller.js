@@ -79,17 +79,20 @@ export default class extends Controller {
         return;
       }
       this.hub = hub;
-      this.agentsValue = Array.isArray(hub.agents) ? hub.agents : [];
-      this.workspacesValue = Array.isArray(hub.openWorkspaces) ? hub.openWorkspaces : [];
+      this.agentsValue = hub.agents.current();
+      this.workspacesValue = hub.openWorkspaces.current();
+
+      hub.agents.load().catch(() => {});
+      hub.openWorkspaces.load().catch(() => {});
 
       this.unsubscribers.push(
-        this.hub.onAgentList((agents) => {
+        this.hub.agents.onChange((agents) => {
           this.agentsValue = agents;
         }),
       );
 
       this.unsubscribers.push(
-        this.hub.onOpenWorkspaceList((workspaces) => {
+        this.hub.openWorkspaces.onChange((workspaces) => {
           this.workspacesValue = workspaces;
         }),
       );

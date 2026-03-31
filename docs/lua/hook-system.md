@@ -68,7 +68,7 @@ The `events` primitive provides a separate pub-sub layer from hooks. Rust emits 
 | `connection_code_error` | Rust connection generation | error string |
 | `agent_status_changed` | Rust/Lua | `{agent_id, status}` |
 | `process_exited` | Rust PTY watcher | `{session_uuid, exit_code}` |
-| `outgoing_signal` | Rust WebRTC | Pre-encrypted signal data for ActionCable relay |
+| `outgoing_signal` | Rust Hub signaling router | Pre-encrypted signal data for `HubCommandChannel.signal` relay |
 
 ## Rust -> Lua Bridge Methods
 

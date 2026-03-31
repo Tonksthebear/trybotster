@@ -15,6 +15,7 @@ let instance = null
 
 // WebRTC transport (lazily imported)
 let webrtcTransport = null
+const CRYPTO_INIT_TIMEOUT_MS = 30000
 
 class WorkerBridge {
   // Crypto SharedWorker
@@ -23,6 +24,9 @@ class WorkerBridge {
   #pendingCryptoRequests = new Map()
   #cryptoRequestId = 0
   #cryptoReadyPromise = null
+  #cryptoReady = false
+  #cryptoReadyInfo = null
+  #cryptoReadyResolvers = new Set()
 
   #initialized = false
   #initPromise = null
@@ -56,8 +60,11 @@ class WorkerBridge {
 
   async #doInit({ cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl }) {
     try {
-      // 1. Create crypto SharedWorker first and initialize WASM
-      this.#cryptoWorker = new SharedWorker(cryptoWorkerUrl, { type: "module", name: "vodozemac-crypto" })
+      // 1. Create crypto SharedWorker first and initialize WASM.
+      // This stays a SharedWorker so tabs share one encryption chain. Keep it
+      // in classic mode: the worker has no static imports, and Safari has been
+      // more reliable booting classic SharedWorkers than module workers here.
+      this.#cryptoWorker = new SharedWorker(cryptoWorkerUrl, { name: "vodozemac-crypto" })
       this.#cryptoWorkerPort = this.#cryptoWorker.port
       this.#cryptoWorkerPort.onmessage = (e) => this.#handleCryptoMessage(e)
       this.#cryptoWorkerPort.onmessageerror = (e) => {
@@ -71,7 +78,11 @@ class WorkerBridge {
       await this.#cryptoReadyPromise
 
       // Initialize WASM via crypto worker
-      await this.sendCrypto("init", { wasmJsUrl, wasmBinaryUrl })
+      const initStartedAt = performance.now()
+      await this.sendCrypto("init", { wasmJsUrl, wasmBinaryUrl }, CRYPTO_INIT_TIMEOUT_MS)
+      console.debug(
+        `[WorkerBridge] Crypto worker initialized in ${Math.round(performance.now() - initStartedAt)}ms`,
+      )
 
       // 2. Create WebRTC transport (runs in main thread - RTCPeerConnection not available in Workers)
       console.debug(`[WorkerBridge] Using WebRTC transport`)
@@ -86,6 +97,7 @@ class WorkerBridge {
       webrtcTransport.on("subscription:message", (data) => this.#dispatchEvent({ event: "subscription:message", ...data }))
       webrtcTransport.on("subscription:confirmed", (data) => this.#dispatchEvent({ event: "subscription:confirmed", ...data }))
       webrtcTransport.on("health", (data) => this.#dispatchEvent({ event: "health", ...data }))
+      webrtcTransport.on("browser:state", (data) => this.#dispatchEvent({ event: "browser:state", ...data }))
       webrtcTransport.on("session:invalid", (data) => this.#dispatchEvent({ event: "session:invalid", ...data }))
       webrtcTransport.on("session:refreshed", (data) => this.#dispatchEvent({ event: "session:refreshed", ...data }))
       webrtcTransport.on("signaling:state", (data) => this.#dispatchEvent({ event: "signaling:state", ...data }))
@@ -113,6 +125,14 @@ class WorkerBridge {
 
     if (data.event === "ready") {
       console.debug("[WorkerBridge] Crypto worker connected", data)
+      this.#cryptoReady = true
+      this.#cryptoReadyInfo = data
+      for (const resolve of this.#cryptoReadyResolvers) {
+        try {
+          resolve(data)
+        } catch (_) {}
+      }
+      this.#cryptoReadyResolvers.clear()
       return
     }
 
@@ -144,22 +164,23 @@ class WorkerBridge {
         return
       }
 
-      const previousHandler = this.#cryptoWorkerPort.onmessage
+      if (this.#cryptoReady) {
+        resolve(this.#cryptoReadyInfo)
+        return
+      }
+
       const timer = setTimeout(() => {
-        this.#cryptoWorkerPort.onmessage = previousHandler
+        this.#cryptoReadyResolvers.delete(onReady)
         reject(new Error("Crypto worker ready timeout"))
       }, timeout)
 
-      this.#cryptoWorkerPort.onmessage = (event) => {
-        if (event.data?.event === "ready") {
-          clearTimeout(timer)
-          this.#cryptoWorkerPort.onmessage = previousHandler
-          resolve(event.data)
-          return
-        }
-
-        previousHandler?.(event)
+      const onReady = (data) => {
+        clearTimeout(timer)
+        this.#cryptoReadyResolvers.delete(onReady)
+        resolve(data)
       }
+
+      this.#cryptoReadyResolvers.add(onReady)
     })
   }
 

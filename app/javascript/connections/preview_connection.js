@@ -55,6 +55,10 @@ export class PreviewConnection extends HubRoute {
   }
 
   handleMessage(message) {
+    if (this.processMessage(message)) {
+      return
+    }
+
     // Stream frames are handled via the stream:frame event, not subscription messages.
     // Only handle control messages that come through the subscription path.
     switch (message.type) {

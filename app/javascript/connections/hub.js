@@ -1,5 +1,10 @@
 import { HubConnectionManager } from "connections/hub_connection_manager";
 import { HubTransport } from "connections/hub_connection";
+import { HubCollection, HubResource, HubScopedResource } from "connections/hub_resource";
+import {
+  buildHubConnectionStatus,
+  DEFAULT_HUB_CONNECTION_STATUS,
+} from "connections/hub_connection_status";
 
 const EMPTY_CONFIG = Object.freeze({
   agents: [],
@@ -7,7 +12,22 @@ const EMPTY_CONFIG = Object.freeze({
   workspaces: [],
 });
 
-export class Hub {
+const DEFAULT_PREFETCH = Object.freeze([
+  "agents",
+  "openWorkspaces",
+  "spawnTargets",
+]);
+
+function cloneConfig(value) {
+  return {
+    targetId: value?.targetId || null,
+    agents: Array.isArray(value?.agents) ? value.agents : [],
+    accessories: Array.isArray(value?.accessories) ? value.accessories : [],
+    workspaces: Array.isArray(value?.workspaces) ? value.workspaces : [],
+  };
+}
+
+export class HubSession {
   constructor(hubId, options = {}, manager = null) {
     this.hubId = hubId;
     this.options = options;
@@ -16,29 +36,81 @@ export class Hub {
     this.transport = null;
     this.subscribers = new Map();
     this.unsubscribers = [];
-
-    this.agents = [];
-    this.workspaces = [];
-    this.openWorkspaces = [];
-    this.spawnTargets = [];
-    this.hubRecoveryState = null;
-    this.agentConfigByTargetId = new Map();
-    this.worktreesByTargetId = new Map();
-
-    this.loaded = {
-      agents: false,
-      workspaces: false,
-      openWorkspaces: false,
-      spawnTargets: false,
-      hubRecoveryState: false,
-    };
-
-    this.pending = new Map();
     this.destroyed = false;
+
+    this.agents = new HubCollection({
+      load: () => this.#requestCollection({
+        eventName: "agentList",
+        request: () => this.transport?.requestAgents(),
+        timeoutMs: 8000,
+      }),
+    });
+
+    this.workspaces = new HubCollection({
+      load: () => this.#requestCollection({
+        eventName: "hubWorkspaceList",
+        request: () => this.transport?.requestWorkspaces(),
+      }),
+    });
+
+    this.openWorkspaces = new HubCollection({
+      load: () => this.#requestCollection({
+        eventName: "openWorkspaceList",
+        request: () => this.transport?.requestOpenWorkspaces(),
+      }),
+    });
+
+    this.spawnTargets = new HubCollection({
+      load: () => this.#requestCollection({
+        eventName: "spawnTargetList",
+        request: () => this.transport?.requestSpawnTargets(),
+      }),
+    });
+
+    this.recoveryState = new HubResource({
+      initialValue: null,
+    });
+
+    this.connectionStatus = new HubResource({
+      initialValue: DEFAULT_HUB_CONNECTION_STATUS,
+      normalize: (value) => value || DEFAULT_HUB_CONNECTION_STATUS,
+    });
+
+    this.configs = new HubScopedResource({
+      createEntry: (targetId) => new HubResource({
+        initialValue: cloneConfig(EMPTY_CONFIG),
+        normalize: cloneConfig,
+        load: () => {
+          if (!targetId) return Promise.resolve(cloneConfig(EMPTY_CONFIG));
+          return this.#requestCollection({
+            eventName: "agentConfig",
+            request: () => this.transport?.requestAgentConfig(targetId),
+            match: (payload) => (payload?.targetId || null) === targetId,
+          });
+        },
+      }),
+    });
+
+    this.worktrees = new HubScopedResource({
+      createEntry: (targetId) => new HubCollection({
+        load: () => {
+          if (!targetId) return Promise.resolve([]);
+          return this.#requestCollection({
+            eventName: "worktreeList",
+            request: () => this.transport?.requestWorktrees(targetId),
+            match: (payload) => (payload?.targetId || null) === targetId,
+          });
+        },
+      }),
+    });
   }
 
   async initialize() {
-    if (this.transport) return;
+    return this.boot();
+  }
+
+  async boot() {
+    if (this.transport) return this;
 
     this.transport = await HubConnectionManager.acquire(HubTransport, this.hubId, {
       hubId: this.hubId,
@@ -47,6 +119,8 @@ export class Hub {
 
     this.#bindTransport();
     this.#hydrateFromTransport();
+    this.#schedulePrefetch();
+    return this;
   }
 
   release() {
@@ -86,7 +160,7 @@ export class Hub {
       try {
         callback(data);
       } catch (error) {
-        console.error("[Hub] Event handler error:", error);
+        console.error("[HubSession] Event handler error:", error);
       }
     }
   }
@@ -116,18 +190,19 @@ export class Hub {
   }
 
   onAgentList(callback) {
-    if (this.loaded.agents) callback(this.agents);
-    return this.on("agentList", callback);
+    return this.agents.onChange(callback);
+  }
+
+  onConnectionStatusChange(callback) {
+    return this.connectionStatus.onChange(callback);
   }
 
   onWorkspaceList(callback) {
-    if (this.loaded.workspaces) callback(this.workspaces);
-    return this.on("workspaceList", callback);
+    return this.workspaces.onChange(callback);
   }
 
   onOpenWorkspaceList(callback) {
-    if (this.loaded.openWorkspaces) callback(this.openWorkspaces);
-    return this.on("openWorkspaceList", callback);
+    return this.openWorkspaces.onChange(callback);
   }
 
   onWorktreeList(callback) {
@@ -135,90 +210,72 @@ export class Hub {
   }
 
   onSpawnTargetList(callback) {
-    if (this.loaded.spawnTargets) callback(this.spawnTargets);
-    return this.on("spawnTargetList", callback);
+    return this.spawnTargets.onChange(callback);
+  }
+
+  async prefetch(resources = DEFAULT_PREFETCH) {
+    const loaders = [];
+
+    for (const resource of resources) {
+      switch (resource) {
+        case "agents":
+          loaders.push(this.agents.load().catch(() => {}));
+          break;
+        case "workspaces":
+          loaders.push(this.workspaces.load().catch(() => {}));
+          break;
+        case "openWorkspaces":
+          loaders.push(this.openWorkspaces.load().catch(() => {}));
+          break;
+        case "spawnTargets":
+          loaders.push(this.spawnTargets.load().catch(() => {}));
+          break;
+      }
+    }
+
+    await Promise.all(loaders);
+  }
+
+  ensureAgents(options = {}) {
+    return this.agents.load(options);
+  }
+
+  ensureWorkspaces(options = {}) {
+    return this.workspaces.load(options);
+  }
+
+  ensureOpenWorkspaces(options = {}) {
+    return this.openWorkspaces.load(options);
+  }
+
+  ensureSpawnTargets(options = {}) {
+    return this.spawnTargets.load(options);
+  }
+
+  ensureWorktrees(targetId, options = {}) {
+    if (!targetId) return Promise.resolve([]);
+    return this.worktrees.load(targetId, options);
+  }
+
+  ensureAgentConfig(targetId, options = {}) {
+    if (!targetId) return Promise.resolve(cloneConfig(EMPTY_CONFIG));
+    return this.configs.load(targetId, options);
   }
 
   getAgentConfig(targetId) {
-    return this.agentConfigByTargetId.get(targetId || "__default__") || EMPTY_CONFIG;
+    return this.configs.current(targetId);
   }
 
   hasAgentConfig(targetId) {
-    return this.agentConfigByTargetId.has(targetId || "__default__");
+    return this.configs.isLoaded(targetId);
   }
 
   getWorktrees(targetId) {
-    return this.worktreesByTargetId.get(targetId || "__default__") || [];
+    return this.worktrees.current(targetId);
   }
 
   hasWorktrees(targetId) {
-    return this.worktreesByTargetId.has(targetId || "__default__");
-  }
-
-  ensureAgents({ force = false } = {}) {
-    return this.#load("agents", force, () => this.transport?.requestAgents() ?? Promise.resolve());
-  }
-
-  ensureWorkspaces({ force = false } = {}) {
-    return this.#load("workspaces", force, () => this.transport?.requestWorkspaces() ?? Promise.resolve());
-  }
-
-  ensureOpenWorkspaces({ force = false } = {}) {
-    return this.#load(
-      "openWorkspaces",
-      force,
-      () => this.transport?.requestOpenWorkspaces() ?? Promise.resolve(),
-    );
-  }
-
-  ensureSpawnTargets({ force = false } = {}) {
-    return this.#load("spawnTargets", force, () => this.transport?.requestSpawnTargets() ?? Promise.resolve());
-  }
-
-  ensureWorktrees(targetId, { force = false } = {}) {
-    const key = `worktrees:${targetId || "__default__"}`;
-    if (!targetId) return Promise.resolve([]);
-    return this.#load(key, force, () => this.transport?.requestWorktrees(targetId) ?? Promise.resolve());
-  }
-
-  ensureAgentConfig(targetId, { force = false } = {}) {
-    const key = `agentConfig:${targetId || "__default__"}`;
-    if (!targetId) return Promise.resolve(EMPTY_CONFIG);
-    return this.#load(key, force, () => this.transport?.requestAgentConfig(targetId) ?? Promise.resolve());
-  }
-
-  #load(key, force, loader) {
-    const loaded = this.#isLoaded(key);
-    if (!force && loaded) {
-      return Promise.resolve();
-    }
-
-    if (!force && this.pending.has(key)) {
-      return this.pending.get(key);
-    }
-
-    const request = Promise.resolve(loader()).finally(() => {
-      this.pending.delete(key);
-    });
-
-    this.pending.set(key, request);
-    return request;
-  }
-
-  #isLoaded(key) {
-    if (key === "agents") return this.loaded.agents;
-    if (key === "workspaces") return this.loaded.workspaces;
-    if (key === "openWorkspaces") return this.loaded.openWorkspaces;
-    if (key === "spawnTargets") return this.loaded.spawnTargets;
-    if (key.startsWith("worktrees:")) {
-      const targetId = key.slice("worktrees:".length);
-      return this.worktreesByTargetId.has(targetId);
-    }
-    if (key.startsWith("agentConfig:")) {
-      const targetId = key.slice("agentConfig:".length);
-      return this.agentConfigByTargetId.has(targetId);
-    }
-    return false;
+    return this.worktrees.isLoaded(targetId);
   }
 
   #bindTransport() {
@@ -231,65 +288,66 @@ export class Hub {
       "sessionTypes",
       "message",
       "error",
-      "browserStatusChange",
       "connectionModeChange",
     ];
 
     this.unsubscribers.push(
       this.transport.onAgentList((agents) => {
-        this.agents = Array.isArray(agents) ? agents : [];
-        this.loaded.agents = true;
-        this.emit("agentList", this.agents);
+        const normalized = this.agents.set(agents);
+        this.emit("agentList", normalized);
       }),
       this.transport.onOpenWorkspaceList((workspaces) => {
-        this.openWorkspaces = Array.isArray(workspaces) ? workspaces : [];
-        this.loaded.openWorkspaces = true;
-        this.emit("openWorkspaceList", this.openWorkspaces);
+        const normalized = this.openWorkspaces.set(workspaces);
+        this.emit("openWorkspaceList", normalized);
       }),
       this.transport.on("hubWorkspaceList", (workspaces) => {
-        this.workspaces = Array.isArray(workspaces) ? workspaces : [];
-        this.loaded.workspaces = true;
-        this.emit("workspaceList", this.workspaces);
+        const normalized = this.workspaces.set(workspaces);
+        this.emit("workspaceList", normalized);
       }),
       this.transport.on("spawnTargetList", (targets) => {
-        this.spawnTargets = Array.isArray(targets) ? targets : [];
-        this.loaded.spawnTargets = true;
-        this.#pruneTargetScopedCaches(this.spawnTargets);
-        this.emit("spawnTargetList", this.spawnTargets);
+        const normalized = this.spawnTargets.set(targets);
+        this.#pruneTargetScopedCaches(normalized);
+        this.emit("spawnTargetList", normalized);
       }),
       this.transport.on("worktreeList", (payload) => {
-        const targetId = payload?.targetId || "__default__";
+        const targetId = payload?.targetId || null;
         const worktrees = Array.isArray(payload?.worktrees) ? payload.worktrees : [];
-        this.worktreesByTargetId.set(targetId, worktrees);
-        this.emit("worktreeList", {
-          targetId: payload?.targetId || null,
-          worktrees,
-        });
+        this.worktrees.set(targetId, worktrees);
+        this.emit("worktreeList", { targetId, worktrees });
       }),
       this.transport.on("agentConfig", (payload) => {
-        const targetId = payload?.targetId || "__default__";
-        const normalized = {
-          targetId: payload?.targetId || null,
-          agents: Array.isArray(payload?.agents) ? payload.agents : [],
-          accessories: Array.isArray(payload?.accessories) ? payload.accessories : [],
-          workspaces: Array.isArray(payload?.workspaces) ? payload.workspaces : [],
-        };
-        this.agentConfigByTargetId.set(targetId, normalized);
+        const normalized = cloneConfig(payload);
+        const targetId = normalized.targetId || null;
+        this.configs.set(targetId, normalized);
         this.emit("agentConfig", normalized);
       }),
       this.transport.on("hubRecoveryState", (payload) => {
-        this.hubRecoveryState = payload || null;
-        this.loaded.hubRecoveryState = true;
-        this.emit("hubRecoveryState", this.hubRecoveryState);
+        this.recoveryState.set(payload || null);
+        this.emit("hubRecoveryState", this.recoveryState.current());
       }),
       this.transport.onConnected(() => {
+        this.#syncConnectionStatus();
         this.emit("connected", this);
       }),
       this.transport.onDisconnected(() => {
+        this.#syncConnectionStatus();
         this.emit("disconnected", this);
       }),
       this.transport.onStateChange((stateInfo) => {
+        this.#syncConnectionStatus();
         this.emit("stateChange", stateInfo);
+      }),
+      this.transport.on("browserSocketStateChange", () => {
+        this.#syncConnectionStatus();
+      }),
+      this.transport.on("cliStatusChange", () => {
+        this.#syncConnectionStatus();
+      }),
+      this.transport.on("connectionModeChange", () => {
+        this.#syncConnectionStatus();
+      }),
+      this.transport.on("error", () => {
+        this.#syncConnectionStatus();
       }),
     );
 
@@ -303,52 +361,109 @@ export class Hub {
   }
 
   #hydrateFromTransport() {
+    this.#syncConnectionStatus();
+
     if (this.transport.hasAgentListSnapshot()) {
-      this.agents = this.transport.getAgents();
-      this.loaded.agents = true;
+      this.agents.set(this.transport.getAgents());
     }
 
     if (this.transport.hasHubWorkspaceListSnapshot()) {
-      this.workspaces = this.transport.getHubWorkspaces();
-      this.loaded.workspaces = true;
+      this.workspaces.set(this.transport.getHubWorkspaces());
     }
 
     if (this.transport.hasOpenWorkspaceListSnapshot()) {
-      this.openWorkspaces = this.transport.getOpenWorkspaces();
-      this.loaded.openWorkspaces = true;
+      this.openWorkspaces.set(this.transport.getOpenWorkspaces());
     }
 
     if (this.transport.hasSpawnTargetListSnapshot()) {
-      this.spawnTargets = this.transport.getSpawnTargets();
-      this.loaded.spawnTargets = true;
+      this.spawnTargets.set(this.transport.getSpawnTargets());
     }
 
     if (this.transport.hasHubRecoveryStateSnapshot()) {
-      this.hubRecoveryState = this.transport.getHubRecoveryState();
-      this.loaded.hubRecoveryState = true;
+      this.recoveryState.set(this.transport.getHubRecoveryState());
     }
+  }
+
+  #schedulePrefetch() {
+    const prefetch = this.options.prefetch === false
+      ? []
+      : Array.isArray(this.options.prefetch)
+        ? this.options.prefetch
+        : DEFAULT_PREFETCH;
+
+    if (prefetch.length === 0) return;
+
+    queueMicrotask(() => {
+      if (this.destroyed) return;
+      this.prefetch(prefetch).catch((error) => {
+        console.debug("[HubSession] Prefetch failed:", error?.message || error);
+      });
+    });
+  }
+
+  async #requestCollection({
+    eventName,
+    request,
+    match = null,
+    timeoutMs = 5000,
+  }) {
+    let unsubscribe = null;
+    let timer = null;
+
+    const resourceEvent = new Promise((resolve, reject) => {
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        unsubscribe?.();
+      };
+
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`${eventName} timed out`));
+      }, timeoutMs);
+
+      unsubscribe = this.on(eventName, (payload) => {
+        if (typeof match === "function" && !match(payload)) return;
+        cleanup();
+        resolve(payload);
+      });
+    });
+
+    try {
+      const requestResult = await Promise.resolve(request?.());
+      if (requestResult === false) {
+        throw new Error(`Failed to request ${eventName}`);
+      }
+    } catch (error) {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      unsubscribe?.();
+      throw error;
+    }
+
+    return resourceEvent;
   }
 
   #pruneTargetScopedCaches(targets) {
-    const targetIds = new Set(
-      (Array.isArray(targets) ? targets : [])
-        .map((target) => target?.id)
-        .filter(Boolean),
-    );
+    const targetIds = (Array.isArray(targets) ? targets : [])
+      .map((target) => target?.id)
+      .filter(Boolean);
 
-    for (const key of this.agentConfigByTargetId.keys()) {
-      if (key !== "__default__" && !targetIds.has(key)) {
-        this.agentConfigByTargetId.delete(key);
-      }
-    }
+    this.configs.retain(targetIds);
+    this.worktrees.retain(targetIds);
+  }
 
-    for (const key of this.worktreesByTargetId.keys()) {
-      if (key !== "__default__" && !targetIds.has(key)) {
-        this.worktreesByTargetId.delete(key);
-      }
-    }
+  #syncConnectionStatus() {
+    this.connectionStatus.set(buildHubConnectionStatus(this.transport));
+    this.emit("connectionStatusChange", this.connectionStatus.current());
   }
 }
+
+export const Hub = HubSession;
 
 const TRANSPORT_METHODS = [
   "requestAgents",
@@ -392,7 +507,7 @@ const TRANSPORT_METHODS = [
 ];
 
 TRANSPORT_METHODS.forEach((methodName) => {
-  Hub.prototype[methodName] = function(...args) {
+  HubSession.prototype[methodName] = function(...args) {
     if (!this.transport) {
       throw new Error(`Hub transport is not ready for ${methodName}`);
     }

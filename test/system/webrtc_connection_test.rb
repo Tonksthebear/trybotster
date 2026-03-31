@@ -38,6 +38,89 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     )
   end
 
+  test "browser and hub ready state triggers a WebRTC attempt" do
+    @cli = start_cli(@hub)
+    pair_browser_with_cli(@cli)
+
+    # This guards the exact gate semantics for the status badges: once the
+    # browser is connected to Rails and the hub is online, the middle badge
+    # must at least enter a live WebRTC attempt.
+    assert_selector(
+      "[data-connection-status-target='browserSection'][data-status='connected']",
+      wait: 30
+    )
+    assert_selector(
+      "[data-connection-status-target='hubSection'][data-status='online']",
+      wait: 30
+    )
+
+    assert_selector(
+      "[data-connection-status-target='connectionSection'][data-state='connecting'], " \
+      "[data-connection-status-target='connectionSection'][data-state='direct'], " \
+      "[data-connection-status-target='connectionSection'][data-state='relay']",
+      wait: 10
+    )
+  end
+
+  test "crypto SharedWorker reaches ready and init on hub page" do
+    sign_in_as(@user)
+    visit hub_path(@hub)
+
+    # SharedWorker bootstrap is part of the real browser connection path.
+    # Prove ready -> init explicitly so regressions fail before later WebRTC
+    # assertions become ambiguous.
+    result = page.evaluate_async_script(<<~JS)
+      const done = arguments[arguments.length - 1];
+      const workerMeta = document.querySelector('meta[name="crypto-worker-url"]');
+      const wasmJsMeta = document.querySelector('meta[name="crypto-wasm-js-url"]');
+      const wasmBinaryMeta = document.querySelector('meta[name="crypto-wasm-binary-url"]');
+
+      if (!workerMeta?.content || !wasmJsMeta?.content) {
+        done({ ok: false, error: "missing worker meta tags" });
+        return;
+      }
+
+      let settled = false;
+      const finish = (payload) => {
+        if (settled) return;
+        settled = true;
+        done(payload);
+      };
+
+      const timer = setTimeout(() => {
+        finish({ ok: false, error: "timeout waiting for SharedWorker init" });
+      }, 30000);
+
+      try {
+        const worker = new SharedWorker(workerMeta.content, { name: "vodozemac-crypto-test" });
+        worker.port.onmessage = (event) => {
+          const data = event.data || {};
+
+          if (data.event === "ready") {
+            worker.port.postMessage({
+              id: 424242,
+              action: "init",
+              wasmJsUrl: wasmJsMeta.content,
+              wasmBinaryUrl: wasmBinaryMeta?.content || null,
+            });
+            return;
+          }
+
+          if (data.id === 424242) {
+            clearTimeout(timer);
+            finish({ ok: !!data.success, error: data.error || null, result: data.result || null });
+          }
+        };
+        worker.port.start();
+      } catch (error) {
+        clearTimeout(timer);
+        finish({ ok: false, error: String(error) });
+      }
+    JS
+
+    assert_equal true, result["ok"], "Expected SharedWorker init to succeed, got: #{result.inspect}"
+  end
+
   test "connection URL with fragment establishes pairing" do
     @cli = start_cli(@hub)
     url = @cli.connection_url
@@ -145,19 +228,28 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     sign_in_as(@user)
     visit hub_path(@hub)
 
+    # Browser section should still show "connected" because it only reflects
+    # the browser's ActionCable connection to Rails.
+    assert_selector(
+      "[data-connection-status-target='browserSection'][data-status='connected']",
+      wait: 10
+    )
+
     # Hub section should show "offline" since CLI is not running
     assert_selector(
       "[data-connection-status-target='hubSection'][data-status='offline']",
       wait: 10
     )
 
-    # Connection section should show "unpaired" or "disconnected" (no crypto session, no CLI)
+    # Connection section should not look "connecting" just because browser
+    # signaling is up. Without both sides ready for WebRTC, it stays
+    # disconnected or unpaired.
     connection_section = find("[data-connection-status-target='connectionSection']", wait: 10)
     state = connection_section["data-state"]
     assert_includes(
-      %w[unpaired disconnected connecting],
+      %w[unpaired disconnected],
       state,
-      "Without CLI, connection state should be unpaired, disconnected, or connecting (got #{state})"
+      "Without CLI, connection state should be unpaired or disconnected (got #{state})"
     )
   end
 

@@ -37,7 +37,7 @@
   <%# Connection - WebRTC status (6 states: disconnected, connecting, direct, relay, expired, unpaired) %>
   <div class="flex items-center gap-1 px-2 py-1 border-r border-zinc-700/50 group/connection"
        data-connection-status-target="connectionSection"
-       data-state="connecting"
+       data-state="disconnected"
        title="WebRTC connection mode">
     <%# Left connector %>
     <span class="text-zinc-600 transition-colors
@@ -111,7 +111,7 @@
   <%# Hub - CLI health status %>
   <div class="flex items-center gap-1 px-2 py-1 rounded-r-md group/hub"
        data-connection-status-target="hubSection"
-       data-status="<%= hub.active? ? 'online' : 'offline' %>"
+       data-status="connecting"
        title="Hub CLI status">
     <%# Label %>
     <span class="hidden sm:inline transition-colors

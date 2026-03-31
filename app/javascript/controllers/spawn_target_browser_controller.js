@@ -41,7 +41,8 @@ export default class extends Controller {
     this.unsubscribers = [];
     HubManager.acquire(this.hubIdValue).then((hub) => {
       this.hub = hub;
-      this.targetsState = (Array.isArray(hub.spawnTargets) ? hub.spawnTargets : []).map((target, index) =>
+      hub.spawnTargets.load().catch(() => {});
+      this.targetsState = hub.spawnTargets.current().map((target, index) =>
         this.#normalizeTarget(target, index),
       );
       if (!this.targetsState.some((target) => target.id === this.selectedTargetIdValue)) {
@@ -50,7 +51,7 @@ export default class extends Controller {
       this.#render();
 
       this.unsubscribers.push(
-        hub.onSpawnTargetList((targets) => {
+        hub.spawnTargets.onChange((targets) => {
           this.targetsState = (Array.isArray(targets) ? targets : []).map((target, index) =>
             this.#normalizeTarget(target, index),
           );

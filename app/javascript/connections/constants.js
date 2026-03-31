@@ -1,9 +1,5 @@
 /**
- * Connection constants — shared by HubRoute, HealthTracker, and HubEventHandlers.
- *
- * Extracted to break circular dependency: HubRoute imports managers/constants
- * and manager internals import these constants. Keeping shared enums in this
- * leaf module avoids TDZ (temporal dead zone) issues during evaluation.
+ * Connection constants shared across the connection wrappers.
  */
 
 // Connection state (combines browser subscription + CLI handshake status)
