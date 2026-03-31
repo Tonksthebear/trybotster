@@ -192,7 +192,9 @@ fn test_get_prompt_with_invalid_path() {
 }
 
 /// Test update command with --check flag
+/// Ignored by default: requires network access to GitHub API
 #[test]
+#[ignore]
 fn test_update_check() {
     let output = Command::new("cargo")
         .args(&["run", "--quiet", "--", "update", "--check"])
