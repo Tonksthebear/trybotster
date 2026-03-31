@@ -684,6 +684,17 @@ fn run_session(
     // Clean shutdown
     shutdown.store(true, Ordering::Release);
     let _ = writer_tx.send(PtyWriteCommand::Shutdown);
+
+    // Kill child process group so descendants (e.g. codex, claude) don't orphan
+    if child_pid > 0 {
+        let pgid = child_pid as i32;
+        log::info!("[session] sending SIGTERM to process group {pgid}");
+        unsafe { libc::killpg(pgid, libc::SIGTERM); }
+        thread::sleep(Duration::from_millis(500));
+        unsafe { libc::killpg(pgid, libc::SIGKILL); }
+        log::info!("[session] sent SIGKILL to process group {pgid}");
+    }
+
     let socket_existed = socket_path.exists();
     if socket_existed {
         std::fs::remove_file(socket_path).ok();
