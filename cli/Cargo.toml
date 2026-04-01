@@ -94,6 +94,7 @@ flate2 = "1.1.8"
 
 # WebRTC for peer-to-peer communication
 rustrtc = "0.3"
+mdns-sd = "0.18"
 
 # WebSocket (used by ws.rs)
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
@@ -184,4 +185,3 @@ cast_possible_truncation = "allow"    # Terminal dimensions are safely bounded
 cast_sign_loss = "allow"              # Terminal dimensions are always positive
 needless_continue = "allow"           # Explicit continue can improve readability
 match_same_arms = "allow"             # Sometimes explicit arms improve clarity
-
