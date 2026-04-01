@@ -34,8 +34,6 @@ pub struct TerminalPanel {
     color_cache: ColorCache,
     state: PanelState,
     dims: (u16, u16),
-    /// Lines scrolled up from live view. Zero means at bottom (live).
-    scroll_offset: usize,
     /// Consecutive mouse scroll events in the current tick (for acceleration).
     scroll_accel: u32,
 }
@@ -66,7 +64,6 @@ impl TerminalPanel {
             color_cache,
             state: PanelState::Idle,
             dims: (rows, cols),
-            scroll_offset: 0,
             scroll_accel: 0,
         }
     }
@@ -218,10 +215,9 @@ impl TerminalPanel {
         // defaults so each TUI attach can render with its own theme.
         self.parser.apply_color_cache(&self.color_cache);
 
+        // Reattach should always resume at the live viewport.
+        self.parser.terminal_mut().scroll_viewport_bottom();
         self.update_render_state();
-
-        // Reset scroll state — reconnect starts at live view
-        self.scroll_offset = 0;
 
         self.state = PanelState::Connected;
     }
@@ -271,68 +267,61 @@ impl TerminalPanel {
         if lines == 0 {
             return;
         }
-        let depth = self.scrollback_depth();
-        let new_offset = self.scroll_offset.saturating_add(lines).min(depth);
-        let delta = new_offset - self.scroll_offset;
-        if delta > 0 {
-            self.scroll_offset = new_offset;
-            self.parser
-                .terminal_mut()
-                .scroll_viewport_delta(-(delta as isize));
-            self.update_render_state();
-        }
+        self.parser
+            .terminal_mut()
+            .scroll_viewport_delta(-(lines as isize));
+        self.update_render_state();
     }
 
     /// Scroll down toward live view by `lines` lines.
     pub fn scroll_down(&mut self, lines: usize) {
-        if lines == 0 || self.scroll_offset == 0 {
+        let current_offset = self.scroll_offset();
+        if lines == 0 || current_offset == 0 {
             return;
         }
-        let old = self.scroll_offset;
-        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
-        let delta = old - self.scroll_offset;
-        if delta > 0 {
-            self.parser
-                .terminal_mut()
-                .scroll_viewport_delta(delta as isize);
-            self.update_render_state();
-        }
+        let delta = lines.min(current_offset);
+        self.parser
+            .terminal_mut()
+            .scroll_viewport_delta(delta as isize);
+        self.update_render_state();
     }
 
     /// Jump to the top of the scrollback buffer.
     pub fn scroll_to_top(&mut self) {
-        let depth = self.scrollback_depth();
-        if depth == 0 {
+        if self.scrollback_depth() == 0 {
             return;
         }
-        self.scroll_offset = depth;
         self.parser.terminal_mut().scroll_viewport_top();
         self.update_render_state();
     }
 
     /// Jump to the bottom (return to live view).
     pub fn scroll_to_bottom(&mut self) {
-        if self.scroll_offset == 0 {
+        if !self.is_scrolled() {
             return;
         }
-        self.scroll_offset = 0;
         self.parser.terminal_mut().scroll_viewport_bottom();
         self.update_render_state();
     }
 
     /// Whether the panel is scrolled up from live view.
     pub fn is_scrolled(&self) -> bool {
-        self.scroll_offset > 0
+        self.scroll_offset() > 0
     }
 
     /// Current scroll offset (lines up from bottom).
     pub fn scroll_offset(&self) -> usize {
-        self.scroll_offset
+        self.scrollbar().lines_from_bottom()
     }
 
     /// Total scrollback lines available.
     pub fn scrollback_depth(&self) -> usize {
-        self.parser.history_size()
+        self.scrollbar().scrollback_rows()
+    }
+
+    /// Ghostty-reported scrollbar geometry for the current viewport.
+    pub fn scrollbar(&self) -> crate::ghostty_vt::ScrollbarState {
+        self.parser.terminal().scrollbar()
     }
 }
 
@@ -594,5 +583,38 @@ mod tests {
             0,
             "CSI 3J should clear scrollback"
         );
+    }
+
+    #[test]
+    fn scroll_state_tracks_live_output_while_viewport_is_scrolled() {
+        let mut panel = TerminalPanel::new(5, 80);
+        panel.connect("sess-0");
+
+        for i in 0..20 {
+            panel.on_output(format!("line {i}\r\n").as_bytes());
+        }
+
+        panel.scroll_up(3);
+        let original_offset = panel.scroll_offset();
+        assert!(original_offset > 0, "precondition: viewport should be scrolled");
+
+        for i in 20..25 {
+            panel.on_output(format!("line {i}\r\n").as_bytes());
+        }
+
+        assert!(
+            panel.scroll_offset() > original_offset,
+            "live output should increase distance from the bottom while scrolled"
+        );
+
+        panel.scroll_down(original_offset);
+        assert!(
+            panel.is_scrolled(),
+            "scrolling down by the stale pre-output offset must not claim we're back at bottom"
+        );
+
+        panel.scroll_to_bottom();
+        assert_eq!(panel.scroll_offset(), 0);
+        assert!(!panel.is_scrolled());
     }
 }

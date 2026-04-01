@@ -132,6 +132,35 @@ enum GhosttyTerminalScreen {
     Alternate = 1,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GhosttyTerminalScrollbar {
+    total: u64,
+    offset: u64,
+    len: u64,
+}
+
+/// Scrollbar state for the current terminal viewport.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScrollbarState {
+    pub total: usize,
+    pub offset: usize,
+    pub len: usize,
+}
+
+impl ScrollbarState {
+    /// Lines between the bottom of the viewport and live output.
+    pub fn lines_from_bottom(self) -> usize {
+        self.total
+            .saturating_sub(self.offset.saturating_add(self.len))
+    }
+
+    /// Total scrollback rows available above the live viewport.
+    pub fn scrollback_rows(self) -> usize {
+        self.total.saturating_sub(self.len)
+    }
+}
+
 // ── Terminal options (set) ─────────────────────────────────────────────────
 
 #[repr(i32)]
@@ -608,9 +637,7 @@ pub fn init_logging() {
 #[allow(dead_code)]
 extern "C" {
     // Logging
-    fn ghostty_vt_set_log_callback(
-        cb: extern "C" fn(level: u8, ptr: *const u8, len: usize),
-    );
+    fn ghostty_vt_set_log_callback(cb: extern "C" fn(level: u8, ptr: *const u8, len: usize));
 
     // Terminal lifecycle
     fn ghostty_terminal_new(
@@ -1051,6 +1078,28 @@ impl Terminal {
             );
         }
         rows
+    }
+
+    /// Scrollbar geometry for the current viewport.
+    pub fn scrollbar(&self) -> ScrollbarState {
+        let mut scrollbar = GhosttyTerminalScrollbar::default();
+        let result = unsafe {
+            ghostty_terminal_get(
+                self.handle,
+                GhosttyTerminalData::Scrollbar,
+                &mut scrollbar as *mut GhosttyTerminalScrollbar as *mut c_void,
+            )
+        };
+
+        if result != GhosttyResult::Success {
+            return ScrollbarState::default();
+        }
+
+        ScrollbarState {
+            total: scrollbar.total as usize,
+            offset: scrollbar.offset as usize,
+            len: scrollbar.len as usize,
+        }
     }
 
     /// Terminal title as set by OSC 0/2.
@@ -2052,8 +2101,7 @@ mod tests {
     fn render_state_re_resolves_palette_backed_cells_after_palette_change() {
         let mut term = Terminal::new(80, 24, 0).expect("terminal creation failed");
 
-        let mut palette =
-            [GhosttyColorRgb { r: 0, g: 0, b: 0 }; 256];
+        let mut palette = [GhosttyColorRgb { r: 0, g: 0, b: 0 }; 256];
         palette[4] = GhosttyColorRgb {
             r: 0xF0,
             g: 0xE0,
