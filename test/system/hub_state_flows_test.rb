@@ -30,18 +30,15 @@ class HubStateFlowsTest < ApplicationSystemTestCase
     assert_selector "[data-new-session-chooser-target='targetSection']", wait: 10
     assert_no_selector "[data-new-session-chooser-target='targetSection'].hidden", visible: :all
 
-    target_select = find("[data-new-session-chooser-target='targetSelect']", wait: 10)
-    target_options = target_select.all("option").map(&:text)
-    assert target_options.any? { |text| text.include?(File.basename(@cli.temp_dir)) },
+    find("[data-new-session-chooser-target='targetSelect']", wait: 10)
+    selected_option = wait_for_spawn_target_option
+    assert selected_option[:text].include?(File.basename(@cli.temp_dir)),
       "Expected chooser options to include the admitted spawn target label"
 
     assert_selector "[data-new-session-chooser-target='agentButton'][disabled]", wait: 5
     assert_selector "[data-new-session-chooser-target='accessoryButton'][disabled]", wait: 5
 
-    selectable_option = target_select.all("option").find { |option| option.value.present? }
-    assert selectable_option, "Expected at least one admitted spawn target option"
-
-    target_select.select(selectable_option.text)
+    find("[data-new-session-chooser-target='targetSelect']", wait: 5).select(selected_option[:text])
 
     assert_no_selector "[data-new-session-chooser-target='agentButton'][disabled]", wait: 10
     assert_no_selector "[data-new-session-chooser-target='accessoryButton'][disabled]", wait: 10
@@ -57,20 +54,8 @@ class HubStateFlowsTest < ApplicationSystemTestCase
 
     open_new_session_chooser
 
-    # Wait for async spawn target load — options may re-render after initial mount.
-    selected_value = nil
-    selected_text = nil
-    assert wait_until?(timeout: 15, poll: 0.3) {
-      target_select = find("[data-new-session-chooser-target='targetSelect']", wait: 2)
-      option = target_select.all("option").find { |o| o.value.present? rescue false }
-      if option
-        selected_value = option.value
-        selected_text = option.text
-        true
-      end
-    }, "Expected at least one admitted spawn target option"
-
-    find("[data-new-session-chooser-target='targetSelect']", wait: 5).select(selected_text)
+    selected_option = wait_for_spawn_target_option
+    find("[data-new-session-chooser-target='targetSelect']", wait: 5).select(selected_option[:text])
     find("[data-new-session-chooser-target='agentButton']", wait: 10).click
 
     assert_selector "dialog#new-agent-modal[open]", wait: 10
@@ -78,7 +63,7 @@ class HubStateFlowsTest < ApplicationSystemTestCase
     assert_no_selector "[data-new-agent-form-target='worktreeOptions'].hidden", visible: :all, wait: 10
 
     modal_target_select = find("[data-new-agent-form-target='targetSelect']", wait: 10)
-    assert_equal selected_value, modal_target_select.value
+    assert_equal selected_option[:value], modal_target_select.value
   end
 
   test "quick setup hides the no-agent-config banner after installing the template" do
@@ -136,5 +121,22 @@ class HubStateFlowsTest < ApplicationSystemTestCase
   def open_new_session_chooser
     first("[commandfor='new-session-chooser-modal']:not([disabled])", wait: 10).click
     assert_selector "dialog#new-session-chooser-modal[open]", wait: 10
+  end
+
+  def wait_for_spawn_target_option(timeout: 15)
+    option_value = nil
+    option_text = nil
+
+    assert wait_until?(timeout: timeout, poll: 0.3) {
+      target_select = find("[data-new-session-chooser-target='targetSelect']", wait: 2)
+      option = target_select.all("option").find { |candidate| candidate.value.present? rescue false }
+      if option
+        option_value = option.value
+        option_text = option.text
+        true
+      end
+    }, "Expected at least one admitted spawn target option"
+
+    { value: option_value, text: option_text }
   end
 end
