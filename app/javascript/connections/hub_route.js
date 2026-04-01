@@ -8,6 +8,8 @@ export { ConnectionState, BrowserStatus, CliStatus, ConnectionMode };
 const TAB_ID = crypto.randomUUID();
 const RECONNECT_DELAY_MS = 1000;
 const SESSION_TIMEOUT_MS = 5000;
+const PEER_PROBE_TIMEOUT_MS = 1500;
+const PEER_PROBE_COOLDOWN_MS = 1000;
 
 const HEALTH_STATUS_MAP = {
   offline: CliStatus.OFFLINE,
@@ -32,6 +34,10 @@ export class HubRoute {
   #reconnectTimer = null;
   #destroyed = false;
   #browserSocketObserverCleanup = null;
+  #peerHealthDirty = false;
+  #peerProbePending = null;
+  #peerProbeResolve = null;
+  #lastPeerProbeAt = 0;
 
   constructor(key, options = {}, manager) {
     this.key = key;
@@ -180,6 +186,7 @@ export class HubRoute {
     }
 
     if (message.type === "dc_pong") {
+      this.#resolvePeerProbe(true);
       return true;
     }
 
@@ -291,6 +298,7 @@ export class HubRoute {
       if (this.#destroyed) return;
       this.#setBrowserSocketState(state);
       if (state === "connected") {
+        this.#markPeerHealthDirty("browser_socket_connected");
         this.#ensureConnected().catch(() => {});
       } else if (!this.isConnected()) {
         this.#setState(ConnectionState.DISCONNECTED);
@@ -310,6 +318,7 @@ export class HubRoute {
         if (event.hubId !== hubId) return;
         this.#signalingConnected = event.state === "connected";
         if (this.#signalingConnected) {
+          this.#markPeerHealthDirty("signaling_connected");
           this.#ensureConnected().catch(() => {});
         }
       }),
@@ -331,6 +340,7 @@ export class HubRoute {
         if (event.hubId !== hubId) return;
         if (event.state === "connected") {
           this.#clearReconnectTimer();
+          this.#peerHealthDirty = false;
           if (event.mode) this.#setConnectionMode(event.mode);
           this.#ensureSubscribed().catch((error) => {
             console.error(`[${this.constructor.name}] Subscribe failed after peer connect:`, error);
@@ -347,6 +357,11 @@ export class HubRoute {
             this.#scheduleReconnect();
           }
         }
+      }),
+      bridge.on("connection:stalled", (event) => {
+        if (event.hubId !== hubId) return;
+        this.#markPeerHealthDirty("connection_stalled");
+        this.#ensureConnected().catch(() => {});
       }),
       bridge.on("connection:mode", (event) => {
         if (event.hubId !== hubId) return;
@@ -371,6 +386,23 @@ export class HubRoute {
         }
         this.#ensureConnected().catch(() => {});
       }),
+    );
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "visible") return;
+      this.#markPeerHealthDirty("visibilitychange");
+      this.#ensureConnected().catch(() => {});
+    };
+    const onPageShow = () => {
+      this.#markPeerHealthDirty("pageshow");
+      this.#ensureConnected().catch(() => {});
+    };
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pageshow", onPageShow);
+    this.#unsubscribers.push(
+      () => document.removeEventListener("visibilitychange", onVisibilityChange),
+      () => window.removeEventListener("pageshow", onPageShow),
     );
   }
 
@@ -405,8 +437,18 @@ export class HubRoute {
     if (this.cliStatus !== CliStatus.ONLINE) return;
 
     if (this.subscriptionId) {
-      this.#setState(ConnectionState.CONNECTED);
-      return;
+      if (this.#peerHealthDirty) {
+        const healthy = await this.#probeExistingPeer();
+        if (!healthy) {
+          await this.#rebuildPeer("probe_failed");
+        }
+      }
+
+      if (this.subscriptionId) {
+        this.#peerHealthDirty = false;
+        this.#setState(ConnectionState.CONNECTED);
+        return;
+      }
     }
 
     if (this.#connectPending) {
@@ -421,6 +463,7 @@ export class HubRoute {
       // fresh connection:state event for this route. Ensure the route's
       // subscription exists even when connectPeer() is effectively a no-op.
       await this.#ensureSubscribed();
+      this.#peerHealthDirty = false;
     })();
 
     try {
@@ -428,6 +471,95 @@ export class HubRoute {
     } finally {
       this.#connectPending = null;
     }
+  }
+
+  async #probeExistingPeer() {
+    const now = Date.now();
+    if (this.#peerProbePending) {
+      return this.#peerProbePending;
+    }
+
+    if (now - this.#lastPeerProbeAt < PEER_PROBE_COOLDOWN_MS) {
+      return true;
+    }
+
+    this.#peerProbePending = (async () => {
+      this.#lastPeerProbeAt = Date.now();
+
+      const peer = await bridge.send("probePeerHealth", { hubId: this.getHubId() });
+      if (!peer?.alive) {
+        return false;
+      }
+
+      if (!this.subscriptionId) {
+        return false;
+      }
+
+      const pong = await this.#awaitPeerPong();
+      return pong;
+    })();
+
+    try {
+      return await this.#peerProbePending;
+    } catch (error) {
+      console.warn(`[${this.constructor.name}] Peer probe failed:`, error);
+      return false;
+    } finally {
+      this.#peerProbePending = null;
+    }
+  }
+
+  async #awaitPeerPong() {
+    if (!this.subscriptionId) return false;
+
+    const pongPromise = new Promise((resolve) => {
+      let timer = null;
+      const resolver = (alive) => {
+        clearTimeout(timer);
+        if (this.#peerProbeResolve === resolver) {
+          this.#peerProbeResolve = null;
+        }
+        resolve(alive);
+      };
+
+      timer = setTimeout(() => {
+        resolver(false);
+      }, PEER_PROBE_TIMEOUT_MS);
+
+      this.#peerProbeResolve = resolver;
+    });
+
+    try {
+      await this.#sendEncrypted({ type: "dc_ping", timestamp: Date.now() });
+    } catch (error) {
+      this.#resolvePeerProbe(false);
+      return false;
+    }
+
+    return pongPromise;
+  }
+
+  async #rebuildPeer(reason) {
+    this.#clearSubscription();
+    this.#resolvePeerProbe(false);
+    this.#peerHealthDirty = true;
+
+    try {
+      await bridge.send("disconnectPeer", { hubId: this.getHubId() });
+    } catch (error) {
+      console.warn(`[${this.constructor.name}] Failed to disconnect stale peer (${reason}):`, error);
+    }
+  }
+
+  #markPeerHealthDirty(_reason) {
+    this.#peerHealthDirty = true;
+  }
+
+  #resolvePeerProbe(alive) {
+    const resolve = this.#peerProbeResolve;
+    if (!resolve) return;
+    this.#peerProbeResolve = null;
+    resolve(alive);
   }
 
   async #ensureActiveSession() {
@@ -522,6 +654,7 @@ export class HubRoute {
   #clearSubscription() {
     const subscriptionId = this.subscriptionId;
     this.subscriptionId = null;
+    this.#resolvePeerProbe(false);
     this.#clearSubscriptionListeners();
     if (subscriptionId) {
       bridge.clearSubscriptionListeners(subscriptionId);
