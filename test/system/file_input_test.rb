@@ -166,19 +166,30 @@ class FileInputTest < ApplicationSystemTestCase
     )
   end
 
-  # Polls for TerminalConnection readiness at the Ruby level, then stashes the
-  # connection on window._botsterTestConn for subsequent sendFile calls.
-  # This avoids a long JS polling loop inside execute_async_script which can
-  # exceed Selenium's script timeout on slow CI runners.
+  # Acquires a TerminalConnection directly via HubConnectionManager, bypassing
+  # the Restty WASM init path (which requires WebGPU/WebGL2 that may not be
+  # available in headless Chrome on CI). Stashes the connection on
+  # window._botsterTestConn for subsequent sendFile calls.
   def wait_for_terminal_connection(hub_id, session_uuid)
     key = "terminal:#{hub_id}:#{session_uuid}"
     assert wait_until?(timeout: 20, poll: 0.5) {
-      status = page.driver.browser.execute_async_script(<<~JS, key)
+      status = page.driver.browser.execute_async_script(<<~JS, key, hub_id.to_s, session_uuid)
         var done = arguments[arguments.length - 1];
+        var key = arguments[0];
+        var hubId = arguments[1];
+        var sessionUuid = arguments[2];
         (async function() {
           try {
-            var { HubConnectionManager } = await import("connections/hub_connection_manager");
-            var conn = HubConnectionManager.get(arguments[0]);
+            var { HubConnectionManager, TerminalConnection } = await import("connections");
+            // Try existing connection first (Restty may have created it)
+            var conn = HubConnectionManager.get(key);
+            if (!conn) {
+              // Acquire directly — Restty WASM may not load in headless CI
+              conn = await HubConnectionManager.acquire(
+                TerminalConnection, key,
+                { hubId: hubId, sessionUuid: sessionUuid }
+              );
+            }
             if (conn && conn.isConnected()) {
               window._botsterTestConn = conn;
               done("connected");
