@@ -21,6 +21,7 @@
 //! - Signaling (offer/answer/ICE) via ActionCable, E2E encrypted
 
 use async_trait::async_trait;
+use mdns_sd::{HostnameResolutionEvent, ScopedIp, ServiceDaemon};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -48,6 +49,24 @@ use crate::relay::olm_crypto::{
 fn ice_config_cache() -> &'static std::sync::Mutex<HashMap<String, CachedIceConfig>> {
     static CACHE: OnceLock<std::sync::Mutex<HashMap<String, CachedIceConfig>>> = OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Shared mDNS daemon for resolving browser `.local` ICE candidates.
+///
+/// Browser host candidates can use mDNS names for privacy. `rustrtc` expects
+/// numeric socket addresses, so we resolve `.local.` hostnames to IPs here and
+/// rewrite the candidate SDP before handing it to the parser.
+fn mdns_daemon() -> Option<ServiceDaemon> {
+    static DAEMON: OnceLock<Option<ServiceDaemon>> = OnceLock::new();
+    DAEMON
+        .get_or_init(|| match ServiceDaemon::new() {
+            Ok(daemon) => Some(daemon),
+            Err(err) => {
+                log::warn!("[WebRTC] Failed to initialize mDNS resolver: {err}");
+                None
+            }
+        })
+        .clone()
 }
 
 #[derive(Clone, Debug)]
@@ -1071,7 +1090,10 @@ impl WebRtcChannel {
         }
 
         if host.ends_with(".local") {
-            return None;
+            let ip = Self::resolve_mdns_hostname(&host).await?;
+            parts[4] = ip.to_string();
+            log::debug!("[WebRTC] Rewrote mDNS ICE candidate {host} -> {}", parts[4]);
+            return Some(parts.join(" "));
         }
 
         let mut resolved = tokio::net::lookup_host((host.as_str(), port)).await.ok()?;
@@ -1082,6 +1104,67 @@ impl WebRtcChannel {
             parts[4]
         );
         Some(parts.join(" "))
+    }
+
+    async fn resolve_mdns_hostname(host: &str) -> Option<IpAddr> {
+        const MDNS_HOSTNAME_TIMEOUT_MS: u64 = 750;
+
+        let daemon = mdns_daemon()?;
+        let hostname = Self::canonical_mdns_hostname(host);
+        let receiver = daemon
+            .resolve_hostname(&hostname, Some(MDNS_HOSTNAME_TIMEOUT_MS))
+            .ok()?;
+
+        let result = loop {
+            match receiver.recv_async().await.ok()? {
+                HostnameResolutionEvent::AddressesFound(found_hostname, addresses) => {
+                    if !found_hostname.eq_ignore_ascii_case(&hostname) {
+                        continue;
+                    }
+                    if let Some(ip) = Self::select_mdns_ip(&addresses) {
+                        break Some(ip);
+                    }
+                }
+                HostnameResolutionEvent::SearchTimeout(found_hostname)
+                | HostnameResolutionEvent::SearchStopped(found_hostname) => {
+                    if found_hostname.eq_ignore_ascii_case(&hostname) {
+                        break None;
+                    }
+                }
+                HostnameResolutionEvent::SearchStarted(_) => {}
+                _ => {}
+            }
+        };
+
+        let _ = daemon.stop_resolve_hostname(&hostname);
+        result
+    }
+
+    fn canonical_mdns_hostname(host: &str) -> String {
+        if host.ends_with(".local.") {
+            host.to_string()
+        } else if host.ends_with(".local") {
+            format!("{host}.")
+        } else {
+            host.to_string()
+        }
+    }
+
+    fn select_mdns_ip(addresses: &HashSet<ScopedIp>) -> Option<IpAddr> {
+        addresses
+            .iter()
+            .find_map(|addr| match addr {
+                ScopedIp::V4(v4) => Some(IpAddr::V4(*v4.addr())),
+                ScopedIp::V6(_) => None,
+                _ => None,
+            })
+            .or_else(|| {
+                addresses.iter().find_map(|addr| match addr {
+                    ScopedIp::V6(v6) => Some(IpAddr::V6(*v6.addr())),
+                    ScopedIp::V4(_) => None,
+                    _ => None,
+                })
+            })
     }
 
     fn is_mdns_hostname_candidate(candidate_sdp: &str) -> bool {
@@ -1116,6 +1199,9 @@ impl WebRtcChannel {
 #[cfg(test)]
 mod tests {
     use super::WebRtcChannel;
+    use mdns_sd::ScopedIp;
+    use std::collections::HashSet;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[tokio::test]
     async fn rewrite_hostname_candidate_to_ip_skips_numeric_addresses() {
@@ -1145,6 +1231,30 @@ mod tests {
         let candidate =
             "1 1 udp 2122260223 a4b9c343-f925-4558-b2ce-76521f4bc787.local 54872 typ host";
         assert!(WebRtcChannel::is_mdns_hostname_candidate(candidate));
+    }
+
+    #[test]
+    fn canonical_mdns_hostname_appends_trailing_dot() {
+        assert_eq!(
+            WebRtcChannel::canonical_mdns_hostname("abcd.local"),
+            "abcd.local."
+        );
+        assert_eq!(
+            WebRtcChannel::canonical_mdns_hostname("abcd.local."),
+            "abcd.local."
+        );
+    }
+
+    #[test]
+    fn select_mdns_ip_prefers_ipv4() {
+        let mut addresses = HashSet::new();
+        addresses.insert(ScopedIp::from(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        addresses.insert(ScopedIp::from(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+
+        assert_eq!(
+            WebRtcChannel::select_mdns_ip(&addresses),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
     }
 }
 
