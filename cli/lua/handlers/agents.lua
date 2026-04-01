@@ -719,6 +719,16 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
             target_repo = message.target_repo,
         }
 
+        -- Resolve target from repo when target_id is not provided (e.g., plugin-originated events)
+        if not command_target.target_id and message.repo then
+            local found, _ = TargetContext.find_by_repo(message.repo)
+            if found then
+                command_target.target_id = found.target_id
+                command_target.target_path = found.target_path
+                command_target.target_repo = found.target_repo
+            end
+        end
+
         -- Check if any agents already exist for this workspace — notify them
         if issue_or_branch then
             local meta = TargetContext.with_metadata(message.metadata, command_target)
