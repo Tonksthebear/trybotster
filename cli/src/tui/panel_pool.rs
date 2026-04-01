@@ -366,10 +366,9 @@ impl PanelPool {
             .map(|p| p.dims())
             .unwrap_or(self.terminal_dims);
         let color_cache = self.color_cache.clone();
-        let panel = self
-            .panels
-            .entry(uuid.to_string())
-            .or_insert_with(|| TerminalPanel::new_with_color_cache(widget_dims.0, widget_dims.1, color_cache));
+        let panel = self.panels.entry(uuid.to_string()).or_insert_with(|| {
+            TerminalPanel::new_with_color_cache(widget_dims.0, widget_dims.1, color_cache)
+        });
         // Defer subscribe to `sync_subscriptions()`, which runs after render and
         // has accurate widget areas for this session.
         panel.mark_transport_disconnected();
@@ -422,9 +421,11 @@ mod tests {
 
     #[test]
     fn focus_terminal_panel_shares_pool_color_cache() {
-        let color_cache: ColorCache = std::sync::Arc::new(std::sync::Mutex::new(
-            HashMap::from([(257usize, crate::terminal::Rgb::new(0xF0, 0xE0, 0xD0))]),
-        ));
+        let color_cache: ColorCache =
+            std::sync::Arc::new(std::sync::Mutex::new(HashMap::from([(
+                257usize,
+                crate::terminal::Rgb::new(0xF0, 0xE0, 0xD0),
+            )])));
         let mut pool = PanelPool::new_with_color_cache((24, 80), color_cache.clone());
 
         let _ = pool.focus_terminal(Some("agent-1"), Some("sess-1"), false);

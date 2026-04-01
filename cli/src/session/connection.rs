@@ -207,7 +207,10 @@ impl SessionConnection {
     }
 
     /// Replace the session parser's current terminal color profile.
-    pub fn set_color_profile(&mut self, colors: &std::collections::HashMap<usize, crate::terminal::Rgb>) -> Result<()> {
+    pub fn set_color_profile(
+        &mut self,
+        colors: &std::collections::HashMap<usize, crate::terminal::Rgb>,
+    ) -> Result<()> {
         let frame = encode_json(
             FRAME_SET_COLOR_PROFILE,
             &TerminalColorProfile {

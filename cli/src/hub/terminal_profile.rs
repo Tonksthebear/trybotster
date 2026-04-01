@@ -1091,5 +1091,4 @@ mod tests {
         assert!(!bytes.windows(7).any(|w| w == b"\x1b]10;?\x07"));
         assert!(!bytes.windows(7).any(|w| w == b"\x1b]11;?\x07"));
     }
-
 }
