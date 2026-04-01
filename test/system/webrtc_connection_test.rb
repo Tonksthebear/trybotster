@@ -297,8 +297,8 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
   # confirmation button, then redirects to the hub after session creation.
   def complete_pairing
     click_button "Complete Pairing", wait: 10
-    # Pairing controller shows success state then redirects after 800ms.
-    # Wait for hub page to load (connection-status targets appear).
+    assert_selector "[data-pairing-target='success']:not(.hidden)", wait: 15
+    visit hub_path(@hub)
     assert_selector "[data-connection-status-target='connectionSection']", wait: 15
   end
 

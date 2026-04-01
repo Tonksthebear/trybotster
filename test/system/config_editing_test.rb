@@ -248,7 +248,8 @@ class ConfigEditingTest < ApplicationSystemTestCase
     assert_selector "[data-pairing-target='ready']", wait: 15
     find("[data-action='pairing#pair']").click
 
-    # Wait for redirect to hub page after successful pairing
+    assert_selector "[data-pairing-target='success']:not(.hidden)", wait: 15
+    visit hub_path(@hub)
     assert_selector "[data-connection-status-target='connectionSection']", wait: 15
 
     # Wait for WebRTC DataChannel to be established (direct or relay)

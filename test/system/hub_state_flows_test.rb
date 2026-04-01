@@ -119,6 +119,8 @@ class HubStateFlowsTest < ApplicationSystemTestCase
     assert_selector "[data-pairing-target='ready']", wait: 15
     find("[data-action='pairing#pair']").click
 
+    assert_selector "[data-pairing-target='success']:not(.hidden)", wait: 15
+    visit hub_path(@hub)
     assert_selector "[data-connection-status-target='connectionSection']", wait: 15
     assert_webrtc_connected
   end
