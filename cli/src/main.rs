@@ -1037,6 +1037,9 @@ fn main() -> Result<()> {
             .init();
     }
 
+    // Route ghostty's Zig logs through Rust's log crate (instead of stderr).
+    botster::ghostty_vt::init_logging();
+
     // Set up panic hook to log panics and ensure terminal cleanup
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {

@@ -310,17 +310,6 @@ pub fn local_device_hub_id() -> anyhow::Result<String> {
 /// The Hub owns all application state and coordinates between the TUI,
 /// server integration, and browser relay components. It can run in either
 /// TUI mode (with terminal rendering) or headless mode (for CI/daemon use).
-/// Tracks pending OSC color probes sent to a browser peer.
-///
-/// Created when the hub injects probe bytes on focus-in, consumed as
-/// responses arrive via PTY input.
-#[derive(Debug, Default)]
-pub struct BrowserColorProbeState {
-    /// Probe indices still awaiting a response (0-255 palette, 256 fg, 257 bg, 258 cursor).
-    pub pending: std::collections::HashSet<usize>,
-    /// Accumulated color responses.
-    pub colors: std::collections::HashMap<usize, crate::terminal::Rgb>,
-}
 
 /// Central orchestrator that owns all hub state and runs the event loop.
 pub struct Hub {
@@ -475,15 +464,6 @@ pub struct Hub {
     /// Used to ensure OSC color queries are only forwarded to the active
     /// client terminal, avoiding duplicate auto-replies from passive clients.
     active_terminal_peers: Arc<Mutex<std::collections::HashMap<String, String>>>,
-    /// Pending browser color probes per peer.
-    ///
-    /// When a browser sends focus-in, the hub injects OSC color probe bytes
-    /// into the PTY output stream for that browser. Restty's ghostty WASM
-    /// responds via write_pty → sendInput. This map tracks expected probe
-    /// indices and accumulates colors until enough arrive to build a profile.
-    browser_color_probes:
-        std::collections::HashMap<String, BrowserColorProbeState>,
-
     /// Sender for outgoing WebRTC signals (ICE candidates) from async callbacks.
     ///
     /// Cloned for each new WebRTC channel. The async `on_ice_candidate` callback
@@ -745,7 +725,6 @@ impl Hub {
             terminal_session_peers: std::collections::HashMap::new(),
             terminal_forwarder_peers: std::collections::HashMap::new(),
             active_terminal_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            browser_color_probes: std::collections::HashMap::new(),
             webrtc_outgoing_signal_tx,
             webrtc_outgoing_signal_rx: Some(webrtc_outgoing_signal_rx),
             stream_muxes: std::collections::HashMap::new(),

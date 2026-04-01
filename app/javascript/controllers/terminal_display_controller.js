@@ -179,6 +179,9 @@ export default class extends Controller {
           `[terminal_display] loadBinarySnapshot failed session=${this.sessionUuidValue} bytes=${data?.byteLength ?? 0} backendReady=${this.#backendReady}`,
         );
       }
+      if (loaded) {
+        this.#sendColorProfile();
+      }
     };
     this.#transport.onFocusReportingChanged = (_enabled) => {
       this.#sendCurrentFocusState();
@@ -224,6 +227,7 @@ export default class extends Controller {
       },
       appOptions: {
         ptyTransport: this.#transport,
+        readOnly: true,
         autoResize: true,
         fontSize: 14,
         fontPreset: "none",
@@ -703,6 +707,29 @@ export default class extends Controller {
 
   #sendCurrentFocusState() {
     this.#transport?.sendInput(this.#focused ? "\x1b[I" : "\x1b[O");
+    if (this.#focused) {
+      this.#sendColorProfile();
+    }
+  }
+
+  #sendColorProfile() {
+    if (!this.#restty) return;
+    const colors = {};
+    const fg = this.#restty.getColorForeground?.();
+    const bg = this.#restty.getColorBackground?.();
+    const cursor = this.#restty.getColorCursor?.();
+    if (fg != null) colors[256] = { r: (fg >> 16) & 0xff, g: (fg >> 8) & 0xff, b: fg & 0xff };
+    if (bg != null) colors[257] = { r: (bg >> 16) & 0xff, g: (bg >> 8) & 0xff, b: bg & 0xff };
+    if (cursor != null) colors[258] = { r: (cursor >> 16) & 0xff, g: (cursor >> 8) & 0xff, b: cursor & 0xff };
+    const palette = this.#restty.getPalette?.();
+    if (palette) {
+      for (let i = 0; i < 256; i++) {
+        colors[i] = { r: palette[i * 3], g: palette[i * 3 + 1], b: palette[i * 3 + 2] };
+      }
+    }
+    if (Object.keys(colors).length > 0) {
+      this.#transport?.sendColorProfile(colors);
+    }
   }
 
   // Public actions for touch control buttons

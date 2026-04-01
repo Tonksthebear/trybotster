@@ -123,6 +123,13 @@ export class TerminalConnection extends HubRoute {
     return this.sendBinaryFile(data, filename);
   }
 
+  sendColorProfile(colors) {
+    return this.send("terminal_color_profile", {
+      session_uuid: this.sessionUuid,
+      colors,
+    });
+  }
+
   sendResize(cols, rows) {
     // Keep local geometry in sync so requestSnapshot() sends current bounds.
     this.options.cols = cols;

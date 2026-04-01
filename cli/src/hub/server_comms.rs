@@ -380,7 +380,6 @@ impl Hub {
 
     fn unregister_terminal_client_peer(&mut self, peer_id: &str, promote_next: bool) {
         self.terminal_client_profiles.remove(peer_id);
-        self.browser_color_probes.remove(peer_id);
 
         let forwarder_ids: Vec<String> = self
             .terminal_forwarder_peers
@@ -443,103 +442,6 @@ impl Hub {
 
         drop(active);
         self.sync_session_terminal_profile(session_uuid);
-    }
-
-    /// Send OSC color probes to a browser peer's terminal.
-    ///
-    /// Injects full probe bytes (OSC 4/10/11/12 queries) as PTY output so
-    /// restty's ghostty WASM processes them and responds via write_pty.
-    fn send_browser_color_probe(&mut self, browser_identity: &str, session_uuid: &str) {
-        let subscription_id = format!("terminal_{session_uuid}");
-        let probe_bytes = crate::hub::terminal_profile::full_probe_bytes();
-
-        // Prefix with 0x01 (live PTY output) for the browser terminal framing.
-        let mut data = Vec::with_capacity(1 + probe_bytes.len());
-        data.push(0x01);
-        data.extend_from_slice(probe_bytes);
-
-        let output = super::WebRtcPtyOutput {
-            subscription_id,
-            browser_identity: browser_identity.to_string(),
-            data,
-            session_uuid: session_uuid.to_string(),
-        };
-
-        if self.webrtc_pty_output_tx.try_send(output).is_ok() {
-            // Flush any stale probe state — publish whatever was accumulated
-            // from a previous probe that never fully completed.
-            if let Some(old_state) = self.browser_color_probes.remove(browser_identity) {
-                if !old_state.colors.is_empty() {
-                    log::debug!(
-                        "[PTY-PROBE] Flushing stale probe for browser {}: {} colors",
-                        &browser_identity[..browser_identity.len().min(8)],
-                        old_state.colors.len()
-                    );
-                    self.update_terminal_client_profile(browser_identity, old_state.colors);
-                }
-            }
-
-            // Set up tracking state for expected responses.
-            let mut pending = std::collections::HashSet::new();
-            for index in 0usize..256 {
-                pending.insert(index);
-            }
-            pending.insert(256); // fg
-            pending.insert(257); // bg
-            pending.insert(258); // cursor
-            self.browser_color_probes.insert(
-                browser_identity.to_string(),
-                super::BrowserColorProbeState {
-                    pending,
-                    colors: std::collections::HashMap::new(),
-                },
-            );
-            log::debug!(
-                "[PTY-PROBE] Sent color probes to browser {}",
-                &browser_identity[..browser_identity.len().min(8)]
-            );
-        }
-    }
-
-    /// Accumulate parsed color entries into a browser peer's probe state.
-    ///
-    /// When fg and bg are both received, publishes the profile via
-    /// `update_terminal_client_profile` and removes the probe state.
-    fn consume_browser_color_entries(
-        &mut self,
-        browser_identity: &str,
-        entries: Vec<(usize, crate::terminal::Rgb)>,
-    ) {
-        let Some(state) = self.browser_color_probes.get_mut(browser_identity) else {
-            return;
-        };
-
-        for (index, color) in entries {
-            state.pending.remove(&index);
-            state.colors.insert(index, color);
-        }
-
-        // Publish once fg + bg arrive. Cursor is optional (fallback is fine).
-        // Don't wait for all 256 palette entries — they may arrive across
-        // multiple chunks and the profile is useful with just fg/bg.
-        let fg_done = !state.pending.contains(&256);
-        let bg_done = !state.pending.contains(&257);
-
-        if fg_done && bg_done {
-            let colors = self
-                .browser_color_probes
-                .remove(browser_identity)
-                .expect("just checked")
-                .colors;
-            let bg = colors.get(&257usize).copied();
-            log::info!(
-                "[PTY-PROBE] Browser {} color profile complete: {} colors, bg={:?}",
-                &browser_identity[..browser_identity.len().min(8)],
-                colors.len(),
-                bg
-            );
-            self.update_terminal_client_profile(browser_identity, colors);
-        }
     }
 
     fn learn_terminal_probe_replies(&mut self, session_uuid: &str, peer_id: &str, data: &[u8]) {
@@ -1535,39 +1437,12 @@ impl Hub {
             self.set_active_terminal_peer(&input.session_uuid, &input.browser_identity, true);
             self.lua
                 .set_pty_focused(&input.session_uuid, &input.browser_identity, true);
-            self.send_browser_color_probe(&input.browser_identity, &input.session_uuid);
+            // Color profile is now sent by the browser as a JSON message
+            // after snapshot load — no need to inject OSC probe bytes.
         } else if input.data == b"\x1b[O" {
             self.set_active_terminal_peer(&input.session_uuid, &input.browser_identity, false);
             self.lua
                 .set_pty_focused(&input.session_uuid, &input.browser_identity, false);
-        }
-
-        // Strip OSC color probe responses from browser terminal input.
-        // Restty's ghostty WASM generates these in response to the probe
-        // bytes we injected on focus-in. Consume the color replies and
-        // forward any remaining bytes (user input) to the session PTY.
-        if self.browser_color_probes.contains_key(&input.browser_identity) {
-            let (colors, remainder) =
-                crate::hub::terminal_profile::split_color_replies(&input.data);
-            if !colors.is_empty() {
-                self.consume_browser_color_entries(&input.browser_identity, colors);
-            }
-            if remainder.is_empty() {
-                return;
-            }
-            // Forward non-color-reply bytes to session.
-            self.learn_terminal_probe_replies(
-                &input.session_uuid,
-                &input.browser_identity,
-                &remainder,
-            );
-            self.lua.notify_pty_input(&input.session_uuid);
-            if let Some(session_handle) = self.handle_cache.get_session(&input.session_uuid) {
-                if let Err(e) = session_handle.pty().write_input_direct(&remainder) {
-                    log::error!("[PTY-INPUT] Write failed: {e}");
-                }
-            }
-            return;
         }
 
         self.learn_terminal_probe_replies(
