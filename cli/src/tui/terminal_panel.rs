@@ -11,8 +11,8 @@ use crate::terminal::{CursorStyle, Rgb, TerminalParser};
 
 use super::ColorCache;
 
-/// Default scrollback buffer size in lines for TUI panels.
-const TUI_SCROLLBACK: usize = 10_000;
+/// Default scrollback buffer size in bytes for TUI panels (matches ghostty's 10MB default).
+const TUI_SCROLLBACK: usize = 10_000_000;
 
 /// Connection lifecycle for a terminal panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

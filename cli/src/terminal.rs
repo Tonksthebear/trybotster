@@ -15,8 +15,9 @@ const MAX_OSC_QUERY_BUFFER_BYTES: usize = 512;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Default scrollback line limit for shadow terminals.
-pub const DEFAULT_SCROLLBACK_LINES: usize = 5_000;
+/// Default scrollback limit in bytes (matches ghostty's default of 10MB).
+/// ghostty's max_scrollback is measured in bytes, not lines.
+pub const DEFAULT_SCROLLBACK_BYTES: usize = 10_000_000;
 
 /// Minimum rows clamped on construction.
 pub const MIN_ROWS: u16 = 1;

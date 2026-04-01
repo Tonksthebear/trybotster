@@ -8,7 +8,7 @@ import {
   isBuiltinThemeName,
   listBuiltinThemeNames,
   parseGhosttyTheme
-} from "chunk-x0p382as";
+} from "chunk-rmwd45b7";
 export {
   parseGhosttyTheme,
   listBuiltinThemeNames,

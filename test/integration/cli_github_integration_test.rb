@@ -190,6 +190,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     setup_git_repo(temp_dir, TEST_REPO)
     install_github_plugin(temp_dir)
     install_agent_session(temp_dir)
+    register_spawn_target(temp_dir)
     write_long_lived_session(temp_dir) if @use_long_lived_session
 
     @test_temp_dirs ||= []
@@ -396,6 +397,26 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     end
 
     Rails.logger.info "[CliGithubTest] Installed long-lived agent config"
+  end
+
+  # Pre-seed a spawn target so the hub discovers repo-level plugins at boot.
+  # The spawn_targets.json lives under BOTSTER_CONFIG_DIR (= temp_dir).
+  def register_spawn_target(repo_path)
+    canonical_path = File.realpath(repo_path)
+    spawn_targets = {
+      targets: [
+        {
+          id: "tgt_test_#{SecureRandom.hex(8)}",
+          name: "Test Repo",
+          path: canonical_path,
+          enabled: true,
+          created_at: Time.now.iso8601,
+          updated_at: Time.now.iso8601
+        }
+      ]
+    }
+    File.write(File.join(repo_path, "spawn_targets.json"), JSON.generate(spawn_targets))
+    Rails.logger.info "[CliGithubTest] Registered spawn target: #{canonical_path}"
   end
 
   def assert_message_acknowledged(message, timeout: 15)
