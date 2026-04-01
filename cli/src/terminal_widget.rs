@@ -10,36 +10,15 @@ use ratatui::{
     widgets::{Block, Widget},
 };
 
-use crate::ghostty_vt::{
-    self, GhosttyCellWide, GhosttyColorRgb, GhosttyRenderStateCursorVisualStyle, RenderState,
-};
-
-/// Configuration for cursor rendering.
-#[derive(Debug, Clone)]
-pub struct CursorConfig {
-    /// Whether to render the cursor.
-    pub show: bool,
-    /// Character to render at cursor position.
-    pub symbol: String,
-    /// Ratatui style for the cursor cell.
-    pub style: Style,
-}
-
-impl Default for CursorConfig {
-    fn default() -> Self {
-        Self {
-            show: true,
-            symbol: "\u{2588}".to_string(),
-            style: Style::default().add_modifier(Modifier::REVERSED),
-        }
-    }
-}
+use crate::ghostty_vt::{self, GhosttyCellWide, GhosttyColorRgb, RenderState};
 
 /// A widget that renders a ghostty terminal to a ratatui buffer.
+///
+/// Cursor rendering is handled by the host terminal's hardware cursor via
+/// `Frame::set_cursor_position()` in `render_terminal_panel`, not by cell painting.
 pub struct TerminalWidget<'a> {
     render_state: &'a RenderState,
     block: Option<Block<'a>>,
-    cursor: CursorConfig,
     default_fg: Option<GhosttyColorRgb>,
     default_bg: Option<GhosttyColorRgb>,
 }
@@ -47,7 +26,6 @@ pub struct TerminalWidget<'a> {
 impl std::fmt::Debug for TerminalWidget<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TerminalWidget")
-            .field("cursor", &self.cursor)
             .field("has_block", &self.block.is_some())
             .finish_non_exhaustive()
     }
@@ -62,7 +40,6 @@ impl<'a> TerminalWidget<'a> {
         Self {
             render_state,
             block: None,
-            cursor: CursorConfig::default(),
             default_fg: None,
             default_bg: None,
         }
@@ -74,22 +51,10 @@ impl<'a> TerminalWidget<'a> {
         self
     }
 
-    /// Override cursor rendering configuration.
-    pub fn cursor(mut self, cursor: CursorConfig) -> Self {
-        self.cursor = cursor;
-        self
-    }
-
     /// Override the terminal default foreground/background colors.
     pub fn default_colors(mut self, fg: GhosttyColorRgb, bg: GhosttyColorRgb) -> Self {
         self.default_fg = Some(fg);
         self.default_bg = Some(bg);
-        self
-    }
-
-    /// Disable cursor rendering.
-    pub fn hide_cursor(mut self) -> Self {
-        self.cursor.show = false;
         self
     }
 }
@@ -114,10 +79,6 @@ impl Widget for TerminalWidget<'_> {
 
         if let Ok(mut iter) = self.render_state.iterator() {
             render_grid(&mut iter, inner_area, buf, default_fg, default_bg);
-        }
-
-        if self.cursor.show {
-            render_cursor(self.render_state, inner_area, buf, &self.cursor);
         }
     }
 }
@@ -218,59 +179,6 @@ fn render_grid(
     }
 }
 
-fn render_cursor(rs: &RenderState, area: Rect, buf: &mut Buffer, cursor_config: &CursorConfig) {
-    if !rs.cursor_visible() || !rs.cursor_in_viewport() {
-        return;
-    }
-
-    let (cursor_x, cursor_y) = rs.cursor_viewport_position();
-    let visual_style = rs.cursor_visual_style();
-
-    let buf_x = area.x + cursor_x;
-    let buf_y = area.y + cursor_y;
-
-    if buf_x >= area.x + area.width || buf_y >= area.y + area.height {
-        return;
-    }
-
-    let buf_cell = &mut buf[(buf_x, buf_y)];
-    let has_char = {
-        let s = buf_cell.symbol();
-        !s.is_empty() && s != " "
-    };
-
-    match visual_style {
-        GhosttyRenderStateCursorVisualStyle::Block => {
-            if has_char {
-                buf_cell.set_style(cursor_config.style.add_modifier(Modifier::REVERSED));
-            } else {
-                buf_cell.set_symbol(&cursor_config.symbol);
-                buf_cell.set_style(cursor_config.style);
-            }
-        }
-        GhosttyRenderStateCursorVisualStyle::Bar => {
-            buf_cell.set_symbol("\u{258e}");
-            buf_cell.set_style(cursor_config.style);
-        }
-        GhosttyRenderStateCursorVisualStyle::Underline => {
-            if has_char {
-                buf_cell.set_style(cursor_config.style.add_modifier(Modifier::UNDERLINED));
-            } else {
-                buf_cell.set_symbol("_");
-                buf_cell.set_style(cursor_config.style);
-            }
-        }
-        GhosttyRenderStateCursorVisualStyle::BlockHollow => {
-            if has_char {
-                buf_cell.set_style(cursor_config.style.add_modifier(Modifier::REVERSED));
-            } else {
-                buf_cell.set_symbol(&cursor_config.symbol);
-                buf_cell.set_style(cursor_config.style);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,16 +201,7 @@ mod tests {
     fn test_terminal_widget_creation() {
         let mut parser = TerminalParser::new(24, 80, 1000);
         let rs = make_render_state(&mut parser);
-        let widget = TerminalWidget::new(&rs);
-        assert!(widget.cursor.show);
-    }
-
-    #[test]
-    fn test_terminal_widget_hide_cursor() {
-        let mut parser = TerminalParser::new(24, 80, 1000);
-        let rs = make_render_state(&mut parser);
-        let widget = TerminalWidget::new(&rs).hide_cursor();
-        assert!(!widget.cursor.show);
+        let _widget = TerminalWidget::new(&rs);
     }
 
     #[test]
@@ -446,8 +345,8 @@ mod tests {
                     .background_color_default()
                     .or_else(|| panel.background_color())
                     .unwrap_or(crate::terminal::Rgb::new(0, 0, 0));
-                let widget =
-                    TerminalWidget::new(panel.render_state()).default_colors(default_fg.into(), default_bg.into());
+                let widget = TerminalWidget::new(panel.render_state())
+                    .default_colors(default_fg.into(), default_bg.into());
                 f.render_widget(widget, f.area());
             })
             .unwrap();
@@ -471,8 +370,8 @@ mod tests {
                     .background_color_default()
                     .or_else(|| panel.background_color())
                     .unwrap_or(crate::terminal::Rgb::new(0, 0, 0));
-                let widget =
-                    TerminalWidget::new(panel.render_state()).default_colors(default_fg.into(), default_bg.into());
+                let widget = TerminalWidget::new(panel.render_state())
+                    .default_colors(default_fg.into(), default_bg.into());
                 f.render_widget(widget, f.area());
             })
             .unwrap();

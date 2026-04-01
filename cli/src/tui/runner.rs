@@ -672,7 +672,8 @@ where
                     let responses = self.take_osc_color_responses(raw_bytes);
                     if !responses.is_empty() {
                         for response in responses {
-                            let Some((index, color)) = Self::parse_color_cache_entry(&response) else {
+                            let Some((index, color)) = Self::parse_color_cache_entry(&response)
+                            else {
                                 continue;
                             };
                             if self.consume_local_color_probe(index) {
@@ -1262,9 +1263,13 @@ where
     }
 
     fn has_pending_focus_sync_probe(&self) -> bool {
-        Self::FOCUS_SYNC_COLOR_INDICES
-            .iter()
-            .any(|index| self.local_color_probe_pending.get(index).copied().unwrap_or(0) > 0)
+        Self::FOCUS_SYNC_COLOR_INDICES.iter().any(|index| {
+            self.local_color_probe_pending
+                .get(index)
+                .copied()
+                .unwrap_or(0)
+                > 0
+        })
     }
 
     fn current_color_profile_message(&self) -> Option<serde_json::Value> {
@@ -1752,6 +1757,10 @@ where
             panels: &self.panel_pool.panels,
             scroll_offset,
             is_scrolled,
+
+            // Cursor — hardware cursor only for focused terminal in terminal mode
+            focused_session_uuid: self.panel_pool.current_session_uuid.as_deref(),
+            is_terminal_mode: self.mode == "terminal",
 
             // Status Indicators - TuiRunner doesn't track these, use defaults
             seconds_since_poll: 0,
@@ -4441,6 +4450,8 @@ mod tests {
             panels,
             scroll_offset: 0,
             is_scrolled: false,
+            focused_session_uuid: None,
+            is_terminal_mode: false,
             seconds_since_poll: 0,
             poll_interval: 10,
             vpn_status: None,

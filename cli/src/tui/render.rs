@@ -78,6 +78,13 @@ pub struct RenderContext<'a> {
     /// Whether the active PTY is scrolled (not at bottom).
     pub is_scrolled: bool,
 
+    // === Cursor State ===
+    /// Session UUID of the focused terminal panel, if any.
+    /// Used to show the hardware cursor only for the focused PTY.
+    pub focused_session_uuid: Option<&'a str>,
+    /// Whether the TUI is in terminal mode (PTY input active).
+    pub is_terminal_mode: bool,
+
     // === Status Indicators ===
     /// Seconds since last poll.
     pub seconds_since_poll: u64,
@@ -237,9 +244,8 @@ pub(super) fn render_terminal_panel(
     let panel = session_uuid.and_then(|uuid| ctx.panels.get(uuid));
 
     if let Some(panel) = panel {
-        let scroll_offset = panel.scroll_offset();
-        let scrollback_depth = panel.scrollback_depth();
-        let is_scrolled = panel.is_scrolled();
+        let scrollbar_state = panel.scrollbar();
+        let is_scrolled = scrollbar_state.lines_from_bottom() > 0;
 
         let rs = panel.render_state();
         let default_fg = panel
@@ -253,21 +259,33 @@ pub(super) fn render_terminal_panel(
         let widget = crate::TerminalWidget::new(rs)
             .default_colors(default_fg.into(), default_bg.into())
             .block(block);
-        let widget = if is_scrolled {
-            widget.hide_cursor()
-        } else {
-            widget
-        };
 
         widget.render(area, f.buffer_mut());
 
+        // Show the host terminal's hardware cursor only for the focused
+        // panel in terminal mode, when the PTY cursor is visible.
+        let is_focused = ctx.is_terminal_mode
+            && session_uuid.is_some()
+            && ctx.focused_session_uuid == session_uuid;
+        if is_focused
+            && !is_scrolled
+            && rs.cursor_visible()
+            && rs.cursor_in_viewport()
+        {
+            let (cx, cy) = rs.cursor_viewport_position();
+            let abs_x = inner.x + cx;
+            let abs_y = inner.y + cy;
+            if abs_x < inner.x + inner.width && abs_y < inner.y + inner.height {
+                f.set_cursor_position((abs_x, abs_y));
+            }
+        }
+
         // Scrollbar overlay when scrolled — uses panel's pre-computed
-        // scrollback_depth, no mid-render mutations.
-        if is_scrolled && scrollback_depth > 0 {
-            let content_length = scrollback_depth + inner.height as usize;
-            // scroll_offset=max means top of history; position=0 means scrollbar at top
-            let position = content_length.saturating_sub(scroll_offset + inner.height as usize);
-            let mut scrollbar_state = ScrollbarState::new(content_length).position(position);
+        // ghostty scrollbar geometry directly so the thumb tracks the real viewport.
+        if is_scrolled && scrollbar_state.scrollback_rows() > 0 {
+            let mut scrollbar_state = ScrollbarState::new(scrollbar_state.total)
+                .position(scrollbar_state.offset)
+                .viewport_content_length(scrollbar_state.len);
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
             scrollbar.render(inner, f.buffer_mut(), &mut scrollbar_state);
         }

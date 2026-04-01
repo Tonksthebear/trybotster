@@ -792,6 +792,8 @@ mod tests {
             panels,
             scroll_offset: 0,
             is_scrolled: false,
+            focused_session_uuid: None,
+            is_terminal_mode: false,
             seconds_since_poll: 0,
             poll_interval: 10,
             vpn_status: None,
