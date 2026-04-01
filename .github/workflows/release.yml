@@ -9,14 +9,68 @@ permissions:
   contents: write # Needed to create releases
 
 jobs:
+  build-cli:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install packages
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            cli/target/
+          key: ${{ runner.os }}-cargo-release-build-cli-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-build-cli-
+
+      - name: Build CLI
+        env:
+          BOTSTER_ENV: test
+        working-directory: cli
+        run: cargo test --no-run --lib --bins --tests
+
+      - name: Upload CLI binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: botster-cli
+          path: cli/target/debug/botster
+          retention-days: 1
+
   ci-gate:
     runs-on: ubuntu-latest
+    needs: [build-cli]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          submodules: true
 
       - name: Install packages
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -36,13 +90,12 @@ jobs:
 
       - name: Run CLI tests
         working-directory: cli
-        env:
-          BOTSTER_ENV: test
-        run: cargo test --all-targets -- --test-threads=1
+        run: ./test.sh
 
   rails-test:
     runs-on: ubuntu-latest
     environment: test
+    needs: [build-cli]
 
     services:
       postgres:
@@ -59,7 +112,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libpq-dev pkg-config
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Download CLI binary
+        uses: actions/download-artifact@v4
+        with:
+          name: botster-cli
+          path: cli/target/debug/
+
+      - name: Make CLI executable
+        run: chmod +x cli/target/debug/botster
 
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
@@ -73,11 +135,13 @@ jobs:
           DB_USERNAME: postgres
           DB_PASSWORD: postgres
           RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
+          SKIP_CLI_BUILD: "1"
         run: bin/rails db:test:prepare test
 
   rails-system-test:
     runs-on: ubuntu-latest
     environment: test
+    needs: [build-cli]
 
     services:
       postgres:
@@ -94,7 +158,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libpq-dev pkg-config
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Download CLI binary
+        uses: actions/download-artifact@v4
+        with:
+          name: botster-cli
+          path: cli/target/debug/
+
+      - name: Make CLI executable
+        run: chmod +x cli/target/debug/botster
 
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
@@ -108,6 +181,7 @@ jobs:
           DB_USERNAME: postgres
           DB_PASSWORD: postgres
           RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
+          SKIP_CLI_BUILD: "1"
         run: bin/rails db:test:prepare test:system
 
       - name: Keep screenshots from failed system tests
@@ -133,27 +207,31 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_name: botster-linux-x86_64
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: botster-linux-arm64
-            use_cross: true
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Install cross
-        if: matrix.use_cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
 
       - name: Set version from git tag
         run: |
@@ -165,11 +243,7 @@ jobs:
       - name: Build release binary
         run: |
           cd cli
-          if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+          cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
         run: |
