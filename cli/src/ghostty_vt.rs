@@ -582,10 +582,36 @@ struct GhosttyFormatterOpaque {
 }
 type GhosttyFormatterPtr = *mut GhosttyFormatterOpaque;
 
+// ── Log callback ──────────────────────────────────────────────────────────
+
+/// Callback invoked by ghostty's Zig logging. Routes through Rust's `log` crate.
+extern "C" fn ghostty_log_callback(level: u8, ptr: *const u8, len: usize) {
+    // SAFETY: Zig passes a valid pointer+length from a stack buffer.
+    let msg = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) };
+    match level {
+        0 => log::error!(target: "ghostty", "{msg}"),
+        1 => log::warn!(target: "ghostty", "{msg}"),
+        2 => log::info!(target: "ghostty", "{msg}"),
+        _ => log::debug!(target: "ghostty", "{msg}"),
+    }
+}
+
+/// Install the log callback. Call once at startup before creating any terminals.
+pub fn init_logging() {
+    unsafe {
+        ghostty_vt_set_log_callback(ghostty_log_callback);
+    }
+}
+
 // ── Extern C functions ─────────────────────────────────────────────────────
 
 #[allow(dead_code)]
 extern "C" {
+    // Logging
+    fn ghostty_vt_set_log_callback(
+        cb: extern "C" fn(level: u8, ptr: *const u8, len: usize),
+    );
+
     // Terminal lifecycle
     fn ghostty_terminal_new(
         allocator: *const c_void,

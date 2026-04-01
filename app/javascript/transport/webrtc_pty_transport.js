@@ -95,6 +95,12 @@ export class WebRtcPtyTransport {
     return true;
   }
 
+  sendColorProfile(colors) {
+    if (!this.#terminalConn?.isConnected()) return false;
+    this.#terminalConn.sendColorProfile(colors);
+    return true;
+  }
+
   sendFile(data, filename) {
     if (!this.#terminalConn?.isConnected()) return false;
     this.#terminalConn.sendFile(data, filename);
