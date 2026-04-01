@@ -21,4 +21,4 @@
 echo "Botster agent initialized for branch: $(botster context branch_name)"
 echo "Worktree: $BOTSTER_WORKTREE_PATH"
 
-codex --full-auto --no-alt-screen "$(botster context prompt)"
+codex "$(botster context prompt)"
