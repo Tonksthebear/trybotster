@@ -23,9 +23,18 @@ export class HubPeerLifecycle {
       `[WebRTCTransport] ICE config ready for hub ${hubId} in ${Math.round(performance.now() - conn.peerSetupStartedAt)}ms`,
     )
 
+    const forceRelay = this.#shouldForceRelay(conn, iceConfig)
+    if (forceRelay) {
+      const remainingMs = Math.max(0, conn.forceRelayUntil - Date.now())
+      console.debug(
+        `[WebRTCTransport] Forcing TURN relay for hub ${hubId} for ${Math.ceil(remainingMs / 1000)}s after direct churn`,
+      )
+    }
+
     const pc = new RTCPeerConnection({
       iceServers: iceConfig.ice_servers,
       iceCandidatePoolSize: 1,
+      ...(forceRelay ? { iceTransportPolicy: "relay" } : {}),
     })
     conn.pc = pc
     conn.state = TransportState.CONNECTING
@@ -77,6 +86,7 @@ export class HubPeerLifecycle {
           conn.iceDisconnectedTimer = setTimeout(() => {
             conn.iceDisconnectedTimer = null
             if (pc.iceConnectionState === "disconnected") {
+              this.#recordDirectDisconnect(hubId, conn)
               console.debug("[WebRTCTransport] ICE stuck disconnected for 5s, cleaning up peer")
               this.cleanupPeer(hubId, conn)
             }
@@ -374,5 +384,46 @@ export class HubPeerLifecycle {
       )
       this.cleanupPeer(hubId, current)
     }, PEER_SETUP_TIMEOUT_MS)
+  }
+
+  #shouldForceRelay(conn, iceConfig) {
+    if (!conn) return false
+    if (!this.#hasTurnServers(iceConfig)) return false
+    return conn.forceRelayUntil > Date.now()
+  }
+
+  #recordDirectDisconnect(hubId, conn) {
+    const {
+      ConnectionMode,
+      DIRECT_CHURN_WINDOW_MS,
+      DIRECT_CHURN_THRESHOLD,
+      RELAY_FALLBACK_MS,
+    } = this.#constants
+
+    if (!conn || conn.mode !== ConnectionMode.DIRECT) return
+    if (!this.#hasTurnServers(conn.iceConfig)) {
+      console.warn(
+        `[WebRTCTransport] Direct peer churn detected for hub ${hubId}, but no TURN servers are available for relay fallback`,
+      )
+      return
+    }
+
+    const cutoff = Date.now() - DIRECT_CHURN_WINDOW_MS
+    conn.recentDirectDisconnects = (conn.recentDirectDisconnects || []).filter((at) => at >= cutoff)
+    conn.recentDirectDisconnects.push(Date.now())
+
+    if (conn.recentDirectDisconnects.length < DIRECT_CHURN_THRESHOLD) return
+
+    conn.forceRelayUntil = Date.now() + RELAY_FALLBACK_MS
+    console.warn(
+      `[WebRTCTransport] Direct peer churn detected for hub ${hubId}; forcing TURN relay for ${Math.round(RELAY_FALLBACK_MS / 1000)}s`,
+    )
+  }
+
+  #hasTurnServers(iceConfig) {
+    return Array.isArray(iceConfig?.ice_servers) && iceConfig.ice_servers.some((server) => {
+      const urls = Array.isArray(server?.urls) ? server.urls : [server?.urls]
+      return urls.some((url) => typeof url === "string" && /^turns?:/i.test(url))
+    })
   }
 }

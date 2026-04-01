@@ -45,6 +45,9 @@ const MAX_PENDING_REMOTE_ICE = 128
 const ICE_CONFIG_CACHE_TTL_MS = 60_000
 const ICE_CONFIG_FETCH_TIMEOUT_MS = 3000
 const PEER_SETUP_TIMEOUT_MS = 15_000
+const DIRECT_CHURN_WINDOW_MS = 60_000
+const DIRECT_CHURN_THRESHOLD = 1
+const RELAY_FALLBACK_MS = 5 * 60_000
 
 function base64ToBytes(b64) {
   const binary = atob(b64)
@@ -110,6 +113,9 @@ class HubPeerConnection {
         ICE_RESTART_BACKOFF_MULTIPLIER,
         MAX_PENDING_REMOTE_ICE,
         PEER_SETUP_TIMEOUT_MS,
+        DIRECT_CHURN_WINDOW_MS,
+        DIRECT_CHURN_THRESHOLD,
+        RELAY_FALLBACK_MS,
       },
     })
 
@@ -200,6 +206,8 @@ class HubPeerConnection {
       peerSetupTimer: null,
       peerSetupStartedAt: 0,
       offerSentAt: 0,
+      recentDirectDisconnects: [],
+      forceRelayUntil: 0,
       signalingConnected: true,
       lastHealth: null,
     }
