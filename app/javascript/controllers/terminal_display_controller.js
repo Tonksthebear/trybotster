@@ -170,13 +170,14 @@ export default class extends Controller {
       console.debug(
         `[terminal_display] applying binary snapshot session=${this.sessionUuidValue} bytes=${data?.byteLength ?? 0} backendReady=${this.#backendReady}`,
       );
-      const loaded = this.#restty?.loadBinarySnapshot(data) ?? false;
+      const resttyReady = !!this.#restty;
+      const loaded = resttyReady ? this.#restty.loadBinarySnapshot(data) : false;
       console.debug(
-        `[terminal_display] loadBinarySnapshot result session=${this.sessionUuidValue} loaded=${loaded}`,
+        `[terminal_display] loadBinarySnapshot result session=${this.sessionUuidValue} loaded=${loaded} resttyReady=${resttyReady}`,
       );
       if (!loaded) {
         console.warn(
-          `[terminal_display] loadBinarySnapshot failed session=${this.sessionUuidValue} bytes=${data?.byteLength ?? 0} backendReady=${this.#backendReady}`,
+          `[terminal_display] loadBinarySnapshot failed session=${this.sessionUuidValue} bytes=${data?.byteLength ?? 0} backendReady=${this.#backendReady} resttyReady=${resttyReady} dataType=${typeof data} isUint8Array=${data instanceof Uint8Array}`,
         );
       }
       if (loaded) {
@@ -331,11 +332,7 @@ export default class extends Controller {
         touchSelectionMode: "long-press",
         callbacks: {
           onLog: (line) => {
-            if (line.includes("StringAllocOutOfMemory")) {
-              console.warn(
-                "[terminal] WASM OOM detected (should not happen with patched ghostty-vt)",
-              );
-            }
+            console.debug(`[restty] ${line}`);
           },
           onBackend: () => {
             this.#backendReady = true;

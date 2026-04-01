@@ -110,10 +110,11 @@ end)
 safe_require("user.init")
 
 -- ============================================================================
--- Plugin Loading (device-global)
+-- Plugin Loading (device + spawn targets)
 -- ============================================================================
--- Device-hub startup has no ambient repo target. Load only device plugins here.
--- Target-local plugins are resolved explicitly by target-aware commands.
+-- Load plugins from device root and from each admitted spawn target's repo root.
+-- Repo-level plugins (e.g. .botster/plugins/github/) need to load at hub startup
+-- so they can subscribe to ActionCable channels and handle messages immediately.
 
 local ConfigResolver = require("lib.config_resolver")
 local state = require("hub.state")
@@ -136,16 +137,24 @@ if ConfigResolver.needs_migration(device_root, nil) then
     end
 end
 
-if device_root then
-    local unified = ConfigResolver.resolve_all({
-        device_root = device_root,
-        repo_root = nil,
-        require_agent = false,  -- plugin discovery doesn't need agent session
-    })
+-- Collect repo roots from admitted spawn targets
+local target_repo_roots = {}
+local target_registry = rawget(_G, "spawn_targets")
+if target_registry and type(target_registry.list) == "function" then
+    local ok, targets = pcall(target_registry.list)
+    if ok and type(targets) == "table" then
+        for _, target in ipairs(targets) do
+            if target.enabled ~= false and target.path then
+                target_repo_roots[target.path] = true
+            end
+        end
+    end
+end
 
-    if unified and unified.plugins then
-        for _, plugin in ipairs(unified.plugins) do
-            -- Register in plugin_registry first (load_plugin checks disabled set)
+local function load_plugins_from_resolved(unified)
+    if not unified or not unified.plugins then return end
+    for _, plugin in ipairs(unified.plugins) do
+        if not plugin_registry[plugin.name] then
             plugin_registry[plugin.name] = {
                 path = plugin.init_path,
                 status = "pending",
@@ -170,6 +179,26 @@ if device_root then
             end
         end
     end
+end
+
+-- Load device-level plugins
+if device_root then
+    local unified = ConfigResolver.resolve_all({
+        device_root = device_root,
+        repo_root = nil,
+        require_agent = false,
+    })
+    load_plugins_from_resolved(unified)
+end
+
+-- Load repo-level plugins from each spawn target
+for repo_root, _ in pairs(target_repo_roots) do
+    local unified = ConfigResolver.resolve_all({
+        device_root = nil,
+        repo_root = repo_root,
+        require_agent = false,
+    })
+    load_plugins_from_resolved(unified)
 end
 
 if not next(loaded_plugin_names) then

@@ -44,7 +44,7 @@ use std::{mem::ManuallyDrop, thread};
 
 use anyhow::{bail, Context, Result};
 
-use crate::terminal::{CallbackConfig, TerminalParser, DEFAULT_SCROLLBACK_LINES};
+use crate::terminal::{CallbackConfig, TerminalParser, DEFAULT_SCROLLBACK_BYTES};
 
 use protocol::*;
 
@@ -442,7 +442,7 @@ fn run_session(
         let mut parser = TerminalParser::new_with_callbacks(
             config.rows,
             config.cols,
-            DEFAULT_SCROLLBACK_LINES,
+            DEFAULT_SCROLLBACK_BYTES,
             callbacks,
         );
         let mut color_cache = std::collections::HashMap::new();

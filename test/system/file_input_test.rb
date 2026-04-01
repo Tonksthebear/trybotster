@@ -46,31 +46,17 @@ class FileInputTest < ApplicationSystemTestCase
     # Send via TerminalConnection (not HubTransport — correct sub_id routing).
     # Capybara's .drop() doesn't work here because Chrome's synthetic DragEvent
     # doesn't populate dataTransfer.files. We use attach_file + sendFile instead.
-    result = page.driver.browser.execute_async_script(<<~JS, @hub.id.to_s, session_uuid)
-      var done = arguments[arguments.length - 1];
-      var hubId = arguments[0];
-      var sessionUuid = arguments[1];
+    wait_for_terminal_connection(@hub.id, session_uuid)
 
+    result = page.driver.browser.execute_async_script(<<~JS)
+      var done = arguments[arguments.length - 1];
       (async function() {
         try {
-          var { HubConnectionManager } = await import("connections/hub_connection_manager");
-          var key = "terminal:" + hubId + ":" + sessionUuid;
-
-          // Wait for TerminalConnection to be created by terminal_display_controller
-          var conn = null;
-          for (var i = 0; i < 100; i++) {
-            conn = HubConnectionManager.get(key);
-            if (conn && conn.isConnected()) break;
-            conn = null;
-            await new Promise(r => setTimeout(r, 200));
-          }
-          if (!conn) { done("error: TerminalConnection not ready"); return; }
-
           var file = document.getElementById("test-file-input").files[0];
           if (!file) { done("error: No file attached"); return; }
 
           var buffer = await file.arrayBuffer();
-          conn.sendFile(new Uint8Array(buffer), file.name);
+          window._botsterTestConn.sendFile(new Uint8Array(buffer), file.name);
           done("ok");
         } catch(e) {
           done("error: " + e.message);
@@ -114,31 +100,18 @@ class FileInputTest < ApplicationSystemTestCase
     page.execute_script("document.body.insertAdjacentHTML('beforeend', '<input type=\"file\" id=\"test-file-input\">')")
     attach_file("test-file-input", fixture_path.to_s, make_visible: true)
 
-    result = page.driver.browser.execute_async_script(<<~JS, @hub.id.to_s, session_uuid)
-      var done = arguments[arguments.length - 1];
-      var hubId = arguments[0];
-      var sessionUuid = arguments[1];
+    wait_for_terminal_connection(@hub.id, session_uuid)
 
+    result = page.driver.browser.execute_async_script(<<~JS)
+      var done = arguments[arguments.length - 1];
       (async function() {
         try {
-          var { HubConnectionManager } = await import("connections/hub_connection_manager");
-          var key = "terminal:" + hubId + ":" + sessionUuid;
-
-          var conn = null;
-          for (var i = 0; i < 100; i++) {
-            conn = HubConnectionManager.get(key);
-            if (conn && conn.isConnected()) break;
-            conn = null;
-            await new Promise(r => setTimeout(r, 200));
-          }
-          if (!conn) { done("error: TerminalConnection not ready"); return; }
-
           var file = document.getElementById("test-file-input").files[0];
           if (!file) { done("error: No file attached"); return; }
 
           var buffer = await file.arrayBuffer();
           var data = new Uint8Array(buffer);
-          await conn.sendFile(data, file.name);
+          await window._botsterTestConn.sendFile(data, file.name);
           done("ok:" + data.length);
         } catch(e) {
           done("error: " + e.message + " | stack: " + (e.stack || "none"));
@@ -191,6 +164,32 @@ class FileInputTest < ApplicationSystemTestCase
       "[data-connection-status-target='connectionSection'][data-state='relay']",
       wait: 30
     )
+  end
+
+  # Polls for TerminalConnection readiness at the Ruby level, then stashes the
+  # connection on window._botsterTestConn for subsequent sendFile calls.
+  # This avoids a long JS polling loop inside execute_async_script which can
+  # exceed Selenium's script timeout on slow CI runners.
+  def wait_for_terminal_connection(hub_id, session_uuid)
+    key = "terminal:#{hub_id}:#{session_uuid}"
+    assert wait_until?(timeout: 20, poll: 0.5) {
+      status = page.driver.browser.execute_async_script(<<~JS, key)
+        var done = arguments[arguments.length - 1];
+        (async function() {
+          try {
+            var { HubConnectionManager } = await import("connections/hub_connection_manager");
+            var conn = HubConnectionManager.get(arguments[0]);
+            if (conn && conn.isConnected()) {
+              window._botsterTestConn = conn;
+              done("connected");
+            } else {
+              done("waiting");
+            }
+          } catch(e) { done("error: " + e.message); }
+        })();
+      JS
+      status == "connected"
+    }, "TerminalConnection for #{key} did not become ready within 20s"
   end
 
   def create_agent_via_ui
