@@ -120,7 +120,7 @@ fn test_scroll_then_render() {
             let block = Block::default().borders(Borders::ALL).title("Scrolled");
             let mut p = parser.lock().unwrap();
             let rs = make_render_state(&mut p);
-            let widget = TerminalWidget::new(&rs).block(block).hide_cursor();
+            let widget = TerminalWidget::new(&rs).block(block);
             f.render_widget(widget, f.area());
         })
         .unwrap();
@@ -145,7 +145,7 @@ fn test_extreme_scrollback_render() {
             let block = Block::default().borders(Borders::ALL).title("Top");
             let mut p = parser.lock().unwrap();
             let rs = make_render_state(&mut p);
-            let widget = TerminalWidget::new(&rs).block(block).hide_cursor();
+            let widget = TerminalWidget::new(&rs).block(block);
             f.render_widget(widget, f.area());
         })
         .unwrap();
