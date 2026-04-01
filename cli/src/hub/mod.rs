@@ -452,8 +452,7 @@ pub struct Hub {
     /// Tracks which peers currently have a terminal forwarder attached for a
     /// given session so disconnect/unsubscribe can promote another client or
     /// fall back to the boot profile deterministically.
-    terminal_session_peers:
-        std::collections::HashMap<String, std::collections::HashSet<String>>,
+    terminal_session_peers: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Reverse lookup for terminal forwarder ownership.
     ///
     /// Keyed by forwarder ID (`peer:session`, `tui:session`) so forwarder

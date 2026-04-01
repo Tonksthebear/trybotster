@@ -689,9 +689,13 @@ fn run_session(
     if child_pid > 0 {
         let pgid = child_pid as i32;
         log::info!("[session] sending SIGTERM to process group {pgid}");
-        unsafe { libc::killpg(pgid, libc::SIGTERM); }
+        unsafe {
+            libc::killpg(pgid, libc::SIGTERM);
+        }
         thread::sleep(Duration::from_millis(500));
-        unsafe { libc::killpg(pgid, libc::SIGKILL); }
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
         log::info!("[session] sent SIGKILL to process group {pgid}");
     }
 
@@ -826,24 +830,22 @@ fn handle_hub_frame(
             }
         }
 
-        FRAME_SET_COLOR_PROFILE => {
-            match frame.json::<TerminalColorProfile>() {
-                Ok(profile) => {
-                    if let Ok(mut parser) = parser.lock() {
-                        let bg = profile.colors.get(&257usize).copied();
-                        log::debug!(
-                            "[PTY-PROFILE] session applying color profile colors={} bg={:?}",
-                            profile.colors.len(),
-                            bg
-                        );
-                        parser.apply_color_cache_map(&profile.colors);
-                    }
-                }
-                Err(error) => {
-                    log::warn!("[session] invalid color profile payload: {error:#}");
+        FRAME_SET_COLOR_PROFILE => match frame.json::<TerminalColorProfile>() {
+            Ok(profile) => {
+                if let Ok(mut parser) = parser.lock() {
+                    let bg = profile.colors.get(&257usize).copied();
+                    log::debug!(
+                        "[PTY-PROFILE] session applying color profile colors={} bg={:?}",
+                        profile.colors.len(),
+                        bg
+                    );
+                    parser.apply_color_cache_map(&profile.colors);
                 }
             }
-        }
+            Err(error) => {
+                log::warn!("[session] invalid color profile payload: {error:#}");
+            }
+        },
 
         FRAME_ARM_TEE => {
             if let Ok(config) = frame.json::<serde_json::Value>() {
