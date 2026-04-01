@@ -191,8 +191,11 @@ if device_root then
     load_plugins_from_resolved(unified)
 end
 
--- Load repo-level plugins from each spawn target
+-- Load repo-level plugins from each spawn target.
+-- Set _loading_plugin_repo_root so hub.detect_repo() can resolve the repo
+-- from the target path (the hub's CWD is $HOME, not a repo directory).
 for repo_root, _ in pairs(target_repo_roots) do
+    _G._loading_plugin_repo_root = repo_root
     local unified = ConfigResolver.resolve_all({
         device_root = nil,
         repo_root = repo_root,
@@ -200,6 +203,7 @@ for repo_root, _ in pairs(target_repo_roots) do
     })
     load_plugins_from_resolved(unified)
 end
+_G._loading_plugin_repo_root = nil
 
 if not next(loaded_plugin_names) then
     log.debug("No plugins found")

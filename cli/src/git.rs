@@ -819,6 +819,25 @@ fn git_remote_url(path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Detects the repo name ("owner/name") for a given directory path.
+///
+/// Finds the git root via `git rev-parse --show-toplevel`, then extracts the
+/// repo name from the origin remote URL (or falls back to directory name).
+pub fn repo_name_for_path(path: &Path) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git rev-parse")?;
+
+    if !output.status.success() {
+        anyhow::bail!("Not in a git repository: {}", path.display());
+    }
+
+    let repo_root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    repo_name_for_root(&repo_root)
+}
+
 fn repo_name_for_root(repo_path: &Path) -> Result<String> {
     if let Ok(url) = git_remote_url(repo_path) {
         let trimmed = url.trim_end_matches(".git");

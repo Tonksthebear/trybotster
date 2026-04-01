@@ -458,16 +458,40 @@ pub(crate) fn register(
     hub.set("server_id", server_id_fn)
         .map_err(|e| anyhow!("Failed to set hub.server_id: {e}"))?;
 
-    // hub.detect_repo() - Detects repo name from BOTSTER_REPO env var or git remote.
+    // hub.detect_repo([path]) - Detects repo name from BOTSTER_REPO env var or git remote.
+    //
+    // Optional `path` argument specifies the directory to detect from (instead of CWD).
+    // When called without arguments during plugin loading, falls back to
+    // _G._loading_plugin_repo_root (set by hub/init.lua when loading spawn-target plugins).
     //
     // Returns the repo name in "owner/name" format, or nil if detection fails.
     let detect_repo_fn = lua
-        .create_function(move |_, ()| {
+        .create_function(move |lua, path: Option<String>| {
             // Check env var first (explicit override)
             if let Ok(repo) = std::env::var("BOTSTER_REPO") {
                 return Ok(Some(repo));
             }
-            // Fall back to git remote detection
+
+            // Determine the directory to detect from:
+            // 1. Explicit path argument
+            // 2. _G._loading_plugin_repo_root (set during spawn-target plugin loading)
+            // 3. CWD (original behavior)
+            let detect_path = path.or_else(|| {
+                lua.globals()
+                    .get::<Option<String>>("_loading_plugin_repo_root")
+                    .ok()
+                    .flatten()
+            });
+
+            if let Some(p) = detect_path {
+                let repo_path = std::path::PathBuf::from(&p);
+                match crate::git::repo_name_for_path(&repo_path) {
+                    Ok(name) => return Ok(Some(name)),
+                    Err(_) => return Ok(None),
+                }
+            }
+
+            // Fall back to git remote detection from CWD
             match crate::git::WorktreeManager::detect_current_repo() {
                 Ok((_path, name)) => Ok(Some(name)),
                 Err(_) => Ok(None),
