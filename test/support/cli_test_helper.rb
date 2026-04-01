@@ -95,9 +95,16 @@ module CliTestHelper
       @hub_token&.destroy
     end
 
-    # Wait for CLI to be ready (connected to relay)
+    # Wait for CLI to be ready (connected to relay).
+    # Aborts early if the process exits before becoming ready.
     def wait_for_ready(timeout: 15)
-      wait_until?(timeout: timeout, poll: 0.2) { ready? }
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      loop do
+        return true if ready?
+        return false if !running? # process died — no point waiting
+        return false if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        sleep 0.2
+      end
     end
 
     def ready?
@@ -309,20 +316,27 @@ module CliTestHelper
       started_at: started_at
     )
 
-    # Start log reader thread
+    # Start log reader thread.
+    # Keep reading while the process is alive OR there is unread data in the
+    # pipes.  A fast exit (crash / bail) may leave bytes in the pipe buffer
+    # that we need for diagnostics.
     log_thread = Thread.new do
-      combined = IO.select([ stdout_r, stderr_r ])
-      while cli.running?
+      pipes_open = true
+      while cli.running? || pipes_open
         ready = IO.select([ stdout_r, stderr_r ], nil, nil, 0.1)
         next unless ready
 
+        pipes_open = false # assume closed; reset if any read succeeds
         ready[0].each do |io|
           begin
-            line = io.read_nonblock(4096)
-            cli.add_output(line)
-            Rails.logger.debug "[CLI] #{line}" if options[:verbose]
-          rescue IO::WaitReadable, EOFError
-            # Expected
+            data = io.read_nonblock(4096)
+            cli.add_output(data)
+            Rails.logger.debug "[CLI] #{data}" if options[:verbose]
+            pipes_open = true
+          rescue IO::WaitReadable
+            pipes_open = true # still open, just no data right now
+          rescue EOFError
+            # This pipe is closed — don't set pipes_open
           end
         end
       end
@@ -335,8 +349,24 @@ module CliTestHelper
     unless cli.wait_for_ready(timeout: timeout)
       output = cli.recent_output
       log_output = cli.log_contents
+
+      # Check if process died early — include exit status for diagnostics
+      exit_info = ""
+      unless cli.running?
+        begin
+          _pid, status = Process.waitpid2(pid, Process::WNOHANG)
+          if status
+            exit_info = "\nProcess exited: #{status.inspect} (exitstatus=#{status.exitstatus}, signal=#{status.termsig})"
+          else
+            exit_info = "\nProcess not running but no status available"
+          end
+        rescue Errno::ECHILD
+          exit_info = "\nProcess already reaped (ECHILD)"
+        end
+      end
+
       cli.stop
-      raise "CLI failed to start within #{timeout}s.\nRecent stdout:\n#{output}\n\nRecent logs:\n#{log_output}"
+      raise "CLI failed to start within #{timeout}s.#{exit_info}\nRecent stdout:\n#{output}\n\nRecent logs:\n#{log_output}"
     end
 
     Rails.logger.info "[CliTestHelper] CLI ready, connection URL available"

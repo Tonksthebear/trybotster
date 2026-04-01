@@ -156,14 +156,13 @@ class FileInputTest < ApplicationSystemTestCase
     assert_selector "[data-pairing-target='ready']", wait: 15
     find("[data-action='pairing#pair']").click
 
-    # Wait for redirect to hub page after successful pairing
+    assert_selector "[data-pairing-target='success']:not(.hidden)", wait: 15
+    visit hub_path(@hub)
     assert_selector "[data-connection-status-target='connectionSection']", wait: 15
 
-    assert_selector(
-      "[data-connection-status-target='connectionSection'][data-state='direct'], " \
-      "[data-connection-status-target='connectionSection'][data-state='relay']",
-      wait: 30
-    )
+    # This test later acquires TerminalConnection directly and waits for it to
+    # be usable. Avoid coupling setup to the status badge reaching direct/relay,
+    # which is a separate UI signal and has been flaky in headless Chrome.
   end
 
   # Acquires a TerminalConnection directly via HubConnectionManager, bypassing
@@ -204,20 +203,21 @@ class FileInputTest < ApplicationSystemTestCase
   end
 
   def create_agent_via_ui
-    find("#new-agent-modal", visible: :all)
-    page.execute_script("document.getElementById('new-agent-modal').showModal()")
+    first("[commandfor='new-session-chooser-modal']:not([disabled])", wait: 15).click
+    assert_selector "dialog#new-session-chooser-modal[open]", wait: 10
 
-    target_select = find("[data-new-agent-form-target='targetSelect']", wait: 10)
-
-    # Spawn targets are loaded asynchronously from the CLI via WebRTC.
-    # Wait for at least one option with a non-empty value to appear.
-    selectable_option = nil
+    selectable_option_text = nil
     assert wait_until?(timeout: 15, poll: 0.3) {
-      selectable_option = target_select.all("option").find { |option| option.value.present? }
-      selectable_option.present?
+      target_select = find("[data-new-session-chooser-target='targetSelect']", wait: 2)
+      selectable_option = target_select.all("option").find { |option| option.value.present? rescue false }
+      selectable_option_text = selectable_option&.text
+      selectable_option_text.present?
     }, "Expected at least one admitted spawn target option"
 
-    target_select.select(selectable_option.text)
+    find("[data-new-session-chooser-target='targetSelect']", wait: 5).select(selectable_option_text)
+    find("[data-new-session-chooser-target='agentButton']", wait: 10).click
+
+    assert_selector "dialog#new-agent-modal[open]", wait: 10
     assert_no_selector "[data-new-agent-form-target='worktreeOptions'].hidden", visible: :all, wait: 10
 
     find("[data-action='new-agent-form#selectMainBranch']", wait: 10).click
