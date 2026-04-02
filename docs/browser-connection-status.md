@@ -31,10 +31,10 @@ should retry automatically.
 
 ## Implementation Notes
 
-- [connection_status_controller.js](/Users/exampleuser/Rails/trybotster/app/javascript/controllers/connection_status_controller.js) renders the badges.
-- [hub_signaling_client.js](/Users/exampleuser/Rails/trybotster/app/javascript/transport/hub_signaling_client.js) is the source of browser socket truth.
-- [hub_route.js](/Users/exampleuser/Rails/trybotster/app/javascript/connections/hub_route.js) applies the WebRTC attempt gate.
-- [webrtc_connection_test.rb](/Users/exampleuser/Rails/trybotster/test/system/webrtc_connection_test.rb) proves the gate and SharedWorker bootstrap end to end.
+- [connection_status_controller.js](../app/javascript/controllers/connection_status_controller.js) renders the badges.
+- [hub_signaling_client.js](../app/javascript/transport/hub_signaling_client.js) is the source of browser socket truth.
+- [hub_route.js](../app/javascript/connections/hub_route.js) applies the WebRTC attempt gate.
+- [webrtc_connection_test.rb](../test/system/webrtc_connection_test.rb) proves the gate and SharedWorker bootstrap end to end.
 
 ## WAN Timing
 

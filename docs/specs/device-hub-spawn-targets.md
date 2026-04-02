@@ -56,7 +56,7 @@ Stored target fields:
 {
   "id": "tgt_01jabcxyz",
   "name": "trybotster",
-  "path": "/Users/exampleuser/Rails/trybotster",
+  "path": "/path/to/trybotster",
   "enabled": true,
   "created_at": "2026-03-20T20:00:00Z",
   "updated_at": "2026-03-20T20:00:00Z"
@@ -80,9 +80,9 @@ Derived fields:
 
 ```json
 {
-  "path": "/Users/exampleuser/Rails/trybotster",
+  "path": "/path/to/trybotster",
   "is_git_repo": true,
-  "repo_root": "/Users/exampleuser/Rails/trybotster",
+  "repo_root": "/path/to/trybotster",
   "repo_name": "wiedymi/restty",
   "current_branch": "main",
   "default_branch": "main",
@@ -187,7 +187,7 @@ Workspaces and sessions must carry target identity explicitly so reconnect, brow
   "id": "ws_01jabcxyz",
   "name": "Fix auth bug",
   "target_id": "tgt_01jabcxyz",
-  "target_path": "/Users/exampleuser/Rails/trybotster",
+  "target_path": "/path/to/trybotster",
   "target_repo": "wiedymi/restty",
   "status": "active",
   "created_at": "2026-03-20T20:00:00Z",
@@ -203,10 +203,10 @@ Workspaces and sessions must carry target identity explicitly so reconnect, brow
   "uuid": "sess_01jabcxyz",
   "workspace_id": "ws_01jabcxyz",
   "target_id": "tgt_01jabcxyz",
-  "target_path": "/Users/exampleuser/Rails/trybotster",
+  "target_path": "/path/to/trybotster",
   "repo": "wiedymi/restty",
   "branch": "botster-issue-42",
-  "worktree_path": "/Users/exampleuser/botster-sessions/restty-botster-issue-42",
+  "worktree_path": "/path/to/botster-sessions/restty-botster-issue-42",
   "status": "active",
   "created_at": "2026-03-20T20:00:00Z",
   "updated_at": "2026-03-20T20:00:00Z"
@@ -406,7 +406,7 @@ Spawn targets declare which plugins are available for sessions in that target:
 ```json
 {
   "id": "tgt_01jabcxyz",
-  "path": "/Users/exampleuser/Rails/trybotster",
+  "path": "/path/to/trybotster",
   "plugins": ["github", "orchestrator", "messaging"]
 }
 ```

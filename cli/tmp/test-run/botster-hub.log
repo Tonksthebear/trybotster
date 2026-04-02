@@ -21,7 +21,7 @@
 [2026-01-11T22:48:30Z DEBUG botster_hub::relay::signal] Using PreKey 1 for bundle (100 remaining)
 [2026-01-11T22:48:30Z INFO  botster_hub::hub::registration] Signal Protocol ready: identity=BQm4g8Rv...
 [2026-01-11T22:48:30Z INFO  botster_hub::relay::connection] Connecting to Action Cable: wss://trybotster.com/cable
-[2026-01-11T22:48:30Z DEBUG botster_hub::relay::persistence] Wrote connection URL to "/Users/exampleuser/Rails/trybotster/cli/tmp/test-run/hubs/test-123/connection_url.txt"
+[2026-01-11T22:48:30Z DEBUG botster_hub::relay::persistence] Wrote connection URL to "/path/to/trybotster/cli/tmp/test-run/hubs/test-123/connection_url.txt"
 [2026-01-11T22:48:30Z INFO  botster_hub::hub::registration] Connection URL available for external access
 [2026-01-11T22:48:30Z ERROR botster_hub::tunnel] [Tunnel] WebSocket connection failed: HTTP error: 404 Not Found
 [2026-01-11T22:48:30Z WARN  botster_hub::hub::registration] Tunnel connection error: HTTP error: 404 Not Found, reconnecting in 5s...

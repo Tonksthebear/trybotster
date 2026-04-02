@@ -24,7 +24,6 @@ export class WebRtcPtyTransport {
   #terminalConn = null;
   #callbacks = null;
   #unsubscribers = [];
-  #decoder = new TextDecoder();
   #wasConnected = false;
   #awaitingReconnectSnapshot = false;
   #onReconnect = null;
@@ -83,7 +82,6 @@ export class WebRtcPtyTransport {
       this.#pendingResize = null;
     }
     this.#awaitingReconnectSnapshot = false;
-    this.#decoder = new TextDecoder();
     this.#unsubscribers.forEach((unsub) => unsub());
     this.#unsubscribers = [];
     this.#callbacks = null;
@@ -190,10 +188,7 @@ export class WebRtcPtyTransport {
 
     this.#unsubscribers.push(
       this.#terminalConn.onOutput((data) => {
-        const text = data instanceof Uint8Array
-          ? this.#decoder.decode(data, { stream: true })
-          : data;
-        this.#callbacks?.onData?.(text);
+        this.#callbacks?.onData?.(data);
       }),
     );
 

@@ -43,6 +43,14 @@
                      text-zinc-500 border-transparent hover:text-zinc-300">
         Templates
       </button>
+      <button type="button"
+              data-tab="hub"
+              data-action="click->hub-settings#switchTab"
+              class="px-4 py-2 text-sm font-medium transition-colors border-b-2
+                     data-[active]:text-zinc-100 data-[active]:border-primary-500
+                     text-zinc-500 border-transparent hover:text-zinc-300">
+        Hub
+      </button>
     </div>
   </div>
 
@@ -359,30 +367,6 @@
         </div>
       </div>
 
-      <%# Hub Controls — restart %>
-      <div class="max-w-4xl mx-auto px-4 pb-6 lg:pb-8">
-        <div class="border border-zinc-800 rounded-lg">
-          <div class="px-4 py-3 border-b border-zinc-800">
-            <h2 class="text-sm font-medium text-zinc-400">Hub Controls</h2>
-          </div>
-          <div class="px-4 py-4 flex items-center justify-between gap-4">
-            <div>
-              <p class="text-sm text-zinc-300 font-medium">Restart Hub</p>
-              <p class="text-xs text-zinc-500 mt-0.5">
-                Gracefully restarts the hub process. Running agents are preserved
-                and reconnect automatically within ~120 s.
-              </p>
-            </div>
-            <button type="button"
-                    data-action="hub-settings#restartHub"
-                    class="shrink-0 px-4 py-2 text-sm font-medium text-amber-400 hover:text-amber-300
-                           bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30
-                           rounded transition-colors">
-              Restart
-            </button>
-          </div>
-        </div>
-      </div>
     </div>
 
     <%# Templates Tab %>
@@ -515,5 +499,183 @@
         </div>
       </div>
     </div>
+
+    <%# Hub Tab %>
+    <div data-hub-settings-target="tabPanel" data-tab-panel="hub" class="hidden">
+      <div class="max-w-3xl mx-auto px-4 py-6 lg:py-8 space-y-6">
+
+        <%# Hub Identity %>
+        <div class="border border-zinc-800 rounded-lg">
+          <div class="px-4 py-3 border-b border-zinc-800">
+            <h2 class="text-sm font-medium text-zinc-400">Hub Identity</h2>
+          </div>
+          <div class="px-4 py-4">
+            <%= form_with model: Current.hub, url: hub_settings_path(Current.hub), method: :patch, class: "space-y-4" do |f| %>
+              <div>
+                <label for="hub_name" class="block text-xs text-zinc-500 mb-1.5">Name</label>
+                <%= f.text_field :name,
+                      value: Current.hub.read_attribute(:name),
+                      placeholder: Current.hub.identifier,
+                      class: "w-full px-3 py-2 bg-zinc-950 border border-zinc-700 rounded-lg text-sm text-zinc-200 font-mono placeholder-zinc-600 focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/30 focus:outline-none" %>
+                <p class="text-xs text-zinc-600 mt-1.5">
+                  Identifier: <span class="font-mono"><%= Current.hub.identifier %></span>
+                </p>
+              </div>
+              <div class="flex justify-end">
+                <%= f.submit "Save",
+                      class: "px-4 py-2 text-sm font-medium text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 rounded-lg transition-colors cursor-pointer" %>
+              </div>
+            <% end %>
+          </div>
+        </div>
+
+        <%# Spawn Targets %>
+        <div class="border border-zinc-800 rounded-lg"
+             data-controller="spawn-target-browser"
+             data-spawn-target-browser-hub-id-value="<%= Current.hub.id %>"
+             data-spawn-target-browser-home-path-value="<%= Dir.home %>">
+          <div class="px-4 py-3 border-b border-zinc-800">
+            <h2 class="text-sm font-medium text-zinc-400">Spawn Targets</h2>
+            <p class="text-xs text-zinc-600 mt-1">
+              Directories where this hub can spawn sessions. Managed on the hub device.
+            </p>
+          </div>
+          <div class="px-4 py-4 space-y-4">
+
+            <%# Add target form %>
+            <div class="flex items-end gap-2">
+              <div class="flex-1 min-w-0">
+                <label class="block text-xs text-zinc-500 mb-1.5">Path</label>
+                <input type="text"
+                       data-spawn-target-browser-target="pathInput"
+                       data-action="input->spawn-target-browser#pathInputChanged focus->spawn-target-browser#refreshPathSuggestions"
+                       list="spawn-target-path-suggestions"
+                       placeholder="/path/to/project"
+                       autocomplete="off"
+                       class="w-full px-3 py-2 bg-zinc-950 border border-zinc-700 rounded-lg text-sm text-zinc-200 font-mono placeholder-zinc-600 focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/30 focus:outline-none">
+                <datalist id="spawn-target-path-suggestions"
+                          data-spawn-target-browser-target="pathSuggestions"></datalist>
+              </div>
+              <div class="w-40 shrink-0">
+                <label class="block text-xs text-zinc-500 mb-1.5">Name (optional)</label>
+                <input type="text"
+                       data-spawn-target-browser-target="nameInput"
+                       placeholder="my-project"
+                       autocomplete="off"
+                       class="w-full px-3 py-2 bg-zinc-950 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-600 focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/30 focus:outline-none">
+              </div>
+              <button type="button"
+                      data-action="spawn-target-browser#admitTarget"
+                      class="shrink-0 px-4 py-2 text-sm font-medium text-primary-400 hover:text-primary-300 bg-primary-500/10 hover:bg-primary-500/20 border border-primary-500/30 rounded-lg transition-colors">
+                Add
+              </button>
+            </div>
+
+            <%# Feedback %>
+            <p data-spawn-target-browser-target="feedback"
+               class="text-xs text-zinc-500 empty:hidden"></p>
+
+            <%# Filter %>
+            <div>
+              <input type="text"
+                     data-spawn-target-browser-target="filterInput"
+                     data-action="input->spawn-target-browser#filter"
+                     placeholder="Filter targets..."
+                     autocomplete="off"
+                     class="w-full px-3 py-2 bg-zinc-950 border border-zinc-700 rounded-lg text-sm text-zinc-200 placeholder-zinc-600 focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/30 focus:outline-none">
+            </div>
+
+            <%# Target list %>
+            <div data-spawn-target-browser-target="list" class="space-y-2"></div>
+
+            <%# Empty state %>
+            <div data-spawn-target-browser-target="emptyState" class="hidden py-6 text-center">
+              <p class="text-sm text-zinc-500">No spawn targets admitted yet.</p>
+              <p class="text-xs text-zinc-600 mt-1">Add a directory path above to get started.</p>
+            </div>
+          </div>
+        </div>
+
+        <%# Hub Controls — restart %>
+        <div class="border border-zinc-800 rounded-lg">
+          <div class="px-4 py-3 border-b border-zinc-800">
+            <h2 class="text-sm font-medium text-zinc-400">Hub Controls</h2>
+          </div>
+          <div class="px-4 py-4 flex items-center justify-between gap-4">
+            <div>
+              <p class="text-sm text-zinc-300 font-medium">Restart Hub</p>
+              <p class="text-xs text-zinc-500 mt-0.5">
+                Gracefully restarts the hub process. Running agents are preserved
+                and reconnect automatically within ~120 s.
+              </p>
+            </div>
+            <button type="button"
+                    data-action="hub-settings#restartHub"
+                    class="shrink-0 px-4 py-2 text-sm font-medium text-amber-400 hover:text-amber-300
+                           bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30
+                           rounded-lg transition-colors">
+              Restart
+            </button>
+          </div>
+        </div>
+
+        <%# Danger Zone — delete hub %>
+        <div class="border border-red-500/30 rounded-lg">
+          <div class="px-4 py-3 border-b border-red-500/20">
+            <h2 class="text-sm font-medium text-red-400">Danger Zone</h2>
+          </div>
+          <div class="px-4 py-4 flex items-center justify-between gap-4">
+            <div>
+              <p class="text-sm text-zinc-300 font-medium">Delete Hub</p>
+              <p class="text-xs text-zinc-500 mt-0.5">
+                Permanently removes this hub and all associated data. This cannot be undone.
+              </p>
+            </div>
+            <button type="button"
+                    command="show-modal"
+                    commandfor="delete-hub-modal"
+                    class="shrink-0 px-4 py-2 text-sm font-medium text-red-400 hover:text-red-300
+                           bg-red-500/10 hover:bg-red-500/20 border border-red-500/30
+                           rounded-lg transition-colors">
+              Delete Hub
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <%# Delete Hub Confirmation Modal %>
+    <%= render Elements::DialogComponent.new(id: "delete-hub-modal") do %>
+      <div class="flex flex-col min-w-[320px]">
+        <div class="px-5 py-4 border-b border-zinc-800 bg-zinc-950/50">
+          <div class="flex items-center gap-3">
+            <span class="size-7 rounded-md bg-red-500/20 text-red-400 flex items-center justify-center border border-red-500/30">
+              <%= icon "trash", class: "size-4" %>
+            </span>
+            <h3 class="text-base font-semibold text-zinc-100">Delete Hub</h3>
+          </div>
+        </div>
+        <div class="p-5">
+          <p class="text-sm text-zinc-300">
+            Are you sure you want to delete <strong class="text-zinc-100"><%= Current.hub.name %></strong>?
+          </p>
+          <p class="text-xs text-zinc-500 mt-2">
+            This will remove the hub registration and all associated tokens. The CLI process on the device will not be affected.
+          </p>
+        </div>
+        <div class="px-5 py-4 border-t border-zinc-800 bg-zinc-950/30 flex gap-2 justify-end">
+          <button type="button"
+                  command="close"
+                  commandfor="delete-hub-modal"
+                  class="px-4 py-2 text-sm font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-800 hover:bg-zinc-700 rounded transition-colors">
+            Cancel
+          </button>
+          <%= button_to "Delete",
+                hub_settings_path(Current.hub),
+                method: :delete,
+                class: "px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-500 rounded transition-colors" %>
+        </div>
+      </div>
+    <% end %>
   </div>
 </div>

@@ -334,8 +334,8 @@ mod tests {
     #[test]
     fn test_scan_cwd_empty_hostname() {
         // Some shells emit file:///path (empty hostname)
-        let data = b"\x1b]7;file:///Users/jason/code\x07";
-        assert_eq!(scan_cwd(data), Some("/Users/jason/code".to_string()));
+        let data = b"\x1b]7;file:///tmp/code\x07";
+        assert_eq!(scan_cwd(data), Some("/tmp/code".to_string()));
     }
 
     #[test]

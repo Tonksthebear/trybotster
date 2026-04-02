@@ -41,7 +41,7 @@ module Integrations
         end
 
         test "bot_author? returns false for normal usernames" do
-          refute @handler.bot_author?("exampleuser")
+          refute @handler.bot_author?("human-reviewer")
           refute @handler.bot_author?("octocat")
         end
 

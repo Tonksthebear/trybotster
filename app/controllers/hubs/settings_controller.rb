@@ -13,11 +13,25 @@ module Hubs
       @agent_templates = @templates["agents"] || []
     end
 
+    def update
+      Current.hub.update(hub_params)
+      redirect_to hub_settings_path(Current.hub)
+    end
+
+    def destroy
+      Current.hub.destroy!
+      redirect_to hubs_path
+    end
+
     private
 
     def set_hub
       Current.hub = current_user.hubs.find_by(id: params[:hub_id])
       redirect_to hubs_path, alert: "Hub not found" unless Current.hub
+    end
+
+    def hub_params
+      params.require(:hub).permit(:name)
     end
 
     def config_metadata

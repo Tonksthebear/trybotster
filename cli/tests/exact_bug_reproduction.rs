@@ -1,5 +1,5 @@
 //! Reproduces the exact "main working tree" worktree deletion bug.
-/// "Failed to remove worktree: fatal: '/Users/exampleuser/Rails/trybotster' is a main working tree"
+/// "Failed to remove worktree: fatal: '/path/to/trybotster' is a main working tree"
 ///
 /// The issue is that delete_worktree_by_path is receiving the MAIN repo path instead of the worktree path
 use botster::WorktreeManager;
@@ -51,12 +51,12 @@ fn setup_test_repo(path: &std::path::Path) {
 #[test]
 fn test_exact_bug_main_repo_path_passed_to_delete() {
     // This reproduces the EXACT scenario where delete_worktree_by_path
-    // receives the MAIN repository path (like /Users/exampleuser/Rails/trybotster)
+    // receives the MAIN repository path (like /path/to/trybotster)
     // instead of the worktree path
 
     let temp_dir = TempDir::new().unwrap();
 
-    // Create main repository at a path like /Users/exampleuser/Rails/trybotster
+    // Create main repository at a path like /path/to/trybotster
     let main_repo = temp_dir.path().join("trybotster");
     std::fs::create_dir_all(&main_repo).unwrap();
     setup_test_repo(&main_repo);
