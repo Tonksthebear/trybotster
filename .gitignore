@@ -50,6 +50,9 @@ mise.toml
 # macOS files
 .DS_Store
 
+# Claude Code local settings (per-machine, not shared)
+.claude/settings.local.json
+
 # Agent worktree context (written at runtime, never committed)
 .botster/context.json
 
