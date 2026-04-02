@@ -840,6 +840,13 @@ impl Hub {
     /// URL is first requested (TUI QR display, external automation, etc.).
     /// This avoids blocking boot on bundle generation.
     pub fn setup(&mut self) {
+        // Install bundled xterm-ghostty terminfo (pre-compiled at build time).
+        // Runs before Lua primitives so config.terminfo() has a result.
+        if let Some(data_dir) = crate::env::data_dir() {
+            let ti = crate::terminfo::init(&data_dir);
+            log::info!("Terminfo: TERM={}, dir={:?}", ti.term, ti.terminfo_dir);
+        }
+
         let offline = crate::env::is_offline();
 
         if !crate::env::is_test_mode() && !offline {
