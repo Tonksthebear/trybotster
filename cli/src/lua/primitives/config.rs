@@ -271,6 +271,28 @@ pub fn register(lua: &Lua) -> Result<()> {
         .set("data_dir", data_dir_fn)
         .map_err(|e| anyhow!("Failed to set config.data_dir: {e}"))?;
 
+    // config.terminfo() -> { term = string, terminfo_dir = string|nil }
+    //
+    // Returns the terminal type and optional TERMINFO directory for spawned
+    // processes.  Uses bundled xterm-ghostty when compiled terminfo is
+    // available, otherwise falls back to xterm-256color.
+    let terminfo_fn = lua
+        .create_function(|lua, ()| {
+            let ti = crate::terminfo::config();
+            let table = lua.create_table()?;
+            table.set("term", ti.term)?;
+            match ti.terminfo_dir {
+                Some(dir) => table.set("terminfo_dir", dir)?,
+                None => table.set("terminfo_dir", mlua::Value::Nil)?,
+            }
+            Ok(table)
+        })
+        .map_err(|e| anyhow!("Failed to create config.terminfo function: {e}"))?;
+
+    config_table
+        .set("terminfo", terminfo_fn)
+        .map_err(|e| anyhow!("Failed to set config.terminfo: {e}"))?;
+
     // config.server_url() -> string
     //
     // Returns the Botster server URL from the BOTSTER_SERVER_URL env var,

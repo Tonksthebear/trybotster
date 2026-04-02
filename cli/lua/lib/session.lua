@@ -869,7 +869,17 @@ function Session:build_env(base_env)
         end
     end
 
-    env.TERM = env.TERM or os.getenv("TERM") or "xterm-256color"
+    -- Terminal identity: use bundled xterm-ghostty terminfo when available.
+    -- Botster IS the terminal — don't inherit TERM from the host.
+    local ti = _G.config and _G.config.terminfo and _G.config.terminfo() or { term = "xterm-256color" }
+    env.TERM = env.TERM or ti.term
+    if ti.terminfo_dir then
+        env.TERMINFO = env.TERMINFO or ti.terminfo_dir
+    end
+    -- Ensure UTF-8 locale for child processes.
+    if not env.LANG and not os.getenv("LANG") then
+        env.LANG = "en_US.UTF-8"
+    end
     env.BOTSTER_WORKTREE_PATH = self.worktree_path
     if self.target_id then env.BOTSTER_TARGET_ID = self.target_id end
     if self.target_path then env.BOTSTER_TARGET_PATH = self.target_path end
