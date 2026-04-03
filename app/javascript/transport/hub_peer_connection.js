@@ -67,6 +67,7 @@ class HubPeerConnection {
   #connectPromises = new Map()
   #peerConnectPromises = new Map()
   #bundleRefreshPromises = new Map()
+  #dataMessageChains = new Map()
   #eventListeners = new Map()
   #subscriptionListeners = new Map()
   #subscriptionIdCounter = 0
@@ -649,10 +650,20 @@ class HubPeerConnection {
     }
 
     dataChannel.onmessage = (event) => {
-      this.#channelProtocol.handleDataChannelMessage(hubId, event.data).catch((error) => {
+      this.#enqueueDataChannelMessage(hubId, event.data)
+    }
+  }
+
+  #enqueueDataChannelMessage(hubId, data) {
+    const previous = this.#dataMessageChains.get(hubId) || Promise.resolve()
+    const current = previous
+      .catch(() => {})
+      .then(() => this.#channelProtocol.handleDataChannelMessage(hubId, data))
+      .catch((error) => {
         console.error("[WebRTCTransport] Message handler error:", error)
       })
-    }
+
+    this.#dataMessageChains.set(hubId, current)
   }
 
   #emit(eventName, data) {
