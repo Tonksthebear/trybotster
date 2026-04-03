@@ -275,6 +275,7 @@ fn build_ghostty_vt() {
         "-Demit-lib-vt",
         "-Doptimize=ReleaseFast",
         "-Dsimd=false",
+        "-Dcpu=baseline",
     ];
 
     // Try mise first (local dev), fall back to bare zig (CI).
