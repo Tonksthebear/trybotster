@@ -240,6 +240,10 @@ jobs:
           rm -f cli/Cargo.toml.bak
           echo "Building version: ${VERSION}"
 
+      - name: Verify portable Ghostty CPU target on Linux
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: grep -Fq -- '-Dcpu=baseline' cli/build.rs
+
       - name: Build release binary
         run: |
           cd cli
