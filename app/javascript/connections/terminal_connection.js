@@ -38,6 +38,9 @@ export class TerminalConnection extends HubRoute {
   // Initial/recovery snapshot can arrive before transport wires snapshot listeners.
   // Keep the latest one and replay it atomically once onBinarySnapshot() attaches.
   #earlyBinarySnapshot = null;
+  // Tracks whether an authoritative snapshot was already replayed before
+  // onOutput() attached. If so, buffered live output is stale by definition.
+  #authoritativeSnapshotSeen = false;
   static #EARLY_OUTPUT_MAX_BYTES = 2 * 1024 * 1024;
   static #EARLY_OUTPUT_MAX_ITEMS = 512;
 
@@ -158,6 +161,7 @@ export class TerminalConnection extends HubRoute {
     this.#earlyOutputBuffer = [];
     this.#earlyOutputBytes = 0;
     this.#earlyBinarySnapshot = null;
+    this.#authoritativeSnapshotSeen = false;
     super.destroy();
   }
 
@@ -195,7 +199,15 @@ export class TerminalConnection extends HubRoute {
 
   onOutput(callback) {
     const unsubscribe = this.on("output", callback);
-    this.#flushEarlyOutput();
+    if (this.#earlyBinarySnapshot || this.#authoritativeSnapshotSeen) {
+      // Initial attach can race: live PTY bytes may arrive before listeners,
+      // then the authoritative binary snapshot arrives before onOutput wires.
+      // Replaying those buffered bytes after the snapshot duplicates screen
+      // state and can garble full-screen TUIs like the /resume picker.
+      this.#dropEarlyOutput();
+    } else {
+      this.#flushEarlyOutput();
+    }
     return unsubscribe;
   }
 
@@ -268,6 +280,15 @@ export class TerminalConnection extends HubRoute {
     }
   }
 
+  #dropEarlyOutput() {
+    if (this.#earlyOutputBuffer.length === 0) return;
+    console.debug(
+      `[TerminalConnection] Dropping ${this.#earlyOutputBuffer.length} buffered output chunks because an authoritative binary snapshot is pending`,
+    );
+    this.#earlyOutputBuffer = [];
+    this.#earlyOutputBytes = 0;
+  }
+
   #flushEarlyBinarySnapshot() {
     const data = this.#earlyBinarySnapshot;
     if (!data) return;
@@ -279,6 +300,7 @@ export class TerminalConnection extends HubRoute {
   }
 
   #emitSnapshot(data) {
+    this.#authoritativeSnapshotSeen = true;
     const listenerCount = this.subscribers.get("binarySnapshot")?.size ?? 0;
     console.debug(
       `[TerminalConnection] Emitting binary snapshot: ${data.byteLength} bytes listeners=${listenerCount}`,
