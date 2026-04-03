@@ -87,7 +87,6 @@ Worktree file copying and cleanup are handled via the **Workspace Include** plug
 | Path | Content |
 |------|---------|
 | `~/.config/botster/config.json` | Main CLI config (macOS: `~/Library/Application Support/botster/`) |
-| `~/.config/botster/hub_registry.json` | hub_id -> hub display name |
 | `~/.config/botster/device.json` | Device identity |
 | `~/.config/botster/credentials.json` | API token fallback (0600 perms, when no keyring) |
 | `~/.config/botster/hubs/{hub_id}/` | Per-hub encrypted state (OlmCrypto, WebRTC) |

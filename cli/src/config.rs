@@ -5,7 +5,6 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{fs, path::PathBuf};
@@ -28,10 +27,10 @@ pub struct Config {
     pub max_sessions: usize,
     /// Base directory for creating worktrees.
     pub worktree_base: PathBuf,
-    /// Deprecated: hub names are now per-directory in `HubRegistry`.
+    /// Deprecated: hub names now live exclusively in Rails.
     /// Kept for backwards-compatible deserialization of old config files.
-    #[serde(default, skip_serializing)]
-    pub hub_name: Option<String>,
+    #[serde(default, skip)]
+    _hub_name: Option<String>,
 }
 
 impl Default for Config {
@@ -60,7 +59,7 @@ impl Default for Config {
             agent_timeout: 3600,
             max_sessions: 20,
             worktree_base,
-            hub_name: None,
+            _hub_name: None,
         }
     }
 }
@@ -217,72 +216,6 @@ impl Config {
     }
 }
 
-/// Entry for a single hub in the registry.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct HubEntry {
-    /// User-chosen display name for this hub.
-    pub name: String,
-    /// Legacy canonical repo/directory path retained for debugging only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo_path: Option<String>,
-}
-
-/// Local hub name registry.
-///
-/// Maps local `hub_identifier` values to a `HubEntry` containing the
-/// user-chosen display name. Stored at `{config_dir}/hub_registry.json`.
-#[derive(Serialize, Deserialize, Default, Debug)]
-pub struct HubRegistry {
-    hubs: HashMap<String, HubEntry>,
-}
-
-impl HubRegistry {
-    /// Load the hub registry from disk, or return an empty registry.
-    pub fn load() -> Self {
-        Self::load_from_file().unwrap_or_default()
-    }
-
-    fn load_from_file() -> Result<Self> {
-        let path = Self::registry_path()?;
-        if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            Ok(serde_json::from_str(&content)?)
-        } else {
-            Ok(Self::default())
-        }
-    }
-
-    /// Persist the registry to disk.
-    pub fn save(&self) -> Result<()> {
-        let path = Self::registry_path()?;
-        fs::write(&path, serde_json::to_string_pretty(self)?)?;
-
-        #[cfg(unix)]
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-
-        Ok(())
-    }
-
-    /// Look up the hub name for a given identifier.
-    pub fn get_hub_name(&self, hub_id: &str) -> Option<&str> {
-        self.hubs.get(hub_id).map(|e| e.name.as_str())
-    }
-
-    /// Check if the registry has no entries.
-    pub fn is_empty(&self) -> bool {
-        self.hubs.is_empty()
-    }
-
-    /// Store a hub name for a given identifier.
-    pub fn set_hub_name(&mut self, hub_id: &str, name: String, repo_path: Option<String>) {
-        self.hubs
-            .insert(hub_id.to_string(), HubEntry { name, repo_path });
-    }
-
-    fn registry_path() -> Result<PathBuf> {
-        Ok(Config::config_dir()?.join("hub_registry.json"))
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -313,33 +246,6 @@ mod tests {
         let mut config = Config::default();
         config.token = "btstr_test123".to_string();
         assert_eq!(config.get_api_key(), "btstr_test123");
-    }
-
-    #[test]
-    fn test_hub_registry_get_set() {
-        let mut registry = HubRegistry::default();
-        assert!(registry.get_hub_name("abc123").is_none());
-
-        registry.set_hub_name(
-            "abc123",
-            "my-api".to_string(),
-            Some("/home/user/my-api".to_string()),
-        );
-        assert_eq!(registry.get_hub_name("abc123"), Some("my-api"));
-
-        registry.set_hub_name("def456", "frontend".to_string(), None);
-        assert_eq!(registry.get_hub_name("def456"), Some("frontend"));
-        assert_eq!(registry.get_hub_name("abc123"), Some("my-api"));
-    }
-
-    #[test]
-    fn test_hub_registry_serialization() {
-        let mut registry = HubRegistry::default();
-        registry.set_hub_name("abc", "test-hub".to_string(), Some("/tmp/test".to_string()));
-
-        let json = serde_json::to_string(&registry).unwrap();
-        let loaded: HubRegistry = serde_json::from_str(&json).unwrap();
-        assert_eq!(loaded.get_hub_name("abc"), Some("test-hub"));
     }
 
     #[test]

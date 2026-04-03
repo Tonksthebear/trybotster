@@ -48,33 +48,20 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_equal users(:primary_user), hub.user
   end
 
-  test "POST /hubs sets hub name when provided" do
+  test "POST /hubs ignores name param from CLI registration" do
     identifier = "named-hub-#{SecureRandom.hex(8)}"
 
     post hubs_url,
-      params: { identifier: identifier, name: "My Cool Hub" }.to_json,
+      params: { identifier: identifier, name: "My Cool Hub", repo: "owner/repo" }.to_json,
       headers: auth_headers_for(:primary_user)
 
     assert_response :created
 
     hub = Hub.find_by(identifier: identifier)
-    assert_equal "My Cool Hub", hub.name
+    assert_equal "owner/repo", hub.name, "name param should be ignored; repo used as default"
   end
 
-  test "POST /hubs name param overrides repo fallback" do
-    identifier = "override-hub-#{SecureRandom.hex(8)}"
-
-    post hubs_url,
-      params: { identifier: identifier, name: "Custom Name", repo: "owner/repo" }.to_json,
-      headers: auth_headers_for(:primary_user)
-
-    assert_response :created
-
-    hub = Hub.find_by(identifier: identifier)
-    assert_equal "Custom Name", hub.name
-  end
-
-  test "POST /hubs falls back to repo for name when name not provided" do
+  test "POST /hubs sets repo as name for new hubs" do
     identifier = "repo-hub-#{SecureRandom.hex(8)}"
 
     post hubs_url,

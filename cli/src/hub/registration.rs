@@ -43,7 +43,6 @@ pub fn register_hub_with_server(
     server_url: &str,
     api_key: &str,
     fingerprint: &str,
-    hub_name: Option<&str>,
 ) -> String {
     // Detect repo: env var > git detection (optional — not stored on server)
     let repo_name: Option<String> = std::env::var("BOTSTER_REPO").ok().or_else(|| {
@@ -65,10 +64,6 @@ pub fn register_hub_with_server(
     if let Some(ref repo) = repo_name {
         payload["repo"] = serde_json::Value::String(repo.clone());
     }
-    if let Some(name) = hub_name {
-        payload["name"] = serde_json::Value::String(name.to_string());
-    }
-
     log::info!("Registering hub with server to get Botster ID...");
     match reqwest::blocking::Client::builder()
         .user_agent(crate::constants::user_agent())

@@ -63,8 +63,8 @@ module Hubs
 
       # Find or create hub by fingerprint
       hub = auth.user.hubs.find_or_initialize_by(fingerprint: fingerprint)
+      hub.name = auth.device_name if hub.new_record?
       hub.update!(
-        name: auth.device_name,
         identifier: hub.identifier.presence || SecureRandom.hex(16),
         last_seen_at: Time.current,
         alive: false
