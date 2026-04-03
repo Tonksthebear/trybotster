@@ -5577,7 +5577,6 @@ impl Hub {
             &self.config.server_url,
             self.config.get_api_key(),
             &self.device.fingerprint,
-            self.config.hub_name.as_deref(),
         );
         // Store server-assigned ID (used for all server communication)
         self.botster_id = Some(botster_id.clone());
@@ -5840,15 +5839,14 @@ mod tests {
     use crate::relay::create_crypto_service;
 
     fn e2e_config() -> Config {
-        Config {
-            server_url: "http://localhost:3000".to_string(),
-            token: "btstr_test-key".to_string(),
-            poll_interval: 10,
-            agent_timeout: 300,
-            max_sessions: 10,
-            worktree_base: PathBuf::from("/tmp/test-worktrees"),
-            hub_name: None,
-        }
+        let mut config = Config::default();
+        config.server_url = "http://localhost:3000".to_string();
+        config.token = "btstr_test-key".to_string();
+        config.poll_interval = 10;
+        config.agent_timeout = 300;
+        config.max_sessions = 10;
+        config.worktree_base = PathBuf::from("/tmp/test-worktrees");
+        config
     }
 
     /// Create a Hub with TUI registered, crypto initialized, and all real

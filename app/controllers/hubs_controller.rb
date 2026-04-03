@@ -52,9 +52,7 @@ class HubsController < ApplicationController
     is_new = hub.new_record?
     hub.last_seen_at = Time.current
     hub.alive = true
-    if params[:name].present?
-      hub.name = params[:name]
-    elsif params[:repo].present? && hub.read_attribute(:name).blank?
+    if is_new && params[:repo].present?
       hub.name = params[:repo]
     end
 

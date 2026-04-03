@@ -1320,15 +1320,14 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        Config {
-            server_url: "http://localhost:3000".to_string(),
-            token: "btstr_test-key".to_string(),
-            poll_interval: 10,
-            agent_timeout: 300,
-            max_sessions: 10,
-            worktree_base: PathBuf::from("/tmp/test-worktrees"),
-            hub_name: None,
-        }
+        let mut config = Config::default();
+        config.server_url = "http://localhost:3000".to_string();
+        config.token = "btstr_test-key".to_string();
+        config.poll_interval = 10;
+        config.agent_timeout = 300;
+        config.max_sessions = 10;
+        config.worktree_base = PathBuf::from("/tmp/test-worktrees");
+        config
     }
 
     #[test]

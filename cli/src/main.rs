@@ -4,7 +4,7 @@
 //! for the core functionality.
 
 use anyhow::{Context, Result};
-use botster::{commands, tui, Config, Hub, HubRegistry};
+use botster::{commands, tui, Config, Hub};
 use mimalloc::MiMalloc;
 
 /// Global allocator configured per M-MIMALLOC-APPS guideline.
@@ -77,21 +77,6 @@ fn ensure_authenticated() -> Result<()> {
             device.name = device_name;
             if let Err(e) = device.save() {
                 log::warn!("Failed to save device name: {e}");
-            }
-        }
-
-        // Also prompt for the device hub name now (while we're still in the
-        // setup flow) so the user doesn't get asked again after returning
-        // from the browser.
-        if atty::is(atty::Stream::Stdin) && !botster::env::is_test_mode() {
-            let hub_id = botster::hub::local_device_hub_id()?;
-
-            let mut registry = HubRegistry::load();
-            if registry.get_hub_name(&hub_id).is_none() {
-                let name = auth::prompt_hub_name()?;
-                registry.set_hub_name(&hub_id, name.clone(), None);
-                registry.save()?;
-                config.hub_name = Some(name);
             }
         }
 
@@ -185,57 +170,6 @@ fn save_tokens(config: &mut Config, token_response: &botster::auth::TokenRespons
     Ok(())
 }
 
-/// Ensure the local device hub has a display name in the registry.
-///
-/// Computes the device-scoped local `hub_identifier`, checks the registry, and
-/// prompts the user if this is the first startup on the device. Sets
-/// `config.hub_name` to the looked-up or newly-chosen name so `Hub::new()` can
-/// pass it to the server.
-fn ensure_hub_named(config: &mut Config) -> Result<()> {
-    use botster::auth;
-
-    if botster::env::is_test_mode() {
-        return Ok(());
-    }
-
-    let hub_id = botster::hub::local_device_hub_id()?;
-
-    let mut registry = HubRegistry::load();
-
-    if let Some(name) = registry.get_hub_name(&hub_id) {
-        // Already registered — use cached name.
-        config.hub_name = Some(name.to_string());
-    } else if registry.is_empty() && config.hub_name.is_some() {
-        // Migrate from the old global hub_name to the device-hub registry.
-        let legacy_name = config.hub_name.as_ref().unwrap();
-        log::info!("Migrating legacy hub_name '{}' to registry", legacy_name);
-        registry.set_hub_name(&hub_id, legacy_name.clone(), None);
-        registry.save()?;
-    } else if atty::is(atty::Stream::Stdin) {
-        // First startup on this device, interactive — prompt for hub name.
-        let name = auth::prompt_hub_name()?;
-        registry.set_hub_name(&hub_id, name.clone(), None);
-        registry.save()?;
-        config.hub_name = Some(name);
-    } else {
-        // First startup on this device, non-interactive — auto-name.
-        let name = std::env::var("BOTSTER_REPO")
-            .ok()
-            .or_else(|| {
-                botster::device::Device::load_or_create()
-                    .ok()
-                    .map(|d| d.name)
-            })
-            .unwrap_or_else(|| "my-hub".to_string());
-        log::info!("Auto-naming hub: {name} (non-interactive)");
-        registry.set_hub_name(&hub_id, name.clone(), None);
-        registry.save()?;
-        config.hub_name = Some(name);
-    }
-
-    Ok(())
-}
-
 /// Runs the hub in headless mode (no TUI).
 ///
 /// This mode is useful for:
@@ -262,7 +196,7 @@ fn run_headless() -> Result<()> {
     flag::register(SIGHUP, Arc::clone(&SHUTDOWN_FLAG))?;
 
     // Create Hub with default terminal size (80x24 for headless)
-    let mut config = Config::load()?;
+    let config = Config::load()?;
 
     // Verify token is available after load - catches keyring save/load issues
     // Skip in test mode and offline mode since ensure_authenticated() skips auth
@@ -281,9 +215,6 @@ fn run_headless() -> Result<()> {
             &config.get_api_key()[config.get_api_key().len().saturating_sub(4)..]
         );
     }
-
-    // Ensure this directory has a hub name in the registry
-    ensure_hub_named(&mut config)?;
 
     let mut hub = Hub::new(config)?;
 
@@ -356,7 +287,7 @@ fn run_with_tui() -> Result<()> {
 
     // Create Hub BEFORE entering raw mode so errors are visible
     println!("Initializing hub...");
-    let mut config = Config::load()?;
+    let config = Config::load()?;
 
     // Verify token is available after load - catches keyring save/load issues
     // Skip in test mode and offline mode since ensure_authenticated() skips auth
@@ -375,9 +306,6 @@ fn run_with_tui() -> Result<()> {
             &config.get_api_key()[config.get_api_key().len().saturating_sub(4)..]
         );
     }
-
-    // Ensure this directory has a hub name in the registry
-    ensure_hub_named(&mut config)?;
 
     let mut hub = Hub::new(config)?;
 

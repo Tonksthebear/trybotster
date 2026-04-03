@@ -238,44 +238,6 @@ pub fn prompt_device_name() -> Result<String> {
     Ok(name)
 }
 
-/// Prompt the user to name the local device hub.
-///
-/// Uses repo/directory context only as a naming hint when available.
-/// Returns the chosen name.
-pub fn prompt_hub_name() -> Result<String> {
-    // Priority: BOTSTER_REPO env > git repo name > directory basename > "my-hub"
-    let default_name = std::env::var("BOTSTER_REPO")
-        .ok()
-        .or_else(|| {
-            crate::git::WorktreeManager::detect_current_repo()
-                .map(|(_, name)| name)
-                .ok()
-        })
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-        })
-        .unwrap_or_else(|| "my-hub".to_string());
-
-    println!();
-    print!("  Hub name [{}]: ", default_name);
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let input = input.trim();
-
-    let name = if input.is_empty() {
-        default_name
-    } else {
-        input.to_string()
-    };
-
-    println!();
-    Ok(name)
-}
-
 /// Process the result from the background polling thread.
 fn handle_poll_result(result: Result<TokenResponse, String>) -> Result<TokenResponse> {
     match result {

@@ -57,7 +57,7 @@ pub mod terminfo;
 
 // Re-export commonly used types
 pub use agent::Agent;
-pub use config::{Config, HubRegistry};
+pub use config::Config;
 pub use git::WorktreeManager;
 pub use relay::{AgentInfo, TerminalMessage, WorktreeInfo};
 pub use spawn_targets::{SpawnTarget, SpawnTargetInspection, SpawnTargetRegistry};
