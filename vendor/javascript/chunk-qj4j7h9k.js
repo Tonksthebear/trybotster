@@ -12853,6 +12853,14 @@ function observeOscPromptState(state2, seq) {
 }
 
 // src/input/output/index.ts
+var BYTE_TEXT_CHUNK = 32768;
+function mapBytesToControlText(bytes) {
+  let out = "";
+  for (let i = 0;i < bytes.length; i += BYTE_TEXT_CHUNK) {
+    out += String.fromCharCode(...bytes.subarray(i, i + BYTE_TEXT_CHUNK));
+  }
+  return out;
+}
 function normalizeCursorPosition(value) {
   if (!value)
     return null;
@@ -12881,7 +12889,7 @@ function resolveCursorSetParam(raw) {
     return 1;
   return Math.max(1, Math.floor(parsed));
 }
-function applyTextToCursorHint(cursor, text, cols) {
+function applyTextToCursorHint(cursor, text, cols, trackHighBytesAsPrintable) {
   for (const ch of text) {
     const code = ch.charCodeAt(0);
     if (code === 13) {
@@ -12902,6 +12910,8 @@ function applyTextToCursorHint(cursor, text, cols) {
       continue;
     }
     if (code < 32 || code === 127)
+      continue;
+    if (!trackHighBytesAsPrintable && code >= 128)
       continue;
     cursor.col += 1;
     if (cols > 0 && cursor.col > cols) {
@@ -13056,7 +13066,7 @@ class OutputFilter {
       onWindowOp: this.windowOpHandler
     });
   }
-  filter(output) {
+  filterInternal(output, trackHighBytesAsPrintable) {
     if (!output)
       return output;
     let data = this.remainder + output;
@@ -13071,7 +13081,7 @@ class OutputFilter {
       const ch = data[i];
       if (ch !== "\x1B") {
         result += ch;
-        applyTextToCursorHint(trackedCursor, ch, colsHint);
+        applyTextToCursorHint(trackedCursor, ch, colsHint, trackHighBytesAsPrintable);
         i += 1;
         continue;
       }
@@ -13146,6 +13156,14 @@ class OutputFilter {
     this.cursorHint = { ...trackedCursor };
     return result;
   }
+  filter(output) {
+    return this.filterInternal(output, true);
+  }
+  filterBytes(output) {
+    if (!output.length)
+      return;
+    this.filterInternal(mapBytesToControlText(output), false);
+  }
 }
 
 // src/input/index.ts
@@ -13177,6 +13195,7 @@ function createInputHandler(options = {}) {
     encodeBeforeInput,
     mapKeyForPty,
     filterOutput: (output) => filter.filter(output),
+    filterOutputBytes: (output) => filter.filterBytes(output),
     setReplySink: (fn) => {
       mouse.setReplySink(fn);
       filter.setReplySink(fn);
@@ -57766,6 +57785,7 @@ function createRuntimeDebugTools(options) {
 // src/runtime/create-runtime/input-hooks.ts
 function createRuntimeInputHooks(options) {
   const { beforeInputHook, beforeRenderOutputHook } = options;
+  const bytesDecoder = new TextDecoder("utf-8", { fatal: false });
   function runHook(hook, text2, source, errorLabel) {
     if (!hook)
       return text2;
@@ -57783,7 +57803,21 @@ function createRuntimeInputHooks(options) {
   }
   return {
     runBeforeInputHook: (text2, source) => runHook(beforeInputHook, text2, source, "[restty] beforeInput hook error:"),
-    runBeforeRenderOutputHook: (text2, source) => runHook(beforeRenderOutputHook, text2, source, "[restty] beforeRenderOutput hook error:")
+    runBeforeRenderOutputHook: (text2, source) => runHook(beforeRenderOutputHook, text2, source, "[restty] beforeRenderOutput hook error:"),
+    runBeforeRenderOutputBytesHook: (bytes, source) => {
+      if (!beforeRenderOutputHook)
+        return true;
+      try {
+        return beforeRenderOutputHook({
+          text: bytesDecoder.decode(bytes),
+          source,
+          bytes
+        }) !== null;
+      } catch (error) {
+        console.error("[restty] beforeRenderOutput hook error:", error);
+        return true;
+      }
+    }
   };
 }
 
@@ -57878,7 +57912,6 @@ function createPtyInputRuntime(options) {
   function queuePtyOutputBytes(data) {
     ptyOutputBuffer.queueBytes(data);
   }
-  const lossyDecoder = new TextDecoder("utf-8", { fatal: false });
   function disconnectPty2() {
     flushPtyOutputBuffer();
     cancelPtyOutputFlush();
@@ -57930,8 +57963,7 @@ function createPtyInputRuntime(options) {
           },
           onData: (data) => {
             if (data instanceof Uint8Array) {
-              const text2 = lossyDecoder.decode(data);
-              inputHandler.filterOutput(text2);
+              inputHandler.filterOutputBytes?.(data);
               updateMouseStatus();
               queuePtyOutputBytes(data);
             } else {
@@ -63882,6 +63914,7 @@ function createRuntimeAppApi(options) {
     shouldSuppressWasmLog,
     runBeforeInputHook,
     runBeforeRenderOutputHook,
+    runBeforeRenderOutputBytesHook,
     CURSOR_BLINK_MS,
     RESIZE_ACTIVE_MS,
     TARGET_RENDER_FPS,
@@ -64068,15 +64101,13 @@ function createRuntimeAppApi(options) {
     }
     writeState({ needsRender: true });
   }
-  const bytesDecoder = new TextDecoder("utf-8", { fatal: false });
   function sendInputBytes(data) {
     const shared = readState();
     if (!shared.wasmReady || !shared.wasm || !shared.wasmHandle)
       return;
     if (!data.length)
       return;
-    const hookText = runBeforeRenderOutputHook(bytesDecoder.decode(data), "pty");
-    if (!hookText)
+    if (!runBeforeRenderOutputBytesHook(data, "pty"))
       return;
     if (interaction.linkState.hoverId)
       interaction.updateLinkHover(null);
@@ -64519,7 +64550,7 @@ function createResttyApp(options) {
   const { canvas: canvasInput, imeInput: imeInputInput, elements, callbacks } = options;
   const beforeInputHook = options.beforeInput;
   const beforeRenderOutputHook = options.beforeRenderOutput;
-  const { runBeforeInputHook, runBeforeRenderOutputHook } = createRuntimeInputHooks({
+  const { runBeforeInputHook, runBeforeRenderOutputHook, runBeforeRenderOutputBytesHook } = createRuntimeInputHooks({
     beforeInputHook,
     beforeRenderOutputHook
   });
@@ -65517,6 +65548,7 @@ function createResttyApp(options) {
     shouldSuppressWasmLog,
     runBeforeInputHook,
     runBeforeRenderOutputHook,
+    runBeforeRenderOutputBytesHook,
     CURSOR_BLINK_MS,
     RESIZE_ACTIVE_MS,
     TARGET_RENDER_FPS,

@@ -7,8 +7,8 @@ import {
   getBuiltinThemeSource,
   isBuiltinThemeName,
   listBuiltinThemeNames,
-  parseGhosttyTheme,
-} from "chunk-x2k97mq2";
+  parseGhosttyTheme
+} from "chunk-qj4j7h9k";
 export {
   parseGhosttyTheme,
   listBuiltinThemeNames,
@@ -18,5 +18,5 @@ export {
   createRestty,
   ResttyPaneHandle,
   Restty,
-  RESTTY_PLUGIN_API_VERSION,
+  RESTTY_PLUGIN_API_VERSION
 };
