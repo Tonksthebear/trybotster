@@ -64176,12 +64176,6 @@ function createRuntimeAppApi(options) {
       shared.wasm.destroy(nextHandle);
       return false;
     }
-    const canvas = getCanvas();
-    shared.wasm.setPixelSize(nextHandle, canvas.width, canvas.height);
-    const liveCols = gridState.cols || 80;
-    const liveRows = gridState.rows || 24;
-    shared.wasm.resize(nextHandle, liveCols, liveRows);
-    shared.wasm.renderUpdate(nextHandle);
     try {
       shared.wasm.destroy(shared.wasmHandle);
     } catch {}
