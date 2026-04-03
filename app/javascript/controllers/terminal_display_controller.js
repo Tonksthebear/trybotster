@@ -181,6 +181,10 @@ export default class extends Controller {
         );
       }
       if (loaded) {
+        // Snapshot import swaps in a fresh WASM handle. Force Restty to apply
+        // the live canvas/grid geometry to that new handle immediately so we
+        // do not keep rendering an imported snapshot at stale dimensions.
+        this.#restty?.updateSize(true);
         this.#sendColorProfile();
       }
     };
