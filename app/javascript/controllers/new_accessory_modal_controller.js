@@ -56,9 +56,7 @@ export default class extends Controller {
         const config = hub.getAgentConfig(this.selectedTargetId);
         this.accessories = Array.isArray(config.accessories) ? config.accessories : [];
         this.#renderAccessoryList();
-        if (!this.hub.hasAgentConfig(this.selectedTargetId)) {
-          this.hub.ensureAgentConfig(this.selectedTargetId);
-        }
+        this.hub.ensureAgentConfig(this.selectedTargetId, { force: true }).catch(() => {});
       }
 
       this.unsubscribers.push(
@@ -162,9 +160,7 @@ export default class extends Controller {
         const config = this.hub.getAgentConfig(this.selectedTargetId);
         this.accessories = Array.isArray(config.accessories) ? config.accessories : [];
         this.#renderAccessoryList();
-        if (!this.hub.hasAgentConfig(this.selectedTargetId)) {
-          this.hub.ensureAgentConfig(this.selectedTargetId);
-        }
+        this.hub.ensureAgentConfig(this.selectedTargetId, { force: true }).catch(() => {});
       }
     }
 
@@ -351,9 +347,7 @@ export default class extends Controller {
     this.#updateSubmitState();
 
     if (!targetId || !this.hub) return;
-    if (!this.hub.hasAgentConfig(targetId)) {
-      this.hub.ensureAgentConfig(targetId);
-    }
+    this.hub.ensureAgentConfig(targetId, { force: true }).catch(() => {});
   }
 
   #updateFlowVisibility() {

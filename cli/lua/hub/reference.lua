@@ -95,6 +95,7 @@ M.primitives = {
             { sig = "config.data_dir()",   desc = "~/.botster directory path" },
             { sig = "config.server_url()", desc = "Botster server URL" },
             { sig = "config.env(key)",     desc = "Read environment variable" },
+            { sig = "config.find_available_port(start, finish, excluded?)", desc = "Find first bindable localhost port in range" },
         },
     },
     {

@@ -28,8 +28,73 @@ local Session = state.class("Session")
 -- Session registry keyed by session_uuid (persistent across reloads)
 local sessions = state.get("agent_registry", {})
 
--- Sequential port counter for forward_port sessions (persistent across reloads)
-local port_state = state.get("agent_port_state", { next_port = 8080 })
+-- Reserve forwarded ports from a high, non-common range and probe localhost
+-- availability before assigning them to accessories.
+local FORWARD_PORT_MIN = 46000
+local FORWARD_PORT_MAX = 61999
+local port_state = state.get("agent_port_state", {
+    next_port = FORWARD_PORT_MIN,
+    reserved = {},
+})
+
+local function normalize_port_state()
+    if type(port_state.reserved) ~= "table" then
+        port_state.reserved = {}
+    end
+    if type(port_state.next_port) ~= "number"
+        or port_state.next_port < FORWARD_PORT_MIN
+        or port_state.next_port > FORWARD_PORT_MAX then
+        port_state.next_port = FORWARD_PORT_MIN
+    end
+end
+
+local function collect_reserved_ports()
+    normalize_port_state()
+    local seen = {}
+    for port_key, reserved in pairs(port_state.reserved) do
+        local port = tonumber(port_key)
+        if reserved and port then
+            seen[port] = true
+        end
+    end
+    for _, session in pairs(sessions) do
+        local port = session and session._port or nil
+        if type(port) == "number" then
+            seen[port] = true
+        end
+    end
+    local ports = {}
+    for port, _ in pairs(seen) do
+        ports[#ports + 1] = port
+    end
+    table.sort(ports)
+    return ports
+end
+
+local function reserve_forward_port()
+    normalize_port_state()
+    local start = port_state.next_port
+    local excluded = collect_reserved_ports()
+    local port, err = config.find_available_port(start, FORWARD_PORT_MAX, excluded)
+    if not port and start > FORWARD_PORT_MIN then
+        port, err = config.find_available_port(FORWARD_PORT_MIN, start - 1, excluded)
+    end
+    if not port then
+        return nil, err or string.format(
+            "No available localhost port in preferred range %d-%d",
+            FORWARD_PORT_MIN, FORWARD_PORT_MAX)
+    end
+    port_state.next_port = (port < FORWARD_PORT_MAX) and (port + 1) or FORWARD_PORT_MIN
+    port_state.reserved[tostring(port)] = true
+    return port
+end
+
+local function release_forward_port(port)
+    normalize_port_state()
+    if type(port) == "number" then
+        port_state.reserved[tostring(port)] = nil
+    end
+end
 
 --- Update the hub manifest with currently active workspace IDs.
 -- Called whenever the session registry changes (create/close).
@@ -294,6 +359,7 @@ function Session._init(self, config)
 
     local spawn_config = {
         worktree_path = config.worktree_path,
+        cwd = config.worktree_path,
         command = session_config.command or "bash",
         env = session_env,
         detect_notifications = session_config.notifications or false,
@@ -313,11 +379,14 @@ function Session._init(self, config)
         end
     end
 
-    -- Allocate port for forward_port sessions
+    -- Allocate a high, currently bindable port for forwarded sessions.
     local port = nil
     if session_config.forward_port then
-        port = port_state.next_port
-        port_state.next_port = port + 1
+        local port_err
+        port, port_err = reserve_forward_port()
+        if not port then
+            error(string.format("Failed to allocate forwarded port: %s", tostring(port_err)))
+        end
         spawn_config.port = port
         session_env.PORT = tostring(port)
     end
@@ -340,11 +409,17 @@ function Session._init(self, config)
     }
     local spawn_result = hooks.call("before_pty_spawn", spawn_ctx)
     if spawn_result == nil then
+        if port then
+            release_forward_port(port)
+        end
         error(string.format("PTY spawn blocked by interceptor for %s", key))
     end
 
     local ok, handle = pcall(hub.spawn_session, spawn_config, session_uuid)
     if not ok or not handle then
+        if port then
+            release_forward_port(port)
+        end
         error(string.format(
             "Failed to spawn session process for %s: %s",
             key, tostring(handle)
@@ -786,6 +861,9 @@ function Session:close(delete_worktree)
         if not ok2 then
             log.warn(string.format("Session %s: error killing PTY: %s", key, tostring(err2)))
         end
+    end
+    if self._port then
+        release_forward_port(self._port)
     end
     self.session = nil
     self.status = "closed"

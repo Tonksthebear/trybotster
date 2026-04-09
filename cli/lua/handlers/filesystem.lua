@@ -40,11 +40,32 @@ local function resolve_scope_root(scope, command)
     return target.target_path, nil
 end
 
+local function repo_config_dirname()
+    local root = config.data_dir and config.data_dir() or nil
+    if not root then return ".botster" end
+    local trimmed = tostring(root):gsub("/+$", "")
+    return trimmed:match("([^/]+)$") or ".botster"
+end
+
+local function normalize_repo_config_path(relative)
+    local path = tostring(relative or "")
+    local dirname = repo_config_dirname()
+    if dirname == ".botster" then return path end
+    if path == ".botster" then return dirname end
+    if path:sub(1, 9) == ".botster/" then
+        return dirname .. path:sub(9)
+    end
+    return path
+end
+
 local function safe_path(relative, scope, command)
     local root
     local root_err
     root, root_err = resolve_scope_root(scope, command)
     if not root then return nil, root_err end
+    if scope ~= "device" then
+        relative = normalize_repo_config_path(relative)
+    end
     return fs.resolve_safe(root, relative)
 end
 
