@@ -73,9 +73,7 @@ export default class extends Controller {
         if (!this.hub.hasWorktrees(this.selectedTargetId)) {
           this.hub.ensureWorktrees(this.selectedTargetId);
         }
-        if (!this.hub.hasAgentConfig(this.selectedTargetId)) {
-          this.hub.ensureAgentConfig(this.selectedTargetId);
-        }
+        this.hub.ensureAgentConfig(this.selectedTargetId, { force: true }).catch(() => {});
       }
 
       this.unsubscribers.push(
@@ -224,6 +222,7 @@ export default class extends Controller {
   refresh() {
     if (this.selectedTargetId) {
       this.hub?.ensureWorktrees(this.selectedTargetId, { force: true });
+      this.hub?.ensureAgentConfig(this.selectedTargetId, { force: true }).catch(() => {});
     }
   }
 
@@ -306,9 +305,7 @@ export default class extends Controller {
     if (!this.hub.hasWorktrees(targetId)) {
       this.hub.ensureWorktrees(targetId);
     }
-    if (!this.hub.hasAgentConfig(targetId)) {
-      this.hub.ensureAgentConfig(targetId);
-    }
+    this.hub.ensureAgentConfig(targetId, { force: true }).catch(() => {});
   }
 
   #renderTargetSelect() {

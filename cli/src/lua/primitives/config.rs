@@ -38,6 +38,7 @@
 //! - Success: `value, nil`
 //! - Failure: `nil, error_message`
 
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -126,6 +127,21 @@ fn read_config_cached(cache: &ConfigCache) -> std::io::Result<serde_json::Value>
     Ok(config)
 }
 
+/// Returns true when `127.0.0.1:port` is currently bindable.
+fn port_is_available(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Find the first bindable TCP port in an inclusive range, skipping excluded values.
+fn find_available_port_in_range(start: u16, finish: u16, excluded: &[u16]) -> Option<u16> {
+    if start > finish {
+        return None;
+    }
+
+    let excluded: std::collections::HashSet<u16> = excluded.iter().copied().collect();
+    (start..=finish).find(|port| !excluded.contains(port) && port_is_available(*port))
+}
+
 /// Register the `config` table with configuration functions.
 ///
 /// Creates a global `config` table with methods:
@@ -135,6 +151,7 @@ fn read_config_cached(cache: &ConfigCache) -> std::io::Result<serde_json::Value>
 /// - `config.lua_path()` - Get the Lua scripts base path
 /// - `config.data_dir()` - Get the `~/.botster` path
 /// - `config.env(key)` - Read an environment variable
+/// - `config.find_available_port(start, finish, excluded?)` - Probe localhost ports
 ///
 /// # Errors
 ///
@@ -323,6 +340,32 @@ pub fn register(lua: &Lua) -> Result<()> {
         .set("env", env_fn)
         .map_err(|e| anyhow!("Failed to set config.env: {e}"))?;
 
+    // config.find_available_port(start, finish, excluded?) -> (port, nil) or (nil, error_string)
+    //
+    // Returns the first bindable localhost port in the inclusive range,
+    // skipping any values supplied by Lua.
+    let find_available_port_fn = lua
+        .create_function(
+            |_, (start, finish, excluded): (u16, u16, Option<Vec<u16>>)| {
+                let excluded = excluded.unwrap_or_default();
+                match find_available_port_in_range(start, finish, &excluded) {
+                    Some(port) => Ok((Some(port), None::<String>)),
+                    None => Ok((
+                        None::<u16>,
+                        Some(format!(
+                            "No available localhost port in range {}-{}",
+                            start, finish
+                        )),
+                    )),
+                }
+            },
+        )
+        .map_err(|e| anyhow!("Failed to create config.find_available_port function: {e}"))?;
+
+    config_table
+        .set("find_available_port", find_available_port_fn)
+        .map_err(|e| anyhow!("Failed to set config.find_available_port: {e}"))?;
+
     lua.globals()
         .set("config", config_table)
         .map_err(|e| anyhow!("Failed to register config table globally: {e}"))?;
@@ -353,6 +396,9 @@ mod tests {
             .get("data_dir")
             .expect("config.data_dir should exist");
         let _: Function = config_table.get("env").expect("config.env should exist");
+        let _: Function = config_table
+            .get("find_available_port")
+            .expect("config.find_available_port should exist");
     }
 
     #[test]
@@ -499,5 +545,35 @@ mod tests {
             let expected = format!(".{}", crate::env::APP_NAME);
             assert!(path.unwrap().to_string_lossy().contains(&expected));
         }
+    }
+
+    #[test]
+    fn test_find_available_port_skips_excluded_and_bound_ports() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
+        let occupied = listener.local_addr().expect("listener addr").port();
+
+        let found = find_available_port_in_range(occupied, occupied + 4, &[occupied])
+            .expect("should find a different port");
+
+        assert_ne!(found, occupied);
+    }
+
+    #[test]
+    fn test_find_available_port_lua_returns_value() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register config primitives");
+
+        let port: Option<u16> = lua
+            .load(
+                r#"
+                local port, err = config.find_available_port(46000, 46010, {})
+                assert(err == nil, err)
+                return port
+            "#,
+            )
+            .eval()
+            .expect("config.find_available_port should be callable");
+
+        assert!(port.is_some(), "expected a probed localhost port");
     }
 }

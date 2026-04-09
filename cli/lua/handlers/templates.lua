@@ -31,7 +31,9 @@ local function safe_path(relative, scope, command)
     if scope == "repo" then
         local target, target_err = resolve_repo_target(command)
         if not target then return nil, tostring(target_err) end
-        return fs.resolve_safe(target.target_path .. "/.botster", relative)
+        local data_dir = config.data_dir and config.data_dir() or nil
+        local dirname = data_dir and tostring(data_dir):gsub("/+$", ""):match("([^/]+)$") or ".botster"
+        return fs.resolve_safe(target.target_path .. "/" .. dirname, relative)
     else
         local root = config.data_dir and config.data_dir() or nil
         if not root then return nil, "No data_dir configured" end
@@ -168,8 +170,9 @@ commands.register("template:list", function(client, sub_id, command)
     end
 
     -- Repo root
-    if repo_root and fs.exists(repo_root .. "/.botster") then
-        scan_plugins(repo_root .. "/.botster", "repo", "")
+    local repo_config_dir = device_root and tostring(device_root):gsub("/+$", ""):match("([^/]+)$") or ".botster"
+    if repo_root and fs.exists(repo_root .. "/" .. repo_config_dir) then
+        scan_plugins(repo_root .. "/" .. repo_config_dir, "repo", "")
     end
 
     respond(client, sub_id, command.request_id, { ok = true, installed = installed })

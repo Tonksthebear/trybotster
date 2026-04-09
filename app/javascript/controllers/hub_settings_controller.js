@@ -494,6 +494,7 @@ export default class extends Controller {
         ]);
         if (!agentsStat.exists && !accessoriesStat.exists && !pluginsStat.exists && !workspacesStat.exists) {
           this.treePanelTarget.dataset.view = "empty";
+          this.#refreshAgentConfigCache();
           return;
         }
       } else {
@@ -501,6 +502,7 @@ export default class extends Controller {
         const botsterStat = await this.hub.statFile(".botster", fsScope, this.#targetId()).catch(() => ({ exists: false }));
         if (!botsterStat.exists) {
           this.treePanelTarget.dataset.view = "empty";
+          this.#refreshAgentConfigCache();
           return;
         }
       }
@@ -558,6 +560,7 @@ export default class extends Controller {
       }
       this.#renderTree();
       this.dispatch("configChanged");
+      this.#refreshAgentConfigCache();
     } catch (error) {
       if (isFirstLoad) {
         this.treeFeedbackTarget.textContent = `Failed to scan: ${error.message}`;
@@ -927,6 +930,18 @@ export default class extends Controller {
   /** Return the fs scope string to pass to hub methods. */
   #fsScope() {
     return this.configScope === "device" ? "device" : "repo";
+  }
+
+  #refreshAgentConfigCache() {
+    if (!this.hub) return;
+
+    const targetIds = this.configScope === "repo"
+      ? [this.#targetId()]
+      : this.spawnTargets.map((target) => target?.id);
+
+    targetIds.filter(Boolean).forEach((targetId) => {
+      this.hub.ensureAgentConfig(targetId, { force: true }).catch(() => {});
+    });
   }
 
   #targetId() {

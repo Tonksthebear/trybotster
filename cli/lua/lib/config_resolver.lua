@@ -33,6 +33,17 @@ local M = {}
 -- Internal Helpers
 -- =============================================================================
 
+--- Derive the repo config directory name from the device root path.
+-- e.g. "~/.botster-dev" → ".botster-dev", "~/.botster" → ".botster"
+-- Falls back to ".botster" if device_root is nil.
+-- @param device_root string|nil Path to device config dir (e.g. ~/.botster-dev)
+-- @return string The dot-prefixed directory name to look for in repos
+local function repo_config_dirname(device_root)
+    if not device_root then return ".botster" end
+    local trimmed = tostring(device_root):gsub("/+$", "")
+    return trimmed:match("([^/]+)$") or ".botster"
+end
+
 --- List subdirectory names under a path (skips files).
 -- @param path string Directory to scan
 -- @return string[] Array of directory names, or empty table
@@ -278,12 +289,12 @@ function M.resolve_all(opts)
         end
     end
 
-    -- Layer 2: repo ({repo}/.botster/) — wins on collision
+    -- Layer 2: repo ({repo}/.botster[-dev]/) — wins on collision
     -- For agents, manifest fields are merged (repo overrides device per field)
     -- so a target-local manifest.json can override specific fields while
     -- inheriting others from the device-level manifest.
     if repo_root then
-        local rr = repo_root .. "/.botster"
+        local rr = repo_root .. "/" .. repo_config_dirname(device_root)
         for name, agent in pairs(read_agents(rr, "repo")) do
             local existing = acc.agents[name]
             if existing and existing.manifest and agent.manifest then
@@ -364,7 +375,7 @@ function M.list_agents(device_root, repo_root)
         end
     end
     if repo_root then
-        local rr = repo_root .. "/.botster/agents"
+        local rr = repo_root .. "/" .. repo_config_dirname(device_root) .. "/agents"
         for _, name in ipairs(list_subdirs(rr)) do
             if fs.exists(rr .. "/" .. name .. "/initialization") then
                 if not seen[name] then
@@ -397,7 +408,7 @@ function M.list_accessories(device_root, repo_root)
         end
     end
     if repo_root then
-        local rr = repo_root .. "/.botster/accessories"
+        local rr = repo_root .. "/" .. repo_config_dirname(device_root) .. "/accessories"
         for _, name in ipairs(list_subdirs(rr)) do
             if fs.exists(rr .. "/" .. name .. "/initialization") then
                 if not seen[name] then
@@ -442,7 +453,7 @@ function M.list_workspaces(device_root, repo_root)
         scan(device_root .. "/workspaces")
     end
     if repo_root then
-        scan(repo_root .. "/.botster/workspaces")
+        scan(repo_root .. "/" .. repo_config_dirname(device_root) .. "/workspaces")
     end
     table.sort(result)
     return result
@@ -466,7 +477,7 @@ function M.needs_migration(device_root, repo_root)
         end
     end
     if repo_root then
-        local rr = repo_root .. "/.botster"
+        local rr = repo_root .. "/" .. repo_config_dirname(device_root)
         if fs.exists(rr .. "/profiles") and fs.is_dir(rr .. "/profiles") then
             return true
         end
@@ -604,7 +615,7 @@ function M.migrate(device_root, repo_root)
 
     migrate_root(device_root)
     if repo_root then
-        migrate_root(repo_root .. "/.botster")
+        migrate_root(repo_root .. "/" .. repo_config_dirname(device_root))
     end
 
     return true
