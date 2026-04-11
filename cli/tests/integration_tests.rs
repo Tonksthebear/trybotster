@@ -325,6 +325,7 @@ fn test_spawn_real_pty_with_init_script() {
             .spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),
                 command: "bash".to_string(),
+                args: vec![],
                 env: env_vars,
                 init_commands: vec![format!("source {}", init_script.display())],
                 detect_notifications: true,
@@ -385,6 +386,7 @@ fn test_spawn_pty_with_server_script() {
             .spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),
                 command: server_script.display().to_string(),
+                args: vec![],
                 env: server_env,
                 init_commands: vec![],
                 detect_notifications: false,
@@ -442,6 +444,7 @@ fn test_real_pty_spawn_and_output() {
             .spawn(PtySpawnConfig {
                 worktree_path: temp_dir.path().to_path_buf(),
                 command: "bash".to_string(),
+                args: vec![],
                 env: HashMap::new(),
                 init_commands: vec!["for i in $(seq 1 50); do echo \"Line $i\"; done".to_string()],
                 detect_notifications: true,

@@ -352,6 +352,7 @@ impl PtySession {
     /// pty.spawn(PtySpawnConfig {
     ///     worktree_path: PathBuf::from("/path/to/worktree"),
     ///     command: "bash".to_string(),
+    ///     args: vec![],
     ///     env: HashMap::new(),
     ///     init_commands: vec!["source .botster/shared/sessions/agent/initialization".to_string()],
     ///     detect_notifications: true,
@@ -370,7 +371,12 @@ impl PtySession {
         let pair = spawn::open_pty(rows, cols)?;
 
         // Build and spawn command
-        let cmd = spawn::build_command(&config.command, &config.worktree_path, &config.env);
+        let cmd = spawn::build_command(
+            &config.command,
+            &config.args,
+            &config.worktree_path,
+            &config.env,
+        );
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -1068,7 +1074,8 @@ mod tests {
 
         let config = PtySpawnConfig {
             worktree_path: temp_dir.path().to_path_buf(),
-            command: "echo hello".to_string(),
+            command: "echo".to_string(),
+            args: vec!["hello".to_string()],
             env: HashMap::new(),
             init_commands: vec![],
             detect_notifications: false,
@@ -1091,7 +1098,8 @@ mod tests {
 
         let config = PtySpawnConfig {
             worktree_path: temp_dir.path().to_path_buf(),
-            command: "echo hello".to_string(),
+            command: "echo".to_string(),
+            args: vec!["hello".to_string()],
             env: HashMap::new(),
             init_commands: vec![],
             detect_notifications: true,
@@ -1114,7 +1122,8 @@ mod tests {
 
         let config = PtySpawnConfig {
             worktree_path: temp_dir.path().to_path_buf(),
-            command: "echo hello".to_string(),
+            command: "echo".to_string(),
+            args: vec!["hello".to_string()],
             env: HashMap::new(),
             init_commands: vec![],
             detect_notifications: false,

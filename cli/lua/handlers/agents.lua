@@ -648,7 +648,9 @@ local function handle_delete_session(session_uuid, delete_worktree)
         local wt_path = agent.worktree_path
         local still_running = {}
         for _, other in ipairs(Agent.list()) do
-            if other.session_uuid ~= agent.session_uuid and other.worktree_path == wt_path then
+            if other.session_uuid ~= agent.session_uuid
+                and other.worktree_path == wt_path
+                and not require("lib.session").is_system_session(other) then
                 still_running[#still_running + 1] = other.session_uuid
             end
         end

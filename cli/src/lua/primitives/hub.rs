@@ -73,6 +73,20 @@ pub enum HubRequest {
     /// On build failure the Hub logs an error and keeps running — no agents
     /// are disrupted.  Intended for development iteration only.
     DevRebuild,
+    /// Wait for a quick-tunnel hostname to resolve via DoH before surfacing
+    /// the URL to the browser (avoids negative-cache poisoning on the client).
+    ProbePreviewDns {
+        /// Connector session UUID.
+        connector_session_uuid: String,
+        /// Parent session UUID.
+        parent_session_uuid: String,
+        /// Full preview URL to surface once DNS resolves.
+        url: String,
+        /// Bare hostname to resolve via DoH.
+        hostname: String,
+        /// Deadline in seconds.
+        timeout_secs: f64,
+    },
     /// Handle an incoming ActionCable signaling/control message for WebRTC.
     HandleSignalingMessage {
         /// Full message payload from the Lua ActionCable adapter.
@@ -564,6 +578,7 @@ pub(crate) fn register(
     //   opts: table {
     //     worktree_path: string     — working directory for the child
     //     command: string?           — command to run (default "bash")
+    //     args: table?               — command arguments {"-lc", "echo hi"}
     //     rows: integer?             — terminal rows (default 24)
     //     cols: integer?             — terminal cols (default 80)
     //     detect_notifications: bool? — enable OSC notification detection
@@ -588,6 +603,14 @@ pub(crate) fn register(
                     .get("worktree_path")
                     .map_err(|_| LuaError::runtime("worktree_path is required"))?;
                 let command: String = opts.get("command").unwrap_or_else(|_| "bash".to_string());
+                let mut command_args = Vec::new();
+                if let Ok(args_table) = opts.get::<LuaTable>("args") {
+                    for pair in args_table.pairs::<i64, String>() {
+                        if let Ok((_, arg)) = pair {
+                            command_args.push(arg);
+                        }
+                    }
+                }
                 let rows: u16 = opts.get("rows").unwrap_or(24);
                 let cols: u16 = opts.get("cols").unwrap_or(80);
                 let tee_path: Option<String> = opts.get("tee_path").ok();
@@ -708,7 +731,7 @@ pub(crate) fn register(
                     };
                 let spawn_config = SpawnConfig {
                     command,
-                    args: Vec::new(),
+                    args: command_args,
                     env: env_pairs,
                     cwd: Some(worktree_path),
                     rows,
@@ -923,6 +946,65 @@ pub(crate) fn register(
 
     hub.set("dev_rebuild", dev_rebuild_fn)
         .map_err(|e| anyhow!("Failed to set hub.dev_rebuild: {e}"))?;
+
+    // hub.probe_preview_dns(connector_uuid, parent_uuid, url, hostname, timeout_secs?)
+    // DNS-only readiness gate: waits for the hostname to resolve via DoH before
+    // surfacing the URL (prevents browser negative-cache poisoning).
+    let tx_probe_dns = hub_event_tx.clone();
+    let probe_preview_dns_fn = lua
+        .create_function(
+            move |_,
+                  (connector_session_uuid, parent_session_uuid, url, hostname, timeout_secs): (
+                String,
+                String,
+                String,
+                String,
+                Option<f64>,
+            )| {
+                let guard = tx_probe_dns
+                    .lock()
+                    .expect("HubEventSender mutex poisoned");
+                if let Some(ref sender) = *guard {
+                    let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::ProbePreviewDns {
+                        connector_session_uuid,
+                        parent_session_uuid,
+                        url,
+                        hostname,
+                        timeout_secs: timeout_secs.unwrap_or(15.0),
+                    }));
+                }
+                Ok(())
+            },
+        )
+        .map_err(|e| anyhow!("Failed to create hub.probe_preview_dns function: {e}"))?;
+
+    hub.set("probe_preview_dns", probe_preview_dns_fn)
+        .map_err(|e| anyhow!("Failed to set hub.probe_preview_dns: {e}"))?;
+
+    // hub.set_public_preview(session_uuid, port, enabled) - Enable/disable public preview
+    //
+    // Sends SetPublicPreview event to the Hub event loop. When enabling, the hub
+    // accepts plaintext WebRTC connections for this session's forwarded port.
+    // When disabling, disconnects all preview peers for the session.
+    let tx_preview = hub_event_tx.clone();
+    let set_public_preview_fn = lua
+        .create_function(
+            move |_, (session_uuid, port, enabled): (String, u16, bool)| {
+                let guard = tx_preview.lock().expect("HubEventSender mutex poisoned");
+                if let Some(ref sender) = *guard {
+                    let _ = sender.send(HubEvent::SetPublicPreview {
+                        session_uuid,
+                        port,
+                        enabled,
+                    });
+                }
+                Ok(())
+            },
+        )
+        .map_err(|e| anyhow!("Failed to create hub.set_public_preview function: {e}"))?;
+
+    hub.set("set_public_preview", set_public_preview_fn)
+        .map_err(|e| anyhow!("Failed to set hub.set_public_preview: {e}"))?;
 
     // Ensure hub table is globally registered
     lua.globals()

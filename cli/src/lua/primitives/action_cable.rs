@@ -31,7 +31,7 @@
 //! # Crypto
 //!
 //! When `crypto = true` is passed to `action_cable.connect()`, incoming
-//! messages with `type == "signal"` have their `envelope` field automatically
+//! encrypted signaling messages have their `envelope` field automatically
 //! decrypted via the hub's `CryptoService` before the Lua callback fires.
 //!
 //! # Usage in Lua
@@ -231,17 +231,20 @@ pub fn poll_lua_action_cable_channels(
             .map_or(false, |c| c.crypto_enabled);
 
         while let Some(mut msg) = channel.handle.try_recv() {
-            // Auto-decrypt signal envelopes when crypto is enabled
+            // Auto-decrypt encrypted signal envelopes when crypto is enabled.
+            // Public preview signaling is plaintext and must pass through.
             if crypto_enabled {
                 if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
                     if msg_type == "signal" {
                         if let Some(envelope_val) = msg.get("envelope").cloned() {
-                            msg = decrypt_signal_envelope(
-                                &msg,
-                                &envelope_val,
-                                crypto_service,
-                                channel_id,
-                            );
+                            if should_auto_decrypt_signal(&msg, &envelope_val) {
+                                msg = decrypt_signal_envelope(
+                                    &msg,
+                                    &envelope_val,
+                                    crypto_service,
+                                    channel_id,
+                                );
+                            }
                         }
                     }
                 }
@@ -337,7 +340,8 @@ pub(crate) fn fire_single_ac_message(
     };
     // Registry lock released — safe to call Lua.
 
-    // Auto-decrypt signal envelopes when crypto is enabled for this connection.
+    // Auto-decrypt encrypted signal envelopes when crypto is enabled for this
+    // connection. Public preview signaling is plaintext and must pass through.
     let crypto_enabled = connections
         .get(&channel.connection_id)
         .map_or(false, |c| c.crypto_enabled);
@@ -346,12 +350,14 @@ pub(crate) fn fire_single_ac_message(
         if let Some(msg_type) = message.get("type").and_then(|t| t.as_str()) {
             if msg_type == "signal" {
                 if let Some(envelope_val) = message.get("envelope").cloned() {
-                    message = decrypt_signal_envelope(
-                        &message,
-                        &envelope_val,
-                        crypto_service,
-                        channel_id,
-                    );
+                    if should_auto_decrypt_signal(&message, &envelope_val) {
+                        message = decrypt_signal_envelope(
+                            &message,
+                            &envelope_val,
+                            crypto_service,
+                            channel_id,
+                        );
+                    }
                 }
             }
         }
@@ -377,6 +383,22 @@ pub(crate) fn fire_single_ac_message(
 ///
 /// On success, replaces the `envelope` field with the decrypted JSON payload.
 /// On failure, logs a warning and returns the original message unmodified.
+fn should_auto_decrypt_signal(msg: &serde_json::Value, envelope_val: &serde_json::Value) -> bool {
+    if msg
+        .get("browser_identity")
+        .and_then(|v| v.as_str())
+        .is_some_and(|identity| identity.starts_with("preview:"))
+    {
+        return false;
+    }
+
+    let Some(envelope) = envelope_val.as_object() else {
+        return false;
+    };
+
+    envelope.contains_key("t") && envelope.contains_key("b")
+}
+
 fn decrypt_signal_envelope(
     msg: &serde_json::Value,
     envelope_val: &serde_json::Value,
@@ -881,6 +903,42 @@ mod tests {
 
         // Without crypto service, message should be returned unmodified
         assert_eq!(result, msg);
+    }
+
+    #[test]
+    fn test_should_auto_decrypt_signal_rejects_public_preview_identity() {
+        let msg = serde_json::json!({
+            "type": "signal",
+            "browser_identity": "preview:sess-123:tab-456",
+            "envelope": { "type": "offer", "sdp": "v=0..." }
+        });
+        let envelope_val = msg.get("envelope").unwrap();
+
+        assert!(!should_auto_decrypt_signal(&msg, envelope_val));
+    }
+
+    #[test]
+    fn test_should_auto_decrypt_signal_rejects_plaintext_signal_payload() {
+        let msg = serde_json::json!({
+            "type": "signal",
+            "browser_identity": "browser-123",
+            "envelope": { "type": "offer", "sdp": "v=0..." }
+        });
+        let envelope_val = msg.get("envelope").unwrap();
+
+        assert!(!should_auto_decrypt_signal(&msg, envelope_val));
+    }
+
+    #[test]
+    fn test_should_auto_decrypt_signal_accepts_olm_envelope() {
+        let msg = serde_json::json!({
+            "type": "signal",
+            "browser_identity": "browser-123",
+            "envelope": { "t": 1, "b": "ciphertext", "k": "sender" }
+        });
+        let envelope_val = msg.get("envelope").unwrap();
+
+        assert!(should_auto_decrypt_signal(&msg, envelope_val));
     }
 
     #[test]

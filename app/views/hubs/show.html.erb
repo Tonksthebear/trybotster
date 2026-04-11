@@ -194,6 +194,25 @@
             </a>
             <button type="button"
                     data-agent-id
+                    data-action="agent-list#togglePreview"
+                    data-preview-button
+                    data-preview-visible="false"
+                    data-preview-state="inactive"
+                    class="shrink-0 p-3 text-zinc-600 hover:text-zinc-300 transition-colors data-[preview-visible=false]:hidden data-[preview-state=starting]:text-amber-400 data-[preview-state=running]:text-emerald-400 data-[preview-state=error]:text-red-400 data-[preview-state=inactive]:text-zinc-600"
+                    title="Enable Cloudflare preview">
+              <%= icon "globe-alt", class: "size-4" %>
+            </button>
+            <a data-preview-link
+               data-preview-visible="false"
+               data-preview-state="unavailable"
+               class="shrink-0 p-3 text-zinc-600 hover:text-zinc-300 transition-colors data-[preview-visible=false]:hidden data-[preview-state=running]:text-emerald-400 data-[preview-state=starting]:text-amber-400 data-[preview-state=error]:text-red-400 data-[preview-state=unavailable]:text-zinc-600"
+               target="_blank"
+               rel="noopener noreferrer"
+               title="Open Cloudflare preview in new tab">
+              <%= icon "arrow-top-right-on-square", class: "size-4" %>
+            </a>
+            <button type="button"
+                    data-agent-id
                     data-action="agent-list#moveAgentWorkspace"
                     class="shrink-0 p-3 text-zinc-600 hover:text-zinc-300 transition-colors"
                     title="Move to workspace">

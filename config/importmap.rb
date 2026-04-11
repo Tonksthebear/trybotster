@@ -24,6 +24,8 @@ pin_all_from "app/javascript/lib", under: "lib"
 pin_all_from "app/javascript/transport", under: "transport"
 pin_all_from "app/javascript/preview", under: "preview"
 pin_all_from "app/javascript/channels", under: "channels"
+pin "public_preview"
+pin_all_from "app/javascript/public_preview", under: "public_preview"
 pin "@tailwindplus/elements", to: "@tailwindplus--elements.js" # @1.0.22
 pin "chunk-qj4j7h9k", to: "chunk-qj4j7h9k.js"
 pin "restty", to: "restty.js"

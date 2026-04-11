@@ -78,6 +78,25 @@
             </a>
             <button type="button"
                     data-agent-id
+                    data-action="agent-list#togglePreview"
+                    data-preview-button
+                    data-preview-visible="false"
+                    data-preview-state="inactive"
+                    class="shrink-0 p-1.5 text-zinc-600 hover:text-zinc-300 opacity-0 group-hover:opacity-100 [@media(pointer:coarse)]:opacity-100 transition-opacity data-[preview-visible=false]:hidden data-[preview-state=starting]:text-amber-400 data-[preview-state=running]:text-emerald-400 data-[preview-state=error]:text-red-400 data-[preview-state=inactive]:text-zinc-600"
+                    title="Enable Cloudflare preview">
+              <%= icon "globe-alt", class: "size-3.5" %>
+            </button>
+            <a data-preview-link
+               data-preview-visible="false"
+               data-preview-state="unavailable"
+               class="shrink-0 p-1.5 text-zinc-600 hover:text-zinc-300 opacity-0 group-hover:opacity-100 [@media(pointer:coarse)]:opacity-100 transition-opacity data-[preview-visible=false]:hidden data-[preview-state=running]:text-emerald-400 data-[preview-state=starting]:text-amber-400 data-[preview-state=error]:text-red-400 data-[preview-state=unavailable]:text-zinc-600"
+               target="_blank"
+               rel="noopener noreferrer"
+               title="Open Cloudflare preview in new tab">
+              <%= icon "arrow-top-right-on-square", class: "size-3.5" %>
+            </a>
+            <button type="button"
+                    data-agent-id
                     data-action="agent-list#moveAgentWorkspace"
                     class="shrink-0 p-1.5 text-zinc-600 hover:text-zinc-300 opacity-0 group-hover:opacity-100 [@media(pointer:coarse)]:opacity-100 transition-opacity"
                     title="Move to workspace">

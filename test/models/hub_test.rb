@@ -279,4 +279,51 @@ class HubTest < ActiveSupport::TestCase
       hub.update!(last_seen_at: Time.current)
     end
   end
+
+  # === Public Preview ===
+
+  test "public_preview_enabled? returns false by default" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current, alive: true)
+    assert_not hub.public_preview_enabled?("sess-123")
+  end
+
+  test "enable_public_preview! adds session to list" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current, alive: true)
+    hub.enable_public_preview!("sess-123", 8080)
+
+    assert hub.public_preview_enabled?("sess-123")
+    assert_equal [{ "session_uuid" => "sess-123", "port" => 8080 }], hub.reload.public_preview_sessions
+  end
+
+  test "enable_public_preview! replaces existing entry for same session" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current, alive: true)
+    hub.enable_public_preview!("sess-123", 8080)
+    hub.enable_public_preview!("sess-123", 9090)
+
+    assert_equal 1, hub.reload.public_preview_sessions.size
+    assert_equal 9090, hub.public_preview_sessions.first["port"]
+  end
+
+  test "disable_public_preview! removes session from list" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current, alive: true)
+    hub.enable_public_preview!("sess-123", 8080)
+    hub.enable_public_preview!("sess-456", 8081)
+    hub.disable_public_preview!("sess-123")
+
+    assert_not hub.public_preview_enabled?("sess-123")
+    assert hub.public_preview_enabled?("sess-456")
+  end
+
+  test "public_preview_port returns port for enabled session" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current, alive: true)
+    hub.enable_public_preview!("sess-123", 8080)
+
+    assert_equal 8080, hub.public_preview_port("sess-123")
+    assert_nil hub.public_preview_port("sess-nonexistent")
+  end
+
+  test "public_preview_sessions defaults to empty array" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current)
+    assert_equal [], hub.public_preview_sessions
+  end
 end
