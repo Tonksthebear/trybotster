@@ -210,7 +210,7 @@ export default class extends Controller {
     );
   }
 
-  // Action: toggle public preview for a session's forwarded port
+  // Action: toggle Cloudflare-hosted preview for a session's forwarded port
   togglePreview(event) {
     event.preventDefault();
     event.stopPropagation();
@@ -493,12 +493,21 @@ export default class extends Controller {
     // Preview button: show only for sessions with a forwarded port
     const previewBtn = root.querySelector("[data-preview-button]");
     const previewLink = root.querySelector("[data-preview-link]");
+    const previewStatus = root.querySelector("[data-preview-status]");
+    const previewMessage = root.querySelector("[data-preview-message]");
+    const previewInstallLink = root.querySelector("[data-preview-install-link]");
     if (previewBtn) {
       const hostedPreview = agent.hosted_preview || null;
       const previewUrl = typeof hostedPreview?.url === "string" ? hostedPreview.url : null;
       const previewState = hostedPreview?.status || "inactive";
       const previewError = hostedPreview?.error || null;
+      const previewInstallUrl =
+        typeof hostedPreview?.install_url === "string"
+          ? hostedPreview.install_url
+          : null;
       const previewReady = previewState === "running" && !!previewUrl;
+      let previewStatusText = "";
+      let previewStatusTone = "text-zinc-500";
 
       if (agent.port) {
         previewBtn.dataset.previewVisible = "true";
@@ -522,8 +531,12 @@ export default class extends Controller {
           previewBtn.title = "Disable Cloudflare preview";
         } else if (previewState === "starting") {
           previewBtn.title = "Cloudflare preview is starting";
+          previewStatusText = "Preview is launching...";
+          previewStatusTone = "text-amber-400";
         } else if (previewState === "error") {
           previewBtn.title = previewError || "Cloudflare preview failed";
+          previewStatusText = previewError || "Cloudflare preview failed";
+          previewStatusTone = "text-red-400";
         } else {
           previewBtn.title = "Enable Cloudflare preview";
         }
@@ -537,6 +550,35 @@ export default class extends Controller {
           previewLink.removeAttribute("href");
           previewLink.removeAttribute("aria-label");
           previewLink.title = "Preview unavailable for sessions without a forwarded port";
+        }
+      }
+
+      if (previewStatus && previewMessage) {
+        if (previewStatusText) {
+          previewStatus.classList.remove("hidden", "text-zinc-500", "text-amber-400", "text-red-400");
+          previewStatus.classList.add(previewStatusTone);
+          previewMessage.textContent = previewStatusText;
+        } else {
+          previewStatus.classList.add("hidden");
+          previewStatus.classList.remove("text-zinc-500", "text-amber-400", "text-red-400");
+          previewMessage.textContent = "";
+        }
+      }
+
+      if (previewInstallLink) {
+        if (previewState === "error" && previewInstallUrl) {
+          previewInstallLink.classList.remove("hidden");
+          previewInstallLink.href = previewInstallUrl;
+          previewInstallLink.title = "Open Cloudflare cloudflared install docs";
+          previewInstallLink.setAttribute(
+            "aria-label",
+            "Open Cloudflare cloudflared install docs",
+          );
+        } else {
+          previewInstallLink.classList.add("hidden");
+          previewInstallLink.removeAttribute("href");
+          previewInstallLink.removeAttribute("aria-label");
+          previewInstallLink.removeAttribute("title");
         }
       }
     }

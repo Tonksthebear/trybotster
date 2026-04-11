@@ -166,7 +166,8 @@ M.primitives = {
             { sig = "hub.is_offline()",            desc = "Check if hub is in offline mode" },
             { sig = "hub.quit()",                  desc = "Request hub shutdown" },
             { sig = "hub.graceful_restart()",      desc = "Restart hub (sessions survive)" },
-            { sig = "hub.probe_preview_dns(connector_uuid, parent_uuid, url, hostname, timeout_secs?)", desc = "DNS readiness gate for hosted preview URL" },
+            { sig = "hub.resolve_command_path(command)", desc = "Resolve an executable against the live PATH" },
+            { sig = "hub.probe_preview_dns(connector_uuid, parent_uuid, url, hostname, timeout_secs?)", desc = "DNS + HTTPS readiness gate for hosted preview URL" },
         },
     },
     {

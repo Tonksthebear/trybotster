@@ -947,9 +947,34 @@ pub(crate) fn register(
     hub.set("dev_rebuild", dev_rebuild_fn)
         .map_err(|e| anyhow!("Failed to set hub.dev_rebuild: {e}"))?;
 
+    // hub.resolve_command_path(command) -> (path, nil) or (nil, error)
+    //
+    // Resolves an executable against the Hub's live environment without
+    // spawning anything. Hosted preview uses this on every enable attempt so
+    // cloudflared installation changes are picked up immediately.
+    let resolve_command_path_fn = lua
+        .create_function(|_, command: String| {
+            let trimmed = command.trim().to_string();
+            if trimmed.is_empty() {
+                return Ok((None::<String>, Some("Command cannot be blank".to_string())));
+            }
+
+            match crate::hosted_preview::resolve_command_path(&trimmed) {
+                Some(path) => Ok((Some(path.to_string_lossy().into_owned()), None::<String>)),
+                None => Ok((
+                    None::<String>,
+                    Some(format!("Command not found: {trimmed}")),
+                )),
+            }
+        })
+        .map_err(|e| anyhow!("Failed to create hub.resolve_command_path function: {e}"))?;
+
+    hub.set("resolve_command_path", resolve_command_path_fn)
+        .map_err(|e| anyhow!("Failed to set hub.resolve_command_path: {e}"))?;
+
     // hub.probe_preview_dns(connector_uuid, parent_uuid, url, hostname, timeout_secs?)
-    // DNS-only readiness gate: waits for the hostname to resolve via DoH before
-    // surfacing the URL (prevents browser negative-cache poisoning).
+    // Hosted preview readiness gate: waits for DNS plus HTTPS reachability
+    // before surfacing the URL.
     let tx_probe_dns = hub_event_tx.clone();
     let probe_preview_dns_fn = lua
         .create_function(
@@ -961,9 +986,7 @@ pub(crate) fn register(
                 String,
                 Option<f64>,
             )| {
-                let guard = tx_probe_dns
-                    .lock()
-                    .expect("HubEventSender mutex poisoned");
+                let guard = tx_probe_dns.lock().expect("HubEventSender mutex poisoned");
                 if let Some(ref sender) = *guard {
                     let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::ProbePreviewDns {
                         connector_session_uuid,
@@ -1036,6 +1059,7 @@ mod tests {
         assert!(hub.contains_key("graceful_restart").unwrap());
         assert!(hub.contains_key("exec_restart").unwrap());
         assert!(hub.contains_key("dev_rebuild").unwrap());
+        assert!(hub.contains_key("resolve_command_path").unwrap());
         assert!(hub.contains_key("pty_tee").unwrap());
     }
 
