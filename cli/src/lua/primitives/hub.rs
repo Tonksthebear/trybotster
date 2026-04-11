@@ -981,31 +981,6 @@ pub(crate) fn register(
     hub.set("probe_preview_dns", probe_preview_dns_fn)
         .map_err(|e| anyhow!("Failed to set hub.probe_preview_dns: {e}"))?;
 
-    // hub.set_public_preview(session_uuid, port, enabled) - Enable/disable public preview
-    //
-    // Sends SetPublicPreview event to the Hub event loop. When enabling, the hub
-    // accepts plaintext WebRTC connections for this session's forwarded port.
-    // When disabling, disconnects all preview peers for the session.
-    let tx_preview = hub_event_tx.clone();
-    let set_public_preview_fn = lua
-        .create_function(
-            move |_, (session_uuid, port, enabled): (String, u16, bool)| {
-                let guard = tx_preview.lock().expect("HubEventSender mutex poisoned");
-                if let Some(ref sender) = *guard {
-                    let _ = sender.send(HubEvent::SetPublicPreview {
-                        session_uuid,
-                        port,
-                        enabled,
-                    });
-                }
-                Ok(())
-            },
-        )
-        .map_err(|e| anyhow!("Failed to create hub.set_public_preview function: {e}"))?;
-
-    hub.set("set_public_preview", set_public_preview_fn)
-        .map_err(|e| anyhow!("Failed to set hub.set_public_preview: {e}"))?;
-
     // Ensure hub table is globally registered
     lua.globals()
         .set("hub", hub)
