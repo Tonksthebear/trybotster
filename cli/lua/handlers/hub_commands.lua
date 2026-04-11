@@ -164,6 +164,31 @@ if handles.signal_event_sub then
     events.off(handles.signal_event_sub)
 end
 
+-- Sync public preview state to Rails on (re)connect.
+-- Sends the full set of active previews so Rails replaces any stale cache
+-- (e.g. after hub restart where in-memory state was lost).
+local function sync_preview_state()
+    if not handles.channel then return end
+
+    local Session = require("lib.session")
+    local active = {}
+    for _, session in ipairs(Session.list()) do
+        if session._public_preview and session._port then
+            active[#active + 1] = {
+                session_uuid = session.session_uuid,
+                port = session._port,
+            }
+        end
+    end
+
+    action_cable.perform(handles.channel, "sync_previews", {
+        sessions = active,
+    })
+end
+
+-- Sync after initial subscribe (runs once at load / hot-reload)
+sync_preview_state()
+
 -- Relay outgoing WebRTC signals (pre-encrypted by Rust) through ActionCable
 handles.signal_event_sub = events.on("outgoing_signal", function(data)
     if handles.channel then

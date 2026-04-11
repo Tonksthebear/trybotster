@@ -225,11 +225,16 @@ _event_sub = events.on("sessions_discovered", function(data)
     -- Broadcast recovered sessions to clients
     if #recovered > 0 then
         local connections = require("handlers.connections")
+        local Session = require("lib.session")
+        local HostedPreview = require("lib.hosted_preview")
 
         local ok, err = pcall(function()
             for _, session in ipairs(recovered) do
-                hooks.notify("agent_created", session:info())
+                if not Session.is_system_session(session) then
+                    hooks.notify("agent_created", session:info())
+                end
             end
+            HostedPreview.reconcile()
             connections.broadcast_hub_event("agent_list", { agents = Agent.all_info() })
         end)
 

@@ -1734,7 +1734,11 @@ impl WebRtcSender {
         Ok(())
     }
 
-    /// Send a stream multiplexer frame via encrypted DataChannel.
+    /// Send a stream multiplexer frame via DataChannel.
+    ///
+    /// When `crypto_service` is present (encrypted connections), the frame is
+    /// Olm-encrypted. When absent (public preview connections), the frame is
+    /// sent as plaintext (DTLS provides transport encryption).
     pub async fn send_stream_raw(
         &self,
         frame_type: u8,
@@ -1752,13 +1756,6 @@ impl WebRtcSender {
             .await
             .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
 
-        let cs = self
-            .crypto_service
-            .as_ref()
-            .ok_or_else(|| ChannelError::EncryptionError("No crypto service".into()))?;
-
-        let peer_key = self.get_peer_olm_key().await?;
-
         let stream_id_bytes = stream_id.to_be_bytes();
         let mut plaintext = Vec::with_capacity(4 + payload.len());
         plaintext.push(CONTENT_STREAM);
@@ -1766,15 +1763,24 @@ impl WebRtcSender {
         plaintext.extend_from_slice(&stream_id_bytes);
         plaintext.extend_from_slice(payload);
 
-        let encrypted = cs
-            .lock()
-            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
-            .encrypt_binary(&plaintext, &peer_key)
-            .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
+        if let Some(ref cs) = self.crypto_service {
+            // Encrypted path
+            let peer_key = self.get_peer_olm_key().await?;
+            let encrypted = cs
+                .lock()
+                .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
+                .encrypt_binary(&plaintext, &peer_key)
+                .map_err(|e| ChannelError::EncryptionError(e.to_string()))?;
 
-        pc.send_data(dc_id, &encrypted)
-            .await
-            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
+            pc.send_data(dc_id, &encrypted)
+                .await
+                .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
+        } else {
+            // Plaintext path (public preview — DTLS still encrypts transport)
+            pc.send_data(dc_id, &plaintext)
+                .await
+                .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -1846,30 +1852,47 @@ async fn handle_dc_message(
     hub_event_tx: &Option<crate::hub::events::HubEventTx>,
     chunk_assemblies: &mut std::collections::HashMap<u8, FileChunkAssembly>,
 ) {
-    // Every DataChannel message is a binary Olm frame:
-    // [msg_type:1][ciphertext] or [msg_type:1][key:32][ciphertext]
-    let Some(ref cs) = crypto_service else {
-        log::error!("[WebRTC-DC] No crypto service -- cannot decrypt");
-        return;
-    };
+    let is_preview = crypto_service.is_none();
 
-    // Decrypt binary frame via vodozemac
-    let peer_olm_key = crate::relay::extract_olm_key(browser_identity);
-    let plaintext = match cs.lock() {
-        Ok(mut guard) => match guard.decrypt_binary(data, Some(peer_olm_key)) {
-            Ok(pt) => {
-                decrypt_failures.store(0, Ordering::Relaxed);
-                pt
-            }
+    let plaintext = if is_preview {
+        // Preview connections: raw plaintext frames (DTLS provides transport encryption).
+        // Hard-fail any content type except CONTENT_STREAM before reaching generic routing.
+        if data.is_empty() {
+            log::warn!("[WebRTC-DC] Empty preview frame");
+            return;
+        }
+        if data[0] != CONTENT_STREAM {
+            log::warn!(
+                "[WebRTC-DC] Preview blocked content type 0x{:02x} from {}",
+                data[0],
+                &browser_identity[..browser_identity.len().min(12)]
+            );
+            return;
+        }
+        data.to_vec()
+    } else {
+        // Encrypted path: Olm decryption
+        let Some(ref cs) = crypto_service else {
+            log::error!("[WebRTC-DC] No crypto service -- cannot decrypt");
+            return;
+        };
+        let peer_olm_key = crate::relay::extract_olm_key(browser_identity);
+        match cs.lock() {
+            Ok(mut guard) => match guard.decrypt_binary(data, Some(peer_olm_key)) {
+                Ok(pt) => {
+                    decrypt_failures.store(0, Ordering::Relaxed);
+                    pt
+                }
+                Err(e) => {
+                    decrypt_failures.fetch_add(1, Ordering::Relaxed);
+                    log::error!("[WebRTC-DC] Olm decryption FAILED: {e}");
+                    return;
+                }
+            },
             Err(e) => {
-                decrypt_failures.fetch_add(1, Ordering::Relaxed);
-                log::error!("[WebRTC-DC] Olm decryption FAILED: {e}");
+                log::error!("[WebRTC-DC] Crypto mutex poisoned: {e}");
                 return;
             }
-        },
-        Err(e) => {
-            log::error!("[WebRTC-DC] Crypto mutex poisoned: {e}");
-            return;
         }
     };
 

@@ -8,6 +8,7 @@
 
 local state = require("hub.state")
 local Agent = require("lib.agent")
+local Session = require("lib.session")
 local pty_clients = require("lib.pty_clients")
 local AgentListPayload = require("lib.agent_list_payload")
 
@@ -185,6 +186,9 @@ end
 -- ============================================================================
 
 hooks.on("agent_created", "broadcast_agent_created", function(info)
+    if Session.is_system_session(info) then
+        return
+    end
     log.info(string.format("Broadcasting agent_created: %s",
         info.id or info.session_uuid or "?"))
 
@@ -383,6 +387,11 @@ hooks.on("pty_output", "idle_activity_reset", function(ctx, _data)
     local uuid = ctx.session_uuid
     if not uuid then return end
 
+    local HostedPreview = require("lib.hosted_preview")
+    if HostedPreview.handle_output(ctx, _data) then
+        return
+    end
+
     local session = Agent.get(uuid)
     if not session then return end
 
@@ -434,6 +443,11 @@ _event_subs[#_event_subs + 1] = events.on("connection_code_ready", function(data
     broadcast_hub_event("connection_code", { url = data.url, qr_ascii = data.qr_ascii })
 end)
 
+_event_subs[#_event_subs + 1] = events.on("preview_dns_ready", function(data)
+    local HostedPreview = require("lib.hosted_preview")
+    HostedPreview.handle_dns_ready(data)
+end)
+
 _event_subs[#_event_subs + 1] = events.on("connection_code_error", function(err)
     log.warn(string.format("Broadcasting connection_code_error: %s", err or "unknown"))
     broadcast_hub_event("connection_code_error", { error = err or "Connection code not available" })
@@ -474,6 +488,11 @@ _event_subs[#_event_subs + 1] = events.on("process_exited", function(data)
     local exit_code = data.exit_code
     log.info(string.format("Process exited for %s (code=%s)",
         session_uuid or "?", tostring(exit_code)))
+
+    local HostedPreview = require("lib.hosted_preview")
+    if HostedPreview.handle_process_exited(data) then
+        return
+    end
 
     local agent = (session_uuid and Agent.get(session_uuid))
     if agent then

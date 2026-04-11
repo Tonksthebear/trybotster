@@ -76,6 +76,7 @@ async fn test_agent_spawns_with_echo_command() {
     let config = PtySpawnConfig {
         worktree_path: worktree,
         command: "echo test".to_string(),
+        args: vec![],
         env: HashMap::new(),
         init_commands: vec![],
         detect_notifications: false,

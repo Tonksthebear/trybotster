@@ -27,8 +27,18 @@ module Hubs
     def authenticate_user_or_hub!
       return if current_user
       return if authenticate_hub_from_token
+      return if public_preview_request?
 
       render json: { error: "Unauthorized" }, status: :unauthorized
+    end
+
+    # Allow unauthenticated ICE config requests for sessions with public preview enabled
+    def public_preview_request?
+      session_uuid = request.params[:session_uuid]
+      return false unless session_uuid.present?
+
+      @_public_preview_hub = Hub.find_by(id: params[:hub_id])
+      @_public_preview_hub&.alive? && @_public_preview_hub&.public_preview_enabled?(session_uuid)
     end
 
     def authenticate_hub_from_token
@@ -49,6 +59,8 @@ module Hubs
       elsif @current_hub_from_token
                # Verify the token's hub matches the requested hub
                @current_hub_from_token if @current_hub_from_token.id == params[:hub_id].to_i
+      elsif @_public_preview_hub
+               @_public_preview_hub
       end
 
       render json: { error: "Hub not found" }, status: :not_found unless @hub

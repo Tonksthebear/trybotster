@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_04_01_215845) do
+ActiveRecord::Schema[8.1].define(version: 2026_04_03_000000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -160,6 +160,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_01_215845) do
     t.bigint "message_sequence", default: 0, null: false
     t.string "name"
     t.boolean "notifications_enabled", default: false, null: false
+    t.json "public_preview_sessions", default: []
     t.datetime "updated_at", null: false
     t.bigint "user_id", null: false
     t.index ["fingerprint"], name: "index_hubs_on_fingerprint"

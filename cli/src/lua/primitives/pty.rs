@@ -776,6 +776,14 @@ pub(crate) fn spawn_session_handle_from_opts(
 
     // Parse optional fields with defaults
     let command: String = opts.get("command").unwrap_or_else(|_| "bash".to_string());
+    let mut args = Vec::new();
+    if let Ok(args_table) = opts.get::<LuaTable>("args") {
+        for pair in args_table.pairs::<i64, String>() {
+            if let Ok((_, arg)) = pair {
+                args.push(arg);
+            }
+        }
+    }
     let rows: u16 = opts.get("rows").unwrap_or(24);
     let cols: u16 = opts.get("cols").unwrap_or(80);
     let detect_notifications: bool = opts.get("detect_notifications").unwrap_or(false);
@@ -808,6 +816,7 @@ pub(crate) fn spawn_session_handle_from_opts(
     let config = PtySpawnConfig {
         worktree_path: PathBuf::from(worktree_path),
         command,
+        args,
         env,
         init_commands,
         detect_notifications,

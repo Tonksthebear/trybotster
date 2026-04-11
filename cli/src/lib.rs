@@ -46,6 +46,7 @@ pub mod file_watcher;
 #[allow(missing_docs, missing_debug_implementations)]
 pub mod ghostty_vt;
 pub mod git;
+pub mod hosted_preview;
 pub mod keyring;
 pub mod notifications;
 pub mod process;

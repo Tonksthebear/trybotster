@@ -210,6 +210,18 @@ export default class extends Controller {
     );
   }
 
+  // Action: toggle public preview for a session's forwarded port
+  togglePreview(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!this.hub) return;
+
+    const agentId = event.currentTarget.dataset.agentId;
+    if (!agentId) return;
+
+    this.hub.toggleHostedPreview(agentId);
+  }
+
   // Action: delete an agent - opens confirmation modal
   delete(event) {
     event.preventDefault();
@@ -477,6 +489,57 @@ export default class extends Controller {
     }
 
     this.#renderActivityIndicator(root, agent, isAccessory);
+
+    // Preview button: show only for sessions with a forwarded port
+    const previewBtn = root.querySelector("[data-preview-button]");
+    const previewLink = root.querySelector("[data-preview-link]");
+    if (previewBtn) {
+      const hostedPreview = agent.hosted_preview || null;
+      const previewUrl = typeof hostedPreview?.url === "string" ? hostedPreview.url : null;
+      const previewState = hostedPreview?.status || "inactive";
+      const previewError = hostedPreview?.error || null;
+      const previewReady = previewState === "running" && !!previewUrl;
+
+      if (agent.port) {
+        previewBtn.dataset.previewVisible = "true";
+        previewBtn.dataset.previewState = previewState;
+        previewBtn.setAttribute("aria-pressed", previewState === "running" ? "true" : "false");
+        if (previewLink) {
+          previewLink.dataset.previewVisible = previewReady ? "true" : "false";
+          previewLink.dataset.previewState = previewState;
+          if (previewReady) {
+            previewLink.href = previewUrl;
+            previewLink.title = "Open Cloudflare preview in new tab";
+            previewLink.setAttribute("aria-label", "Open Cloudflare preview in new tab");
+          } else {
+            previewLink.removeAttribute("href");
+            previewLink.removeAttribute("aria-label");
+            previewLink.title = previewError || "Preview URL not ready yet";
+          }
+        }
+
+        if (previewState === "running") {
+          previewBtn.title = "Disable Cloudflare preview";
+        } else if (previewState === "starting") {
+          previewBtn.title = "Cloudflare preview is starting";
+        } else if (previewState === "error") {
+          previewBtn.title = previewError || "Cloudflare preview failed";
+        } else {
+          previewBtn.title = "Enable Cloudflare preview";
+        }
+      } else {
+        previewBtn.dataset.previewVisible = "false";
+        previewBtn.dataset.previewState = "unavailable";
+        previewBtn.setAttribute("aria-pressed", "false");
+        if (previewLink) {
+          previewLink.dataset.previewVisible = "false";
+          previewLink.dataset.previewState = "unavailable";
+          previewLink.removeAttribute("href");
+          previewLink.removeAttribute("aria-label");
+          previewLink.title = "Preview unavailable for sessions without a forwarded port";
+        }
+      }
+    }
 
     return root;
   }

@@ -33,7 +33,6 @@ export class PreviewConnection extends HubRoute {
   constructor(key, options, manager) {
     super(key, options, manager)
     this.sessionUuid = options.sessionUuid
-    this.port = options.port ?? 3000
   }
 
   // ========== Connection overrides ==========
@@ -111,12 +110,13 @@ export class PreviewConnection extends HubRoute {
       throw new Error("Stream multiplexer not initialized")
     }
 
-    const stream = this.#mux.open(this.port)
+    const port = this.getPort()
+    const stream = this.#mux.open(port)
 
     try {
       await stream.waitOpen()
     } catch (e) {
-      throw new Error(`Failed to open stream to port ${this.port}: ${e.message}`)
+      throw new Error(`Failed to open stream to port ${port}: ${e.message}`)
     }
 
     const reqBytes = serializeRequest(
@@ -124,7 +124,7 @@ export class PreviewConnection extends HubRoute {
       request.path,
       request.headers || {},
       request.body,
-      `localhost:${this.port}`,
+      `localhost:${port}`,
     )
     stream.write(reqBytes)
 
@@ -169,7 +169,7 @@ export class PreviewConnection extends HubRoute {
   }
 
   getPort() {
-    return this.port
+    return Number(this.options.port ?? 3000)
   }
 
   // ========== Event helpers ==========

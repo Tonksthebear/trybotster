@@ -622,6 +622,11 @@ function M.build_workspace_groups(data_dir, agents)
     local agent_list = agents or {}
 
     for _, agent in ipairs(agent_list) do
+        local metadata = type(agent) == "table" and agent.metadata or nil
+        if type(metadata) == "table"
+            and (metadata.system_session == true or metadata.system_session == "true") then
+            goto continue_agent
+        end
         local workspace_id = agent.workspace_id
         if workspace_id then
             if not by_id[workspace_id] then
@@ -675,6 +680,7 @@ function M.build_workspace_groups(data_dir, agents)
                     by_id[workspace_id].session_counts.other + 1
             end
         end
+        ::continue_agent::
     end
 
     table.sort(grouped, function(a, b)

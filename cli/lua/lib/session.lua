@@ -361,6 +361,7 @@ function Session._init(self, config)
         worktree_path = config.worktree_path,
         cwd = config.worktree_path,
         command = session_config.command or "bash",
+        args = type(session_config.args) == "table" and session_config.args or {},
         env = session_env,
         detect_notifications = session_config.notifications or false,
         session_uuid = key,
@@ -371,11 +372,20 @@ function Session._init(self, config)
     }
 
     -- Build init_commands from init_script (absolute path from config resolver)
+    spawn_config.init_commands = {}
     if session_config.init_script then
         if fs.exists(session_config.init_script) then
-            spawn_config.init_commands = { "source " .. session_config.init_script }
+            spawn_config.init_commands[#spawn_config.init_commands + 1] =
+                "source " .. session_config.init_script
         else
             log.debug(string.format("Init script not found: %s", session_config.init_script))
+        end
+    end
+    if type(session_config.init_commands) == "table" then
+        for _, cmd in ipairs(session_config.init_commands) do
+            if type(cmd) == "string" and cmd ~= "" then
+                spawn_config.init_commands[#spawn_config.init_commands + 1] = cmd
+            end
         end
     end
 
@@ -577,6 +587,7 @@ end
 local RUNTIME_ONLY_FIELDS = {
     is_idle = true,
     notification = true,
+    hosted_preview = true,
 }
 
 function Session:update(fields)
@@ -846,6 +857,10 @@ end
 function Session:close(delete_worktree)
     local key = self.session_uuid
 
+    pcall(function()
+        require("lib.hosted_preview").handle_session_closing(self)
+    end)
+
     -- Notify observers
     hooks.notify("before_agent_close", self)
 
@@ -1050,6 +1065,8 @@ function Session:info()
         status = self.status,
         notification = self.notification or false,
         port = port,
+        hosted_preview = self.hosted_preview,
+        system_session = Session.is_system_session(self),
         created_at = self.created_at,
         label = self.label,
         task = self.task,
@@ -1122,12 +1139,26 @@ function Session.count()
     return count
 end
 
+--- Whether a session/info record is internal-only and should be hidden from
+-- normal client payloads.
+-- @param subject table|nil Session instance or info table
+-- @return boolean
+function Session.is_system_session(subject)
+    local metadata = type(subject) == "table" and subject.metadata or nil
+    return type(metadata) == "table"
+        and (metadata.system_session == true or metadata.system_session == "true")
+end
+
 --- Get info tables for all sessions (for client broadcast).
+-- By default, internal system sessions are excluded.
+-- @param opts table|nil { include_system = boolean }
 -- @return array of info tables sorted by creation time
-function Session.all_info()
+function Session.all_info(opts)
     local result = {}
     for _, entry in pairs(sessions) do
-        result[#result + 1] = entry:info()
+        if (opts and opts.include_system) or not Session.is_system_session(entry) then
+            result[#result + 1] = entry:info()
+        end
     end
     table.sort(result, function(a, b)
         local ac = tonumber(a.created_at) or 0

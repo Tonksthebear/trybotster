@@ -448,6 +448,72 @@ commands.register("delete_agent", function(_client, _sub_id, command)
     end
 end, { description = "Delete a session (agent or accessory, optionally with worktree)" })
 
+commands.register("toggle_public_preview", function(_client, _sub_id, command)
+    local Session = require("lib.session")
+    local session_id = command.session_uuid or command.agent_id or command.id
+    if not session_id then
+        log.warn("toggle_public_preview missing session identifier")
+        return
+    end
+
+    local session = Session.get(session_id)
+    if not session then
+        log.warn(string.format("toggle_public_preview: session not found: %s", session_id))
+        return
+    end
+
+    local enabled = command.enabled
+    if enabled == nil then
+        -- Toggle: if currently enabled, disable; otherwise enable
+        enabled = not session._public_preview
+    end
+
+    if enabled then
+        local ok, err = pcall(function() session:enable_public_preview() end)
+        if not ok then
+            log.warn(string.format("toggle_public_preview failed: %s", tostring(err)))
+        end
+    else
+        session:disable_public_preview()
+    end
+end, { description = "Enable or disable public preview for a session's forwarded port" })
+
+commands.register("toggle_hosted_preview", function(_client, _sub_id, command)
+    local Session = require("lib.session")
+    local HostedPreview = require("lib.hosted_preview")
+    local session_id = command.session_uuid or command.agent_id or command.id
+    if not session_id then
+        log.warn("toggle_hosted_preview missing session identifier")
+        return
+    end
+
+    local session = Session.get(session_id)
+    if not session then
+        log.warn(string.format("toggle_hosted_preview: session not found: %s", session_id))
+        return
+    end
+
+    if not session._port then
+        log.warn(string.format("toggle_hosted_preview: session has no forwarded port: %s", session_id))
+        return
+    end
+
+    local hosted = session.hosted_preview
+    local enabled = command.enabled
+    if enabled == nil then
+        enabled = not (hosted and (hosted.status == "starting" or hosted.status == "running"))
+    end
+
+    if enabled then
+        local _, err = HostedPreview.enable(session)
+        if err then
+            log.warn(string.format("toggle_hosted_preview failed: %s", tostring(err)))
+        end
+    else
+        HostedPreview.disable(session)
+    end
+end, { description = "Enable or disable a Cloudflare-hosted preview for a forwarded session" })
+
 -- Alias: delete_session → delete_agent
 commands.register("delete_session", function(_client, _sub_id, command)
     local session_id = command.id or command.session_uuid or command.agent_id or command.session_key

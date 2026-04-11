@@ -33,6 +33,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 /// let config = PtySpawnConfig {
 ///     worktree_path: PathBuf::from("/path/to/worktree"),
 ///     command: "bash".to_string(),
+///     args: vec![],
 ///     env: HashMap::new(),
 ///     init_commands: vec!["source .botster/shared/sessions/agent/initialization".to_string()],
 ///     detect_notifications: true,
@@ -47,6 +48,8 @@ pub struct PtySpawnConfig {
     pub worktree_path: PathBuf,
     /// Command to run (e.g., "bash").
     pub command: String,
+    /// Arguments passed to the command.
+    pub args: Vec<String>,
     /// Environment variables to set.
     pub env: HashMap<String, String>,
     /// Commands to run after spawn (e.g., sourcing a session initialization script).
@@ -88,13 +91,21 @@ pub fn open_pty(rows: u16, cols: u16) -> Result<PtyPair> {
 )]
 pub fn build_command(
     command_str: &str,
+    args: &[String],
     cwd: &std::path::Path,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> CommandBuilder {
-    let parts: Vec<&str> = command_str.split_whitespace().collect();
-    let mut cmd = CommandBuilder::new(parts[0]);
-    for arg in &parts[1..] {
-        cmd.arg(arg);
+    let mut cmd = CommandBuilder::new(command_str);
+    if args.is_empty() {
+        let parts: Vec<&str> = command_str.split_whitespace().collect();
+        cmd = CommandBuilder::new(parts[0]);
+        for arg in &parts[1..] {
+            cmd.arg(arg);
+        }
+    } else {
+        for arg in args {
+            cmd.arg(arg);
+        }
     }
     cmd.cwd(cwd);
     for (key, value) in env_vars {
@@ -299,7 +310,21 @@ mod tests {
 
         let env = HashMap::new();
         let cwd = PathBuf::from("/tmp");
-        let cmd = build_command("echo hello world", &cwd, &env);
+        let cmd = build_command("echo hello world", &[], &cwd, &env);
+
+        // CommandBuilder doesn't expose its internals, so we just verify it was created
+        let _ = cmd;
+    }
+
+    #[test]
+    fn test_build_command_with_args() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env = HashMap::new();
+        let cwd = PathBuf::from("/tmp");
+        let args = vec!["hello".to_string(), "world".to_string()];
+        let cmd = build_command("echo", &args, &cwd, &env);
 
         // CommandBuilder doesn't expose its internals, so we just verify it was created
         let _ = cmd;

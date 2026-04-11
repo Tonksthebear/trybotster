@@ -51,6 +51,10 @@ self.addEventListener('fetch', (event) => {
   }
 
   const scopePath = SCOPE;
+  const referrerUrl = event.request.referrer ? safeUrl(event.request.referrer) : null;
+  const fromPreviewScope = referrerUrl && referrerUrl.pathname.startsWith(scopePath);
+  const fromShellPage = referrerUrl && isShellPath(referrerUrl.pathname, scopePath);
+  const fromPreviewContent = fromPreviewScope && !fromShellPage;
 
   // Pass through the shell page (/preview/shell) and bootstrap (/preview)
   // Shell is at a distinct path so /preview/ can proxy to dev server root
@@ -69,17 +73,11 @@ self.addEventListener('fetch', (event) => {
   if (url.pathname.startsWith(scopePath + '/')) {
     // Preview-scoped request: /hubs/123/sessions/abc-uuid/preview/api/users -> /api/users
     relativePath = url.pathname.slice(scopePath.length) || '/';
-  } else if (url.pathname.startsWith('/assets/')) {
-    // Asset request - only proxy if from proxied iframe content, NOT from shell page
-    const referrer = event.request.referrer;
-    // Shell page assets should NOT be proxied (they're from trybotster.com)
-    // Only proxy assets when referrer is proxied content (not /shell)
-    if (referrer && referrer.includes(scopePath) && !referrer.endsWith('/shell')) {
-      relativePath = url.pathname;
-    } else {
-      // Shell page assets or no referrer - don't proxy
-      return;
-    }
+  } else if (fromPreviewContent && !url.pathname.startsWith('/rails/active_storage/')) {
+    // Proxied app content often emits origin-rooted paths like /users/sign_in
+    // or /icon.svg. If the request comes from preview content, keep it in the
+    // tunnel rather than letting it escape to dev.trybotster.com itself.
+    relativePath = url.pathname;
   } else {
     // Not ours to proxy
     return;
@@ -91,7 +89,13 @@ self.addEventListener('fetch', (event) => {
 async function proxyRequest(request, path, queryString) {
   // Get a client (the preview shell page) to communicate with
   const clients = await self.clients.matchAll({ type: 'window' });
-  const client = clients.find(c => c.url.includes(SCOPE));
+  const client = clients.find((candidate) => {
+    const url = safeUrl(candidate.url);
+    return url && isShellPath(url.pathname, SCOPE);
+  }) || clients.find((candidate) => {
+    const url = safeUrl(candidate.url);
+    return url && url.pathname.startsWith(SCOPE);
+  });
 
   if (!client) {
     return new Response('Preview shell not loaded. Please refresh the page.', {
@@ -193,4 +197,16 @@ async function proxyRequest(request, path, queryString) {
       statusText: 'Bad Gateway'
     });
   }
+}
+
+function safeUrl(value) {
+  try {
+    return new URL(value);
+  } catch (_) {
+    return null;
+  }
+}
+
+function isShellPath(pathname, scopePath) {
+  return pathname === scopePath || pathname === scopePath + '/shell';
 }
