@@ -1089,16 +1089,42 @@ impl Hub {
                         hostname,
                         timeout_secs,
                     } => {
+                        log::info!(
+                            "[HostedPreview] Probe start connector={} parent={} url={} hostname={} timeout_secs={:.1}",
+                            connector_session_uuid,
+                            parent_session_uuid,
+                            url,
+                            hostname,
+                            timeout_secs
+                        );
                         let event_tx = self.hub_event_tx.clone();
                         self.tokio_runtime.spawn(async move {
                             let result = crate::hosted_preview::wait_until_dns_ready(
                                 &hostname,
+                                &url,
                                 std::time::Duration::from_secs_f64(timeout_secs.max(0.1)),
                             )
                             .await;
                             let (ready, error) = match result {
-                                Ok(()) => (true, None),
-                                Err(e) => (false, Some(e)),
+                                Ok(()) => {
+                                    log::info!(
+                                        "[HostedPreview] Probe success connector={} parent={} url={}",
+                                        connector_session_uuid,
+                                        parent_session_uuid,
+                                        url
+                                    );
+                                    (true, None)
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[HostedPreview] Probe failure connector={} parent={} url={} reason={}",
+                                        connector_session_uuid,
+                                        parent_session_uuid,
+                                        url,
+                                        e
+                                    );
+                                    (false, Some(e))
+                                }
                             };
                             let _ = event_tx.send(
                                 crate::hub::events::HubEvent::PreviewDnsReady {

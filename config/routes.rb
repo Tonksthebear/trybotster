@@ -37,10 +37,6 @@ Rails.application.routes.draw do
       # Session terminal view by session UUID
       # /hubs/:hub_id/sessions/:session_uuid - terminal for a specific session
       resources :sessions, only: [ :show ], param: :uuid do
-        # Preview - for sessions with port forwarding
-        get "preview/sw.js", to: "sessions/previews#service_worker", as: :preview_service_worker
-        get "preview/shell", to: "sessions/previews#shell", as: :preview_shell
-        get "preview", to: "sessions/previews#bootstrap", as: :preview
       end
     end
   end

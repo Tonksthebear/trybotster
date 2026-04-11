@@ -4,11 +4,10 @@
 -- hub-owned background child process. This reuses the execution model already
 -- proven to work when cloudflared is launched manually inside Botster.
 --
--- Readiness model: cloudflared prints the URL after tunnel registration, but
--- DNS propagation lags a few seconds. If the browser navigates before DNS is
--- live, the system resolver caches NXDOMAIN for ~30 minutes. We gate on a
--- fast DoH check (Cloudflare is authoritative → always fresh) and only
--- surface the URL once DNS resolves. Process exit catches tunnel failures.
+-- Readiness model: cloudflared prints the URL before the tunnel is fully
+-- reachable. We keep the parent session in "starting" until DNS resolves and
+-- HTTPS responds, then surface the hosted URL. Process exit catches tunnel
+-- failures after startup.
 
 local state = require("hub.state")
 local Accessory = require("lib.accessory")
@@ -18,6 +17,10 @@ local TargetContext = require("lib.target_context")
 local M = {}
 
 local connector_output_buffers = state.get("hosted_preview.connector_output_buffers", {})
+local CLOUDFLARED_INSTALL_URL =
+    "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+local MISSING_BINARY_ERROR =
+    "Hosted preview requires cloudflared to be installed on this machine."
 
 local function metadata_flag(value)
     return value == true or value == "true"
@@ -51,6 +54,19 @@ local function trycloudflare_url_from_text(text)
         return nil
     end
     return "https://" .. host, host
+end
+
+local function resolve_cloudflared_binary()
+    local override = os.getenv("BOTSTER_CLOUDFLARED_BIN")
+    if type(override) == "string" and override:match("%S") then
+        local resolved = hub.resolve_command_path(override)
+        if resolved then
+            return resolved
+        end
+        return nil
+    end
+
+    return hub.resolve_command_path("cloudflared")
 end
 
 function M.is_system_session(subject)
@@ -111,6 +127,20 @@ function M.enable(parent)
         return nil, "Parent session has no forwarded port"
     end
 
+    local cloudflared_bin = resolve_cloudflared_binary()
+    if not cloudflared_bin then
+        parent:update({
+            hosted_preview = preview_state_for(parent, {
+                status = "error",
+                error = MISSING_BINARY_ERROR,
+                install_url = CLOUDFLARED_INSTALL_URL,
+                url = nil,
+                connector_session_uuid = nil,
+            }),
+        })
+        return nil, MISSING_BINARY_ERROR
+    end
+
     local existing = M.find_connector(parent.session_uuid)
     if existing then
         M.disable_by_parent_uuid(parent.session_uuid, { clear_parent = false })
@@ -131,7 +161,7 @@ function M.enable(parent)
         worktree_path = parent.worktree_path,
         session = {
             name = "hosted-preview",
-            command = os.getenv("BOTSTER_CLOUDFLARED_BIN") or "cloudflared",
+            command = cloudflared_bin,
             args = {
                 "tunnel",
                 "--url",
@@ -157,6 +187,7 @@ function M.enable(parent)
             hosted_preview = preview_state_for(parent, {
                 status = "error",
                 error = error_message,
+                install_url = nil,
                 url = nil,
                 connector_session_uuid = nil,
             }),
@@ -169,6 +200,7 @@ function M.enable(parent)
         hosted_preview = preview_state_for(parent, {
             status = "starting",
             error = nil,
+            install_url = nil,
             url = nil,
             connector_session_uuid = connector.session_uuid,
         }),
@@ -216,11 +248,12 @@ function M.handle_output(ctx, data)
     end
     connector:set_meta("preview_url", url)
 
-    -- Stay in "starting" until DNS resolves — prevents browser negative-cache
+    -- Stay in "starting" until the probe confirms the hosted URL is live.
     parent:update({
         hosted_preview = preview_state_for(parent, {
             status = "starting",
             error = nil,
+            install_url = nil,
             url = nil,
             connector_session_uuid = connector.session_uuid,
         }),
@@ -253,6 +286,7 @@ function M.handle_dns_ready(data)
                 status = "running",
                 url = url,
                 error = nil,
+                install_url = nil,
                 connector_session_uuid = connector.session_uuid,
             }),
         })
@@ -260,7 +294,8 @@ function M.handle_dns_ready(data)
         parent:update({
             hosted_preview = preview_state_for(parent, {
                 status = "error",
-                error = data.error or "DNS never resolved",
+                error = data.error or "Preview never became reachable",
+                install_url = nil,
                 url = nil,
                 connector_session_uuid = connector.session_uuid,
             }),
@@ -296,6 +331,7 @@ function M.handle_process_exited(data)
                 status = "error",
                 url = nil,
                 error = error_message,
+                install_url = nil,
                 connector_session_uuid = nil,
             }),
         })
@@ -335,6 +371,7 @@ function M.reconcile()
                                 status = "starting",
                                 url = nil,
                                 error = nil,
+                                install_url = nil,
                                 connector_session_uuid = session.session_uuid,
                             }),
                         })
@@ -346,6 +383,7 @@ function M.reconcile()
                             status = "starting",
                             url = nil,
                             error = nil,
+                            install_url = nil,
                             connector_session_uuid = session.session_uuid,
                         }),
                     })
