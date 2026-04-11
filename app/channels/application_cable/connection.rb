@@ -3,20 +3,10 @@
 module ApplicationCable
   class Connection < ActionCable::Connection::Base
     identified_by :current_user
-    identified_by :preview_identity
 
     def connect
-      # Try authenticated paths first (session, HubToken)
-      if (user = find_authenticated_user)
-        self.current_user = user
-      elsif (identity = request.params[:preview_identity])&.start_with?("preview:")
-        # Anonymous public preview connection — identified by preview string only
-        self.preview_identity = identity
-        Rails.logger.info "[ActionCable] Preview connection: #{identity[..30]}"
-      else
-        Rails.logger.warn "[ActionCable] No valid auth - rejecting connection"
-        reject_unauthorized_connection
-      end
+      self.current_user = find_authenticated_user
+      reject_unauthorized_connection unless current_user
     end
 
     private

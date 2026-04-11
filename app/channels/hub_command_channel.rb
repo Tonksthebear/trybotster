@@ -64,35 +64,6 @@ class HubCommandChannel < ApplicationCable::Channel
     Rails.logger.debug "[HubCommandChannel] Heartbeat from hub=#{@hub.id}"
   end
 
-  # CLI announces public preview state changes
-  def update_preview(data)
-    return unless @hub
-
-    case data["type"]
-    when "public_preview_enabled"
-      @hub.enable_public_preview!(data["session_uuid"], data["port"].to_i)
-      Rails.logger.info "[HubCommandChannel] Public preview enabled: hub=#{@hub.id}, session=#{data["session_uuid"]}, port=#{data["port"]}"
-    when "public_preview_disabled"
-      @hub.disable_public_preview!(data["session_uuid"])
-      Rails.logger.info "[HubCommandChannel] Public preview disabled: hub=#{@hub.id}, session=#{data["session_uuid"]}"
-    end
-  end
-
-  # Full sync of public preview state from CLI.
-  # Replaces the entire Rails cache with the CLI's authoritative state.
-  # Sent on every (re)connect so stale entries from before a restart are cleared.
-  def sync_previews(data)
-    return unless @hub
-
-    sessions = (data["sessions"] || []).map do |s|
-      s = s.stringify_keys if s.respond_to?(:stringify_keys)
-      { "session_uuid" => s["session_uuid"], "port" => s["port"].to_i }
-    end
-
-    @hub.update!(public_preview_sessions: sessions)
-    Rails.logger.info "[HubCommandChannel] Preview state synced: hub=#{@hub.id}, #{sessions.size} active preview(s)"
-  end
-
   # Relay opaque encrypted envelope from CLI → specific browser
   def signal(data)
     browser_identity = data["browser_identity"]

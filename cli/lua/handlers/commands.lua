@@ -448,36 +448,6 @@ commands.register("delete_agent", function(_client, _sub_id, command)
     end
 end, { description = "Delete a session (agent or accessory, optionally with worktree)" })
 
-commands.register("toggle_public_preview", function(_client, _sub_id, command)
-    local Session = require("lib.session")
-    local session_id = command.session_uuid or command.agent_id or command.id
-    if not session_id then
-        log.warn("toggle_public_preview missing session identifier")
-        return
-    end
-
-    local session = Session.get(session_id)
-    if not session then
-        log.warn(string.format("toggle_public_preview: session not found: %s", session_id))
-        return
-    end
-
-    local enabled = command.enabled
-    if enabled == nil then
-        -- Toggle: if currently enabled, disable; otherwise enable
-        enabled = not session._public_preview
-    end
-
-    if enabled then
-        local ok, err = pcall(function() session:enable_public_preview() end)
-        if not ok then
-            log.warn(string.format("toggle_public_preview failed: %s", tostring(err)))
-        end
-    else
-        session:disable_public_preview()
-    end
-end, { description = "Enable or disable public preview for a session's forwarded port" })
-
 commands.register("toggle_hosted_preview", function(_client, _sub_id, command)
     local Session = require("lib.session")
     local HostedPreview = require("lib.hosted_preview")

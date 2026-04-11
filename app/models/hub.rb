@@ -24,35 +24,6 @@ class Hub < ApplicationRecord
     true
   end
 
-  # Check if a session has public preview enabled.
-  # public_preview_sessions is a JSON column: [{"session_uuid": "...", "port": 8080}, ...]
-  def public_preview_enabled?(session_uuid)
-    return false unless public_preview_sessions.is_a?(Array)
-
-    public_preview_sessions.any? { |entry| entry["session_uuid"] == session_uuid }
-  end
-
-  # Get the forwarded port for a public preview session.
-  def public_preview_port(session_uuid)
-    return nil unless public_preview_sessions.is_a?(Array)
-
-    entry = public_preview_sessions.find { |e| e["session_uuid"] == session_uuid }
-    entry&.dig("port")
-  end
-
-  # Enable public preview for a session. Called when CLI announces via HubCommandChannel.
-  def enable_public_preview!(session_uuid, port)
-    sessions = (public_preview_sessions || []).reject { |e| e["session_uuid"] == session_uuid }
-    sessions << { "session_uuid" => session_uuid, "port" => port }
-    update!(public_preview_sessions: sessions)
-  end
-
-  # Disable public preview for a session.
-  def disable_public_preview!(session_uuid)
-    sessions = (public_preview_sessions || []).reject { |e| e["session_uuid"] == session_uuid }
-    update!(public_preview_sessions: sessions)
-  end
-
   # Check if this hub is active (alive flag set and seen within 2 minutes)
   def active?
     alive? && last_seen_at > 2.minutes.ago

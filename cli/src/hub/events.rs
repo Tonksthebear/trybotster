@@ -301,17 +301,6 @@ pub(crate) enum HubEvent {
         session_uuid: String,
     },
 
-    /// Enable or disable public preview for a session.
-    ///
-    /// Sent by `hub.set_public_preview()` Lua primitive. When enabling,
-    /// adds the session to `public_preview_sessions`. When disabling,
-    /// removes it and disconnects all preview peers for that session.
-    SetPublicPreview {
-        session_uuid: String,
-        port: u16,
-        enabled: bool,
-    },
-
     /// Async worktree deletion completed.
     ///
     /// Sent by the `spawn_blocking` task in the `WorktreeRequest::Delete`
@@ -388,7 +377,6 @@ impl HubEvent {
             Self::MessageDelivered { .. } => "message_delivered",
             Self::SessionProcessExited { .. } => "session_process_exited",
             Self::SessionUnregistered { .. } => "session_unregistered",
-            Self::SetPublicPreview { .. } => "set_public_preview",
             Self::WorktreeDeleteCompleted { .. } => "worktree_delete_completed",
             Self::WebRtcOfferCompleted { .. } => "webrtc_offer_completed",
         }

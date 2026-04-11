@@ -476,12 +476,6 @@ pub struct Hub {
     webrtc_outgoing_signal_rx:
         Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::OutgoingSignal>>,
 
-    /// Sessions with public preview enabled. Session UUID → authorized port.
-    /// Hub is the sole authority — rejects preview offers for sessions not in this set.
-    pub public_preview_sessions: std::collections::HashMap<String, u16>,
-    /// Reverse index: preview browser_identity → session_uuid.
-    /// Needed for cleanup on disable and session death.
-    pub preview_peers: std::collections::HashMap<String, String>,
     /// TCP stream multiplexers per browser identity for preview tunneling.
     stream_muxes: std::collections::HashMap<String, crate::relay::stream_mux::StreamMultiplexer>,
     /// Receiver for incoming stream frames from WebRTC DataChannels.
@@ -732,8 +726,6 @@ impl Hub {
             active_terminal_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             webrtc_outgoing_signal_tx,
             webrtc_outgoing_signal_rx: Some(webrtc_outgoing_signal_rx),
-            public_preview_sessions: std::collections::HashMap::new(),
-            preview_peers: std::collections::HashMap::new(),
             stream_muxes: std::collections::HashMap::new(),
             stream_frame_rx: Some(stream_frame_rx),
             stream_frame_tx,

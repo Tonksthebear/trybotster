@@ -719,15 +719,9 @@ impl Hub {
                 }
             }
             HubEvent::DcOpened { browser_identity } => {
-                let is_preview = browser_identity.starts_with("preview:");
                 log::info!(
-                    "[WebRTC] DataChannel opened for {}{}",
+                    "[WebRTC] DataChannel opened for {}, firing peer_connected",
                     &browser_identity[..browser_identity.len().min(8)],
-                    if is_preview {
-                        " (preview)"
-                    } else {
-                        ", firing peer_connected"
-                    }
                 );
 
                 // Spawn a forwarding task that reads from the WebRTC recv channel
@@ -761,13 +755,9 @@ impl Hub {
                     // Spawn per-peer send task so DataChannel sends run off the event loop.
                     self.spawn_peer_send_task(&browser_identity);
 
-                    if !is_preview {
-                        // Terminal/browser peers use JSON control frames and Lua lifecycle hooks.
-                        // Public preview peers only carry raw stream mux traffic.
-                        self.spawn_dc_ping_task(&browser_identity);
-                        if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
-                            log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
-                        }
+                    self.spawn_dc_ping_task(&browser_identity);
+                    if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
+                        log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
                     }
                 } else {
                     log::warn!(
@@ -1316,61 +1306,7 @@ impl Hub {
                     active.remove(&session_uuid);
                 }
 
-                // Clean up preview peers if this session had public preview enabled.
-                if self.public_preview_sessions.remove(&session_uuid).is_some() {
-                    let to_disconnect: Vec<String> = self
-                        .preview_peers
-                        .iter()
-                        .filter(|(_, sess)| *sess == &session_uuid)
-                        .map(|(bi, _)| bi.clone())
-                        .collect();
-                    for bi in &to_disconnect {
-                        self.cleanup_webrtc_channel(bi, "session_died");
-                        self.preview_peers.remove(bi);
-                    }
-                    if !to_disconnect.is_empty() {
-                        log::info!(
-                            "[Preview] Session '{}' died, disconnected {} preview peer(s)",
-                            &session_uuid[..session_uuid.len().min(12)],
-                            to_disconnect.len()
-                        );
-                    }
-                }
-
                 log::debug!("[Session] Unregistered '{}'", session_uuid);
-            }
-            HubEvent::SetPublicPreview {
-                session_uuid,
-                port,
-                enabled,
-            } => {
-                if enabled {
-                    self.public_preview_sessions
-                        .insert(session_uuid.clone(), port);
-                    log::info!(
-                        "[Preview] Enabled public preview for session '{}' on port {}",
-                        &session_uuid[..session_uuid.len().min(12)],
-                        port
-                    );
-                } else {
-                    self.public_preview_sessions.remove(&session_uuid);
-                    // Disconnect all preview peers for this session
-                    let to_disconnect: Vec<String> = self
-                        .preview_peers
-                        .iter()
-                        .filter(|(_, sess)| *sess == &session_uuid)
-                        .map(|(bi, _)| bi.clone())
-                        .collect();
-                    for bi in &to_disconnect {
-                        self.cleanup_webrtc_channel(bi, "preview_disabled");
-                        self.preview_peers.remove(bi);
-                    }
-                    log::info!(
-                        "[Preview] Disabled public preview for session '{}', disconnected {} peer(s)",
-                        &session_uuid[..session_uuid.len().min(12)],
-                        to_disconnect.len()
-                    );
-                }
             }
             HubEvent::WebRtcOfferCompleted {
                 browser_identity,
@@ -1394,24 +1330,6 @@ impl Hub {
                         channel.disconnect().await;
                     });
                     return;
-                }
-
-                // Re-check: if preview was disabled while async offer was in flight, reject.
-                if browser_identity.starts_with("preview:") {
-                    let parts: Vec<&str> = browser_identity.splitn(3, ':').collect();
-                    if parts.len() >= 2 && !self.public_preview_sessions.contains_key(parts[1]) {
-                        log::info!(
-                            "[WebRTC] Preview disabled during offer negotiation for {}, discarding",
-                            &browser_identity[..browser_identity.len().min(12)]
-                        );
-                        self.preview_peers.remove(&browser_identity);
-                        self.webrtc_connection_started.remove(&browser_identity);
-                        self.webrtc_offer_generation.remove(&browser_identity);
-                        self.tokio_runtime.spawn(async move {
-                            channel.disconnect().await;
-                        });
-                        return;
-                    }
                 }
 
                 if encrypted_answer.is_none() {
@@ -1859,32 +1777,7 @@ impl Hub {
 
     /// Handle a single incoming stream frame from WebRTC.
     pub fn handle_stream_frame(&mut self, frame: crate::channel::webrtc::StreamIncoming) {
-        use crate::relay::stream_mux::{StreamMultiplexer, FRAME_OPEN};
-
-        // Port validation for preview connections: only the authorized port is allowed.
-        if frame.browser_identity.starts_with("preview:") && frame.frame_type == FRAME_OPEN {
-            if frame.payload.len() >= 2 {
-                let requested_port = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
-                if let Some(session_uuid) = self.preview_peers.get(&frame.browser_identity) {
-                    if let Some(&authorized_port) = self.public_preview_sessions.get(session_uuid) {
-                        if requested_port != authorized_port {
-                            log::warn!(
-                                "[StreamMux] Preview tried port {} but authorized for {} — blocked",
-                                requested_port,
-                                authorized_port
-                            );
-                            return;
-                        }
-                    } else {
-                        log::warn!("[StreamMux] Preview session no longer in public_preview_sessions — blocked");
-                        return;
-                    }
-                } else {
-                    log::warn!("[StreamMux] Preview peer not in preview_peers — blocked");
-                    return;
-                }
-            }
-        }
+        use crate::relay::stream_mux::StreamMultiplexer;
 
         let _guard = self.tokio_runtime.enter();
         let mux = self
@@ -4915,39 +4808,12 @@ impl Hub {
             return;
         }
 
-        let is_preview = browser_identity.starts_with("preview:");
-
-        // Validate preview connections against public_preview_sessions (hub is the gatekeeper).
-        let preview_session_uuid = if is_preview {
-            // Format: preview:{session_uuid}:{tabId}
-            let parts: Vec<&str> = browser_identity.splitn(3, ':').collect();
-            if parts.len() < 3 {
-                log::warn!(
-                    "[WebRTC] Malformed preview identity: {}",
-                    &browser_identity[..browser_identity.len().min(20)]
-                );
-                return;
-            }
-            let session_uuid = parts[1].to_string();
-            if !self.public_preview_sessions.contains_key(&session_uuid) {
-                log::warn!(
-                    "[WebRTC] Rejecting preview offer — session {} not in public_preview_sessions",
-                    &session_uuid[..session_uuid.len().min(12)]
-                );
-                return;
-            }
-            Some(session_uuid)
-        } else {
-            None
-        };
-
         let hub_id = self.server_hub_id().to_string();
         let server_url = self.config.server_url.clone();
         let api_key = self.config.get_api_key().to_string();
 
         log::info!(
-            "[WebRTC] Received {} offer from {}",
-            if is_preview { "preview" } else { "encrypted" },
+            "[WebRTC] Received offer from {}",
             &browser_identity[..browser_identity.len().min(12)]
         );
 
@@ -4955,75 +4821,62 @@ impl Hub {
         let is_new_connection = !self.webrtc_channels.contains_key(browser_identity);
 
         if is_new_connection {
-            if !is_preview {
-                // Clean up stale channels from the same device (same Olm key, different tab UUID).
-                let olm_key = crate::relay::extract_olm_key(browser_identity);
-                let stale: Vec<String> = self
-                    .webrtc_channels
-                    .keys()
-                    .filter(|id| {
-                        *id != browser_identity && crate::relay::extract_olm_key(id) == olm_key
-                    })
-                    .cloned()
-                    .collect();
-                for stale_id in stale {
-                    log::info!(
-                        "[WebRTC] Replacing stale channel for same device: {}",
-                        &stale_id[..stale_id.len().min(8)]
-                    );
-                    self.cleanup_webrtc_channel(&stale_id, "replaced");
-                }
+            // Clean up stale channels from the same device (same Olm key, different tab UUID).
+            let olm_key = crate::relay::extract_olm_key(browser_identity);
+            let stale: Vec<String> = self
+                .webrtc_channels
+                .keys()
+                .filter(|id| {
+                    *id != browser_identity && crate::relay::extract_olm_key(id) == olm_key
+                })
+                .cloned()
+                .collect();
+            for stale_id in stale {
+                log::info!(
+                    "[WebRTC] Replacing stale channel for same device: {}",
+                    &stale_id[..stale_id.len().min(8)]
+                );
+                self.cleanup_webrtc_channel(&stale_id, "replaced");
+            }
 
-                // Wait briefly for the previous connection's sockets to be released.
-                if let Some(mut close_rx) = self.webrtc_pending_closes.remove(olm_key) {
-                    if *close_rx.borrow() {
-                        log::debug!("[WebRTC] Previous connection already closed");
-                    } else {
-                        match tokio::task::block_in_place(|| {
-                            self.tokio_runtime.block_on(tokio::time::timeout(
-                                std::time::Duration::from_millis(100),
-                                close_rx.wait_for(|v| *v),
-                            ))
-                        }) {
-                            Ok(Ok(_)) => {
-                                log::debug!("[WebRTC] Previous connection sockets released")
-                            }
-                            Ok(Err(_)) => {
-                                log::debug!("[WebRTC] Close channel dropped, proceeding")
-                            }
-                            Err(_) => log::debug!(
-                                "[WebRTC] Previous connection still closing, proceeding anyway"
-                            ),
+            // Wait briefly for the previous connection's sockets to be released.
+            if let Some(mut close_rx) = self.webrtc_pending_closes.remove(olm_key) {
+                if *close_rx.borrow() {
+                    log::debug!("[WebRTC] Previous connection already closed");
+                } else {
+                    match tokio::task::block_in_place(|| {
+                        self.tokio_runtime.block_on(tokio::time::timeout(
+                            std::time::Duration::from_millis(100),
+                            close_rx.wait_for(|v| *v),
+                        ))
+                    }) {
+                        Ok(Ok(_)) => {
+                            log::debug!("[WebRTC] Previous connection sockets released")
                         }
+                        Ok(Err(_)) => {
+                            log::debug!("[WebRTC] Close channel dropped, proceeding")
+                        }
+                        Err(_) => log::debug!(
+                            "[WebRTC] Previous connection still closing, proceeding anyway"
+                        ),
                     }
                 }
             }
 
-            let mut builder = WebRtcChannel::builder()
+            let builder = WebRtcChannel::builder()
                 .server_url(&server_url)
                 .api_key(&api_key)
                 .signal_tx(self.webrtc_outgoing_signal_tx.clone())
                 .stream_frame_tx(self.stream_frame_tx.clone())
-                .hub_event_tx(self.hub_event_tx.clone());
-
-            if is_preview {
-                // Preview: no crypto, no PTY input, no file input
-                log::info!(
-                    "[WebRTC] Building plaintext preview channel for {}",
-                    &browser_identity[..browser_identity.len().min(12)]
-                );
-            } else {
-                // Encrypted: full access
-                builder = builder
-                    .crypto_service(
-                        self.browser
-                            .crypto_service
-                            .clone()
-                            .expect("crypto service required"),
-                    )
-                    .pty_input_tx(self.pty_input_tx.clone())
-                    .file_input_tx(self.file_input_tx.clone());
-            }
+                .hub_event_tx(self.hub_event_tx.clone())
+                .crypto_service(
+                    self.browser
+                        .crypto_service
+                        .clone()
+                        .expect("crypto service required"),
+                )
+                .pty_input_tx(self.pty_input_tx.clone())
+                .file_input_tx(self.file_input_tx.clone());
 
             let mut channel = builder.build();
 
@@ -5031,7 +4884,7 @@ impl Hub {
                 channel_name: "WebRtcChannel".to_string(),
                 hub_id: hub_id.clone(),
                 browser_identity: Some(browser_identity.to_string()),
-                encrypt: !is_preview,
+                encrypt: true,
                 compression_threshold: Some(4096),
                 cli_subscription: false,
             };
@@ -5050,12 +4903,6 @@ impl Hub {
             // Track connection start time for timeout detection
             self.webrtc_connection_started
                 .insert(browser_identity.to_string(), Instant::now());
-
-            // Track preview peer → session mapping for cleanup
-            if let Some(ref session_uuid) = preview_session_uuid {
-                self.preview_peers
-                    .insert(browser_identity.to_string(), session_uuid.clone());
-            }
         }
 
         // Remove the channel from the HashMap to pass it owned to the async task.
@@ -5072,11 +4919,7 @@ impl Hub {
         let event_tx = self.hub_event_tx.clone();
         let sdp = sdp.to_string();
         let browser_id = browser_identity.to_string();
-        let olm_key = if is_preview {
-            String::new()
-        } else {
-            crate::relay::extract_olm_key(browser_identity).to_string()
-        };
+        let olm_key = crate::relay::extract_olm_key(browser_identity).to_string();
         let offer_generation = {
             let entry = self
                 .webrtc_offer_generation
@@ -5086,19 +4929,13 @@ impl Hub {
             *entry
         };
 
-        // Spawn async task for SDP negotiation + answer (encrypted or plaintext).
-        let is_preview_clone = is_preview;
+        // Spawn async task for SDP negotiation + answer encryption.
         self.tokio_runtime.spawn(async move {
             let started_at = Instant::now();
             let answer_value = match channel.handle_sdp_offer(&sdp, &browser_id).await {
                 Ok(answer_sdp) => {
                     log::info!(
-                        "[WebRTC] Created answer for {} {} in {}ms",
-                        if is_preview_clone {
-                            "preview"
-                        } else {
-                            "browser"
-                        },
+                        "[WebRTC] Created answer for {} in {}ms",
                         &browser_id[..browser_id.len().min(12)],
                         started_at.elapsed().as_millis()
                     );
@@ -5108,42 +4945,36 @@ impl Hub {
                         "sdp": answer_sdp,
                     });
 
-                    if is_preview_clone {
-                        // Plaintext answer for preview connections
-                        Some(answer_payload)
-                    } else {
-                        // Encrypted answer for paired connections
-                        let Some(ref crypto) = crypto else {
-                            log::error!("[WebRTC] No crypto service for encrypted answer");
-                            return;
-                        };
-                        let plaintext = serde_json::to_vec(&answer_payload).unwrap_or_default();
-                        match crypto.lock() {
-                            Ok(mut guard) => match guard.encrypt(&plaintext, &olm_key) {
-                                Ok(envelope) => match serde_json::to_value(&envelope) {
-                                    Ok(v) => Some(v),
-                                    Err(e) => {
-                                        log::error!(
-                                            "[WebRTC] Failed to serialize answer envelope: {e}"
-                                        );
-                                        None
-                                    }
-                                },
+                    let Some(ref crypto) = crypto else {
+                        log::error!("[WebRTC] No crypto service for encrypted answer");
+                        return;
+                    };
+                    let plaintext = serde_json::to_vec(&answer_payload).unwrap_or_default();
+                    match crypto.lock() {
+                        Ok(mut guard) => match guard.encrypt(&plaintext, &olm_key) {
+                            Ok(envelope) => match serde_json::to_value(&envelope) {
+                                Ok(v) => Some(v),
                                 Err(e) => {
                                     log::error!(
-                                        "[WebRTC] Failed to encrypt answer after {}ms: {e}",
-                                        started_at.elapsed().as_millis()
+                                        "[WebRTC] Failed to serialize answer envelope: {e}"
                                     );
                                     None
                                 }
                             },
                             Err(e) => {
                                 log::error!(
-                                    "[WebRTC] Crypto mutex poisoned after {}ms: {e}",
+                                    "[WebRTC] Failed to encrypt answer after {}ms: {e}",
                                     started_at.elapsed().as_millis()
                                 );
                                 None
                             }
+                        },
+                        Err(e) => {
+                            log::error!(
+                                "[WebRTC] Crypto mutex poisoned after {}ms: {e}",
+                                started_at.elapsed().as_millis()
+                            );
+                            None
                         }
                     }
                 }

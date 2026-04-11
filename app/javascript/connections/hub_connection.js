@@ -286,17 +286,6 @@ export class HubTransport extends HubRoute {
   }
 
   /**
-   * Toggle public preview for a session.
-   * @param {string} sessionUuid - Session UUID
-   * @param {boolean} [enabled] - Explicit enable/disable. Omit to toggle.
-   */
-  togglePublicPreview(sessionUuid, enabled) {
-    const payload = { session_uuid: sessionUuid }
-    if (enabled !== undefined) payload.enabled = enabled
-    return this.send("toggle_public_preview", payload);
-  }
-
-  /**
    * Toggle a Cloudflare-hosted preview for a session.
    * @param {string} sessionUuid - Session UUID
    * @param {boolean} [enabled] - Explicit enable/disable. Omit to toggle.
