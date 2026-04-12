@@ -47,6 +47,11 @@ const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How often to check for unconfirmed subscriptions that have timed out.
 const CONFIRM_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long to wait without receiving any WebSocket message before treating the
+/// connection as dead. ActionCable sends pings every ~3 seconds, so 15 seconds
+/// of silence means the connection silently died (no close frame, no error).
+const RECEIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Message received from the hub command channel.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommandMessage {
@@ -428,6 +433,11 @@ async fn run_message_loop(
     let mut confirm_check = tokio::time::interval(CONFIRM_CHECK_INTERVAL);
     confirm_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Deadline for receiving any WebSocket message. Reset on every received
+    // message. If this fires, the connection silently died.
+    let receive_deadline = tokio::time::sleep(RECEIVE_TIMEOUT);
+    tokio::pin!(receive_deadline);
+
     loop {
         if config.shutdown.load(Ordering::SeqCst) {
             log::info!("[ActionCable] Shutdown requested, closing connection");
@@ -438,6 +448,9 @@ async fn run_message_loop(
         tokio::select! {
             // Receive from WebSocket
             msg = reader.recv() => {
+                // Any received message proves the connection is alive — reset deadline
+                receive_deadline.as_mut().reset(tokio::time::Instant::now() + RECEIVE_TIMEOUT);
+
                 match msg {
                     Some(Ok(crate::ws::WsMessage::Text(text))) => {
                         let prev_confirmed = confirmed.len();
@@ -512,6 +525,15 @@ async fn run_message_loop(
                     );
                     pending_performs.push(request);
                 }
+            }
+
+            // No WebSocket messages received within RECEIVE_TIMEOUT — connection is dead
+            () = &mut receive_deadline => {
+                log::warn!(
+                    "[ActionCable] No messages received for {}s, connection presumed dead",
+                    RECEIVE_TIMEOUT.as_secs()
+                );
+                return ConnectionLoopExit::Disconnected;
             }
 
             // Check for unconfirmed subscriptions that have timed out
