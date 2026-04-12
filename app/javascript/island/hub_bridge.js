@@ -1,14 +1,15 @@
 import { HubManager } from "connections";
-import { normalize, selectedSessionId } from "island/store";
+import { normalize, selectedSessionId, setSurface } from "island/store";
 
 let hub = null;
 let unsubscribers = [];
 
 // Connect the signal store to a hub's live state.
 // Call once from the Stimulus mount controller.
-export async function connect(hubId) {
+export async function connect(hubId, { surface = "panel" } = {}) {
   if (hub) disconnect();
 
+  setSurface(surface);
   hub = await HubManager.acquire(hubId);
 
   // Hydrate from current state (always normalize — clears stale data from prior hub)
