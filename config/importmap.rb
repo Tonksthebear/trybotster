@@ -25,3 +25,12 @@ pin_all_from "app/javascript/channels", under: "channels"
 pin "@tailwindplus/elements", to: "@tailwindplus--elements.js" # @1.0.22
 pin "chunk-qj4j7h9k", to: "chunk-qj4j7h9k.js"
 pin "restty", to: "restty.js"
+
+# Preact island runtime (htm tagged templates — no build step)
+pin "preact", to: "preact.js" # @10.29.1
+pin "preact/hooks", to: "preact--hooks.js" # @10.29.1
+pin "htm", to: "htm.js" # @3.1.1
+pin "htm/preact", to: "htm--preact.js" # @3.1.1
+pin "@preact/signals-core", to: "@preact--signals-core.js" # @1.14.1
+pin "@preact/signals", to: "@preact--signals.js" # @2.9.0
+pin_all_from "app/javascript/island", under: "island"
