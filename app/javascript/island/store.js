@@ -116,6 +116,12 @@ export function getUngroupedSessions() {
   return ungroupedSessionIds.value.map((id) => byId[id]).filter(Boolean);
 }
 
+// Set the rendering surface (called by mount controller to configure density)
+// The Stimulus controller should pass "sidebar" or "panel" from the ERB template.
+export function setSurface(value) {
+  surface.value = value;
+}
+
 // Toggle workspace collapse
 export function toggleWorkspaceCollapsed(workspaceId) {
   const next = new Set(collapsedWorkspaceIds.value);
@@ -125,4 +131,65 @@ export function toggleWorkspaceCollapsed(workspaceId) {
     next.add(workspaceId);
   }
   collapsedWorkspaceIds.value = next;
+}
+
+// --- Composite prop derivations ---
+
+// Derive WorkspaceGroupPropsV1 for a given workspace id
+export function workspaceGroupProps(workspaceId) {
+  const ws = workspacesById.value[workspaceId];
+  if (!ws) return null;
+  const sessions = workspaceSessions(workspaceId);
+  return {
+    id: workspaceId,
+    title: ws.name || ws.id,
+    count: sessions.length,
+    expanded: !collapsedWorkspaceIds.value.has(workspaceId),
+    density: surface.value === "sidebar" ? "sidebar" : "panel",
+    canRename: true,
+    sessions,
+  };
+}
+
+// Derive SessionRowPropsV1 from a raw session object
+export function sessionRowProps(session) {
+  if (!session) return null;
+  const preview = previewState(session);
+  return {
+    sessionId: session.id,
+    sessionUuid: session.session_uuid,
+    density: surface.value === "sidebar" ? "sidebar" : "panel",
+    primaryName: displayName(session),
+    titleLine: titleLine(session),
+    subtext: subtext(session),
+    selected: selectedSessionId.value === session.id,
+    notification: !!session.notification,
+    sessionType: session.session_type || "agent",
+    activityState: activityState(session),
+    hostedPreview: preview.canPreview ? preview : null,
+    previewError: preview.status === "error" ? preview.error : null,
+    actionsMenu: {
+      canPreview: preview.canPreview,
+      previewStatus: preview.status,
+      previewUrl: preview.url,
+      canMove: true,
+      canDelete: true,
+    },
+    canMoveWorkspace: true,
+    canDelete: true,
+    inWorktree: session.in_worktree ?? true,
+  };
+}
+
+// Derive HostedPreviewIndicatorPropsV1 from a session
+export function hostedPreviewIndicatorProps(session) {
+  if (!session) return null;
+  const preview = previewState(session);
+  if (!preview.canPreview) return null;
+  return {
+    status: preview.status,
+    url: preview.url,
+    error: preview.error,
+    installUrl: preview.installUrl,
+  };
 }
