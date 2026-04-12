@@ -175,63 +175,97 @@
 
         <%# Template for agent cards %>
         <template data-agent-list-target="template">
-          <div class="group relative flex items-center gap-0 bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 hover:border-zinc-700 rounded-lg transition-colors border-l-2 border-l-transparent data-[notification=true]:border-l-yellow-400">
-            <a data-href="/hubs/{hubId}/sessions/{sessionUuid}"
-               data-agent-id
-               class="flex items-center gap-3 px-4 py-3 flex-1 min-w-0">
-              <div class="size-10 rounded-lg bg-zinc-700/50 flex items-center justify-center text-zinc-400 shrink-0">
-                <%= icon "command-line", class: "size-5" %>
-              </div>
-              <div class="flex-1 min-w-0">
-                <div class="flex items-center gap-2 min-w-0">
-                  <span data-activity-indicator class="hidden shrink-0 text-sm leading-none"></span>
-                  <div data-field="name" class="text-sm font-medium text-zinc-100 truncate font-mono"></div>
+          <div class="group relative bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 hover:border-zinc-700 rounded-lg transition-colors border-l-2 border-l-transparent data-[notification=true]:border-l-yellow-400">
+            <div class="flex items-center gap-0">
+              <a data-href="/hubs/{hubId}/sessions/{sessionUuid}"
+                 data-agent-id
+                 class="flex items-center gap-3 px-4 py-3 flex-1 min-w-0">
+                <div class="size-10 rounded-lg bg-zinc-700/50 flex items-center justify-center text-zinc-400 shrink-0">
+                  <%= icon "command-line", class: "size-5" %>
                 </div>
-                <div data-field="title-line" class="text-xs text-zinc-500 italic truncate hidden"></div>
-                <div data-field="subtext" class="text-xs text-zinc-400 truncate"></div>
-                <div data-preview-status class="hidden mt-1 text-[11px] leading-4 text-zinc-400">
-                  <span data-preview-message></span>
-                  <a data-preview-install-link
-                     class="hidden ml-2 underline decoration-zinc-500 underline-offset-2 hover:text-zinc-200 hover:decoration-zinc-300"
-                     target="_blank"
-                     rel="noopener noreferrer">Install</a>
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center gap-2 min-w-0">
+                    <span data-activity-indicator class="hidden shrink-0 text-sm leading-none"></span>
+                    <div data-field="name" class="text-sm font-medium text-zinc-100 truncate font-mono"></div>
+                  </div>
+                  <div data-field="title-line" class="text-xs text-zinc-500 italic truncate hidden"></div>
+                  <div data-field="subtext" class="text-xs text-zinc-400 truncate"></div>
                 </div>
+                <%= icon "chevron-right", class: "size-5 text-zinc-600 shrink-0" %>
+              </a>
+              <a data-preview-indicator
+                 data-preview-indicator-visible="false"
+                 data-preview-state="inactive"
+                 class="hidden shrink-0 p-3 transition-colors data-[preview-indicator-visible=true]:block data-[preview-state=running]:text-emerald-400 data-[preview-state=starting]:text-amber-400 data-[preview-state=error]:text-red-400"
+                 target="_blank"
+                 rel="noopener noreferrer"
+                 title="Cloudflare preview status">
+                <%= icon "globe-alt", class: "size-4" %>
+              </a>
+              <%= render Elements::DropdownComponent.new(
+                anchor: "bottom end",
+                class: "shrink-0",
+                panel: "w-56 rounded-md bg-zinc-800 py-1 shadow-lg outline-1 -outline-offset-1 outline-white/10"
+              ) do |dropdown| %>
+                <% dropdown.with_button(
+                  class: "shrink-0 p-3 text-zinc-600 hover:text-zinc-300 transition-colors"
+                ) do %>
+                  <span class="sr-only">Open session options</span>
+                  <%= icon "ellipsis-vertical", class: "size-4" %>
+                <% end %>
+
+                <button type="button"
+                        data-agent-id
+                        data-action="agent-list#togglePreview"
+                        data-preview-button
+                        data-preview-visible="false"
+                        data-preview-state="inactive"
+                        class="hidden w-full items-center gap-3 px-3 py-2 text-left text-sm text-zinc-200 hover:bg-zinc-700/70 focus:bg-zinc-700/70 focus:outline-hidden data-[preview-visible=true]:flex"
+                        title="Enable Cloudflare preview">
+                  <%= icon "globe-alt", class: "size-4 shrink-0 text-zinc-400" %>
+                  <span data-preview-button-label class="min-w-0 flex-1 truncate">Enable Cloudflare preview</span>
+                </button>
+                <a data-preview-link
+                   data-preview-visible="false"
+                   data-preview-state="unavailable"
+                   class="hidden items-center gap-3 px-3 py-2 text-sm text-zinc-200 hover:bg-zinc-700/70 focus:bg-zinc-700/70 focus:outline-hidden data-[preview-visible=true]:flex"
+                   target="_blank"
+                   rel="noopener noreferrer"
+                   title="Open Cloudflare preview in new tab">
+                  <%= icon "arrow-top-right-on-square", class: "size-4 shrink-0 text-zinc-400" %>
+                  <span class="min-w-0 flex-1 truncate">Open Cloudflare preview</span>
+                </a>
+                <button type="button"
+                        data-agent-id
+                        data-action="agent-list#moveAgentWorkspace"
+                        class="flex w-full items-center gap-3 px-3 py-2 text-left text-sm text-zinc-200 hover:bg-zinc-700/70 focus:bg-zinc-700/70 focus:outline-hidden"
+                        title="Move to workspace">
+                  <%= icon "arrows-right-left", class: "size-4 shrink-0 text-zinc-400" %>
+                  <span class="min-w-0 flex-1 truncate">Move to workspace</span>
+                </button>
+                <button type="button"
+                        data-agent-id
+                        data-action="agent-list#delete"
+                        class="flex w-full items-center gap-3 px-3 py-2 text-left text-sm text-red-200 hover:bg-red-500/15 focus:bg-red-500/15 focus:outline-hidden"
+                        title="Delete agent">
+                  <%= icon "trash", class: "size-4 shrink-0 text-red-300" %>
+                  <span class="min-w-0 flex-1 truncate">Delete session</span>
+                </button>
+              <% end %>
+            </div>
+            <div data-preview-error-panel
+                 class="hidden px-4 pb-3">
+              <div class="flex items-start gap-3 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2">
+                <%= icon "exclamation-triangle", class: "size-4 shrink-0 text-red-300 mt-0.5" %>
+                <div class="min-w-0 flex-1">
+                  <div data-preview-error-message class="text-xs leading-5 text-red-200"></div>
+                </div>
+                <a data-preview-install-link
+                   class="hidden shrink-0 text-xs font-medium text-red-100 underline decoration-red-300/70 underline-offset-2 hover:text-white hover:decoration-red-100"
+                   target="_blank"
+                   rel="noopener noreferrer">Install</a>
               </div>
-              <%= icon "chevron-right", class: "size-5 text-zinc-600 shrink-0" %>
-            </a>
-            <button type="button"
-                    data-agent-id
-                    data-action="agent-list#togglePreview"
-                    data-preview-button
-                    data-preview-visible="false"
-                    data-preview-state="inactive"
-                    class="shrink-0 p-3 text-zinc-600 hover:text-zinc-300 transition-colors data-[preview-visible=false]:hidden data-[preview-state=starting]:text-amber-400 data-[preview-state=running]:text-emerald-400 data-[preview-state=error]:text-red-400 data-[preview-state=inactive]:text-zinc-600"
-                    title="Enable Cloudflare preview">
-              <%= icon "globe-alt", class: "size-4" %>
-            </button>
-            <a data-preview-link
-               data-preview-visible="false"
-               data-preview-state="unavailable"
-               class="shrink-0 p-3 text-zinc-600 hover:text-zinc-300 transition-colors data-[preview-visible=false]:hidden data-[preview-state=running]:text-emerald-400 data-[preview-state=starting]:text-amber-400 data-[preview-state=error]:text-red-400 data-[preview-state=unavailable]:text-zinc-600"
-               target="_blank"
-               rel="noopener noreferrer"
-               title="Open Cloudflare preview in new tab">
-              <%= icon "arrow-top-right-on-square", class: "size-4" %>
-            </a>
-            <button type="button"
-                    data-agent-id
-                    data-action="agent-list#moveAgentWorkspace"
-                    class="shrink-0 p-3 text-zinc-600 hover:text-zinc-300 transition-colors"
-                    title="Move to workspace">
-              <%= icon "arrows-right-left", class: "size-4" %>
-            </button>
-            <button type="button"
-                    data-agent-id
-                    data-action="agent-list#delete"
-                    class="shrink-0 p-3 text-zinc-600 hover:text-red-400 transition-colors"
-                    title="Delete agent">
-              <%= icon "trash", class: "size-4" %>
-            </button>
+            </div>
           </div>
         </template>
 

@@ -103,14 +103,22 @@ end
 
 function M.disable_by_parent_uuid(parent_uuid, opts)
     opts = opts or {}
+    local parent = Session.get(parent_uuid)
+    if parent and opts.clear_parent ~= false then
+        parent:update({
+            hosted_preview = preview_state_for(parent, {
+                status = "inactive",
+                error = nil,
+                install_url = nil,
+                url = nil,
+                connector_session_uuid = nil,
+            }),
+        })
+    end
+
     local connector = M.find_connector(parent_uuid)
     if connector then
         close_connector(connector)
-    end
-
-    local parent = Session.get(parent_uuid)
-    if parent and opts.clear_parent ~= false then
-        parent:update({ hosted_preview = nil })
     end
 end
 
