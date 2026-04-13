@@ -163,6 +163,15 @@
           <p class="px-2 py-4 text-center text-xs text-zinc-600">Connecting...</p>
         </div>
       </div>
+
+      <%# React workspace list (new — renders side by side with Stimulus version during migration) %>
+      <div data-controller="react-mount"
+           data-component="App"
+           data-props='<%= { hubId: Current.hub.id, surface: "sidebar" }.to_json %>'
+           data-turbo-permanent
+           id="react-workspace-sidebar-<%= local_assigns[:sidebar_id] || 'default' %>"
+           class="flex-1 overflow-y-auto px-2 pt-1 pb-2">
+      </div>
     <% end %>
   </div>
 

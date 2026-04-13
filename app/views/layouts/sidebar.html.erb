@@ -16,6 +16,8 @@
     <meta name="crypto-wasm-binary-url" content="<%= asset_path('vodozemac/vodozemac_wasm_bg.wasm') %>">
 
     <%= yield :head %>
+    <%= vite_client_tag %>
+    <%= vite_javascript_tag 'application.jsx' %>
 
     <link rel="icon" href="/favicon-96.png" type="image/png" sizes="96x96">
     <link rel="icon" href="/favicon.png" type="image/png" sizes="32x32">

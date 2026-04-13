@@ -302,6 +302,14 @@
           </p>
         </div>
       </div>
+
+      <%# React workspace list (new — renders side by side with Stimulus version during migration) %>
+      <div data-controller="react-mount"
+           data-component="App"
+           data-props='<%= { hubId: Current.hub.id, surface: "panel" }.to_json %>'
+           id="react-workspace-panel"
+           class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 lg:p-6 mt-6">
+      </div>
     </div>
   </div>
 

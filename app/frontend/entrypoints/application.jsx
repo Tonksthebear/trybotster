@@ -1,11 +1,17 @@
 import React from 'react'
 import { createRoot } from 'react-dom/client'
 import ProofOfLife from '../components/ProofOfLife'
+import App from '../components/App'
+
+// Side-effect import: registers singleton event listeners for
+// rename/move/delete CustomEvents dispatched by the action system.
+import '../lib/modal-bridge'
 
 // Component registry — maps data-component names to React components.
 // Future agents add entries here as new components are built.
 const COMPONENTS = {
   ProofOfLife,
+  App,
 }
 
 // Track mounted roots for cleanup on disconnect
