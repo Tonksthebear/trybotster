@@ -59,6 +59,9 @@ Rails.application.routes.draw do
   get "docs", to: "docs#show", as: :docs
   get "docs/*path", to: "docs#show", as: :doc
 
+  # Vite + React proof-of-life (scaffold validation — remove when real UI ships)
+  get "vite", to: "vite_proof#show"
+
   root to: "home#index"
 
   # PWA

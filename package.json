@@ -1,0 +1,17 @@
+{
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.1",
+    "vite": "^8.0.8",
+    "vite-plugin-ruby": "^5.2.1"
+  },
+  "dependencies": {
+    "@headlessui/react": "^2.2.10",
+    "clsx": "^2.1.1",
+    "motion": "^12.38.0",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
+    "zustand": "^5.0.12"
+  }
+}

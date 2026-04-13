@@ -83,3 +83,6 @@ end
 # UI Components
 gem "view_component"
 gem "classy-yaml"
+
+# Vite for React frontend (coexists with importmap for Stimulus/Turbo)
+gem "vite_rails"

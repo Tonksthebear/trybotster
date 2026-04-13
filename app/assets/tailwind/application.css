@@ -6,6 +6,7 @@
 /* Mobile keyboard open — matches when body has data-mobile-keyboard */
 @custom-variant mobile-keyboard (body[data-mobile-keyboard] &);
 @source "../../../app/components";
+@source "../../../app/frontend";
 @source "../../../config/elements.yml";
 
 /* Disable pinch zoom in standalone PWA mode */
