@@ -5,6 +5,9 @@ import App from '../components/App'
 import DialogHost from '../components/DialogHost'
 import PairingPage from '../components/pairing/PairingPage'
 import SettingsApp from '../components/settings/SettingsApp'
+import TerminalView from '../components/terminal/TerminalView'
+import ShareHub from '../components/hub/ShareHub'
+import ConnectionStatus from '../components/hub/ConnectionStatus'
 
 // Side-effect import: registers singleton event listeners for
 // rename/move/delete CustomEvents dispatched by the action system.
@@ -17,6 +20,9 @@ const COMPONENTS = {
   App,
   PairingPage,
   SettingsApp,
+  TerminalView,
+  ShareHub,
+  ConnectionStatus,
 }
 
 // Track mounted roots for cleanup on disconnect

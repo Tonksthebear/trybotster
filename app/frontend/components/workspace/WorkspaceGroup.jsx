@@ -1,20 +1,19 @@
 import React from 'react'
 import clsx from 'clsx'
-import {
-  useWorkspaceStore,
-  selectWorkspaceGroupProps,
-} from '../../store/workspace-store'
+import { useWorkspaceStore } from '../../store/workspace-store'
 import { dispatch, ACTION } from '../../lib/actions'
 import SessionRow from './SessionRow'
 
 export default function WorkspaceGroup({ workspaceId, hubId, surface }) {
-  const groupProps = useWorkspaceStore((s) =>
-    selectWorkspaceGroupProps(s, workspaceId)
+  const ws = useWorkspaceStore((s) => s.workspacesById[workspaceId])
+  const expanded = useWorkspaceStore(
+    (s) => !s.collapsedWorkspaceIds.has(workspaceId)
   )
 
-  if (!groupProps || groupProps.count === 0) return null
+  if (!ws || !Array.isArray(ws.agents) || ws.agents.length === 0) return null
 
-  const { title, count, expanded, sessions } = groupProps
+  const title = ws.name || ws.id
+  const count = ws.agents.length
   const density = surface === 'sidebar' ? 'sidebar' : 'panel'
   const isSidebar = density === 'sidebar'
 
@@ -96,10 +95,10 @@ export default function WorkspaceGroup({ workspaceId, hubId, surface }) {
 
       {expanded && (
         <div className={isSidebar ? 'space-y-0.5' : 'space-y-2'}>
-          {sessions.map((session) => (
+          {ws.agents.map((id) => (
             <SessionRow
-              key={session.id}
-              sessionId={session.id}
+              key={id}
+              sessionId={id}
               hubId={hubId}
               surface={surface}
             />

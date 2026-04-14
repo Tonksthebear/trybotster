@@ -24,153 +24,18 @@
 
     <%# Workspaces Section - only shown when hub is selected %>
     <% if Current.hub %>
-      <div class="flex flex-col min-h-0 border-t border-zinc-800"
-           data-controller="agent-list"
-           data-agent-list-hub-id-value="<%= Current.hub.id %>"
-           data-agent-list-agents-value="[]"
-           data-agent-list-workspaces-value="[]"
-           data-turbo-permanent
-           id="sidebar-agent-list-<%= local_assigns[:sidebar_id] || 'default' %>">
-        <div class="shrink-0 flex items-center justify-between px-4 py-3">
+      <div class="flex flex-col min-h-0 border-t border-zinc-800">
+        <div class="shrink-0 px-4 py-3">
           <h2 class="text-xs font-medium text-zinc-500 uppercase tracking-wider">Workspaces</h2>
-          <button type="button"
-                  data-controller="requires-connection"
-                  data-requires-connection-key-value="<%= Current.hub.id %>"
-                  class="p-1 text-zinc-500 hover:text-primary-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-500"
-                  title="New Session"
-                  command="show-modal"
-                  commandfor="new-session-chooser-modal"
-                  disabled>
-            <%= icon "plus", class: "size-4" %>
-          </button>
         </div>
 
-        <%# Template for workspace group headers %>
-        <template data-agent-list-target="workspaceTemplate">
-          <div class="flex items-center gap-1.5 px-2 pt-2 pb-1 cursor-pointer select-none group/ws">
-            <svg data-workspace-chevron class="size-3 text-zinc-600 transition-transform duration-150 shrink-0" viewBox="0 0 20 20" fill="currentColor">
-              <path fill-rule="evenodd" d="M6.293 7.293a1 1 0 011.414 0L10 9.586l2.293-2.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clip-rule="evenodd" />
-            </svg>
-            <span data-field="workspace-title" class="text-[10px] font-medium text-zinc-500 group-hover/ws:text-zinc-400 truncate uppercase tracking-wider"></span>
-            <button type="button"
-                    data-workspace-id
-                    data-action="agent-list#renameWorkspace"
-                    class="ml-auto shrink-0 p-1 text-zinc-700 hover:text-zinc-400 opacity-0 group-hover/ws:opacity-100 transition-opacity"
-                    title="Rename workspace">
-              <%= icon "pencil", class: "size-3" %>
-            </button>
-          </div>
-        </template>
-
-        <%# Template for each agent item %>
-        <template data-agent-list-target="template">
-          <div class="group relative rounded transition-colors hover:bg-zinc-800/50 data-[selected=true]:bg-primary-500/20 border-l-2 border-l-transparent data-[notification=true]:border-l-yellow-400">
-            <div class="flex items-center gap-1">
-              <a data-href="/hubs/{hubId}/sessions/{sessionUuid}"
-                 data-agent-id
-                 data-action="agent-list#select"
-                 class="flex-1 text-left px-2 py-1.5 min-w-0 text-zinc-300 hover:text-zinc-100 data-[selected=true]:text-primary-300 data-[selected=true]:font-medium">
-                <div class="flex items-center gap-1.5 min-w-0">
-                  <span data-activity-indicator class="hidden shrink-0 text-xs leading-none"></span>
-                  <span data-field="name" class="truncate font-mono text-xs block"></span>
-                </div>
-                <span data-field="title-line" class="truncate text-[10px] text-zinc-500 italic block hidden"></span>
-                <span data-field="subtext" class="truncate text-[10px] text-zinc-500 block"></span>
-              </a>
-              <a data-preview-indicator
-                 data-preview-indicator-visible="false"
-                 data-preview-state="inactive"
-                 class="hidden shrink-0 p-1.5 transition-colors data-[preview-indicator-visible=true]:block data-[preview-state=running]:text-emerald-400 data-[preview-state=starting]:text-amber-400 data-[preview-state=error]:text-red-400"
-                 target="_blank"
-                 rel="noopener noreferrer"
-                 title="Cloudflare preview status">
-                <%= icon "globe-alt", class: "size-3.5" %>
-              </a>
-              <%= render Elements::DropdownComponent.new(
-                anchor: "bottom end",
-                class: "shrink-0 opacity-0 group-hover:opacity-100 [@media(pointer:coarse)]:opacity-100 transition-opacity",
-                panel: "w-48 rounded-md bg-zinc-800 py-1 shadow-lg outline-1 -outline-offset-1 outline-white/10"
-              ) do |dropdown| %>
-                <% dropdown.with_button(
-                  class: "shrink-0 p-1.5 text-zinc-600 hover:text-zinc-300 transition-colors"
-                ) do %>
-                  <span class="sr-only">Open session options</span>
-                  <%= icon "ellipsis-vertical", class: "size-3.5" %>
-                <% end %>
-
-                <button type="button"
-                        data-agent-id
-                        data-action="agent-list#togglePreview"
-                        data-preview-button
-                        data-preview-visible="false"
-                        data-preview-state="inactive"
-                        class="hidden w-full items-center gap-2 px-3 py-2 text-left text-xs text-zinc-200 hover:bg-zinc-700/70 focus:bg-zinc-700/70 focus:outline-hidden data-[preview-visible=true]:flex"
-                        title="Enable Cloudflare preview">
-                  <%= icon "globe-alt", class: "size-3.5 shrink-0 text-zinc-400" %>
-                  <span data-preview-button-label class="min-w-0 flex-1 truncate">Enable preview</span>
-                </button>
-                <a data-preview-link
-                   data-preview-visible="false"
-                   data-preview-state="unavailable"
-                   class="hidden items-center gap-2 px-3 py-2 text-xs text-zinc-200 hover:bg-zinc-700/70 focus:bg-zinc-700/70 focus:outline-hidden data-[preview-visible=true]:flex"
-                   target="_blank"
-                   rel="noopener noreferrer"
-                   title="Open Cloudflare preview in new tab">
-                  <%= icon "arrow-top-right-on-square", class: "size-3.5 shrink-0 text-zinc-400" %>
-                  <span class="min-w-0 flex-1 truncate">Open preview</span>
-                </a>
-                <button type="button"
-                        data-agent-id
-                        data-action="agent-list#moveAgentWorkspace"
-                        class="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-zinc-200 hover:bg-zinc-700/70 focus:bg-zinc-700/70 focus:outline-hidden"
-                        title="Move to workspace">
-                  <%= icon "arrows-right-left", class: "size-3.5 shrink-0 text-zinc-400" %>
-                  <span class="min-w-0 flex-1 truncate">Move to workspace</span>
-                </button>
-                <button type="button"
-                        data-agent-id
-                        data-action="agent-list#delete"
-                        class="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-red-200 hover:bg-red-500/15 focus:bg-red-500/15 focus:outline-hidden"
-                        title="Delete agent">
-                  <%= icon "trash", class: "size-3.5 shrink-0 text-red-300" %>
-                  <span class="min-w-0 flex-1 truncate">Delete session</span>
-                </button>
-              <% end %>
-            </div>
-            <div data-preview-error-panel
-                 class="hidden px-2 pb-2">
-              <div class="rounded border border-red-500/25 bg-red-500/10 px-2 py-1.5">
-                <div data-preview-error-message class="text-[10px] leading-4 text-red-200"></div>
-                <a data-preview-install-link
-                   class="hidden mt-1 inline-flex text-[10px] font-medium text-red-100 underline decoration-red-300/70 underline-offset-2 hover:text-white hover:decoration-red-100"
-                   target="_blank"
-                   rel="noopener noreferrer">Install cloudflared</a>
-              </div>
-            </div>
-          </div>
-        </template>
-
-        <%# List container %>
-        <div data-agent-list-target="list" class="flex-1 overflow-y-auto px-2 pt-1 pb-2 space-y-1"></div>
-
-        <%# Empty state %>
-        <div data-agent-list-target="empty" class="hidden px-2 pb-2">
-          <p class="px-2 py-4 text-center text-xs text-zinc-600">No sessions running</p>
+        <div data-controller="react-mount"
+             data-component="App"
+             data-props='<%= { hubId: Current.hub.id.to_s, surface: "sidebar" }.to_json %>'
+             data-turbo-permanent
+             id="react-workspace-sidebar-<%= local_assigns[:sidebar_id] || 'default' %>"
+             class="flex-1 overflow-y-auto px-2 pt-1 pb-2">
         </div>
-
-        <%# Loading state %>
-        <div data-agent-list-target="loading" class="px-2 pb-2">
-          <p class="px-2 py-4 text-center text-xs text-zinc-600">Connecting...</p>
-        </div>
-      </div>
-
-      <%# React workspace list (new — renders side by side with Stimulus version during migration) %>
-      <div data-controller="react-mount"
-           data-component="App"
-           data-props='<%= { hubId: Current.hub.id, surface: "sidebar" }.to_json %>'
-           data-turbo-permanent
-           id="react-workspace-sidebar-<%= local_assigns[:sidebar_id] || 'default' %>"
-           class="flex-1 overflow-y-auto px-2 pt-1 pb-2">
       </div>
     <% end %>
   </div>

@@ -2,7 +2,11 @@ import React from 'react'
 import clsx from 'clsx'
 import {
   useWorkspaceStore,
-  selectSessionRowProps,
+  displayName,
+  titleLine as getTitleLine,
+  subtext as getSubtext,
+  activityState as getActivityState,
+  previewState,
 } from '../../store/workspace-store'
 import { dispatch, ACTION } from '../../lib/actions'
 import SessionActionsMenu from './SessionActionsMenu'
@@ -10,26 +14,28 @@ import HostedPreviewIndicator from './HostedPreviewIndicator'
 import HostedPreviewError from './HostedPreviewError'
 
 export default function SessionRow({ sessionId, hubId, surface }) {
-  const rowProps = useWorkspaceStore((s) => {
-    const session = s.sessionsById[sessionId]
-    return session ? selectSessionRowProps(s, session) : null
-  })
+  const session = useWorkspaceStore((s) => s.sessionsById[sessionId])
+  const selected = useWorkspaceStore((s) => s.selectedSessionId === sessionId)
 
-  if (!rowProps) return null
+  if (!session) return null
 
-  const {
-    sessionUuid,
-    primaryName,
-    titleLine,
-    subtext,
-    selected,
-    notification,
-    sessionType,
-    activityState,
-    hostedPreview,
-    previewError,
-    actionsMenu,
-  } = rowProps
+  const sessionUuid = session.session_uuid
+  const primaryName = displayName(session)
+  const titleLine = getTitleLine(session)
+  const subtext = getSubtext(session)
+  const notification = !!session.notification
+  const sessionType = session.session_type || 'agent'
+  const activityState = getActivityState(session)
+  const preview = previewState(session)
+  const hostedPreview = preview.canPreview ? preview : null
+  const previewError = preview.status === 'error' ? preview.error : null
+  const actionsMenu = {
+    canPreview: preview.canPreview,
+    previewStatus: preview.status,
+    previewUrl: preview.url,
+    canMove: true,
+    canDelete: true,
+  }
 
   const density = surface === 'sidebar' ? 'sidebar' : 'panel'
   const isSidebar = density === 'sidebar'

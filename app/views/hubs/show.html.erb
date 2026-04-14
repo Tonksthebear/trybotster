@@ -10,8 +10,11 @@
           </p>
         </div>
 
-        <%# Connection status - three-column view %>
-        <%= render "shared/connection_status", hub: Current.hub, connection_type: "hub" %>
+        <%# Connection status %>
+        <div data-controller="react-mount"
+             data-component="ConnectionStatus"
+             data-props='<%= { hubId: Current.hub.id.to_s }.to_json %>'>
+        </div>
       </div>
     </div>
   </div>
@@ -25,29 +28,14 @@
           <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider">Hub Information</h2>
           <div class="flex items-center gap-2">
             <%= link_to hub_settings_path(Current.hub),
-                  class: "inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 rounded-lg transition-colors aria-disabled:opacity-50 aria-disabled:cursor-not-allowed aria-disabled:pointer-events-none",
-                  "aria-disabled": "true",
-                  data: {
-                    controller: "requires-connection",
-                    requires_connection_key_value: Current.hub.id,
-                  } do %>
+                  class: "inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 rounded-lg transition-colors" do %>
               <%= icon "cog-6-tooth", class: "size-3.5" %>
               <span>Settings</span>
             <% end %>
-            <%= render Elements::ButtonComponent.new(color: :neutral, variant: :ghost, size: :sm,
-                  data: {
-                    controller: "requires-connection share-hub",
-                    requires_connection_key_value: Current.hub.id,
-                    share_hub_hub_id_value: Current.hub.id,
-                    action: "share-hub#open"
-                  },
-                  command: "show-modal",
-                  commandfor: "share-hub-modal",
-                  title: "Share Hub",
-                  disabled: true) do %>
-              <%= icon "share", class: "size-3.5" %>
-              <span>Share</span>
-            <% end %>
+            <div data-controller="react-mount"
+                 data-component="ShareHub"
+                 data-props='<%= { hubId: Current.hub.id.to_s }.to_json %>'>
+            </div>
           </div>
         </div>
         <dl class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -79,236 +67,12 @@
         </dl>
       </div>
 
-      <%# Setup Banner - shown when hub has no session configuration %>
-      <% if @recommended_template %>
-        <div data-controller="hub-setup-banner"
-             data-hub-setup-banner-hub-id-value="<%= Current.hub.id %>"
-             data-hub-setup-banner-template-dest-value="<%= @recommended_template[:dest] %>"
-             data-hub-setup-banner-template-content-value="<%= @recommended_template[:content] %>">
-          <div data-hub-setup-banner-target="banner"
-               class="hidden bg-amber-500/10 border border-amber-500/20 rounded-lg p-4 lg:p-6 mb-6">
-            <div class="flex items-start gap-4">
-              <div class="shrink-0 size-10 rounded-lg bg-amber-500/10 flex items-center justify-center">
-                <%= icon "exclamation-triangle", class: "size-5 text-amber-400" %>
-              </div>
-              <div class="flex-1 min-w-0">
-                <h3 class="text-sm font-medium text-amber-300">No agent configuration</h3>
-                <p class="text-sm text-zinc-400 mt-1">
-                  Agents need an initialization script to run properly. Install an agent template to get started.
-                </p>
-                <div class="flex items-center gap-3 mt-3">
-                  <button type="button"
-                          data-action="hub-setup-banner#quickSetup"
-                          data-controller="requires-connection"
-                          data-requires-connection-key-value="<%= Current.hub.id %>"
-                          class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-amber-200 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/30 rounded-lg transition-colors disabled:opacity-50"
-                          disabled>
-                    <%= icon "bolt", class: "size-3.5" %>
-                    <span data-hub-setup-banner-target="status">Quick Setup: <%= @recommended_template[:name] %></span>
-                  </button>
-                  <%= link_to hub_settings_path(Current.hub),
-                        class: "text-sm text-zinc-500 hover:text-zinc-300 transition-colors" do %>
-                    Go to Settings &rarr;
-                  <% end %>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      <% end %>
-
-      <%# Scan QR Prompt - shown when connection needs pairing %>
-      <div data-controller="scan-prompt"
-           data-scan-prompt-hub-id-value="<%= Current.hub.id %>"
-           class="hidden bg-amber-500/10 border border-amber-500/20 rounded-lg p-4 lg:p-6 mb-6">
-        <%= link_to hub_pairing_path(Current.hub), class: "flex items-start gap-4 group" do %>
-          <div class="shrink-0 size-10 rounded-lg bg-amber-500/10 flex items-center justify-center">
-            <%= icon "qr-code", class: "size-5 text-amber-400" %>
-          </div>
-          <div>
-            <h3 class="text-sm font-medium text-amber-300 group-hover:text-amber-200 transition-colors">Pair This Device</h3>
-            <p class="text-sm text-zinc-400 mt-1">
-              Scan the QR code on your hub's terminal, or paste a connection link to establish a secure connection.
-            </p>
-          </div>
-        <% end %>
-      </div>
-
       <%# Workspaces Section %>
-      <div class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 lg:p-6"
-           data-controller="agent-list"
-           data-agent-list-hub-id-value="<%= Current.hub.id %>"
-           data-agent-list-agents-value="[]"
-           data-agent-list-workspaces-value="[]"
-           id="hub-agent-list">
-        <div data-agent-list-target="header" class="flex items-center justify-between mb-4 hidden">
-          <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wider">Workspaces</h2>
-          <button type="button"
-                  data-controller="requires-connection"
-                  data-requires-connection-key-value="<%= Current.hub.id %>"
-                  class="p-1.5 text-zinc-500 hover:text-primary-400 hover:bg-zinc-800/50 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-500"
-                  title="New Session"
-                  command="show-modal"
-                  commandfor="new-session-chooser-modal"
-                  disabled>
-            <%= icon "plus", class: "size-5" %>
-          </button>
-        </div>
-
-        <%# Template for workspace group headers %>
-        <template data-agent-list-target="workspaceTemplate">
-          <div class="flex items-center gap-2 py-2 cursor-pointer select-none group/ws">
-            <svg data-workspace-chevron class="size-4 text-zinc-500 transition-transform duration-150 shrink-0" viewBox="0 0 20 20" fill="currentColor">
-              <path fill-rule="evenodd" d="M6.293 7.293a1 1 0 011.414 0L10 9.586l2.293-2.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clip-rule="evenodd" />
-            </svg>
-            <span data-field="workspace-title" class="text-xs font-medium text-zinc-400 group-hover/ws:text-zinc-300 truncate"></span>
-            <span data-field="workspace-count" class="text-[10px] text-zinc-600 shrink-0"></span>
-            <button type="button"
-                    data-workspace-id
-                    data-action="agent-list#renameWorkspace"
-                    class="ml-auto shrink-0 p-1 text-zinc-600 hover:text-zinc-300 opacity-0 group-hover/ws:opacity-100 transition-opacity"
-                    title="Rename workspace">
-              <%= icon "pencil", class: "size-3.5" %>
-            </button>
-          </div>
-        </template>
-
-        <%# Template for agent cards %>
-        <template data-agent-list-target="template">
-          <div class="group relative bg-zinc-800/50 hover:bg-zinc-800 border border-zinc-700/50 hover:border-zinc-700 rounded-lg transition-colors border-l-2 border-l-transparent data-[notification=true]:border-l-yellow-400">
-            <div class="flex items-center gap-0">
-              <a data-href="/hubs/{hubId}/sessions/{sessionUuid}"
-                 data-agent-id
-                 class="flex items-center gap-3 px-4 py-3 flex-1 min-w-0">
-                <div class="size-10 rounded-lg bg-zinc-700/50 flex items-center justify-center text-zinc-400 shrink-0">
-                  <%= icon "command-line", class: "size-5" %>
-                </div>
-                <div class="flex-1 min-w-0">
-                  <div class="flex items-center gap-2 min-w-0">
-                    <span data-activity-indicator class="hidden shrink-0 text-sm leading-none"></span>
-                    <div data-field="name" class="text-sm font-medium text-zinc-100 truncate font-mono"></div>
-                  </div>
-                  <div data-field="title-line" class="text-xs text-zinc-500 italic truncate hidden"></div>
-                  <div data-field="subtext" class="text-xs text-zinc-400 truncate"></div>
-                </div>
-                <%= icon "chevron-right", class: "size-5 text-zinc-600 shrink-0" %>
-              </a>
-              <a data-preview-indicator
-                 data-preview-indicator-visible="false"
-                 data-preview-state="inactive"
-                 class="hidden shrink-0 p-3 transition-colors data-[preview-indicator-visible=true]:block data-[preview-state=running]:text-emerald-400 data-[preview-state=starting]:text-amber-400 data-[preview-state=error]:text-red-400"
-                 target="_blank"
-                 rel="noopener noreferrer"
-                 title="Cloudflare preview status">
-                <%= icon "globe-alt", class: "size-4" %>
-              </a>
-              <%= render Elements::DropdownComponent.new(
-                anchor: "bottom end",
-                class: "shrink-0",
-                panel: "w-56 rounded-md bg-zinc-800 py-1 shadow-lg outline-1 -outline-offset-1 outline-white/10"
-              ) do |dropdown| %>
-                <% dropdown.with_button(
-                  class: "shrink-0 p-3 text-zinc-600 hover:text-zinc-300 transition-colors"
-                ) do %>
-                  <span class="sr-only">Open session options</span>
-                  <%= icon "ellipsis-vertical", class: "size-4" %>
-                <% end %>
-
-                <button type="button"
-                        data-agent-id
-                        data-action="agent-list#togglePreview"
-                        data-preview-button
-                        data-preview-visible="false"
-                        data-preview-state="inactive"
-                        class="hidden w-full items-center gap-3 px-3 py-2 text-left text-sm text-zinc-200 hover:bg-zinc-700/70 focus:bg-zinc-700/70 focus:outline-hidden data-[preview-visible=true]:flex"
-                        title="Enable Cloudflare preview">
-                  <%= icon "globe-alt", class: "size-4 shrink-0 text-zinc-400" %>
-                  <span data-preview-button-label class="min-w-0 flex-1 truncate">Enable Cloudflare preview</span>
-                </button>
-                <a data-preview-link
-                   data-preview-visible="false"
-                   data-preview-state="unavailable"
-                   class="hidden items-center gap-3 px-3 py-2 text-sm text-zinc-200 hover:bg-zinc-700/70 focus:bg-zinc-700/70 focus:outline-hidden data-[preview-visible=true]:flex"
-                   target="_blank"
-                   rel="noopener noreferrer"
-                   title="Open Cloudflare preview in new tab">
-                  <%= icon "arrow-top-right-on-square", class: "size-4 shrink-0 text-zinc-400" %>
-                  <span class="min-w-0 flex-1 truncate">Open Cloudflare preview</span>
-                </a>
-                <button type="button"
-                        data-agent-id
-                        data-action="agent-list#moveAgentWorkspace"
-                        class="flex w-full items-center gap-3 px-3 py-2 text-left text-sm text-zinc-200 hover:bg-zinc-700/70 focus:bg-zinc-700/70 focus:outline-hidden"
-                        title="Move to workspace">
-                  <%= icon "arrows-right-left", class: "size-4 shrink-0 text-zinc-400" %>
-                  <span class="min-w-0 flex-1 truncate">Move to workspace</span>
-                </button>
-                <button type="button"
-                        data-agent-id
-                        data-action="agent-list#delete"
-                        class="flex w-full items-center gap-3 px-3 py-2 text-left text-sm text-red-200 hover:bg-red-500/15 focus:bg-red-500/15 focus:outline-hidden"
-                        title="Delete agent">
-                  <%= icon "trash", class: "size-4 shrink-0 text-red-300" %>
-                  <span class="min-w-0 flex-1 truncate">Delete session</span>
-                </button>
-              <% end %>
-            </div>
-            <div data-preview-error-panel
-                 class="hidden px-4 pb-3">
-              <div class="flex items-start gap-3 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2">
-                <%= icon "exclamation-triangle", class: "size-4 shrink-0 text-red-300 mt-0.5" %>
-                <div class="min-w-0 flex-1">
-                  <div data-preview-error-message class="text-xs leading-5 text-red-200"></div>
-                </div>
-                <a data-preview-install-link
-                   class="hidden shrink-0 text-xs font-medium text-red-100 underline decoration-red-300/70 underline-offset-2 hover:text-white hover:decoration-red-100"
-                   target="_blank"
-                   rel="noopener noreferrer">Install</a>
-              </div>
-            </div>
-          </div>
-        </template>
-
-        <%# List container %>
-        <div data-agent-list-target="list" data-test="hub-agents-list" class="space-y-2"></div>
-
-        <%# Empty state %>
-        <div data-agent-list-target="empty" class="hidden py-8 text-center">
-          <%= icon "sparkles", class: "size-12 text-zinc-700 mx-auto mb-4" %>
-          <h3 class="text-lg font-medium text-zinc-300 mb-2">No sessions running</h3>
-          <p class="text-sm text-zinc-500 mb-4">Start a new agent or accessory to begin working</p>
-          <button type="button"
-                  data-controller="requires-connection"
-                  data-requires-connection-key-value="<%= Current.hub.id %>"
-                  command="show-modal"
-                  commandfor="new-session-chooser-modal"
-                  class="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 hover:bg-primary-500 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  disabled>
-            <%= icon "plus", class: "size-4" %>
-            New Session
-          </button>
-        </div>
-
-        <%# Loading state — replaces the entire section while connecting %>
-        <div data-agent-list-target="loading" class="py-12 text-center">
-          <div class="inline-flex items-center justify-center size-16 bg-primary-500/10 rounded-2xl mb-5">
-            <svg class="size-8 text-primary-400 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0M12.53 18.22l-.53.53-.53-.53a.75.75 0 011.06 0z" />
-            </svg>
-          </div>
-          <h3 class="text-lg font-medium text-zinc-200 mb-2">Connecting to hub...</h3>
-          <p class="text-sm text-zinc-500 max-w-xs mx-auto">
-            Establishing a secure connection. Sessions will appear here once connected.
-          </p>
-        </div>
-      </div>
-
-      <%# React workspace list (new — renders side by side with Stimulus version during migration) %>
       <div data-controller="react-mount"
            data-component="App"
-           data-props='<%= { hubId: Current.hub.id, surface: "panel" }.to_json %>'
+           data-props='<%= { hubId: Current.hub.id.to_s, surface: "panel" }.to_json %>'
            id="react-workspace-panel"
-           class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 lg:p-6 mt-6">
+           class="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 lg:p-6">
       </div>
     </div>
   </div>

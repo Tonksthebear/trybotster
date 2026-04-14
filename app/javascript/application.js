@@ -17,6 +17,17 @@ import * as bundleModule from "matrix/bundle";
 window.__botsterBridge = bridge;
 window.__botsterBundle = bundleModule;
 
+// Expose connection status observer to Vite/React world.
+import { observeBrowserSocketState } from "transport/hub_signaling_client";
+window.__botsterObserveBrowserSocket = observeBrowserSocketState;
+
+// Expose terminal infrastructure to Vite/React world.
+// TerminalView.jsx reads these to mount Restty + WebRTC PTY transport.
+import { Restty } from "restty";
+import { HubConnectionManager, HubTransport } from "connections";
+import { WebRtcPtyTransport } from "transport/webrtc_pty_transport";
+window.__botsterTerminal = { Restty, HubConnectionManager, HubTransport, WebRtcPtyTransport };
+
 // Close mobile sidebar before Turbo caches the page so back-navigation
 // doesn't restore a snapshot with the sidebar open.
 // Note: el-dialog overrides <dialog>.close() with an animated version that
