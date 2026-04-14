@@ -2,15 +2,12 @@ import React, { useRef, useEffect, useCallback } from 'react'
 import { connect, disconnect } from '../../lib/hub-bridge'
 import ConnectionStatus from '../hub/ConnectionStatus'
 
+import { Restty } from 'restty'
+import { HubConnectionManager, HubTransport } from 'connections'
+import { WebRtcPtyTransport } from 'transport/webrtc_pty_transport'
+
 const CONNECT_DEBOUNCE_MS = 30
 const MAX_FILE_SIZE = 50 * 1024 * 1024
-
-function resolveTerminal() {
-  if (window.__botsterTerminal) return window.__botsterTerminal
-  throw new Error(
-    '[TerminalView] Terminal infrastructure not available. Ensure application.js has loaded.'
-  )
-}
 
 export default function TerminalView({ hubId, sessionUuid }) {
   const containerRef = useRef(null)
@@ -25,9 +22,6 @@ export default function TerminalView({ hubId, sessionUuid }) {
 
   useEffect(() => {
     if (!hubId || !sessionUuid) return
-
-    const { Restty, HubConnectionManager, HubTransport, WebRtcPtyTransport } =
-      resolveTerminal()
 
     const isMobile = 'ontouchstart' in window
     const container = containerRef.current

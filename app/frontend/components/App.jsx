@@ -30,18 +30,17 @@ export default function App({ hubId, surface = 'panel' }) {
     }
   }, [hubId, surface])
 
-  // Turbo navigation: resync selection from URL when turbo-permanent
-  // element persists across page transitions.
+  // Resync selection from URL on popstate (SPA back/forward navigation)
   useEffect(() => {
     if (!hubId) return
 
-    function handleTurboLoad() {
+    function handlePopState() {
       const hub = getHub(hubId)
       if (hub) syncSelectionFromUrl(hub)
     }
 
-    document.addEventListener('turbo:load', handleTurboLoad)
-    return () => document.removeEventListener('turbo:load', handleTurboLoad)
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
   }, [hubId])
 
   if (!hubId) return null

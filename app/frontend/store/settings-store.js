@@ -1,9 +1,5 @@
 import { create } from 'zustand'
-
-function resolveHubManager() {
-  if (window.__botsterHubManager) return window.__botsterHubManager
-  throw new Error('[settings-store] HubManager not available')
-}
+import { HubManager } from 'connections'
 
 export const useSettingsStore = create((set, get) => ({
   // --- Connection ---
@@ -63,7 +59,7 @@ export const useSettingsStore = create((set, get) => ({
   // --- Hub lifecycle ---
 
   async connectHub(hubId) {
-    const HubManager = resolveHubManager()
+    // HubManager imported at module level
     const hub = await HubManager.acquire(hubId)
 
     const targets = hub.spawnTargets.current()

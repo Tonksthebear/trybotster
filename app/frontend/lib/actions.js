@@ -54,9 +54,10 @@ const handlers = {
     if (hub && payload.sessionId) {
       hub.selectAgent(payload.sessionId)
     }
-    // Navigate via Turbo if we have a session URL
+    // Navigate via React Router (pushState)
     if (payload.url) {
-      window.Turbo?.visit(payload.url)
+      window.history.pushState({}, '', payload.url)
+      window.dispatchEvent(new PopStateEvent('popstate'))
     }
   },
 

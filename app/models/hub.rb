@@ -14,8 +14,6 @@ class Hub < ApplicationRecord
   scope :stale, -> { where(alive: false).or(where("last_seen_at <= ?", 2.minutes.ago)) }
   scope :with_notifications, -> { where(notifications_enabled: true) }
 
-  after_commit :broadcast_hubs_list
-  after_create_commit :broadcast_redirect_to_hub
   after_update_commit :broadcast_health_status, if: :health_status_changed?
   after_destroy_commit :broadcast_health_offline
 
@@ -44,36 +42,6 @@ class Hub < ApplicationRecord
   end
 
   private
-
-  def broadcast_redirect_to_hub
-    Turbo::StreamsChannel.broadcast_action_to(
-      [ user, :hubs ],
-      action: :redirect,
-      attributes: { url: Rails.application.routes.url_helpers.hub_path(self), from: "/hubs" }
-    )
-  rescue => e
-    Rails.logger.warn "Failed to broadcast hub redirect: #{e.message}"
-  end
-
-  def broadcast_hubs_list
-    hubs = user.hubs.order(last_seen_at: :desc)
-
-    Turbo::StreamsChannel.broadcast_update_to(
-      [ user, :hubs ],
-      targets: ".hubs-list",
-      partial: "layouts/sidebar_hubs",
-      locals: { hubs: hubs }
-    )
-
-    Turbo::StreamsChannel.broadcast_update_to(
-      [ user, :hubs ],
-      targets: ".hubs-dashboard",
-      partial: "hubs/index_hubs",
-      locals: { hubs: hubs }
-    )
-  rescue => e
-    Rails.logger.warn "Failed to broadcast hubs list: #{e.message}"
-  end
 
   def broadcast_health_offline
     ActionCable.server.broadcast("hub:#{id}:health", { type: "health", cli: "offline" })

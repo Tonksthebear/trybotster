@@ -1,3 +1,4 @@
+import { HubManager } from 'connections'
 import { useWorkspaceStore } from '../store/workspace-store'
 
 // Per-hub shared state
@@ -144,8 +145,5 @@ export function syncSelectionFromUrl(hub) {
 }
 
 function resolveHubManager() {
-  if (window.__botsterHubManager) return window.__botsterHubManager
-  throw new Error(
-    '[hub-bridge] HubManager not available. Ensure application.js has loaded (it assigns window.__botsterHubManager).'
-  )
+  return HubManager
 }

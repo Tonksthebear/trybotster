@@ -38,9 +38,8 @@ function HubIdentityForm({ hubName, hubIdentifier, hubSettingsPath }) {
       })
 
       if (response.ok || response.redirected) {
-        // Reload to match the old form's redirect-and-render behavior
-        window.Turbo?.visit(window.location.href, { action: 'replace' }) ??
-          window.location.reload()
+        // Refresh after save
+        window.location.reload()
       } else {
         setError(`Save failed (${response.status})`)
         setSaving(false)

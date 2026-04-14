@@ -8,10 +8,12 @@
   },
   "dependencies": {
     "@headlessui/react": "^2.2.10",
+    "@rails/actioncable": "^8.1.300",
     "clsx": "^2.1.1",
     "motion": "^12.38.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
+    "react-router-dom": "^7.14.1",
     "zustand": "^5.0.12"
   }
 }

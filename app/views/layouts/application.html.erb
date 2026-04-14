@@ -18,19 +18,10 @@
     <link rel="apple-touch-icon" href="/apple-touch-icon.png">
     <link rel="manifest" href="<%= pwa_manifest_path %>">
 
-    <%# Includes all stylesheet files in app/assets/stylesheets %>
-    <%= stylesheet_link_tag :app, "data-turbo-track": "reload" %>
-    <%= javascript_importmap_tags %>
+    <%= stylesheet_link_tag :app %>
     <%= vite_client_tag %>
-    <!--
-      If using a TypeScript entrypoint file:
-        vite_typescript_tag 'application'
-
-      If using a .jsx or .tsx entrypoint, add the extension:
-        vite_javascript_tag 'application.jsx'
-
-      Visit the guide for more information: https://vite-ruby.netlify.app/guide/rails
-    -->
+    <%= vite_react_refresh_tag %>
+    <%= vite_javascript_tag 'application.jsx' %>
 
   </head>
 
@@ -67,11 +58,9 @@
             <span class="text-sm text-zinc-500 font-mono">
               <%= current_user.username || current_user.email %>
             </span>
-            <%= link_to destroy_user_session_path,
-                        data: { turbo_method: :delete },
-                        class: "text-sm text-zinc-400 hover:text-zinc-200 transition-colors" do %>
-              Logout
-            <% end %>
+            <%= button_to "Logout", destroy_user_session_path,
+                          method: :delete,
+                          class: "text-sm text-zinc-400 hover:text-zinc-200 transition-colors" %>
           <% end %>
         </div>
       <% end %>
@@ -92,11 +81,9 @@
               <div class="px-3 py-2 text-sm text-zinc-500 font-mono">
                 <%= current_user.username || current_user.email %>
               </div>
-              <%= link_to destroy_user_session_path,
-                          data: { turbo_method: :delete },
-                          class: "block px-3 py-2 rounded text-base font-medium text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition-colors" do %>
-                Logout
-              <% end %>
+              <%= button_to "Logout", destroy_user_session_path,
+                            method: :delete,
+                            class: "block px-3 py-2 rounded text-base font-medium text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition-colors" %>
             </div>
           <% end %>
         </div>

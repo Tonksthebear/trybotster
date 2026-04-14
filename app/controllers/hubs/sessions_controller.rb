@@ -14,6 +14,7 @@ module Hubs
 
     # GET /hubs/:hub_id/sessions/:session_uuid
     def show
+      render "spa/show", layout: "spa"
     end
 
     private

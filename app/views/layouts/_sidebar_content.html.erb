@@ -32,7 +32,7 @@
         <div data-controller="react-mount"
              data-component="App"
              data-props='<%= { hubId: Current.hub.id.to_s, surface: "sidebar" }.to_json %>'
-             data-turbo-permanent
+
              id="react-workspace-sidebar-<%= local_assigns[:sidebar_id] || 'default' %>"
              class="flex-1 overflow-y-auto px-2 pt-1 pb-2">
         </div>
@@ -74,11 +74,9 @@
         <%= icon "chevron-up-down", class: "size-4 text-zinc-600" %>
       <% end %>
 
-      <%= link_to destroy_user_session_path,
-          data: { turbo_method: :delete },
-          class: "block px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-700 rounded-md transition-colors" do %>
-        Logout
-      <% end %>
+      <%= button_to "Logout", destroy_user_session_path,
+          method: :delete,
+          class: "block px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-700 rounded-md transition-colors" %>
     <% end %>
   </div>
 </div>

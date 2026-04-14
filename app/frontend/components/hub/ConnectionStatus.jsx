@@ -55,14 +55,13 @@ export default function ConnectionStatus({ hubId }) {
     const teardowns = []
 
     // Browser socket state
-    const observeBrowser = window.__botsterObserveBrowserSocket
-    if (observeBrowser) {
-      observeBrowser((state) => {
+    import('transport/hub_signaling_client').then(({ observeBrowserSocketState }) => {
+      observeBrowserSocketState((state) => {
         setBrowser(state === 'connected' ? 'connected' : state)
       }).then((unsub) => {
         teardowns.push(unsub)
       })
-    }
+    })
 
     // Hub connection status — poll until hub is available
     let cancelled = false
