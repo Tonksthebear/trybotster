@@ -1,3 +1,12 @@
+<%# React pairing page (Vite/Catalyst — dormant until Stimulus controller is removed).
+    Uses data-react-pending instead of data-controller="react-mount" to prevent
+    both implementations from racing on fragment parsing and crypto init. %>
+<div data-react-pending="PairingPage"
+     data-component="PairingPage"
+     data-props='<%= { hubId: Current.hub.id, redirectUrl: hub_path(Current.hub) }.to_json %>'
+     id="react-pairing-page">
+</div>
+
 <div class="min-h-[calc(100vh-8rem)] flex items-center justify-center px-4 py-12"
      data-controller="pairing"
      data-pairing-hub-id-value="<%= Current.hub.id %>"

@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client'
 import ProofOfLife from '../components/ProofOfLife'
 import App from '../components/App'
 import DialogHost from '../components/DialogHost'
+import PairingPage from '../components/pairing/PairingPage'
+import SettingsApp from '../components/settings/SettingsApp'
 
 // Side-effect import: registers singleton event listeners for
 // rename/move/delete CustomEvents dispatched by the action system.
@@ -13,6 +15,8 @@ import '../lib/modal-bridge'
 const COMPONENTS = {
   ProofOfLife,
   App,
+  PairingPage,
+  SettingsApp,
 }
 
 // Track mounted roots for cleanup on disconnect

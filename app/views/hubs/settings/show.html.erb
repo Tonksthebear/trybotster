@@ -1,4 +1,4 @@
-<div class="h-full flex flex-col overflow-hidden"
+<div class="h-full flex flex-col overflow-hidden <%= 'hidden' if params[:react].present? %>"
      data-controller="hub-settings hub-templates"
      data-hub-settings-hub-id-value="<%= Current.hub.id %>"
      data-hub-settings-config-metadata-value="<%= @config_metadata.to_json %>"
@@ -679,3 +679,21 @@
     <% end %>
   </div>
 </div>
+
+<%# React Settings (Vite + Catalyst) — activate with ?react=1 in URL %>
+<% if params[:react].present? %>
+  <div class="h-full flex flex-col overflow-hidden"
+       data-controller="react-mount"
+       data-component="SettingsApp"
+       data-props='<%= {
+         hubId: Current.hub.id,
+         configMetadata: @config_metadata,
+         templates: @templates,
+         agentTemplates: @agent_templates,
+         hubName: Current.hub.name,
+         hubIdentifier: Current.hub.identifier,
+         hubSettingsPath: hub_settings_path(Current.hub),
+         hubPath: hub_path(Current.hub),
+       }.to_json %>'>
+  </div>
+<% end %>

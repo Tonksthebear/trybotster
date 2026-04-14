@@ -10,6 +10,13 @@ import "turbo_stream_redirect";
 import { HubManager } from "connections";
 window.__botsterHubManager = HubManager;
 
+// Expose crypto bridge and bundle parser to Vite/React world.
+// The React crypto-bridge reads these to avoid crossing module graph boundaries.
+import bridge from "workers/bridge";
+import * as bundleModule from "matrix/bundle";
+window.__botsterBridge = bridge;
+window.__botsterBundle = bundleModule;
+
 // Close mobile sidebar before Turbo caches the page so back-navigation
 // doesn't restore a snapshot with the sidebar open.
 // Note: el-dialog overrides <dialog>.close() with an animated version that
