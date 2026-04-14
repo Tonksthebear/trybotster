@@ -9,6 +9,7 @@ export const useWorkspaceStore = create((set, get) => ({
   ungroupedSessionIds: [],
   selectedSessionId: null,
   collapsedWorkspaceIds: new Set(),
+  connected: false,
   surface: 'agent_list',
 
   // --- Actions ---
@@ -38,7 +39,12 @@ export const useWorkspaceStore = create((set, get) => ({
       workspacesById: wsById,
       workspaceOrder: wsOrder,
       ungroupedSessionIds: order.filter((id) => !grouped.has(id)),
+      connected: true,
     })
+  },
+
+  setConnected(value) {
+    set({ connected: value })
   },
 
   setSurface(value) {

@@ -1,5 +1,6 @@
 import React from 'react'
 import { useWorkspaceStore } from '../../store/workspace-store'
+import { useDialogStore } from '../../store/dialog-store'
 import WorkspaceGroup from './WorkspaceGroup'
 import SessionRow from './SessionRow'
 
@@ -7,10 +8,12 @@ export default function WorkspaceList({ hubId, surface }) {
   const workspaceOrder = useWorkspaceStore((s) => s.workspaceOrder)
   const ungroupedSessionIds = useWorkspaceStore((s) => s.ungroupedSessionIds)
   const sessionCount = useWorkspaceStore((s) => s.sessionOrder.length)
+  const connected = useWorkspaceStore((s) => s.connected)
+  const openNewSession = useDialogStore((s) => s.openNewSession)
   const density = surface === 'sidebar' ? 'sidebar' : 'panel'
 
   if (sessionCount === 0) {
-    return <EmptyState density={density} />
+    return <EmptyState density={density} onNewSession={openNewSession} disabled={!connected} />
   }
 
   return (
@@ -31,17 +34,51 @@ export default function WorkspaceList({ hubId, surface }) {
           surface={surface}
         />
       ))}
+      <NewSessionButton density={density} onClick={openNewSession} disabled={!connected} />
     </div>
   )
 }
 
-function EmptyState({ density }) {
+function NewSessionButton({ density, onClick, disabled }) {
+  if (density === 'sidebar') {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={disabled}
+        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-500 disabled:hover:bg-transparent"
+      >
+        <svg className="size-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+        </svg>
+        {disabled ? 'Connecting...' : 'New session'}
+      </button>
+    )
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-700 py-3 text-sm text-zinc-500 hover:text-zinc-300 hover:border-zinc-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-500 disabled:hover:border-zinc-700"
+    >
+      <svg className="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+      </svg>
+      {disabled ? 'Connecting...' : 'New session'}
+    </button>
+  )
+}
+
+function EmptyState({ density, onNewSession, disabled }) {
   if (density === 'sidebar') {
     return (
       <div className="px-2 pb-2">
         <p className="px-2 py-4 text-center text-xs text-zinc-600">
           No sessions running
         </p>
+        <NewSessionButton density={density} onClick={onNewSession} disabled={disabled} />
       </div>
     )
   }
@@ -64,9 +101,10 @@ function EmptyState({ density }) {
       <h3 className="text-lg font-medium text-zinc-300 mb-2">
         No sessions running
       </h3>
-      <p className="text-sm text-zinc-500">
+      <p className="text-sm text-zinc-500 mb-4">
         Start a new agent or accessory to begin working
       </p>
+      <NewSessionButton density={density} onClick={onNewSession} disabled={disabled} />
     </div>
   )
 }

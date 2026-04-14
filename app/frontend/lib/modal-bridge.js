@@ -1,15 +1,13 @@
 /**
- * Singleton bridge between React action CustomEvents and existing Rails modals.
+ * Bridge between React action CustomEvents and Catalyst dialog components.
  *
  * The action system (actions.js) dispatches document-level CustomEvents for
  * rename, move, and delete. This module registers listeners ONCE at import
- * time to handle them — opening prompts or Rails dialog modals as needed.
+ * time and opens the corresponding dialog via the zustand dialog store.
  *
- * Imported from application.jsx so it runs once at boot, regardless of how
- * many App component instances mount (sidebar desktop, sidebar mobile, panel).
+ * Imported from application.jsx so it runs once at boot.
  */
-import { getHub } from './hub-bridge'
-import { useWorkspaceStore } from '../store/workspace-store'
+import { useDialogStore } from '../store/dialog-store'
 
 let activeHubId = null
 
@@ -23,67 +21,20 @@ export function setHubId(hubId) {
 
 function handleRename(e) {
   if (!activeHubId) return
-  const hub = getHub(activeHubId)
-  if (!hub) return
   const { workspaceId, title } = e.detail
-  const input = window.prompt('Rename workspace:', title)
-  if (input === null) return
-  const newName = input.trim()
-  if (!newName || newName === title) return
-  hub.renameWorkspace(workspaceId, newName)
+  useDialogStore.getState().openRename({ workspaceId, title })
 }
 
 function handleMove(e) {
   if (!activeHubId) return
-  const hub = getHub(activeHubId)
-  if (!hub) return
-  const { sessionId } = e.detail
-  const store = useWorkspaceStore.getState()
-  const workspaces = Object.values(store.workspacesById)
-  const currentWs = workspaces.find(
-    (ws) => Array.isArray(ws?.agents) && ws.agents.includes(sessionId)
-  )
-  const names = workspaces
-    .map((ws) => ws?.name || ws?.id)
-    .filter(Boolean)
-    .join(', ')
-  const promptLabel = names
-    ? `Move session to workspace (name or id).\nExisting: ${names}`
-    : 'Move session to workspace (name or id)'
-  const input = window.prompt(promptLabel, currentWs?.name || '')
-  if (input === null) return
-  const target = input.trim()
-  if (!target) return
-  const existing = workspaces.find(
-    (ws) => ws?.id === target || ws?.name === target
-  )
-  hub.moveAgentWorkspace(
-    sessionId,
-    existing?.id || null,
-    existing?.name || target
-  )
+  const { sessionId, sessionUuid } = e.detail
+  useDialogStore.getState().openMove({ sessionId, sessionUuid })
 }
 
 function handleDelete(e) {
-  const { sessionId } = e.detail
-  const store = useWorkspaceStore.getState()
-  const session = store.sessionsById[sessionId]
-  const name =
-    session?.label || session?.display_name || session?.id || 'this agent'
-  const inWorktree = session?.in_worktree ?? true
-
-  const modal = document.getElementById('delete-agent-modal')
-  if (!modal) return
-  const controller = modal.querySelector(
-    "[data-controller='delete-agent-modal']"
-  )
-  if (controller) {
-    controller.dataset.agentId = sessionId
-    controller.dataset.deleteAgentModalInWorktreeValue = inWorktree
-  }
-  const nameEl = modal.querySelector('[data-agent-name]')
-  if (nameEl) nameEl.textContent = name
-  modal.showModal()
+  if (!activeHubId) return
+  const { sessionId, sessionUuid } = e.detail
+  useDialogStore.getState().openDelete({ sessionId, sessionUuid })
 }
 
 // Register once at module evaluation — never removed.

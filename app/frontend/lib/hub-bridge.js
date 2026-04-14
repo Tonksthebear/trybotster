@@ -117,6 +117,7 @@ function doDisconnect(hubId, callerId) {
   state.hub.release()
   hubState.delete(hubId)
   chains.delete(hubId)
+  getStoreActions().setConnected(false)
 }
 
 export function getHub(hubId) {
