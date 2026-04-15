@@ -93,6 +93,7 @@ export default function NewSessionChooser({ hubId }) {
         <Field disabled={!hubReady}>
           <Label>Spawn target</Label>
           <Select
+            data-testid="spawn-target-select"
             value={selectedTargetId}
             onChange={(e) => setSelectedTargetId(e.target.value)}
           >
@@ -113,6 +114,7 @@ export default function NewSessionChooser({ hubId }) {
         <div className="mt-6 grid grid-cols-2 gap-3">
           <button
             type="button"
+            data-testid="choose-agent"
             disabled={!selectedTargetId}
             onClick={chooseAgent}
             className="group flex flex-col items-center gap-3 rounded-lg border border-zinc-700 bg-zinc-900 p-4 transition-colors hover:border-indigo-500/50 hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:border-zinc-700 disabled:hover:bg-zinc-900"
@@ -130,6 +132,7 @@ export default function NewSessionChooser({ hubId }) {
 
           <button
             type="button"
+            data-testid="choose-accessory"
             disabled={!selectedTargetId}
             onClick={chooseAccessory}
             className="group flex flex-col items-center gap-3 rounded-lg border border-zinc-700 bg-zinc-900 p-4 transition-colors hover:border-emerald-500/50 hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:border-zinc-700 disabled:hover:bg-zinc-900"

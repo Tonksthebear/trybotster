@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
+import { useNavigate, Link as RouterLink } from 'react-router-dom'
 import { usePairingStore } from '../../store/pairing-store'
 import {
   ensureCryptoReady,
@@ -86,6 +87,7 @@ function ShieldCheckIcon({ className }) {
 }
 
 export default function PairingPage({ hubId, redirectUrl }) {
+  const navigate = useNavigate()
   const store = usePairingStore()
   const inputRef = useRef(null)
   const [copyLabel, setCopyLabel] = useState('Copy Code')
@@ -170,7 +172,7 @@ export default function PairingPage({ hubId, redirectUrl }) {
       store.succeed()
 
       setTimeout(() => {
-        window.location.href = redirectUrl
+        navigate(redirectUrl)
       }, 800)
     } catch (error) {
       console.error('[PairingPage] Session creation failed:', error)
@@ -206,7 +208,7 @@ export default function PairingPage({ hubId, redirectUrl }) {
 
         {/* Paste link state */}
         {store.status === 'paste' && (
-          <div>
+          <div data-testid="pairing-paste">
             <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-6 mb-6">
               <div className="space-y-4">
                 <div className="flex items-start gap-3">
@@ -247,7 +249,7 @@ export default function PairingPage({ hubId, redirectUrl }) {
 
         {/* Ready state — bundle parsed, awaiting confirmation */}
         {store.status === 'ready' && (
-          <div>
+          <div data-testid="pairing-ready">
             <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-6 mb-6">
               <div className="space-y-4">
                 <div className="flex items-start gap-3">
@@ -298,7 +300,7 @@ export default function PairingPage({ hubId, redirectUrl }) {
 
         {/* Success state */}
         {store.status === 'success' && (
-          <div className="bg-emerald-500/10 border border-emerald-500/20 rounded-lg p-8 text-center">
+          <div data-testid="pairing-success" className="bg-emerald-500/10 border border-emerald-500/20 rounded-lg p-8 text-center">
             <div className="inline-flex items-center justify-center w-12 h-12 bg-emerald-500/10 rounded-xl mb-4">
               <CheckIcon className="w-6 h-6 text-emerald-400" />
             </div>
@@ -322,18 +324,18 @@ export default function PairingPage({ hubId, redirectUrl }) {
               </div>
             </div>
 
-            <a href={redirectUrl} className="block text-center text-sm text-zinc-500 hover:text-zinc-300 transition-colors">
+            <RouterLink to={redirectUrl} className="block text-center text-sm text-zinc-500 hover:text-zinc-300 transition-colors">
               &larr; Back to hub
-            </a>
+            </RouterLink>
           </div>
         )}
 
         {/* Back link (shown with ready and paste states) */}
         {(store.status === 'paste' || store.status === 'ready') && (
           <div className="text-center mt-6">
-            <a href={redirectUrl} className="text-sm text-zinc-500 hover:text-zinc-300 transition-colors">
+            <RouterLink to={redirectUrl} className="text-sm text-zinc-500 hover:text-zinc-300 transition-colors">
               &larr; Back to hub
-            </a>
+            </RouterLink>
           </div>
         )}
 

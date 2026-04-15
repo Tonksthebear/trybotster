@@ -8,6 +8,26 @@ export default defineConfig({
     RubyPlugin(),
     react(),
   ],
+  server: {
+    headers: {
+      'Cache-Control': 'no-store',
+    },
+  },
+  optimizeDeps: {
+    // Force all React packages into a single optimization pass so they share
+    // one CJS interop wrapper. Without this, the optimizer may create separate
+    // wrappers that return different module instances.
+    include: [
+      'react',
+      'react-dom',
+      'react-dom/client',
+      'react/jsx-runtime',
+      'react/jsx-dev-runtime',
+      'react-router-dom',
+      'motion/react',
+    ],
+    force: true,
+  },
   resolve: {
     dedupe: ['react', 'react-dom'],
     alias: {

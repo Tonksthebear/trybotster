@@ -1,4 +1,5 @@
 import React, { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useSettingsStore } from '../../store/settings-store'
 import { Button } from '../catalyst/button'
 import {
@@ -14,7 +15,8 @@ import { Text } from '../catalyst/text'
 
 // ─── Hub Identity Form ─────────────────────────────────────────────
 
-function HubIdentityForm({ hubName, hubIdentifier, hubSettingsPath }) {
+function HubIdentityForm({ hubName, hubIdentifier, hubSettingsPath, hubPath }) {
+  const navigate = useNavigate()
   const [name, setName] = useState(hubName || '')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
@@ -38,8 +40,8 @@ function HubIdentityForm({ hubName, hubIdentifier, hubSettingsPath }) {
       })
 
       if (response.ok || response.redirected) {
-        // Refresh after save
-        window.location.reload()
+        // Navigate back to hub to see updated name
+        navigate(hubPath)
       } else {
         setError(`Save failed (${response.status})`)
         setSaving(false)
@@ -125,6 +127,7 @@ function HubControls() {
 // ─── Danger Zone ───────────────────────────────────────────────────
 
 function DangerZone({ hubSettingsPath, hubName }) {
+  const navigate = useNavigate()
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [deleting, setDeleting] = useState(false)
 
@@ -141,10 +144,8 @@ function DangerZone({ hubSettingsPath, hubName }) {
         redirect: 'follow',
       })
 
-      if (response.redirected) {
-        window.location.href = response.url
-      } else if (response.ok) {
-        window.location.href = '/'
+      if (response.ok || response.redirected) {
+        navigate('/hubs')
       }
     } catch {
       setDeleting(false)
@@ -207,6 +208,7 @@ export default function HubInfoPanel({
   hubName,
   hubIdentifier,
   hubSettingsPath,
+  hubPath,
 }) {
   return (
     <div className="max-w-3xl mx-auto px-4 py-6 lg:py-8 space-y-6">
@@ -214,6 +216,7 @@ export default function HubInfoPanel({
         hubName={hubName}
         hubIdentifier={hubIdentifier}
         hubSettingsPath={hubSettingsPath}
+        hubPath={hubPath}
       />
       <HubControls />
       <DangerZone hubSettingsPath={hubSettingsPath} hubName={hubName} />
