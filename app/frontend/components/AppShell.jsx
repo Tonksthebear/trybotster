@@ -102,16 +102,6 @@ function HubLayout() {
   const isSessionRoute = /\/sessions\//.test(location.pathname)
   const isSettingsRoute = /\/settings/.test(location.pathname)
 
-  // Full-screen terminal — no sidebar
-  if (isSessionRoute) {
-    return (
-      <div className="relative h-full">
-        <TerminalCache hubId={hubId} />
-        <DialogHost hubId={hubId} />
-      </div>
-    )
-  }
-
   return (
     <>
       <SidebarLayout
@@ -160,7 +150,14 @@ function HubLayout() {
           </Sidebar>
         }
       >
-        <Outlet />
+        {/* Terminal cache — always mounted, visible on session routes */}
+        {isSessionRoute ? (
+          <div className="relative h-full -m-6 lg:-m-10 lg:-mt-10 lg:-mb-2 lg:-mr-2">
+            <TerminalCache hubId={hubId} />
+          </div>
+        ) : (
+          <Outlet />
+        )}
       </SidebarLayout>
       <DialogHost hubId={hubId} />
     </>
