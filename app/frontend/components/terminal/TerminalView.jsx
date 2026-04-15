@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useCallback } from 'react'
+import { Button } from '../catalyst/button'
 import { connect, disconnect } from '../../lib/hub-bridge'
 
 import { Restty } from 'restty'
@@ -669,90 +670,42 @@ export default function TerminalView({ hubId, sessionUuid }) {
       {/* Mobile Touch Controls */}
       {isMobile && (
         <div className="shrink-0 border-t border-zinc-700/50 bg-zinc-900/95 backdrop-blur-sm pb-[env(safe-area-inset-bottom)]">
-          <div className="flex items-center justify-between px-2 py-1">
+          <div className="flex items-center justify-between px-1.5 py-0.5">
             <div className="flex items-center gap-0.5">
-              <button
-                type="button"
-                onClick={() => sendKey('\x03')}
-                className="px-2 py-1 text-xs font-mono font-medium text-red-300 hover:bg-red-500/10 rounded transition-colors"
-              >
+              <Button plain onClick={() => sendKey('\x03')} className="!px-2 !py-0.5 !text-xs !font-mono !text-red-400">
                 ^C
-              </button>
-              <button
-                type="button"
-                onClick={() => sendKey('\x1b')}
-                className="px-2 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-800 rounded transition-colors"
-              >
+              </Button>
+              <Button plain onClick={() => sendKey('\x1b')} className="!px-2 !py-0.5 !text-xs">
                 Esc
-              </button>
-              <button
-                type="button"
-                onClick={() => sendKey('\t')}
-                className="px-2 py-1 text-xs font-medium text-zinc-300 hover:bg-zinc-800 rounded transition-colors"
-              >
+              </Button>
+              <Button plain onClick={() => sendKey('\t')} className="!px-2 !py-0.5 !text-xs">
                 Tab
-              </button>
-              <button
-                type="button"
-                onClick={() => sendKey('\r')}
-                className="px-2 py-1 text-xs font-medium text-primary-300 bg-primary-500/10 hover:bg-primary-500/20 rounded transition-colors"
-              >
+              </Button>
+              <Button color="indigo" onClick={() => sendKey('\r')} className="!px-2.5 !py-0.5 !text-xs">
                 Enter
-              </button>
+              </Button>
             </div>
             <div className="flex items-center gap-0.5">
-              <button
-                type="button"
-                onClick={() => sendKey('\x1b[D')}
-                className="p-1 text-zinc-400 hover:bg-zinc-800 rounded-full transition-colors"
-              >
-                <svg className="size-4" viewBox="0 0 20 20" fill="currentColor">
-                  <path
-                    fillRule="evenodd"
-                    d="M11.78 5.22a.75.75 0 010 1.06L8.06 10l3.72 3.72a.75.75 0 11-1.06 1.06l-4.25-4.25a.75.75 0 010-1.06l4.25-4.25a.75.75 0 011.06 0z"
-                    clipRule="evenodd"
-                  />
+              <Button plain onClick={() => sendKey('\x1b[D')} className="!p-1">
+                <svg data-slot="icon" className="!size-4" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M11.78 5.22a.75.75 0 010 1.06L8.06 10l3.72 3.72a.75.75 0 11-1.06 1.06l-4.25-4.25a.75.75 0 010-1.06l4.25-4.25a.75.75 0 011.06 0z" clipRule="evenodd" />
                 </svg>
-              </button>
-              <button
-                type="button"
-                onClick={() => sendKey('\x1b[B')}
-                className="p-1 text-zinc-400 hover:bg-zinc-800 rounded-full transition-colors"
-              >
-                <svg className="size-4" viewBox="0 0 20 20" fill="currentColor">
-                  <path
-                    fillRule="evenodd"
-                    d="M5.22 8.22a.75.75 0 011.06 0L10 11.94l3.72-3.72a.75.75 0 111.06 1.06l-4.25 4.25a.75.75 0 01-1.06 0l-4.25-4.25a.75.75 0 010-1.06z"
-                    clipRule="evenodd"
-                  />
+              </Button>
+              <Button plain onClick={() => sendKey('\x1b[B')} className="!p-1">
+                <svg data-slot="icon" className="!size-4" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M5.22 8.22a.75.75 0 011.06 0L10 11.94l3.72-3.72a.75.75 0 111.06 1.06l-4.25 4.25a.75.75 0 01-1.06 0l-4.25-4.25a.75.75 0 010-1.06z" clipRule="evenodd" />
                 </svg>
-              </button>
-              <button
-                type="button"
-                onClick={() => sendKey('\x1b[A')}
-                className="p-1 text-zinc-400 hover:bg-zinc-800 rounded-full transition-colors"
-              >
-                <svg className="size-4" viewBox="0 0 20 20" fill="currentColor">
-                  <path
-                    fillRule="evenodd"
-                    d="M14.78 11.78a.75.75 0 01-1.06 0L10 8.06l-3.72 3.72a.75.75 0 01-1.06-1.06l4.25-4.25a.75.75 0 011.06 0l4.25 4.25a.75.75 0 010 1.06z"
-                    clipRule="evenodd"
-                  />
+              </Button>
+              <Button plain onClick={() => sendKey('\x1b[A')} className="!p-1">
+                <svg data-slot="icon" className="!size-4" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M14.78 11.78a.75.75 0 01-1.06 0L10 8.06l-3.72 3.72a.75.75 0 01-1.06-1.06l4.25-4.25a.75.75 0 011.06 0l4.25 4.25a.75.75 0 010 1.06z" clipRule="evenodd" />
                 </svg>
-              </button>
-              <button
-                type="button"
-                onClick={() => sendKey('\x1b[C')}
-                className="p-1 text-zinc-400 hover:bg-zinc-800 rounded-full transition-colors"
-              >
-                <svg className="size-4" viewBox="0 0 20 20" fill="currentColor">
-                  <path
-                    fillRule="evenodd"
-                    d="M8.22 5.22a.75.75 0 011.06 0l4.25 4.25a.75.75 0 010 1.06l-4.25 4.25a.75.75 0 01-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 010-1.06z"
-                    clipRule="evenodd"
-                  />
+              </Button>
+              <Button plain onClick={() => sendKey('\x1b[C')} className="!p-1">
+                <svg data-slot="icon" className="!size-4" viewBox="0 0 20 20" fill="currentColor">
+                  <path fillRule="evenodd" d="M8.22 5.22a.75.75 0 011.06 0l4.25 4.25a.75.75 0 010 1.06l-4.25 4.25a.75.75 0 01-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 010-1.06z" clipRule="evenodd" />
                 </svg>
-              </button>
+              </Button>
             </div>
           </div>
         </div>
