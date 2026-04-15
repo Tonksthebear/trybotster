@@ -48,7 +48,7 @@ export function SidebarLayout({ navbar, sidebar, flush, children }) {
   let [showSidebar, setShowSidebar] = useState(false)
 
   return (
-    <div className="relative isolate flex min-h-svh w-full bg-white max-lg:flex-col lg:bg-zinc-100 dark:bg-zinc-900 dark:lg:bg-zinc-950">
+    <div className="relative isolate flex h-svh w-full overflow-hidden bg-white max-lg:flex-col lg:bg-zinc-100 dark:bg-zinc-900 dark:lg:bg-zinc-950">
       {/* Sidebar on desktop */}
       <div className="fixed inset-y-0 left-0 w-64 max-lg:hidden">{sidebar}</div>
 
@@ -57,8 +57,8 @@ export function SidebarLayout({ navbar, sidebar, flush, children }) {
         {sidebar}
       </MobileSidebar>
 
-      {/* Navbar on mobile */}
-      <header className="flex items-center px-4 lg:hidden">
+      {/* Navbar on mobile — sticky */}
+      <header className="sticky top-0 z-20 flex shrink-0 items-center border-b border-zinc-950/5 bg-white px-4 dark:border-white/5 dark:bg-zinc-900 lg:hidden">
         <div className="py-2.5">
           <NavbarItem onClick={() => setShowSidebar(true)} aria-label="Open navigation">
             <OpenMenuIcon />
@@ -68,10 +68,10 @@ export function SidebarLayout({ navbar, sidebar, flush, children }) {
       </header>
 
       {/* Content */}
-      <main className={`flex flex-1 flex-col lg:min-w-0 lg:pl-64 ${flush ? '' : 'pb-2 lg:pt-2 lg:pr-2'}`}>
+      <main className={`flex min-h-0 flex-1 flex-col lg:min-w-0 lg:pl-64 ${flush ? '' : 'pb-2 lg:pt-2 lg:pr-2'}`}>
         <div className={flush
           ? 'relative grow flex flex-col overflow-hidden'
-          : 'grow p-6 lg:rounded-lg lg:bg-white lg:p-10 lg:shadow-xs lg:ring-1 lg:ring-zinc-950/5 dark:lg:bg-zinc-900 dark:lg:ring-white/10'
+          : 'grow overflow-y-auto p-3 sm:p-6 lg:rounded-lg lg:bg-white lg:p-10 lg:shadow-xs lg:ring-1 lg:ring-zinc-950/5 dark:lg:bg-zinc-900 dark:lg:ring-white/10'
         }>
           {flush ? children : <div className="mx-auto max-w-6xl">{children}</div>}
         </div>
