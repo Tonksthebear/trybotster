@@ -105,6 +105,7 @@ function HubLayout() {
   return (
     <>
       <SidebarLayout
+        flush={isSessionRoute}
         navbar={
           <Navbar>
             <NavbarItem href={`/hubs/${hubId}`}>
@@ -150,11 +151,8 @@ function HubLayout() {
           </Sidebar>
         }
       >
-        {/* Terminal cache — always mounted, visible on session routes */}
         {isSessionRoute ? (
-          <div className="relative h-full -m-6 lg:-m-10 lg:-mt-10 lg:-mb-2 lg:-mr-2">
-            <TerminalCache hubId={hubId} />
-          </div>
+          <TerminalCache hubId={hubId} />
         ) : (
           <Outlet />
         )}
