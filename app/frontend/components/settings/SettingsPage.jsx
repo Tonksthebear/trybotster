@@ -1,4 +1,5 @@
 import React from 'react'
+import { Link } from 'react-router-dom'
 import clsx from 'clsx'
 import { useSettingsStore } from '../../store/settings-store'
 import ConnectionStatus from '../hub/ConnectionStatus'
@@ -31,8 +32,8 @@ export default function SettingsPage({
         <div className="px-4 py-4 lg:py-6">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0 flex items-center gap-3">
-              <a
-                href={hubPath}
+              <Link
+                to={hubPath}
                 className="text-zinc-500 hover:text-zinc-300 transition-colors"
               >
                 <svg
@@ -48,7 +49,7 @@ export default function SettingsPage({
                     d="M10.5 19.5L3 12m0 0l7.5-7.5M3 12h18"
                   />
                 </svg>
-              </a>
+              </Link>
               <div>
                 <h1 className="text-xl lg:text-2xl font-bold text-zinc-100 font-mono">
                   Settings
