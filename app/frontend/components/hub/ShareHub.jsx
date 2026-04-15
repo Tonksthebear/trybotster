@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react'
+import React, { useState, useCallback, useRef, useEffect } from 'react'
 import {
   Dialog,
   DialogTitle,
@@ -16,8 +16,21 @@ export default function ShareHub({ hubId }) {
   const [url, setUrl] = useState('')
   const [qrAscii, setQrAscii] = useState('')
   const [copyStatus, setCopyStatus] = useState('')
+  const unsubRef = useRef(null)
+
+  // Clean up listener on unmount
+  useEffect(() => {
+    return () => {
+      unsubRef.current?.()
+      unsubRef.current = null
+    }
+  }, [])
 
   const requestCode = useCallback(async () => {
+    // Clean up any previous listener
+    unsubRef.current?.()
+    unsubRef.current = null
+
     setStatus('loading')
     setErrorMessage('')
 
@@ -30,6 +43,7 @@ export default function ShareHub({ hubId }) {
 
     const unsub = hub.on('connectionCode', (message) => {
       unsub()
+      unsubRef.current = null
       const { url: codeUrl, qr_ascii } = message
       if (!codeUrl || !qr_ascii) {
         setStatus('error')
@@ -43,15 +57,19 @@ export default function ShareHub({ hubId }) {
       setStatus('success')
     })
 
+    unsubRef.current = unsub
+
     try {
       const sent = await hub.requestConnectionCode()
       if (!sent) {
         unsub()
+        unsubRef.current = null
         setStatus('error')
         setErrorMessage('Failed to send request - not connected')
       }
     } catch (err) {
       unsub()
+      unsubRef.current = null
       setStatus('error')
       setErrorMessage(err.message || 'Connection failed')
     }
@@ -63,6 +81,8 @@ export default function ShareHub({ hubId }) {
   }
 
   function handleClose() {
+    unsubRef.current?.()
+    unsubRef.current = null
     setOpen(false)
     setStatus('idle')
     setCopyStatus('')

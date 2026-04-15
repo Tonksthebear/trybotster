@@ -1,37 +1,42 @@
-import React, { useState, useEffect } from 'react'
-import { useLocation, useParams } from 'react-router-dom'
+import React, { useState, useEffect, useCallback } from 'react'
+import { useLocation } from 'react-router-dom'
 import TerminalView from './TerminalView'
+
+const MAX_CACHED = 5
 
 /**
  * Keeps terminal sessions alive across route changes within a hub.
- * Renders inside HubLayout — always present but hidden when not on a session route.
- * Active terminals are kept mounted with display:none when not visible.
+ * LRU eviction: when more than MAX_CACHED terminals have been visited,
+ * the least-recently-used one is removed (unmounted, transport torn down).
  */
 export default function TerminalCache({ hubId }) {
   const location = useLocation()
-  const [sessions, setSessions] = useState(new Set())
+  // Ordered array: most-recently-used last
+  const [order, setOrder] = useState([])
 
-  // Parse the current session UUID from the URL
   const match = location.pathname.match(/\/hubs\/[^/]+\/sessions\/([^/]+)/)
   const activeSessionUuid = match ? match[1] : null
 
-  // Track opened sessions
   useEffect(() => {
-    if (activeSessionUuid) {
-      setSessions((prev) => {
-        if (prev.has(activeSessionUuid)) return prev
-        const next = new Set(prev)
-        next.add(activeSessionUuid)
-        return next
-      })
-    }
+    if (!activeSessionUuid) return
+
+    setOrder((prev) => {
+      // Move to end (most recent)
+      const without = prev.filter((id) => id !== activeSessionUuid)
+      const next = [...without, activeSessionUuid]
+      // Evict LRU if over limit
+      if (next.length > MAX_CACHED) {
+        return next.slice(next.length - MAX_CACHED)
+      }
+      return next
+    })
   }, [activeSessionUuid])
 
-  if (sessions.size === 0) return null
+  if (order.length === 0) return null
 
   return (
     <>
-      {[...sessions].map((uuid) => (
+      {order.map((uuid) => (
         <div
           key={uuid}
           className="absolute inset-0 z-10"

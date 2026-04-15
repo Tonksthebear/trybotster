@@ -18,23 +18,11 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to root_path
   end
 
-  test "index shows hubs list when hubs exist" do
+  test "index serves SPA shell" do
     sign_in @user
     get hubs_path
     assert_response :success
-
-    assert_select "h2", text: /Hubs/
-  end
-
-  test "index shows empty state when no hubs" do
-    sign_in @user
-    Hub.where(user: @user).destroy_all
-
-    get hubs_path
-    assert_response :success
-
-    assert_select "h2", text: /No Active Hubs/
-    assert_match "botster", response.body
+    assert_select "#app"
   end
 
   # === Show HTML Tests ===
@@ -44,57 +32,11 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to root_path
   end
 
-  test "show displays hub info" do
+  test "show serves SPA shell" do
     sign_in @user
     get hub_path(@active_hub)
     assert_response :success
-
-    # Should show hub identifier
-    assert_match @active_hub.identifier, response.body
-  end
-
-  test "show displays agents section with agent-list controller" do
-    sign_in @user
-    get hub_path(@active_hub)
-    assert_response :success
-
-    assert_select "[data-controller='agent-list']"
-  end
-
-  test "show displays new session button" do
-    sign_in @user
-    get hub_path(@active_hub)
-    assert_response :success
-
-    assert_select "[commandfor='new-session-chooser-modal']"
-  end
-
-  test "show renders target-first new session chooser" do
-    sign_in @user
-    get hub_path(@active_hub)
-    assert_response :success
-
-    assert_select "[data-controller='new-session-chooser']"
-    assert_match "Choose spawn location first, then session type", response.body
-    assert_match "Spawn Target", response.body
-  end
-
-  test "show displays settings link" do
-    sign_in @user
-    get hub_path(@active_hub)
-    assert_response :success
-
-    assert_select "a[href=?]", hub_settings_path(@active_hub)
-  end
-
-  test "show includes setup banner with recommended template" do
-    sign_in @user
-    get hub_path(@active_hub)
-    assert_response :success
-
-    assert_select "[data-controller='hub-setup-banner']"
-    assert_select "[data-hub-setup-banner-target='banner']"
-    assert_select "[data-action='hub-setup-banner#quickSetup']"
+    assert_select "#app"
   end
 
   test "show redirects to index for non-existent hub" do

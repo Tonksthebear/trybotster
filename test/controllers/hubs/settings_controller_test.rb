@@ -11,54 +11,30 @@ class Hubs::SettingsControllerTest < ActionDispatch::IntegrationTest
     sign_in @user
   end
 
-  test "settings page renders template catalog" do
+  test "settings page serves SPA shell" do
     get hub_settings_path(@hub)
     assert_response :success
-
-    # Should render the GitHub plugin template card
-    assert_match "GitHub Integration", response.body
-    assert_match "plugins-github", response.body
+    assert_select "#app"
   end
 
-  test "settings page includes template content in data attribute" do
-    get hub_settings_path(@hub)
+  test "settings JSON returns config metadata" do
+    get hub_settings_path(@hub), as: :json
     assert_response :success
 
-    # The preview panel should include the template content for DataChannel install
-    assert_match "Github::EventsChannel", response.body
+    json = JSON.parse(response.body)
+    assert json.key?("configMetadata")
+    assert json.key?("templates")
+    assert json.key?("agentTemplates")
+    assert json.key?("hubName")
+    assert json.key?("hubIdentifier")
   end
 
-  test "settings page includes template dest path" do
-    get hub_settings_path(@hub)
+  test "settings JSON includes template catalog" do
+    get hub_settings_path(@hub), as: :json
     assert_response :success
 
-    assert_match "plugins/github/init.lua", response.body
-  end
-
-  test "settings page renders all template categories" do
-    get hub_settings_path(@hub)
-    assert_response :success
-
-    assert_match "plugins", response.body
-    assert_match "sessions", response.body
-    assert_match "initialization", response.body
-  end
-
-  test "settings empty state shows session template suggestions" do
-    get hub_settings_path(@hub)
-    assert_response :success
-
-    # Empty state should have quick setup buttons with template data
-    assert_select "[data-action='hub-settings#quickSetup']", minimum: 1
-    assert_select "[data-action='hub-settings#initBotster']", text: /Initialize empty/
-  end
-
-  test "settings empty state includes session template content in data attributes" do
-    get hub_settings_path(@hub)
-    assert_response :success
-
-    # Session templates should have dest and content data attributes
-    assert_select "[data-action='hub-settings#quickSetup'][data-template-dest]", minimum: 1
-    assert_select "[data-action='hub-settings#quickSetup'][data-template-content]", minimum: 1
+    json = JSON.parse(response.body)
+    templates = json["templates"]
+    assert templates.is_a?(Hash), "Expected templates to be a hash"
   end
 end
