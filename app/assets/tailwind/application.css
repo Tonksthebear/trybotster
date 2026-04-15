@@ -19,6 +19,15 @@ html {
   overflow: hidden;
 }
 
+/*
+ * Hide mobile app shell chrome when virtual keyboard is open.
+ * Targets the SidebarLayout mobile header (sticky navbar) without
+ * modifying the Catalyst source file.
+ */
+body[data-mobile-keyboard] header.sticky {
+  display: none !important;
+}
+
 
 /*
  * iOS safe area insets for touch controls

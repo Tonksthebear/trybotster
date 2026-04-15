@@ -1,10 +1,9 @@
 # frozen_string_literal: true
 
 require "test_helper"
-require "turbo/broadcastable/test_helper"
 
 class HubTest < ActiveSupport::TestCase
-  include Turbo::Broadcastable::TestHelper
+  include ActionCable::TestHelper
 
   setup do
     @user = User.create!(
@@ -214,43 +213,6 @@ class HubTest < ActiveSupport::TestCase
     assert_equal 1, seq1
     assert_equal 2, seq2
     assert_equal 3, seq3
-  end
-
-  # ==========================================================================
-  # Turbo Stream Broadcasts
-  # ==========================================================================
-
-  test "creating hub broadcasts hubs list update" do
-    assert_turbo_stream_broadcasts [ @user, :hubs ] do
-      Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current)
-    end
-  end
-
-  test "updating hub broadcasts hubs list update" do
-    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: 1.minute.ago, alive: true)
-
-    assert_turbo_stream_broadcasts [ @user, :hubs ] do
-      hub.update!(last_seen_at: Time.current)
-    end
-  end
-
-  test "destroying hub broadcasts hubs list update" do
-    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current)
-
-    assert_turbo_stream_broadcasts [ @user, :hubs ] do
-      hub.destroy!
-    end
-  end
-
-  test "hubs list broadcast targets sidebar and dashboard" do
-    streams = capture_turbo_stream_broadcasts [ @user, :hubs ] do
-      Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current)
-    end
-
-    update_streams = streams.select { |s| s["action"] == "update" }
-    targets = update_streams.map { |s| s["targets"] }
-    assert_includes targets, ".hubs-list", "Expected sidebar broadcast"
-    assert_includes targets, ".hubs-dashboard", "Expected dashboard broadcast"
   end
 
   test "destroying hub broadcasts health offline" do

@@ -2,7 +2,6 @@ import React from 'react'
 import { Link } from 'react-router-dom'
 import clsx from 'clsx'
 import { useSettingsStore } from '../../store/settings-store'
-import ConnectionStatus from '../hub/ConnectionStatus'
 import ConfigEditor from './ConfigEditor'
 import TemplateCatalog from './TemplateCatalog'
 import HubInfoPanel from './HubInfoPanel'
@@ -59,7 +58,6 @@ export default function SettingsPage({
                 </p>
               </div>
             </div>
-            <ConnectionStatus hubId={hubId} />
           </div>
         </div>
 

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react'
+import React, { useEffect } from 'react'
 import {
   BrowserRouter,
   Routes,
@@ -6,9 +6,8 @@ import {
   Outlet,
   useParams,
   useLocation,
-
+  useNavigate,
 } from 'react-router-dom'
-import { connect, disconnect } from '../lib/hub-bridge'
 import { SidebarLayout } from './catalyst/sidebar-layout'
 import {
   Sidebar,
@@ -23,10 +22,13 @@ import {
 } from './catalyst/sidebar'
 import { Navbar, NavbarItem, NavbarSpacer } from './catalyst/navbar'
 import WorkspaceList from './workspace/WorkspaceList'
-import ConnectionStatus from './hub/ConnectionStatus'
+import HubSwitcher from './hub/HubSwitcher'
+import SidebarConnectionStatus from './hub/SidebarConnectionStatus'
+import ConnectionOverlay from './hub/ConnectionOverlay'
 import DialogHost from './DialogHost'
 import TerminalCache from './terminal/TerminalCache'
 import { setHubId } from '../lib/modal-bridge'
+import { useHubStore } from '../store/hub-store'
 
 // Lazy-loaded route components
 const Home = React.lazy(() => import('./pages/Home'))
@@ -77,38 +79,78 @@ function CommandLineIcon() {
 }
 
 /**
- * Hub-scoped layout with Catalyst sidebar.
+ * Syncs route :hubId param into the hub store.
+ * Renders inside /hubs/:hubId routes.
  */
-function HubLayout() {
+function HubRouteSync() {
   const { hubId } = useParams()
-  const location = useLocation()
-  const connectionRef = useRef(null)
+  const selectedHubId = useHubStore((s) => s.selectedHubId)
+  const selectHub = useHubStore((s) => s.selectHub)
 
   useEffect(() => {
-    if (!hubId) return
-
-    setHubId(hubId)
-    const state = { unmounted: false }
-
-    connect(hubId, { surface: 'panel' }).then(({ connectionId }) => {
-      if (state.unmounted) {
-        disconnect(connectionId)
-      } else {
-        connectionRef.current = connectionId
-      }
-    })
-
-    return () => {
-      state.unmounted = true
-      if (connectionRef.current != null) {
-        disconnect(connectionRef.current)
-        connectionRef.current = null
-      }
+    if (hubId && String(hubId) !== String(selectedHubId)) {
+      selectHub(hubId)
     }
-  }, [hubId])
+  }, [hubId, selectedHubId, selectHub])
+
+  return <Outlet />
+}
+
+/**
+ * Hub-scoped layout with Catalyst sidebar, hub switcher, and connection overlay.
+ * Wraps all /hubs/* routes.
+ */
+function HubShell() {
+  const location = useLocation()
+  const navigate = useNavigate()
+  const selectedHubId = useHubStore((s) => s.selectedHubId)
+  const connectionState = useHubStore((s) => s.connectionState)
+  const hubListLoading = useHubStore((s) => s.hubListLoading)
+  const fetchHubList = useHubStore((s) => s.fetchHubList)
+  const selectHub = useHubStore((s) => s.selectHub)
+  const disconnectHub = useHubStore((s) => s.disconnectHub)
+  const getLastHubId = useHubStore((s) => s.getLastHubId)
+
+  // Fetch hub list on mount
+  useEffect(() => {
+    fetchHubList()
+  }, [fetchHubList])
+
+  // Auto-select last-used hub when at /hubs (no hub in URL)
+  useEffect(() => {
+    if (hubListLoading) return
+
+    const hubList = useHubStore.getState().hubList
+    const isHubRoute = /^\/hubs\/[^/]/.test(location.pathname)
+
+    // Only auto-select when at /hubs with no hub in URL
+    if (isHubRoute) return
+
+    const lastId = getLastHubId()
+    const target = lastId && hubList.find((h) => String(h.id) === String(lastId))
+
+    if (target) {
+      selectHub(target.id)
+      navigate(`/hubs/${target.id}`, { replace: true })
+    } else if (hubList.length === 1) {
+      selectHub(hubList[0].id)
+      navigate(`/hubs/${hubList[0].id}`, { replace: true })
+    }
+  }, [hubListLoading, location.pathname, navigate, selectHub, getLastHubId])
+
+  // Keep modal-bridge in sync
+  useEffect(() => {
+    if (selectedHubId) setHubId(selectedHubId)
+  }, [selectedHubId])
+
+  // Disconnect when navigating away from /hubs/* routes (preserves lastHubId)
+  useEffect(() => {
+    return () => disconnectHub()
+  }, [disconnectHub])
 
   const isSessionRoute = /\/sessions\//.test(location.pathname)
   const isSettingsRoute = /\/settings/.test(location.pathname)
+  const isPairingRoute = /\/pairing/.test(location.pathname)
 
   return (
     <>
@@ -116,40 +158,37 @@ function HubLayout() {
         flush={isSessionRoute}
         navbar={
           <Navbar>
-            <NavbarItem href={`/hubs/${hubId}`}>
+            <NavbarItem href={selectedHubId ? `/hubs/${selectedHubId}` : '/hubs'}>
               <CommandLineIcon />
               <span className="font-mono font-bold tracking-tight">botster</span>
             </NavbarItem>
             <NavbarSpacer />
-            <ConnectionStatus hubId={hubId} />
           </Navbar>
         }
         sidebar={
           <Sidebar>
             <SidebarHeader>
-              <SidebarItem href={`/hubs/${hubId}`}>
-                <CommandLineIcon />
-                <SidebarLabel className="font-mono font-bold tracking-tight">
-                  botster
-                </SidebarLabel>
-              </SidebarItem>
+              <HubSwitcher />
             </SidebarHeader>
             <SidebarBody>
+              <SidebarConnectionStatus />
               <SidebarSection>
                 <SidebarHeading>Workspaces</SidebarHeading>
-                <WorkspaceList hubId={hubId} surface="sidebar" />
+                <WorkspaceList hubId={selectedHubId} surface="sidebar" />
               </SidebarSection>
               <SidebarSpacer />
             </SidebarBody>
             <SidebarFooter>
               <SidebarSection>
-                <SidebarItem
-                  href={`/hubs/${hubId}/settings`}
-                  current={isSettingsRoute}
-                >
-                  <CogIcon />
-                  <SidebarLabel>Hub Settings</SidebarLabel>
-                </SidebarItem>
+                {selectedHubId && (
+                  <SidebarItem
+                    href={`/hubs/${selectedHubId}/settings`}
+                    current={isSettingsRoute}
+                  >
+                    <CogIcon />
+                    <SidebarLabel>Hub Settings</SidebarLabel>
+                  </SidebarItem>
+                )}
                 <SidebarItem href="/docs" target="_blank">
                   <BookIcon />
                   <SidebarLabel>Docs</SidebarLabel>
@@ -174,12 +213,13 @@ function HubLayout() {
         }
       >
         {isSessionRoute ? (
-          <TerminalCache hubId={hubId} />
+          <TerminalCache hubId={selectedHubId} />
         ) : (
           <Outlet />
         )}
+        <ConnectionOverlay suppress={isPairingRoute} />
       </SidebarLayout>
-      <DialogHost hubId={hubId} />
+      {selectedHubId && <DialogHost hubId={selectedHubId} />}
     </>
   )
 }
@@ -193,13 +233,16 @@ export default function AppShell() {
       <React.Suspense fallback={<SuspenseFallback />}>
         <Routes>
           <Route path="/" element={<Home />} />
-          <Route path="/hubs" element={<HubDashboard />} />
 
-          <Route path="/hubs/:hubId" element={<HubLayout />}>
-            <Route index element={<HubShow />} />
-            <Route path="sessions/:sessionUuid" element={null} />
-            <Route path="settings" element={<SettingsRoute />} />
-            <Route path="pairing" element={<PairingRoute />} />
+          <Route element={<HubShell />}>
+            <Route path="/hubs" element={<HubDashboard />} />
+
+            <Route path="/hubs/:hubId" element={<HubRouteSync />}>
+              <Route index element={<HubShow />} />
+              <Route path="sessions/:sessionUuid" element={null} />
+              <Route path="settings" element={<SettingsRoute />} />
+              <Route path="pairing" element={<PairingRoute />} />
+            </Route>
           </Route>
         </Routes>
       </React.Suspense>

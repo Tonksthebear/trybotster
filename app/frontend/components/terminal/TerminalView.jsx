@@ -1,6 +1,5 @@
 import React, { useRef, useEffect, useCallback } from 'react'
 import { connect, disconnect } from '../../lib/hub-bridge'
-import ConnectionStatus from '../hub/ConnectionStatus'
 
 import { Restty } from 'restty'
 import { HubConnectionManager, HubTransport } from 'connections'
@@ -632,31 +631,11 @@ export default function TerminalView({ hubId, sessionUuid }) {
     }
   }, [hubId, sessionUuid])
 
-  const isMobile = typeof window !== 'undefined' && 'ontouchstart' in window
+  const isMobile = typeof window !== 'undefined' &&
+    ('ontouchstart' in window || window.matchMedia('(pointer: coarse)').matches)
 
   return (
-    <div className="h-dvh flex flex-col overflow-hidden mobile-keyboard:h-(--kb-height)">
-      {/* Header */}
-      <div className="shrink-0 border-b border-zinc-800 bg-zinc-900/50 mobile-keyboard:hidden">
-        <div className="px-3 py-2 lg:px-4 lg:py-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 lg:gap-4 min-w-0">
-              <div className="flex items-center bg-zinc-800/50 rounded p-0.5">
-                <span className="px-2 py-1 text-xs font-medium rounded bg-zinc-700 text-zinc-100">
-                  Terminal
-                </span>
-              </div>
-            </div>
-            <div className="flex items-center gap-4">
-              <ConnectionStatus hubId={hubId} />
-              <span className="text-xs text-zinc-600 hidden lg:inline">
-                scroll: mouse wheel
-              </span>
-            </div>
-          </div>
-        </div>
-      </div>
-
+    <div className="h-full flex flex-col overflow-hidden mobile-keyboard:h-(--kb-height)">
       {/* Terminal Panel */}
       <div className="flex-1 min-h-0 flex flex-col">
         <div className="flex-1 flex flex-col min-h-0 bg-zinc-950 overflow-hidden">
