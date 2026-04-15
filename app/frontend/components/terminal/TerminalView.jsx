@@ -669,7 +669,7 @@ export default function TerminalView({ hubId, sessionUuid }) {
 
       {/* Mobile Touch Controls */}
       {isMobile && (
-        <div className="shrink-0 border-t border-zinc-700/50 bg-zinc-900/95 backdrop-blur-sm pb-[env(safe-area-inset-bottom)]">
+        <div className="shrink-0 border-t border-zinc-700/50 bg-zinc-900/95 backdrop-blur-sm">
           <div className="flex items-center justify-between px-1.5 py-0.5">
             <div className="flex items-center gap-0.5">
               <Button plain onClick={() => sendKey('\x03')} className="!px-2 !py-0.5 !text-xs !font-mono !text-red-400">
@@ -685,24 +685,24 @@ export default function TerminalView({ hubId, sessionUuid }) {
                 Enter
               </Button>
             </div>
-            <div className="flex items-center gap-0.5">
-              <Button plain onClick={() => sendKey('\x1b[D')} className="!p-1">
-                <svg data-slot="icon" className="!size-4" viewBox="0 0 20 20" fill="currentColor">
+            <div className="flex items-center gap-1">
+              <Button plain onClick={() => sendKey('\x1b[D')} className="!p-1.5">
+                <svg data-slot="icon" className="!size-5" viewBox="0 0 20 20" fill="currentColor">
                   <path fillRule="evenodd" d="M11.78 5.22a.75.75 0 010 1.06L8.06 10l3.72 3.72a.75.75 0 11-1.06 1.06l-4.25-4.25a.75.75 0 010-1.06l4.25-4.25a.75.75 0 011.06 0z" clipRule="evenodd" />
                 </svg>
               </Button>
-              <Button plain onClick={() => sendKey('\x1b[B')} className="!p-1">
-                <svg data-slot="icon" className="!size-4" viewBox="0 0 20 20" fill="currentColor">
+              <Button plain onClick={() => sendKey('\x1b[B')} className="!p-1.5">
+                <svg data-slot="icon" className="!size-5" viewBox="0 0 20 20" fill="currentColor">
                   <path fillRule="evenodd" d="M5.22 8.22a.75.75 0 011.06 0L10 11.94l3.72-3.72a.75.75 0 111.06 1.06l-4.25 4.25a.75.75 0 01-1.06 0l-4.25-4.25a.75.75 0 010-1.06z" clipRule="evenodd" />
                 </svg>
               </Button>
-              <Button plain onClick={() => sendKey('\x1b[A')} className="!p-1">
-                <svg data-slot="icon" className="!size-4" viewBox="0 0 20 20" fill="currentColor">
+              <Button plain onClick={() => sendKey('\x1b[A')} className="!p-1.5">
+                <svg data-slot="icon" className="!size-5" viewBox="0 0 20 20" fill="currentColor">
                   <path fillRule="evenodd" d="M14.78 11.78a.75.75 0 01-1.06 0L10 8.06l-3.72 3.72a.75.75 0 01-1.06-1.06l4.25-4.25a.75.75 0 011.06 0l4.25 4.25a.75.75 0 010 1.06z" clipRule="evenodd" />
                 </svg>
               </Button>
-              <Button plain onClick={() => sendKey('\x1b[C')} className="!p-1">
-                <svg data-slot="icon" className="!size-4" viewBox="0 0 20 20" fill="currentColor">
+              <Button plain onClick={() => sendKey('\x1b[C')} className="!p-1.5">
+                <svg data-slot="icon" className="!size-5" viewBox="0 0 20 20" fill="currentColor">
                   <path fillRule="evenodd" d="M8.22 5.22a.75.75 0 011.06 0l4.25 4.25a.75.75 0 010 1.06l-4.25 4.25a.75.75 0 01-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 010-1.06z" clipRule="evenodd" />
                 </svg>
               </Button>

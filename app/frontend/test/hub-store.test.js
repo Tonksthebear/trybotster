@@ -65,8 +65,8 @@ describe('hub-store', () => {
     it('transitions to connecting state', async () => {
       await useHubStore.getState().selectHub(1)
 
-      expect(useHubStore.getState().selectedHubId).toBe(1)
-      expect(mockConnect).toHaveBeenCalledWith(1, { surface: 'panel' })
+      expect(useHubStore.getState().selectedHubId).toBe('1')
+      expect(mockConnect).toHaveBeenCalledWith('1', { surface: 'panel' })
     })
 
     it('stores last hub ID in localStorage', async () => {
@@ -83,7 +83,7 @@ describe('hub-store', () => {
       await useHubStore.getState().selectHub(2)
 
       expect(mockDisconnect).toHaveBeenCalledWith(firstRef)
-      expect(useHubStore.getState().selectedHubId).toBe(2)
+      expect(useHubStore.getState().selectedHubId).toBe('2')
     })
 
     it('clears state when selecting null', async () => {

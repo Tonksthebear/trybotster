@@ -37,6 +37,7 @@ export const useHubStore = create((set, get) => ({
   },
 
   selectHub: async (hubId) => {
+    if (hubId != null) hubId = String(hubId)
     const { selectedHubId, _connectionRef, _statusUnsub } = get()
     if (hubId === selectedHubId) return
 
