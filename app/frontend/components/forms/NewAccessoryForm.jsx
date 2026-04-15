@@ -156,7 +156,7 @@ export default function NewAccessoryForm({ hubId }) {
           <div className="mt-6">
             {accessories.length > 0 ? (
               <>
-                <Label>Accessory configuration</Label>
+                <p className="text-sm/6 font-medium text-zinc-950 dark:text-white">Accessory configuration</p>
                 <div className="mt-2 space-y-2">
                   {accessories.map((name) => (
                     <button

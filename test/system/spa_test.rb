@@ -154,6 +154,45 @@ class SpaTest < ApplicationSystemTestCase
     assert_empty errors, "Expected no JS errors during agent creation, got: #{errors.map(&:message).join(', ')}"
   end
 
+  test "full accessory creation flow: chooser -> accessory form -> submit without JS errors" do
+    sign_in_and_connect
+
+    # Open new session chooser
+    all("button", text: "New session", wait: 10).last.click
+
+    # Select spawn target
+    select_el = find("[data-testid='spawn-target-select']", wait: 10)
+    option_text = nil
+    assert wait_until?(timeout: 15, poll: 0.3) {
+      opt = select_el.all("option").find { |o| o.value.present? rescue false }
+      option_text = opt&.text
+      opt
+    }, "Expected a spawn target option"
+    select_el.select(option_text)
+
+    # Click Accessory — chooser closes, accessory form opens
+    find("[data-testid='choose-accessory']", wait: 10).click
+    assert_text "New Accessory", wait: 10
+
+    # Spawn target should be pre-selected
+    assert_text "Spawn target", wait: 5
+
+    # Select accessory config if listed
+    if page.has_text?("terminal", wait: 5)
+      find("button", text: "terminal", wait: 5).click
+    end
+
+    # Submit — dialog should close
+    click_button "Create Accessory"
+    assert_no_text "New Accessory", wait: 10
+
+    # No JS errors (specifically no HeadlessUI Label error)
+    errors = page.driver.browser.logs.get(:browser).select { |log|
+      log.level == "SEVERE" && !log.message.include?("favicon")
+    }
+    assert_empty errors, "Expected no JS errors during accessory creation, got: #{errors.map(&:message).join(', ')}"
+  end
+
   # --- Navigation ---
 
   test "sidebar navigation to settings and back preserves connection" do
