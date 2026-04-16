@@ -338,18 +338,30 @@ export default function TerminalView({ hubId, sessionUuid }) {
     }
 
     // Viewport tracking for iOS virtual keyboard
+    // Debounced with a height threshold to avoid feedback loops:
+    // keyboard open → hide nav → layout shift → resize → repeat.
+    const KB_THRESHOLD = 100 // px — ignore small viewport changes
     let viewportHandler = null
+    let viewportTimer = null
+    let keyboardOpen = false
     if (window.visualViewport) {
       viewportHandler = () => {
-        const vv = window.visualViewport
-        const keyboardHeight = window.innerHeight - vv.height
-        if (keyboardHeight <= 0) {
-          document.body.style.removeProperty('--kb-height')
-          delete document.body.dataset.mobileKeyboard
-          return
-        }
-        document.body.style.setProperty('--kb-height', `${vv.height}px`)
-        document.body.dataset.mobileKeyboard = ''
+        clearTimeout(viewportTimer)
+        viewportTimer = setTimeout(() => {
+          const vv = window.visualViewport
+          const keyboardHeight = window.innerHeight - vv.height
+          if (keyboardHeight > KB_THRESHOLD) {
+            if (!keyboardOpen) {
+              keyboardOpen = true
+              document.body.dataset.mobileKeyboard = ''
+            }
+            document.body.style.setProperty('--kb-height', `${vv.height}px`)
+          } else if (keyboardOpen) {
+            keyboardOpen = false
+            document.body.style.removeProperty('--kb-height')
+            delete document.body.dataset.mobileKeyboard
+          }
+        }, 80)
       }
       window.visualViewport.addEventListener('resize', viewportHandler)
       window.visualViewport.addEventListener('scroll', viewportHandler)
@@ -598,6 +610,7 @@ export default function TerminalView({ hubId, sessionUuid }) {
       clearTimeout(afkTimer)
 
       // Viewport
+      clearTimeout(viewportTimer)
       if (viewportHandler && window.visualViewport) {
         window.visualViewport.removeEventListener('resize', viewportHandler)
         window.visualViewport.removeEventListener('scroll', viewportHandler)
