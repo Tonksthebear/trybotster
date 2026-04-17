@@ -182,5 +182,4 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
 
     assert_nothing_raised { perform :signal, envelope: { sdp: "test" } }
   end
-
 end
