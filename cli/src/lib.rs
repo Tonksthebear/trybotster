@@ -51,6 +51,7 @@ pub mod keyring;
 pub mod notifications;
 pub mod process;
 pub mod server;
+pub mod shutdown;
 pub mod spawn_targets;
 pub mod terminal;
 pub mod terminal_widget;
