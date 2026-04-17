@@ -15,6 +15,7 @@
 -- Session UUID is the primary key for everything.
 
 local Agent = require("lib.agent")
+local SessionClosePolicy = require("lib.session_close_policy")
 local Accessory = require("lib.accessory")
 local ConfigResolver = require("lib.config_resolver")
 local TargetContext = require("lib.target_context")
@@ -645,19 +646,15 @@ local function handle_delete_session(session_uuid, delete_worktree)
 
     -- Guard: skip worktree deletion if other agents are still running in it
     if delete_worktree then
-        local wt_path = agent.worktree_path
-        local still_running = {}
-        for _, other in ipairs(Agent.list()) do
-            if other.session_uuid ~= agent.session_uuid
-                and other.worktree_path == wt_path
-                and not require("lib.session").is_system_session(other) then
-                still_running[#still_running + 1] = other.session_uuid
-            end
-        end
+        local still_running = SessionClosePolicy.other_active_sessions(agent, Agent.list())
         if #still_running > 0 then
+            local still_running_ids = {}
+            for _, other in ipairs(still_running) do
+                still_running_ids[#still_running_ids + 1] = other.session_uuid
+            end
             log.warn(string.format(
                 "Cannot delete worktree — session(s) [%s] still running in it",
-                table.concat(still_running, ", ")))
+                table.concat(still_running_ids, ", ")))
             delete_worktree = false
         end
     end
