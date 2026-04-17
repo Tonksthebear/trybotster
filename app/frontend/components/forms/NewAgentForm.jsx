@@ -31,6 +31,7 @@ export default function NewAgentForm({ hubId }) {
   const [selectedAgent, setSelectedAgent] = useState('')
   // { id: string|null, name: string|null } | null
   const [workspaceChoice, setWorkspaceChoice] = useState(null)
+  const [submitting, setSubmitting] = useState(false)
 
   // Subscribe to hub data when dialog opens
   useEffect(() => {
@@ -109,6 +110,7 @@ export default function NewAgentForm({ hubId }) {
       setSelectedTargetId('')
       setWorktrees([])
       setAgents([])
+      setSubmitting(false)
     }
   }, [open])
 
@@ -173,7 +175,7 @@ export default function NewAgentForm({ hubId }) {
     hub.ensureAgentConfig(selectedTargetId, { force: true }).catch(() => {})
   }
 
-  function handleSubmit() {
+  async function handleSubmit() {
     if (!pendingSelection || !selectedTargetId) return
 
     const hub = getHub(hubId)
@@ -181,9 +183,12 @@ export default function NewAgentForm({ hubId }) {
 
     const prompt = promptInput.trim() || null
     const agentName = selectedAgent || null
+    let sent = false
+
+    setSubmitting(true)
 
     if (pendingSelection.type === 'existing') {
-      hub.send('reopen_worktree', {
+      sent = await hub.send('reopen_worktree', {
         path: pendingSelection.path,
         branch: pendingSelection.branch,
         prompt,
@@ -193,7 +198,7 @@ export default function NewAgentForm({ hubId }) {
         workspace_name: workspaceChoice?.name || null,
       })
     } else if (pendingSelection.type === 'main') {
-      hub.send('create_agent', {
+      sent = await hub.send('create_agent', {
         prompt,
         agent_name: agentName,
         target_id: selectedTargetId,
@@ -201,7 +206,7 @@ export default function NewAgentForm({ hubId }) {
         workspace_name: workspaceChoice?.name || null,
       })
     } else {
-      hub.send('create_agent', {
+      sent = await hub.send('create_agent', {
         issue_or_branch: pendingSelection.issueOrBranch,
         prompt,
         agent_name: agentName,
@@ -210,6 +215,16 @@ export default function NewAgentForm({ hubId }) {
         workspace_name: workspaceChoice?.name || null,
       })
     }
+
+    if (!sent) {
+      setSubmitting(false)
+      return
+    }
+
+    await Promise.allSettled([
+      hub.agents.load({ force: true }),
+      hub.openWorkspaces.load({ force: true }),
+    ])
 
     close()
   }
@@ -412,7 +427,7 @@ export default function NewAgentForm({ hubId }) {
           Cancel
         </Button>
         {step === 2 && (
-          <Button color="indigo" onClick={handleSubmit} data-action="new-agent-form#submit">
+          <Button color="indigo" onClick={handleSubmit} data-action="new-agent-form#submit" disabled={submitting}>
             Create Agent
           </Button>
         )}

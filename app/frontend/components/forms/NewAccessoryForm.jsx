@@ -21,6 +21,7 @@ export default function NewAccessoryForm({ hubId }) {
   const [selectedAccessory, setSelectedAccessory] = useState(null)
   // { id: string|null, name: string|null } | null
   const [workspaceChoice, setWorkspaceChoice] = useState(null)
+  const [submitting, setSubmitting] = useState(false)
 
   // Subscribe to hub data
   useEffect(() => {
@@ -80,6 +81,7 @@ export default function NewAccessoryForm({ hubId }) {
       setSelectedAccessory(null)
       setWorkspaceChoice(null)
       setAccessories([])
+      setSubmitting(false)
     }
   }, [open])
 
@@ -99,18 +101,30 @@ export default function NewAccessoryForm({ hubId }) {
     applyTarget(e.target.value || null)
   }
 
-  function handleSubmit() {
+  async function handleSubmit() {
     if (!selectedAccessory || !selectedTargetId) return
 
     const hub = getHub(hubId)
     if (!hub) return
 
-    hub.createAccessory(
+    setSubmitting(true)
+
+    const sent = await hub.createAccessory(
       selectedAccessory,
       workspaceChoice?.id || null,
       workspaceChoice?.name || null,
       selectedTargetId
     )
+
+    if (!sent) {
+      setSubmitting(false)
+      return
+    }
+
+    await Promise.allSettled([
+      hub.agents.load({ force: true }),
+      hub.openWorkspaces.load({ force: true }),
+    ])
 
     close()
   }
@@ -203,7 +217,7 @@ export default function NewAccessoryForm({ hubId }) {
         <Button
           color="indigo"
           onClick={handleSubmit}
-          disabled={!selectedAccessory || !selectedTargetId}
+          disabled={submitting || !selectedAccessory || !selectedTargetId}
         >
           Create Accessory
         </Button>

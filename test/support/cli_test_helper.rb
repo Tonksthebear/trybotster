@@ -85,7 +85,8 @@ module CliTestHelper
       @log_thread&.kill
       @stdout_r&.close
       @stderr_r&.close
-      FileUtils.rm_rf(@temp_dir) if !preserve_temp_dir && @temp_dir && File.directory?(@temp_dir)
+      keep_temp_dir = preserve_temp_dir || ENV["BOTSTER_TEST_PRESERVE_TEMP_DIRS"] == "1"
+      FileUtils.rm_rf(@temp_dir) if !keep_temp_dir && @temp_dir && File.directory?(@temp_dir)
 
       # Clean up socket file (lives in /tmp/botster-{uid}/, not temp_dir).
       # SIGKILL may bypass the Rust shutdown path that normally removes this.
@@ -323,6 +324,7 @@ module CliTestHelper
     # pipes.  A fast exit (crash / bail) may leave bytes in the pipe buffer
     # that we need for diagnostics.
     log_thread = Thread.new do
+      File.open(log_file_path, "ab") do |log_file|
       pipes_open = true
       while cli.running? || pipes_open
         ready = IO.select([ stdout_r, stderr_r ], nil, nil, 0.1)
@@ -333,6 +335,8 @@ module CliTestHelper
           begin
             data = io.read_nonblock(4096)
             cli.add_output(data)
+            log_file.write(data)
+            log_file.flush
             Rails.logger.debug "[CLI] #{data}" if options[:verbose]
             pipes_open = true
           rescue IO::WaitReadable
@@ -341,6 +345,7 @@ module CliTestHelper
             # This pipe is closed — don't set pipes_open
           end
         end
+      end
       end
     end
 

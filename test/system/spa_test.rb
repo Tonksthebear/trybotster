@@ -146,6 +146,7 @@ class SpaTest < ApplicationSystemTestCase
     # Submit — dialog should close
     click_button "Create"
     assert_no_text "New Agent", wait: 10
+    assert_selector "a[href*='/sessions/']", wait: 30
 
     # No JS errors from the entire flow
     errors = relevant_browser_errors
@@ -183,6 +184,7 @@ class SpaTest < ApplicationSystemTestCase
     # Submit — dialog should close
     click_button "Create Accessory"
     assert_no_text "New Accessory", wait: 10
+    assert_selector "a[href*='/sessions/']", wait: 30
 
     # No JS errors (specifically no HeadlessUI Label error)
     errors = relevant_browser_errors

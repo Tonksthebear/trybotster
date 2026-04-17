@@ -8,6 +8,17 @@ import { WebRtcPtyTransport } from 'transport/webrtc_pty_transport'
 
 const CONNECT_DEBOUNCE_MS = 30
 const MAX_FILE_SIZE = 50 * 1024 * 1024
+const TEST_MODE = import.meta.env.MODE === 'test'
+
+function setTerminalTestHook(key, transport) {
+  if (!TEST_MODE || typeof window === 'undefined') return
+  if (!window._botsterTestTerminal) window._botsterTestTerminal = {}
+  if (transport) {
+    window._botsterTestTerminal[key] = { transport }
+  } else {
+    delete window._botsterTestTerminal[key]
+  }
+}
 
 export default function TerminalView({ hubId, sessionUuid }) {
   const containerRef = useRef(null)
@@ -26,6 +37,7 @@ export default function TerminalView({ hubId, sessionUuid }) {
     const isMobile = 'ontouchstart' in window
     const container = containerRef.current
     if (!container) return
+    const testKey = `terminal:${hubId}:${sessionUuid}`
 
     // Mutable state for this terminal instance
     const state = {
@@ -437,6 +449,7 @@ export default function TerminalView({ hubId, sessionUuid }) {
 
       // 2. Create PTY transport
       state.transport = new WebRtcPtyTransport({ hubId, sessionUuid })
+      setTerminalTestHook(testKey, state.transport)
       state.transport.onReconnect = () => {}
       state.transport.onBinarySnapshot = (data) => {
         const loaded = state.restty
@@ -640,6 +653,7 @@ export default function TerminalView({ hubId, sessionUuid }) {
       state.transport = null
       state.overlay?.remove()
       state.overlay = null
+      setTerminalTestHook(testKey, null)
 
       stateRef.current = null
     }
