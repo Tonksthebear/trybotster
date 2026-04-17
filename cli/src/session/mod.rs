@@ -239,6 +239,7 @@ pub struct SpawnConfig {
 /// 4. Runs the I/O relay loop until the child exits or socket is deleted
 pub fn run(session_uuid: &str, socket_path: &str, timeout_secs: u64) -> Result<()> {
     let socket_path = Path::new(socket_path);
+    let session_pid = std::process::id();
 
     // Clean up stale socket if present
     if socket_path.exists() {
@@ -257,20 +258,35 @@ pub fn run(session_uuid: &str, socket_path: &str, timeout_secs: u64) -> Result<(
         socket_path.display()
     );
 
-    // Accept hub connection (with timeout for initial connect)
-    listener
-        .set_nonblocking(true)
-        .context("set socket nonblocking for accept")?;
-    let stream = wait_for_connection(&listener, Duration::from_secs(timeout_secs), socket_path)?;
-    stream
-        .set_nonblocking(false)
-        .context("set stream blocking")?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .context("set read timeout")?;
+    write_session_pid_file(session_uuid, session_pid)
+        .with_context(|| format!("write session pid file for {}", session_uuid))?;
 
-    // Run the main session loop (handles reconnect)
-    run_session(session_uuid, socket_path, &listener, stream, timeout_secs)
+    let run_result = (|| -> Result<()> {
+        // Accept hub connection (with timeout for initial connect)
+        listener
+            .set_nonblocking(true)
+            .context("set socket nonblocking for accept")?;
+        let stream =
+            wait_for_connection(&listener, Duration::from_secs(timeout_secs), socket_path)?;
+        stream
+            .set_nonblocking(false)
+            .context("set stream blocking")?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .context("set read timeout")?;
+
+        // Run the main session loop (handles reconnect)
+        run_session(session_uuid, socket_path, &listener, stream, timeout_secs)
+    })();
+
+    if let Ok(pid_path) = session_pid_path(session_uuid) {
+        let _ = std::fs::remove_file(pid_path);
+    }
+    if run_result.is_err() && socket_path.exists() {
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    run_result
 }
 
 /// Wait for a Hub connection, checking socket-as-lease periodically.
@@ -318,6 +334,7 @@ fn run_session(
             rows: 24,
             cols: 80,
             last_output_at: 0,
+            mode_flags: ModeFlags::default(),
         },
     )
     .context("initial handshake")?;
@@ -644,6 +661,7 @@ fn run_session(
                                 rows,
                                 cols,
                                 last_output_at: last_output_at.load(Ordering::Relaxed),
+                                mode_flags: parser_mode_flags(&parser),
                             },
                         );
                         hub_decoder = FrameDecoder::new();
@@ -813,18 +831,7 @@ fn handle_hub_frame(
         }
 
         FRAME_GET_MODE_FLAGS => {
-            let flags = parser
-                .lock()
-                .map(|p| ModeFlags {
-                    kitty_enabled: p.kitty_enabled(),
-                    cursor_visible: !p.cursor_hidden(),
-                    bracketed_paste: p.bracketed_paste(),
-                    mouse_mode: p.mouse_mode(),
-                    alt_screen: p.alt_screen_active(),
-                    focus_reporting: p.focus_reporting(),
-                    application_cursor: p.application_cursor(),
-                })
-                .unwrap_or_default();
+            let flags = parser_mode_flags(parser);
             if let Ok(response) = encode_json(FRAME_MODE_FLAGS, &flags) {
                 let _ = stream.write_all(&response);
             }
@@ -885,6 +892,21 @@ fn handle_hub_frame(
             log::debug!("[session] unknown frame type 0x{:02x}", frame.frame_type);
         }
     }
+}
+
+fn parser_mode_flags(parser: &Arc<Mutex<TerminalParser>>) -> ModeFlags {
+    parser
+        .lock()
+        .map(|p| ModeFlags {
+            kitty_enabled: p.kitty_enabled(),
+            cursor_visible: !p.cursor_hidden(),
+            bracketed_paste: p.bracketed_paste(),
+            mouse_mode: p.mouse_mode(),
+            alt_screen: p.alt_screen_active(),
+            focus_reporting: p.focus_reporting(),
+            application_cursor: p.application_cursor(),
+        })
+        .unwrap_or_default()
 }
 
 // ─── Reader loop ─────────────────────────────────────────────────────────────
@@ -1134,14 +1156,203 @@ pub fn session_socket_path(session_uuid: &str) -> Result<PathBuf> {
     Ok(dir.join(format!("{session_uuid}.sock")))
 }
 
+/// PID file path for a specific session.
+pub fn session_pid_path(session_uuid: &str) -> Result<PathBuf> {
+    let dir = sessions_socket_dir()?;
+    Ok(dir.join(format!("{session_uuid}.pid")))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct SessionIdentity {
+    pid: u32,
+    #[serde(default)]
+    pgid: Option<u32>,
+    #[serde(default)]
+    sid: Option<u32>,
+}
+
+/// Write the session process PID used for liveness validation.
+pub fn write_session_pid_file(session_uuid: &str, pid: u32) -> Result<()> {
+    let path = session_pid_path(session_uuid)?;
+    let identity = SessionIdentity {
+        pid,
+        pgid: current_process_group_id(),
+        sid: current_session_id(),
+    };
+    let payload = serde_json::to_vec(&identity).context("serialize session identity")?;
+    std::fs::write(&path, payload)
+        .with_context(|| format!("write session pid file: {}", path.display()))
+}
+
+/// Read the session process PID if present.
+pub fn read_session_pid_file(session_uuid: &str) -> Result<Option<u32>> {
+    Ok(read_session_identity_file(session_uuid)?.map(|identity| identity.pid))
+}
+
+fn read_session_identity_file(session_uuid: &str) -> Result<Option<SessionIdentity>> {
+    let path = session_pid_path(session_uuid)?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| format!("read session pid file: {}", path.display()))
+        }
+    };
+
+    let trimmed = content.trim();
+    if trimmed.starts_with('{') {
+        let identity: SessionIdentity = serde_json::from_str(trimmed)
+            .with_context(|| format!("parse session pid file: {}", path.display()))?;
+        return Ok(Some(identity));
+    }
+
+    let pid = trimmed
+        .parse::<u32>()
+        .with_context(|| format!("parse legacy session pid file: {}", path.display()))?;
+    Ok(Some(SessionIdentity {
+        pid,
+        pgid: None,
+        sid: None,
+    }))
+}
+
+fn pid_is_live(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+
+    matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(code) if code == libc::EPERM
+    )
+}
+
+fn current_process_group_id() -> Option<u32> {
+    process_group_id(std::process::id())
+}
+
+fn current_session_id() -> Option<u32> {
+    session_id(std::process::id())
+}
+
+fn process_group_id(pid: u32) -> Option<u32> {
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    (pgid >= 0).then_some(pgid as u32)
+}
+
+fn session_id(pid: u32) -> Option<u32> {
+    let sid = unsafe { libc::getsid(pid as libc::pid_t) };
+    (sid >= 0).then_some(sid as u32)
+}
+
+fn session_identity_is_live(identity: &SessionIdentity) -> bool {
+    if !pid_is_live(identity.pid) {
+        return false;
+    }
+
+    if let Some(expected_pgid) = identity.pgid {
+        if process_group_id(identity.pid) != Some(expected_pgid) {
+            return false;
+        }
+    }
+
+    if let Some(expected_sid) = identity.sid {
+        if session_id(identity.pid) != Some(expected_sid) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn cleanup_stale_session_files(session_uuid: &str) {
+    if let Ok(path) = session_socket_path(session_uuid) {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Ok(path) = session_pid_path(session_uuid) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Whether a session process still appears live.
+pub fn session_process_is_live(session_uuid: &str) -> bool {
+    let socket_exists = session_socket_path(session_uuid)
+        .map(|path| path.exists())
+        .unwrap_or(false);
+    if !socket_exists {
+        return false;
+    }
+
+    read_session_identity_file(session_uuid)
+        .ok()
+        .flatten()
+        .is_some_and(|identity| session_identity_is_live(&identity))
+}
+
+/// Remove orphaned session socket/PID files left by abnormal exits.
+pub fn cleanup_orphaned_session_files() {
+    let dir = match sessions_socket_dir() {
+        Ok(dir) => dir,
+        Err(_) => return,
+    };
+
+    let mut removed = 0;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+                continue;
+            };
+            if ext != "sock" && ext != "pid" {
+                continue;
+            }
+            let Some(session_uuid) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+
+            let identity = read_session_identity_file(session_uuid).ok().flatten();
+            let socket_exists = session_socket_path(session_uuid)
+                .map(|socket_path| socket_path.exists())
+                .unwrap_or(false);
+            let identity_live = identity.as_ref().is_some_and(session_identity_is_live);
+
+            if socket_exists && identity.is_some() && !identity_live {
+                cleanup_stale_session_files(session_uuid);
+                removed += 1;
+            } else if !socket_exists && identity.is_some() && !identity_live {
+                if let Ok(pid_path) = session_pid_path(session_uuid) {
+                    let _ = std::fs::remove_file(pid_path);
+                    removed += 1;
+                }
+            }
+        }
+    }
+
+    if removed > 0 {
+        log::info!(
+            "[session] cleaned up {removed} orphaned session socket/pid file set(s) from {}",
+            dir.display()
+        );
+    }
+}
+
 /// Discover all live session sockets by scanning the directory.
 pub fn discover_sessions() -> Result<Vec<PathBuf>> {
+    cleanup_orphaned_session_files();
+
     let dir = sessions_socket_dir()?;
     let mut sockets = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map(|e| e == "sock").unwrap_or(false) {
+            if !path.extension().map(|e| e == "sock").unwrap_or(false) {
+                continue;
+            }
+            let Some(session_uuid) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if session_process_is_live(session_uuid) {
                 sockets.push(path);
             }
         }

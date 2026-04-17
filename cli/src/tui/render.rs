@@ -267,11 +267,7 @@ pub(super) fn render_terminal_panel(
         let is_focused = ctx.is_terminal_mode
             && session_uuid.is_some()
             && ctx.focused_session_uuid == session_uuid;
-        if is_focused
-            && !is_scrolled
-            && rs.cursor_visible()
-            && rs.cursor_in_viewport()
-        {
+        if is_focused && !is_scrolled && rs.cursor_visible() && rs.cursor_in_viewport() {
             let (cx, cy) = rs.cursor_viewport_position();
             let abs_x = inner.x + cx;
             let abs_y = inner.y + cy;

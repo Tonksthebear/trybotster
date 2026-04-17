@@ -372,6 +372,30 @@ impl PtyHandle {
             .is_some_and(crate::session::connection::SessionConnection::is_reader_alive)
     }
 
+    /// Drop the inner `SessionConnection` so the session process sees EOF
+    /// and enters its reconnect window.
+    ///
+    /// Returns `true` if a connection was cleared; `false` if already empty
+    /// or this handle is not session-backed.
+    pub fn clear_session_connection(&self) -> bool {
+        let Some(ref conn) = self.session_connection else {
+            return false;
+        };
+        let Ok(mut guard) = conn.lock() else {
+            return false;
+        };
+        guard.take().is_some()
+    }
+
+    /// Get the shared session connection Arc for reconnect.
+    ///
+    /// Used by the reconnect completion handler to store a fresh connection.
+    pub fn shared_session_connection(
+        &self,
+    ) -> Option<&crate::session::connection::SharedSessionConnection> {
+        self.session_connection.as_ref()
+    }
+
     /// Broadcast a `ProcessExited` event on this handle's channel.
     ///
     /// Used by session lifecycle handlers to bridge process exit detection

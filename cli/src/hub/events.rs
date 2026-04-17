@@ -292,6 +292,22 @@ pub(crate) enum HubEvent {
         exit_code: Option<i32>,
     },
 
+    /// A background reconnect task completed successfully.
+    ///
+    /// Sent by `spawn_blocking` after `SessionConnection::connect_and_seed()`
+    /// succeeds. The hub loop validates the generation, installs the reader
+    /// thread, and publishes the new connection into the shared mutex.
+    SessionReconnectReady {
+        /// Session UUID that reconnected.
+        session_uuid: String,
+        /// Generation counter to detect stale completions.
+        generation: u64,
+        /// Fresh connection (reader not yet installed).
+        conn: crate::session::connection::SessionConnection,
+        /// Mode flags fetched during reconnect handshake.
+        mode_flags: Option<crate::session::protocol::ModeFlags>,
+    },
+
     /// A session was removed from `HandleCache` by `hub.unregister_session()`.
     ///
     /// The Hub removes any per-session routing state whose `session_uuid`
@@ -376,6 +392,7 @@ impl HubEvent {
             Self::SocketSend(_) => "socket_send",
             Self::MessageDelivered { .. } => "message_delivered",
             Self::SessionProcessExited { .. } => "session_process_exited",
+            Self::SessionReconnectReady { .. } => "session_reconnect_ready",
             Self::SessionUnregistered { .. } => "session_unregistered",
             Self::WorktreeDeleteCompleted { .. } => "worktree_delete_completed",
             Self::WebRtcOfferCompleted { .. } => "webrtc_offer_completed",

@@ -63,10 +63,85 @@ fn detect_running_target_dir(current_exe: &Path) -> Option<std::path::PathBuf> {
     (target_dir.file_name()? == "target").then(|| target_dir.to_path_buf())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotAttachState {
+    Ready,
+    Reconnecting,
+    Exited,
+}
+
 impl Hub {
     /// How long a terminal attach intent can stay pending before `not_found`.
     const TERMINAL_ATTACH_NOT_FOUND_TIMEOUT: Duration = Duration::from_secs(10);
     const RESTTY_FIXTURE_LIVE_CHUNK_LIMIT: usize = 8;
+
+    /// Spawn a background task to reconnect to a session process.
+    ///
+    /// The blocking `connect_and_seed` handshake runs in `spawn_blocking`.
+    /// On success, a `SessionReconnectReady` event is sent back to the hub
+    /// loop for reader installation and state seeding.
+    fn spawn_session_reconnect(&mut self, session_uuid: String, generation: u64) {
+        // Mark in-flight with current timestamp
+        if let Some(state) = self.pending_reconnects.get_mut(&session_uuid) {
+            state.in_flight = true;
+            state.attempt_started_at = Some(Instant::now());
+        }
+
+        // Check socket exists before spawning (cheap sync check)
+        let socket_path = match crate::session::session_socket_path(&session_uuid) {
+            Ok(p) if crate::session::session_process_is_live(&session_uuid) => p,
+            _ => {
+                log::warn!(
+                    "[Session] Live session transport gone for '{}', aborting reconnect",
+                    &session_uuid[..session_uuid.len().min(16)]
+                );
+                // Socket gone — session truly dead. Clean up and fire deferred exit.
+                self.pending_reconnects.remove(&session_uuid);
+                if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
+                    session_handle.pty().notify_process_exited(None);
+                }
+                let data = serde_json::json!({
+                    "session_uuid": session_uuid,
+                    "exit_code": null,
+                });
+                if let Err(e) = self.lua.fire_json_event("session_process_exited", &data) {
+                    log::error!("[Session] Failed to fire deferred session_process_exited: {e}");
+                }
+                return;
+            }
+        };
+
+        let tx = self.hub_event_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            log::info!(
+                "[Session] Reconnect attempt for '{}' gen={}",
+                &session_uuid[..session_uuid.len().min(16)],
+                generation
+            );
+            match crate::session::connection::SessionConnection::connect_and_seed(&socket_path) {
+                Ok((conn, mode_flags)) => {
+                    log::info!(
+                        "[Session] Reconnect handshake succeeded for '{}'",
+                        &session_uuid[..session_uuid.len().min(16)]
+                    );
+                    let _ = tx.send(crate::hub::events::HubEvent::SessionReconnectReady {
+                        session_uuid,
+                        generation,
+                        conn,
+                        mode_flags,
+                    });
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[Session] Reconnect failed for '{}': {e}",
+                        &session_uuid[..session_uuid.len().min(16)]
+                    );
+                    // Don't send anything — CleanupTick will detect that
+                    // in_flight has been true for >10s and reset it for retry.
+                }
+            }
+        });
+    }
 
     /// Build a single-line preview for ICE candidate logging.
     fn ice_candidate_preview(candidate: &str) -> String {
@@ -717,6 +792,56 @@ impl Hub {
                     );
                     self.hub_event_metrics_last_log = std::time::Instant::now();
                 }
+
+                // Retry pending session reconnects.
+                if !self.pending_reconnects.is_empty() {
+                    let now = Instant::now();
+                    let reconnect_deadline = Duration::from_secs(110);
+                    let in_flight_timeout = Duration::from_secs(10);
+
+                    // Phase 1: categorize entries (expired, retryable, in-flight-stale).
+                    let mut expired = Vec::new();
+                    let mut retryable = Vec::new();
+
+                    for (uuid, state) in &mut self.pending_reconnects {
+                        if now.duration_since(state.started_at) > reconnect_deadline {
+                            expired.push(uuid.clone());
+                        } else if state.in_flight
+                            && state
+                                .attempt_started_at
+                                .is_some_and(|t| now.duration_since(t) > in_flight_timeout)
+                        {
+                            // Background task likely failed silently — reset.
+                            state.in_flight = false;
+                            state.attempt_started_at = None;
+                            retryable.push((uuid.clone(), state.generation));
+                        } else if !state.in_flight {
+                            retryable.push((uuid.clone(), state.generation));
+                        }
+                    }
+
+                    // Phase 2: handle expired entries.
+                    for uuid in expired {
+                        log::warn!(
+                            "[Session] Reconnect expired for '{}'",
+                            &uuid[..uuid.len().min(16)]
+                        );
+                        self.pending_reconnects.remove(&uuid);
+                        if let Some(sh) = self.handle_cache.get_session(&uuid) {
+                            sh.pty().notify_process_exited(None);
+                        }
+                        let data = serde_json::json!({
+                            "session_uuid": uuid,
+                            "exit_code": null,
+                        });
+                        let _ = self.lua.fire_json_event("session_process_exited", &data);
+                    }
+
+                    // Phase 3: retry non-in-flight entries.
+                    for (uuid, generation) in retryable {
+                        self.spawn_session_reconnect(uuid, generation);
+                    }
+                }
             }
             HubEvent::DcOpened { browser_identity } => {
                 log::info!(
@@ -1301,7 +1426,9 @@ impl Hub {
             }
             // Per-session process exited or disconnected.
             // The reader thread already broadcasts PtyEvent directly, so we
-            // just need to notify Lua for cleanup.
+            // just need to notify Lua for cleanup — unless this is a reader
+            // death (exit_code=None) on a session-backed handle, in which case
+            // we attempt to reconnect before declaring the session dead.
             HubEvent::SessionProcessExited {
                 session_uuid,
                 exit_code,
@@ -1311,6 +1438,43 @@ impl Hub {
                     session_uuid,
                     exit_code
                 );
+
+                // Reader death on a session-backed handle: attempt reconnect
+                // instead of immediately declaring the session dead.
+                if exit_code.is_none() {
+                    if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
+                        let pty = session_handle.pty();
+                        if pty.is_session_backed() {
+                            // Drop old connection so session process sees EOF
+                            // and enters wait_for_reconnect().
+                            let cleared = pty.clear_session_connection();
+                            log::info!(
+                                "[Session] Reader died for '{}', cleared old connection={}, initiating reconnect",
+                                &session_uuid[..session_uuid.len().min(16)],
+                                cleared
+                            );
+
+                            // Allocate a generation and insert pending entry.
+                            self.reconnect_generation += 1;
+                            let generation = self.reconnect_generation;
+                            self.pending_reconnects.insert(
+                                session_uuid.clone(),
+                                super::ReconnectState {
+                                    started_at: Instant::now(),
+                                    attempt_started_at: None,
+                                    generation,
+                                    in_flight: false,
+                                },
+                            );
+
+                            // Immediately spawn background reconnect.
+                            self.spawn_session_reconnect(session_uuid, generation);
+                            return;
+                        }
+                    }
+                }
+
+                // Real process exit or non-session-backed: normal handling.
                 if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
                     session_handle.pty().notify_process_exited(exit_code);
                 }
@@ -1320,6 +1484,97 @@ impl Hub {
                 });
                 if let Err(e) = self.lua.fire_json_event("session_process_exited", &data) {
                     log::error!("[Session] Failed to fire session_process_exited event: {e}");
+                }
+            }
+
+            // Background reconnect completed — validate generation, install
+            // reader, publish connection, seed state.
+            HubEvent::SessionReconnectReady {
+                session_uuid,
+                generation,
+                mut conn,
+                mode_flags,
+            } => {
+                // Validate the pending entry still exists and generation matches.
+                let valid = self
+                    .pending_reconnects
+                    .get(&session_uuid)
+                    .is_some_and(|s| s.generation == generation);
+
+                if !valid {
+                    log::info!(
+                        "[Session] Dropping stale reconnect for '{}' gen={}",
+                        &session_uuid[..session_uuid.len().min(16)],
+                        generation
+                    );
+                    drop(conn);
+                    return;
+                }
+
+                // Look up the session handle to access PtyHandle fields.
+                let Some(session_handle) = self.handle_cache.get_session(&session_uuid) else {
+                    log::warn!(
+                        "[Session] Session '{}' disappeared during reconnect",
+                        &session_uuid[..session_uuid.len().min(16)]
+                    );
+                    self.pending_reconnects.remove(&session_uuid);
+                    return;
+                };
+                let pty = session_handle.pty();
+
+                // Install reader on the new connection (cheap: stream clone + thread spawn).
+                if let Err(e) = conn.install_reader(
+                    session_uuid.clone(),
+                    pty.event_tx_clone(),
+                    pty.kitty_enabled_arc(),
+                    pty.cursor_visible_arc(),
+                    pty.resize_pending_arc(),
+                    Arc::clone(pty.last_output_at_atomic()),
+                    self.hub_event_tx.clone(),
+                ) {
+                    log::error!(
+                        "[Session] Failed to install reader after reconnect for '{}': {e}",
+                        &session_uuid[..session_uuid.len().min(16)]
+                    );
+                    self.pending_reconnects.remove(&session_uuid);
+                    // Fire deferred exit.
+                    pty.notify_process_exited(None);
+                    let data = serde_json::json!({
+                        "session_uuid": session_uuid,
+                        "exit_code": null,
+                    });
+                    let _ = self.lua.fire_json_event("session_process_exited", &data);
+                    return;
+                }
+
+                // Store the new connection in the shared mutex.
+                // This propagates to all holders (SessionConnectionWriter, etc.).
+                if let Some(shared) = pty.shared_session_connection() {
+                    if let Ok(mut guard) = shared.lock() {
+                        *guard = Some(conn);
+                    }
+                }
+
+                // Seed hub-visible state from mode flags.
+                if let Some(flags) = mode_flags {
+                    pty.kitty_enabled_arc()
+                        .store(flags.kitty_enabled, std::sync::atomic::Ordering::Relaxed);
+                    pty.cursor_visible_arc()
+                        .store(flags.cursor_visible, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // Clean up pending entry.
+                self.pending_reconnects.remove(&session_uuid);
+
+                log::info!(
+                    "[Session] Reconnected to '{}' successfully",
+                    &session_uuid[..session_uuid.len().min(16)]
+                );
+
+                // Fire Lua event for observability.
+                let data = serde_json::json!({ "session_uuid": session_uuid });
+                if let Err(e) = self.lua.fire_json_event("session_reconnected", &data) {
+                    log::error!("[Session] Failed to fire session_reconnected: {e}");
                 }
             }
 
@@ -2980,12 +3235,7 @@ impl Hub {
         session_uuid: &str,
         state: &str,
     ) {
-        let payload = serde_json::json!({
-            "type": "terminal_attach",
-            "subscriptionId": subscription_id,
-            "session_uuid": session_uuid,
-            "state": state,
-        });
+        let payload = Self::terminal_attach_state_payload(subscription_id, session_uuid, state);
         match serde_json::to_vec(&payload) {
             Ok(data) => self.try_send_to_peer(peer_id, super::WebRtcSendItem::Json { data }),
             Err(e) => {
@@ -2995,6 +3245,125 @@ impl Hub {
                     e
                 );
             }
+        }
+    }
+
+    fn send_tui_terminal_attach_state(
+        &self,
+        subscription_id: &str,
+        session_uuid: &str,
+        state: &str,
+    ) {
+        let Some(output_tx) = self.tui_output_tx.clone() else {
+            return;
+        };
+        Self::push_tui_terminal_attach_state(
+            &output_tx,
+            self.tui_wake_fd,
+            subscription_id,
+            session_uuid,
+            state,
+        );
+    }
+
+    fn send_socket_terminal_attach_state(
+        &self,
+        client_id: &str,
+        subscription_id: &str,
+        session_uuid: &str,
+        state: &str,
+    ) {
+        let Some(frame_tx) = self
+            .socket_clients
+            .get(client_id)
+            .map(crate::socket::client_conn::SocketClientConn::frame_sender)
+        else {
+            return;
+        };
+        Self::push_socket_terminal_attach_state(
+            &frame_tx,
+            client_id,
+            subscription_id,
+            session_uuid,
+            state,
+        );
+    }
+
+    fn terminal_attach_state_payload(
+        subscription_id: &str,
+        session_uuid: &str,
+        state: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "type": "terminal_attach",
+            "subscriptionId": subscription_id,
+            "session_uuid": session_uuid,
+            "state": state,
+        })
+    }
+
+    fn push_tui_terminal_attach_state(
+        output_tx: &tokio::sync::mpsc::UnboundedSender<crate::client::TuiOutput>,
+        wake_fd: Option<std::os::unix::io::RawFd>,
+        subscription_id: &str,
+        session_uuid: &str,
+        state: &str,
+    ) {
+        let payload = Self::terminal_attach_state_payload(subscription_id, session_uuid, state);
+        if output_tx
+            .send(crate::client::TuiOutput::Message(payload))
+            .is_ok()
+        {
+            if let Some(fd) = wake_fd {
+                super::wake_tui_pipe(fd);
+            }
+        }
+    }
+
+    fn push_socket_terminal_attach_state(
+        frame_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+        client_id: &str,
+        subscription_id: &str,
+        session_uuid: &str,
+        state: &str,
+    ) {
+        let payload = Self::terminal_attach_state_payload(subscription_id, session_uuid, state);
+        let frame = crate::socket::framing::Frame::Json(payload);
+        match frame_tx.try_send(frame.encode()) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                log::warn!(
+                    "[Lua-Socket] Outbound queue full while sending terminal_attach='{}' for {}",
+                    state,
+                    client_id
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                log::trace!(
+                    "[Lua-Socket] Frame channel closed before terminal_attach='{}' for {}",
+                    state,
+                    client_id
+                );
+            }
+        }
+    }
+
+    fn classify_snapshot_attach_state(
+        pty_handle: &crate::hub::agent_handle::PtyHandle,
+        session_uuid: &str,
+        snapshot: &[u8],
+    ) -> SnapshotAttachState {
+        if !snapshot.is_empty()
+            || !pty_handle.is_session_backed()
+            || pty_handle.session_connection_alive()
+        {
+            return SnapshotAttachState::Ready;
+        }
+
+        if crate::session::session_process_is_live(session_uuid) {
+            SnapshotAttachState::Reconnecting
+        } else {
+            SnapshotAttachState::Exited
         }
     }
 
@@ -3583,13 +3952,26 @@ impl Hub {
         request: &PendingTerminalAttachRequest,
         state: &str,
     ) {
-        if let PendingTerminalAttachRequest::WebRtc(req) = request {
-            self.send_terminal_attach_state(
-                &req.peer_id,
-                &req.subscription_id,
-                &req.session_uuid,
-                state,
-            );
+        match request {
+            PendingTerminalAttachRequest::WebRtc(req) => {
+                self.send_terminal_attach_state(
+                    &req.peer_id,
+                    &req.subscription_id,
+                    &req.session_uuid,
+                    state,
+                );
+            }
+            PendingTerminalAttachRequest::Tui(req) => {
+                self.send_tui_terminal_attach_state(&req.subscription_id, &req.session_uuid, state);
+            }
+            PendingTerminalAttachRequest::Socket(req) => {
+                self.send_socket_terminal_attach_state(
+                    &req.client_id,
+                    &req.subscription_id,
+                    &req.session_uuid,
+                    state,
+                );
+            }
         }
     }
 
@@ -3650,6 +4032,11 @@ impl Hub {
         let forwarder_key = format!("tui:{}", req.session_uuid);
 
         if self.try_attach_tui_terminal_forwarder(&req) {
+            self.send_tui_terminal_attach_state(
+                &req.subscription_id,
+                &req.session_uuid,
+                "attached",
+            );
             return;
         }
 
@@ -3657,6 +4044,13 @@ impl Hub {
             &forwarder_key,
             PendingTerminalAttachRequest::Tui(req),
         );
+        if let Some(PendingTerminalAttach {
+            request: PendingTerminalAttachRequest::Tui(req),
+            ..
+        }) = self.pending_terminal_attaches.get(&forwarder_key)
+        {
+            self.send_tui_terminal_attach_state(&req.subscription_id, &req.session_uuid, "pending");
+        }
     }
 
     /// Try to attach a TUI PTY forwarder immediately.
@@ -3697,6 +4091,7 @@ impl Hub {
 
         let sink = output_tx;
         let session_uuid = req.session_uuid.clone();
+        let subscription_id = req.subscription_id.clone();
         let target_rows = req.rows;
         let target_cols = req.cols;
         let active_flag = Arc::clone(&req.active_flag);
@@ -3760,46 +4155,61 @@ impl Hub {
                 snapshot.len()
             );
 
-            if snapshot.is_empty()
-                && pty_handle.is_session_backed()
-                && !pty_handle.session_connection_alive()
-            {
-                log::warn!(
-                    "[Lua-TUI] Session RPC died before snapshot for {}; sending ProcessExited instead of empty scrollback",
+            let attach_state =
+                Self::classify_snapshot_attach_state(&pty_handle, &session_uuid, &snapshot);
+            match attach_state {
+                SnapshotAttachState::Ready => {}
+                SnapshotAttachState::Exited => {
+                    log::warn!(
+                        "[Lua-TUI] Session RPC died before snapshot for {}; sending ProcessExited",
+                        session_uuid
+                    );
+                    let _ = sink.send(TuiOutput::ProcessExited {
+                        session_uuid: session_uuid.clone(),
+                        exit_code: None,
+                    });
+                    if let Some(fd) = wake_fd {
+                        super::wake_tui_pipe(fd);
+                    }
+                    return;
+                }
+                SnapshotAttachState::Reconnecting => {
+                    log::info!(
+                        "[Lua-TUI] Session '{}' snapshot unavailable — reconnect pending",
+                        &session_uuid[..session_uuid.len().min(16)]
+                    );
+                    Self::push_tui_terminal_attach_state(
+                        &sink,
+                        wake_fd,
+                        &subscription_id,
+                        &session_uuid,
+                        "reconnecting",
+                    );
+                }
+            }
+
+            if attach_state != SnapshotAttachState::Reconnecting {
+                log::debug!(
+                    "[Lua-TUI] Sending {} bytes of snapshot for session {}",
+                    snapshot.len(),
                     session_uuid
                 );
-                let _ = sink.send(TuiOutput::ProcessExited {
-                    session_uuid: session_uuid.clone(),
-                    exit_code: None,
-                });
+                if sink
+                    .send(TuiOutput::Scrollback {
+                        session_uuid: session_uuid.clone(),
+                        rows: snapshot_rows,
+                        cols: snapshot_cols,
+                        data: snapshot,
+                        kitty_enabled,
+                    })
+                    .is_err()
+                {
+                    log::trace!("[Lua-TUI] Output channel closed before snapshot sent");
+                    return;
+                }
                 if let Some(fd) = wake_fd {
                     super::wake_tui_pipe(fd);
                 }
-                return;
-            }
-
-            // Always send a scrollback frame (even empty) so the TUI panel
-            // can transition out of Connecting and begin live streaming.
-            log::debug!(
-                "[Lua-TUI] Sending {} bytes of snapshot for session {}",
-                snapshot.len(),
-                session_uuid
-            );
-            if sink
-                .send(TuiOutput::Scrollback {
-                    session_uuid: session_uuid.clone(),
-                    rows: snapshot_rows,
-                    cols: snapshot_cols,
-                    data: snapshot,
-                    kitty_enabled,
-                })
-                .is_err()
-            {
-                log::trace!("[Lua-TUI] Output channel closed before snapshot sent");
-                return;
-            }
-            if let Some(fd) = wake_fd {
-                super::wake_tui_pipe(fd);
             }
 
             loop {
@@ -3980,6 +4390,12 @@ impl Hub {
         let forwarder_key = format!("{}:{}", req.client_id, req.session_uuid);
 
         if self.try_attach_socket_terminal_forwarder(&req) {
+            self.send_socket_terminal_attach_state(
+                &req.client_id,
+                &req.subscription_id,
+                &req.session_uuid,
+                "attached",
+            );
             return;
         }
 
@@ -3987,6 +4403,18 @@ impl Hub {
             &forwarder_key,
             PendingTerminalAttachRequest::Socket(req),
         );
+        if let Some(PendingTerminalAttach {
+            request: PendingTerminalAttachRequest::Socket(req),
+            ..
+        }) = self.pending_terminal_attaches.get(&forwarder_key)
+        {
+            self.send_socket_terminal_attach_state(
+                &req.client_id,
+                &req.subscription_id,
+                &req.session_uuid,
+                "pending",
+            );
+        }
     }
 
     /// Try to attach a socket PTY forwarder immediately.
@@ -4031,6 +4459,7 @@ impl Hub {
         let pty_for_snapshot = pty_handle.clone();
 
         let session_uuid = req.session_uuid.clone();
+        let subscription_id = req.subscription_id.clone();
         let target_rows = req.rows;
         let target_cols = req.cols;
         let active_flag = Arc::clone(&req.active_flag);
@@ -4100,47 +4529,63 @@ impl Hub {
                 snapshot.len()
             );
 
-            if snapshot.is_empty()
-                && pty_handle.is_session_backed()
-                && !pty_handle.session_connection_alive()
-            {
-                log::warn!(
-                    "[Lua-Socket] Session RPC died before snapshot for {} session {}; sending ProcessExited instead of empty scrollback",
-                    client_id,
-                    session_uuid
-                );
-                let frame = Frame::ProcessExited {
-                    session_uuid: session_uuid.clone(),
-                    exit_code: None,
-                };
-                let _ = frame_tx.try_send(frame.encode());
-                return;
-            }
-
-            // Always send a scrollback frame (even empty) so clients can
-            // deterministically leave connecting state after subscribe.
-            let frame = Frame::Scrollback {
-                session_uuid: session_uuid.clone(),
-                rows: snapshot_rows,
-                cols: snapshot_cols,
-                kitty_enabled,
-                data: snapshot,
-            };
-            match frame_tx.try_send(frame.encode()) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            let attach_state =
+                Self::classify_snapshot_attach_state(&pty_handle, &session_uuid, &snapshot);
+            match attach_state {
+                SnapshotAttachState::Ready => {}
+                SnapshotAttachState::Exited => {
                     log::warn!(
-                        "[Lua-Socket] Outbound queue full for {}, forcing reconnect",
-                        client_id
+                        "[Lua-Socket] Session RPC died before snapshot for {} session {}; sending ProcessExited",
+                        client_id,
+                        session_uuid
                     );
-                    let _ = hub_event_tx.send(super::events::HubEvent::SocketClientDisconnected {
-                        client_id: client_id.clone(),
-                    });
+                    let frame = Frame::ProcessExited {
+                        session_uuid: session_uuid.clone(),
+                        exit_code: None,
+                    };
+                    let _ = frame_tx.try_send(frame.encode());
                     return;
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    log::trace!("[Lua-Socket] Frame channel closed before snapshot sent");
-                    return;
+                SnapshotAttachState::Reconnecting => {
+                    log::info!(
+                        "[Lua-Socket] Session '{}' snapshot unavailable — reconnect pending",
+                        &session_uuid[..session_uuid.len().min(16)]
+                    );
+                    Self::push_socket_terminal_attach_state(
+                        &frame_tx,
+                        &client_id,
+                        &subscription_id,
+                        &session_uuid,
+                        "reconnecting",
+                    );
+                }
+            }
+
+            if attach_state != SnapshotAttachState::Reconnecting {
+                let frame = Frame::Scrollback {
+                    session_uuid: session_uuid.clone(),
+                    rows: snapshot_rows,
+                    cols: snapshot_cols,
+                    kitty_enabled,
+                    data: snapshot,
+                };
+                match frame_tx.try_send(frame.encode()) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        log::warn!(
+                            "[Lua-Socket] Outbound queue full for {}, forcing reconnect",
+                            client_id
+                        );
+                        let _ =
+                            hub_event_tx.send(super::events::HubEvent::SocketClientDisconnected {
+                                client_id: client_id.clone(),
+                            });
+                        return;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        log::trace!("[Lua-Socket] Frame channel closed before snapshot sent");
+                        return;
+                    }
                 }
             }
 
@@ -5822,8 +6267,10 @@ mod cargo_profile_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::agent::pty::PtySession;
 
@@ -5911,6 +6358,7 @@ mod tests {
     use crate::hub::{Hub, PendingTerminalAttachRequest};
     use crate::lua::CreateForwarderRequest;
     use crate::relay::create_crypto_service;
+    use crate::socket::framing::{Frame, FrameDecoder};
 
     fn e2e_config() -> Config {
         let mut config = Config::default();
@@ -5979,6 +6427,50 @@ mod tests {
         SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
     }
 
+    fn test_session_backed_handle(session_uuid: &str, rows: u16, cols: u16) -> SessionHandle {
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let pty = PtyHandle::new_with_session(
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            rows,
+            cols,
+        );
+        SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
+    }
+
+    fn unique_session_uuid(prefix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time drift")
+            .as_nanos();
+        format!("{prefix}-{nanos}")
+    }
+
+    fn register_live_session_identity(session_uuid: &str) {
+        let socket_path = crate::session::session_socket_path(session_uuid).expect("socket path");
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent).expect("create sessions dir");
+        }
+        std::fs::write(&socket_path, b"live").expect("write socket sentinel");
+        crate::session::write_session_pid_file(session_uuid, std::process::id())
+            .expect("write session pid file");
+    }
+
+    fn cleanup_live_session_identity(session_uuid: &str) {
+        if let Ok(path) = crate::session::session_socket_path(session_uuid) {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Ok(path) = crate::session::session_pid_path(session_uuid) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     fn register_test_socket_client(hub: &mut Hub, client_id: &str) -> tokio::net::UnixStream {
         let (client_std, server_std) =
             std::os::unix::net::UnixStream::pair().expect("std UnixStream::pair");
@@ -6000,6 +6492,27 @@ mod tests {
         );
         hub.socket_clients.insert(client_id.to_string(), conn);
         client_stream
+    }
+
+    fn read_test_socket_frame(stream: &mut tokio::net::UnixStream) -> Frame {
+        let handle = shared_test_runtime();
+        handle.block_on(async {
+            use tokio::io::AsyncReadExt;
+
+            let mut decoder = FrameDecoder::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                    .await
+                    .expect("timed out waiting for socket frame")
+                    .expect("socket read");
+                assert!(n > 0, "socket closed before frame arrived");
+                let frames = decoder.feed(&buf[..n]).expect("decode frame");
+                if let Some(frame) = frames.into_iter().next() {
+                    return frame;
+                }
+            }
+        })
     }
 
     /// Create a test session handle. No local shadow screen — all PTYs are
@@ -6875,5 +7388,121 @@ mod tests {
             hub.pty_forwarders.contains_key(&key),
             "socket forwarder should start after prerequisites are available"
         );
+    }
+
+    #[test]
+    fn test_tui_attach_reconnecting_emits_explicit_attach_state() {
+        let session_uuid = unique_session_uuid("sess-tui-reconnecting");
+        register_live_session_identity(&session_uuid);
+
+        let (mut hub, _request_tx, mut output_rx) = e2e_hub();
+        hub.handle_cache
+            .add_session(test_session_backed_handle(&session_uuid, 24, 80));
+
+        let req = crate::lua::primitives::CreateTuiForwarderRequest {
+            session_uuid: session_uuid.clone(),
+            subscription_id: format!("tui:{session_uuid}"),
+            active_flag: Arc::new(Mutex::new(true)),
+            rows: 24,
+            cols: 80,
+        };
+        hub.create_lua_tui_pty_forwarder(req);
+
+        let rt = shared_test_runtime();
+        let outputs = rt.block_on(async {
+            let mut outputs = Vec::new();
+            for _ in 0..2 {
+                let output = tokio::time::timeout(Duration::from_secs(2), output_rx.recv())
+                    .await
+                    .expect("timed out waiting for TUI output")
+                    .expect("TUI output channel closed");
+                outputs.push(output);
+            }
+            outputs
+        });
+
+        assert!(
+            outputs.iter().any(|output| matches!(
+                output,
+                TuiOutput::Message(json)
+                    if json.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
+                        && json.get("state").and_then(|v| v.as_str()) == Some("attached")
+                        && json.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid.as_str())
+            )),
+            "initial attach should still emit attached state"
+        );
+        assert!(
+            outputs.iter().any(|output| matches!(
+                output,
+                TuiOutput::Message(json)
+                    if json.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
+                        && json.get("state").and_then(|v| v.as_str()) == Some("reconnecting")
+                        && json.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid.as_str())
+            )),
+            "reconnect-pending attach should emit explicit reconnecting state"
+        );
+        assert!(
+            !outputs.iter().any(
+                |output| matches!(output, TuiOutput::Scrollback { data, .. } if data.is_empty())
+            ),
+            "reconnect-pending attach must not fake an empty scrollback"
+        );
+
+        cleanup_live_session_identity(&session_uuid);
+    }
+
+    #[test]
+    fn test_socket_attach_reconnecting_emits_explicit_attach_state() {
+        let session_uuid = unique_session_uuid("sess-socket-reconnecting");
+        register_live_session_identity(&session_uuid);
+
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let client_id = "socket:reconnecting";
+        let mut client_stream = register_test_socket_client(&mut hub, client_id);
+        hub.handle_cache
+            .add_session(test_session_backed_handle(&session_uuid, 24, 80));
+
+        let req = crate::lua::primitives::CreateSocketForwarderRequest {
+            client_id: client_id.to_string(),
+            session_uuid: session_uuid.clone(),
+            subscription_id: format!("socket:{session_uuid}"),
+            active_flag: Arc::new(Mutex::new(true)),
+            rows: 24,
+            cols: 80,
+        };
+        hub.create_lua_socket_pty_forwarder(req);
+
+        let first = read_test_socket_frame(&mut client_stream);
+        let second = read_test_socket_frame(&mut client_stream);
+        let frames = vec![first, second];
+
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                Frame::Json(value)
+                    if value.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
+                        && value.get("state").and_then(|v| v.as_str()) == Some("attached")
+                        && value.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid.as_str())
+            )),
+            "initial socket attach should still emit attached state"
+        );
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                Frame::Json(value)
+                    if value.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
+                        && value.get("state").and_then(|v| v.as_str()) == Some("reconnecting")
+                        && value.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid.as_str())
+            )),
+            "reconnect-pending socket attach should emit explicit reconnecting state"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| matches!(frame, Frame::Scrollback { data, .. } if data.is_empty())),
+            "reconnect-pending socket attach must not fake an empty scrollback"
+        );
+
+        cleanup_live_session_identity(&session_uuid);
     }
 }

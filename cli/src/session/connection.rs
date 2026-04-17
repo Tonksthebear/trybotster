@@ -224,6 +224,13 @@ impl SessionConnection {
         Ok(())
     }
 
+    /// Connect to a session process and seed reconnect state from handshake metadata.
+    pub fn connect_and_seed(socket_path: &Path) -> Result<(Self, Option<ModeFlags>)> {
+        let conn = Self::connect(socket_path)?;
+        let mode_flags = Some(conn.metadata.mode_flags.clone());
+        Ok((conn, mode_flags))
+    }
+
     /// Send a ping and wait for pong.
     pub fn ping(&mut self) -> Result<()> {
         let req = encode_empty(FRAME_PING);
@@ -320,6 +327,7 @@ fn session_reader(
     let mut stream = stream;
     let _ = stream.set_read_timeout(None); // block indefinitely
     let mut buf = [0u8; 8192];
+    let mut saw_process_exit = false;
 
     log::info!(
         "[session-reader] started for {}",
@@ -339,7 +347,16 @@ fn session_reader(
             Ok(n) => n,
         };
 
-        for frame in decoder.feed(&buf[..n]) {
+        let frames = decoder.feed(&buf[..n]);
+
+        // Check for sustained protocol corruption — the decoder saw enough
+        // consecutive bad headers to conclude the stream is irrecoverable.
+        if decoder.is_desynced() {
+            log::warn!("[session-reader] protocol desync detected — treating as connection death");
+            break;
+        }
+
+        for frame in frames {
             match frame.frame_type {
                 FRAME_PTY_OUTPUT => {
                     let data = &frame.payload;
@@ -436,6 +453,7 @@ fn session_reader(
                         .ok()
                         .and_then(|v| v["exit_code"].as_i64())
                         .map(|c| c as i32);
+                    saw_process_exit = true;
                     let _ = hub_event_tx.send(crate::hub::events::HubEvent::SessionProcessExited {
                         session_uuid: session_uuid.clone(),
                         exit_code,
@@ -455,18 +473,62 @@ fn session_reader(
     }
 
     // Session socket closed — notify hub
-    let _ = hub_event_tx.send(crate::hub::events::HubEvent::SessionProcessExited {
-        session_uuid,
-        exit_code: None,
-    });
+    if !saw_process_exit {
+        let _ = hub_event_tx.send(crate::hub::events::HubEvent::SessionProcessExited {
+            session_uuid,
+            exit_code: None,
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::Shutdown;
+
     use super::*;
+    use tokio::sync::mpsc;
 
     #[test]
     fn shared_session_connection_type_compiles() {
         let _conn: SharedSessionConnection = Arc::new(Mutex::new(None));
+    }
+
+    #[test]
+    fn session_reader_does_not_emit_disconnect_after_process_exited_frame() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let (response_tx, _response_rx) = std::sync::mpsc::channel::<Frame>();
+        let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
+        let hub_event_tx = crate::hub::events::HubEventTx::from(hub_tx);
+
+        let handle = std::thread::spawn(move || {
+            session_reader(
+                reader,
+                "sess-test-reader".to_string(),
+                event_tx,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(0)),
+                response_tx,
+                hub_event_tx,
+            );
+        });
+
+        let frame = encode_json(FRAME_PROCESS_EXITED, &serde_json::json!({ "exit_code": 0 }))
+            .expect("encode exit frame");
+        writer.write_all(&frame).expect("write exit frame");
+        writer.shutdown(Shutdown::Both).expect("shutdown writer");
+
+        handle.join().expect("reader thread joins");
+
+        let mut exits = Vec::new();
+        while let Ok(event) = hub_rx.try_recv() {
+            if let crate::hub::events::HubEvent::SessionProcessExited { exit_code, .. } = event {
+                exits.push(exit_code);
+            }
+        }
+
+        assert_eq!(exits, vec![Some(0)]);
     }
 }
