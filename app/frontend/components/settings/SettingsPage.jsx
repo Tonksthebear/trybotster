@@ -67,8 +67,6 @@ export default function SettingsPage({
             <button
               key={tab.id}
               type="button"
-              data-tab={tab.id}
-              data-active={activeTab === tab.id ? '' : undefined}
               onClick={() => setActiveTab(tab.id)}
               className={clsx(
                 'px-4 py-2 text-sm font-medium transition-colors border-b-2',

@@ -107,20 +107,14 @@ export default function SidebarConnectionStatus() {
       >
         <span className="flex items-center gap-1.5">
           <span
-            data-connection-status-target="browserSection"
-            data-status={browser}
             className={`size-1.5 rounded-full ${DOT_BG[browser] || DOT_BG.disconnected}`}
             title={`Browser: ${BROWSER_LABEL[browser] || 'Offline'}`}
           />
           <span
-            data-connection-status-target="connectionSection"
-            data-state={connection}
             className={`size-1.5 rounded-full ${CONNECTION_DOT[connection] || CONNECTION_DOT.disconnected}`}
             title={`Connection: ${CONNECTION_LABEL[connection] || 'Offline'}`}
           />
           <span
-            data-connection-status-target="hubSection"
-            data-status={hubStatus || 'unknown'}
             className={`size-1.5 rounded-full ${hubStatus ? DOT_BG[hubStatus] || DOT_BG.offline : DOT_BG.connecting}`}
             title={`Hub: ${hubStatus ? HUB_LABEL[hubStatus] || 'Unknown' : 'Connecting'}`}
           />
