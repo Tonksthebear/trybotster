@@ -90,8 +90,7 @@ fn install(terminfo_dir: &Path) -> Result<(), String> {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        std::fs::write(&dest, data)
-            .map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
+        std::fs::write(&dest, data).map_err(|e| format!("cannot write {}: {e}", dest.display()))?;
     }
 
     log::info!(

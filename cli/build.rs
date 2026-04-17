@@ -222,17 +222,9 @@ fn compile_terminfo(out_dir: &str) {
         "/// Pre-compiled terminfo entries: (relative_path, compiled_bytes)."
     )
     .unwrap();
-    writeln!(
-        out,
-        "pub static TERMINFO_FILES: &[(&str, &[u8])] = &["
-    )
-    .unwrap();
+    writeln!(out, "pub static TERMINFO_FILES: &[(&str, &[u8])] = &[").unwrap();
     for (rel_path, abs_path) in &compiled {
-        writeln!(
-            out,
-            "    (\"{rel_path}\", include_bytes!(\"{abs_path}\")),",
-        )
-        .unwrap();
+        writeln!(out, "    (\"{rel_path}\", include_bytes!(\"{abs_path}\")),",).unwrap();
     }
     writeln!(out, "];").unwrap();
 }

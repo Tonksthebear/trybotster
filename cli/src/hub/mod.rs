@@ -311,6 +311,18 @@ pub fn local_device_hub_id() -> anyhow::Result<String> {
 /// server integration, and browser relay components. It can run in either
 /// TUI mode (with terminal rendering) or headless mode (for CI/daemon use).
 
+/// State for a session awaiting background reconnect.
+pub(crate) struct ReconnectState {
+    /// When the reconnect was first requested.
+    pub started_at: std::time::Instant,
+    /// When the current in-flight attempt was launched (if any).
+    pub attempt_started_at: Option<std::time::Instant>,
+    /// Generation counter to detect stale completions from background tasks.
+    pub generation: u64,
+    /// Whether a background reconnect task is currently in flight.
+    pub in_flight: bool,
+}
+
 /// Central orchestrator that owns all hub state and runs the event loop.
 pub struct Hub {
     // === Core State ===
@@ -548,6 +560,17 @@ pub struct Hub {
     /// Cleared every `CleanupTick` (5s) to coalesce decrypt failure storms.
     ratchet_restarted_peers: std::collections::HashSet<String>,
 
+    /// Sessions with dead reader threads awaiting background reconnect.
+    ///
+    /// Keyed by session_uuid. Entries are inserted when `SessionProcessExited`
+    /// fires with `exit_code: None` (reader death, not real process exit).
+    /// Background tasks attempt reconnect; `CleanupTick` retries and expires
+    /// entries older than 110s.
+    pending_reconnects: std::collections::HashMap<String, ReconnectState>,
+
+    /// Monotonic counter for reconnect generation tracking.
+    reconnect_generation: u64,
+
     // === Web Push Notifications ===
     /// VAPID keys for web push authentication (loaded on startup).
     pub(crate) vapid_keys: Option<crate::notifications::vapid::VapidKeys>,
@@ -744,6 +767,8 @@ impl Hub {
             pty_output_messages_drained: 0,
             notification_watcher_handles: std::collections::HashMap::new(),
             ratchet_restarted_peers: std::collections::HashSet::new(),
+            pending_reconnects: std::collections::HashMap::new(),
+            reconnect_generation: 0,
             vapid_keys: None,
             push_subscriptions: crate::notifications::push::PushSubscriptionStore::default(),
             singleton_lock: None,
@@ -917,9 +942,8 @@ impl Hub {
 
     /// Discover live session process sockets and fire Lua recovery event.
     ///
-    /// Scans the session socket directory for `.sock` files. For each one,
-    /// attempts a connect + handshake to verify liveness and extract metadata.
-    /// Fires `sessions_discovered` with the list of live sessions.
+    /// Scans the session socket directory for `.sock` files backed by live
+    /// session PID files and fires `sessions_discovered`.
     fn recover_session_processes(&mut self) -> usize {
         let sockets = match crate::session::discover_sessions() {
             Ok(s) => s,
@@ -989,6 +1013,7 @@ impl Hub {
 
         // Sweep orphaned sockets left by crashed/killed processes
         daemon::cleanup_orphaned_sockets();
+        crate::session::cleanup_orphaned_session_files();
 
         let path = daemon::socket_path(&self.hub_identifier)?;
         let socket_path = path.display().to_string();

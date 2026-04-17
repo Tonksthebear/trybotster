@@ -107,6 +107,15 @@ mod protocol_tests {
             rows: 24,
             cols: 80,
             last_output_at: 1234567890,
+            mode_flags: ModeFlags {
+                kitty_enabled: true,
+                cursor_visible: false,
+                bracketed_paste: true,
+                mouse_mode: 3,
+                alt_screen: true,
+                focus_reporting: true,
+                application_cursor: false,
+            },
         };
         let json = serde_json::to_vec(&meta).unwrap();
         let decoded: SessionMetadata = serde_json::from_slice(&json).unwrap();
@@ -115,6 +124,13 @@ mod protocol_tests {
         assert_eq!(decoded.rows, 24);
         assert_eq!(decoded.cols, 80);
         assert_eq!(decoded.last_output_at, 1234567890);
+        assert!(decoded.mode_flags.kitty_enabled);
+        assert!(!decoded.mode_flags.cursor_visible);
+        assert!(decoded.mode_flags.bracketed_paste);
+        assert_eq!(decoded.mode_flags.mouse_mode, 3);
+        assert!(decoded.mode_flags.alt_screen);
+        assert!(decoded.mode_flags.focus_reporting);
+        assert!(!decoded.mode_flags.application_cursor);
     }
 }
 
@@ -264,13 +280,33 @@ mod hub_manifest_tests {
 
 #[cfg(test)]
 mod socket_path_tests {
-    use crate::session::{session_socket_path, sessions_socket_dir};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::session::{
+        cleanup_orphaned_session_files, read_session_pid_file, session_pid_path,
+        session_process_is_live, session_socket_path, sessions_socket_dir, write_session_pid_file,
+    };
+
+    fn unique_session_uuid(suffix: &str) -> String {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("sess-test-{}-{}-{ts}", std::process::id(), suffix)
+    }
 
     #[test]
     fn session_socket_path_format() {
         let path = session_socket_path("sess-1234-abcd").unwrap();
         let filename = path.file_name().unwrap().to_str().unwrap();
         assert_eq!(filename, "sess-1234-abcd.sock");
+    }
+
+    #[test]
+    fn session_pid_path_format() {
+        let path = session_pid_path("sess-1234-abcd").unwrap();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(filename, "sess-1234-abcd.pid");
     }
 
     #[test]
@@ -281,5 +317,92 @@ mod socket_path_tests {
             dir.to_str().unwrap().contains("sessions"),
             "path should contain 'sessions'"
         );
+    }
+
+    #[test]
+    fn session_process_is_live_requires_socket_and_live_pid() {
+        let session_uuid = unique_session_uuid("live");
+        let socket_path = session_socket_path(&session_uuid).unwrap();
+        let pid_path = session_pid_path(&session_uuid).unwrap();
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+
+        std::fs::write(&socket_path, b"").unwrap();
+        assert!(
+            !session_process_is_live(&session_uuid),
+            "socket alone should not count as a live session"
+        );
+
+        write_session_pid_file(&session_uuid, std::process::id()).unwrap();
+        assert!(
+            session_process_is_live(&session_uuid),
+            "socket plus live pid should count as a live session"
+        );
+        assert_eq!(
+            read_session_pid_file(&session_uuid).unwrap(),
+            Some(std::process::id())
+        );
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+    }
+
+    #[test]
+    fn cleanup_orphaned_session_files_preserves_socket_without_pid_file() {
+        let session_uuid = unique_session_uuid("missing-pid");
+        let socket_path = session_socket_path(&session_uuid).unwrap();
+        let pid_path = session_pid_path(&session_uuid).unwrap();
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+
+        std::fs::write(&socket_path, b"").unwrap();
+        cleanup_orphaned_session_files();
+
+        assert!(
+            socket_path.exists(),
+            "cleanup should not remove a socket when pid metadata is missing"
+        );
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+    }
+
+    #[test]
+    fn session_pid_file_is_json_identity_record() {
+        let session_uuid = unique_session_uuid("identity");
+        let pid_path = session_pid_path(&session_uuid).unwrap();
+        let _ = std::fs::remove_file(&pid_path);
+
+        write_session_pid_file(&session_uuid, std::process::id()).unwrap();
+        let content = std::fs::read_to_string(&pid_path).unwrap();
+
+        assert!(
+            content.trim_start().starts_with('{'),
+            "pid file should now serialize a structured identity record"
+        );
+        assert_eq!(
+            read_session_pid_file(&session_uuid).unwrap(),
+            Some(std::process::id())
+        );
+
+        let _ = std::fs::remove_file(&pid_path);
+    }
+
+    #[test]
+    fn legacy_plaintext_session_pid_file_still_reads() {
+        let session_uuid = unique_session_uuid("legacy");
+        let pid_path = session_pid_path(&session_uuid).unwrap();
+        let _ = std::fs::remove_file(&pid_path);
+
+        std::fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
+
+        assert_eq!(
+            read_session_pid_file(&session_uuid).unwrap(),
+            Some(std::process::id())
+        );
+
+        let _ = std::fs::remove_file(&pid_path);
     }
 }
