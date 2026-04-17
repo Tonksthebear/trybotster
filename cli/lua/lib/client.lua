@@ -364,6 +364,7 @@ end
 -- @param sub_id The subscription ID to send to
 function Client:send_worktree_list(sub_id, target)
     local worktrees = {}
+    local WorktreeListPayload = require("lib.worktree_list_payload")
     local registry = rawget(_G, "spawn_targets")
     local inspection = nil
     if registry and target and target.target_path and type(registry.inspect) == "function" then
@@ -386,6 +387,7 @@ function Client:send_worktree_list(sub_id, target)
             ))
         end
     end
+    worktrees = WorktreeListPayload.build(target, worktrees, Agent.all_info())
     log.info(string.format("Sending worktree list: %d worktrees", #worktrees))
     for i, wt in ipairs(worktrees) do
         log.debug(string.format("  Worktree %d: %s (%s)", i, wt.path or "?", wt.branch or "?"))
