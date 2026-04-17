@@ -36,6 +36,7 @@ pub mod config;
 pub mod connection;
 pub mod events;
 pub mod fs;
+pub mod hook_timeout;
 pub mod http;
 pub mod hub;
 pub mod hub_client;
@@ -123,6 +124,7 @@ pub fn register_all(lua: &Lua) -> Result<()> {
     hub_discovery::register(lua)?;
     secrets::register(lua)?;
     spawn_targets::register(lua)?;
+    hook_timeout::register(lua)?;
     Ok(())
 }
 

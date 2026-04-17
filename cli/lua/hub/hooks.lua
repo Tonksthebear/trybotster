@@ -191,6 +191,14 @@ function M.has_interceptors(event)
 end
 
 --- Call interceptor chain. Each can transform or drop (return nil).
+---
+--- Each interceptor runs under a wall-deadline enforced by the Rust-side
+--- `__hook_timed_pcall` primitive (see `cli/src/lua/primitives/hook_timeout.rs`).
+--- If an interceptor's body blows past `timeout_ms`, a Lua VM hook raises a
+--- runtime error; the chain continues with the previous (untransformed) value.
+--- This catches pure-Lua infinite loops but NOT callbacks blocked inside a
+--- Rust primitive; the Rust shutdown watchdog is the backstop for those.
+---
 --- @param event string Event name
 --- @param ... any Arguments passed through chain
 --- @return any Transformed result, or nil if dropped
@@ -201,11 +209,14 @@ function M.call(event, ...)
 
     local result = table.pack(...)
     for _, entry in ipairs(sorted) do
-        local returns = table.pack(pcall(entry.h.callback, table.unpack(result, 1, result.n)))
+        local timeout_ms = entry.h.timeout_ms or 10
+        local returns = table.pack(__hook_timed_pcall(
+            entry.h.callback, timeout_ms, table.unpack(result, 1, result.n)))
+
         local ok = returns[1]
         if not ok then
             log.error(string.format("hooks.call %s.%s: %s", event, entry.name, returns[2]))
-            -- Continue with previous result on error
+            -- Continue with previous result on error (timeout or otherwise)
         elseif returns.n <= 1 or returns[2] == nil then
             return nil -- Dropped (no return values or explicit nil)
         else
