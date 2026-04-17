@@ -30,6 +30,10 @@ use anyhow::Result;
 
 use crate::hub::Hub;
 
+/// Poll infrequently so signal-hook shutdown atomics are observed even when
+/// the hub is otherwise idle.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Run the Hub event loop without TUI (headless mode).
 ///
 /// Fully event-driven via `tokio::select!`. Direct channel receivers
@@ -37,7 +41,8 @@ use crate::hub::Hub;
 /// the loop instantly. The unified `HubEvent` channel delivers all
 /// background events (HTTP, WebSocket, timers, ActionCable, WebRTC,
 /// PTY notifications, file watches, cleanup ticks) with zero latency.
-/// No periodic polling — the loop sleeps between events.
+/// A small timeout backstop is still required for signal-hook's atomic
+/// shutdown flags because they do not wake `tokio::select!` on their own.
 ///
 /// # Arguments
 ///
@@ -220,6 +225,9 @@ pub(crate) fn run_event_loop(
                     hub.hub_event_metrics
                         .record_handler_time(kind, started_at.elapsed());
                 }
+
+                // signal-hook only flips atomics; it does not wake this select loop.
+                _ = tokio::time::sleep(SHUTDOWN_POLL_INTERVAL) => {}
             }
 
             // Check shutdown conditions
