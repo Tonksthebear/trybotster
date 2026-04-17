@@ -74,28 +74,12 @@ class CliPairingTest < ApplicationSystemTestCase
     sign_in_as(@user)
     visit url
 
-    # Pairing page: wait for bundle to be parsed, then click pair button
-    assert_selector "[data-pairing-target='ready']", wait: 15
-    find("[data-action='pairing#pair']").click
-
-    assert_selector "[data-pairing-target='success']:not(.hidden)", wait: 15
-    visit hub_path(@hub)
-    assert_selector "[data-connection-status-target='connectionSection']", wait: 15
+    complete_pairing_for(@hub, pairing_url: url)
 
     # All three status sections should reach their connected states
-    assert_selector(
-      "[data-connection-status-target='browserSection'][data-status='connected']",
-      wait: 25
-    )
-    assert_selector(
-      "[data-connection-status-target='hubSection'][data-status='online']",
-      wait: 25
-    )
-    assert_selector(
-      "[data-connection-status-target='connectionSection'][data-state='direct'], " \
-      "[data-connection-status-target='connectionSection'][data-state='relay']",
-      wait: 30
-    )
+    assert_sidebar_connection_status(browser: "connected", wait: 25)
+    assert_sidebar_connection_status(hub: "online", wait: 25)
+    assert_sidebar_webrtc_connected(wait: 30)
   end
 
   # -- Test 3: Invalid/corrupted bundle shows error state --------------------
@@ -109,18 +93,15 @@ class CliPairingTest < ApplicationSystemTestCase
 
     # Connection section should show "unpaired" (bundle parse failure -> no Olm session).
     # The state transitions: connecting -> (ActionCable subscribes) -> unpaired.
-    assert_selector(
-      "[data-connection-status-target='connectionSection'][data-state='unpaired']",
-      wait: 45
-    )
+    assert_sidebar_connection_status(connection: "unpaired", wait: 45)
   end
 
   # -- Test 4: Stale session requires new QR scan ---------------------------
   #
   # Scenario: Browser connected to CLI #1, CLI #1 stops, CLI #2 starts with
   # new keys. The browser's cached Olm session (from CLI #1) is now stale
-  # and should not auto-reconnect to CLI #2. The connection should show
-  # "expired" or "unpaired", forcing the user to scan a new QR code.
+  # and should not auto-reconnect to CLI #2. The connection should surface
+  # an expired/stale-session state instead of silently reusing bad keys.
   test "stale session does not reconnect after CLI restart with new keys" do
     # Phase 1: Establish connection with first CLI
     @cli = start_cli(@hub)
@@ -130,20 +111,10 @@ class CliPairingTest < ApplicationSystemTestCase
     sign_in_as(@user)
     visit url
 
-    # Pairing page: wait for bundle to be parsed, then click pair button
-    assert_selector "[data-pairing-target='ready']", wait: 15
-    find("[data-action='pairing#pair']").click
-
-    assert_selector "[data-pairing-target='success']:not(.hidden)", wait: 15
-    visit hub_path(@hub)
-    assert_selector "[data-connection-status-target='connectionSection']", wait: 15
+    complete_pairing_for(@hub, pairing_url: url)
 
     # Wait for connection to fully establish
-    assert_selector(
-      "[data-connection-status-target='connectionSection'][data-state='direct'], " \
-      "[data-connection-status-target='connectionSection'][data-state='relay']",
-      wait: 30
-    )
+    assert_sidebar_webrtc_connected(wait: 30)
 
     # Phase 2: Stop CLI and start a new one (new keypair)
     stop_cli(@cli)
@@ -151,9 +122,9 @@ class CliPairingTest < ApplicationSystemTestCase
 
     # Wait for browser to detect disconnection
     assert_selector(
-      "[data-connection-status-target='connectionSection'][data-state='disconnected'], " \
-      "[data-connection-status-target='connectionSection'][data-state='expired'], " \
-      "[data-connection-status-target='connectionSection'][data-state='unpaired']",
+      "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='disconnected'], " \
+      "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='expired'], " \
+      "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='unpaired']",
       wait: 15
     )
 
@@ -162,15 +133,20 @@ class CliPairingTest < ApplicationSystemTestCase
     assert new_url.present?
 
     # Phase 3: Visit the hub page WITHOUT the new bundle fragment.
-    # The browser still has the stale Olm session from CLI #1.
-    visit "#{page.server_url}/hubs/#{@hub.id}"
+    # The browser still has the stale Olm session from CLI #1, so the SPA
+    # should prompt for a fresh pairing instead of reconnecting automatically.
+    visit hub_path(@hub)
 
-    # The connection should NOT reach "direct" or "relay" — the old session
-    # is incompatible with the new CLI's keys. It should show expired or unpaired.
+    assert_sidebar_connection_status(browser: "connected", wait: 30)
+    assert_sidebar_connection_status(hub: "online", wait: 30)
     assert_selector(
-      "[data-connection-status-target='connectionSection'][data-state='expired'], " \
-      "[data-connection-status-target='connectionSection'][data-state='unpaired']",
-      wait: 25
+      "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='expired'], " \
+      "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='pairing_needed']",
+      wait: 30
+    )
+    assert(
+      page.has_button?("Retry connection", wait: 5) || page.has_button?("Start pairing", wait: 5),
+      "Expected stale session recovery UI"
     )
   end
 
@@ -185,10 +161,7 @@ class CliPairingTest < ApplicationSystemTestCase
 
     # Connection section should show "unpaired" (no bundle -> no Olm session).
     # The state transitions: connecting -> (ActionCable subscribes) -> unpaired.
-    assert_selector(
-      "[data-connection-status-target='connectionSection'][data-state='unpaired']",
-      wait: 45
-    )
+    assert_sidebar_connection_status(connection: "unpaired", wait: 45)
   end
 
   private

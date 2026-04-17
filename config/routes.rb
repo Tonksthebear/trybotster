@@ -1,4 +1,7 @@
 Rails.application.routes.draw do
+  # ActionCable WebSocket endpoint
+  mount ActionCable.server => "/cable"
+
   # Devise routes for session management (without OmniAuth callbacks)
   devise_for :users, skip: [ :sessions, :registrations, :omniauth_callbacks ]
 
@@ -59,7 +62,14 @@ Rails.application.routes.draw do
   get "docs", to: "docs#show", as: :docs
   get "docs/*path", to: "docs#show", as: :doc
 
-  root to: "home#index"
+  # SPA frontend routes — React Router handles navigation
+  root to: "spa#home"
+
+  # SPA catch-all for frontend paths that React Router manages.
+  # Must be after all API/auth routes to avoid intercepting them.
+  get "/hubs/:hub_id/sessions/*path", to: "spa#hub", as: nil
+  get "/hubs/:hub_id/settings", to: "spa#hub", as: nil
+  get "/hubs/:hub_id/pairing", to: "spa#hub", as: nil
 
   # PWA
   get "manifest" => "rails/pwa#manifest", as: :pwa_manifest

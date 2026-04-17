@@ -12,6 +12,22 @@ class HubsController < ApplicationController
   # Dashboard showing list of hubs with health status
   def index
     @hubs = current_user.hubs.order(last_seen_at: :desc)
+
+    respond_to do |format|
+      format.html { render html: "", layout: "spa" }
+      format.json do
+        render json: @hubs.map { |hub|
+          {
+            id: hub.id,
+            name: hub.name,
+            identifier: hub.identifier,
+            fingerprint: hub.fingerprint,
+            active: hub.active?,
+            last_seen_at: hub.last_seen_at&.iso8601
+          }
+        }
+      end
+    end
   end
 
   # GET /hubs/:id
@@ -28,9 +44,7 @@ class HubsController < ApplicationController
     end
 
     respond_to do |format|
-      format.html do
-        @recommended_template = read_template("agents/claude.sh")
-      end
+      format.html { render html: "", layout: "spa" }
       format.json do
         render json: {
           id: Current.hub.id,

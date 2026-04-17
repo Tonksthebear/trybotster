@@ -20,12 +20,12 @@ module Hubs
 
     # === Session View ===
 
-    test "show renders session terminal view" do
+    test "show serves SPA shell" do
       sign_in @user
       get hub_session_path(@active_hub, "test-session-uuid")
 
       assert_response :success
-      assert_match "session-uuid", response.body
+      assert_select "#app"
     end
 
     # === Hub Scoping ===

@@ -49,18 +49,17 @@
 
     <%# Actions %>
     <div class="flex gap-3">
-      <%= render Elements::ButtonComponent.new("Cancel",
-        as: :a, href: new_users_hub_path,
-        color: :neutral, size: :lg, class: "flex-1 text-center"
-      ) %>
+      <%= link_to "Cancel",
+                  new_users_hub_path,
+                  class: "inline-flex flex-1 items-center justify-center rounded-md border border-zinc-700 bg-zinc-900 px-4 py-3 text-sm font-semibold text-zinc-200 transition-colors hover:border-zinc-600 hover:bg-zinc-800" %>
 
       <%= form_with url: users_hubs_path, method: :post, class: "flex-1" do %>
         <%= hidden_field_tag :code, @authorization.user_code %>
         <%= hidden_field_tag :approve, "1" %>
-        <%= render Elements::ButtonComponent.new("Approve",
-          as: :button, type: :submit,
-          color: :success, size: :lg, class: "w-full"
-        ) %>
+        <button type="submit"
+                class="inline-flex w-full items-center justify-center rounded-md bg-emerald-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-emerald-500 focus:outline-hidden focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 focus:ring-offset-zinc-950">
+          Approve
+        </button>
       <% end %>
     </div>
   </div>

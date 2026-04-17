@@ -85,7 +85,8 @@ module CliTestHelper
       @log_thread&.kill
       @stdout_r&.close
       @stderr_r&.close
-      FileUtils.rm_rf(@temp_dir) if !preserve_temp_dir && @temp_dir && File.directory?(@temp_dir)
+      keep_temp_dir = preserve_temp_dir || ENV["BOTSTER_TEST_PRESERVE_TEMP_DIRS"] == "1"
+      FileUtils.rm_rf(@temp_dir) if !keep_temp_dir && @temp_dir && File.directory?(@temp_dir)
 
       # Clean up socket file (lives in /tmp/botster-{uid}/, not temp_dir).
       # SIGKILL may bypass the Rust shutdown path that normally removes this.
@@ -246,6 +247,8 @@ module CliTestHelper
   def start_cli(hub, **options)
     build_cli unless skip_build?
 
+    hub = resolve_test_hub!(hub)
+
     # Create temp directory for CLI data
     temp_dir = options[:temp_dir] || Dir.mktmpdir("cli_test_")
     device_identity = prepare_cli_identity!(hub, temp_dir)
@@ -321,6 +324,7 @@ module CliTestHelper
     # pipes.  A fast exit (crash / bail) may leave bytes in the pipe buffer
     # that we need for diagnostics.
     log_thread = Thread.new do
+      File.open(log_file_path, "ab") do |log_file|
       pipes_open = true
       while cli.running? || pipes_open
         ready = IO.select([ stdout_r, stderr_r ], nil, nil, 0.1)
@@ -331,6 +335,8 @@ module CliTestHelper
           begin
             data = io.read_nonblock(4096)
             cli.add_output(data)
+            log_file.write(data)
+            log_file.flush
             Rails.logger.debug "[CLI] #{data}" if options[:verbose]
             pipes_open = true
           rescue IO::WaitReadable
@@ -339,6 +345,7 @@ module CliTestHelper
             # This pipe is closed — don't set pipes_open
           end
         end
+      end
       end
     end
 
@@ -415,12 +422,26 @@ module CliTestHelper
   end
 
   def create_hub_token_for_hub(hub)
+    hub = resolve_test_hub!(hub)
+
     # Create a hub token for the CLI to authenticate
     # Returns the HubToken record (not just the token string) for cleanup
     hub.hub_token || hub.create_hub_token!(name: "CLI Test Token #{SecureRandom.hex(4)}")
   end
 
+  def resolve_test_hub!(hub)
+    persisted = Hub.find_by(id: hub.id) || hub.user.hubs.find_by(identifier: hub.identifier)
+    return persisted if persisted
+
+    hub.user.hubs.create!(
+      identifier: hub.identifier.presence || "test-hub-#{SecureRandom.hex(8)}",
+      last_seen_at: Time.current,
+      fingerprint: hub.fingerprint
+    )
+  end
+
   def prepare_cli_identity!(hub, temp_dir)
+    hub = resolve_test_hub!(hub)
     device_identity = load_or_create_cli_device_identity(temp_dir)
     target_identifier = device_hub_identifier(device_identity[:fingerprint])
 

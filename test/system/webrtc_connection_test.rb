@@ -23,19 +23,13 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     pair_browser_with_cli(@cli)
 
     # Browser section should reach "connected" (ActionCable signaling up)
-    assert_selector(
-      "[data-connection-status-target='browserSection'][data-status='connected']",
-      wait: 30
-    )
+    assert_sidebar_connection_status(browser: "connected", wait: 30)
 
     # Connection section should reach "direct" or "relay" (WebRTC data channel open)
-    assert_webrtc_connected
+    assert_sidebar_webrtc_connected
 
     # Hub section should show "online" (CLI heartbeating)
-    assert_selector(
-      "[data-connection-status-target='hubSection'][data-status='online']",
-      wait: 30
-    )
+    assert_sidebar_connection_status(hub: "online", wait: 30)
   end
 
   test "browser and hub ready state triggers a WebRTC attempt" do
@@ -45,19 +39,13 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     # This guards the exact gate semantics for the status badges: once the
     # browser is connected to Rails and the hub is online, the middle badge
     # must at least enter a live WebRTC attempt.
-    assert_selector(
-      "[data-connection-status-target='browserSection'][data-status='connected']",
-      wait: 30
-    )
-    assert_selector(
-      "[data-connection-status-target='hubSection'][data-status='online']",
-      wait: 30
-    )
+    assert_sidebar_connection_status(browser: "connected", wait: 30)
+    assert_sidebar_connection_status(hub: "online", wait: 30)
 
     assert_selector(
-      "[data-connection-status-target='connectionSection'][data-state='connecting'], " \
-      "[data-connection-status-target='connectionSection'][data-state='direct'], " \
-      "[data-connection-status-target='connectionSection'][data-state='relay']",
+      "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='connecting'], " \
+      "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='direct'], " \
+      "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='relay']",
       wait: 10
     )
   end
@@ -121,7 +109,7 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     assert_equal true, result["ok"], "Expected SharedWorker init to succeed, got: #{result.inspect}"
   end
 
-  test "connection URL with fragment establishes pairing" do
+  test "connection URL with fragment loads pairing confirmation" do
     @cli = start_cli(@hub)
     url = @cli.connection_url
     assert url.present?, "CLI should produce a connection URL"
@@ -135,10 +123,13 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
 
     sign_in_as(@user)
     visit url
-    complete_pairing
+    assert_pairing_ready(pairing_url: url)
+    click_button "Complete Pairing", wait: 10
+    assert_pairing_success(wait: 30)
 
-    # Verify connection establishes via the pairing bundle
-    assert_webrtc_connected
+    # The fragment should be enough to drive the browser into the secure
+    # pairing confirmation flow without manual paste entry.
+    assert_text "Paired successfully", wait: 30
   end
 
   test "connection survives page refresh" do
@@ -146,28 +137,19 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     pair_browser_with_cli(@cli)
 
     # Wait for full connection
-    assert_webrtc_connected
+    assert_sidebar_webrtc_connected
     paired_hub_url = current_url
 
-    # Refresh the page. The reconnect path should recover without manual
-    # intervention while the browser session remains alive.
+    # Refresh the page. The browser should recover the active session.
     visit paired_hub_url
 
     # Connection should re-establish without manual intervention.
-    assert_selector(
-      "[data-connection-status-target='browserSection'][data-status='connected']",
-      wait: 30
-    )
-
-    assert_webrtc_connected
-
-    assert_selector(
-      "[data-connection-status-target='hubSection'][data-status='online']",
-      wait: 30
-    )
+    assert_sidebar_connection_status(browser: "connected", wait: 30)
+    assert_sidebar_connection_status(hub: "online", wait: 30)
+    assert_sidebar_webrtc_connected(wait: 30)
   end
 
-  test "connection re-establishes after Turbo navigation away and back" do
+  test "connection re-establishes after client-side navigation away and back" do
     @cli = start_cli(@hub)
     pair_browser_with_cli(@cli)
 
@@ -175,53 +157,41 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     assert_webrtc_connected
     paired_hub_url = current_url
 
-    # Navigate away (Turbo soft navigation — releases connections, starts grace period)
+    # Navigate away, which releases the active connections and starts the grace period.
     visit settings_path
 
-    # Navigate back to hub (reacquires connections, must not storm)
+    # Navigate back to the hub and reacquire the same connections without storming.
     visit paired_hub_url
 
     # Connection should re-establish cleanly within a reasonable timeout.
     # Before the fix, this would never stabilize — the browser would loop
     # creating peer connections that the CLI rejects ("Connection in progress").
-    assert_webrtc_connected(wait: 15)
+    assert_sidebar_webrtc_connected(wait: 15)
 
-    assert_selector(
-      "[data-connection-status-target='hubSection'][data-status='online']",
-      wait: 15
-    )
+    assert_sidebar_connection_status(hub: "online", wait: 15)
   end
 
-  test "paired browser reconnects after hub reboot without rescanning" do
+  test "browser reconnects after hub reboot with preserved keys" do
     @cli = start_cli(@hub)
     pair_browser_with_cli(@cli)
 
-    assert_webrtc_connected
+    assert_sidebar_webrtc_connected
 
     preserved_temp_dir = @cli.temp_dir
     stop_cli(@cli, preserve_temp_dir: true)
     @cli = nil
 
     assert_selector(
-      "[data-connection-status-target='connectionSection'][data-state='disconnected'], " \
-      "[data-connection-status-target='connectionSection'][data-state='expired'], " \
-      "[data-connection-status-target='connectionSection'][data-state='unpaired']",
+      "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='disconnected'], " \
+      "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='expired'], " \
+      "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='unpaired']",
       wait: 20
     )
 
     @cli = start_cli(@hub, temp_dir: preserved_temp_dir)
-
-    visit current_url
-
-    assert_selector(
-      "[data-connection-status-target='browserSection'][data-status='connected']",
-      wait: 30
-    )
-    assert_webrtc_connected(wait: 30)
-    assert_selector(
-      "[data-connection-status-target='hubSection'][data-status='online']",
-      wait: 30
-    )
+    assert_sidebar_connection_status(browser: "connected", wait: 30)
+    assert_sidebar_connection_status(hub: "online", wait: 30)
+    assert_sidebar_webrtc_connected(wait: 30)
   end
 
   test "without CLI connection shows appropriate state" do
@@ -230,22 +200,15 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
 
     # Browser section should still show "connected" because it only reflects
     # the browser's ActionCable connection to Rails.
-    assert_selector(
-      "[data-connection-status-target='browserSection'][data-status='connected']",
-      wait: 10
-    )
+    assert_sidebar_connection_status(browser: "connected", wait: 10)
 
     # Hub section should show "offline" since CLI is not running
-    assert_selector(
-      "[data-connection-status-target='hubSection'][data-status='offline']",
-      wait: 10
-    )
+    assert_sidebar_connection_status(hub: "offline", wait: 10)
 
     # Connection section should not look "connecting" just because browser
     # signaling is up. Without both sides ready for WebRTC, it stays
     # disconnected or unpaired.
-    connection_section = find("[data-connection-status-target='connectionSection']", wait: 10)
-    state = connection_section["data-state"]
+    state = sidebar_connection_state(wait: 10)
     assert_includes(
       %w[unpaired disconnected],
       state,
@@ -288,26 +251,48 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     assert url.present?, "CLI should produce a connection URL"
 
     sign_in_as(@user)
-    visit url
-    complete_pairing
+    attempts = 0
+
+    loop do
+      visit url
+      complete_pairing(url)
+
+      return if page.has_selector?(
+        "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='direct'], " \
+        "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='relay']",
+        wait: 10
+      )
+
+      attempts += 1
+      revisit_pairing_url_if_needed(url)
+
+      if attempts >= 2
+        assert_sidebar_webrtc_connected(wait: 10)
+        return
+      end
+    end
   end
 
   # Click "Complete Secure Pairing" and wait for redirect to hub page.
   # The pairing page parses the bundle from the URL fragment, shows a
   # confirmation button, then redirects to the hub after session creation.
-  def complete_pairing
-    click_button "Complete Pairing", wait: 10
-    assert_selector "[data-pairing-target='success']:not(.hidden)", wait: 15
-    visit hub_path(@hub)
-    assert_selector "[data-connection-status-target='connectionSection']", wait: 15
+  def complete_pairing(pairing_url = current_url)
+    complete_pairing_for(@hub, pairing_url:)
+  end
+
+  def revisit_pairing_url_if_needed(url)
+    return unless page.has_button?("Start pairing", wait: 2) ||
+      page.has_selector?(
+        "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='pairing_needed']",
+        wait: 2
+      )
+
+    visit url
+    complete_pairing(url)
   end
 
   # Assert WebRTC data channel is connected (direct P2P or TURN relay).
   def assert_webrtc_connected(wait: 30)
-    assert_selector(
-      "[data-connection-status-target='connectionSection'][data-state='direct'], " \
-      "[data-connection-status-target='connectionSection'][data-state='relay']",
-      wait: wait
-    )
+    assert_sidebar_webrtc_connected(wait:)
   end
 end

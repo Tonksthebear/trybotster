@@ -15,29 +15,11 @@ class Hubs::PairingControllerTest < ActionDispatch::IntegrationTest
     assert_redirected_to root_path
   end
 
-  test "pairing page renders for authenticated user" do
+  test "pairing page serves SPA shell" do
     sign_in @user
     get hub_pairing_path(@hub)
     assert_response :success
-
-    assert_match "Secure Pairing", response.body
-  end
-
-  test "pairing page includes pairing stimulus controller" do
-    sign_in @user
-    get hub_pairing_path(@hub)
-    assert_response :success
-
-    assert_select "[data-controller='pairing']"
-    assert_select "[data-pairing-hub-id-value=?]", @hub.id.to_s
-  end
-
-  test "pairing page includes redirect URL to hub show" do
-    sign_in @user
-    get hub_pairing_path(@hub)
-    assert_response :success
-
-    assert_select "[data-pairing-redirect-url-value=?]", hub_path(@hub)
+    assert_select "#app"
   end
 
   test "pairing page redirects for non-existent hub" do

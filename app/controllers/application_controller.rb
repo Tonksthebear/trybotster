@@ -1,9 +1,6 @@
 class ApplicationController < ActionController::Base
-  # Only allow modern browsers supporting webp images, web push, badges, import maps, CSS nesting, and CSS :has.
+  # Only allow modern browsers supporting webp images, web push, badges, CSS nesting, and CSS :has.
   allow_browser versions: :modern
-
-  # Changes to the importmap will invalidate the etag for HTML responses
-  stale_when_importmap_changes
 
   # CSRF protection strategy:
   # - Browser requests (session auth): raise exception on invalid token
@@ -16,16 +13,11 @@ class ApplicationController < ActionController::Base
   layout :choose_layout
 
   before_action :set_current_attributes, if: :user_signed_in?
-  before_action :set_sidebar_hubs, if: :user_signed_in?
 
   private
 
   def choose_layout
-    user_signed_in? ? "sidebar" : "application"
-  end
-
-  def set_sidebar_hubs
-    @sidebar_hubs = current_user.hubs.order(last_seen_at: :desc)
+    "spa"
   end
 
   def set_current_attributes
