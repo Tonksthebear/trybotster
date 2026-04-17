@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react'
+import React, { useEffect, useRef } from 'react'
 import {
   BrowserRouter,
   Routes,
@@ -7,6 +7,7 @@ import {
   useParams,
   useLocation,
   useNavigate,
+  useSearchParams,
 } from 'react-router-dom'
 import { SidebarLayout } from './catalyst/sidebar-layout'
 import {
@@ -103,6 +104,9 @@ function HubRouteSync() {
 function HubShell() {
   const location = useLocation()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const isBooting = searchParams.get('booting') === '1'
+  const initialHubIdsRef = useRef(null)
   const selectedHubId = useHubStore((s) => s.selectedHubId)
   const connectionState = useHubStore((s) => s.connectionState)
   const hubListLoading = useHubStore((s) => s.hubListLoading)
@@ -116,9 +120,48 @@ function HubShell() {
     fetchHubList()
   }, [fetchHubList])
 
+  // Poll while waiting for a newly approved hub to register.
+  // After Users::HubsController#create, the browser is redirected here before
+  // the CLI finishes its POST /hubs, so the initial fetch returns stale data.
+  useEffect(() => {
+    if (!isBooting) return
+
+    const startedAt = Date.now()
+    const maxDurationMs = 30000
+    let cancelled = false
+
+    const tick = async () => {
+      const hubs = await fetchHubList()
+      if (cancelled) return
+
+      if (initialHubIdsRef.current === null) {
+        initialHubIdsRef.current = new Set(hubs.map((h) => String(h.id)))
+        return
+      }
+
+      const newHub = hubs.find((h) => !initialHubIdsRef.current.has(String(h.id)))
+      if (newHub) {
+        initialHubIdsRef.current = null
+        selectHub(newHub.id)
+        navigate(`/hubs/${newHub.id}`, { replace: true })
+      } else if (Date.now() - startedAt >= maxDurationMs) {
+        initialHubIdsRef.current = null
+        navigate('/hubs', { replace: true })
+      }
+    }
+
+    tick()
+    const interval = setInterval(tick, 2000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [isBooting, fetchHubList, selectHub, navigate])
+
   // Auto-select last-used hub when at /hubs (no hub in URL)
   useEffect(() => {
     if (hubListLoading) return
+    if (isBooting) return // booting effect owns selection until the new hub registers
 
     const hubList = useHubStore.getState().hubList
     const isHubRoute = /^\/hubs\/[^/]/.test(location.pathname)
@@ -136,7 +179,7 @@ function HubShell() {
       selectHub(hubList[0].id)
       navigate(`/hubs/${hubList[0].id}`, { replace: true })
     }
-  }, [hubListLoading, location.pathname, navigate, selectHub, getLastHubId])
+  }, [hubListLoading, isBooting, location.pathname, navigate, selectHub, getLastHubId])
 
   // Keep modal-bridge in sync
   useEffect(() => {
@@ -224,6 +267,25 @@ function HubShell() {
   )
 }
 
+export function AppRoutes() {
+  return (
+    <Routes>
+      <Route path="/" element={<Home />} />
+
+      <Route element={<HubShell />}>
+        <Route path="/hubs" element={<HubDashboard />} />
+
+        <Route path="/hubs/:hubId" element={<HubRouteSync />}>
+          <Route index element={<HubShow />} />
+          <Route path="sessions/:sessionUuid" element={null} />
+          <Route path="settings" element={<SettingsRoute />} />
+          <Route path="pairing" element={<PairingRoute />} />
+        </Route>
+      </Route>
+    </Routes>
+  )
+}
+
 /**
  * Root application shell.
  */
@@ -231,20 +293,7 @@ export default function AppShell() {
   return (
     <BrowserRouter>
       <React.Suspense fallback={<SuspenseFallback />}>
-        <Routes>
-          <Route path="/" element={<Home />} />
-
-          <Route element={<HubShell />}>
-            <Route path="/hubs" element={<HubDashboard />} />
-
-            <Route path="/hubs/:hubId" element={<HubRouteSync />}>
-              <Route index element={<HubShow />} />
-              <Route path="sessions/:sessionUuid" element={null} />
-              <Route path="settings" element={<SettingsRoute />} />
-              <Route path="pairing" element={<PairingRoute />} />
-            </Route>
-          </Route>
-        </Routes>
+        <AppRoutes />
       </React.Suspense>
     </BrowserRouter>
   )

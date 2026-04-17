@@ -4,9 +4,13 @@
 class SpaController < ApplicationController
   layout "spa"
 
-  # Public — no auth required
+  # Public — signed-in visitors jump straight to their hubs dashboard.
   def home
-    render "spa/show"
+    if user_signed_in?
+      redirect_to hubs_path
+    else
+      render "spa/show"
+    end
   end
 
   def docs

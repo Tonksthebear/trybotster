@@ -47,7 +47,7 @@ module Users
       end
 
       @authorization.approve!(current_user)
-      redirect_to hubs_path, flash: { hub_booting: true }
+      redirect_to hubs_path(booting: 1)
     end
 
     def lookup_and_redirect
