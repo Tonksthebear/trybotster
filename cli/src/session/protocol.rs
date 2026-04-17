@@ -122,6 +122,12 @@ pub struct SessionMetadata {
     pub cols: u16,
     /// Unix timestamp of last PTY output.
     pub last_output_at: u64,
+    /// Terminal mode flags at handshake time.
+    ///
+    /// Reconnect handshakes carry this so the hub can seed state without
+    /// issuing an RPC before the reader thread owns the socket.
+    #[serde(default)]
+    pub mode_flags: ModeFlags,
 }
 
 /// Terminal mode flags reported on reconnect.
@@ -252,6 +258,8 @@ impl Frame {
 #[derive(Debug)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
+    /// Consecutive bad frame headers discarded without any valid frame in between.
+    consecutive_bad_headers: u32,
 }
 
 impl FrameDecoder {
@@ -259,12 +267,23 @@ impl FrameDecoder {
     pub fn new() -> Self {
         Self {
             buf: Vec::with_capacity(8192),
+            consecutive_bad_headers: 0,
         }
     }
 
     /// Maximum frame payload size (16 MiB) to reject obviously malformed input
     /// before allocating.
     const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+    /// Number of consecutive bad headers before the decoder considers the
+    /// stream irrecoverably desynced.
+    const DESYNC_THRESHOLD: u32 = 100;
+
+    /// Whether the decoder has seen enough consecutive bad headers to consider
+    /// the stream irrecoverably desynced.
+    pub fn is_desynced(&self) -> bool {
+        self.consecutive_bad_headers >= Self::DESYNC_THRESHOLD
+    }
 
     /// Feed raw bytes, return any complete frames.
     pub fn feed(&mut self, data: &[u8]) -> Vec<Frame> {
@@ -279,13 +298,23 @@ impl FrameDecoder {
                 u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
             if len == 0 || len > Self::MAX_FRAME_SIZE {
                 // Consume the bad 4-byte header so the decoder doesn't wedge.
-                log::warn!("FrameDecoder: bad frame length {len}, discarding header");
+                self.consecutive_bad_headers += 1;
+                if self.consecutive_bad_headers <= 5
+                    || self.consecutive_bad_headers == Self::DESYNC_THRESHOLD
+                {
+                    log::warn!(
+                        "FrameDecoder: bad frame length {len}, discarding header (consecutive: {})",
+                        self.consecutive_bad_headers
+                    );
+                }
                 self.buf.drain(..4);
                 continue;
             }
             if self.buf.len() < 4 + len {
                 break;
             }
+            // Valid frame — reset bad header counter.
+            self.consecutive_bad_headers = 0;
             let frame_type = self.buf[4];
             let payload = self.buf[5..4 + len].to_vec();
             // Remove consumed bytes
@@ -551,6 +580,15 @@ mod tests {
             rows: 24,
             cols: 80,
             last_output_at: 0,
+            mode_flags: ModeFlags {
+                kitty_enabled: true,
+                cursor_visible: false,
+                bracketed_paste: true,
+                mouse_mode: 6,
+                alt_screen: true,
+                focus_reporting: true,
+                application_cursor: true,
+            },
         };
 
         // Simulate hub → session → hub via in-memory buffers
@@ -596,5 +634,12 @@ mod tests {
         assert_eq!(decoded.pid, 42);
         assert_eq!(decoded.rows, 24);
         assert_eq!(decoded.cols, 80);
+        assert!(decoded.mode_flags.kitty_enabled);
+        assert!(!decoded.mode_flags.cursor_visible);
+        assert!(decoded.mode_flags.bracketed_paste);
+        assert_eq!(decoded.mode_flags.mouse_mode, 6);
+        assert!(decoded.mode_flags.alt_screen);
+        assert!(decoded.mode_flags.focus_reporting);
+        assert!(decoded.mode_flags.application_cursor);
     }
 }

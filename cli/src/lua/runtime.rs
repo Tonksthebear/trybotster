@@ -4251,4 +4251,162 @@ mod tests {
             "reference.lua should have at least 26 info fields, got {info_fields}"
         );
     }
+
+    // =========================================================================
+    // Hook Timeout Tests (cli/lua/hub/hooks.lua)
+    // =========================================================================
+    //
+    // These tests verify that a runaway interceptor cannot block the Hub event
+    // loop. hooks.call() dispatches each interceptor through the Rust-side
+    // `__hook_timed_pcall` primitive (see primitives::hook_timeout), which
+    // installs a VM instruction-count hook to enforce the per-hook timeout_ms.
+    // Without this, a plugin bug with an infinite loop would deadlock the
+    // event loop and require `kill -9` to recover.
+
+    /// Load the real hooks.lua into a fresh VM, with a stubbed `log` global
+    /// and the `__hook_timed_pcall` primitive registered (production VMs have
+    /// this registered by `primitives::register_all`).
+    fn load_hooks_module(lua: &mlua::Lua) {
+        crate::lua::primitives::hook_timeout::register(lua)
+            .expect("register __hook_timed_pcall");
+
+        // hooks.lua calls log.debug/log.error on register/error paths.
+        lua.load(
+            r#"
+            log = {
+                debug = function(...) end,
+                error = function(...) end,
+                info = function(...) end,
+                warn = function(...) end,
+            }
+            "#,
+        )
+        .exec()
+        .expect("stub log");
+
+        // Debug builds leave `embedded::get` empty (Lua files load from disk
+        // for hot-reload); release builds embed at compile time. The test
+        // wants the real source regardless of profile, so try embedded first,
+        // fall back to the on-disk copy relative to CARGO_MANIFEST_DIR.
+        let hooks_src: String = match crate::lua::embedded::get("hub/hooks.lua") {
+            Some(s) => s.to_string(),
+            None => {
+                let manifest_dir = env!("CARGO_MANIFEST_DIR");
+                let path = std::path::Path::new(manifest_dir)
+                    .join("lua")
+                    .join("hub")
+                    .join("hooks.lua");
+                std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!("read hub/hooks.lua from {}: {e}", path.display())
+                })
+            }
+        };
+
+        let hooks: mlua::Table = lua
+            .load(&hooks_src)
+            .set_name("hub/hooks.lua")
+            .eval()
+            .expect("eval hooks.lua returns a module table");
+        lua.globals().set("hooks", hooks).expect("bind hooks");
+    }
+
+    /// Runaway-loop interceptor with a tight timeout must return instead of
+    /// hanging the caller — the previous value flows through unchanged.
+    #[test]
+    fn hook_call_enforces_timeout_on_runaway_interceptor() {
+        let lua = mlua::Lua::new();
+        load_hooks_module(&lua);
+
+        // Register an interceptor that spins forever. Use a small timeout so
+        // the test finishes in well under the 60s cargo default.
+        lua.load(
+            r#"
+            hooks.intercept("spinny", "spinner", function(x)
+                while true do end
+            end, { timeout_ms = 50 })
+            "#,
+        )
+        .exec()
+        .expect("register runaway interceptor");
+
+        let start = std::time::Instant::now();
+        let result: String = lua
+            .load(r#"return hooks.call("spinny", "original")"#)
+            .eval()
+            .expect("hooks.call returns without hanging");
+        let elapsed = start.elapsed();
+
+        // The interceptor timed out; pcall caught the error; the chain
+        // continues with the previous (unchanged) value.
+        assert_eq!(result, "original", "untransformed value passes through");
+
+        // Generous bound: timeout is 50ms, instruction check cadence is 10k,
+        // teardown is trivial. A well-behaved machine finishes in well under
+        // 500ms; anything approaching 5s indicates the watchdog did not fire.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "hooks.call should enforce timeout quickly, took {elapsed:?}"
+        );
+    }
+
+    /// A well-behaved interceptor within its budget must still transform
+    /// data — the timeout must not interfere with the fast path.
+    #[test]
+    fn hook_call_fast_interceptor_is_unaffected() {
+        let lua = mlua::Lua::new();
+        load_hooks_module(&lua);
+
+        lua.load(
+            r#"
+            hooks.intercept("fast_event", "appender", function(x)
+                return x .. "_ok"
+            end, { timeout_ms = 100 })
+            "#,
+        )
+        .exec()
+        .expect("register fast interceptor");
+
+        let result: String = lua
+            .load(r#"return hooks.call("fast_event", "ping")"#)
+            .eval()
+            .expect("hooks.call succeeds");
+
+        assert_eq!(result, "ping_ok", "fast interceptor transforms normally");
+    }
+
+    /// A chain with a runaway hook must not poison subsequent hooks — after
+    /// the timeout fires, the chain continues with the previous value and
+    /// later interceptors still run on it.
+    #[test]
+    fn hook_call_chain_continues_after_timeout() {
+        let lua = mlua::Lua::new();
+        load_hooks_module(&lua);
+
+        // Priority ordering: higher priority runs first. The spinner runs
+        // first (priority 200), times out, then the appender runs on the
+        // un-transformed value.
+        lua.load(
+            r#"
+            hooks.intercept("chain", "spinner", function(x)
+                while true do end
+            end, { timeout_ms = 25, priority = 200 })
+
+            hooks.intercept("chain", "appender", function(x)
+                return x .. "_after"
+            end, { timeout_ms = 100, priority = 100 })
+            "#,
+        )
+        .exec()
+        .expect("register chain");
+
+        let result: String = lua
+            .load(r#"return hooks.call("chain", "seed")"#)
+            .eval()
+            .expect("hooks.call completes");
+
+        assert_eq!(
+            result, "seed_after",
+            "chain recovers from timeout and subsequent interceptor runs"
+        );
+    }
 }

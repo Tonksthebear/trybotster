@@ -2,427 +2,570 @@
 
 ## Goal
 
-Replace the current browser-side "template cloning plus Stimulus reconciliation" approach for live operator surfaces with a Rails-owned React runtime that renders trusted component primitives from structured state.
+Replace the current browser-side "template cloning plus Stimulus reconciliation" approach for live operator surfaces with a Rails-owned React runtime that renders trusted Botster primitives from structured data.
 
-The long-term direction is to make the web UI programmable in the same way the TUI is programmable:
+This spec is the web renderer application of the shared contract in [cross-client-ui-primitives.md](cross-client-ui-primitives.md). The cross-client spec owns primitive names, shared action semantics, and renderer-neutral state ownership rules. This document only defines the web-specific rollout and the phase-1 adapter boundary.
 
-- the runtime owns primitives
-- Lua composes them
-- the browser renders them locally
+Adaptive viewport behavior is specified separately in [adaptive-ui-viewport-and-presentation.md](adaptive-ui-viewport-and-presentation.md). That viewport-aware work is a phase-2 follow-on for the web runtime, not part of the initial phase-1 React island.
 
-This is not a plan to let the CLI send arbitrary HTML or JavaScript.
+This is the web equivalent of the TUI model:
+
+- Rails owns the trusted runtime, primitive registry, styling, and accessibility behavior
+- hub/Lua owns authoritative state and declarative composition
+- the browser renders locally and emits structured actions
+
+Botster is not becoming a React SPA. Rails still owns the shell, routing, settings pages, forms, and mostly static screens. React is introduced first as an island for the agent/workspace surface because that surface already behaves like a miniature application.
 
 ## Problem
 
-The agent/workspace UI has crossed the line where Stimulus is acting as a miniature frontend framework:
+The current `agent_list_controller.js` now owns too much application logic:
 
-- websocket-driven authoritative state
-- per-row async preview lifecycle
-- conditional visibility and affordances
-- hidden/system-session filtering
-- duplicated row logic across sidebar and main list
-- manual DOM reconciliation through cloned templates and `data-*` attributes
+- websocket-driven state
+- workspace grouping
+- selection syncing
+- per-row activity derivation
+- hosted preview lifecycle
+- duplicate row rendering in sidebar and main panel
+- manual DOM reconciliation through cloned templates and `data-*` mutation
 
-That model is now fragile. The hosted-preview disable bug was a good example: stale row state is easy to create because the rendering layer is manually derived from incremental messages instead of from a normalized state tree.
+That is the wrong shape for Stimulus. The next runtime must render from normalized state instead of progressively mutating the DOM.
 
-## Product Direction
+## Decision Summary
 
-Botster's web UI should follow the same principle as the TUI:
+- React is the browser runtime for live operator surfaces
+- Rails owns the primitive/component registry
+- hub/Lua does not send HTML, CSS, or JavaScript
+- phase 1 stays state-first, not tree-first
+- Botster composites exist for phase 1, but they are runtime-owned, not Lua-public
 
-- Rails ships a trusted web runtime plus primitive components
-- CLI/Lua owns live state and composition
-- the browser renders locally from structured data
+That last point matters: phase 1 proves the React island using the existing hub state feed. It does not simultaneously ship a generic schema renderer for arbitrary Lua-authored web trees.
 
-This enables:
+## Versioning
 
-- richer live UIs with fewer reconciliation bugs
-- reusable browser primitives
-- future user-customizable web frontends
-- a safer extensibility boundary than raw HTML/CSS/JS injection
+This document defines `web-ui-runtime/v1`.
 
-## Non-Goals
+Rules:
 
-- CLI-generated HTML
-- CLI-served arbitrary JavaScript components
-- replacing all Rails views with React
-- turning the entire app into an SPA
-- exposing raw third-party component APIs as the public Lua contract
+- `v1` additions must be backward-compatible
+- removing props or changing action payload semantics requires `v2`
+- phase-1 implementation may keep adapter code internal as long as the contracts below remain stable
 
-## Architectural Decision
+## Phase 1 Boundary
 
-### Rails owns presentation primitives
+Phase 1 covers only the agent/workspace UI:
 
-Rails owns:
-
-- the browser runtime
-- the trusted component registry
-- design tokens and styling
-- accessibility behavior
-- command dispatch plumbing
-- schema validation
-
-### CLI/Lua owns composition and state
-
-CLI/Lua owns:
-
-- authoritative live state
-- layout composition
-- action intent definitions
-- feature-specific orchestration
-
-### Browser owns rendering and reconciliation
-
-The browser runtime:
-
-- receives structured state and UI trees
-- validates them against the supported schema
-- renders them using React
-- dispatches actions back to the hub
-
-## Why React
-
-React is justified here not because "React is trendy," but because Botster needs a stable browser runtime with real reconciliation semantics.
-
-Benefits:
-
-- predictable re-rendering from normalized state
-- shared components between sidebar and main panel
-- easier derivation of computed UI state
-- cleaner lifecycle handling across websocket updates
-- a natural basis for a component registry and schema renderer
-
-Preact would be sufficient for isolated islands. React is the better fit if Botster is becoming a programmable web UI platform.
-
-## Why Not CLI HTML or Remote React Code
-
-The CLI should not ship presentation code directly into the web app.
-
-That would create:
-
-- version skew between CLI and browser runtime
-- upgrade fragility
-- security/trust issues
-- styling collisions
-- no stable compatibility boundary
-
-The protocol must remain declarative.
-
-Good:
-
-- `type`
-- `props`
-- `children`
-- `action ids`
-- structured state payloads
-
-Bad:
-
-- HTML strings
-- raw CSS payloads
-- arbitrary JavaScript bundles
-- serialized React components
-
-## Rendering Model
-
-### Page model
-
-Rails still renders the application shell:
-
-- layouts
-- navigation
-- settings pages
-- mostly static pages
-- mount points for interactive islands
-
-React mounts only inside explicit islands.
-
-Turbo and Stimulus may still exist on the same page, but they must not mutate inside a React-owned subtree.
-
-### Data model
-
-The browser runtime should keep a normalized store for each live surface. For agent/workspace UI, that store likely starts with:
-
-- `sessionsById`
-- `workspaceOrder`
-- `workspacesById`
-- `selectedSessionId`
-- `expandedWorkspaceIds`
-- `ui.pendingActions`
-
-All row UI should derive from selectors rather than from direct DOM mutation.
-
-### Action model
-
-Browser actions should remain command-oriented:
-
-- `toggle_hosted_preview`
-- `delete_session`
-- `move_session`
-- `rename_workspace`
-- `select_session`
-
-The browser sends action ids plus payloads to the hub. The hub remains authoritative.
-
-## Extensibility Model
-
-This spec follows the existing vault decision:
-
-- theme tokens first
-- primitive composition second
-- sandboxed custom rendering later
-
-The intended progression is:
-
-1. Rails-owned React primitives for core Botster UI
-2. Lua composition against a constrained component registry
-3. Optional advanced extension points later, likely sandboxed
-
-## Phase 1 Scope
-
-Phase 1 is deliberately narrow:
-
-- move the agent/workspace surface to a React island
-- keep the rest of the app on Rails/Turbo/Stimulus
-- define the initial primitive inventory
-- prove the runtime with one real live surface
-
-The first React island should own:
-
-- workspace tree
-- session rows
+- sidebar workspace tree
+- main hub workspace list
+- shared session row logic
+- hosted preview indicator and error state
 - row actions menu
-- hosted preview indicator/state
-- hosted preview error strip
-- selection state
-- expansion state
 
-## Initial Primitive Inventory
+Phase 1 explicitly does not include:
 
-The first task is to define the primitives Rails will own. These are not raw Radix or shadcn primitives as the public API. They are Botster primitives with stable contracts.
+- settings/forms primitives
+- dialog schema from Lua
+- arbitrary user-authored browser composition
+- replacing the rest of Rails/Turbo/Stimulus
 
-### Foundation primitives
+## Contract Layers
 
-- `Stack`
-- `Inline`
-- `Grid`
-- `Panel`
-- `Separator`
-- `ScrollArea`
-- `Spacer`
+There are three separate contracts in `v1`.
 
-### Content primitives
+### 1. Hub transport contract for phase 1
 
-- `Text`
-- `Heading`
-- `Code`
-- `Icon`
-- `Badge`
-- `StatusDot`
-- `EmptyState`
+The hub continues to send the existing state-oriented payloads. The React island normalizes them locally.
 
-### Action primitives
+### 2. Rails-owned primitive registry
 
-- `Button`
-- `IconButton`
-- `LinkButton`
-- `Menu`
-- `MenuItem`
-- `MenuSection`
-- `Disclosure`
-- `Dialog`
-- `Tooltip`
+Rails defines the stable browser primitive inventory and prop schemas. This is the future Lua-facing surface area.
 
-### Form primitives
+### 3. Internal phase-1 composites
 
-- `TextField`
-- `Select`
-- `Checkbox`
-- `Toggle`
-- `RadioGroup`
-- `FieldMessage`
+The first React island uses Botster-specific composites for the workspace/session surface. These are stable within the Rails runtime, but are not public to Lua in phase 1.
 
-### Navigation/list primitives
+## Phase 1 Transport Contract
 
-- `List`
-- `ListItem`
-- `Tree`
-- `TreeGroup`
-- `TreeItem`
-- `Tabs`
+The React island should adapt the current hub payload, not invent a second transport.
 
-### Botster-specific composites for phase 1
+### Hub input shape
 
-These should be provided by Rails as first-party composites built from the primitives above:
+```ts
+type HostedPreviewStateV1 = {
+  status?: "inactive" | "starting" | "running" | "error"
+  url?: string | null
+  error?: string | null
+  install_url?: string | null
+}
 
-- `WorkspaceList`
-- `WorkspaceGroup`
-- `WorkspaceHeader`
-- `SessionRow`
-- `SessionActivityIndicator`
-- `HostedPreviewIndicator`
-- `HostedPreviewError`
-- `SessionActionsMenu`
+type SessionSummaryV1 = {
+  id: string
+  session_uuid: string
+  session_type?: "agent" | "accessory" | string | null
+  label?: string | null
+  display_name?: string | null
+  title?: string | null
+  task?: string | null
+  target_name?: string | null
+  branch_name?: string | null
+  agent_name?: string | null
+  profile_name?: string | null
+  notification?: boolean
+  is_idle?: boolean | null
+  port?: number | null
+  hosted_preview?: HostedPreviewStateV1 | null
+  in_worktree?: boolean | null
+}
 
-The first phase should not attempt to express the entire agent/workspace UI purely from low-level layout nodes. A few Botster composites are the pragmatic bridge.
+type OpenWorkspaceSummaryV1 = {
+  id: string
+  name?: string | null
+  agents?: string[]
+}
 
-## Known Props/State Needed For Phase 1
-
-The initial component contracts will need to cover at least:
-
-### `WorkspaceGroup`
-
-- `id`
-- `title`
-- `count`
-- `expanded`
-- `renamable`
-
-### `SessionRow`
-
-- `sessionId`
-- `name`
-- `titleLine`
-- `subtext`
-- `selected`
-- `notification`
-- `activityState`
-- `isAccessory`
-- `canMoveWorkspace`
-
-### `HostedPreviewIndicator`
-
-- `status`
-- `url`
-- `error`
-- `installUrl`
-- `visible`
-
-Allowed statuses:
-
-- `inactive`
-- `starting`
-- `running`
-- `error`
-
-### `SessionActionsMenu`
-
-- `canPreview`
-- `previewStatus`
-- `previewUrl`
-- `canMove`
-- `canDelete`
-- action ids for preview toggle, move, and delete
-
-## Protocol Shape
-
-The runtime should support a declarative node format similar to:
-
-```json
-{
-  "type": "SessionRow",
-  "key": "session:abc",
-  "props": {
-    "sessionId": "abc",
-    "name": "main",
-    "selected": false,
-    "notification": false,
-    "activityState": "active",
-    "hostedPreview": {
-      "status": "running",
-      "url": "https://example.trycloudflare.com"
-    }
-  }
+type AgentWorkspaceSurfaceInputV1 = {
+  hub_id: string
+  agents: SessionSummaryV1[]
+  open_workspaces: OpenWorkspaceSummaryV1[]
+  selected_session_uuid?: string | null
+  surface: "sidebar" | "panel"
 }
 ```
 
-For phase 1, it is acceptable to keep the hub protocol as state-first rather than tree-first:
+### Normalized browser store
 
-- hub still sends normalized session/workspace state
-- browser React components render from that state
+The runtime should normalize that input into a store shaped like:
 
-The component-tree protocol can follow after the first React island lands.
+```ts
+type AgentWorkspaceStoreV1 = {
+  sessionsById: Record<string, SessionSummaryV1>
+  sessionOrder: string[]
+  workspacesById: Record<string, {
+    id: string
+    title: string
+    sessionIds: string[]
+  }>
+  workspaceOrder: string[]
+  ungroupedSessionIds: string[]
+  selectedSessionId: string | null
+  collapsedWorkspaceIds: string[]
+  surface: "sidebar" | "panel"
+}
+```
 
-## Migration Plan
+Rules:
 
-### Phase 0: Runtime decision and boundary definition
+- hub data remains the single remote source of truth
+- `collapsedWorkspaceIds` is browser-local UI state
+- selection is derived from route plus hub state, then stored as `selectedSessionId`
+- runtime selectors derive display names, title lines, preview affordances, and row density
 
-- choose React for the browser runtime
-- define island boundaries
-- define what stays in Rails/Stimulus
-- define the primitive/component registry ownership model
+## Primitive Inventory
 
-### Phase 1: Agent/workspace React island
+`v1` intentionally exposes a small primitive set. Anything not listed here is out of scope for `v1`.
 
-- create a React mount point for the sidebar and/or main workspace panel
-- build a normalized store fed by existing hub events
-- implement `WorkspaceGroup`, `SessionRow`, `HostedPreviewIndicator`, and `SessionActionsMenu`
-- remove template cloning and most per-row DOM mutation logic from `agent_list_controller.js`
+| Category | Component | `v1` status | Lua public in `v1` |
+|---|---|---|---|
+| Foundation | `Stack` | supported | yes |
+| Foundation | `Inline` | supported | yes |
+| Foundation | `Panel` | supported | yes |
+| Foundation | `ScrollArea` | supported | yes |
+| Content | `Text` | supported | yes |
+| Content | `Icon` | supported | yes |
+| Content | `Badge` | supported | yes |
+| Content | `StatusDot` | supported | yes |
+| Content | `EmptyState` | supported | yes |
+| Actions | `Button` | supported | yes |
+| Actions | `IconButton` | supported | yes |
+| Actions | `Menu` | supported | no |
+| Actions | `MenuItem` | supported | no |
+| Navigation | `Tree` | supported | yes |
+| Navigation | `TreeItem` | supported | yes |
+| Botster composite | `WorkspaceList` | supported | no |
+| Botster composite | `WorkspaceGroup` | supported | no |
+| Botster composite | `SessionRow` | supported | no |
+| Botster composite | `HostedPreviewIndicator` | supported | no |
+| Botster composite | `HostedPreviewError` | supported | no |
+| Botster composite | `SessionActionsMenu` | supported | no |
 
-### Phase 2: Stable primitive contracts
+Deferred from `v1`:
 
-- formalize the first Botster web component registry
-- document supported component ids and prop schemas
-- add validation and fallback behavior for unknown nodes
+- `Grid`
+- `Separator`
+- `Spacer`
+- `Heading`
+- `Code`
+- `LinkButton`
+- `Disclosure`
+- `Dialog`
+- `Tooltip`
+- form primitives
+- `Tabs`
 
-### Phase 3: Declarative UI composition from CLI/Lua
+## Shared Schema Types
 
-- allow Lua to describe surfaces using the registry
-- keep actions declarative and browser-routed
-- add capability negotiation/versioning
+The public registry uses these shared scalar types.
 
-### Phase 4: User-extensible frontend composition
+`Density` in this web runtime spec is a phase-1 surface variant for shared workspace and session components. It is intentionally separate from the shared cross-client `UiInteractionDensityV1` token defined in [cross-client-ui-primitives.md](cross-client-ui-primitives.md).
 
-- support user-defined composition for allowed surfaces
-- maintain the staged extensibility model from the vault
-- add sandboxed escape hatches only after the primitives layer is mature
+```ts
+type Space = "0" | "1" | "2" | "3" | "4" | "6"
+type Density = "sidebar" | "panel"
+type Tone = "default" | "muted" | "accent" | "success" | "warning" | "danger"
+type NodeV1 = {
+  type: string
+  props: Record<string, unknown>
+}
 
-## Implementation Notes
+type ActionBindingV1 = {
+  id:
+    | "botster.workspace.toggle"
+    | "botster.workspace.rename.request"
+    | "botster.session.select"
+    | "botster.session.preview.toggle"
+    | "botster.session.preview.open"
+    | "botster.session.move.request"
+    | "botster.session.delete.request"
+  payload: Record<string, unknown>
+  disabled?: boolean
+}
+```
 
-### Shared state source
+`Density` in this web runtime spec is a phase-1 surface variant for shared workspace/session components. It is intentionally separate from the shared cross-client `UiInteractionDensityV1` token defined in [cross-client-ui-primitives.md](cross-client-ui-primitives.md).
 
-The existing `agent_list` payload should remain the initial authoritative source. Do not invent a second browser-only state channel for phase 1.
+## Lua-Public Primitive Props
 
-### Shared component code
+These are the exact public prop shapes for the `v1` primitive registry.
 
-Sidebar and main workspace list should render from shared row/group components with different density props instead of duplicated templates.
+### `Stack`
 
-### Styling
+```ts
+type StackPropsV1 = {
+  gap?: Space
+  padding?: Space
+  align?: "start" | "center" | "end" | "stretch"
+  justify?: "start" | "center" | "end" | "between"
+  children: NodeV1[]
+}
+```
 
-Botster primitives should own styling. Third-party component libraries may be used internally, but must not become the public protocol contract.
+### `Inline`
 
-### Turbo coexistence
+```ts
+type InlinePropsV1 = {
+  gap?: Space
+  padding?: Space
+  align?: "start" | "center" | "end" | "stretch"
+  justify?: "start" | "center" | "end" | "between"
+  wrap?: boolean
+  children: NodeV1[]
+}
+```
 
-Turbo can remain for navigation. React islands should:
+### `Panel`
 
-- mount on page load
-- clean up before Turbo cache if necessary
-- rehydrate/reconnect cleanly on revisits
+```ts
+type PanelPropsV1 = {
+  padding?: Space
+  tone?: "default" | "muted"
+  border?: boolean
+  radius?: "sm" | "md"
+  children: NodeV1[]
+}
+```
 
-## Risks
+### `ScrollArea`
 
-- React introduced without a clear state boundary becomes a second source of truth
-- exposing third-party components directly would freeze Botster to their API
-- trying to make every surface schema-driven too early would slow delivery
-- trying to skip composites and use only ultra-low-level primitives at first would overcomplicate the first migration
+```ts
+type ScrollAreaPropsV1 = {
+  axis?: "y" | "x" | "both"
+  children: NodeV1[]
+}
+```
+
+### `Text`
+
+```ts
+type TextPropsV1 = {
+  text: string
+  size?: "xs" | "sm" | "md"
+  tone?: Tone
+  weight?: "regular" | "medium" | "semibold"
+  italic?: boolean
+  truncate?: boolean
+  monospace?: boolean
+}
+```
+
+### `Icon`
+
+```ts
+type IconPropsV1 = {
+  name: string
+  size?: "xs" | "sm" | "md"
+  tone?: Tone
+  label?: string
+}
+```
+
+### `Badge`
+
+```ts
+type BadgePropsV1 = {
+  text: string
+  tone?: "default" | "accent" | "success" | "warning" | "danger"
+  size?: "sm" | "md"
+}
+```
+
+### `StatusDot`
+
+```ts
+type StatusDotPropsV1 = {
+  state: "neutral" | "idle" | "active" | "success" | "warning" | "danger"
+  label?: string
+}
+```
+
+### `EmptyState`
+
+```ts
+type EmptyStatePropsV1 = {
+  title: string
+  description?: string
+  icon?: string
+  primaryAction?: ActionBindingV1
+}
+```
+
+### `Button`
+
+```ts
+type ButtonPropsV1 = {
+  label: string
+  action: ActionBindingV1
+  variant?: "solid" | "ghost"
+  tone?: "default" | "accent" | "danger"
+  leadingIcon?: string
+  disabled?: boolean
+}
+```
+
+### `IconButton`
+
+```ts
+type IconButtonPropsV1 = {
+  icon: string
+  label: string
+  action: ActionBindingV1
+  tone?: "default" | "accent" | "danger"
+  disabled?: boolean
+}
+```
+
+### `Tree`
+
+```ts
+type TreePropsV1 = {
+  // Web-only phase-1 surface variant, not the shared interaction-density token.
+  density: Density
+  children: NodeV1[]
+}
+```
+
+### `TreeItem`
+
+```ts
+type TreeItemPropsV1 = {
+  id: string
+  selected?: boolean
+  notification?: boolean
+  action?: ActionBindingV1
+  startSlot?: NodeV1[]
+  title: NodeV1[]
+  subtitle?: NodeV1[]
+  endSlot?: NodeV1[]
+}
+```
+
+## Internal Phase-1 Composite Contract
+
+These composites are runtime-owned in `v1`. They are stable enough to build the React island, but they are not exposed to Lua until the state-first migration has landed cleanly.
+
+### `WorkspaceList`
+
+```ts
+type WorkspaceListPropsV1 = {
+  density: Density
+  groups: WorkspaceGroupPropsV1[]
+  ungroupedSessions?: SessionRowPropsV1[]
+  emptyState?: EmptyStatePropsV1
+}
+```
+
+Emits: none directly. Child composites emit the actions.
+
+### `WorkspaceGroup`
+
+```ts
+type WorkspaceGroupPropsV1 = {
+  id: string
+  title: string
+  count: number
+  expanded: boolean
+  density: Density
+  canRename: boolean
+  sessions: SessionRowPropsV1[]
+}
+```
+
+Emits:
+
+- `botster.workspace.toggle` with `{ workspaceId }`
+- `botster.workspace.rename.request` with `{ workspaceId, currentName }`
+
+### `SessionRow`
+
+```ts
+type SessionRowPropsV1 = {
+  sessionId: string
+  sessionUuid: string
+  density: Density
+  primaryName: string
+  titleLine?: string
+  subtext: string
+  selected: boolean
+  notification: boolean
+  sessionType: "agent" | "accessory"
+  activityState: "hidden" | "idle" | "active"
+  hostedPreview?: HostedPreviewIndicatorPropsV1 | null
+  previewError?: HostedPreviewErrorPropsV1 | null
+  actionsMenu: SessionActionsMenuPropsV1
+  canMoveWorkspace: boolean
+  canDelete: boolean
+  inWorktree?: boolean | null
+}
+```
+
+Emits:
+
+- `botster.session.select` with `{ sessionId, sessionUuid }`
+
+### `HostedPreviewIndicator`
+
+```ts
+type HostedPreviewIndicatorPropsV1 = {
+  sessionId: string
+  sessionUuid: string
+  hasForwardedPort: boolean
+  status: "inactive" | "starting" | "running" | "error" | "unavailable"
+  url?: string | null
+  error?: string | null
+  installUrl?: string | null
+}
+```
+
+Emits:
+
+- `botster.session.preview.open` with `{ sessionId, sessionUuid, url }` when `status === "running"` and `url` is present
+
+### `HostedPreviewError`
+
+```ts
+type HostedPreviewErrorPropsV1 = {
+  sessionId: string
+  sessionUuid: string
+  visible: boolean
+  message: string
+  installUrl?: string | null
+}
+```
+
+Emits:
+
+- no hub action
+- optional browser navigation to `installUrl`
+
+### `SessionActionsMenu`
+
+```ts
+type SessionActionsMenuPropsV1 = {
+  sessionId: string
+  sessionUuid: string
+  hasForwardedPort: boolean
+  previewStatus: "inactive" | "starting" | "running" | "error" | "unavailable"
+  previewUrl?: string | null
+  previewError?: string | null
+  canMoveWorkspace: boolean
+  canDelete: boolean
+  inWorktree?: boolean | null
+}
+```
+
+Emits:
+
+- `botster.session.preview.toggle` with `{ sessionId, sessionUuid }`
+- `botster.session.preview.open` with `{ sessionId, sessionUuid, url }`
+- `botster.session.move.request` with `{ sessionId, sessionUuid }`
+- `botster.session.delete.request` with `{ sessionId, sessionUuid, inWorktree }`
+
+## Action Contract
+
+These action ids are the only user-intent events the phase-1 composites may emit.
+
+| Action id | Payload | Phase-1 adapter behavior |
+|---|---|---|
+| `botster.workspace.toggle` | `{ workspaceId }` | local UI state only |
+| `botster.workspace.rename.request` | `{ workspaceId, currentName }` | open rename UI, then call `hub.renameWorkspace` |
+| `botster.session.select` | `{ sessionId, sessionUuid }` | navigate/select, then call `hub.selectAgent` |
+| `botster.session.preview.toggle` | `{ sessionId, sessionUuid }` | call `hub.toggleHostedPreview(sessionUuid)` |
+| `botster.session.preview.open` | `{ sessionId, sessionUuid, url }` | browser navigation only |
+| `botster.session.move.request` | `{ sessionId, sessionUuid }` | open move UI, then call `hub.moveAgentWorkspace` |
+| `botster.session.delete.request` | `{ sessionId, sessionUuid, inWorktree }` | open delete UI, then call `hub.deleteAgent` |
+
+Rules:
+
+- action ids are semantic Botster events, not DOM event names
+- local UI actions and hub-routed actions share one action envelope shape
+- phase 1 may still open Rails-owned modals or prompts for rename, move, and delete
+
+## Density Model
+
+The sidebar and main panel must share component logic and differ only by density.
+
+Allowed densities in `v1`:
+
+- `sidebar` — compact row height, hover-revealed actions, tighter typography
+- `panel` — larger card-like row layout, always-present affordances where appropriate
+
+Any variant beyond those two is out of scope for `v1`.
+
+## Why Composites Stay Internal In Phase 1
+
+`WorkspaceGroup`, `SessionRow`, and the preview/menu composites encode a lot of current product behavior:
+
+- session naming fallback rules
+- activity indicator derivation
+- accessory-vs-agent affordances
+- hosted preview state mapping
+- action availability rules
+
+That behavior is still moving. Freezing it into the Lua contract before the React island lands would lock Botster into premature APIs. The public `v1` Lua surface should therefore stop at primitives, while phase 1 uses internal composites as the migration bridge.
 
 ## Acceptance Criteria For Phase 1
 
-- Agent/workspace UI no longer depends on cloned HTML templates for row rendering
-- Preview indicator, actions menu, and error strip render from a normalized React state model
-- Sidebar and main panel share row logic
-- Preview enable/disable state updates render correctly without manual DOM bookkeeping
-- Rails continues to own the page shell
-- CLI continues to send structured state, not HTML
+- the agent/workspace UI no longer depends on cloned HTML templates for row rendering
+- sidebar and main panel share the same row/group logic with density variants
+- hosted preview indicator, preview error state, and actions menu render from normalized state
+- hub transport remains structured state, not HTML
+- Rails continues to own the page shell and primitive registry
+- the action vocabulary above is sufficient to reproduce the current session/workspace behavior
 
-## First Concrete Deliverable
+## Immediate Implementation Sequence
 
-Before any runtime work starts, produce a versioned inventory of supported web primitives and phase-1 composites:
+1. Build the React island adapter around `AgentWorkspaceSurfaceInputV1`
+2. Normalize state into `AgentWorkspaceStoreV1`
+3. Implement the internal composites above in `sidebar` and `panel` densities
+4. Map the action ids above onto the existing hub transport methods
+5. Remove template cloning from `agent_list_controller.js`
 
-- foundation primitives
-- content primitives
-- action primitives
-- form primitives
-- navigation/list primitives
-- Botster-specific composites
-
-That inventory is the first real contract. Everything else should build on it.
+The next contract after this one is not "more React." It is a separate spec for when the Lua-authored node tree becomes public beyond the internal phase-1 adapter.

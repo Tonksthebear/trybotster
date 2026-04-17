@@ -362,6 +362,7 @@ end
 function Hub:create_agent(issue_or_branch, prompt, profile, workspace_id, workspace_name, target)
     if self._is_local then
         local agents_handler = require("handlers.agents")
+        local ClientSessionPayload = require("lib.client_session_payload")
         local metadata = target and require("lib.target_context").with_metadata(nil, target) or nil
         if workspace_id or workspace_name then
             metadata = metadata or {}
@@ -372,7 +373,7 @@ function Hub:create_agent(issue_or_branch, prompt, profile, workspace_id, worksp
             issue_or_branch, prompt, nil, nil, profile, metadata, target
         )
         if agent then
-            return agent:info()
+            return ClientSessionPayload.build(agent, Agent.all_info())
         elseif err then
             error(err)
         else
@@ -575,6 +576,7 @@ end
 function Hub:update_session(agent_id, fields)
     if self._is_local then
         local session = Agent.get(agent_id)
+        local ClientSessionPayload = require("lib.client_session_payload")
         if not session then
             error(string.format("Hub:update_session: session '%s' not found", tostring(agent_id)))
         end
@@ -588,7 +590,7 @@ function Hub:update_session(agent_id, fields)
             session:update(allowed)
         end
 
-        return session:info()
+        return ClientSessionPayload.build(session, Agent.all_info())
     end
 
     local result = hub_client.request(self._conn_id, {
@@ -652,7 +654,7 @@ end
 -- @return array of agent info tables
 function Hub:agent_list()
     if self._is_local then
-        return Agent.all_info()
+        return require("lib.client_session_payload").build_many(Agent.all_info())
     end
 
     local result = hub_client.request(self._conn_id, {

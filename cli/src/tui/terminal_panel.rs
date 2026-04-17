@@ -596,7 +596,10 @@ mod tests {
 
         panel.scroll_up(3);
         let original_offset = panel.scroll_offset();
-        assert!(original_offset > 0, "precondition: viewport should be scrolled");
+        assert!(
+            original_offset > 0,
+            "precondition: viewport should be scrolled"
+        );
 
         for i in 20..25 {
             panel.on_output(format!("line {i}\r\n").as_bytes());

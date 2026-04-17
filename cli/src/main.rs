@@ -194,6 +194,7 @@ fn run_headless() -> Result<()> {
     flag::register(SIGINT, Arc::clone(&SHUTDOWN_FLAG))?;
     flag::register(SIGTERM, Arc::clone(&SHUTDOWN_FLAG))?;
     flag::register(SIGHUP, Arc::clone(&SHUTDOWN_FLAG))?;
+    botster::shutdown::spawn(Arc::clone(&SHUTDOWN_FLAG));
 
     // Create Hub with default terminal size (80x24 for headless)
     let config = Config::load()?;
@@ -284,6 +285,7 @@ fn run_with_tui() -> Result<()> {
     flag::register(SIGINT, Arc::clone(&SHUTDOWN_FLAG))?;
     flag::register(SIGTERM, Arc::clone(&SHUTDOWN_FLAG))?;
     flag::register(SIGHUP, Arc::clone(&SHUTDOWN_FLAG))?;
+    botster::shutdown::spawn(Arc::clone(&SHUTDOWN_FLAG));
 
     // Create Hub BEFORE entering raw mode so errors are visible
     println!("Initializing hub...");
@@ -753,6 +755,7 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
         flag::register(SIGINT, Arc::clone(&SHUTDOWN_FLAG))?;
         flag::register(SIGTERM, Arc::clone(&SHUTDOWN_FLAG))?;
     }
+    botster::shutdown::spawn(Arc::clone(&SHUTDOWN_FLAG));
 
     // Spawn TUI thread
     let tui_handle = std::thread::Builder::new()

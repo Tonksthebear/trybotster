@@ -1676,6 +1676,20 @@ where
             log::debug!("[TUI] Bridge reconnected: reset to attach-like state");
         }
 
+        if event_type == "terminal_attach" {
+            let session_uuid = msg
+                .get("session_uuid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let state = msg.get("state").and_then(|v| v.as_str()).unwrap_or("");
+            log::debug!(
+                "[TUI] terminal_attach session={} state={}",
+                session_uuid,
+                state
+            );
+            return;
+        }
+
         // Handle focus_reporting_changed — PTY toggled focus reporting mode.
         // When newly enabled and the session is focused, send immediate focus state.
         if event_type == "focus_reporting_changed" {

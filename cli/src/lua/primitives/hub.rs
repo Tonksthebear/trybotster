@@ -447,13 +447,11 @@ pub(crate) fn register(
     hub.set("update_manifest_workspaces", update_ws_fn)
         .map_err(|e| anyhow!("Failed to set hub.update_manifest_workspaces: {e}"))?;
 
-    // hub.session_socket_exists(session_uuid) — check if a session socket file exists.
+    // hub.session_socket_exists(session_uuid) — check if a session transport looks live.
     // Used by close() to avoid marking "closed" when the session process is still alive.
     let session_socket_fn = lua
         .create_function(|_, session_uuid: String| {
-            let exists = crate::session::session_socket_path(&session_uuid)
-                .map(|p| p.exists())
-                .unwrap_or(false);
+            let exists = crate::session::session_process_is_live(&session_uuid);
             Ok(exists)
         })
         .map_err(|e| anyhow!("Failed to create hub.session_socket_exists function: {e}"))?;

@@ -8,6 +8,7 @@
 
 local state = require("hub.state")
 local Agent = require("lib.agent")
+local ClientSessionPayload = require("lib.client_session_payload")
 local Session = require("lib.session")
 local pty_clients = require("lib.pty_clients")
 local AgentListPayload = require("lib.agent_list_payload")
@@ -189,10 +190,11 @@ hooks.on("agent_created", "broadcast_agent_created", function(info)
     if Session.is_system_session(info) then
         return
     end
+    local payload = ClientSessionPayload.build(info, Agent.all_info())
     log.info(string.format("Broadcasting agent_created: %s",
-        info.id or info.session_uuid or "?"))
+        payload.id or payload.session_uuid or "?"))
 
-    broadcast_hub_event("agent_created", { agent = info })
+    broadcast_hub_event("agent_created", { agent = payload })
     broadcast_hub_event("agent_list", { agents = Agent.all_info() })
     broadcast_workspace_list()
 

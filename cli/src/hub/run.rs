@@ -230,6 +230,34 @@ pub(crate) fn run_event_loop(
                 _ = tokio::time::sleep(SHUTDOWN_POLL_INTERVAL) => {}
             }
 
+            // Fairness drain: biased select above keeps hub_event last.
+            // Under sustained load on higher-priority arms (typically
+            // webrtc_pty_output), hub events (cleanup ticks, lifecycle,
+            // shutdown propagation from hub.quit) can go unserved. Drain
+            // a small bounded batch inline after each select iteration so
+            // hub events make progress even when a high-volume arm is hot.
+            //
+            // A tight bound keeps iteration latency predictable for the
+            // keystroke fast path; 4 is small enough to be invisible and
+            // large enough that a backlog clears quickly across iterations.
+            const FAIRNESS_DRAIN_LIMIT: usize = 4;
+            if let Some(ref mut rx) = hub_event_rx {
+                for _ in 0..FAIRNESS_DRAIN_LIMIT {
+                    match rx.try_recv() {
+                        Ok(event) => {
+                            let kind = event.kind();
+                            let bytes = event.approx_size_bytes();
+                            hub.hub_event_metrics.record_dequeue(kind, bytes);
+                            let started_at = Instant::now();
+                            hub.handle_hub_event(event);
+                            hub.hub_event_metrics
+                                .record_handler_time(kind, started_at.elapsed());
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+
             // Check shutdown conditions
             if hub.quit || shutdown_flag.load(Ordering::SeqCst) {
                 break;
