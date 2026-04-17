@@ -307,32 +307,51 @@ function Session._init(self, config)
             end
         end
 
-        -- Standalone session: allocate an anonymous orchestration workspace.
+        -- Standalone session: reuse the default active workspace for this
+        -- branch/target instead of minting a fresh anonymous workspace ID.
         if not workspace_id then
             if not workspace_name or workspace_name == "" then
                 workspace_name = default_workspace_name(config.branch_name)
             end
-            workspace_id = ws.generate_workspace_id()
-            local anon_manifest = {
-                id         = workspace_id,
-                name       = workspace_name,
-                target_id  = self.target_id,
-                target_path = self.target_path,
-                target_repo = self.target_repo,
-                status     = "active",
-                created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
-                updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
-                metadata   = {},
-            }
-            pcall(ws.write_workspace, data_dir, workspace_id, anon_manifest)
-            pcall(function()
-                local hooks_mod = require("hub.hooks")
-                hooks_mod.notify("workspace_created", {
-                    workspace_id = workspace_id,
+            local ok_ws, ws_id, ws_err = pcall(function()
+                local id, _, _, err = ws.ensure_workspace(data_dir, {
                     name = workspace_name,
-                    manifest = anon_manifest,
+                    target_id = self.target_id,
+                    target_path = self.target_path,
+                    target_repo = self.target_repo,
+                    metadata = self._workspace_metadata,
+                    created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
+                    expect_new = false,
                 })
+                return id, err
             end)
+            if ok_ws and ws_id then
+                workspace_id = ws_id
+            else
+                log.warn(string.format("Failed to ensure default workspace manifest: %s",
+                    tostring(ws_err or ws_id)))
+                workspace_id = ws.generate_workspace_id()
+                local anon_manifest = {
+                    id         = workspace_id,
+                    name       = workspace_name,
+                    target_id  = self.target_id,
+                    target_path = self.target_path,
+                    target_repo = self.target_repo,
+                    status     = "active",
+                    created_at = os.date("!%Y-%m-%dT%H:%M:%SZ", self.created_at),
+                    updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time()),
+                    metadata   = {},
+                }
+                pcall(ws.write_workspace, data_dir, workspace_id, anon_manifest)
+                pcall(function()
+                    local hooks_mod = require("hub.hooks")
+                    hooks_mod.notify("workspace_created", {
+                        workspace_id = workspace_id,
+                        name = workspace_name,
+                        manifest = anon_manifest,
+                    })
+                end)
+            end
         end
 
         self._workspace_id = workspace_id
