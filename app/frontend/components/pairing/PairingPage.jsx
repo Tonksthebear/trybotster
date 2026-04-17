@@ -249,7 +249,7 @@ export default function PairingPage({ hubId, redirectUrl }) {
 
         {/* Ready state — bundle parsed, awaiting confirmation */}
         {store.status === 'ready' && (
-          <div data-testid="pairing-ready">
+          <div data-testid="pairing-ready" data-pairing-target="ready">
             <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-6 mb-6">
               <div className="space-y-4">
                 <div className="flex items-start gap-3">
@@ -276,7 +276,12 @@ export default function PairingPage({ hubId, redirectUrl }) {
             </div>
 
             <div className="flex gap-3">
-              <Button color="indigo" className="flex-1" onClick={handlePair}>
+              <Button
+                color="indigo"
+                className="flex-1"
+                onClick={handlePair}
+                data-action="pairing#pair"
+              >
                 <ShieldCheckIcon data-slot="icon" className="size-5" />
                 Complete Pairing
               </Button>
@@ -300,7 +305,11 @@ export default function PairingPage({ hubId, redirectUrl }) {
 
         {/* Success state */}
         {store.status === 'success' && (
-          <div data-testid="pairing-success" className="bg-emerald-500/10 border border-emerald-500/20 rounded-lg p-8 text-center">
+          <div
+            data-testid="pairing-success"
+            data-pairing-target="success"
+            className="bg-emerald-500/10 border border-emerald-500/20 rounded-lg p-8 text-center"
+          >
             <div className="inline-flex items-center justify-center w-12 h-12 bg-emerald-500/10 rounded-xl mb-4">
               <CheckIcon className="w-6 h-6 text-emerald-400" />
             </div>
