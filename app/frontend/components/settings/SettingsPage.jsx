@@ -91,6 +91,7 @@ export default function SettingsPage({
         )}
         {activeTab === 'hub' && (
           <HubInfoPanel
+            hubId={hubId}
             hubName={hubName}
             hubIdentifier={hubIdentifier}
             hubSettingsPath={hubSettingsPath}

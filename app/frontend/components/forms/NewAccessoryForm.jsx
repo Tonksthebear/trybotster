@@ -5,6 +5,7 @@ import { Select } from '../catalyst/select'
 import { Button } from '../catalyst/button'
 import { useDialogStore } from '../../store/dialog-store'
 import { getHub } from '../../lib/hub-bridge'
+import WorkspacePicker from './WorkspacePicker'
 
 export default function NewAccessoryForm({ hubId }) {
   const { activeDialog, context, close } = useDialogStore()
@@ -18,7 +19,8 @@ export default function NewAccessoryForm({ hubId }) {
 
   const [selectedTargetId, setSelectedTargetId] = useState('')
   const [selectedAccessory, setSelectedAccessory] = useState(null)
-  const [selectedWorkspace, setSelectedWorkspace] = useState('')
+  // { id: string|null, name: string|null } | null
+  const [workspaceChoice, setWorkspaceChoice] = useState(null)
 
   // Subscribe to hub data
   useEffect(() => {
@@ -76,7 +78,7 @@ export default function NewAccessoryForm({ hubId }) {
     if (!open) {
       setSelectedTargetId('')
       setSelectedAccessory(null)
-      setSelectedWorkspace('')
+      setWorkspaceChoice(null)
       setAccessories([])
     }
   }, [open])
@@ -103,23 +105,15 @@ export default function NewAccessoryForm({ hubId }) {
     const hub = getHub(hubId)
     if (!hub) return
 
-    const workspace = selectedWorkspace
-      ? workspaces.find((ws) => ws?.id === selectedWorkspace) || { id: selectedWorkspace, name: null }
-      : null
-
     hub.createAccessory(
       selectedAccessory,
-      workspace?.id || null,
-      workspace?.name || null,
+      workspaceChoice?.id || null,
+      workspaceChoice?.name || null,
       selectedTargetId
     )
 
     close()
   }
-
-  const filteredWorkspaces = workspaces.filter(
-    (ws) => ws && typeof ws === 'object' && ws.id
-  )
 
   const targetPrompt = selectedTargetId
     ? 'Spawn target selected. Now choose an accessory configuration.'
@@ -190,19 +184,15 @@ export default function NewAccessoryForm({ hubId }) {
         )}
 
         {/* Workspace */}
-        {selectedTargetId && filteredWorkspaces.length > 0 && (
-          <Field className="mt-6">
-            <Label>Workspace</Label>
-            <Select value={selectedWorkspace} onChange={(e) => setSelectedWorkspace(e.target.value)}>
-              <option value="">None</option>
-              {filteredWorkspaces.map((ws) => (
-                <option key={ws.id} value={ws.id}>
-                  {ws.name || ws.id}
-                </option>
-              ))}
-            </Select>
-            <Description>Optionally assign this accessory to a workspace.</Description>
-          </Field>
+        {selectedTargetId && (
+          <div className="mt-6">
+            <WorkspacePicker
+              workspaces={workspaces}
+              value={workspaceChoice}
+              onChange={setWorkspaceChoice}
+              description="Group this accessory with agents in a workspace, or leave as Default."
+            />
+          </div>
         )}
       </DialogBody>
 

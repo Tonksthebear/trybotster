@@ -2,6 +2,13 @@ import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { Field, Label, Description } from '../catalyst/fieldset'
 import { Input } from '../catalyst/input'
 import { Button } from '../catalyst/button'
+import {
+  Dialog,
+  DialogTitle,
+  DialogDescription,
+  DialogBody,
+  DialogActions,
+} from '../catalyst/dialog'
 import { getHub } from '../../lib/hub-bridge'
 
 function normalizePath(path) {
@@ -62,42 +69,63 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
   const [pathSuggestions, setPathSuggestions] = useState([])
   const [feedback, setFeedback] = useState({ message: '', tone: 'neutral' })
 
+  const [renameTargetId, setRenameTargetId] = useState(null)
+  const [renameValue, setRenameValue] = useState('')
+
   const browseTokenRef = useRef(0)
   const browseTimerRef = useRef(null)
 
   useEffect(() => {
     if (!hubId) return
 
-    const hub = getHub(hubId)
-    if (!hub) return
-
+    let cancelled = false
+    let pollId = null
     const unsubs = []
 
-    const rawTargets = hub.spawnTargets.current()
-    setTargets(rawTargets.map(normalizeTarget))
-    hub.spawnTargets.load().catch(() => {})
+    function attach(hub) {
+      if (cancelled) return
+      const rawTargets = hub.spawnTargets.current()
+      setTargets(rawTargets.map(normalizeTarget))
+      hub.spawnTargets.load().catch(() => {})
 
-    unsubs.push(
-      hub.spawnTargets.onChange((raw) => {
-        const normalized = (Array.isArray(raw) ? raw : []).map(normalizeTarget)
-        setTargets(normalized)
-        setSelectedTargetId((prev) => {
-          if (normalized.some((t) => t.id === prev)) return prev
-          return normalized[0]?.id || ''
+      unsubs.push(
+        hub.spawnTargets.onChange((raw) => {
+          const normalized = (Array.isArray(raw) ? raw : []).map(normalizeTarget)
+          setTargets(normalized)
+          setSelectedTargetId((prev) => {
+            if (normalized.some((t) => t.id === prev)) return prev
+            return normalized[0]?.id || ''
+          })
         })
-      })
-    )
+      )
 
-    unsubs.push(
-      hub.on('spawnTargetFeedback', ({ tone, message }) => {
-        setFeedback({
-          message,
-          tone: tone === 'error' ? 'error' : tone === 'success' ? 'success' : 'neutral',
+      unsubs.push(
+        hub.on('spawnTargetFeedback', ({ tone, message }) => {
+          setFeedback({
+            message,
+            tone: tone === 'error' ? 'error' : tone === 'success' ? 'success' : 'neutral',
+          })
         })
-      })
-    )
+      )
+    }
+
+    const hub = getHub(hubId)
+    if (hub) {
+      attach(hub)
+    } else {
+      pollId = setInterval(() => {
+        const h = getHub(hubId)
+        if (h) {
+          clearInterval(pollId)
+          pollId = null
+          attach(h)
+        }
+      }, 200)
+    }
 
     return () => {
+      cancelled = true
+      if (pollId) clearInterval(pollId)
       unsubs.forEach((unsub) => unsub())
       if (browseTimerRef.current) clearTimeout(browseTimerRef.current)
     }
@@ -175,18 +203,33 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
     hub.removeSpawnTarget(targetId)
   }
 
-  function renameTarget(targetId, currentName) {
-    const input = window.prompt('Rename spawn target:', currentName || '')
-    if (input === null) return
-    const newName = input.trim()
-    if (!newName || newName === currentName) return
+  function openRenameDialog(targetId, currentName) {
+    setRenameTargetId(targetId)
+    setRenameValue(currentName || '')
+  }
+
+  function closeRenameDialog() {
+    setRenameTargetId(null)
+    setRenameValue('')
+  }
+
+  function confirmRename() {
+    if (!renameTargetId) return
+    const target = targets.find((t) => t.id === renameTargetId)
+    const newName = renameValue.trim()
+    if (!newName || newName === target?.name) {
+      closeRenameDialog()
+      return
+    }
 
     const hub = getHub(hubId)
     if (!hub) {
       setFeedback({ message: 'Hub is not ready yet.', tone: 'error' })
+      closeRenameDialog()
       return
     }
-    hub.renameSpawnTarget(targetId, newName)
+    hub.renameSpawnTarget(renameTargetId, newName)
+    closeRenameDialog()
   }
 
   const visibleTargets = targets.filter((target) => {
@@ -294,7 +337,7 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
                 <div className="flex items-center gap-3">
                   <button
                     type="button"
-                    onClick={() => renameTarget(target.id, target.name)}
+                    onClick={() => openRenameDialog(target.id, target.name)}
                     className="text-xs text-zinc-500 hover:text-zinc-200 transition-colors"
                   >
                     Rename
@@ -329,6 +372,30 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
           </p>
         </div>
       )}
+
+      <Dialog open={renameTargetId !== null} onClose={closeRenameDialog} size="sm">
+        <DialogTitle>Rename spawn target</DialogTitle>
+        <DialogDescription>
+          Choose a new display name. The directory path stays the same.
+        </DialogDescription>
+        <DialogBody>
+          <Field>
+            <Label>Name</Label>
+            <Input
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && confirmRename()}
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </Field>
+        </DialogBody>
+        <DialogActions>
+          <Button plain onClick={closeRenameDialog}>Cancel</Button>
+          <Button onClick={confirmRename}>Rename</Button>
+        </DialogActions>
+      </Dialog>
     </div>
   )
 }

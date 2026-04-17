@@ -6,6 +6,7 @@ import { Select } from '../catalyst/select'
 import { Button } from '../catalyst/button'
 import { useDialogStore } from '../../store/dialog-store'
 import { getHub } from '../../lib/hub-bridge'
+import WorkspacePicker from './WorkspacePicker'
 
 export default function NewAgentForm({ hubId }) {
   const { activeDialog, context, close } = useDialogStore()
@@ -28,7 +29,8 @@ export default function NewAgentForm({ hubId }) {
   const [newBranchInput, setNewBranchInput] = useState('')
   const [promptInput, setPromptInput] = useState('')
   const [selectedAgent, setSelectedAgent] = useState('')
-  const [selectedWorkspace, setSelectedWorkspace] = useState('')
+  // { id: string|null, name: string|null } | null
+  const [workspaceChoice, setWorkspaceChoice] = useState(null)
 
   // Subscribe to hub data when dialog opens
   useEffect(() => {
@@ -103,7 +105,7 @@ export default function NewAgentForm({ hubId }) {
       setNewBranchInput('')
       setPromptInput('')
       setSelectedAgent('')
-      setSelectedWorkspace('')
+      setWorkspaceChoice(null)
       setSelectedTargetId('')
       setWorktrees([])
       setAgents([])
@@ -179,7 +181,6 @@ export default function NewAgentForm({ hubId }) {
 
     const prompt = promptInput.trim() || null
     const agentName = selectedAgent || null
-    const workspace = resolveWorkspace()
 
     if (pendingSelection.type === 'existing') {
       hub.send('reopen_worktree', {
@@ -188,16 +189,16 @@ export default function NewAgentForm({ hubId }) {
         prompt,
         agent_name: agentName,
         target_id: selectedTargetId,
-        workspace_id: workspace?.id || null,
-        workspace_name: workspace?.name || null,
+        workspace_id: workspaceChoice?.id || null,
+        workspace_name: workspaceChoice?.name || null,
       })
     } else if (pendingSelection.type === 'main') {
       hub.send('create_agent', {
         prompt,
         agent_name: agentName,
         target_id: selectedTargetId,
-        workspace_id: workspace?.id || null,
-        workspace_name: workspace?.name || null,
+        workspace_id: workspaceChoice?.id || null,
+        workspace_name: workspaceChoice?.name || null,
       })
     } else {
       hub.send('create_agent', {
@@ -205,22 +206,13 @@ export default function NewAgentForm({ hubId }) {
         prompt,
         agent_name: agentName,
         target_id: selectedTargetId,
-        workspace_id: workspace?.id || null,
-        workspace_name: workspace?.name || null,
+        workspace_id: workspaceChoice?.id || null,
+        workspace_name: workspaceChoice?.name || null,
       })
     }
 
     close()
   }
-
-  function resolveWorkspace() {
-    if (!selectedWorkspace) return null
-    return workspaces.find((ws) => ws?.id === selectedWorkspace) || { id: selectedWorkspace, name: null }
-  }
-
-  const filteredWorkspaces = workspaces.filter(
-    (ws) => ws && typeof ws === 'object' && ws.id
-  )
 
   const targetPrompt = selectedTargetId
     ? 'Spawn target selected. Now choose main, an existing worktree, or a new branch.'
@@ -387,20 +379,12 @@ export default function NewAgentForm({ hubId }) {
             )}
 
             {/* Workspace */}
-            {filteredWorkspaces.length > 0 && (
-              <Field>
-                <Label>Workspace</Label>
-                <Select value={selectedWorkspace} onChange={(e) => setSelectedWorkspace(e.target.value)}>
-                  <option value="">None</option>
-                  {filteredWorkspaces.map((ws) => (
-                    <option key={ws.id} value={ws.id}>
-                      {ws.name || ws.id}
-                    </option>
-                  ))}
-                </Select>
-                <Description>Optionally assign this agent to a workspace.</Description>
-              </Field>
-            )}
+            <WorkspacePicker
+              workspaces={workspaces}
+              value={workspaceChoice}
+              onChange={setWorkspaceChoice}
+              description="Group this agent with others in a workspace, or leave as Default."
+            />
 
             {/* Initial prompt */}
             <Field>

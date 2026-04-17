@@ -12,6 +12,7 @@ import {
 import { Input } from '../catalyst/input'
 import { Field, Label, Description } from '../catalyst/fieldset'
 import { Text } from '../catalyst/text'
+import SpawnTargetBrowser from '../forms/SpawnTargetBrowser'
 
 // ─── Hub Identity Form ─────────────────────────────────────────────
 
@@ -83,6 +84,24 @@ function HubIdentityForm({ hubName, hubIdentifier, hubSettingsPath, hubPath }) {
           </Button>
         </div>
       </form>
+    </div>
+  )
+}
+
+// ─── Spawn Targets ─────────────────────────────────────────────────
+
+function SpawnTargetsPanel({ hubId }) {
+  return (
+    <div className="border border-zinc-800 rounded-lg">
+      <div className="px-4 py-3 border-b border-zinc-800">
+        <h2 className="text-sm font-medium text-zinc-400">Spawn Targets</h2>
+        <Text className="!text-xs mt-0.5">
+          Directories where this hub can spawn sessions. Managed on the hub device.
+        </Text>
+      </div>
+      <div className="px-4 py-4">
+        <SpawnTargetBrowser hubId={hubId} />
+      </div>
     </div>
   )
 }
@@ -205,6 +224,7 @@ function DangerZone({ hubSettingsPath, hubName }) {
 // ─── Main Component ────────────────────────────────────────────────
 
 export default function HubInfoPanel({
+  hubId,
   hubName,
   hubIdentifier,
   hubSettingsPath,
@@ -218,6 +238,7 @@ export default function HubInfoPanel({
         hubSettingsPath={hubSettingsPath}
         hubPath={hubPath}
       />
+      <SpawnTargetsPanel hubId={hubId} />
       <HubControls />
       <DangerZone hubSettingsPath={hubSettingsPath} hubName={hubName} />
     </div>

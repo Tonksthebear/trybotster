@@ -45,6 +45,7 @@
 
 config/github_app_private_key.pem
 mise.toml
+.mise.toml
 .agents/
 
 # macOS files

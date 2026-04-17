@@ -1,50 +1,21 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React from 'react'
 import { useLocation } from 'react-router-dom'
 import TerminalView from './TerminalView'
 
-const MAX_CACHED = 5
-
-/**
- * Keeps terminal sessions alive across route changes within a hub.
- * LRU eviction: when more than MAX_CACHED terminals have been visited,
- * the least-recently-used one is removed (unmounted, transport torn down).
- */
+// Mounts exactly the TerminalView for the current route's session uuid.
+// Switching sessions unmounts the previous view, which tears down its
+// Restty instance and closes its multiplexed stream subscription —
+// trading fast switch-back for much lower memory footprint.
 export default function TerminalCache({ hubId }) {
   const location = useLocation()
-  // Ordered array: most-recently-used last
-  const [order, setOrder] = useState([])
-
   const match = location.pathname.match(/\/hubs\/[^/]+\/sessions\/([^/]+)/)
-  const activeSessionUuid = match ? match[1] : null
+  const sessionUuid = match ? match[1] : null
 
-  useEffect(() => {
-    if (!activeSessionUuid) return
-
-    setOrder((prev) => {
-      // Move to end (most recent)
-      const without = prev.filter((id) => id !== activeSessionUuid)
-      const next = [...without, activeSessionUuid]
-      // Evict LRU if over limit
-      if (next.length > MAX_CACHED) {
-        return next.slice(next.length - MAX_CACHED)
-      }
-      return next
-    })
-  }, [activeSessionUuid])
-
-  if (order.length === 0) return null
+  if (!sessionUuid) return null
 
   return (
-    <>
-      {order.map((uuid) => (
-        <div
-          key={uuid}
-          className="absolute inset-0 z-10"
-          style={{ display: uuid === activeSessionUuid ? 'block' : 'none' }}
-        >
-          <TerminalView hubId={hubId} sessionUuid={uuid} />
-        </div>
-      ))}
-    </>
+    <div className="absolute inset-0 z-10">
+      <TerminalView key={sessionUuid} hubId={hubId} sessionUuid={sessionUuid} />
+    </div>
   )
 }

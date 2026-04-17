@@ -924,7 +924,8 @@ function constrainGlyphBox(glyph, constraint, metrics, constraintWidth) {
       heightFactor = Math.max(1, singleScale);
       widthFactor = heightFactor;
     }
-  } else if (sizeMode === "stretch") {} else {
+  } else if (sizeMode === "stretch") {
+  } else {
     widthFactor = 1;
     heightFactor = 1;
   }
@@ -12740,8 +12741,10 @@ function handleOscSequence(seq, handlers) {
         try {
           const encoded = encodeBase64Bytes(bytes2);
           handlers.sendReply(`\x1B]52;${target};${encoded}\x07`);
-        } catch {}
-      }).catch(() => {});
+        } catch {
+        }
+      }).catch(() => {
+      });
       return true;
     }
     if (!handlers.onClipboardWrite)
@@ -12749,9 +12752,11 @@ function handleOscSequence(seq, handlers) {
     let bytes = new Uint8Array(0);
     try {
       bytes = decodeBase64Bytes(payload);
-    } catch {}
+    } catch {
+    }
     const text = textDecoder3.decode(bytes);
-    Promise.resolve(handlers.onClipboardWrite(text)).catch(() => {});
+    Promise.resolve(handlers.onClipboardWrite(text)).catch(() => {
+    });
     return true;
   }
   const param = parts[1];
@@ -13170,7 +13175,8 @@ class OutputFilter {
 function createInputHandler(options = {}) {
   const config = options.config || {};
   const cursorProvider = options.getCursorPosition || (() => ({ row: 1, col: 1 }));
-  const replySink = options.sendReply || (() => {});
+  const replySink = options.sendReply || (() => {
+  });
   const positionToCell = options.positionToCell || (() => ({ row: 0, col: 0 }));
   const positionToPixel = options.positionToPixel || null;
   const mouse = new MouseController({
@@ -13585,7 +13591,8 @@ async function tryFetchFontBuffer(url) {
     const response = await fetch(url);
     if (response.ok)
       return response.arrayBuffer();
-  } catch {}
+  } catch {
+  }
   return null;
 }
 async function tryLocalFontBuffer(matchers) {
@@ -13603,7 +13610,8 @@ async function tryLocalFontBuffer(matchers) {
       const status = await queryPermission({ name: "local-fonts" });
       if (status?.state === "denied")
         return null;
-    } catch {}
+    } catch {
+    }
   }
   try {
     const fonts = await queryLocalFonts();
@@ -18636,7 +18644,8 @@ function connectPty(state2, options, callbacks) {
     if (state2.connectId !== connectId) {
       try {
         ws.close();
-      } catch {}
+      } catch {
+      }
       return;
     }
     if (state2.socket !== ws)
@@ -18749,7 +18758,8 @@ function handleServerMessage(payload, callbacks) {
       callbacks.onExit?.(msg.code ?? 0);
       return true;
     }
-  } catch {}
+  } catch {
+  }
   return false;
 }
 function isPtyConnected(state2) {
@@ -30872,7 +30882,8 @@ function createSplitDividerFactory(options) {
         return;
       try {
         divider.releasePointerCapture(splitResizeState.pointerId);
-      } catch {}
+      } catch {
+      }
       divider.removeEventListener("pointermove", onPointerMove);
       divider.removeEventListener("pointerup", onPointerEnd);
       divider.removeEventListener("pointercancel", onPointerEnd);
@@ -32939,7 +32950,8 @@ function aQ($) {
   }
   $.error = "ELSE: missing EIF";
 }
-function tQ($) {}
+function tQ($) {
+}
 function eQ($) {
   let Q = $.stack[--$.stackTop];
   if (Q === undefined) {
@@ -41007,7 +41019,8 @@ async function a_($) {
     try {
       let Z = new DecompressionStream("brotli"), q = new Blob([$.buffer]).stream().pipeThrough(Z), J = await new Response(q).arrayBuffer();
       return new Uint8Array(J);
-    } catch {}
+    } catch {
+    }
   let { decompress: Q } = await Promise.resolve().then(() => (zJ(), XJ));
   return Q($);
 }
@@ -47184,7 +47197,8 @@ class p1 {
             let W = Q.slice(U.offset, U.length), H = V5(W);
             q.fullName = x6(H, u6.FullName) ?? undefined, q.family = x6(H, u6.FontFamily) ?? undefined, q.subfamily = x6(H, u6.FontSubfamily) ?? undefined, q.postScriptName = x6(H, u6.PostScriptName) ?? undefined;
           }
-        } catch {}
+        } catch {
+        }
       $.push(q);
     }
     return this.namesCache = $, $;
@@ -54647,7 +54661,8 @@ function openLink(uri) {
     const win = window.open(url.toString(), "_blank", "noopener,noreferrer");
     if (win)
       win.opener = null;
-  } catch {}
+  } catch {
+  }
 }
 function sourceLabelFromUrl(url, index) {
   const trimmed = url.trim();
@@ -54941,7 +54956,8 @@ async function tryLoadLocalFontBuffer(matchers, label) {
       const status = await queryPermission({ name: LOCAL_FONTS_PERMISSION_NAME });
       if (status?.state === "denied")
         return null;
-    } catch {}
+    } catch {
+    }
   }
   try {
     const fonts = await queryLocalFonts();
@@ -55008,7 +55024,8 @@ async function parseFontFacesFromBuffer(buffer) {
           metadataLabel: info.fullName || info.family || info.postScriptName || undefined,
           index: info.index
         });
-      } catch {}
+      } catch {
+      }
     }
     return parsed;
   }
@@ -55063,7 +55080,8 @@ function createResttyFontResourceStore(options = {}) {
         }
         return buffer;
       }
-    } catch {}
+    } catch {
+    }
     return await urlByteCache.getStale(sourceKey);
   };
   const defaultLoadSourceBuffer = async (source, sourceKey) => {
@@ -56950,7 +56968,8 @@ function createShaderStageRuntime(options) {
     console.warn(text2);
     try {
       stage.onError?.(text2);
-    } catch {}
+    } catch {
+    }
   }
   function parseShaderStages(stages) {
     return sortShaderStages(normalizeShaderStages(cloneShaderStages(stages)));
@@ -56981,7 +57000,8 @@ function createShaderStageRuntime(options) {
     for (let i3 = 0;i3 < compiledWebGPUShaderStages.length; i3 += 1) {
       try {
         compiledWebGPUShaderStages[i3].uniformBuffer.destroy();
-      } catch {}
+      } catch {
+      }
     }
     compiledWebGPUShaderStages = [];
   }
@@ -57003,7 +57023,8 @@ function createShaderStageRuntime(options) {
       webgpuStageTargets.sceneTexture.destroy();
       webgpuStageTargets.pingTexture.destroy();
       webgpuStageTargets.pongTexture.destroy();
-    } catch {}
+    } catch {
+    }
     webgpuStageTargets = null;
   }
   function destroyWebGLStageTargets(state2) {
@@ -57260,9 +57281,18 @@ function createColorGlyphAtlasHelpers(options) {
       constrainedGlyphWidths: null
     };
   };
+  const destroy = () => {
+    if (colorGlyphCanvas) {
+      colorGlyphCanvas.width = 0;
+      colorGlyphCanvas.height = 0;
+    }
+    colorGlyphCtx = null;
+    colorGlyphCanvas = null;
+  };
   return {
     atlasBitmapToRGBA: atlasBitmapToRGBA2,
-    buildColorEmojiAtlasWithCanvas
+    buildColorEmojiAtlasWithCanvas,
+    destroy
   };
 }
 
@@ -58174,7 +58204,8 @@ function createPointerAuxHandlers(options) {
   const {
     inputHandler,
     shouldRoutePointerToAppMouse,
-    scrollViewportByWheel = () => {},
+    scrollViewportByWheel = () => {
+    },
     getWasmReady,
     getWasmHandle,
     getGridState,
@@ -58340,7 +58371,8 @@ function bindPointerEvents(options) {
     clearPendingDesktopSelection,
     tryActivatePendingTouchSelection,
     beginSelectionDrag,
-    scrollViewportByWheel = () => {},
+    scrollViewportByWheel = () => {
+    },
     normalizeSelectionCell: normalizeSelectionCell2,
     positionToCell: positionToCell2,
     scrollViewportByLines,
@@ -58634,17 +58666,23 @@ function createNativeScrollbarHost(options) {
   const { canvas, getGridState, noteScrollActivity, setViewportScrollOffset } = options;
   if (typeof document === "undefined") {
     return {
-      flash: () => {},
-      sync: () => {},
-      destroy: () => {}
+      flash: () => {
+      },
+      sync: () => {
+      },
+      destroy: () => {
+      }
     };
   }
   const parent = canvas.parentElement;
   if (!parent) {
     return {
-      flash: () => {},
-      sync: () => {},
-      destroy: () => {}
+      flash: () => {
+      },
+      sync: () => {
+      },
+      destroy: () => {
+      }
     };
   }
   ensureNativeScrollbarStyles();
@@ -59162,6 +59200,12 @@ function createRuntimeInteraction(options) {
     updateCanvasCursor();
     markNeedsRender();
   };
+  cleanupCanvasFns.push(() => {
+    clearPendingTouchSelection();
+    clearPendingDesktopSelection();
+    touchSelectionState.activePointerId = null;
+    touchSelectionState.panPointerId = null;
+  });
   const setPreedit2 = (text2, updateInput = false) => {
     imeState.preedit = text2 || "";
     if (imeInput && updateInput) {
@@ -59304,7 +59348,8 @@ function createKittyImageCache(options) {
     if (source && typeof source.close === "function") {
       try {
         source.close();
-      } catch {}
+      } catch {
+      }
     }
   };
   const decodeRawKittyImage = (placement, key, bytes) => {
@@ -59495,14 +59540,16 @@ function createKittyRenderRuntime(options) {
       return;
     try {
       entry.gl.deleteTexture(entry.texture);
-    } catch {}
+    } catch {
+    }
   };
   const releaseWebGPUTexture = (entry) => {
     if (!entry)
       return;
     try {
       entry.texture.destroy();
-    } catch {}
+    } catch {
+    }
   };
   const pruneWebGLTextures = (activeImageIds) => {
     for (const [imageId, entry] of webglTextures.entries()) {
@@ -59724,6 +59771,28 @@ function createKittyRenderRuntime(options) {
 function createLifecycleCanvasHandlers(deps) {
   let sizeRaf = 0;
   let savedCanvasState = null;
+  function destroyGlyphAtlases() {
+    const activeState = deps.getActiveState();
+    if (!activeState?.glyphAtlases)
+      return;
+    if ("gl" in activeState) {
+      for (const atlas of activeState.glyphAtlases.values()) {
+        try {
+          activeState.gl.deleteTexture(atlas.texture);
+        } catch {
+        }
+      }
+      activeState.glyphAtlases.clear();
+      return;
+    }
+    for (const atlas of activeState.glyphAtlases.values()) {
+      try {
+        atlas.texture.destroy();
+      } catch {
+      }
+    }
+    activeState.glyphAtlases.clear();
+  }
   function saveCanvasState() {
     const canvas = deps.getCanvas();
     savedCanvasState = {
@@ -59773,6 +59842,8 @@ function createLifecycleCanvasHandlers(deps) {
     const newCanvas = document.createElement("canvas");
     newCanvas.id = canvas.id;
     newCanvas.className = canvas.className;
+    canvas.width = 0;
+    canvas.height = 0;
     parent.replaceChild(newCanvas, canvas);
     deps.setCanvas(newCanvas);
     deps.setIsFocused(typeof document !== "undefined" ? document.activeElement === deps.getCanvas() : true);
@@ -59787,10 +59858,7 @@ function createLifecycleCanvasHandlers(deps) {
         entry.fontSizePx = 0;
       }
     }
-    const nextActiveState = deps.getActiveState();
-    if (nextActiveState && nextActiveState.glyphAtlases) {
-      nextActiveState.glyphAtlases.clear();
-    }
+    destroyGlyphAtlases();
     deps.setShaderStagesDirty(true);
   }
   function updateSize(force = false) {
@@ -61234,7 +61302,8 @@ function populateWebGLOverlays(ctx) {
       return shapeClusterWithFont(preeditEntry, value).advance * preeditScale;
     });
     const visiblePreeditText = fittedPreedit.text;
-    if (!visiblePreeditText) {} else {
+    if (!visiblePreeditText) {
+    } else {
       const shaped = shapeClusterWithFont(preeditEntry, visiblePreeditText);
       noteColorGlyphText(preeditEntry, visiblePreeditText, shaped);
       const glyphSet = getGlyphSet(preeditFontIndex);
@@ -63251,6 +63320,28 @@ function createFontRuntimeGridHelpers(options) {
     markSearchDirty,
     shapeClusterWithFont
   } = options;
+  function destroyGlyphAtlases() {
+    const activeState = getActiveState();
+    if (!activeState?.glyphAtlases)
+      return;
+    if ("gl" in activeState) {
+      for (const atlas of activeState.glyphAtlases.values()) {
+        try {
+          activeState.gl.deleteTexture(atlas.texture);
+        } catch {
+        }
+      }
+      activeState.glyphAtlases.clear();
+      return;
+    }
+    for (const atlas of activeState.glyphAtlases.values()) {
+      try {
+        atlas.texture.destroy();
+      } catch {
+      }
+    }
+    activeState.glyphAtlases.clear();
+  }
   function computeCellMetrics2() {
     const primary = fontState.fonts[0];
     if (!primary)
@@ -63313,10 +63404,7 @@ function createFontRuntimeGridHelpers(options) {
     if (metrics.fontSizePx !== gridState.fontSizePx) {
       for (const entry of fontState.fonts)
         resetFontEntry(entry);
-      const activeState = getActiveState();
-      if (activeState && activeState.glyphAtlases) {
-        activeState.glyphAtlases = new Map;
-      }
+      destroyGlyphAtlases();
     }
     Object.assign(gridState, metrics, { cols, rows });
     const wasmReady = getWasmReady();
@@ -64024,7 +64112,8 @@ function createRuntimeAppApi(options) {
     if (!ptyTransport.isConnected())
       return;
     if (options.readOnly) {
-      while (shared.wasm.drainOutput(shared.wasmHandle)) {}
+      while (shared.wasm.drainOutput(shared.wasmHandle)) {
+      }
       return;
     }
     let iterations = 0;
@@ -64114,7 +64203,8 @@ function createRuntimeAppApi(options) {
     const canvas = getCanvas();
     shared.wasm.setPixelSize(shared.wasmHandle, canvas.width, canvas.height);
     shared.wasm.writeBytes(shared.wasmHandle, data);
-    while (shared.wasm.drainOutput(shared.wasmHandle)) {}
+    while (shared.wasm.drainOutput(shared.wasmHandle)) {
+    }
     markSearchDirty();
     if (inputHandler.isSynchronizedOutput?.()) {
       ptyInputRuntime.scheduleSyncOutputReset();
@@ -64178,7 +64268,8 @@ function createRuntimeAppApi(options) {
     }
     try {
       shared.wasm.destroy(shared.wasmHandle);
-    } catch {}
+    } catch {
+    }
     writeState({ wasmHandle: nextHandle });
     ptyInputRuntime.cancelSyncOutputReset();
     handleSearchWasmReset();
@@ -64424,20 +64515,24 @@ function createRuntimeAppApi(options) {
   }
   function destroy() {
     cancelAnimationFrame(internalState.rafId);
+    internalState.rafId = 0;
+    internalState.backend = "none";
+    internalState.frameCount = 0;
     lifecycleThemeSizeRuntime.cancelScheduledSizeUpdate();
     ptyInputRuntime.cancelSyncOutputReset();
     ptyInputRuntime.disconnectPty();
     ptyTransport.destroy?.();
+    const activeState = readState().activeState;
     const shared = readState();
     if (shared.wasm && shared.wasmHandle) {
       try {
         shared.wasm.destroy(shared.wasmHandle);
-      } catch {}
+      } catch {
+      }
       writeState({ wasmHandle: 0 });
     }
     clearWebGPUShaderStages();
     destroyWebGPUStageTargets();
-    const activeState = readState().activeState;
     if (activeState && "gl" in activeState) {
       clearWebGLShaderStages(activeState);
       destroyWebGLStageTargets(activeState);
@@ -64451,6 +64546,23 @@ function createRuntimeAppApi(options) {
     for (const cleanup of cleanupFns)
       cleanup();
     cleanupFns.length = 0;
+    options.destroyActiveRenderer?.(activeState);
+    const canvas = getCanvas();
+    canvas.width = 0;
+    canvas.height = 0;
+    writeState({
+      wasm: null,
+      wasmExports: null,
+      wasmHandle: 0,
+      wasmReady: false,
+      activeState: null,
+      needsRender: false,
+      lastRenderTime: 0,
+      currentContextType: null,
+      isFocused: false,
+      lastKeydownSeq: "",
+      lastKeydownSeqAt: 0
+    });
   }
   function setRenderer(value) {
     if (value !== "auto" && value !== "webgpu" && value !== "webgl2")
@@ -64664,6 +64776,27 @@ function createResttyApp(options) {
   let wasmHandle = 0;
   let wasmReady = false;
   let activeState = null;
+  function destroyGlyphAtlases(state2) {
+    if (!state2?.glyphAtlases)
+      return;
+    if ("gl" in state2) {
+      for (const atlas of state2.glyphAtlases.values()) {
+        try {
+          state2.gl.deleteTexture(atlas.texture);
+        } catch {
+        }
+      }
+      state2.glyphAtlases.clear();
+      return;
+    }
+    for (const atlas of state2.glyphAtlases.values()) {
+      try {
+        atlas.texture.destroy();
+      } catch {
+      }
+    }
+    state2.glyphAtlases.clear();
+  }
   const RESIZE_OVERLAY_HOLD_MS = 500;
   const RESIZE_OVERLAY_FADE_MS = 400;
   const RESIZE_ACTIVE_MS = 180;
@@ -64966,16 +65099,18 @@ function createResttyApp(options) {
     syncImeInputTypography(imeInput, clamped);
     for (const entry of fontState.fonts)
       resetFontEntry(entry);
-    if (activeState && activeState.glyphAtlases) {
-      activeState.glyphAtlases = new Map;
-    }
+    destroyGlyphAtlases(activeState);
     updateGrid();
     wasm?.renderUpdate?.(wasmHandle);
     needsRender = true;
     appendLog(`[ui] font size ${clamped}px`);
   }
   const resolveGlyphPixelMode2 = (entry) => resolveGlyphPixelMode(entry, PixelMode.Gray, PixelMode.RGBA ?? 4, isColorEmojiFont);
-  const { atlasBitmapToRGBA: atlasBitmapToRGBA2, buildColorEmojiAtlasWithCanvas } = createColorGlyphAtlasHelpers({
+  const {
+    atlasBitmapToRGBA: atlasBitmapToRGBA2,
+    buildColorEmojiAtlasWithCanvas,
+    destroy: destroyColorGlyphCanvas
+  } = createColorGlyphAtlasHelpers({
     pixelModeRgba: PixelMode.RGBA ?? 4,
     atlasToRGBA
   });
@@ -65146,6 +65281,82 @@ function createResttyApp(options) {
   } = lifecycleThemeSizeRuntime;
   bindFocusEvents();
   lifecycleThemeSizeRuntime.bindAutoResizeEvents();
+  function destroyWebGPUAtlasState(state2) {
+    destroyGlyphAtlases(state2);
+  }
+  function destroyWebGLAtlasState(state2) {
+    destroyGlyphAtlases(state2);
+  }
+  function destroyWebGPUState(state2) {
+    destroyWebGPUAtlasState(state2);
+    try {
+      state2.uniformBuffer.destroy();
+    } catch {
+    }
+    try {
+      state2.rectInstanceBuffer.destroy();
+    } catch {
+    }
+    try {
+      state2.glyphInstanceBuffer.destroy();
+    } catch {
+    }
+    try {
+      state2.context.unconfigure?.();
+    } catch {
+    }
+  }
+  function destroyWebGLState(state2) {
+    destroyWebGLAtlasState(state2);
+    try {
+      state2.gl.bindVertexArray(null);
+      state2.gl.bindBuffer(state2.gl.ARRAY_BUFFER, null);
+      state2.gl.bindFramebuffer(state2.gl.FRAMEBUFFER, null);
+      state2.gl.useProgram(null);
+    } catch {
+    }
+    try {
+      state2.gl.deleteVertexArray(state2.rectVao);
+    } catch {
+    }
+    try {
+      state2.gl.deleteVertexArray(state2.glyphVao);
+    } catch {
+    }
+    try {
+      state2.gl.deleteBuffer(state2.quadBuffer);
+    } catch {
+    }
+    try {
+      state2.gl.deleteBuffer(state2.rectInstanceBuffer);
+    } catch {
+    }
+    try {
+      state2.gl.deleteBuffer(state2.glyphInstanceBuffer);
+    } catch {
+    }
+    try {
+      state2.gl.deleteProgram(state2.rectProgram);
+    } catch {
+    }
+    try {
+      state2.gl.deleteProgram(state2.glyphProgram);
+    } catch {
+    }
+    try {
+      state2.gl.getExtension("WEBGL_lose_context")?.loseContext();
+    } catch {
+    }
+  }
+  function destroyActiveRendererState(state2) {
+    if (!state2)
+      return;
+    if ("gl" in state2) {
+      destroyWebGLState(state2);
+      return;
+    }
+    destroyWebGPUState(state2);
+  }
   function resolveLinkUri(render, linkId) {
     if (!render.linkOffsets || !render.linkLengths || !render.linkBuffer)
       return "";
@@ -65208,9 +65419,7 @@ function createResttyApp(options) {
     fontState.fonts = [];
     fontState.fontSizePx = 0;
     fontState.fontPickCache.clear();
-    if (activeState?.glyphAtlases) {
-      activeState.glyphAtlases.clear();
-    }
+    destroyGlyphAtlases(activeState);
   }
   async function setFontSources(sources2) {
     configuredFontSources = normalizeFontSources(sources2, undefined);
@@ -65232,9 +65441,7 @@ function createResttyApp(options) {
       entry.atlasScale = 1;
       entry.constraintSignature = "";
     }
-    if (activeState?.glyphAtlases) {
-      activeState.glyphAtlases = new Map;
-    }
+    destroyGlyphAtlases(activeState);
     needsRender = true;
   }
   function setFontHinting(value) {
@@ -65284,9 +65491,7 @@ function createResttyApp(options) {
         fontState.font = entries2[0].font;
         fontState.fontSizePx = 0;
         fontState.fontPickCache.clear();
-        if (activeState && activeState.glyphAtlases) {
-          activeState.glyphAtlases = new Map;
-        }
+        destroyGlyphAtlases(activeState);
         fontError = null;
         if (entries2.length > 1) {
           log(`font loaded (+${entries2.length - 1} fallback)`);
@@ -65523,6 +65728,7 @@ function createResttyApp(options) {
     } = patch);
   };
   cleanupFns.push(() => {
+    destroyColorGlyphCanvas();
     kittyRenderRuntime.clearKittyRenderCaches();
   });
   runtimeAppApi = createRuntimeAppApi({
@@ -65572,6 +65778,7 @@ function createResttyApp(options) {
     destroyWebGPUStageTargets,
     clearWebGLShaderStages,
     destroyWebGLStageTargets,
+    destroyActiveRenderer: destroyActiveRendererState,
     markSearchDirty: () => {
       searchRuntime.markDirty();
     },
@@ -66572,7 +66779,8 @@ function teardownPluginRuntime(runtime) {
   for (let i3 = 0;i3 < runtime.disposers.length; i3 += 1) {
     try {
       runtime.disposers[i3].dispose();
-    } catch {}
+    } catch {
+    }
   }
   runtime.disposers.length = 0;
   const cleanup = runtime.cleanup;
