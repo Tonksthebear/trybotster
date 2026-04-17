@@ -148,7 +148,6 @@ class CliPairingTest < ApplicationSystemTestCase
       page.has_button?("Retry connection", wait: 5) || page.has_button?("Start pairing", wait: 5),
       "Expected stale session recovery UI"
     )
-
   end
 
   # -- Test 5: Hub page without fragment shows scan prompt -------------------
