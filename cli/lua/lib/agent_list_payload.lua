@@ -5,6 +5,7 @@
 --   workspaces -> grouped workspace metadata (Phase 3)
 
 local Agent = require("lib.agent")
+local ClientSessionPayload = require("lib.client_session_payload")
 
 local M = {}
 
@@ -16,6 +17,7 @@ function M.build(agents)
     if type(list) ~= "table" then
         list = Agent.all_info()
     end
+    list = ClientSessionPayload.build_many(list)
 
     local workspaces = {}
     local data_dir = config.data_dir and config.data_dir() or nil

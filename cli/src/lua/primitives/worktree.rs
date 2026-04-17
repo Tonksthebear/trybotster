@@ -153,6 +153,25 @@ fn parse_porcelain_worktrees(output: &str) -> Vec<serde_json::Value> {
     worktrees
 }
 
+fn is_detachable_worktree_path(path: &str) -> bool {
+    std::path::Path::new(path).join(".git").is_file()
+}
+
+fn filter_detachable_worktrees(
+    worktrees: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    worktrees
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(is_detachable_worktree_path)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 /// Register worktree primitives with the Lua state.
 ///
 /// Adds the following functions to the `worktree` table:
@@ -236,7 +255,10 @@ pub(crate) fn register(
                 )));
             }
 
-            let worktrees = parse_porcelain_worktrees(&String::from_utf8_lossy(&output.stdout));
+            let worktrees =
+                filter_detachable_worktrees(parse_porcelain_worktrees(&String::from_utf8_lossy(
+                    &output.stdout,
+                )));
             super::json::json_to_lua(lua, &serde_json::Value::Array(worktrees))
         })
         .map_err(|e| anyhow!("Failed to create worktree.list_for_root function: {e}"))?;
@@ -503,6 +525,7 @@ pub(crate) fn register(
 mod tests {
     use super::super::new_hub_event_sender;
     use super::*;
+    use tempfile::TempDir;
 
     fn create_test_queue_and_cache() -> (HubEventSender, Arc<HandleCache>, PathBuf) {
         (
@@ -510,6 +533,32 @@ mod tests {
             Arc::new(HandleCache::new()),
             PathBuf::from("/tmp/test-worktrees"),
         )
+    }
+
+    #[test]
+    fn test_filter_detachable_worktrees_excludes_main_checkout() {
+        let repo_root = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo_root.path().join(".git")).unwrap();
+
+        let worktree_root = TempDir::new().unwrap();
+        std::fs::write(worktree_root.path().join(".git"), "gitdir: /tmp/example").unwrap();
+
+        let filtered = filter_detachable_worktrees(vec![
+            serde_json::json!({
+                "path": repo_root.path().to_string_lossy().to_string(),
+                "branch": "main",
+            }),
+            serde_json::json!({
+                "path": worktree_root.path().to_string_lossy().to_string(),
+                "branch": "feature-branch",
+            }),
+        ]);
+
+        assert_eq!(filtered.len(), 1, "main checkout should be excluded");
+        assert_eq!(
+            filtered[0].get("branch").and_then(|v| v.as_str()),
+            Some("feature-branch")
+        );
     }
 
     #[test]
