@@ -55,9 +55,13 @@ export default function NewAgentForm({ hubId }) {
 
     unsubs.push(
       hub.on('worktreeList', ({ targetId, worktrees: wts }) => {
-        // Only update if it matches our selected target
+        // Ignore unscoped broadcasts once a target is selected; only explicit
+        // target responses are authoritative for the picker.
         setSelectedTargetId((currentTarget) => {
-          if (targetId && currentTarget && targetId !== currentTarget) return currentTarget
+          if (currentTarget) {
+            if (!targetId) return currentTarget
+            if (targetId !== currentTarget) return currentTarget
+          }
           setWorktrees(Array.isArray(wts) ? wts : [])
           return currentTarget
         })
@@ -314,6 +318,11 @@ export default function NewAgentForm({ hubId }) {
                               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
                             </svg>
                             <span className="font-mono text-sm">{label}</span>
+                            {(wt.active_sessions || 0) > 0 && (
+                              <span className="rounded-full border border-zinc-600 px-2 py-0.5 text-[11px] text-zinc-300">
+                                {wt.active_sessions} active
+                              </span>
+                            )}
                           </div>
                           <div className="text-xs text-zinc-500 mt-1 truncate">{wt.path}</div>
                         </button>
