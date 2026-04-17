@@ -1,35 +1,35 @@
 /**
- * HubConnectionManager - Generic connection pool with Turbo-aware lifecycle.
+ * HubConnectionManager - Generic connection pool with route-aware lifecycle.
  *
  * Manages typed connection wrappers (HubTransport, TerminalConnection) keyed
  * by URL/identifier. Handles reference counting via subscribers and deferred
- * cleanup after Turbo navigations.
+ * cleanup across client-side route transitions.
  *
  * Usage:
  *   import { HubConnectionManager } from "connections/hub_connection_manager";
  *   import { HubTransport } from "connections/hub_connection";
  *
- *   // In Stimulus controller connect():
+ *   // On component mount:
  *   this.transport = await HubConnectionManager.acquire(HubTransport, hubId, { hubId });
  *   this.transport.on("connected", () => this.transport.requestAgents());
  *
- *   // In Stimulus controller disconnect():
+ *   // On component unmount:
  *   this.transport?.release();
  *
  * Lifecycle:
  *   1. acquire() - Returns existing or creates new typed connection
  *   2. release() - Decrements ref count, queues for deletion if zero
- *   3. turbo:render - Destroys connections still queued (no one reclaimed)
+ *   3. idle cleanup - Destroys connections still queued (no one reclaimed)
  */
 
 class HubConnectionManagerSingleton {
   constructor() {
-    this.IDLE_DESTROY_DELAY_MS = 5000; // Keep wrapper briefly across Turbo nav, then GC if still unused
+    this.IDLE_DESTROY_DELAY_MS = 5000; // Keep wrapper briefly across route changes, then GC if still unused
     this.connections = new Map(); // key -> { wrapper, refCount }
     this.pendingCreation = new Map(); // key -> Promise<wrapper> (prevents race conditions)
     this.subscribers = new Map(); // key -> Set<callback>
-    // No turbo:render cleanup needed - WebRTCTransport handles connection
-    // lifecycle with grace periods. Connections persist across Turbo navigation.
+    // WebRTCTransport handles connection lifecycle with grace periods.
+    // Connections persist across client-side navigation.
   }
 
   /**
@@ -55,7 +55,7 @@ class HubConnectionManagerSingleton {
       const wasIdle = entry.refCount <= 0;
       entry.refCount++;
       // Only reacquire when connection was idle (refCount was 0).
-      // During Turbo navigation, multiple controllers acquire the same key —
+      // During client-side navigation, multiple consumers can acquire the same key —
       // only the first needs to re-subscribe. Subsequent acquires reuse the
       // active connection without disrupting the in-flight subscription.
       if (wasIdle) {
@@ -118,8 +118,8 @@ class HubConnectionManagerSingleton {
     entry.refCount--;
 
     // When refCount hits 0, defer idle notification to the next microtask.
-    // During Turbo navigation, Stimulus disconnects old controllers then
-    // connects new ones in the same frame. Deferring lets the refCount
+    // During client-side navigation, one view can release while the next
+    // acquires in the same frame. Deferring lets the refCount
     // bounce 0→N before we decide to start the grace period, avoiding
     // unnecessary disconnect/reconnect churn on rapid link clicks.
     if (entry.refCount <= 0 && !entry.idlePending) {

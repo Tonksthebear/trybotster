@@ -115,7 +115,7 @@ class ConfigEditingTest < ApplicationSystemTestCase
     editor = find("[data-hub-settings-target='editor']")
     editor.set("#!/bin/bash\n# Modified by system test\necho 'hello from config editing test'\n")
 
-    # Trigger input event so Stimulus detects the change
+    # Trigger an input event so the editor change detection runs
     editor.send_keys(" ")
     editor.send_keys(:backspace)
 

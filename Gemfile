@@ -9,13 +9,8 @@ gem "pg", "~> 1.1"
 # Use the Puma web server [https://github.com/puma/puma]
 gem "puma", ">= 5.0"
 gem "falcon"
-# Hotwire gems removed — React SPA handles all frontend navigation
-# gem "importmap-rails"
-# gem "turbo-rails"
-# gem "stimulus-rails"
 # Use Tailwind CSS [https://github.com/rails/tailwindcss-rails]
 gem "tailwindcss-rails"
-gem "rails_icons"
 
 
 # Use Active Model has_secure_password [https://guides.rubyonrails.org/active_model_basics.html#securepassword]
@@ -78,9 +73,6 @@ group :test do
   gem "minitest"
   gem "minitest-mock"
 end
-# UI Components
-gem "view_component"
-gem "classy-yaml"
 
 # Vite for React frontend
 gem "vite_rails"

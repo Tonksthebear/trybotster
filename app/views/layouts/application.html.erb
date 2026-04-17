@@ -19,81 +19,45 @@
     <link rel="manifest" href="<%= pwa_manifest_path %>">
 
     <%= stylesheet_link_tag :app %>
-    <%= vite_client_tag %>
-    <%= vite_react_refresh_tag %>
-    <%= vite_javascript_tag 'application.jsx' %>
-
   </head>
 
   <body class="bg-zinc-950 text-zinc-100 min-h-dvh font-sans antialiased flex flex-col">
-    <%= render Elements::StackedLayoutComponent.new(style: :border) do |layout| %>
-      <% layout.with_navbar do %>
-        <%# Logo & Nav Links %>
-        <div class="flex items-center gap-8">
-          <%= link_to root_path, class: "flex items-center gap-2 text-primary-400 hover:text-primary-300 transition-colors" do %>
-            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+    <header class="border-b border-zinc-800 bg-zinc-900/80 backdrop-blur-sm">
+      <div class="mx-auto flex max-w-7xl flex-col gap-4 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6 lg:px-8">
+        <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:gap-8">
+          <%= link_to root_path, class: "flex items-center gap-2 text-primary-400 transition-colors hover:text-primary-300" do %>
+            <svg class="size-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2z" />
             </svg>
-            <span class="font-mono font-bold text-lg tracking-tight">botster</span>
+            <span class="font-mono text-lg font-bold tracking-tight">botster</span>
           <% end %>
 
-          <div class="hidden sm:flex items-center gap-1">
-            <%= link_to docs_path, class: "px-3 py-1.5 text-sm font-medium rounded transition-colors #{request.path.start_with?('/docs') ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}" do %>
-              Docs
-            <% end %>
+          <nav class="flex flex-wrap items-center gap-2">
+            <%= link_to "Docs", docs_path, class: "rounded px-3 py-1.5 text-sm font-medium transition-colors #{request.path.start_with?('/docs') ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'}" %>
             <% if user_signed_in? %>
-              <%= link_to hubs_path, class: "px-3 py-1.5 text-sm font-medium rounded transition-colors #{request.path == hubs_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}" do %>
-                Hubs
-              <% end %>
-              <%= link_to settings_path, class: "px-3 py-1.5 text-sm font-medium rounded transition-colors #{request.path == settings_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}" do %>
-                Settings
-              <% end %>
+              <%= link_to "Hubs", hubs_path, class: "rounded px-3 py-1.5 text-sm font-medium transition-colors #{request.path == hubs_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'}" %>
+              <%= link_to "Settings", settings_path, class: "rounded px-3 py-1.5 text-sm font-medium transition-colors #{request.path == settings_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'}" %>
             <% end %>
-          </div>
+          </nav>
         </div>
 
-        <%# User Info & Logout (desktop) %>
-        <div class="hidden sm:flex items-center gap-4">
-          <% if user_signed_in? %>
-            <span class="text-sm text-zinc-500 font-mono">
-              <%= current_user.username || current_user.email %>
-            </span>
-            <%= button_to "Logout", destroy_user_session_path,
+        <% if user_signed_in? %>
+          <div class="flex items-center gap-4">
+            <span class="text-sm font-mono text-zinc-500"><%= current_user.username || current_user.email %></span>
+            <%= button_to "Logout",
+                          destroy_user_session_path,
                           method: :delete,
-                          class: "text-sm text-zinc-400 hover:text-zinc-200 transition-colors" %>
-          <% end %>
-        </div>
-      <% end %>
+                          class: "text-sm text-zinc-400 transition-colors hover:text-zinc-200" %>
+          </div>
+        <% end %>
+      </div>
+    </header>
 
-      <% layout.with_mobile_menu do %>
-        <div class="space-y-1 px-4 py-3 border-t border-zinc-800">
-          <%= link_to docs_path, class: "block px-3 py-2 rounded text-base font-medium transition-colors #{request.path.start_with?('/docs') ? 'bg-zinc-800 text-primary-400' : 'text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100'}" do %>
-            Docs
-          <% end %>
-          <% if user_signed_in? %>
-            <%= link_to hubs_path, class: "block px-3 py-2 rounded text-base font-medium transition-colors #{request.path == hubs_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100'}" do %>
-              Hubs
-            <% end %>
-            <%= link_to settings_path, class: "block px-3 py-2 rounded text-base font-medium transition-colors #{request.path == settings_path ? 'bg-zinc-800 text-primary-400' : 'text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100'}" do %>
-              Settings
-            <% end %>
-            <div class="border-t border-zinc-800 mt-3 pt-3">
-              <div class="px-3 py-2 text-sm text-zinc-500 font-mono">
-                <%= current_user.username || current_user.email %>
-              </div>
-              <%= button_to "Logout", destroy_user_session_path,
-                            method: :delete,
-                            class: "block px-3 py-2 rounded text-base font-medium text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition-colors" %>
-            </div>
-          <% end %>
-        </div>
-      <% end %>
-
+    <main class="flex-1">
       <%= yield %>
-    <% end %>
+    </main>
 
     <% unless content_for?(:no_footer) %>
-      <%# Footer %>
       <footer class="border-t border-zinc-800 mt-auto py-6">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <p class="text-center text-xs text-zinc-600 font-mono">

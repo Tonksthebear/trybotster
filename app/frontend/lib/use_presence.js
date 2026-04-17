@@ -1,5 +1,5 @@
 /**
- * usePresence — Stimulus composable for user presence detection.
+ * usePresence — user presence helper for browser-side controllers.
  *
  * Tracks two signals:
  *   1. Page visibility (document.visibilitychange)
@@ -11,10 +11,10 @@
  * Usage:
  *   import { usePresence } from "lib/use_presence";
  *
- *   connect() {
+ *   start() {
  *     this.teardownPresence = usePresence(this, { ms: 120000 });
  *   }
- *   disconnect() { this.teardownPresence?.(); }
+ *   stop() { this.teardownPresence?.(); }
  *   away() { user gone  }
  *   back() { user returned }
  *

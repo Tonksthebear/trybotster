@@ -167,7 +167,7 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     )
   end
 
-  test "connection re-establishes after Turbo navigation away and back" do
+  test "connection re-establishes after client-side navigation away and back" do
     @cli = start_cli(@hub)
     pair_browser_with_cli(@cli)
 
@@ -175,10 +175,10 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     assert_webrtc_connected
     paired_hub_url = current_url
 
-    # Navigate away (Turbo soft navigation — releases connections, starts grace period)
+    # Navigate away, which releases the active connections and starts the grace period.
     visit settings_path
 
-    # Navigate back to hub (reacquires connections, must not storm)
+    # Navigate back to the hub and reacquire the same connections without storming.
     visit paired_hub_url
 
     # Connection should re-establish cleanly within a reasonable timeout.

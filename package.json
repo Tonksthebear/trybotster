@@ -1,6 +1,11 @@
 {
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "vitest --run",
+    "test:frontend": "vitest --run",
+    "test:frontend:watch": "vitest"
+  },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",

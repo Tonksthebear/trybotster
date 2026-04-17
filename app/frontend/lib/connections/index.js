@@ -1,5 +1,5 @@
 /**
- * Connections module - Global connection management for Turbo-aware lifecycle.
+ * Connections module - Global connection management for client-side route changes.
  *
  * Usage:
  *   import { HubConnectionManager, HubManager, HubTransport, TerminalConnection } from "connections";
@@ -19,7 +19,7 @@
  *   });
  *   term.onOutput((data) => terminal.write(data));
  *
- *   // In controller disconnect():
+ *   // On component unmount:
  *   hub?.release();
  *   term?.release();
  */
