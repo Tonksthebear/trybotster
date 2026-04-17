@@ -80,14 +80,13 @@ local function transition_to_workspace_selection()
   return { set_mode_ops("new_agent_select_workspace") }
 end
 
---- Check if the currently selected agent is NOT in a worktree.
-local function selected_agent_not_in_worktree(context)
+local function selected_agent_close_actions(context)
   local agent_id = context.selected_agent
-  if not agent_id then return true end
+  if not agent_id then return nil end
   for _, a in ipairs(_tui_state.agents) do
-    if a.id == agent_id then return not a.in_worktree end
+    if a.id == agent_id then return a.close_actions end
   end
-  return true
+  return nil
 end
 
 -- =============================================================================
@@ -665,8 +664,8 @@ function M.on_action(action, context)
   end
 
   if action == "confirm_close_delete" and _tui_state.mode == "close_agent_confirm" then
-    -- Don't allow deleting worktree when agent is not in a worktree
-    if selected_agent_not_in_worktree(context) then return nil end
+    local close_actions = selected_agent_close_actions(context) or {}
+    if close_actions.can_delete_worktree ~= true then return nil end
     if context.selected_agent then
       return {
         { op = "send_msg", data = {

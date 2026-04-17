@@ -683,11 +683,26 @@ function render_overlay(state)
   elseif _tui_state.mode == "close_agent_confirm" then
     local sa = get_selected_agent()
     local in_worktree = sa and sa.in_worktree
+    local close_actions = sa and sa.close_actions or {}
+    local can_delete_worktree = close_actions.can_delete_worktree == true
+    local other_active_sessions = tonumber(close_actions.other_active_sessions or 0) or 0
     local lines
     if not in_worktree then
       lines = {
         "Close selected agent?",
         "",
+        "Y - Close agent",
+        "",
+        "N/Esc - Cancel",
+      }
+    elseif not can_delete_worktree then
+      local status_line = other_active_sessions == 1
+        and "Another session is still active in this workspace."
+        or string.format("%d other sessions are still active in this workspace.", other_active_sessions)
+      lines = {
+        "Close selected agent?",
+        "",
+        status_line,
         "Y - Close agent",
         "",
         "N/Esc - Cancel",
