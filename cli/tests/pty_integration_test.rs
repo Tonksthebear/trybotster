@@ -331,6 +331,111 @@ fn test_sigterm_triggers_graceful_shutdown() {
     }
 }
 
+/// Headless variant: spawn `botster start --headless --offline`, wait for
+/// the "Hub ready" marker on stdout, SIGTERM, assert clean exit.
+///
+/// This is the end-to-end test for the shutdown watchdog (`cli/src/shutdown.rs`):
+/// a healthy hub must shut down via the normal path within the watchdog's
+/// grace window. Clean exit (status 0) confirms the watchdog was spawned,
+/// did not fire prematurely, and that signal-hook → `SHUTDOWN_FLAG` →
+/// event-loop break → `Hub::shutdown` all wire up for the headless path.
+///
+/// An exit code of 1 would indicate the watchdog force-exited — treat as a
+/// regression of the normal shutdown path, not a success.
+#[test]
+#[cfg(unix)]
+fn test_headless_sigterm_shuts_down_cleanly() {
+    let _serial = test_lock();
+    ensure_test_env();
+    if !binary_exists() {
+        eprintln!("Skipping: release binary not found");
+        return;
+    }
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let mut child = Command::new(get_binary_path())
+        .arg("start")
+        .arg("--headless")
+        .arg("--offline") // skip network/server registration so the test is self-contained
+        .env("BOTSTER_CONFIG_DIR", temp_dir.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn botster start --headless");
+
+    // "Hub ready. Waiting for connections..." is printed once the event
+    // loop is running (see `main.rs::run_headless`). We watch stdout on a
+    // background thread and signal through a channel.
+    //
+    // The thread must keep reading past the marker until EOF: closing the
+    // pipe early would make the child's subsequent `println!` fail with
+    // `Broken pipe` and terminate the process with the `SIGPIPE`/stdout
+    // panic path, which would masquerade as a shutdown regression.
+    let stdout = child.stdout.take().expect("stdout captured");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(stdout);
+        let mut signaled = false;
+        for line in reader.lines().map_while(Result::ok) {
+            if !signaled && line.contains("Hub ready") {
+                let _ = ready_tx.send(());
+                signaled = true;
+            }
+        }
+    });
+
+    // Generous — slow CI with cold caches can take a few seconds to spin up
+    // the Lua runtime, socket server, and plugin loader.
+    let ready_timeout = Duration::from_secs(20);
+    if ready_rx.recv_timeout(ready_timeout).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("headless hub did not print 'Hub ready' within {ready_timeout:?}");
+    }
+
+    let pid = child.id();
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+
+    let sent_at = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                // EXIT_TIMEOUT (10s) is tighter than the watchdog grace (15s).
+                // Any clean shutdown that blows past this is a real regression
+                // — and a watchdog force-exit would still take ~15s, longer
+                // than the bound, so timing out here does mean something is wrong.
+                if sent_at.elapsed() > EXIT_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "headless hub did not exit within {EXIT_TIMEOUT:?} of SIGTERM"
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("Error waiting for process: {e}"),
+        }
+    };
+
+    if !status.success() {
+        let mut stderr_buf = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            use std::io::Read;
+            let _ = stderr.read_to_string(&mut stderr_buf);
+        }
+        panic!(
+            "headless hub should shut down cleanly (exit 0), not via watchdog force-exit. \
+             Exit: {status:?}, elapsed: {elapsed:?}\nstderr:\n{stderr_buf}",
+            elapsed = sent_at.elapsed()
+        );
+    }
+}
+
 #[test]
 fn test_pty_close_triggers_cleanup() {
     let _serial = test_lock();
