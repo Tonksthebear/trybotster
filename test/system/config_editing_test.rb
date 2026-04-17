@@ -40,22 +40,17 @@ class ConfigEditingTest < ApplicationSystemTestCase
       "Tree panel should be loading or disconnected without CLI"
   end
 
-  test "config tree loads files from CLI after Initialize" do
+  test "device config tree loads current editing controls" do
     @cli = start_cli(@hub)
 
     sign_in_and_connect
     click_settings_link
+    switch_to_device_scope
 
-    # Without pre-existing .botster/ dir, tree shows empty state
-    assert_selector "[data-hub-settings-target='treePanel'][data-view='empty']", wait: 30
-
-    # Click Initialize to create default .botster/ structure via DataChannel
-    find("[data-action='hub-settings#initBotster']", wait: 10).click
-
-    # Tree should transition to "tree" view with file entries
-    assert_selector "[data-hub-settings-target='treePanel'][data-view='tree']", wait: 15
-    assert_selector "[data-hub-settings-target='treeContainer'] button[data-file-path]",
-                    minimum: 1, wait: 10
+    assert_selector "[data-hub-settings-target='treePanel'][data-view='tree']", wait: 30
+    assert_selector "[data-hub-settings-target='treeContainer']", wait: 10
+    assert_button "+ Add Agent"
+    assert_button "+ Add Accessory"
   end
 
   test "selecting a file loads its content in editor" do
@@ -63,14 +58,10 @@ class ConfigEditingTest < ApplicationSystemTestCase
 
     sign_in_and_connect
     click_settings_link
+    switch_to_device_scope
 
-    # Initialize config structure first
-    initialize_config_via_ui
-
-    # Click a file entry in the tree
-    file_button = first("[data-hub-settings-target='treeContainer'] button[data-file-path]")
-    assert file_button, "Should have at least one file entry in tree"
-    file_button.click
+    add_agent_named("alpha")
+    select_agent_file("alpha")
 
     # Editor panel should transition to "editing" (file exists) or "creating" (file missing)
     assert_selector(
@@ -93,16 +84,10 @@ class ConfigEditingTest < ApplicationSystemTestCase
 
     sign_in_and_connect
     click_settings_link
+    switch_to_device_scope
 
-    # Initialize and find a file that exists (initialization script)
-    initialize_config_via_ui
-
-    # Select the initialization file (should be in the tree after init)
-    init_button = find(
-      "[data-hub-settings-target='treeContainer'] button[data-file-path$='/initialization']",
-      wait: 10
-    )
-    init_button.click
+    add_agent_named("editor")
+    select_agent_file("editor")
 
     # Wait for editor to load the file content
     assert_selector "[data-hub-settings-target='editorPanel'][data-editor='editing']", wait: 15
@@ -115,7 +100,7 @@ class ConfigEditingTest < ApplicationSystemTestCase
     editor = find("[data-hub-settings-target='editor']")
     editor.set("#!/bin/bash\n# Modified by system test\necho 'hello from config editing test'\n")
 
-    # Trigger input event so Stimulus detects the change
+    # Trigger an input event so the editor change detection runs
     editor.send_keys(" ")
     editor.send_keys(:backspace)
 
@@ -133,33 +118,16 @@ class ConfigEditingTest < ApplicationSystemTestCase
     assert_selector "[data-hub-settings-target='saveBtn'][disabled]", wait: 10
   end
 
-  test "creating a new config file via Initialize" do
+  test "adding an agent creates an editable initialization file" do
     @cli = start_cli(@hub)
 
     sign_in_and_connect
     click_settings_link
+    switch_to_device_scope
 
-    # Tree should show empty state (no .botster/ directory exists)
-    assert_selector "[data-hub-settings-target='treePanel'][data-view='empty']", wait: 30
+    add_agent_named("fresh")
+    select_agent_file("fresh")
 
-    # Click Initialize to create the default .botster/ structure
-    find("[data-action='hub-settings#initBotster']", wait: 10).click
-
-    # Tree should now show "tree" view with file entries
-    assert_selector "[data-hub-settings-target='treePanel'][data-view='tree']", wait: 15
-
-    # Should have at least the initialization file entry
-    assert_selector "[data-hub-settings-target='treeContainer'] button[data-file-path]",
-                    minimum: 1, wait: 10
-
-    # Select the newly created initialization file
-    init_btn = find(
-      "[data-hub-settings-target='treeContainer'] button[data-file-path$='/initialization']",
-      wait: 10
-    )
-    init_btn.click
-
-    # Editor should show the file content (editing state, not creating)
     assert_selector "[data-hub-settings-target='editorPanel'][data-editor='editing']", wait: 15
 
     editor = find("[data-hub-settings-target='editor']")
@@ -169,8 +137,10 @@ class ConfigEditingTest < ApplicationSystemTestCase
   # ========== Templates Tab ==========
 
   test "templates tab shows available templates" do
-    sign_in_as(@user)
-    visit hub_settings_path(@hub)
+    @cli = start_cli(@hub)
+
+    sign_in_and_connect
+    click_settings_link
 
     # Switch to templates tab
     find("[data-tab='templates']").click
@@ -244,20 +214,10 @@ class ConfigEditingTest < ApplicationSystemTestCase
     sign_in_as(@user)
     visit url
 
-    # Pairing page: wait for bundle to be parsed, then click pair button
-    assert_selector "[data-pairing-target='ready']", wait: 15
-    find("[data-action='pairing#pair']").click
-
-    assert_selector "[data-pairing-target='success']:not(.hidden)", wait: 15
-    visit hub_path(@hub)
-    assert_selector "[data-connection-status-target='connectionSection']", wait: 15
+    complete_pairing_for(@hub, pairing_url: url)
 
     # Wait for WebRTC DataChannel to be established (direct or relay)
-    assert_selector(
-      "[data-connection-status-target='connectionSection'][data-state='direct'], " \
-      "[data-connection-status-target='connectionSection'][data-state='relay']",
-      wait: 30
-    )
+    assert_sidebar_webrtc_connected(wait: 30)
   end
 
   # Navigate to settings via Turbo by clicking the Settings link on the hub page.
@@ -267,13 +227,22 @@ class ConfigEditingTest < ApplicationSystemTestCase
     assert_selector "[data-hub-settings-target='treePanel']", wait: 10
   end
 
-  # Click Initialize in the settings UI to create the default .botster/
-  # config structure via DataChannel, then wait for the file tree to render.
-  def initialize_config_via_ui
-    assert_selector "[data-hub-settings-target='treePanel'][data-view='empty']", wait: 30
-    find("[data-action='hub-settings#initBotster']", wait: 10).click
-    assert_selector "[data-hub-settings-target='treePanel'][data-view='tree']", wait: 15
-    assert_selector "[data-hub-settings-target='treeContainer'] button[data-file-path]",
-                    minimum: 1, wait: 10
+  def switch_to_device_scope
+    click_button "Device", wait: 10
+    assert_selector "[data-hub-settings-target='treePanel']", wait: 10
+  end
+
+  def add_agent_named(name)
+    click_button "+ Add Agent", wait: 10
+    assert_text "Add Agent", wait: 10
+    find("input[autocomplete='off']", wait: 10).set(name)
+    click_button "Create"
+    assert_selector "[data-hub-settings-target='treeContainer'] button[data-file-path='agents/#{name}/initialization']",
+                    wait: 15
+  end
+
+  def select_agent_file(name)
+    find("[data-hub-settings-target='treeContainer'] button[data-file-path='agents/#{name}/initialization']",
+         wait: 10).click
   end
 end

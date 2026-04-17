@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html class="dark">
+  <head>
+    <title><%= content_for(:title) || "Botster" %></title>
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="application-name" content="Botster">
+    <meta name="mobile-web-app-capable" content="yes">
+    <%= csrf_meta_tags %>
+    <%= csp_meta_tag %>
+    <%= action_cable_meta_tag %>
+
+    <meta name="crypto-worker-url" content="/workers/olm_crypto.js">
+    <meta name="crypto-wasm-js-url" content="/vodozemac/vodozemac_wasm.js">
+    <meta name="crypto-wasm-binary-url" content="/vodozemac/vodozemac_wasm_bg.wasm">
+
+    <%= vite_client_tag %>
+    <%= vite_react_refresh_tag %>
+    <%= vite_javascript_tag 'entrypoints/application.jsx' %>
+
+    <link rel="icon" href="/favicon-96.png" type="image/png" sizes="96x96">
+    <link rel="icon" href="/favicon.png" type="image/png" sizes="32x32">
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <link rel="manifest" href="<%= pwa_manifest_path %>">
+
+    <%= stylesheet_link_tag :app %>
+  </head>
+
+  <body class="bg-zinc-950 text-zinc-100 h-dvh font-sans antialiased">
+    <div id="app" class="h-full"><%= yield %></div>
+  </body>
+</html>

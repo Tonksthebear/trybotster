@@ -6,6 +6,7 @@ module Hubs
     before_action :set_hub
 
     def show
+      render "spa/show", layout: "spa"
     end
 
     private

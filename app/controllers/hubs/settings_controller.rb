@@ -8,9 +8,19 @@ module Hubs
     before_action :set_hub
 
     def show
-      @config_metadata = config_metadata
-      @templates = template_catalog
-      @agent_templates = @templates["agents"] || []
+      respond_to do |format|
+        format.html { render "spa/show", layout: "spa" }
+        format.json do
+          templates = template_catalog
+          render json: {
+            configMetadata: config_metadata,
+            templates: templates,
+            agentTemplates: templates["agents"] || [],
+            hubName: Current.hub.name,
+            hubIdentifier: Current.hub.identifier
+          }
+        end
+      end
     end
 
     def update

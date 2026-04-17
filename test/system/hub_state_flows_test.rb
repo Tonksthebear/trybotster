@@ -56,28 +56,27 @@ class HubStateFlowsTest < ApplicationSystemTestCase
 
     selected_option = wait_for_spawn_target_option
     find("[data-new-session-chooser-target='targetSelect']", wait: 5).select(selected_option[:text])
-    find("[data-new-session-chooser-target='agentButton']", wait: 10).click
+    find("[data-testid='choose-agent']", wait: 10).click
 
-    assert_selector "dialog#new-agent-modal[open]", wait: 10
-    assert_no_selector "[data-new-agent-form-target='targetSection'].hidden", visible: :all, wait: 10
-    assert_no_selector "[data-new-agent-form-target='worktreeOptions'].hidden", visible: :all, wait: 10
+    assert_text "New Agent", wait: 10
 
-    modal_target_select = find("[data-new-agent-form-target='targetSelect']", wait: 10)
+    modal_target_select = find("[data-testid='new-agent-target-select']", wait: 10)
     assert_equal selected_option[:value], modal_target_select.value
   end
 
-  test "quick setup hides the no-agent-config banner after installing the template" do
+  test "device config tree shows add-session controls when hub config is available" do
     prime_server!
     @cli = start_cli(@hub)
     associate_hub_device!
 
     sign_in_and_connect
 
-    assert_selector "[data-hub-setup-banner-target='banner']:not(.hidden)", wait: 15
-
-    find("[data-action='hub-setup-banner#quickSetup']:not([disabled])", wait: 10).click
-
-    assert_no_selector "[data-hub-setup-banner-target='banner']:not(.hidden)", wait: 15
+    click_link "Hub Settings"
+    click_button "Device", wait: 10
+    assert_selector "[data-hub-settings-target='treePanel'][data-view='tree']", wait: 15
+    assert_no_selector "[data-hub-setup-banner-target='banner']", wait: 2
+    assert_button "+ Add Agent"
+    assert_button "+ Add Accessory"
   end
 
   private
@@ -101,26 +100,17 @@ class HubStateFlowsTest < ApplicationSystemTestCase
     sign_in_as(@user)
     visit url
 
-    assert_selector "[data-pairing-target='ready']", wait: 15
-    find("[data-action='pairing#pair']").click
-
-    assert_selector "[data-pairing-target='success']:not(.hidden)", wait: 15
-    visit hub_path(@hub)
-    assert_selector "[data-connection-status-target='connectionSection']", wait: 15
+    complete_pairing_for(@hub, pairing_url: url)
     assert_webrtc_connected
   end
 
   def assert_webrtc_connected(wait: 30)
-    assert_selector(
-      "[data-connection-status-target='connectionSection'][data-state='direct'], " \
-      "[data-connection-status-target='connectionSection'][data-state='relay']",
-      wait: wait,
-    )
+    assert_sidebar_webrtc_connected(wait:)
   end
 
   def open_new_session_chooser
-    first("[commandfor='new-session-chooser-modal']:not([disabled])", wait: 10).click
-    assert_selector "dialog#new-session-chooser-modal[open]", wait: 10
+    find("[data-testid='new-session-button']:not([disabled])", match: :first, wait: 10).click
+    assert_text "New Session", wait: 10
   end
 
   def wait_for_spawn_target_option(timeout: 15)

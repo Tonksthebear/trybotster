@@ -43,7 +43,10 @@
           </p>
         </div>
 
-        <%= render Elements::ButtonComponent.new("Continue", as: :button, type: :submit, size: :lg, class: "w-full") %>
+        <button type="submit"
+                class="inline-flex w-full items-center justify-center rounded-md bg-primary-600 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-primary-500 focus:outline-hidden focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 focus:ring-offset-zinc-950">
+          Continue
+        </button>
       <% end %>
     </div>
 

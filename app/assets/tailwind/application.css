@@ -5,8 +5,7 @@
 @variant dark (&);
 /* Mobile keyboard open — matches when body has data-mobile-keyboard */
 @custom-variant mobile-keyboard (body[data-mobile-keyboard] &);
-@source "../../../app/components";
-@source "../../../config/elements.yml";
+@source "../../../app/frontend";
 
 /* Disable pinch zoom in standalone PWA mode */
 html {
@@ -16,6 +15,15 @@ html {
 /* Terminal container — restty canvas fills the space */
 .terminal-container {
   overflow: hidden;
+}
+
+/*
+ * Hide mobile app shell chrome when virtual keyboard is open.
+ * Targets the SidebarLayout mobile header (sticky navbar) without
+ * modifying the Catalyst source file.
+ */
+body[data-mobile-keyboard] header.sticky {
+  display: none !important;
 }
 
 
@@ -40,5 +48,4 @@ html {
 .scrollbar-none::-webkit-scrollbar {
   display: none;
 }
-
 

@@ -99,7 +99,7 @@ local function resolve_agent_name(device_root, target_root, agent_name)
     -- Auto-select: list available agents
     local agents = ConfigResolver.list_agents(device_root, target_root)
     if #agents == 0 then
-        return nil, "No agents found in config."
+        return nil, nil
     elseif #agents == 1 then
         log.info(string.format("Auto-selected agent: %s", agents[1]))
         return agents[1], nil
@@ -216,6 +216,7 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_name, met
     local resolved, err = ConfigResolver.resolve_all({
         device_root = device_root,
         repo_root = repo_root,
+        require_agent = false,
     })
     if not resolved then
         local msg = string.format("Config resolution failed for agent '%s': %s",
@@ -351,6 +352,7 @@ spawn_accessory = function(branch_name, wt_path, accessory_name, agent_name, met
         resolved, err = ConfigResolver.resolve_all({
             device_root = device_root,
             repo_root = repo_root,
+            require_agent = false,
         })
         if not resolved then
             log.error(string.format("Config resolution failed: %s", tostring(err)))

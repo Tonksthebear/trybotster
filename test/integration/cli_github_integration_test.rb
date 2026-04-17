@@ -106,10 +106,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
 
       first_message = create_github_message(issue_number: 500, prompt: "Initial task")
 
-      # Don't set BOTSTER_REPO env var — match production where the CLI
-      # detects the repo from the git remote. This exposes the repo mismatch
-      # bug where agents.lua stored "unknown/repo" instead of the real name.
-      cli = start_cli_in_git_repo(@hub, timeout: 30, skip_repo_env: true)
+      cli = start_cli_in_git_repo(@hub, timeout: 30)
       assert_message_acknowledged(first_message, timeout: 20)
 
       # Wait for the agent to be FULLY spawned (not just worktree created).
@@ -185,20 +182,27 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     build_cli unless skip_build?
 
     temp_dir = Dir.mktmpdir("cli_github_test_")
+    config_dir = File.join(temp_dir, ".botster-test")
     worktree_base = Dir.mktmpdir("cli_worktrees_")
+    repo_config_dirname = File.basename(config_dir)
 
     setup_git_repo(temp_dir, TEST_REPO)
-    install_github_plugin(temp_dir)
-    install_agent_session(temp_dir)
-    register_spawn_target(temp_dir)
-    write_long_lived_session(temp_dir) if @use_long_lived_session
+    install_github_plugin(temp_dir, repo_config_dirname:)
+    install_agent_session(temp_dir, repo_config_dirname:)
+    register_spawn_target(config_dir, temp_dir)
+    write_long_lived_session(temp_dir, repo_config_dirname:) if @use_long_lived_session
 
     @test_temp_dirs ||= []
     @test_temp_dirs << temp_dir
+    @test_temp_dirs << config_dir
     @test_temp_dirs << worktree_base
     @git_repo_path = temp_dir
     @worktree_base = worktree_base
     local_hub_identifier = Digest::SHA256.hexdigest(File.realpath(temp_dir))[0, 32]
+    hub = hub.user.hubs.find_by(id: hub.id) || hub.user.hubs.create!(
+      identifier: local_hub_identifier,
+      last_seen_at: Time.current
+    )
     hub.update_column(:identifier, local_hub_identifier) if hub.identifier != local_hub_identifier
 
     # Create hub token for CLI authentication
@@ -209,7 +213,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
 
     env = {
       "BOTSTER_ENV" => "system_test",
-      "BOTSTER_CONFIG_DIR" => temp_dir,
+      "BOTSTER_CONFIG_DIR" => config_dir,
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_TOKEN" => api_key,
       "BOTSTER_WORKTREE_BASE" => worktree_base,
@@ -313,8 +317,8 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
   # Install the github.lua plugin into the repo's .botster/ directory.
   # The Lua runtime discovers plugins via ConfigResolver scanning
   # {repo}/.botster/plugins/{name}/init.lua
-  def install_github_plugin(repo_path)
-    plugin_dir = File.join(repo_path, ".botster", "plugins", "github")
+  def install_github_plugin(repo_path, repo_config_dirname:)
+    plugin_dir = File.join(repo_path, repo_config_dirname, "plugins", "github")
     FileUtils.mkdir_p(plugin_dir)
 
     source = Rails.root.join("app/templates/plugins/github.lua")
@@ -337,8 +341,8 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
   # Install a minimal agent config so ConfigResolver.resolve_all()
   # finds the required default agent. The initialization script is a
   # simple test script that verifies environment and exits.
-  def install_agent_session(repo_path)
-    session_dir = File.join(repo_path, ".botster", "agents", "default")
+  def install_agent_session(repo_path, repo_config_dirname:)
+    session_dir = File.join(repo_path, repo_config_dirname, "agents", "default")
     FileUtils.mkdir_p(session_dir)
 
     File.write(File.join(session_dir, "initialization"), <<~BASH)
@@ -373,8 +377,8 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     @use_long_lived_session = true
   end
 
-  def write_long_lived_session(repo_path)
-    session_dir = File.join(repo_path, ".botster", "agents", "default")
+  def write_long_lived_session(repo_path, repo_config_dirname:)
+    session_dir = File.join(repo_path, repo_config_dirname, "agents", "default")
     FileUtils.mkdir_p(session_dir)
 
     File.write(File.join(session_dir, "initialization"), <<~BASH)
@@ -401,7 +405,8 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
 
   # Pre-seed a spawn target so the hub discovers repo-level plugins at boot.
   # The spawn_targets.json lives under BOTSTER_CONFIG_DIR (= temp_dir).
-  def register_spawn_target(repo_path)
+  def register_spawn_target(config_dir, repo_path)
+    FileUtils.mkdir_p(config_dir)
     canonical_path = File.realpath(repo_path)
     spawn_targets = {
       targets: [
@@ -415,7 +420,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
         }
       ]
     }
-    File.write(File.join(repo_path, "spawn_targets.json"), JSON.generate(spawn_targets))
+    File.write(File.join(config_dir, "spawn_targets.json"), JSON.generate(spawn_targets))
     Rails.logger.info "[CliGithubTest] Registered spawn target: #{canonical_path}"
   end
 
