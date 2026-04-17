@@ -41,17 +41,26 @@ function ScopeButtons({ slug, defaultScope }) {
 
 // ─── Install Badge ─────────────────────────────────────────────────
 
-function InstallBadge({ dest }) {
+function InstallBadge({ template }) {
   const installedDevice = useSettingsStore((s) => s.installedDevice)
   const installedRepo = useSettingsStore((s) => s.installedRepo)
 
-  const name = pluginName(dest)
+  const name = pluginName(template.dest)
   const deviceInstalled = installedDevice.has(name)
   const repoInstalled = installedRepo.has(name)
   const anyInstalled = deviceInstalled || repoInstalled
 
   if (!anyInstalled) {
-    return <Badge color="zinc" className="shrink-0 text-[10px]">available</Badge>
+    return (
+      <Badge
+        color="zinc"
+        className="shrink-0 text-[10px]"
+        data-hub-templates-target="badge"
+        data-badge-for={template.slug}
+      >
+        available
+      </Badge>
+    )
   }
 
   const scopes = []
@@ -60,7 +69,9 @@ function InstallBadge({ dest }) {
 
   return (
     <Badge color="emerald" className="shrink-0 text-[10px]">
-      installed ({scopes.join(', ')})
+      <span data-hub-templates-target="badge" data-badge-for={template.slug}>
+        installed ({scopes.join(', ')})
+      </span>
     </Badge>
   )
 }
@@ -119,6 +130,8 @@ function InstallButton({ template }) {
       color={isInstalled ? 'red' : 'emerald'}
       disabled={busy || (scope === 'repo' && !repoSelectable)}
       onClick={handleClick}
+      data-hub-templates-target="installBtn"
+      data-slug={template.slug}
       className="shrink-0 !text-sm !px-4 !py-2"
     >
       {label}
@@ -170,6 +183,7 @@ function TemplatePreview({ template }) {
         <button
           type="button"
           onClick={() => setPreviewSlug(null)}
+          data-action="hub-templates#backToCatalog"
           className="text-sm text-zinc-500 hover:text-zinc-300 transition-colors flex items-center gap-1"
         >
           <svg className="size-4" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
@@ -216,6 +230,8 @@ function CatalogCard({ template }) {
     <button
       type="button"
       onClick={() => setPreviewSlug(template.slug)}
+      data-hub-templates-target="card"
+      data-dest={template.dest}
       className="w-full text-left px-3 py-3 rounded-lg border border-zinc-700/50 hover:border-zinc-600 hover:bg-zinc-800/50 transition-colors"
     >
       <div className="flex items-start justify-between gap-2">
@@ -227,7 +243,7 @@ function CatalogCard({ template }) {
             {template.description}
           </div>
         </div>
-        <InstallBadge dest={template.dest} />
+        <InstallBadge template={template} />
       </div>
     </button>
   )
@@ -258,6 +274,7 @@ function TemplateTargetSelector() {
         Repo Target
       </label>
       <Select
+        data-testid="template-target-select"
         value={selectedTargetId || ''}
         onChange={handleChange}
         disabled={spawnTargets.length === 0}
@@ -284,6 +301,7 @@ function TemplateTargetSelector() {
 export default function TemplateCatalog({ templates }) {
   const previewSlug = useSettingsStore((s) => s.previewSlug)
   const templateFeedback = useSettingsStore((s) => s.templateFeedback)
+  const installedStateLoaded = useSettingsStore((s) => s.installedStateLoaded)
 
   if (!templates || Object.keys(templates).length === 0) {
     return (
@@ -300,7 +318,11 @@ export default function TemplateCatalog({ templates }) {
     : null
 
   return (
-    <div className="max-w-4xl mx-auto px-4 py-6 lg:py-8">
+    <div
+      className="max-w-4xl mx-auto px-4 py-6 lg:py-8"
+      data-hub-templates-target="catalog"
+      data-hub-templates-ready={installedStateLoaded ? '' : undefined}
+    >
       <TemplateTargetSelector />
 
       {previewTemplate ? (

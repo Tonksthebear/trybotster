@@ -85,15 +85,16 @@ export default function NewSessionChooser({ hubId }) {
         : 'Choose a spawn target first. Session type comes after location.'
 
   return (
-    <Dialog open={open} onClose={close} size="sm">
+    <Dialog open={open} onClose={close} size="sm" data-testid="new-session-chooser-modal">
       <DialogTitle>New Session</DialogTitle>
       <DialogDescription>{prompt}</DialogDescription>
 
       <DialogBody>
-        <Field disabled={!hubReady}>
+        <Field disabled={!hubReady} data-new-session-chooser-target="targetSection">
           <Label>Spawn target</Label>
           <Select
             data-testid="spawn-target-select"
+            data-new-session-chooser-target="targetSelect"
             value={selectedTargetId}
             onChange={(e) => setSelectedTargetId(e.target.value)}
           >
@@ -115,6 +116,7 @@ export default function NewSessionChooser({ hubId }) {
           <button
             type="button"
             data-testid="choose-agent"
+            data-new-session-chooser-target="agentButton"
             disabled={!selectedTargetId}
             onClick={chooseAgent}
             className="group flex flex-col items-center gap-3 rounded-lg border border-zinc-700 bg-zinc-900 p-4 transition-colors hover:border-indigo-500/50 hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:border-zinc-700 disabled:hover:bg-zinc-900"
@@ -133,6 +135,7 @@ export default function NewSessionChooser({ hubId }) {
           <button
             type="button"
             data-testid="choose-accessory"
+            data-new-session-chooser-target="accessoryButton"
             disabled={!selectedTargetId}
             onClick={chooseAccessory}
             className="group flex flex-col items-center gap-3 rounded-lg border border-zinc-700 bg-zinc-900 p-4 transition-colors hover:border-emerald-500/50 hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:border-zinc-700 disabled:hover:bg-zinc-900"

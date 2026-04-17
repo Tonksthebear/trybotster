@@ -68,6 +68,9 @@ export default function SettingsPage({
               key={tab.id}
               type="button"
               onClick={() => setActiveTab(tab.id)}
+              data-tab={tab.id}
+              data-active={activeTab === tab.id ? '' : undefined}
+              data-testid={`settings-tab-${tab.id}`}
               className={clsx(
                 'px-4 py-2 text-sm font-medium transition-colors border-b-2',
                 activeTab === tab.id
@@ -83,21 +86,39 @@ export default function SettingsPage({
 
       {/* Tab panels */}
       <div className="flex-1 overflow-y-auto">
-        {activeTab === 'config' && (
-          <ConfigEditor agentTemplates={agentTemplates} />
-        )}
-        {activeTab === 'templates' && (
-          <TemplateCatalog templates={templates} />
-        )}
-        {activeTab === 'hub' && (
-          <HubInfoPanel
-            hubId={hubId}
-            hubName={hubName}
-            hubIdentifier={hubIdentifier}
-            hubSettingsPath={hubSettingsPath}
-            hubPath={hubPath}
-          />
-        )}
+        <div
+          data-tab-panel="config"
+          data-testid="settings-panel-config"
+          className={activeTab === 'config' ? '' : 'hidden'}
+        >
+          {activeTab === 'config' && (
+            <ConfigEditor agentTemplates={agentTemplates} />
+          )}
+        </div>
+        <div
+          data-tab-panel="templates"
+          data-testid="settings-panel-templates"
+          className={activeTab === 'templates' ? '' : 'hidden'}
+        >
+          {activeTab === 'templates' && (
+            <TemplateCatalog templates={templates} />
+          )}
+        </div>
+        <div
+          data-tab-panel="hub"
+          data-testid="settings-panel-hub"
+          className={activeTab === 'hub' ? '' : 'hidden'}
+        >
+          {activeTab === 'hub' && (
+            <HubInfoPanel
+              hubId={hubId}
+              hubName={hubName}
+              hubIdentifier={hubIdentifier}
+              hubSettingsPath={hubSettingsPath}
+              hubPath={hubPath}
+            />
+          )}
+        </div>
       </div>
     </div>
   )

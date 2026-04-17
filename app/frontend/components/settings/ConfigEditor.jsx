@@ -127,6 +127,7 @@ function FileEntry({ filePath, label, exists, selected, onSelect }) {
     <button
       type="button"
       onClick={() => onSelect(filePath)}
+      data-file-path={filePath}
       className={clsx(
         'w-full text-left px-2.5 py-1.5 rounded border border-zinc-700/50',
         'hover:border-zinc-700 hover:bg-zinc-800/50 transition-colors',
@@ -245,7 +246,7 @@ function EmptyState({ agentTemplates }) {
   }
 
   return (
-    <div className="py-4">
+    <div className="py-4" data-hub-setup-banner-target="banner">
       <h3 className="text-sm font-medium text-zinc-300 mb-1">Get Started</h3>
       <Text className="!text-xs mb-4">
         Choose a session template to initialize your hub:
@@ -259,6 +260,7 @@ function EmptyState({ agentTemplates }) {
               type="button"
               disabled={installing === template.dest}
               onClick={() => handleQuickSetup(template.dest, template.content)}
+              data-action="hub-setup-banner#quickSetup"
               className="w-full text-left px-3 py-2.5 rounded-lg border border-zinc-700/50 hover:border-primary-500/30 hover:bg-zinc-800/50 transition-colors group/card disabled:opacity-50"
             >
               <div className="flex items-center justify-between">
@@ -279,6 +281,7 @@ function EmptyState({ agentTemplates }) {
       <button
         type="button"
         onClick={initBotster}
+        data-action="hub-settings#initBotster"
         className="w-full text-center px-3 py-1.5 text-xs text-zinc-600 hover:text-zinc-400 transition-colors"
       >
         Initialize empty
@@ -319,7 +322,7 @@ function TreeView({ agentTemplates }) {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" data-hub-settings-target="treeContainer">
       {/* Agents */}
       {agentNames.length > 0 && (
         <div className="mt-2">
@@ -492,10 +495,17 @@ function EditorPanel() {
   }
 
   return (
-    <div className="bg-zinc-900/50 border border-zinc-800 rounded-lg">
+    <div
+      className="bg-zinc-900/50 border border-zinc-800 rounded-lg"
+      data-hub-settings-target="editorPanel"
+      data-editor={editorState}
+    >
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
-        <span className="text-sm font-mono text-zinc-400 min-w-0 truncate">
+        <span
+          className="text-sm font-mono text-zinc-400 min-w-0 truncate"
+          data-hub-settings-target="editorTitle"
+        >
           {currentFilePath || 'Select a file'}
         </span>
         <div className="flex items-center gap-2 shrink-0">
@@ -508,6 +518,7 @@ function EditorPanel() {
                 color="emerald"
                 disabled={!dirty}
                 onClick={handleSave}
+                data-hub-settings-target="saveBtn"
                 className="!text-xs !px-3 !py-1.5"
               >
                 {saveLabel}
@@ -548,6 +559,7 @@ function EditorPanel() {
         <textarea
           value={editorContent}
           onChange={(e) => setEditorContent(e.target.value)}
+          data-hub-settings-target="editor"
           className="w-full min-h-[400px] p-4 bg-transparent text-sm font-mono text-zinc-200 placeholder-zinc-600 border-0 focus:ring-0 focus:outline-none resize-y"
           spellCheck="false"
           placeholder="Empty file"
@@ -679,7 +691,11 @@ export default function ConfigEditor({ agentTemplates }) {
           <ScopeSelector />
           <TargetSelector />
 
-          <div className="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4">
+          <div
+            className="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4"
+            data-hub-settings-target="treePanel"
+            data-view={treeState}
+          >
             {(treeState === 'loading' || treeState === 'disconnected') && (
               <div className="py-4 text-center">
                 <Text className="!text-sm">{treeFeedback}</Text>

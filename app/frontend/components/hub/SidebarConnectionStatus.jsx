@@ -103,6 +103,10 @@ export default function SidebarConnectionStatus() {
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
+        data-testid="sidebar-connection-status"
+        data-browser-status={browser}
+        data-connection-state={connection}
+        data-hub-status={hubStatus || 'connecting'}
         className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/50 transition-colors"
       >
         <span className="flex items-center gap-1.5">

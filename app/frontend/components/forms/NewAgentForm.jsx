@@ -221,15 +221,20 @@ export default function NewAgentForm({ hubId }) {
       : 'Choose a spawn target to unlock worktree and branch selection.'
 
   return (
-    <Dialog open={open} onClose={close} size="lg">
+    <Dialog open={open} onClose={close} size="lg" data-testid="new-agent-modal">
       <DialogTitle>New Agent</DialogTitle>
 
       {step === 1 ? (
         <DialogBody>
           {/* Target selection */}
-          <Field>
+          <Field data-new-agent-form-target="targetSection">
             <Label>Spawn target</Label>
-            <Select value={selectedTargetId} onChange={handleTargetChange}>
+            <Select
+              data-testid="new-agent-target-select"
+              data-new-agent-form-target="targetSelect"
+              value={selectedTargetId}
+              onChange={handleTargetChange}
+            >
               <option value="">
                 {spawnTargets.length ? 'Select a spawn target' : 'No admitted spawn targets'}
               </option>
@@ -247,11 +252,12 @@ export default function NewAgentForm({ hubId }) {
 
           {/* Worktree/branch options — visible when target selected */}
           {selectedTargetId && (
-            <div className="mt-6 space-y-4">
+            <div className="mt-6 space-y-4" data-new-agent-form-target="worktreeOptions">
               {/* Main branch */}
               <button
                 type="button"
                 onClick={selectMainBranch}
+                data-action="new-agent-form#selectMainBranch"
                 className="w-full text-left px-4 py-3 rounded-lg border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:border-zinc-600 transition-colors"
               >
                 <div className="flex items-center gap-2">
@@ -406,7 +412,7 @@ export default function NewAgentForm({ hubId }) {
           Cancel
         </Button>
         {step === 2 && (
-          <Button color="indigo" onClick={handleSubmit}>
+          <Button color="indigo" onClick={handleSubmit} data-action="new-agent-form#submit">
             Create Agent
           </Button>
         )}

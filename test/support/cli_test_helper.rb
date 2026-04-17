@@ -246,6 +246,8 @@ module CliTestHelper
   def start_cli(hub, **options)
     build_cli unless skip_build?
 
+    hub = resolve_test_hub!(hub)
+
     # Create temp directory for CLI data
     temp_dir = options[:temp_dir] || Dir.mktmpdir("cli_test_")
     device_identity = prepare_cli_identity!(hub, temp_dir)
@@ -415,12 +417,26 @@ module CliTestHelper
   end
 
   def create_hub_token_for_hub(hub)
+    hub = resolve_test_hub!(hub)
+
     # Create a hub token for the CLI to authenticate
     # Returns the HubToken record (not just the token string) for cleanup
     hub.hub_token || hub.create_hub_token!(name: "CLI Test Token #{SecureRandom.hex(4)}")
   end
 
+  def resolve_test_hub!(hub)
+    persisted = Hub.find_by(id: hub.id) || hub.user.hubs.find_by(identifier: hub.identifier)
+    return persisted if persisted
+
+    hub.user.hubs.create!(
+      identifier: hub.identifier.presence || "test-hub-#{SecureRandom.hex(8)}",
+      last_seen_at: Time.current,
+      fingerprint: hub.fingerprint
+    )
+  end
+
   def prepare_cli_identity!(hub, temp_dir)
+    hub = resolve_test_hub!(hub)
     device_identity = load_or_create_cli_device_identity(temp_dir)
     target_identifier = device_hub_identifier(device_identity[:fingerprint])
 

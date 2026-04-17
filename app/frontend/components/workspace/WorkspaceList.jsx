@@ -46,6 +46,8 @@ function NewSessionButton({ density, onClick, disabled }) {
         type="button"
         onClick={onClick}
         disabled={disabled}
+        data-testid="new-session-button"
+        commandfor="new-session-chooser-modal"
         className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-500 disabled:hover:bg-transparent"
       >
         <svg className="size-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -61,6 +63,8 @@ function NewSessionButton({ density, onClick, disabled }) {
       type="button"
       onClick={onClick}
       disabled={disabled}
+      data-testid="new-session-button"
+      commandfor="new-session-chooser-modal"
       className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-700 py-3 text-sm text-zinc-500 hover:text-zinc-300 hover:border-zinc-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-zinc-500 disabled:hover:border-zinc-700"
     >
       <svg className="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">

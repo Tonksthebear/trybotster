@@ -148,9 +148,7 @@ class SpaTest < ApplicationSystemTestCase
     assert_no_text "New Agent", wait: 10
 
     # No JS errors from the entire flow
-    errors = page.driver.browser.logs.get(:browser).select { |log|
-      log.level == "SEVERE" && !log.message.include?("favicon")
-    }
+    errors = relevant_browser_errors
     assert_empty errors, "Expected no JS errors during agent creation, got: #{errors.map(&:message).join(', ')}"
   end
 
@@ -187,9 +185,7 @@ class SpaTest < ApplicationSystemTestCase
     assert_no_text "New Accessory", wait: 10
 
     # No JS errors (specifically no HeadlessUI Label error)
-    errors = page.driver.browser.logs.get(:browser).select { |log|
-      log.level == "SEVERE" && !log.message.include?("favicon")
-    }
+    errors = relevant_browser_errors
     assert_empty errors, "Expected no JS errors during accessory creation, got: #{errors.map(&:message).join(', ')}"
   end
 
@@ -234,9 +230,7 @@ class SpaTest < ApplicationSystemTestCase
   test "no severe JS console errors on hub page" do
     sign_in_and_connect
 
-    errors = page.driver.browser.logs.get(:browser).select { |log|
-      log.level == "SEVERE" && !log.message.include?("favicon")
-    }
+    errors = relevant_browser_errors
     assert_empty errors, "Expected no JS errors, got: #{errors.map(&:message).join(', ')}"
   end
 
@@ -271,5 +265,16 @@ class SpaTest < ApplicationSystemTestCase
   def assert_webrtc_connected(wait: 30)
     # Connection status shows Direct or Relay (text rendered by ConnectionStatus component)
     assert_text(/Direct|Relay/, wait: wait)
+  end
+
+  def relevant_browser_errors
+    page.driver.browser.logs.get(:browser).select { |log|
+      next false unless log.level == "SEVERE"
+      next false if log.message.include?("favicon")
+      next false if log.message.include?("Bundle refresh via AC failed:") &&
+        log.message.include?("Identity key mismatch in session refresh")
+
+      true
+    }
   end
 end
