@@ -231,7 +231,7 @@ class HubTest < ActiveSupport::TestCase
       Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current, alive: true)
     end
 
-    assert_equal [[ @user, { type: "refresh" } ]], broadcasts
+    assert_equal [ [ @user, { type: "refresh" } ] ], broadcasts
   end
 
   test "marking hub offline broadcasts health status change" do
@@ -251,7 +251,7 @@ class HubTest < ActiveSupport::TestCase
       hub.update!(alive: false)
     end
 
-    assert_equal [[ @user, { type: "refresh" } ]], broadcasts
+    assert_equal [ [ @user, { type: "refresh" } ] ], broadcasts
   end
 
   test "destroying a hub broadcasts a hub list refresh" do
@@ -262,7 +262,7 @@ class HubTest < ActiveSupport::TestCase
       hub.destroy!
     end
 
-    assert_equal [[ @user, { type: "refresh" } ]], broadcasts
+    assert_equal [ [ @user, { type: "refresh" } ] ], broadcasts
   end
 
   test "heartbeat-only update does not broadcast health when status unchanged" do

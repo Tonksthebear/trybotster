@@ -25,6 +25,18 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_select "#app"
   end
 
+  test "index json includes fingerprint for booting handoff matching" do
+    sign_in @user
+    get hubs_path, as: :json
+    assert_response :success
+
+    json = JSON.parse(response.body)
+    active = json.find { |hub| hub["id"] == @active_hub.id }
+
+    assert_equal @active_hub.identifier, active["identifier"]
+    assert_equal @active_hub.fingerprint, active["fingerprint"]
+  end
+
   # === Show HTML Tests ===
 
   test "show requires authentication" do

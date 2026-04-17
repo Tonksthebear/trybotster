@@ -21,6 +21,7 @@ class HubsController < ApplicationController
             id: hub.id,
             name: hub.name,
             identifier: hub.identifier,
+            fingerprint: hub.fingerprint,
             active: hub.active?,
             last_seen_at: hub.last_seen_at&.iso8601
           }

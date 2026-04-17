@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+RUBOCOP_CACHE_ROOT="${PROJECT_ROOT}/tmp/rubocop-cache"
+
+cd "$PROJECT_ROOT"
+mkdir -p "$RUBOCOP_CACHE_ROOT"
+
+echo "Running Ruby lint..."
+RUBOCOP_CACHE_ROOT="$RUBOCOP_CACHE_ROOT" bin/rubocop "$@"
+
+echo
+echo "Running Brakeman..."
+bin/brakeman --quiet --no-pager --exit-on-warn --exit-on-error

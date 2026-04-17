@@ -191,7 +191,7 @@ describe('AppRoutes', () => {
     expect(screen.getByTestId('location')).toHaveTextContent('/hubs?booting=1')
   })
 
-  it('claims a newly approved hub on the first booting poll when the fingerprint already exists', async () => {
+  it('claims a newly approved hub on the first booting poll when the hub list includes the pending fingerprint', async () => {
     const selectHub = vi.fn(() => Promise.resolve())
     const hubs = [{ id: 7, name: 'Fresh Hub', identifier: 'hub-7', fingerprint: 'aa:bb', active: true }]
     const fetchHubList = vi.fn().mockResolvedValue(hubs)

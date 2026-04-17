@@ -9,7 +9,9 @@
 
 # Make sure RUBY_VERSION matches the Ruby version in .ruby-version
 ARG RUBY_VERSION=3.3.6
+ARG NODE_VERSION=22.19.0
 FROM docker.io/library/ruby:$RUBY_VERSION-slim AS base
+FROM docker.io/library/node:$NODE_VERSION-slim AS node
 
 # Rails app lives here
 WORKDIR /rails
@@ -34,6 +36,13 @@ FROM base AS build
 RUN apt-get update -qq && \
   apt-get install --no-install-recommends -y build-essential git libpq-dev libyaml-dev pkg-config && \
   rm -rf /var/lib/apt/lists /var/cache/apt/archives
+
+# Vite asset compilation requires Node.js and npm during the build stage.
+COPY --from=node /usr/local/ /usr/local/
+
+# Install JavaScript dependencies before copying the full app for better layer reuse.
+COPY package.json package-lock.json ./
+RUN npm ci
 
 # Install application gems
 COPY Gemfile Gemfile.lock vendor ./
