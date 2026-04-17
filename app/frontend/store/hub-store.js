@@ -1,7 +1,11 @@
 import { create } from 'zustand'
 import { connect, disconnect, getHub } from '../lib/hub-bridge'
+import { getActionCableConsumer } from '../lib/transport/hub_signaling_client'
 
 const LAST_HUB_KEY = 'botster:lastHubId'
+let hubListSubscription = null
+let hubListSubscriptionPromise = null
+let hubListSubscriptionCount = 0
 
 export const useHubStore = create((set, get) => ({
   hubList: [],
@@ -135,6 +139,47 @@ export const useHubStore = create((set, get) => ({
 
   getLastHubId: () => localStorage.getItem(LAST_HUB_KEY),
 }))
+
+export async function subscribeHubListUpdates() {
+  hubListSubscriptionCount += 1
+
+  if (!hubListSubscriptionPromise) {
+    hubListSubscriptionPromise = getActionCableConsumer().then((consumer) => {
+      hubListSubscription = consumer.subscriptions.create(
+        { channel: 'HubListChannel' },
+        {
+          received: (data) => {
+            if (data?.type === 'refresh') void useHubStore.getState().fetchHubList()
+          },
+        }
+      )
+
+      return hubListSubscription
+    })
+  }
+
+  await hubListSubscriptionPromise
+
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+
+    hubListSubscriptionCount = Math.max(0, hubListSubscriptionCount - 1)
+    if (hubListSubscriptionCount === 0 && hubListSubscription) {
+      hubListSubscription.unsubscribe()
+      hubListSubscription = null
+      hubListSubscriptionPromise = null
+    }
+  }
+}
+
+export function resetHubListSubscriptionForTest() {
+  hubListSubscriptionCount = 0
+  hubListSubscription?.unsubscribe()
+  hubListSubscription = null
+  hubListSubscriptionPromise = null
+}
 
 function applyConnectionStatus(set, get, hubId, status) {
   if (get().selectedHubId !== hubId) return

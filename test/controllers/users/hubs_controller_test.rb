@@ -30,5 +30,18 @@ module Users
     ensure
       authorization&.destroy
     end
+
+    test "approve redirects to the booting handoff with the pending fingerprint" do
+      authorization = HubAuthorization.create!(device_name: "Test CLI", fingerprint: "aa:bb:cc")
+
+      post users_hubs_path, params: { approve: "1", code: authorization.user_code }
+
+      assert_redirected_to hubs_path(booting: 1, pending_fingerprint: "aa:bb:cc")
+      authorization.reload
+      assert_equal "approved", authorization.status
+      assert_equal @user, authorization.user
+    ensure
+      authorization&.destroy
+    end
   end
 end

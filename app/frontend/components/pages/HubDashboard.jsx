@@ -1,30 +1,10 @@
-import React, { useState, useEffect } from 'react'
+import React from 'react'
 import { Link } from 'react-router-dom'
+import { useHubStore } from '../../store/hub-store'
 
 export default function HubDashboard() {
-  const [hubs, setHubs] = useState([])
-  const [loading, setLoading] = useState(true)
-
-  useEffect(() => {
-    fetch('/hubs.json', {
-      headers: { Accept: 'application/json' },
-      credentials: 'same-origin',
-    })
-      .then((res) => {
-        if (res.status === 401 || res.redirected) {
-          window.location.href = '/github/authorization/new'
-          return null
-        }
-        if (!res.ok) throw new Error(`${res.status}`)
-        return res.json()
-      })
-      .then((data) => {
-        if (!data) return
-        setHubs(Array.isArray(data) ? data : data.hubs || [])
-        setLoading(false)
-      })
-      .catch(() => setLoading(false))
-  }, [])
+  const hubs = useHubStore((s) => s.hubList)
+  const loading = useHubStore((s) => s.hubListLoading)
 
   return (
     <div className="min-h-full">

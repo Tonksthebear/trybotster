@@ -3,8 +3,16 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, waitFor, act, cleanup } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import { AppRoutes } from '../components/AppShell'
-import { useHubStore } from '../store/hub-store'
+import { resetHubListSubscriptionForTest, useHubStore } from '../store/hub-store'
 import { setHubId } from '../lib/modal-bridge'
+
+vi.mock('../lib/transport/hub_signaling_client', () => ({
+  getActionCableConsumer: vi.fn(async () => ({
+    subscriptions: {
+      create: vi.fn(() => ({ unsubscribe: vi.fn() })),
+    },
+  })),
+}))
 
 vi.mock('../components/pages/Home', () => ({
   default: () => <div>Home Route</div>,
@@ -110,6 +118,7 @@ function renderRoutes(initialEntry) {
 describe('AppRoutes', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetHubListSubscriptionForTest()
 
     useHubStore.setState({
       hubList: [],
@@ -128,6 +137,7 @@ describe('AppRoutes', () => {
 
   afterEach(() => {
     cleanup()
+    resetHubListSubscriptionForTest()
     vi.useRealTimers()
   })
 
@@ -179,6 +189,27 @@ describe('AppRoutes', () => {
 
     expect(selectHub).not.toHaveBeenCalled()
     expect(screen.getByTestId('location')).toHaveTextContent('/hubs?booting=1')
+  })
+
+  it('claims a newly approved hub on the first booting poll when the fingerprint already exists', async () => {
+    const selectHub = vi.fn(() => Promise.resolve())
+    const hubs = [{ id: 7, name: 'Fresh Hub', identifier: 'hub-7', fingerprint: 'aa:bb', active: true }]
+    const fetchHubList = vi.fn().mockResolvedValue(hubs)
+
+    useHubStore.setState({
+      hubList: [],
+      hubListLoading: false,
+      fetchHubList,
+      selectHub,
+      getLastHubId: vi.fn(() => '99'),
+    })
+
+    renderRoutes('/hubs?booting=1&pending_fingerprint=aa%3Abb')
+
+    await waitFor(() => {
+      expect(selectHub).toHaveBeenCalledWith(7)
+      expect(screen.getByTestId('location')).toHaveTextContent('/hubs/7')
+    })
   })
 
   it('syncs the selected hub ID into the modal bridge on hub routes', async () => {

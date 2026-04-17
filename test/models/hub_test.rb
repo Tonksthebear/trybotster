@@ -224,6 +224,16 @@ class HubTest < ActiveSupport::TestCase
     end
   end
 
+  test "creating a hub broadcasts a hub list refresh" do
+    broadcasts = []
+
+    HubListChannel.stub :broadcast_to, ->(user, payload) { broadcasts << [ user, payload ] } do
+      Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current, alive: true)
+    end
+
+    assert_equal [[ @user, { type: "refresh" } ]], broadcasts
+  end
+
   test "marking hub offline broadcasts health status change" do
     hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current, alive: true)
     health_stream = "hub:#{hub.id}:health"
@@ -233,6 +243,28 @@ class HubTest < ActiveSupport::TestCase
     end
   end
 
+  test "marking hub offline broadcasts a hub list refresh" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current, alive: true)
+    broadcasts = []
+
+    HubListChannel.stub :broadcast_to, ->(user, payload) { broadcasts << [ user, payload ] } do
+      hub.update!(alive: false)
+    end
+
+    assert_equal [[ @user, { type: "refresh" } ]], broadcasts
+  end
+
+  test "destroying a hub broadcasts a hub list refresh" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: Time.current, alive: true)
+    broadcasts = []
+
+    HubListChannel.stub :broadcast_to, ->(user, payload) { broadcasts << [ user, payload ] } do
+      hub.destroy!
+    end
+
+    assert_equal [[ @user, { type: "refresh" } ]], broadcasts
+  end
+
   test "heartbeat-only update does not broadcast health when status unchanged" do
     hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: 30.seconds.ago, alive: true)
     health_stream = "hub:#{hub.id}:health"
@@ -240,5 +272,16 @@ class HubTest < ActiveSupport::TestCase
     assert_no_broadcasts(health_stream) do
       hub.update!(last_seen_at: Time.current)
     end
+  end
+
+  test "heartbeat-only update does not broadcast a hub list refresh when status is unchanged" do
+    hub = Hub.create!(user: @user, identifier: SecureRandom.uuid, last_seen_at: 30.seconds.ago, alive: true)
+    broadcasts = []
+
+    HubListChannel.stub :broadcast_to, ->(user, payload) { broadcasts << [ user, payload ] } do
+      hub.update!(last_seen_at: Time.current)
+    end
+
+    assert_empty broadcasts
   end
 end

@@ -14,6 +14,7 @@ class Hub < ApplicationRecord
   scope :stale, -> { where(alive: false).or(where("last_seen_at <= ?", 2.minutes.ago)) }
   scope :with_notifications, -> { where(notifications_enabled: true) }
 
+  after_commit :broadcast_hubs_list, if: :hub_list_commit?
   after_update_commit :broadcast_health_status, if: :health_status_changed?
   after_destroy_commit :broadcast_health_offline
 
@@ -47,6 +48,10 @@ class Hub < ApplicationRecord
     ActionCable.server.broadcast("hub:#{id}:health", { type: "health", cli: "offline" })
   end
 
+  def broadcast_hubs_list
+    HubListChannel.broadcast_to(user, { type: "refresh" })
+  end
+
   # Only broadcast when active? status actually transitions
   def health_status_changed?
     return true if saved_change_to_alive?
@@ -60,6 +65,14 @@ class Hub < ApplicationRecord
     is_active = alive? && new_last_seen.present? && new_last_seen > threshold
 
     was_active != is_active
+  end
+
+  def hub_list_changed?
+    health_status_changed? || saved_change_to_name? || saved_change_to_identifier?
+  end
+
+  def hub_list_commit?
+    transaction_include_any_action?([ :create, :destroy ]) || hub_list_changed?
   end
 
   # Broadcast hub health status to ActionCable health stream

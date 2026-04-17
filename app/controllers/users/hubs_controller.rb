@@ -47,7 +47,7 @@ module Users
       end
 
       @authorization.approve!(current_user)
-      redirect_to hubs_path(booting: 1)
+      redirect_to hubs_path(booting: 1, pending_fingerprint: @authorization.fingerprint)
     end
 
     def lookup_and_redirect

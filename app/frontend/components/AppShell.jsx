@@ -29,7 +29,7 @@ import ConnectionOverlay from './hub/ConnectionOverlay'
 import DialogHost from './DialogHost'
 import TerminalCache from './terminal/TerminalCache'
 import { setHubId } from '../lib/modal-bridge'
-import { useHubStore } from '../store/hub-store'
+import { subscribeHubListUpdates, useHubStore } from '../store/hub-store'
 
 // Lazy-loaded route components
 const Home = React.lazy(() => import('./pages/Home'))
@@ -106,6 +106,7 @@ function HubShell() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const isBooting = searchParams.get('booting') === '1'
+  const pendingFingerprint = searchParams.get('pending_fingerprint')
   const initialHubIdsRef = useRef(null)
   const selectedHubId = useHubStore((s) => s.selectedHubId)
   const connectionState = useHubStore((s) => s.connectionState)
@@ -120,6 +121,25 @@ function HubShell() {
     fetchHubList()
   }, [fetchHubList])
 
+  useEffect(() => {
+    let cancelled = false
+    let unsubscribe = null
+
+    subscribeHubListUpdates().then((cleanup) => {
+      if (cancelled) {
+        cleanup()
+        return
+      }
+
+      unsubscribe = cleanup
+    })
+
+    return () => {
+      cancelled = true
+      unsubscribe?.()
+    }
+  }, [])
+
   // Poll while waiting for a newly approved hub to register.
   // After Users::HubsController#create, the browser is redirected here before
   // the CLI finishes its POST /hubs, so the initial fetch returns stale data.
@@ -133,6 +153,16 @@ function HubShell() {
     const tick = async () => {
       const hubs = await fetchHubList()
       if (cancelled) return
+
+      const matchedHub = pendingFingerprint
+        ? hubs.find((h) => h.fingerprint === pendingFingerprint)
+        : null
+      if (matchedHub) {
+        initialHubIdsRef.current = null
+        selectHub(matchedHub.id)
+        navigate(`/hubs/${matchedHub.id}`, { replace: true })
+        return
+      }
 
       if (initialHubIdsRef.current === null) {
         initialHubIdsRef.current = new Set(hubs.map((h) => String(h.id)))
@@ -156,7 +186,7 @@ function HubShell() {
       cancelled = true
       clearInterval(interval)
     }
-  }, [isBooting, fetchHubList, selectHub, navigate])
+  }, [isBooting, pendingFingerprint, fetchHubList, selectHub, navigate])
 
   // Auto-select last-used hub when at /hubs (no hub in URL)
   useEffect(() => {

@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { useHubStore } from '../store/hub-store'
+import { waitFor } from '@testing-library/react'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { resetHubListSubscriptionForTest, subscribeHubListUpdates, useHubStore } from '../store/hub-store'
 
 // Mock hub-bridge
 const mockConnect = vi.fn(() => Promise.resolve({ connectionId: 42 }))
@@ -12,6 +13,16 @@ vi.mock('../lib/hub-bridge', () => ({
   getHub: (...args) => mockGetHub(...args),
 }))
 
+const mockSubscriptionCreate = vi.fn()
+
+vi.mock('../lib/transport/hub_signaling_client', () => ({
+  getActionCableConsumer: vi.fn(async () => ({
+    subscriptions: {
+      create: (...args) => mockSubscriptionCreate(...args),
+    },
+  })),
+}))
+
 // Mock fetch for hub list
 const mockHubs = [
   { id: 1, name: 'Hub Alpha', identifier: 'alpha', active: true },
@@ -22,6 +33,7 @@ describe('hub-store', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.clear()
+    resetHubListSubscriptionForTest()
     useHubStore.setState({
       hubList: [],
       hubListLoading: true,
@@ -31,6 +43,10 @@ describe('hub-store', () => {
       _connectionRef: null,
       _statusUnsub: null,
     })
+  })
+
+  afterEach(() => {
+    resetHubListSubscriptionForTest()
   })
 
   describe('fetchHubList', () => {
@@ -111,6 +127,36 @@ describe('hub-store', () => {
 
       expect(useHubStore.getState().connectionState).toBe('error')
       expect(useHubStore.getState().connectionDetail).toBe('Connection refused')
+    })
+  })
+
+  describe('subscribeHubListUpdates', () => {
+    it('refreshes the shared hub list when the cable channel broadcasts', async () => {
+      let received
+      const unsubscribe = vi.fn()
+      mockSubscriptionCreate.mockImplementation((_identifier, callbacks) => {
+        received = callbacks.received
+        return { unsubscribe }
+      })
+
+      globalThis.fetch = vi.fn(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          redirected: false,
+          json: () => Promise.resolve(mockHubs),
+        })
+      )
+
+      const cleanup = await subscribeHubListUpdates()
+      await received({ type: 'refresh' })
+
+      await waitFor(() => {
+        expect(useHubStore.getState().hubList).toEqual(mockHubs)
+      })
+
+      cleanup()
+      expect(unsubscribe).toHaveBeenCalledTimes(1)
     })
   })
 
