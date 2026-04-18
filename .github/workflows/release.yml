@@ -128,6 +128,20 @@ jobs:
         with:
           bundler-cache: true
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build Vite assets
+        env:
+          RAILS_ENV: test
+        run: bin/vite build --mode=test
+
       - name: Run tests
         env:
           RAILS_ENV: test
@@ -173,6 +187,20 @@ jobs:
         uses: ruby/setup-ruby@v1
         with:
           bundler-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build Vite assets
+        env:
+          RAILS_ENV: test
+        run: bin/vite build --mode=test
 
       - name: Run system tests
         env:
