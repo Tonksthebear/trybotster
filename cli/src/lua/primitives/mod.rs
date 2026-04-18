@@ -52,6 +52,7 @@ pub mod timer;
 pub mod tui;
 pub mod update;
 pub mod watch;
+pub mod web_layout;
 pub mod webrtc;
 pub mod websocket;
 pub mod worktree;
@@ -126,6 +127,7 @@ pub fn register_all(lua: &Lua) -> Result<()> {
     spawn_targets::register(lua)?;
     hook_timeout::register(lua)?;
     crate::ui_contract::lua::register(lua)?;
+    web_layout::register(lua)?;
     Ok(())
 }
 
