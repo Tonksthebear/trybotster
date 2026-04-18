@@ -1,55 +1,67 @@
 import React from 'react'
-import { Badge, BadgeButton } from '../catalyst/badge'
-import { safeUrl } from '../../lib/actions'
+import clsx from 'clsx'
+import {
+  UiTree,
+  createHubDispatch,
+  DEFAULT_WEB_CAPABILITIES,
+} from '../../ui_contract'
+import { hostedPreviewIndicator } from '../../ui_contract/composites'
 
-const statusColor = {
-  running: 'emerald',
-  starting: 'amber',
-  error: 'red',
-}
+export default function HostedPreviewIndicator({
+  sessionId,
+  sessionUuid,
+  hubId,
+  status,
+  url,
+  error,
+  density = 'panel',
+  capabilities,
+}) {
+  const result = hostedPreviewIndicator({
+    sessionId: sessionId ?? '',
+    sessionUuid: sessionUuid ?? '',
+    hubId: hubId ?? '',
+    status,
+    url,
+    error,
+    density,
+  })
+  if (!result.node) return null
 
-const statusLabel = {
-  running: 'Running',
-  starting: 'Starting\u2026',
-  error: 'Error',
-}
+  // Capability-gated native tooltip. Badge/Button primitives don't carry a
+  // tooltip prop — keeping them spec-clean — so we wrap at the composite
+  // layer when `capabilities.tooltip === true`. Per Phase A's
+  // UiCapabilitySetV1: callers pass the live capability set to override the
+  // default. Without a caller override we fall back to DEFAULT_WEB_CAPABILITIES
+  // so plain browser surfaces keep working. The SAME capability set flows into
+  // UiTree so primitives render under the same assumptions.
+  const effectiveCapabilities = capabilities ?? DEFAULT_WEB_CAPABILITIES
 
-export default function HostedPreviewIndicator({ status, url, error, density }) {
-  const visible = status === 'running' || status === 'starting' || status === 'error'
-  if (!visible) return null
+  const tree = (
+    <UiTree
+      node={result.node}
+      dispatch={createHubDispatch(hubId ?? '')}
+      capabilities={effectiveCapabilities}
+    />
+  )
 
-  const color = statusColor[status]
-  const label = statusLabel[status]
-  const validUrl = safeUrl(url)
-  const isClickable = status === 'running' && validUrl
-
-  if (isClickable) {
-    return (
-      <BadgeButton
-        color={color}
-        href={validUrl}
-        target="_blank"
-        rel="noopener noreferrer"
-        onClick={(e) => e.stopPropagation()}
-        title="Open Cloudflare preview"
-        className="shrink-0"
-      >
-        {label}
-      </BadgeButton>
+  const supportsTooltip = effectiveCapabilities.tooltip === true
+  const content =
+    supportsTooltip && result.tooltipTitle ? (
+      <span title={result.tooltipTitle}>{tree}</span>
+    ) : (
+      tree
     )
-  }
 
   return (
-    <Badge
-      color={color}
-      className="shrink-0"
-      title={
-        status === 'starting'
-          ? 'Cloudflare preview is starting'
-          : error || 'Cloudflare preview status'
-      }
+    <span
+      className={clsx(
+        'inline-flex shrink-0',
+        density === 'sidebar' ? 'mr-1' : 'mr-2',
+      )}
+      onClick={(e) => e.stopPropagation()}
     >
-      {label}
-    </Badge>
+      {content}
+    </span>
   )
 }

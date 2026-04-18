@@ -9,10 +9,19 @@ import {
   previewState,
 } from '../../store/workspace-store'
 import { dispatch, ACTION } from '../../lib/actions'
+import { UiTree, createHubDispatch } from '../../ui_contract'
+import { sessionRowContent } from '../../ui_contract/composites'
+import { IconGlyph } from '../../ui_contract/icons'
 import SessionActionsMenu from './SessionActionsMenu'
 import HostedPreviewIndicator from './HostedPreviewIndicator'
 import HostedPreviewError from './HostedPreviewError'
 
+// SessionRow keeps its outer container + `<a href>` as JSX:
+// - The anchor preserves right-click/middle-click open-in-new-tab.
+// - The outer container owns density-specific hover/selected/notification
+//   styling that is Rails-surface-owned (not part of the v1 primitive spec).
+// Inner content (activity dot + title + title line + subtext) is built from
+// v1 primitives via `sessionRowContent` and rendered through `UiTree`.
 export default function SessionRow({ sessionId, hubId, surface }) {
   const session = useWorkspaceStore((s) => s.sessionsById[sessionId])
   const selected = useWorkspaceStore((s) => s.selectedSessionId === sessionId)
@@ -50,6 +59,19 @@ export default function SessionRow({ sessionId, hubId, surface }) {
     })
   }
 
+  const contentNode = sessionRowContent({
+    primaryName,
+    titleLine,
+    subtext,
+    selected,
+    sessionType,
+    activityState,
+    density,
+  })
+  const contentTree = (
+    <UiTree node={contentNode} dispatch={createHubDispatch(hubId ?? '')} />
+  )
+
   if (isSidebar) {
     return (
       <div
@@ -70,29 +92,17 @@ export default function SessionRow({ sessionId, hubId, surface }) {
                 : 'text-zinc-300 hover:text-zinc-100'
             )}
           >
-            <div className="flex items-center gap-1.5 min-w-0">
-              <ActivityIndicator state={activityState} density="sidebar" />
-              <span
-                className={clsx(
-                  'truncate font-mono text-xs block',
-                  isAccessory && 'text-zinc-400'
-                )}
-              >
-                {primaryName}
-              </span>
-            </div>
-            {titleLine && (
-              <span className="truncate text-[10px] text-zinc-500 italic block">
-                {titleLine}
-              </span>
-            )}
-            <span className="truncate text-[10px] text-zinc-500 block">
-              {subtext}
-            </span>
+            {contentTree}
           </a>
 
           {hostedPreview && (
-            <HostedPreviewIndicator {...hostedPreview} density="sidebar" />
+            <HostedPreviewIndicator
+              sessionId={sessionId}
+              sessionUuid={sessionUuid}
+              hubId={hubId}
+              {...hostedPreview}
+              density="sidebar"
+            />
           )}
 
           <SessionActionsMenu
@@ -107,6 +117,8 @@ export default function SessionRow({ sessionId, hubId, surface }) {
 
         {previewError && (
           <HostedPreviewError
+            sessionUuid={sessionUuid}
+            hubId={hubId}
             error={previewError}
             installUrl={hostedPreview?.installUrl}
             density="sidebar"
@@ -116,7 +128,6 @@ export default function SessionRow({ sessionId, hubId, surface }) {
     )
   }
 
-  // Panel density
   return (
     <div
       className={clsx(
@@ -134,30 +145,18 @@ export default function SessionRow({ sessionId, hubId, surface }) {
           <div className="size-10 rounded-lg bg-zinc-700/50 flex items-center justify-center text-zinc-400 shrink-0">
             <CommandLineIcon />
           </div>
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 min-w-0">
-              <ActivityIndicator state={activityState} density="panel" />
-              <div
-                className={clsx(
-                  'text-sm font-medium truncate font-mono',
-                  isAccessory ? 'text-zinc-400' : 'text-zinc-100'
-                )}
-              >
-                {primaryName}
-              </div>
-            </div>
-            {titleLine && (
-              <div className="text-xs text-zinc-500 italic truncate">
-                {titleLine}
-              </div>
-            )}
-            <div className="text-xs text-zinc-400 truncate">{subtext}</div>
-          </div>
+          <div className="flex-1 min-w-0">{contentTree}</div>
           <ChevronRightIcon />
         </a>
 
         {hostedPreview && (
-          <HostedPreviewIndicator {...hostedPreview} density="panel" />
+          <HostedPreviewIndicator
+            sessionId={sessionId}
+            sessionUuid={sessionUuid}
+            hubId={hubId}
+            {...hostedPreview}
+            density="panel"
+          />
         )}
 
         <SessionActionsMenu
@@ -172,6 +171,8 @@ export default function SessionRow({ sessionId, hubId, surface }) {
 
       {previewError && (
         <HostedPreviewError
+          sessionUuid={sessionUuid}
+          hubId={hubId}
           error={previewError}
           installUrl={hostedPreview?.installUrl}
           density="panel"
@@ -181,57 +182,18 @@ export default function SessionRow({ sessionId, hubId, surface }) {
   )
 }
 
-function ActivityIndicator({ state, density }) {
-  if (state === 'accessory') return null
-
-  const isIdle = state === 'idle'
-  const sizeClass = density === 'sidebar' ? 'text-xs' : 'text-sm'
-
-  return (
-    <span
-      className={clsx(
-        'shrink-0 leading-none',
-        sizeClass,
-        isIdle ? 'text-sky-500' : 'text-emerald-300'
-      )}
-      title={isIdle ? 'Idle' : 'Active'}
-      aria-label={isIdle ? 'Idle' : 'Active'}
-    >
-      {isIdle ? '\u25CC' : '\u273A'}
-    </span>
-  )
-}
-
 function CommandLineIcon() {
   return (
-    <svg
-      className="size-5"
-      fill="none"
-      stroke="currentColor"
-      viewBox="0 0 24 24"
-    >
-      <path
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth={2}
-        d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
-      />
-    </svg>
+    <span className="inline-flex size-5 items-center justify-center">
+      <IconGlyph name="command-line" className="h-full w-full" />
+    </span>
   )
 }
 
 function ChevronRightIcon() {
   return (
-    <svg
-      className="size-5 text-zinc-600 shrink-0"
-      viewBox="0 0 20 20"
-      fill="currentColor"
-    >
-      <path
-        fillRule="evenodd"
-        d="M8.22 5.22a.75.75 0 011.06 0l4.25 4.25a.75.75 0 010 1.06l-4.25 4.25a.75.75 0 01-1.06-1.06L11.94 10 8.22 6.28a.75.75 0 010-1.06z"
-        clipRule="evenodd"
-      />
-    </svg>
+    <span className="inline-flex size-5 shrink-0 items-center justify-center text-zinc-600">
+      <IconGlyph name="chevron-right" className="h-full w-full" />
+    </span>
   )
 }

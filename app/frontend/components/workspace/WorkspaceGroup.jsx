@@ -2,8 +2,16 @@ import React from 'react'
 import clsx from 'clsx'
 import { useWorkspaceStore } from '../../store/workspace-store'
 import { dispatch, ACTION } from '../../lib/actions'
+import { UiTree, createHubDispatch } from '../../ui_contract'
+import { workspaceHeaderContent } from '../../ui_contract/composites'
+import { IconGlyph } from '../../ui_contract/icons'
 import SessionRow from './SessionRow'
 
+// WorkspaceGroup header content (chevron + title + count) is built from v1
+// primitives via `workspaceHeaderContent`. The click-to-toggle container and
+// the hover-revealed rename button remain JSX because neither behavior is
+// expressible via v1 primitives (rename is hover-only, which the spec
+// intentionally does not put on Button / IconButton in v1).
 export default function WorkspaceGroup({ workspaceId, hubId, surface }) {
   const ws = useWorkspaceStore((s) => s.workspacesById[workspaceId])
   const expanded = useWorkspaceStore(
@@ -32,64 +40,44 @@ export default function WorkspaceGroup({ workspaceId, hubId, surface }) {
     })
   }
 
+  const headerNode = workspaceHeaderContent({
+    title,
+    count,
+    expanded,
+    density,
+  })
+
   return (
     <div>
       <div
         onClick={handleToggle}
         className={clsx(
           'flex items-center cursor-pointer select-none group/ws',
-          isSidebar ? 'gap-1.5 px-2 pt-2 pb-1' : 'gap-2 py-2'
+          isSidebar ? 'px-2 pt-2 pb-1' : 'py-2',
+          '[&_[data-icon="chevron-down"]]:transition-transform [&_[data-icon="chevron-down"]]:duration-150',
+          !expanded && '[&_[data-icon="chevron-down"]]:-rotate-90',
+          'uppercase tracking-wider'
         )}
       >
-        <svg
-          className={clsx(
-            'shrink-0 transition-transform duration-150',
-            isSidebar ? 'size-3 text-zinc-600' : 'size-4 text-zinc-500',
-            !expanded && '-rotate-90'
-          )}
-          viewBox="0 0 20 20"
-          fill="currentColor"
-        >
-          <path
-            fillRule="evenodd"
-            d="M6.293 7.293a1 1 0 011.414 0L10 9.586l2.293-2.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z"
-            clipRule="evenodd"
+        <div className="flex-1 min-w-0">
+          <UiTree
+            node={headerNode}
+            dispatch={createHubDispatch(hubId ?? '')}
           />
-        </svg>
-
-        <span
-          className={clsx(
-            'font-medium truncate uppercase tracking-wider',
-            isSidebar
-              ? 'text-[10px] text-zinc-500 group-hover/ws:text-zinc-400'
-              : 'text-xs text-zinc-400 group-hover/ws:text-zinc-300'
-          )}
-        >
-          {title}
-        </span>
-
-        {!isSidebar && (
-          <span className="text-[10px] text-zinc-600 shrink-0">{count}</span>
-        )}
+        </div>
 
         <button
           type="button"
           onClick={handleRename}
           className={clsx(
-            'ml-auto shrink-0 opacity-0 group-hover/ws:opacity-100 transition-opacity',
+            'ml-auto shrink-0 opacity-0 group-hover/ws:opacity-100 transition-opacity inline-flex items-center justify-center',
             isSidebar
-              ? 'p-1 text-zinc-700 hover:text-zinc-400'
-              : 'p-1 text-zinc-600 hover:text-zinc-300'
+              ? 'p-1 text-zinc-700 hover:text-zinc-400 size-5'
+              : 'p-1 text-zinc-600 hover:text-zinc-300 size-6'
           )}
           title="Rename workspace"
         >
-          <svg
-            className={isSidebar ? 'size-3' : 'size-3.5'}
-            viewBox="0 0 20 20"
-            fill="currentColor"
-          >
-            <path d="M2.695 14.763l-1.262 3.154a.5.5 0 00.65.65l3.155-1.262a4 4 0 001.343-.885L17.5 5.5a2.121 2.121 0 00-3-3L3.58 13.42a4 4 0 00-.885 1.343z" />
-          </svg>
+          <IconGlyph name="pencil" className={isSidebar ? 'size-3' : 'size-3.5'} />
         </button>
       </div>
 

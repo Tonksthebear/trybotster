@@ -57,6 +57,7 @@ pub mod screen;
 pub mod smooth_scroll;
 pub mod terminal_modes;
 pub mod terminal_panel;
+pub mod ui_contract_adapter;
 pub mod widget_state;
 
 #[doc(inline)]

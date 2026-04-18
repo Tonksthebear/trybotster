@@ -81,6 +81,10 @@ impl LayoutLua {
     /// * `lua_source` - Lua source code defining `render(state)` and `render_overlay(state)`
     pub fn new(lua_source: &str) -> Result<Self> {
         let lua = Lua::new();
+        // The cross-client UI DSL is shared across the hub and TUI VMs —
+        // see `hub and tui run separate lua vms` in the knowledge vault.
+        crate::ui_contract::lua::register(&lua)
+            .map_err(|e| anyhow!("Failed to register ui primitives: {e}"))?;
         lua.load(lua_source)
             .exec()
             .map_err(|e| anyhow!("Failed to load layout Lua: {e}"))?;
@@ -175,6 +179,24 @@ impl LayoutLua {
             .call(state)
             .map_err(|e| anyhow!("Lua render() failed: {e}"))?;
 
+        // If Lua returned a Phase A `UiNodeV1` tree (top-level `type` is
+        // one of the shared primitives), route through the adapter. Any
+        // other shape — including the legacy `{ type = "hsplit", ... }`
+        // layout tables — falls through to the pre-existing parser.
+        if let Ok(type_name) = result.get::<String>("type") {
+            if crate::tui::ui_contract_adapter::is_ui_node_type(&type_name) {
+                let viewport = crate::tui::ui_contract_adapter::derive_viewport_from_terminal(
+                    ctx.terminal_cols,
+                    ctx.terminal_rows,
+                    false,
+                );
+                let (render, _actions) = crate::tui::ui_contract_adapter::render_lua_ui_node(
+                    &self.lua, &result, &viewport,
+                )?;
+                return Ok(render);
+            }
+        }
+
         RenderNode::from_lua_table(&result)
     }
 
@@ -195,6 +217,25 @@ impl LayoutLua {
         match result {
             LuaValue::Nil => Ok(None),
             LuaValue::Table(table) => {
+                // Mirror the opt-in adapter routing used by `call_render`:
+                // Phase A `UiNodeV1` trees flow through the adapter, the
+                // legacy layout table shape is handled by the existing
+                // parser.
+                if let Ok(type_name) = table.get::<String>("type") {
+                    if crate::tui::ui_contract_adapter::is_ui_node_type(&type_name) {
+                        let viewport =
+                            crate::tui::ui_contract_adapter::derive_viewport_from_terminal(
+                                ctx.terminal_cols,
+                                ctx.terminal_rows,
+                                false,
+                            );
+                        let (node, _actions) =
+                            crate::tui::ui_contract_adapter::render_lua_ui_node(
+                                &self.lua, &table, &viewport,
+                            )?;
+                        return Ok(Some(node));
+                    }
+                }
                 let node = RenderNode::from_lua_table(&table)?;
                 Ok(Some(node))
             }
@@ -634,6 +675,26 @@ fn render_context_to_lua(lua: &Lua, ctx: &RenderContext) -> Result<LuaTable> {
     set_field(&state, "terminal_cols", ctx.terminal_cols)?;
     set_field(&state, "terminal_rows", ctx.terminal_rows)?;
 
+    // Semantic viewport classes — exposed as `ctx.viewport` so Lua authors
+    // can branch on `state.viewport.width_class` etc. rather than hard-code
+    // raw column counts. Terminal mouse support is not currently detected
+    // at this layer; until the TUI exposes a dedicated probe the pointer
+    // is reported as `"none"`, matching the spec's TUI default.
+    let viewport = crate::tui::ui_contract_adapter::derive_viewport_from_terminal(
+        ctx.terminal_cols,
+        ctx.terminal_rows,
+        false,
+    );
+    let viewport_table = lua
+        .create_table()
+        .map_err(|e| anyhow!("Failed to create viewport table: {e}"))?;
+    set_field(&viewport_table, "width_class", viewport_width_str(&viewport))?;
+    set_field(&viewport_table, "height_class", viewport_height_str(&viewport))?;
+    set_field(&viewport_table, "pointer", viewport_pointer_str(&viewport))?;
+    state
+        .set("viewport", viewport_table)
+        .map_err(|e| anyhow!("Failed to set viewport: {e}"))?;
+
     // Status indicators
     set_field(&state, "seconds_since_poll", ctx.seconds_since_poll)?;
     set_field(&state, "poll_interval", ctx.poll_interval)?;
@@ -668,6 +729,36 @@ fn set_field<V: mlua::IntoLua>(table: &LuaTable, key: &str, value: V) -> Result<
     table
         .set(key, value)
         .map_err(|e| anyhow!("Failed to set field '{key}': {e}"))
+}
+
+/// Stringify [`UiWidthClass`] for the `ctx.viewport.width_class` Lua field.
+fn viewport_width_str(viewport: &crate::ui_contract::viewport::UiViewportV1) -> &'static str {
+    use crate::ui_contract::viewport::UiWidthClass;
+    match viewport.width_class {
+        UiWidthClass::Compact => "compact",
+        UiWidthClass::Regular => "regular",
+        UiWidthClass::Expanded => "expanded",
+    }
+}
+
+/// Stringify [`UiHeightClass`] for the `ctx.viewport.height_class` Lua field.
+fn viewport_height_str(viewport: &crate::ui_contract::viewport::UiViewportV1) -> &'static str {
+    use crate::ui_contract::viewport::UiHeightClass;
+    match viewport.height_class {
+        UiHeightClass::Short => "short",
+        UiHeightClass::Regular => "regular",
+        UiHeightClass::Tall => "tall",
+    }
+}
+
+/// Stringify [`UiPointer`] for the `ctx.viewport.pointer` Lua field.
+fn viewport_pointer_str(viewport: &crate::ui_contract::viewport::UiViewportV1) -> &'static str {
+    use crate::ui_contract::viewport::UiPointer;
+    match viewport.pointer {
+        UiPointer::None => "none",
+        UiPointer::Coarse => "coarse",
+        UiPointer::Fine => "fine",
+    }
 }
 
 /// Convert a Lua table to a `serde_json::Value`.

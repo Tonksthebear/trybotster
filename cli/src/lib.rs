@@ -56,6 +56,7 @@ pub mod spawn_targets;
 pub mod terminal;
 pub mod terminal_widget;
 pub mod terminfo;
+pub mod ui_contract;
 
 // Re-export commonly used types
 pub use agent::Agent;

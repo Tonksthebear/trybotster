@@ -7,7 +7,7 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     setupFiles: ['./app/frontend/test/setup.js'],
-    include: ['app/frontend/**/*.test.{js,jsx}'],
+    include: ['app/frontend/**/*.test.{js,jsx,ts,tsx}'],
   },
   resolve: {
     alias: {

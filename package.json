@@ -4,14 +4,19 @@
   "scripts": {
     "test": "vitest --run",
     "test:frontend": "vitest --run",
-    "test:frontend:watch": "vitest"
+    "test:frontend:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^25.6.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
     "jsdom": "^29.0.2",
+    "typescript": "^6.0.3",
     "vite": "^8.0.8",
     "vite-plugin-ruby": "^5.2.1",
     "vitest": "^4.1.4"
