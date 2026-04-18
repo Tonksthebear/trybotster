@@ -11,7 +11,6 @@
 ARG RUBY_VERSION=3.3.6
 ARG NODE_VERSION=22.19.0
 FROM docker.io/library/ruby:$RUBY_VERSION-slim AS base
-FROM docker.io/library/node:$NODE_VERSION-slim AS node
 
 # Rails app lives here
 WORKDIR /rails
@@ -28,6 +27,9 @@ ENV RAILS_ENV="production" \
   BUNDLE_PATH="/usr/local/bundle" \
   BUNDLE_WITHOUT="development" \
   LD_PRELOAD="/usr/local/lib/libjemalloc.so"
+
+# Node image used only as a source for COPY --from=node (asset build).
+FROM docker.io/library/node:$NODE_VERSION-slim AS node
 
 # Throw-away build stage to reduce size of final image
 FROM base AS build
