@@ -125,6 +125,7 @@ pub fn register_all(lua: &Lua) -> Result<()> {
     secrets::register(lua)?;
     spawn_targets::register(lua)?;
     hook_timeout::register(lua)?;
+    crate::ui_contract::lua::register(lua)?;
     Ok(())
 }
 

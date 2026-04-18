@@ -81,6 +81,10 @@ impl LayoutLua {
     /// * `lua_source` - Lua source code defining `render(state)` and `render_overlay(state)`
     pub fn new(lua_source: &str) -> Result<Self> {
         let lua = Lua::new();
+        // The cross-client UI DSL is shared across the hub and TUI VMs —
+        // see `hub and tui run separate lua vms` in the knowledge vault.
+        crate::ui_contract::lua::register(&lua)
+            .map_err(|e| anyhow!("Failed to register ui primitives: {e}"))?;
         lua.load(lua_source)
             .exec()
             .map_err(|e| anyhow!("Failed to load layout Lua: {e}"))?;
