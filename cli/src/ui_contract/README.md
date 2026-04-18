@@ -1,0 +1,287 @@
+# `ui_contract` — cross-client UI DSL (Phase A)
+
+Phase-A foundation of Botster's unified, renderer-agnostic UI contract. This
+module defines **only** shared types + a Lua DSL. It does **not** render
+anything — Phase B (TUI adapter) and Phase C (web React renderer) consume
+these types.
+
+## Specs
+
+This module is the Rust-side source of truth for:
+
+- [`docs/specs/cross-client-ui-primitives.md`](../../../docs/specs/cross-client-ui-primitives.md)
+- [`docs/specs/adaptive-ui-viewport-and-presentation.md`](../../../docs/specs/adaptive-ui-viewport-and-presentation.md)
+- [`docs/specs/web-ui-primitives-runtime.md`](../../../docs/specs/web-ui-primitives-runtime.md)
+
+Knowledge-vault background:
+
+- `~/knowledge/notes/cross-client ui should share semantic primitives and actions with renderer-specific adapters.md`
+- `~/knowledge/notes/phase one web ui composites stay internal while Lua public contract stops at primitives.md`
+- `~/knowledge/notes/rust-registered lua primitives are globals not modules.md`
+- `~/knowledge/notes/hub and tui run separate lua vms.md`
+
+## Module layout
+
+| File | Purpose |
+|---|---|
+| `tokens.rs` | Shared scalar tokens (`UiTone`, `UiAlign`, `UiSpace`, `UiSize`, `UiInteractionDensity`, `UiPresentation`, …). |
+| `viewport.rs` | `UiViewportV1` plus its classes (`UiWidthClass`, `UiHeightClass`, `UiPointer`, `UiOrientation`). |
+| `node.rs` | `UiNodeV1`, `UiChildV1`, `UiActionV1`, `UiCapabilitySetV1`, `UiResponsiveV1<T>`, `UiConditionalV1`, `UiConditionV1`. |
+| `props.rs` | Strongly-typed Props structs for every v1 Lua-public primitive + `DialogPropsV1`. |
+| `lua.rs` | `register(&Lua)` — installs the `ui` table as a Lua global. |
+
+## Wire format
+
+All types serialize as JSON matching the TypeScript types in the specs
+(camelCase fields, lowercase enum variants, string-valued `UiSpace`).
+
+### Node envelope
+
+```json
+{
+  "type": "stack",
+  "id": "…optional stable id…",
+  "props": { "direction": "vertical", "gap": "2" },
+  "children": [ /* UiChildV1 */ ],
+  "slots":    { "title": [ /* UiChildV1 */ ] }
+}
+```
+
+### Responsive values (at any prop-value position)
+
+```json
+{ "$kind": "responsive", "width": { "compact": "vertical", "expanded": "horizontal" } }
+{ "$kind": "responsive", "height": { "short": "sm", "tall": "md" } }
+{ "$kind": "responsive", "width": { … }, "height": { … } }
+```
+
+The two dimensions are split because `"regular"` is valid in both
+`UiWidthClass` and `UiHeightClass`; a flat map would be ambiguous.
+
+### Conditional wrappers (at child / slot position)
+
+```json
+{ "$kind": "when",   "condition": { "width": "compact" }, "node": { "type": "…" } }
+{ "$kind": "hidden", "condition": { "width": "compact" }, "node": { "type": "…" } }
+```
+
+`$kind = "when"` renders the inner node only when the condition matches;
+`$kind = "hidden"` renders the inner node only when the condition does **not**
+match. Both are accepted anywhere a `UiNodeV1` is (children arrays, slots).
+
+## Lua DSL
+
+`ui_contract::lua::register(&Lua)` installs a `ui` global.
+
+### Primitive constructors (v1, Lua-public)
+
+All prop shapes align with `cross-client-ui-primitives.md` — web-runtime-only
+extensions (`Panel.padding`, `Panel.radius`, `Stack.padding`,
+`Button.leadingIcon`, `Button.disabled`, `IconButton.disabled`,
+`Tree.density`) are intentionally excluded.
+
+```lua
+-- direction is REQUIRED per spec
+ui.stack{ direction = "vertical" | "horizontal" | ui.responsive(...),
+          gap = ..., align = ..., justify = ..., children = {...} }
+
+ui.inline{ gap = ..., align = ..., justify = ..., wrap = ..., children = {...} }
+
+ui.panel{ title = ..., tone = ..., border = ...,
+          interaction_density = ... | ui.responsive(...),
+          children = {...} }
+
+ui.scroll_area{ axis = ..., children = {...} }
+
+ui.text{ text = ..., tone = ..., size = ..., weight = ...,
+         monospace = ..., italic = ..., truncate = ... }
+
+ui.icon{ name = ..., size = ..., tone = ..., label = ... }
+
+ui.badge{ text = ..., tone = ..., size = ... }
+
+ui.status_dot{ state = ..., label = ... }
+
+ui.empty_state{ title = ..., description = ..., icon = ...,
+                primary_action = ui.action(...) }
+
+-- No `disabled` field: disabled travels on `action.disabled` (UiActionV1).
+-- `icon` is the cross-client canonical name (NOT `leadingIcon`).
+ui.button{ label = ..., action = ..., variant = ..., tone = ..., icon = ... }
+
+-- No `disabled` field: use `action.disabled`.
+ui.icon_button{ icon = ..., label = ..., action = ..., tone = ... }
+
+-- No shared props in v1 (web's `density` is renderer-internal).
+ui.tree{ children = {...} }
+
+-- `title` slot is REQUIRED; spec slot keys may be hoisted to top level:
+ui.tree_item{
+  id = ..., expanded = ..., selected = ..., notification = ..., action = ...,
+  title    = { ... },  -- required
+  subtitle = { ... },  -- optional
+  start    = { ... },  -- optional
+  end_     = { ... },  -- optional (Lua `end` is reserved)
+  children = { ... },  -- optional nested tree_items
+}
+```
+
+#### Slot schema enforcement
+
+Constructors reject unknown slot keys at construction time and raise a Lua
+error if a required slot is missing. This catches typos like
+`slots = { footr = ... }` immediately rather than silently misrendering.
+
+### Primitive constructors (internal / experimental)
+
+```lua
+ui.dialog{ open = ..., title = ..., presentation = "auto" | "inline" | "overlay" | "sheet" | "fullscreen",
+           body = { ... },  -- hoisted into slots.body
+           footer = { ... } -- hoisted into slots.footer
+}
+```
+
+`Dialog` is deferred from the Lua-public v1 surface per
+`docs/specs/web-ui-primitives-runtime.md`. It is registered here so renderers
+can adopt it in Phase B / Phase C. Presentation defaults to `"auto"`. Top-level
+`body` and `footer` keys are automatically hoisted into `slots` per the
+cross-client spec's Dialog shape.
+
+### `Menu` / `MenuItem`
+
+**Intentionally not exposed.** Both are web-runtime-internal in v1 until the
+cross-client menu interaction model stabilizes.
+
+### `TextInput` / `Checkbox` / `Toggle` / `Select`
+
+**Intentionally not exposed in v1.** These belong to the broader cross-client
+shared vocabulary but are deferred from the v1 Lua-public inventory per
+`phase one web ui composites stay internal while Lua public contract stops at primitives.md`.
+
+### Adaptive helpers
+
+```lua
+-- Responsive values. Width-only shorthand:
+ui.responsive({ compact = "vertical", expanded = "horizontal" })
+
+-- Explicit form (required when mixing dimensions):
+ui.responsive({
+  width  = { compact = "sidebar", expanded = "panel" },
+  height = { short = "compact", tall = "comfortable" },
+})
+
+-- Conditional render (bare string = widthClass match):
+ui.when("expanded", sidebar_node)
+ui.when({ width = "compact", pointer = "coarse" }, compact_toolbar)
+
+-- Hidden render (same condition semantics, inverted):
+ui.hidden({ width = "compact" }, metadata_node)
+```
+
+### Action helper
+
+```lua
+ui.action("botster.session.select", { sessionUuid = "sess-…" })
+-- => { id = "botster.session.select", payload = { sessionUuid = "sess-…" } }
+```
+
+### Slots
+
+Any primitive with semantic regions uses the `slots` key, not positional
+`children`. Slot keys match the spec:
+
+```lua
+ui.tree_item{
+  id = "sess-1",
+  slots = {
+    title    = { ui.text{ text = "Primary" } },
+    subtitle = { ui.text{ text = "Secondary" } },
+    start    = { ui.status_dot{ state = "active" } },
+    end_     = { ui.icon_button{ icon = "more", label = "…", action = ui.action("…") } },
+  },
+}
+```
+
+`end` is a reserved word in Lua, so authors write `end_` and the marshalling
+layer rewrites it to `end` on the wire.
+
+### Casing
+
+Authors may write prop keys in either `snake_case` or `camelCase` in Lua —
+the marshalling layer converts top-level keys to the wire-format `camelCase`.
+Example:
+
+```lua
+ui.panel{ interaction_density = "compact", ... }  -- emits "interactionDensity"
+ui.panel{ interactionDensity  = "compact", ... }  -- same wire output
+```
+
+The conversion applies to top-level prop keys and `ui.when` / `ui.hidden`
+condition keys. Nested structures (e.g. the payload inside `ui.action`) are
+passed through verbatim.
+
+### Prop allowlist
+
+Every primitive declares its canonical prop set (matching the cross-client
+spec). Unknown props — web-only extensions, typos, or author mistakes — are
+rejected at construction with an error that lists the allowed props:
+
+```
+ui.panel: unknown prop `padding`. Allowed props: ["title", "tone", "border", "interactionDensity"]
+```
+
+The allowlist covers both casing forms: `leading_icon` and `leadingIcon` are
+both rejected for Button because neither is a cross-client canonical Button
+prop (only `icon` is).
+
+### Controlled vs uncontrolled state
+
+The TUI rule applies in both renderers:
+
+- explicit `value` or `selected` ⇒ Lua owns the state (controlled)
+- stable `id` without `value` / `selected` ⇒ renderer owns local state
+
+## Integration points
+
+- **Hub VM** (`crate::lua::LuaRuntime`) — registered inside
+  `crate::lua::primitives::register_all`.
+- **TUI VM** (`crate::tui::layout_lua::LayoutLua`) — registered inside
+  `LayoutLua::new`, before executing the layout source.
+
+Both VMs use the same `ui_contract::lua::register` function so the DSL stays
+identical across them.
+
+## Running the tests
+
+Unit tests (all Props round-trip + Lua constructor unit tests):
+
+```bash
+cd cli
+BOTSTER_ENV=test cargo test --lib ui_contract
+```
+
+Integration tests (end-to-end Lua → JSON wire shapes):
+
+```bash
+cd cli
+BOTSTER_ENV=test cargo test --test ui_contract_lua_test
+```
+
+Note: `./test.sh --integration -- ui_contract` filters the *test name* pattern,
+not the test file, and will silently filter away these tests. Use the explicit
+`cargo test --test ui_contract_lua_test` invocation above instead, or run the
+full integration suite with `./test.sh --integration`.
+
+## Non-goals for Phase A
+
+- No TUI adapter — Phase B.
+- No React renderer — Phase C.
+- No `Menu` / `MenuItem` exposure to Lua.
+- No phase-1 composites (`WorkspaceList`, `SessionRow`, …) — those stay
+  web-runtime-internal per
+  `docs/specs/web-ui-primitives-runtime.md`.
+
+## Versioning
+
+This is `ui-contract/v1`. Additive changes are backward-compatible; removing
+props or changing payload semantics requires `v2`.
