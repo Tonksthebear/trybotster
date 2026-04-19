@@ -89,7 +89,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
     expect(legacyDispatch).not.toHaveBeenCalled()
   })
 
-  it('falls back to legacy dispatch when transport send returns false', async () => {
+  it('falls back to legacy dispatch with synthesized url when transport send returns false', async () => {
     const { transport, send } = makeTransport(async () => false)
     const dispatch = createTransportDispatch({
       transport,
@@ -110,12 +110,15 @@ describe('createTransportDispatch — Phase 2c default', () => {
 
     expect(send).toHaveBeenCalledOnce()
     expect(legacyDispatch).toHaveBeenCalledOnce()
+    // URL is synthesized from hubId + sessionUuid so the legacy handler can
+    // history.pushState after the anchor's preventDefault.
     expect(legacyDispatch).toHaveBeenCalledWith({
       action: 'botster.session.select',
       payload: {
         hubId: 'hub-9',
         sessionId: 'sess-1',
         sessionUuid: 'uuid-1',
+        url: '/hubs/hub-9/sessions/uuid-1',
       },
     })
   })
@@ -148,7 +151,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
     errSpy.mockRestore()
   })
 
-  it('falls back synchronously when transport is null', () => {
+  it('falls back synchronously with synthesized url when transport is null', () => {
     const dispatch = createTransportDispatch({
       transport: null,
       hubId: 'hub-9',
@@ -163,6 +166,15 @@ describe('createTransportDispatch — Phase 2c default', () => {
     )
     fireEvent.click(screen.getByRole('button', { name: 'Select' }))
     expect(legacyDispatch).toHaveBeenCalledOnce()
+    expect(legacyDispatch).toHaveBeenCalledWith({
+      action: 'botster.session.select',
+      payload: {
+        hubId: 'hub-9',
+        sessionId: 'sess-1',
+        sessionUuid: 'uuid-1',
+        url: '/hubs/hub-9/sessions/uuid-1',
+      },
+    })
   })
 
   it('does NOT fall back to legacy for non-idempotent actions like preview.toggle', async () => {

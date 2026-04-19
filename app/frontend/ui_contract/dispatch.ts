@@ -15,8 +15,8 @@ export type CreateTransportDispatchOptions = {
   /** The hub-level transport object (e.g. `HubTransport`). May be null when
    * the hub hasn't connected yet; dispatch short-circuits in that case. */
   transport: UiActionTransport | null | undefined
-  /** Hub id, merged into the legacy-fallback payload for parity with
-   * pre-Phase-2c `createHubDispatch` callers. */
+  /** Hub id, merged into the local/fallback payload so legacy handlers can
+   * resolve hub-scoped state (session routes, workspace selection, etc.). */
   hubId: string
   /** Target surface name the broadcast is associated with (e.g.
    * "workspace_surface"). Echoed back on the outbound frame so the hub can
@@ -62,19 +62,54 @@ const LEGACY_FALLBACK_ACTIONS = new Set<string>([
   'botster.session.select',
 ])
 
+/**
+ * Merge additional fields into the fallback payload that legacy handlers
+ * need to behave correctly when the hub round-trip is skipped. Phase 1
+ * `SessionRow.jsx` always passed `url: /hubs/{hubId}/sessions/{sessionUuid}`
+ * alongside the select envelope so the browser could `history.pushState`
+ * after `event.preventDefault()` — Phase 2a's Lua-authored tree only emits
+ * `{ sessionId, sessionUuid }` in the action payload, so we synthesize the
+ * URL here to preserve disconnected-state route navigation.
+ */
+function enrichFallbackPayload(
+  action: UiActionV1,
+  mergedPayload: Record<string, unknown>,
+): Record<string, unknown> {
+  if (action.id === 'botster.session.select') {
+    const hubId = mergedPayload['hubId']
+    const sessionUuid = mergedPayload['sessionUuid']
+    if (
+      typeof hubId === 'string' &&
+      hubId.length > 0 &&
+      typeof sessionUuid === 'string' &&
+      sessionUuid.length > 0 &&
+      mergedPayload['url'] === undefined
+    ) {
+      return { ...mergedPayload, url: `/hubs/${hubId}/sessions/${sessionUuid}` }
+    }
+  }
+  return mergedPayload
+}
+
 function defaultFallback(
   action: UiActionV1,
   mergedPayload: Record<string, unknown>,
 ): void {
   if (!LEGACY_FALLBACK_ACTIONS.has(action.id)) return
-  dispatchLegacy({ action: action.id, payload: mergedPayload })
+  dispatchLegacy({
+    action: action.id,
+    payload: enrichFallbackPayload(action, mergedPayload),
+  })
 }
 
 function dispatchLocal(
   action: UiActionV1,
   mergedPayload: Record<string, unknown>,
 ): void {
-  dispatchLegacy({ action: action.id, payload: mergedPayload })
+  dispatchLegacy({
+    action: action.id,
+    payload: enrichFallbackPayload(action, mergedPayload),
+  })
 }
 
 /**

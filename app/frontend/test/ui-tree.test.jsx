@@ -265,6 +265,7 @@ describe('<UiTree>', () => {
         hubId: 'hub-1',
         sessionId: 's-1',
         sessionUuid: 'u-1',
+        url: '/hubs/hub-1/sessions/u-1',
       },
     })
   })
