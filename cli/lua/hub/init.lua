@@ -50,6 +50,14 @@ safe_require("lib.accessory")
 safe_require("lib.commands")
 _G.mcp = safe_require("lib.mcp")
 
+-- Phase 2b UI DSL transport libs. `lib.action` is the registry for
+-- browser-emitted UI action envelopes; `lib.layout_broadcast` wraps
+-- `web_layout.render(...)` with per-surface hash dedup. Exposing them as
+-- globals keeps plugin authoring ergonomic (no boilerplate require).
+_G.action = safe_require("lib.action")
+safe_require("lib.layout_input")
+safe_require("lib.layout_broadcast")
+
 -- Register built-in default MCP prompts. Loaded here so they are available
 -- before user.init runs, allowing users to override them by re-registering
 -- prompts with the same name (last registration wins).

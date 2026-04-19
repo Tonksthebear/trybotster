@@ -12,6 +12,8 @@ local ClientSessionPayload = require("lib.client_session_payload")
 local Session = require("lib.session")
 local pty_clients = require("lib.pty_clients")
 local AgentListPayload = require("lib.agent_list_payload")
+local LayoutInput = require("lib.layout_input")
+local LayoutBroadcast = require("lib.layout_broadcast")
 
 -- Shared client registry - all transports register here
 local clients = state.get("connections.clients", {})
@@ -150,6 +152,47 @@ local function broadcast_hub_event(event_name, event_data)
     end
 end
 
+--- Broadcast `ui_layout_tree_v1` frames for every hub-channel subscriber.
+--
+-- Two target surfaces are emitted per subscription (sidebar + panel
+-- densities) — an accepted perf tradeoff versus tracking per-subscription
+-- density preferences. See `lib.layout_broadcast` header for rationale.
+--
+-- Each subscription renders independently because selection is per-browser:
+-- `Client.selected_session_uuid` differs between peers so the tree differs
+-- too. `Client:send_ui_layout_trees` builds THIS subscription's input,
+-- dedupes against its own per-sub version baseline, and ships through the
+-- existing encrypted transport.
+--
+-- The _LayoutInput import above keeps the global builder in scope for test
+-- harnesses that want a hub-wide snapshot without per-subscription detail;
+-- production code uses the per-client fanout below.
+local function broadcast_ui_layout_trees()
+    local total_sent = 0
+    local sub_count = 0
+    for _, client in pairs(clients) do
+        for sub_id, sub in pairs(client.subscriptions or {}) do
+            if sub.channel == "hub" then
+                sub_count = sub_count + 1
+                local ok, sent = pcall(client.send_ui_layout_trees, client, sub_id)
+                if ok and type(sent) == "number" then
+                    total_sent = total_sent + sent
+                elseif not ok then
+                    log.warn(string.format(
+                        "broadcast_ui_layout_trees: %s -> %s failed: %s",
+                        client.peer_id:sub(1, 8), sub_id:sub(1, 16), tostring(sent)))
+                end
+            end
+        end
+    end
+
+    if total_sent > 0 then
+        log.debug(string.format(
+            "Broadcast ui_layout_tree_v1 (%d frame(s)) across %d subscription(s)",
+            total_sent, sub_count))
+    end
+end
+
 local function broadcast_workspace_list()
     local Hub = require("lib.hub")
     local ok, workspaces = pcall(function()
@@ -196,6 +239,7 @@ hooks.on("agent_created", "broadcast_agent_created", function(info)
 
     broadcast_hub_event("agent_created", { agent = payload })
     broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+    broadcast_ui_layout_trees()
     broadcast_workspace_list()
 
     local worktrees = hub.get_worktrees()
@@ -212,6 +256,7 @@ hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
 
     broadcast_hub_event("agent_deleted", { agent_id = agent_id })
     broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+    broadcast_ui_layout_trees()
     broadcast_workspace_list()
 
     local worktrees = hub.get_worktrees()
@@ -421,6 +466,7 @@ hooks.on("session_updated", "broadcast_session_updated", function()
     timer.after_idle("agent_list_broadcast", AGENT_LIST_DEBOUNCE_SECS, function()
         last_agent_list_snapshot = nil
         broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+        broadcast_ui_layout_trees()
     end)
 end)
 

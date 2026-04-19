@@ -36,6 +36,9 @@
 // Rust guideline compliant 2026-04-18
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
@@ -65,6 +68,17 @@ const LAYOUT_WEB_FILE: &str = "layout_web.lua";
 /// Override file name for shared (TUI + web) layouts. Phase 2a only wires this
 /// for web; Phase 2b or later may let the TUI consume the same file.
 const LAYOUT_SHARED_FILE: &str = "layout.lua";
+
+/// Default TTL (milliseconds) for the successful override-chain scan cache.
+///
+/// Phase 2a flagged that `web_layout.render` stats four candidates on every
+/// call. Phase 2b broadcasts trigger that path on every state change, so a
+/// per-render TTL collapses bursts of renders into at most one stat set per
+/// window. 500 ms balances staleness on edits vs. re-stat chatter.
+///
+/// Override at runtime via [`set_override_cache_ttl_millis`]; tests use a 0
+/// TTL so sequential file writes are observed immediately.
+const DEFAULT_OVERRIDE_CACHE_TTL_MILLIS: u64 = 500;
 
 /// Install `web_layout` as a global Lua table with one method: `render`.
 ///
@@ -139,17 +153,179 @@ fn render_surface(lua: &Lua, surface_name: &str, state: Value) -> Result<String>
         .map_err(|e| anyhow!("failed to serialise UiNodeV1 for `{surface_name}`: {e}"))
 }
 
+/// Process-wide cache of the last successful override-chain scan.
+///
+/// Phase 2a's render path stats four candidate files unconditionally; Phase
+/// 2b broadcasts trigger that path on every state change, which can fire many
+/// times per second. The cache bounds the common case to at most one scan per
+/// TTL window while still picking up edits promptly.
+static OVERRIDE_CACHE: Mutex<Option<OverrideCache>> = Mutex::new(None);
+
+/// Current TTL for the cache, in milliseconds. Adjustable at runtime via
+/// [`set_override_cache_ttl_millis`] for tests that need to observe
+/// sequential file writes without waiting 500 ms between them.
+static OVERRIDE_CACHE_TTL_MILLIS: AtomicU64 = AtomicU64::new(DEFAULT_OVERRIDE_CACHE_TTL_MILLIS);
+
+fn override_cache_ttl() -> Duration {
+    Duration::from_millis(OVERRIDE_CACHE_TTL_MILLIS.load(Ordering::Relaxed))
+}
+
+/// Snapshot of the override-chain resolution, guarded by `OVERRIDE_CACHE`.
+///
+/// `valid_until` is the wall-clock deadline after which the cache MUST be
+/// refreshed; `winning` records which candidate (if any) won and the mtime it
+/// had at scan time. A matching mtime on refresh lets us skip the disk read
+/// and reuse the cached `content`. A mismatch (or a newly-present higher-
+/// priority override) invalidates the entry.
+#[derive(Clone)]
+struct OverrideCache {
+    valid_until: Instant,
+    winning: Option<CachedOverride>,
+}
+
+/// Cached payload for one override file: source text plus the mtime observed
+/// when the text was read. Stored as `String` (not `Table`) because Lua tables
+/// can't outlive their parent `Lua`; re-evaluating a cached string on the
+/// caller's Lua VM is cheap compared to a fresh disk read.
+#[derive(Clone)]
+struct CachedOverride {
+    path: PathBuf,
+    mtime: SystemTime,
+    content: String,
+}
+
 /// Walk the resolution chain and return the first layout table that loads
 /// successfully. Falls back to the embedded default via `require`.
+///
+/// Hot path:
+/// - within `OVERRIDE_CACHE_TTL` of the last successful scan, the cache is
+///   reused verbatim (zero stats, cached content re-loaded into `lua`);
+/// - otherwise, each candidate is stat-ed to check for mtime drift. A cached
+///   winning override whose mtime is unchanged short-circuits the read.
 fn resolve_layout_table(lua: &Lua) -> Result<Table> {
-    for candidate in override_candidates() {
-        if !candidate.is_file() {
-            continue;
+    if let Some(cached) = cache_hit() {
+        match cached.winning {
+            Some(entry) => return load_override_from_str(lua, &entry.path, &entry.content),
+            None => return load_embedded(lua),
         }
-        return load_override(lua, &candidate)
-            .map_err(|e| anyhow!("override {}: {e}", candidate.display()));
     }
+    scan_and_load(lua)
+}
+
+/// Return the cached entry if it is still within its TTL window. Expiry is
+/// resolved eagerly: the returned value is an owned snapshot so the lock is
+/// released before we touch Lua.
+fn cache_hit() -> Option<OverrideCache> {
+    let guard = OVERRIDE_CACHE.lock().ok()?;
+    let cached = guard.as_ref()?;
+    if Instant::now() >= cached.valid_until {
+        return None;
+    }
+    Some(cached.clone())
+}
+
+/// Perform a full override-chain scan, update the cache, and load the winning
+/// candidate (or the embedded default) into `lua`.
+fn scan_and_load(lua: &Lua) -> Result<Table> {
+    let candidates = override_candidates();
+
+    // Seed the fresh scan with whatever we have cached for each candidate
+    // path. If a candidate's mtime still matches the cache we skip re-reading
+    // its content; otherwise we pull fresh bytes off disk.
+    let prior_by_path = prior_cache_by_path();
+
+    for candidate in candidates {
+        match candidate_mtime(&candidate) {
+            None => continue, // not a file — skip.
+            Some(mtime) => {
+                let entry = match prior_by_path.get(&candidate) {
+                    Some(prev) if prev.mtime == mtime => CachedOverride {
+                        path: candidate.clone(),
+                        mtime,
+                        content: prev.content.clone(),
+                    },
+                    _ => {
+                        let content = std::fs::read_to_string(&candidate).map_err(|e| {
+                            anyhow!("failed to read {}: {e}", candidate.display())
+                        })?;
+                        CachedOverride {
+                            path: candidate.clone(),
+                            mtime,
+                            content,
+                        }
+                    }
+                };
+                let table = load_override_from_str(lua, &entry.path, &entry.content)?;
+                store_cache(Some(entry));
+                return Ok(table);
+            }
+        }
+    }
+
+    // No override won — cache the negative result so subsequent renders in
+    // this TTL window skip stat-ing the same four paths.
+    store_cache(None);
     load_embedded(lua)
+}
+
+/// Build a fast lookup of the prior cache keyed by path. Used so a partial
+/// rescan (e.g. a newly-added higher-priority override) can still reuse
+/// already-read bytes for unchanged lower-priority files.
+fn prior_cache_by_path() -> std::collections::HashMap<PathBuf, CachedOverride> {
+    let guard = match OVERRIDE_CACHE.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut out = std::collections::HashMap::new();
+    if let Some(cache) = guard.as_ref() {
+        if let Some(entry) = &cache.winning {
+            out.insert(entry.path.clone(), entry.clone());
+        }
+    }
+    out
+}
+
+/// Persist the resolution snapshot and set the next TTL deadline.
+fn store_cache(winning: Option<CachedOverride>) {
+    let new_cache = OverrideCache {
+        valid_until: Instant::now() + override_cache_ttl(),
+        winning,
+    };
+    match OVERRIDE_CACHE.lock() {
+        Ok(mut guard) => *guard = Some(new_cache),
+        Err(poisoned) => *poisoned.into_inner() = Some(new_cache),
+    }
+}
+
+/// Adjust the override-chain cache TTL. Tests that exercise sequential file
+/// edits set this to 0 so each render re-scans the filesystem; production
+/// code never needs to call it. Returns the previous value so test harnesses
+/// can restore it after use.
+#[doc(hidden)]
+pub fn set_override_cache_ttl_millis(ttl_millis: u64) -> u64 {
+    OVERRIDE_CACHE_TTL_MILLIS.swap(ttl_millis, Ordering::Relaxed)
+}
+
+/// Stat helper — returns `Some(mtime)` iff `path` is a regular file. Any I/O
+/// error (including "not found") yields `None` so the caller can skip.
+fn candidate_mtime(path: &Path) -> Option<SystemTime> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    meta.modified().ok()
+}
+
+/// Invalidate the process-wide override cache. Tests use this between runs;
+/// production never needs it because each render's TTL window expires on its
+/// own. Exposed `pub` only because `tests/` and integration test binaries
+/// live outside the crate root.
+#[doc(hidden)]
+pub fn _clear_override_cache_for_tests() {
+    match OVERRIDE_CACHE.lock() {
+        Ok(mut guard) => *guard = None,
+        Err(poisoned) => *poisoned.into_inner() = None,
+    }
 }
 
 /// Override file paths to check, in priority order.
@@ -213,15 +389,13 @@ fn config_dir_name(at: &Path) -> &'static str {
     }
 }
 
-/// Load an override `.lua` file and evaluate it as a Lua chunk returning a
+/// Evaluate an override `.lua` chunk (already read into memory) as a Lua
 /// table. The chunk is named after the file path so stack traces point at the
 /// user's override rather than an anonymous `[string "..."]` entry.
-fn load_override(lua: &Lua, path: &Path) -> Result<Table> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| anyhow!("failed to read {}: {e}", path.display()))?;
+fn load_override_from_str(lua: &Lua, path: &Path, content: &str) -> Result<Table> {
     let chunk_name = format!("@{}", path.display());
     let returned: Value = lua
-        .load(&content)
+        .load(content)
         .set_name(chunk_name)
         .eval()
         .map_err(|e| anyhow!("failed to evaluate {}: {e}", path.display()))?;

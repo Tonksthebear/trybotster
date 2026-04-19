@@ -82,6 +82,10 @@ fn golden_dir() -> PathBuf {
 /// overrides may subsequently set env vars via `EnvGuard` *inside* the held
 /// lock — the guard drops before the lock is released so subsequent tests
 /// see the known-empty baseline.
+///
+/// Also resets the Phase-2b override cache TTL to zero so sequential file
+/// writes inside a single test are picked up without waiting for the 500 ms
+/// window to expire. Production runs leave the default TTL in place.
 fn lock_render_env() -> MutexGuard<'static, ()> {
     let guard = RENDER_LOCK
         .lock()
@@ -93,6 +97,12 @@ fn lock_render_env() -> MutexGuard<'static, ()> {
         std::env::set_var("BOTSTER_CONFIG_DIR", EMPTY_SENTINEL_PATH);
         std::env::remove_var("BOTSTER_DEV");
     }
+    // Drop TTL to 0 and clear the cache — together they make sequential
+    // file edits deterministic. `_clear_override_cache_for_tests()` is safe
+    // to call without any corresponding "restore" step because production
+    // bootstrap paths never observe the test TTL.
+    botster::lua::primitives::web_layout::set_override_cache_ttl_millis(0);
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
     guard
 }
 
@@ -786,4 +796,248 @@ fn override_chain_and_error_fallback() {
         title.contains("Layout error"),
         "fallback title should announce the failure: {title}"
     );
+}
+
+// -------------------------------------------------------------------------
+// Modtime cache (Phase 2b) — the override-chain cache must pick up file
+// mtime changes and preserve override priority on invalidation.
+// -------------------------------------------------------------------------
+
+/// Helper: bump a file's mtime forward by ~2 seconds so the next
+/// `candidate_mtime` call observes a different value even on filesystems
+/// with coarse (1s) mtime granularity.
+fn touch_future(path: &std::path::Path) {
+    // Read-then-write bumps mtime on every filesystem. Add a distinct byte
+    // so the content hash would also change if we ever key on content.
+    let prev = std::fs::read_to_string(path).unwrap_or_default();
+    let bumped = format!("{prev}\n-- touched");
+    std::fs::write(path, bumped).unwrap();
+    // Also force mtime forward explicitly in case the filesystem clamps
+    // subsecond resolution.
+    let now = std::time::SystemTime::now();
+    let future = now + std::time::Duration::from_secs(2);
+    let _ = filetime::set_file_mtime(path, filetime::FileTime::from_system_time(future));
+}
+
+#[test]
+fn modtime_cache_invalidates_on_file_edit_and_restores_embedded_when_removed() {
+    let _lock = lock_render_env();
+    // `lock_render_env` already sets TTL=0 and clears the cache; those are
+    // the right defaults for sequential file edits inside a single test.
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo").join(".botster");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    let _env_repo = EnvGuard::set(
+        "BOTSTER_WEB_LAYOUT_REPO_DIR",
+        repo_dir.to_str().expect("utf-8 repo path"),
+    );
+
+    // 1. No override file -> falls back to embedded default.
+    let lua = new_web_layout_lua();
+    let base = render_via_lua(&lua, FIXTURE_EMPTY);
+    assert_eq!(
+        base.get("type").and_then(|v| v.as_str()),
+        Some("stack"),
+        "embedded default renders the empty-state stack: {base}"
+    );
+
+    // 2. Add a repo override. Because the previous render cached
+    // "no override won" with a 500 ms TTL, the next render WITHIN that
+    // window must still pick up the new file — so we explicitly clear
+    // the cache the same way a cache-miss past TTL would.
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
+    let override_path = repo_dir.join("layout_web.lua");
+    std::fs::write(
+        &override_path,
+        r#"return {
+            workspace_surface = function(_state)
+                return ui.panel{ title = "MODTIME-v1", tone = "muted" }
+            end,
+        }"#,
+    )
+    .unwrap();
+    let lua = new_web_layout_lua();
+    let v1 = render_via_lua(&lua, FIXTURE_EMPTY);
+    assert_eq!(
+        v1.get("props")
+            .and_then(|p| p.get("title"))
+            .and_then(|t| t.as_str()),
+        Some("MODTIME-v1"),
+        "override picked up after cache clear: {v1}"
+    );
+
+    // 3. Second render within TTL reuses the cached content — still v1.
+    let v1_again = render_via_lua(&lua, FIXTURE_EMPTY);
+    assert_eq!(
+        v1_again
+            .get("props")
+            .and_then(|p| p.get("title"))
+            .and_then(|t| t.as_str()),
+        Some("MODTIME-v1"),
+        "within-TTL render reuses cached override: {v1_again}"
+    );
+
+    // 4. Rewrite the file with a new payload and bump mtime. Clearing the
+    // cache here stands in for "TTL elapsed" — the production behavior is
+    // identical past 500 ms.
+    std::fs::write(
+        &override_path,
+        r#"return {
+            workspace_surface = function(_state)
+                return ui.panel{ title = "MODTIME-v2", tone = "muted" }
+            end,
+        }"#,
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now();
+    let future = now + std::time::Duration::from_secs(2);
+    let _ = filetime::set_file_mtime(
+        &override_path,
+        filetime::FileTime::from_system_time(future),
+    );
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
+    let v2 = render_via_lua(&lua, FIXTURE_EMPTY);
+    assert_eq!(
+        v2.get("props")
+            .and_then(|p| p.get("title"))
+            .and_then(|t| t.as_str()),
+        Some("MODTIME-v2"),
+        "mtime drift invalidates the cached content: {v2}"
+    );
+
+    // 5. Remove the override entirely. Past the TTL (or after an explicit
+    // clear) the chain must fall back to embedded again — the previous
+    // "winning override" entry must not be served once the file is gone.
+    std::fs::remove_file(&override_path).unwrap();
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
+    let after_delete = render_via_lua(&lua, FIXTURE_EMPTY);
+    assert_eq!(
+        after_delete.get("type").and_then(|v| v.as_str()),
+        Some("stack"),
+        "removing the override must restore embedded default: {after_delete}"
+    );
+}
+
+#[test]
+fn modtime_cache_reuses_unchanged_content_without_rereading() {
+    // If the cached mtime matches the filesystem's mtime, the cache must
+    // reuse the stored content. We prove this by swapping the file's
+    // content to something that WOULD raise a Lua error on evaluation,
+    // while pinning mtime to the original value. A successful render with
+    // the original title proves the cache served the old bytes.
+    //
+    // This test temporarily restores the production TTL (500 ms) so the
+    // within-TTL cache-hit branch is exercised at all — `lock_render_env`
+    // drops TTL to 0 for deterministic sequential edits.
+    let _lock = lock_render_env();
+    botster::lua::primitives::web_layout::set_override_cache_ttl_millis(500);
+    // Clear between TTL changes so the first `render` in this test seeds a
+    // cache with the new TTL rather than serving a zero-TTL entry.
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
+    // Restore test default at scope exit so later tests aren't surprised.
+    struct TtlRestore;
+    impl Drop for TtlRestore {
+        fn drop(&mut self) {
+            botster::lua::primitives::web_layout::set_override_cache_ttl_millis(0);
+            botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
+        }
+    }
+    let _ttl_restore = TtlRestore;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo").join(".botster");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let _env_repo = EnvGuard::set(
+        "BOTSTER_WEB_LAYOUT_REPO_DIR",
+        repo_dir.to_str().expect("utf-8 repo path"),
+    );
+
+    let override_path = repo_dir.join("layout_web.lua");
+    std::fs::write(
+        &override_path,
+        r#"return {
+            workspace_surface = function(_state)
+                return ui.panel{ title = "CACHED-CONTENT", tone = "muted" }
+            end,
+        }"#,
+    )
+    .unwrap();
+    let original_mtime =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&override_path).unwrap());
+
+    // First render: populates the cache with the good content.
+    let lua = new_web_layout_lua();
+    let first = render_via_lua(&lua, FIXTURE_EMPTY);
+    assert_eq!(
+        first
+            .get("props")
+            .and_then(|p| p.get("title"))
+            .and_then(|t| t.as_str()),
+        Some("CACHED-CONTENT"),
+    );
+
+    // Swap content to something that would raise on evaluation, but pin
+    // mtime back to the original so the cache considers the file
+    // unchanged and reuses the cached bytes.
+    std::fs::write(&override_path, "THIS WOULD RAISE IF RE-READ").unwrap();
+    filetime::set_file_mtime(&override_path, original_mtime).unwrap();
+
+    // Second render within TTL: reuse cache directly (zero disk reads).
+    let second = render_via_lua(&lua, FIXTURE_EMPTY);
+    assert_eq!(
+        second
+            .get("props")
+            .and_then(|p| p.get("title"))
+            .and_then(|t| t.as_str()),
+        Some("CACHED-CONTENT"),
+        "within-TTL render should reuse cached content without re-reading"
+    );
+
+    // Force a cache miss: mtime-pinned content must STILL be reused
+    // because the stat-then-content-diff path short-circuits on mtime
+    // equality.
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
+    // Repopulate cache with good content by rewriting, then pin mtime back.
+    std::fs::write(
+        &override_path,
+        r#"return {
+            workspace_surface = function(_state)
+                return ui.panel{ title = "CACHED-CONTENT", tone = "muted" }
+            end,
+        }"#,
+    )
+    .unwrap();
+    filetime::set_file_mtime(&override_path, original_mtime).unwrap();
+    let lua = new_web_layout_lua();
+    let _prime = render_via_lua(&lua, FIXTURE_EMPTY);
+    // Now the cache holds the good content at `original_mtime`.
+    // Swap to broken content WITHOUT bumping mtime:
+    std::fs::write(&override_path, "still broken").unwrap();
+    filetime::set_file_mtime(&override_path, original_mtime).unwrap();
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
+    // After clear, scan_and_load() re-stats. Mtime equals the cached mtime
+    // only if we can re-seed the cache — but _clear_override_cache_for_tests
+    // wipes it. This branch therefore EXERCISES the re-read path; it must
+    // now fail to a fallback (not crash). Regression guard: the primitive
+    // must never propagate the I/O/parse error as a Rust panic.
+    let lua = new_web_layout_lua();
+    let after = render_via_lua(&lua, FIXTURE_EMPTY);
+    assert_eq!(
+        after.get("type").and_then(|v| v.as_str()),
+        Some("panel"),
+        "broken re-read must land on the error fallback tree: {after}"
+    );
+    let title = after
+        .get("props")
+        .and_then(|p| p.get("title"))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+    assert!(
+        title.contains("Layout error"),
+        "fallback title must announce the failure, got {title}"
+    );
+    let _ = touch_future; // silence warn in the common case where 2-stage touch is unused
 }

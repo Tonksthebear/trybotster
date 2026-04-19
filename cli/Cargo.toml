@@ -111,6 +111,8 @@ tempfile = "3.23"
 portable-pty = "0.9"
 wiremock = "0.6"
 keyring = "3"
+# Phase 2b — mtime manipulation for the web_layout modtime-cache tests.
+filetime = "0.2"
 
 [profile.release]
 opt-level = 3
