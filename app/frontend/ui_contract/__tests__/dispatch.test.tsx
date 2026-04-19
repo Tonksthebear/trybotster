@@ -89,6 +89,56 @@ describe('createTransportDispatch — Phase 2c default', () => {
     expect(legacyDispatch).not.toHaveBeenCalled()
   })
 
+  it('pushes session URL into history on session.select success (hub handles focus, browser owns route)', () => {
+    const { transport, send } = makeTransport()
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-7',
+      targetSurface: 'workspace_surface',
+    })
+    window.history.replaceState({}, '', '/hubs/hub-7')
+    const popstateSpy = vi.fn()
+    window.addEventListener('popstate', popstateSpy)
+
+    render(
+      <UiTreeBody
+        node={selectButton('Select')}
+        dispatch={dispatch}
+        viewport={REGULAR_FINE}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
+
+    expect(send).toHaveBeenCalledOnce()
+    // Synchronous side-effect — runs before the async transport.send resolves.
+    expect(window.location.pathname).toBe('/hubs/hub-7/sessions/uuid-1')
+    expect(popstateSpy).toHaveBeenCalledOnce()
+    window.removeEventListener('popstate', popstateSpy)
+  })
+
+  it('skips history.pushState when already on the target session path', () => {
+    const { transport } = makeTransport()
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-7',
+      targetSurface: 'workspace_surface',
+    })
+    window.history.replaceState({}, '', '/hubs/hub-7/sessions/uuid-1')
+    const pushSpy = vi.spyOn(window.history, 'pushState')
+
+    render(
+      <UiTreeBody
+        node={selectButton('Select')}
+        dispatch={dispatch}
+        viewport={REGULAR_FINE}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
+
+    expect(pushSpy).not.toHaveBeenCalled()
+    pushSpy.mockRestore()
+  })
+
   it('falls back to legacy dispatch with synthesized url when transport send returns false', async () => {
     const { transport, send } = makeTransport(async () => false)
     const dispatch = createTransportDispatch({

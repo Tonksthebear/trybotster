@@ -113,6 +113,40 @@ function dispatchLocal(
 }
 
 /**
+ * Browser-local side-effect that must run for `botster.session.select`
+ * regardless of whether the hub round-trip succeeds. Phase 1's
+ * `SessionRow.jsx` always called `lib/actions.js` which pushed the session
+ * URL into `window.history`; `hub-bridge.js` listens for `popstate` to
+ * derive `selectedSessionId`. On the transport-success path the hub
+ * handles CLI focus but cannot update the browser URL, so we mirror the
+ * Phase 1 navigation side-effect here. Fallback paths still go through
+ * the legacy handler (which already pushes the url via
+ * `enrichFallbackPayload`), so this function is a no-op for them —
+ * kept idempotent via the `location.pathname` equality check.
+ */
+function navigateToSessionLocally(
+  action: UiActionV1,
+  mergedPayload: Record<string, unknown>,
+): void {
+  if (action.id !== 'botster.session.select') return
+  const hubId = mergedPayload['hubId']
+  const sessionUuid = mergedPayload['sessionUuid']
+  if (
+    typeof hubId !== 'string' ||
+    hubId.length === 0 ||
+    typeof sessionUuid !== 'string' ||
+    sessionUuid.length === 0
+  ) {
+    return
+  }
+  if (typeof window === 'undefined' || !window.history?.pushState) return
+  const url = `/hubs/${hubId}/sessions/${sessionUuid}`
+  if (window.location.pathname === url) return
+  window.history.pushState({}, '', url)
+  window.dispatchEvent(new PopStateEvent('popstate'))
+}
+
+/**
  * Build an `ActionDispatch` that routes through the Phase 2b transport as the
  * default path. Serialized wire shape (confirmed with Phase 2b):
  *
@@ -152,6 +186,12 @@ export function createTransportDispatch(
     const envelope: UiActionV1 = action.payload
       ? { id: action.id, payload: action.payload }
       : { id: action.id }
+
+    // Session select needs to push the browser URL locally even when
+    // transport succeeds — the hub handles CLI focus but cannot touch
+    // the browser router. Run it before the async send so the URL
+    // update is synchronous with the click.
+    navigateToSessionLocally(action, mergedPayload)
 
     void (async () => {
       let sent = false
