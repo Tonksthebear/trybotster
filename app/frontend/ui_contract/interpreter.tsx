@@ -90,6 +90,12 @@ export type UiTreeBodyProps = {
   capabilities?: UiCapabilitySetV1
   /** Inject a viewport for tests; defaults to `useViewport()`. */
   viewport?: UiViewportV1
+  /**
+   * Current hub id. Used by web renderers to construct URLs (e.g. session
+   * anchor hrefs). Optional so pure-interpreter tests don't have to supply
+   * one.
+   */
+  hubId?: string
 }
 
 /**
@@ -106,6 +112,7 @@ export function UiTreeBody({
   dispatch,
   capabilities,
   viewport,
+  hubId,
 }: UiTreeBodyProps): ReactElement {
   const liveViewport = useViewport()
   const effectiveViewport = viewport ?? liveViewport
@@ -113,6 +120,7 @@ export function UiTreeBody({
     viewport: effectiveViewport,
     capabilities: capabilities ?? DEFAULT_WEB_CAPABILITIES,
     dispatch,
+    hubId,
   }
   return (
     <RenderContextProvider value={ctx}>

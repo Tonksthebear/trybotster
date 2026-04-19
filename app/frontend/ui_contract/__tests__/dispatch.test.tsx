@@ -22,7 +22,6 @@ vi.mock('../../lib/actions', () => {
 import { dispatch as legacyDispatch } from '../../lib/actions'
 import {
   UiTreeBody,
-  createHubDispatch,
   createTransportDispatch,
   type UiActionTransport,
 } from '..'
@@ -51,46 +50,6 @@ function selectButton(label: string): UiNodeV1 {
     },
   }
 }
-
-describe('createHubDispatch — legacy bridge', () => {
-  it('forwards UiActionV1 to legacy dispatcher with hubId merged into payload', () => {
-    const dispatch = createHubDispatch('hub-123')
-    render(
-      <UiTreeBody
-        node={selectButton('Select')}
-        dispatch={dispatch}
-        viewport={REGULAR_FINE}
-      />,
-    )
-    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
-
-    expect(legacyDispatch).toHaveBeenCalledOnce()
-    expect(legacyDispatch).toHaveBeenCalledWith({
-      action: 'botster.session.select',
-      payload: {
-        hubId: 'hub-123',
-        sessionId: 'sess-1',
-        sessionUuid: 'uuid-1',
-      },
-    })
-  })
-
-  it('skips dispatch when action.disabled is true', () => {
-    const dispatch = createHubDispatch('hub-x')
-    const node: UiNodeV1 = {
-      type: 'button',
-      props: {
-        label: 'Nope',
-        action: { id: 'botster.session.select', disabled: true },
-      },
-    }
-    render(<UiTreeBody node={node} dispatch={dispatch} viewport={REGULAR_FINE} />)
-    const btn = screen.getByRole('button', { name: 'Nope' })
-    expect(btn).toBeDisabled()
-    fireEvent.click(btn)
-    expect(legacyDispatch).not.toHaveBeenCalled()
-  })
-})
 
 describe('createTransportDispatch — Phase 2c default', () => {
   function makeTransport(sendImpl?: (type: string, data: unknown) => Promise<boolean>) {

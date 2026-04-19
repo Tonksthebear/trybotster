@@ -27,6 +27,13 @@ export type RenderContext = {
   viewport: UiViewportV1
   capabilities: UiCapabilitySetV1
   dispatch: ActionDispatch
+  /**
+   * Current hub id, threaded through by <UiTree>. Web-specific; optional
+   * because pure interpreter tests may not supply one. Renderers can use it
+   * to construct URLs (e.g. session row anchor hrefs) so right-click /
+   * middle-click browser navigation works.
+   */
+  hubId?: string
 }
 
 /** Default web capability set. Renderers may override in tests. */

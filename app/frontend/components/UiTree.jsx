@@ -269,6 +269,7 @@ export default function UiTree({
             node={tree}
             dispatch={dispatch}
             capabilities={capabilities}
+            hubId={hubId}
           />
         ) : (
           loadingFallback()

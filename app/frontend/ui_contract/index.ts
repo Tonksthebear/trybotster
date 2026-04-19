@@ -16,7 +16,6 @@ export {
 } from './context'
 
 export {
-  createHubDispatch,
   createRawDispatch,
   createTransportDispatch,
 } from './dispatch'

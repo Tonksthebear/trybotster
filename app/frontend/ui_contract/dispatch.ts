@@ -146,22 +146,3 @@ export function createRawDispatch(
     handler(action, source)
   }
 }
-
-/**
- * @deprecated Legacy Phase-1 bridge. Prefer `createTransportDispatch`. Kept
- * while Phase 2b wires in the hub-side `ui_action_v1` handler so any lingering
- * callers continue to function. Remove once Phase 2b + 2c both land.
- *
- * Forwards `UiActionV1` directly to the legacy `lib/actions.js` dispatcher
- * with `hubId` merged into the payload.
- */
-export function createHubDispatch(hubId: string): ActionDispatch {
-  return (action: UiActionV1) => {
-    if (action.disabled === true) return
-    const mergedPayload = { hubId, ...(action.payload ?? {}) }
-    dispatchLegacy({
-      action: action.id,
-      payload: mergedPayload,
-    })
-  }
-}

@@ -16,7 +16,11 @@ const REGULAR_FINE: UiViewportV1 = {
 
 function renderTree(
   node: UiNodeV1,
-  opts: { viewport?: UiViewportV1; onAction?: (action: UiActionV1) => void } = {},
+  opts: {
+    viewport?: UiViewportV1
+    onAction?: (action: UiActionV1) => void
+    hubId?: string
+  } = {},
 ): ReturnType<typeof render> {
   const handler = vi.fn(opts.onAction ?? (() => {}))
   return render(
@@ -24,6 +28,7 @@ function renderTree(
       node={node}
       dispatch={createRawDispatch(handler)}
       viewport={opts.viewport ?? REGULAR_FINE}
+      hubId={opts.hubId}
     />,
   )
 }
@@ -290,11 +295,46 @@ describe('ui_contract registry — collection primitives', () => {
       },
       { onAction },
     )
-    const row = container.querySelector('[data-session-id="sess-1"] > div')
-    expect(row).not.toBeNull()
-    fireEvent.click(row as Element)
+    // The interactive primary target is the inner clickable div (or <a> when
+    // hubId is present). Structure: <li data-session-id> > <div flex-row> >
+    // <primary onClick>. This test doesn't pass hubId, so the primary is a
+    // <div>.
+    const primary = container.querySelector(
+      '[data-session-id="sess-1"] > div > div',
+    )
+    expect(primary).not.toBeNull()
+    fireEvent.click(primary as Element)
     expect(onAction).toHaveBeenCalledOnce()
     expect(onAction.mock.calls[0]![0].id).toBe('botster.session.select')
+  })
+
+  it('tree_item renders session href when hubId + sessionUuid are present', () => {
+    const { container } = renderTree(
+      {
+        type: 'tree',
+        children: [
+          {
+            type: 'tree_item',
+            id: 'sess-1',
+            props: {
+              action: {
+                id: 'botster.session.select',
+                payload: { sessionUuid: 'uuid-1' },
+              },
+            },
+            slots: {
+              title: [{ type: 'text', props: { text: 'Session one' } }],
+            },
+          },
+        ],
+      },
+      { hubId: 'hub-abc' },
+    )
+    const anchor = container.querySelector(
+      '[data-session-id="sess-1"] a[href]',
+    )
+    expect(anchor).not.toBeNull()
+    expect(anchor?.getAttribute('href')).toBe('/hubs/hub-abc/sessions/uuid-1')
   })
 
   it('tree_item honors children slot only when expanded !== false', () => {
