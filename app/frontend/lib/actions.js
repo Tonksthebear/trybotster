@@ -60,8 +60,11 @@ const handlers = {
     if (hub && payload.sessionId) {
       hub.selectAgent(payload.sessionId)
     }
-    // Navigate via React Router (pushState)
-    if (payload.url) {
+    // Navigate via React Router (pushState). Idempotent — skip when
+    // already on the target path. The transport-success path in
+    // `ui_contract/dispatch.ts` also pushes synchronously, so on a
+    // transport-failure fallback this handler would otherwise double-push.
+    if (payload.url && window.location.pathname !== payload.url) {
       window.history.pushState({}, '', payload.url)
       window.dispatchEvent(new PopStateEvent('popstate'))
     }
