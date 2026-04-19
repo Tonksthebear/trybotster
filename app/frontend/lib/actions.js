@@ -1,10 +1,12 @@
 import { useWorkspaceStore } from '../store/workspace-store'
+import { useDialogStore } from '../store/dialog-store'
 import { getHub } from './hub-bridge'
 
 const ACTION = {
   WORKSPACE_TOGGLE: 'botster.workspace.toggle',
   WORKSPACE_RENAME: 'botster.workspace.rename.request',
   SESSION_SELECT: 'botster.session.select',
+  SESSION_CREATE: 'botster.session.create.request',
   PREVIEW_TOGGLE: 'botster.session.preview.toggle',
   PREVIEW_OPEN: 'botster.session.preview.open',
   SESSION_MOVE: 'botster.session.move.request',
@@ -45,6 +47,10 @@ const handlers = {
         detail: { workspaceId: payload.workspaceId, title: payload.title },
       })
     )
+  },
+
+  [ACTION.SESSION_CREATE]() {
+    useDialogStore.getState().openNewSession()
   },
 
   [ACTION.SESSION_SELECT](payload) {

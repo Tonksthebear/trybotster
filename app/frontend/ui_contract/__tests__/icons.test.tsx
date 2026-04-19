@@ -1,7 +1,7 @@
 import React from 'react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { cleanup, render } from '@testing-library/react'
-import { UiTree, createRawDispatch } from '..'
+import { UiTreeBody, createRawDispatch } from '..'
 import { IconGlyph, hasIcon } from '../icons'
 import type { UiNodeV1, UiViewportV1 } from '../types'
 
@@ -61,7 +61,7 @@ describe('icon primitive renders a visible SVG', () => {
       props: { name: 'external-link', size: 'sm' },
     }
     const { container } = render(
-      <UiTree node={node} dispatch={createRawDispatch(() => {})} viewport={REGULAR_FINE} />,
+      <UiTreeBody node={node} dispatch={createRawDispatch(() => {})} viewport={REGULAR_FINE} />,
     )
     const span = container.querySelector('[data-icon="external-link"]')
     expect(span).not.toBeNull()
@@ -78,7 +78,7 @@ describe('icon primitive renders a visible SVG', () => {
       },
     }
     const { container } = render(
-      <UiTree node={node} dispatch={createRawDispatch(() => {})} viewport={REGULAR_FINE} />,
+      <UiTreeBody node={node} dispatch={createRawDispatch(() => {})} viewport={REGULAR_FINE} />,
     )
     expect(container.querySelector('button svg')).not.toBeNull()
   })
@@ -93,7 +93,7 @@ describe('icon primitive renders a visible SVG', () => {
       },
     }
     const { container } = render(
-      <UiTree node={node} dispatch={createRawDispatch(() => {})} viewport={REGULAR_FINE} />,
+      <UiTreeBody node={node} dispatch={createRawDispatch(() => {})} viewport={REGULAR_FINE} />,
     )
     expect(container.querySelector('button svg')).not.toBeNull()
     expect(container.textContent).toContain('Save')
@@ -105,7 +105,7 @@ describe('icon primitive renders a visible SVG', () => {
       props: { title: 'Empty', icon: 'sparkle' },
     }
     const { container } = render(
-      <UiTree node={node} dispatch={createRawDispatch(() => {})} viewport={REGULAR_FINE} />,
+      <UiTreeBody node={node} dispatch={createRawDispatch(() => {})} viewport={REGULAR_FINE} />,
     )
     expect(container.querySelector('svg')).not.toBeNull()
   })
