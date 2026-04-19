@@ -1,7 +1,7 @@
 import React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, fireEvent } from '@testing-library/react'
-import { UiTree, createRawDispatch } from '..'
+import { UiTreeBody, createRawDispatch } from '..'
 import type { UiActionV1, UiNodeV1, UiViewportV1 } from '../types'
 
 afterEach(() => {
@@ -20,7 +20,7 @@ function renderTree(
 ): ReturnType<typeof render> {
   const handler = vi.fn(opts.onAction ?? (() => {}))
   return render(
-    <UiTree
+    <UiTreeBody
       node={node}
       dispatch={createRawDispatch(handler)}
       viewport={opts.viewport ?? REGULAR_FINE}
@@ -312,7 +312,7 @@ describe('ui_contract registry — collection primitives', () => {
     expect(container.querySelector('[role="group"]')).toBeNull()
 
     rerender(
-      <UiTree
+      <UiTreeBody
         node={{
           type: 'tree_item',
           id: 'ws-1',

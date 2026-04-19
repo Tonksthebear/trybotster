@@ -83,7 +83,7 @@ export function renderNode(node: UiNodeV1, ctx: RenderContext): ReactElement {
   return <>{rendered}</>
 }
 
-export type UiTreeProps = {
+export type UiTreeBodyProps = {
   node: UiNodeV1
   dispatch: ActionDispatch
   /** Override the default web capability set if needed (e.g. tests). */
@@ -93,15 +93,20 @@ export type UiTreeProps = {
 }
 
 /**
- * Entry point for rendering a Ui tree as a React component. Owns the
- * `RenderContext` and hooks into `useViewport`.
+ * Pure tree-walker: renders a supplied `UiNodeV1` through the primitive
+ * registry. Owns the `RenderContext` and hooks into `useViewport`.
+ *
+ * The hub-subscribing mount lives in `components/UiTree.jsx` — it owns
+ * transport subscription + interceptor context and delegates rendering to
+ * this body component. Keeping transport concerns out of `ui_contract/` so
+ * the primitive registry stays a pure view layer.
  */
-export function UiTree({
+export function UiTreeBody({
   node,
   dispatch,
   capabilities,
   viewport,
-}: UiTreeProps): ReactElement {
+}: UiTreeBodyProps): ReactElement {
   const liveViewport = useViewport()
   const effectiveViewport = viewport ?? liveViewport
   const ctx: RenderContext = {

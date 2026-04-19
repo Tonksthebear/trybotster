@@ -170,7 +170,7 @@ function wrapActionClick(
     }
     event.preventDefault()
     event.stopPropagation()
-    ctx.dispatch(action)
+    ctx.dispatch(action, { element: event.currentTarget as Element })
   }
 }
 

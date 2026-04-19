@@ -8,7 +8,7 @@
 import React from 'react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { cleanup, render } from '@testing-library/react'
-import { UiTree, createRawDispatch } from '..'
+import { UiTreeBody, createRawDispatch } from '..'
 import type { UiNodeV1, UiViewportV1 } from '../types'
 
 afterEach(() => {
@@ -29,7 +29,7 @@ const COMPACT_COARSE: UiViewportV1 = {
 
 function renderTree(node: UiNodeV1, viewport = EXPANDED_FINE) {
   return render(
-    <UiTree
+    <UiTreeBody
       node={node}
       dispatch={createRawDispatch(() => {})}
       viewport={viewport}
