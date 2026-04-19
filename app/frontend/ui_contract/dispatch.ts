@@ -29,9 +29,29 @@ export type CreateTransportDispatchOptions = {
 }
 
 /**
+ * Action ids whose semantics are entirely browser-local — they open modals,
+ * manipulate local UI state, or trigger browser navigation. Hub has no
+ * handler for them (sending them over transport is a no-op). They MUST be
+ * dispatched locally via `lib/actions.js` regardless of transport state.
+ *
+ * If one of these ever needs server-side observation, register a hub-side
+ * handler via `action.on(id, ...)` AND remove it from this set so the
+ * transport round-trip runs too.
+ */
+const LOCAL_ONLY_ACTIONS = new Set<string>([
+  'botster.workspace.toggle',
+  'botster.workspace.rename.request',
+  'botster.session.create.request',
+  'botster.session.preview.open',
+  'botster.session.move.request',
+  'botster.session.delete.request',
+])
+
+/**
  * Action ids that retain a defensive local fallback via `lib/actions.js` when
  * the encrypted transport is unavailable (no subscription, hub not connected,
- * etc.).
+ * etc.). These actions are hub-authoritative — transport is the primary path
+ * and local dispatch is only a fallback while the hub is unreachable.
  *
  * Excludes non-idempotent actions (notably `botster.session.preview.toggle`)
  * where running legacy after a failed transport attempt could diverge from
@@ -39,13 +59,7 @@ export type CreateTransportDispatchOptions = {
  * can retry once the connection recovers.
  */
 const LEGACY_FALLBACK_ACTIONS = new Set<string>([
-  'botster.workspace.toggle',
-  'botster.workspace.rename.request',
   'botster.session.select',
-  'botster.session.preview.open',
-  'botster.session.move.request',
-  'botster.session.delete.request',
-  'botster.session.create.request',
 ])
 
 function defaultFallback(
@@ -53,6 +67,13 @@ function defaultFallback(
   mergedPayload: Record<string, unknown>,
 ): void {
   if (!LEGACY_FALLBACK_ACTIONS.has(action.id)) return
+  dispatchLegacy({ action: action.id, payload: mergedPayload })
+}
+
+function dispatchLocal(
+  action: UiActionV1,
+  mergedPayload: Record<string, unknown>,
+): void {
   dispatchLegacy({ action: action.id, payload: mergedPayload })
 }
 
@@ -79,6 +100,14 @@ export function createTransportDispatch(
       hubId,
       ...(action.payload ?? {}),
     } as Record<string, unknown>
+
+    // Browser-local actions (modals, collapse toggles, browser nav) must
+    // never go over transport — hub has no handler and the click would be
+    // silently swallowed. Dispatch directly through the legacy handlers.
+    if (LOCAL_ONLY_ACTIONS.has(action.id)) {
+      dispatchLocal(action, mergedPayload)
+      return
+    }
 
     if (!transport) {
       fallback(action, mergedPayload)

@@ -254,4 +254,57 @@ describe('createTransportDispatch — Phase 2c default', () => {
     expect(send).not.toHaveBeenCalled()
     expect(legacyDispatch).not.toHaveBeenCalled()
   })
+
+  it('dispatches browser-local actions (session.create.request) directly via legacy without touching transport', () => {
+    const { transport, send } = makeTransport()
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-local',
+      targetSurface: 'workspace_sidebar',
+    })
+    const node: UiNodeV1 = {
+      type: 'button',
+      props: {
+        label: 'New session',
+        action: { id: 'botster.session.create.request' },
+      },
+    }
+    render(<UiTreeBody node={node} dispatch={dispatch} viewport={REGULAR_FINE} />)
+    fireEvent.click(screen.getByRole('button', { name: 'New session' }))
+    expect(send).not.toHaveBeenCalled()
+    expect(legacyDispatch).toHaveBeenCalledOnce()
+    expect(legacyDispatch).toHaveBeenCalledWith({
+      action: 'botster.session.create.request',
+      payload: { hubId: 'hub-local' },
+    })
+  })
+
+  it('dispatches browser-local actions locally even when transport is available for other actions', () => {
+    const { transport, send } = makeTransport()
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-mixed',
+      targetSurface: 'workspace_panel',
+    })
+    const toggleNode: UiNodeV1 = {
+      type: 'button',
+      props: {
+        label: 'Toggle',
+        action: {
+          id: 'botster.workspace.toggle',
+          payload: { workspaceId: 'ws-1' },
+        },
+      },
+    }
+    render(
+      <UiTreeBody node={toggleNode} dispatch={dispatch} viewport={REGULAR_FINE} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle' }))
+    expect(send).not.toHaveBeenCalled()
+    expect(legacyDispatch).toHaveBeenCalledOnce()
+    expect(legacyDispatch).toHaveBeenCalledWith({
+      action: 'botster.workspace.toggle',
+      payload: { hubId: 'hub-mixed', workspaceId: 'ws-1' },
+    })
+  })
 })

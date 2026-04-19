@@ -159,6 +159,20 @@ const ICON_SIZE: Record<UiSizeV1, string> = {
 
 // ---------- Action helpers ----------
 
+/**
+ * Mapping from well-known action ids to `data-testid` values that Rails
+ * system tests and other DOM-level consumers can target. Kept in the web
+ * renderer (not in the shared contract) because `data-testid` is a
+ * renderer-specific affordance per the spec's "renderer hints don't belong
+ * in the shared contract" rule.
+ *
+ * Add entries here when a new Lua-authored action needs a stable DOM anchor;
+ * the Lua contract stays unchanged.
+ */
+const ACTION_TEST_IDS: Record<string, string> = {
+  'botster.session.create.request': 'new-session-button',
+}
+
 function wrapActionClick(
   action: UiActionV1,
   ctx: RenderContext,
@@ -393,10 +407,12 @@ const renderButton: PrimitiveRenderer = ({ props, ctx }) => {
   const onClick = wrapActionClick(action, ctx)
   const toneClass =
     variant === 'solid' ? BUTTON_TONE_SOLID[tone] : BUTTON_TONE_GHOST[tone]
+  const testId = ACTION_TEST_IDS[action.id]
   return (
     <button
       type="button"
       data-action-id={action.id}
+      data-testid={testId}
       onClick={onClick}
       disabled={action.disabled === true}
       className={clsx(
@@ -424,11 +440,13 @@ const renderIconButton: PrimitiveRenderer = ({ props, ctx }) => {
     return <button type="button" aria-label={label} disabled />
   }
   const onClick = wrapActionClick(action, ctx)
+  const testId = ACTION_TEST_IDS[action.id]
   return (
     <button
       type="button"
       aria-label={label}
       data-action-id={action.id}
+      data-testid={testId}
       onClick={onClick}
       disabled={action.disabled === true}
       className={clsx(
