@@ -138,6 +138,37 @@ use super::{
     SharedConnectionState,
 };
 
+/// Prepare a PTY payload for wire transmission, honoring an optional compression
+/// threshold and passing pre-gzipped payloads through unchanged.
+///
+/// Callers (e.g. `queue_webrtc_terminal_snapshot`) may pre-compress very large
+/// blobs — the raw snapshot can exceed SCTP's negotiated max message size, and
+/// compressing inside `send_pty_raw` happens too late to save it. Pre-gzipped
+/// data starts with the gzip magic bytes `1f 8b`; routing prefixes for live
+/// output (`0x01`) and snapshots (`0x02`) are disjoint from that magic, so a
+/// byte-sniff is unambiguous.
+fn pty_payload_with_compression<'a>(
+    data: &'a [u8],
+    threshold: Option<usize>,
+) -> Result<(std::borrow::Cow<'a, [u8]>, bool), ChannelError> {
+    // Pre-gzipped: pass through as compressed, skip re-gzip.
+    if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+        return Ok((std::borrow::Cow::Borrowed(data), true));
+    }
+
+    let Some(threshold) = threshold else {
+        return Ok((std::borrow::Cow::Borrowed(data), false));
+    };
+
+    let compressed = maybe_compress(data, Some(threshold))
+        .map_err(|e| ChannelError::CompressionError(e.to_string()))?;
+    if compressed[0] == 0x1f {
+        Ok((std::borrow::Cow::Owned(compressed[1..].to_vec()), true))
+    } else {
+        Ok((std::borrow::Cow::Borrowed(data), false))
+    }
+}
+
 /// Internal message for the receive queue.
 #[derive(Debug)]
 pub(crate) struct RawIncoming {
@@ -1482,19 +1513,7 @@ impl WebRtcChannel {
         let threshold = config_guard.as_ref().and_then(|c| c.compression_threshold);
         drop(config_guard);
 
-        // Compress if above threshold. Cow avoids cloning the common uncompressed path.
-        let (payload, was_compressed): (std::borrow::Cow<'_, [u8]>, bool) =
-            if let Some(threshold) = threshold {
-                let compressed = maybe_compress(data, Some(threshold))
-                    .map_err(|e| ChannelError::CompressionError(e.to_string()))?;
-                if compressed[0] == 0x1f {
-                    (std::borrow::Cow::Owned(compressed[1..].to_vec()), true)
-                } else {
-                    (std::borrow::Cow::Borrowed(data), false)
-                }
-            } else {
-                (std::borrow::Cow::Borrowed(data), false)
-            };
+        let (payload, was_compressed) = pty_payload_with_compression(data, threshold)?;
 
         let peer_key = self.get_peer_olm_key().await?;
 
@@ -1657,18 +1676,7 @@ impl WebRtcSender {
         let threshold = config_guard.as_ref().and_then(|c| c.compression_threshold);
         drop(config_guard);
 
-        let (payload, was_compressed): (std::borrow::Cow<'_, [u8]>, bool) =
-            if let Some(threshold) = threshold {
-                let compressed = maybe_compress(data, Some(threshold))
-                    .map_err(|e| ChannelError::CompressionError(e.to_string()))?;
-                if compressed[0] == 0x1f {
-                    (std::borrow::Cow::Owned(compressed[1..].to_vec()), true)
-                } else {
-                    (std::borrow::Cow::Borrowed(data), false)
-                }
-            } else {
-                (std::borrow::Cow::Borrowed(data), false)
-            };
+        let (payload, was_compressed) = pty_payload_with_compression(data, threshold)?;
 
         let peer_key = self.get_peer_olm_key().await?;
 

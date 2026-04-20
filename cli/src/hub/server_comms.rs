@@ -3685,17 +3685,43 @@ impl Hub {
             return true;
         }
 
-        log::debug!(
-            "[Lua] Sending {} bytes of snapshot for session {}",
-            snapshot.len(),
-            session_uuid
-        );
+        // Pre-gzip the snapshot so the plaintext on the wire is small enough
+        // to survive Olm encryption and SCTP's negotiated 16 MB max message
+        // size. For large scrollback sessions the raw snapshot can exceed that
+        // limit and get dropped silently in the send pipeline.
+        // send_pty_raw detects the gzip magic (1f 8b) and forwards it as a
+        // compressed frame without re-compressing.
+        let uncompressed_len = snapshot.len();
+        let mut plain = Vec::with_capacity(1 + uncompressed_len);
+        plain.push(0x02);
+        plain.extend(snapshot);
 
-        // Single message: [0x02 prefix][snapshot bytes]
-        // WebRTC SCTP handles message fragmentation automatically.
-        let mut raw_message = Vec::with_capacity(1 + snapshot.len());
-        raw_message.push(0x02);
-        raw_message.extend(snapshot);
+        let raw_message = match {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let mut encoder = GzEncoder::new(Vec::with_capacity(uncompressed_len / 4), Compression::fast());
+            encoder
+                .write_all(&plain)
+                .and_then(|()| encoder.finish())
+        } {
+            Ok(gzipped) => gzipped,
+            Err(e) => {
+                log::warn!(
+                    "[Lua] Snapshot gzip failed for session {}, sending uncompressed: {}",
+                    session_uuid,
+                    e
+                );
+                plain
+            }
+        };
+
+        log::debug!(
+            "[Lua] Sending snapshot for session {} ({} bytes raw, {} bytes on wire)",
+            session_uuid,
+            uncompressed_len,
+            raw_message.len()
+        );
 
         match output_tx.try_send(WebRtcPtyOutput {
             subscription_id: subscription_id.to_string(),
