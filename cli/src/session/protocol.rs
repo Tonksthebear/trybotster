@@ -271,9 +271,13 @@ impl FrameDecoder {
         }
     }
 
-    /// Maximum frame payload size (16 MiB) to reject obviously malformed input
-    /// before allocating.
-    const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+    /// Maximum frame payload size to reject obviously malformed input before
+    /// allocating. Binary page snapshots for sessions with large scrollback
+    /// can legitimately reach tens of megabytes — observed 43.9 MB in the
+    /// wild — so this ceiling must stay well above that. The session process
+    /// is a trusted subprocess, not a network peer, so the allocation cost of
+    /// a large frame is acceptable.
+    const MAX_FRAME_SIZE: usize = 128 * 1024 * 1024;
 
     /// Number of consecutive bad headers before the decoder considers the
     /// stream irrecoverably desynced.
