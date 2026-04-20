@@ -165,16 +165,31 @@ pub fn reload(lua: &Lua) -> Result<()> {
 
 /// Core render pipeline: resolve the layout table, look up the surface
 /// function, call it with the state, and serialise the resulting node.
+///
+/// Resolution order:
+///   1. Override/embedded layout table (existing Phase 2a behaviour). Any
+///      file that defines `layout_table[surface_name]` as a function wins.
+///   2. Phase 4a: `_G.surfaces.render_node(surface_name, state)`. This is
+///      the hook plugins use to ship new surfaces without touching the
+///      override-file chain. When `surfaces` is not registered or does not
+///      know the surface, this returns nil and we fall through to the
+///      error path.
+///
+/// The fall-through from (1) to (2) happens whenever the layout table
+/// lookup yields a non-function (including nil); override files that want
+/// to shadow a plugin-registered surface just define the name, even if the
+/// function they define is a thin wrapper around `surfaces.render_node`.
 fn render_surface(lua: &Lua, surface_name: &str, state: Value) -> Result<String> {
     let layout_table = resolve_layout_table(lua)?;
 
-    let surface_fn: Function = layout_table
-        .get(surface_name)
-        .map_err(|e| anyhow!("layout table has no surface `{surface_name}`: {e}"))?;
+    let returned = call_layout_table_surface(&layout_table, surface_name, state.clone())?
+        .or_else(|| call_surfaces_registry_fallback(lua, surface_name, state));
 
-    let returned: Value = surface_fn
-        .call(state)
-        .map_err(|e| anyhow!("surface `{surface_name}` raised: {e}"))?;
+    let Some(returned) = returned else {
+        return Err(anyhow!(
+            "no layout surface registered for `{surface_name}` (checked layout table + surfaces registry)"
+        ));
+    };
 
     let node: UiNodeV1 = lua
         .from_value(returned)
@@ -182,6 +197,58 @@ fn render_surface(lua: &Lua, surface_name: &str, state: Value) -> Result<String>
 
     serde_json::to_string(&node)
         .map_err(|e| anyhow!("failed to serialise UiNodeV1 for `{surface_name}`: {e}"))
+}
+
+/// Look up `surface_name` in the resolved layout table and call it with the
+/// given state when the lookup yields a function. Returns `Ok(None)` when
+/// the layout table has no such entry (or the entry is not callable) — the
+/// caller then consults the surfaces registry.
+fn call_layout_table_surface(
+    layout_table: &Table,
+    surface_name: &str,
+    state: Value,
+) -> Result<Option<Value>> {
+    let candidate: Value = layout_table
+        .get(surface_name)
+        .map_err(|e| anyhow!("layout table lookup for `{surface_name}` failed: {e}"))?;
+    match candidate {
+        Value::Function(f) => {
+            let returned = f
+                .call(state)
+                .map_err(|e| anyhow!("surface `{surface_name}` raised: {e}"))?;
+            Ok(Some(returned))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Fallback to the Phase-4a Lua-side surface registry (`_G.surfaces`). Any
+/// failure (no surfaces global, no `render_node`, registry has no such
+/// surface, or the registered render function raised) is logged and
+/// resolves to `None` so the caller emits the error fallback tree.
+fn call_surfaces_registry_fallback(
+    lua: &Lua,
+    surface_name: &str,
+    state: Value,
+) -> Option<Value> {
+    let surfaces: Table = match lua.globals().get("surfaces") {
+        Ok(Value::Table(t)) => t,
+        _ => return None,
+    };
+    let render_node: Function = match surfaces.get("render_node") {
+        Ok(Value::Function(f)) => f,
+        _ => return None,
+    };
+    match render_node.call::<Value>((surface_name.to_string(), state)) {
+        Ok(Value::Nil) => None,
+        Ok(v) => Some(v),
+        Err(err) => {
+            log::warn!(
+                "web_layout.render: surfaces.render_node for `{surface_name}` raised: {err}"
+            );
+            None
+        }
+    }
 }
 
 /// Process-wide cache of the last successful override-chain scan.

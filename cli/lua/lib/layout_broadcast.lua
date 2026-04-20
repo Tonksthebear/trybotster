@@ -1,18 +1,21 @@
--- Web layout broadcast helper (Phase 2b).
+-- Web layout broadcast helper (Phase 2b + Phase 4a).
 --
--- Wraps `web_layout.render(...)` (Phase 2a) with:
---   1. Two-density expansion — the web has a sidebar and a main panel
---      consuming the same state; this module renders both and returns one
---      frame per target surface.
+-- Wraps `web_layout.render(...)` with:
+--   1. Registry-driven surface expansion — iterates
+--      `lib.surfaces.list()` so every registered surface (workspace_sidebar,
+--      workspace_panel, plugin-authored surfaces) fans out automatically.
+--      Pre-Phase-4a this was a hardcoded two-entry table for the workspace
+--      densities; plugins dropping `surfaces.register(...)` now slot in
+--      without changes here.
 --   2. Version hashing — a pure-Lua fingerprint over the resulting tree JSON
 --      so downstream dedup can skip rebroadcasts when the tree is unchanged.
 --   3. Dedup snapshot — `build_frames` only emits frames whose `version`
 --      differs from the last-sent version for that target surface.
 --
--- Known perf tradeoff (ack'd by orchestrator): two densities broadcast per
--- update. If hub CPU becomes hot with large session lists, we can add
--- per-subscription density selection. For now the hub is viewport-agnostic
--- and the browser picks the matching tree.
+-- Known perf tradeoff (ack'd by orchestrator): every registered surface
+-- is re-rendered per broadcast. Surfaces that don't depend on the session
+-- list can short-circuit in their own render fn; dedup will suppress
+-- unchanged bytes downstream.
 --
 -- The module is pure: no `client:send`. Callers (handlers/connections.lua
 -- and lib/client.lua:send_hub_layout_trees) iterate the returned frames and
@@ -21,19 +24,6 @@
 local state = require("hub.state")
 
 local M = {}
-
--- Maps the logical surface name on the wire -> the state.surface density
--- hint consumed by `web/layout.lua:workspace_surface`. Keeping the map here
--- (rather than in connections.lua) lets tests reason about exactly which
--- frames will fire for a given state.
-local SURFACE_TARGETS = {
-    { target_surface = "workspace_sidebar", density = "sidebar" },
-    { target_surface = "workspace_panel",   density = "panel" },
-}
-
--- Surface name to feed `web_layout.render(...)` — currently a single shared
--- function that switches on `state.surface` for density variation.
-local LAYOUT_SURFACE_NAME = "workspace_surface"
 
 -- Last-sent version per `{subscription_key, target_surface}`. Selection is
 -- per-browser (a click on client A must not flip the selected row on
@@ -104,37 +94,30 @@ end
 -- Frame construction
 -- -------------------------------------------------------------------------
 
---- Build a shallow copy of `state` with `surface` set to the requested
---- density. The Phase-2a layout also looks at other fields
---- (agents/open_workspaces/selected_session_uuid/hub_id) unchanged.
-local function state_with_density(base_state, density)
-    local out = {}
-    for k, v in pairs(base_state) do out[k] = v end
-    out.surface = density
-    return out
-end
-
---- Render one frame for one target surface. Returns a table
---- `{ type, target_surface, tree, version, hub_id }` ready to ship via
---- `client:send(frame)`.
-local function render_one(base_state, entry)
-    local density_state = state_with_density(base_state, entry.density)
-    local tree_json, err = pcall(function()
-        return web_layout.render(LAYOUT_SURFACE_NAME, density_state)
+--- Render one frame for `surface_name` using `surface_state` as input.
+--- Returns a table `{ type, target_surface, tree, version, hub_id }` ready
+--- to ship via `client:send(frame)`, or nil if rendering / decoding failed.
+---
+--- Uses `web_layout.render(surface_name, state)` uniformly so:
+---   * override files (`.botster/layout_web.lua`) keep their precedence
+---   * the embedded `web.layout` module still handles `workspace_surface`
+---     when the workspace wrappers delegate to it
+---   * plugin-registered surfaces fall through to
+---     `_G.surfaces.render_node(...)` via the Rust fallback (Phase 4a).
+local function render_one(surface_name, surface_state)
+    local ok, result_json = pcall(function()
+        return web_layout.render(surface_name, surface_state)
     end)
-    -- pcall with a closure returns (ok, result); remap.
-    local ok = tree_json
-    local result_json = err
     if not ok then
         log.warn(string.format(
             "layout_broadcast: web_layout.render failed for %s: %s",
-            entry.target_surface, tostring(result_json)))
+            surface_name, tostring(result_json)))
         return nil
     end
     if type(result_json) ~= "string" then
         log.warn(string.format(
             "layout_broadcast: render returned %s for %s",
-            type(result_json), entry.target_surface))
+            type(result_json), surface_name))
         return nil
     end
 
@@ -142,7 +125,7 @@ local function render_one(base_state, entry)
     if type(tree) ~= "table" then
         log.warn(string.format(
             "layout_broadcast: tree decode failed for %s: %s",
-            entry.target_surface, tostring(decode_err)))
+            surface_name, tostring(decode_err)))
         return nil
     end
 
@@ -153,10 +136,10 @@ local function render_one(base_state, entry)
 
     return {
         type = "ui_layout_tree_v1",
-        target_surface = entry.target_surface,
+        target_surface = surface_name,
         tree = tree,
         version = version,
-        hub_id = base_state.hub_id,
+        hub_id = (type(surface_state) == "table") and surface_state.hub_id or nil,
     }
 end
 
@@ -179,20 +162,38 @@ local function versions_for(key)
     return bucket
 end
 
---- Build the frame list for a given `AgentWorkspaceSurfaceInputV1`-shaped
---- state. Returns an array of frames that differ from the last-sent version
---- for the given subscription + target surface.
+--- Build the frame list for a hub-channel subscription.
 ---
---- When `opts.force` is true, always emit every frame regardless of dedup.
---- Used for priming new subscribers.
--- @param base_state table Input state (agents, open_workspaces, hub_id, selected_session_uuid, etc.)
--- @param opts table? { force = bool, subscription_key = string }
+--- Iterates every registered surface in `lib.surfaces` and emits one frame
+--- per surface whose rendered tree differs from the last-sent version for
+--- this `(subscription_key, target_surface)` pair.
+---
+--- Input resolution (per surface, in order):
+---   1. If the surface declares an `input_builder(client, sub_id)`, call it.
+---   2. Otherwise, if `opts.client` is set, fall back to
+---      `LayoutInput.build_for_subscription(opts.client, opts.subscription_key)`
+---      — the Phase 2b default for the workspace surfaces.
+---   3. Otherwise (tests / diagnostics), use `base_state` as-is. This is the
+---      path the old two-density test helpers exercise.
+---
+--- When `opts.force` is true, emit every frame regardless of dedup. Used for
+--- priming new subscribers.
+---
+-- @param base_state table Input state (agents, open_workspaces, hub_id, etc.).
+--                         May be nil when opts.client is provided — each
+--                         surface builds its own input in that case.
+-- @param opts table? { force = bool, subscription_key = string, client = any }
 -- @return table array of frames
 function M.build_frames(base_state, opts)
+    if opts == true then
+        -- Legacy API: `build_frames(state, true)` used by older callers /
+        -- tests to force a full emission. Normalise to the modern shape.
+        opts = { force = true }
+    end
     opts = opts or {}
-    local force = opts == true or opts.force == true
+    local force = opts.force == true
 
-    if type(base_state) ~= "table" then
+    if base_state ~= nil and type(base_state) ~= "table" then
         log.warn("layout_broadcast.build_frames: non-table state")
         return {}
     end
@@ -200,12 +201,46 @@ function M.build_frames(base_state, opts)
     local key = resolve_key(opts)
     local bucket = versions_for(key)
 
+    -- Defer the `lib.surfaces` require to call time. Loading it at module
+    -- load would create a circular dependency (surfaces → state → layout,
+    -- layout → surfaces) whenever hot-reload re-evaluates either module.
+    local ok_surfaces, surfaces_mod = pcall(require, "lib.surfaces")
+    if not ok_surfaces or type(surfaces_mod) ~= "table" then
+        log.warn(string.format(
+            "layout_broadcast.build_frames: surfaces module unavailable: %s",
+            tostring(surfaces_mod)))
+        return {}
+    end
+
     local frames = {}
-    for _, entry in ipairs(SURFACE_TARGETS) do
-        local frame = render_one(base_state, entry)
-        if frame then
-            if force or bucket[entry.target_surface] ~= frame.version then
-                frames[#frames + 1] = frame
+    for _, summary in ipairs(surfaces_mod.list()) do
+        local surface_name = summary.name
+        local entry = surfaces_mod.get(surface_name)
+        if entry then
+            local surface_state
+            if entry.input_builder then
+                local ok, built = pcall(entry.input_builder, opts.client, opts.subscription_key)
+                if ok then
+                    surface_state = built
+                else
+                    log.warn(string.format(
+                        "layout_broadcast: input_builder for %s threw: %s",
+                        surface_name, tostring(built)))
+                end
+            elseif opts.client then
+                local LayoutInput = require("lib.layout_input")
+                surface_state = LayoutInput.build_for_subscription(opts.client, opts.subscription_key)
+            else
+                surface_state = base_state
+            end
+
+            if type(surface_state) == "table" then
+                local frame = render_one(surface_name, surface_state)
+                if frame then
+                    if force or bucket[surface_name] ~= frame.version then
+                        frames[#frames + 1] = frame
+                    end
+                end
             end
         end
     end
@@ -249,6 +284,32 @@ function M.forget(subscription_key)
     state.set("layout_broadcast.versions_by_key", versions_by_key)
 end
 
+--- Drop the dedup baselines for `surface_name` across EVERY subscription.
+---
+--- Called when a surface is unregistered so its per-sub version entries
+--- don't accumulate forever. Also guards against the "re-register same
+--- name" footgun: without this, a freshly-registered surface with the
+--- same name would inherit the old surface's cached version hash for
+--- every subscription that ever saw the old tree, and — if the new
+--- tree's hash happened to collide — dedup would silently swallow the
+--- first emission.
+-- @param surface_name string
+-- @return number count of subscription buckets that had an entry removed
+function M.forget_surface(surface_name)
+    if type(surface_name) ~= "string" or surface_name == "" then return 0 end
+    local removed = 0
+    for _, bucket in pairs(versions_by_key) do
+        if bucket[surface_name] ~= nil then
+            bucket[surface_name] = nil
+            removed = removed + 1
+        end
+    end
+    if removed > 0 then
+        state.set("layout_broadcast.versions_by_key", versions_by_key)
+    end
+    return removed
+end
+
 --- Drop the entire dedup cache so the next `build_frames` emits both
 --- densities for every subscription. Used when the input shape changes in a
 --- way the hash cannot detect (e.g. a surface added) or by tests.
@@ -257,12 +318,16 @@ function M.invalidate()
     state.set("layout_broadcast.versions_by_key", versions_by_key)
 end
 
---- Expose the configured target set for introspection (tests).
--- @return table copy of SURFACE_TARGETS
+--- Expose the set of currently registered target surfaces (tests).
+--- Returns a deterministic array `{ target_surface = ... }` mirroring the
+--- ordering produced by `lib.surfaces.list()`.
+-- @return table
 function M.surface_targets()
+    local ok, surfaces_mod = pcall(require, "lib.surfaces")
+    if not ok or type(surfaces_mod) ~= "table" then return {} end
     local out = {}
-    for _, e in ipairs(SURFACE_TARGETS) do
-        out[#out + 1] = { target_surface = e.target_surface, density = e.density }
+    for _, entry in ipairs(surfaces_mod.list()) do
+        out[#out + 1] = { target_surface = entry.name }
     end
     return out
 end

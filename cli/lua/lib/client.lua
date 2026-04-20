@@ -252,6 +252,17 @@ function Client:handle_subscribe(msg)
         self:send_workspace_list(sub_id)
         self:send_spawn_target_list(sub_id)
         self:send_hub_recovery_state(sub_id)
+        -- Phase 4a: prime the route registry BEFORE the layout trees so a
+        -- fresh browser knows which surfaces it can route to before it
+        -- receives their trees. The browser store replaces the registry
+        -- wholesale on each frame, so ordering matters only for the first
+        -- render; subsequent mutations flow via hooks.
+        local reg_ok, reg_err = pcall(self.send_ui_route_registry, self, sub_id)
+        if not reg_ok then
+            log.warn(string.format(
+                "send_ui_route_registry failed for %s: %s",
+                self.peer_id:sub(1, 8), tostring(reg_err)))
+        end
         -- Prime Phase 2b layout trees so a fresh subscriber renders
         -- immediately without waiting for the next session_updated.
         -- `force=true` bypasses dedup; this is the only call that does so
@@ -363,9 +374,17 @@ function Client:send_ui_layout_trees(sub_id, opts)
     opts = opts or {}
     local force = opts.force == true
 
+    -- Phase 4a: layout_broadcast iterates `lib.surfaces` and asks each
+    -- surface for its own input via its `input_builder`. We still precompute
+    -- the canonical workspace input here so layout_broadcast can fall back
+    -- to it for the built-in workspace surfaces (which don't declare their
+    -- own input_builder — Phase 2b kept the builder inlined). Passing
+    -- `client = self` additionally lets surfaces that DO declare an
+    -- input_builder thread the per-subscription identity through.
     local input = LayoutInput.build_for_subscription(self, sub_id)
     local frames = LayoutBroadcast.build_frames(input, {
         subscription_key = sub_id,
+        client = self,
         force = force,
     })
     if #frames == 0 then
@@ -377,6 +396,29 @@ function Client:send_ui_layout_trees(sub_id, opts)
     end
     LayoutBroadcast.mark_sent(frames, { subscription_key = sub_id })
     return #frames
+end
+
+--- Send the `ui_route_registry_v1` frame for a HubChannel subscription.
+--
+-- The payload enumerates every registered surface that declares a `path`,
+-- giving the browser's React Router everything it needs to render the
+-- correct surface for an arbitrary hub-scoped URL (e.g. /hubs/:id/plugins/X)
+-- WITHOUT a Rails route edit. Re-broadcast on every `surfaces_changed`
+-- hook firing so a hot-reloaded plugin registering a new surface is
+-- discoverable within the same session.
+-- @param sub_id The subscription ID to send to
+function Client:send_ui_route_registry(sub_id)
+    local ok_surfaces, surfaces_mod = pcall(require, "lib.surfaces")
+    if not ok_surfaces or type(surfaces_mod) ~= "table" then
+        log.warn(string.format(
+            "send_ui_route_registry: surfaces module unavailable: %s",
+            tostring(surfaces_mod)))
+        return
+    end
+    local hub_id = (type(hub) == "table") and hub.server_id and hub.server_id() or nil
+    local payload = surfaces_mod.build_route_registry_payload(hub_id)
+    payload.subscriptionId = sub_id
+    self:send(payload)
 end
 
 --- Send workspace list to a HubChannel subscription.
