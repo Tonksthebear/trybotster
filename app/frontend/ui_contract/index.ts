@@ -6,6 +6,7 @@
 
 export type {
   ActionDispatch,
+  ActionDispatchSource,
   RenderContext,
 } from './context'
 export {
@@ -14,10 +15,17 @@ export {
   useRenderContext,
 } from './context'
 
-export { createHubDispatch, createRawDispatch } from './dispatch'
+export {
+  createRawDispatch,
+  createTransportDispatch,
+} from './dispatch'
+export type {
+  CreateTransportDispatchOptions,
+  UiActionTransport,
+} from './dispatch'
 
-export { renderNode, UiTree } from './interpreter'
-export type { UiTreeProps } from './interpreter'
+export { renderNode, UiTreeBody } from './interpreter'
+export type { UiTreeBodyProps } from './interpreter'
 
 export { PRIMITIVE_REGISTRY } from './registry'
 export type { PrimitiveRenderer, PrimitiveRendererArgs } from './registry'

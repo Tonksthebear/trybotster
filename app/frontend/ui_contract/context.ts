@@ -2,17 +2,38 @@ import { createContext, useContext } from 'react'
 import type { UiActionV1, UiCapabilitySetV1, UiViewportV1 } from './types'
 
 /**
- * Called when a primitive's bound action is activated. Implementations route
- * to the hub transport (e.g. `hub.selectAgent`, `hub.toggleHostedPreview`),
- * browser navigation, or local UI state depending on the action id.
+ * Optional metadata a primitive may attach when dispatching an action. Used
+ * by composite interceptors (e.g. SessionActionsMenu) that need the trigger
+ * element to anchor a dropdown.
  */
-export type ActionDispatch = (action: UiActionV1) => void
+export type ActionDispatchSource = {
+  /** The DOM element that triggered the action (e.g. the clicked button). */
+  element?: Element | null
+}
+
+/**
+ * Called when a primitive's bound action is activated. Implementations route
+ * the `UiActionV1` envelope to hub transport (Phase 2b's `ui_action_v1` wire
+ * message), local store updates, or composite interceptors depending on the
+ * action id.
+ */
+export type ActionDispatch = (
+  action: UiActionV1,
+  source?: ActionDispatchSource,
+) => void
 
 /** Context handed to every primitive renderer by the interpreter. */
 export type RenderContext = {
   viewport: UiViewportV1
   capabilities: UiCapabilitySetV1
   dispatch: ActionDispatch
+  /**
+   * Current hub id, threaded through by <UiTree>. Web-specific; optional
+   * because pure interpreter tests may not supply one. Renderers can use it
+   * to construct URLs (e.g. session row anchor hrefs) so right-click /
+   * middle-click browser navigation works.
+   */
+  hubId?: string
 }
 
 /** Default web capability set. Renderers may override in tests. */

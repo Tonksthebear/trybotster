@@ -1,5 +1,11 @@
-import React from 'react'
-import clsx from 'clsx'
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import { createPortal } from 'react-dom'
 import {
   Dropdown,
   DropdownButton,
@@ -8,29 +14,88 @@ import {
   DropdownLabel,
   DropdownDivider,
 } from '../catalyst/dropdown'
-import { dispatch, ACTION } from '../../lib/actions'
+import { useUiActionInterceptor, useUiTreeDispatch } from '../UiTree'
+import {
+  useWorkspaceStore,
+  previewState,
+} from '../../store/workspace-store'
 import { IconGlyph } from '../../ui_contract/icons'
 
-// SessionActionsMenu uses Headless UI's Menu via the Catalyst Dropdown
-// wrapper. Per the v1 primitive inventory in
-// `docs/specs/web-ui-primitives-runtime.md`, Menu and MenuItem are supported
-// primitives but NOT Lua-public; they're available to composites like this
-// one. The open/close state machine, portal positioning, and focus trap live
-// in Headless UI. Icons and action dispatch flow through the ui_contract
-// registry: IconGlyph is the same SVG library the `icon` primitive uses.
-export default function SessionActionsMenu({
-  sessionId,
-  sessionUuid,
-  hubId,
-  actionsMenu,
-  isAccessory,
-  density,
-}) {
-  const isSidebar = density === 'sidebar'
-  const { canPreview, previewStatus, previewUrl, canMove, canDelete } = actionsMenu
+// SessionActionsMenu intercepts the placeholder action emitted by Phase 2a's
+// `web/layout.lua:actions_menu_trigger` (`botster.session.menu.open`). Phase
+// 2c keeps the Menu / MenuItem primitives non-Lua-public per the v1 spec
+// (`docs/specs/web-ui-primitives-runtime.md:179`); instead this Rails-owned
+// composite captures the action + click event and renders a Catalyst Dropdown
+// anchored to the triggering button.
+//
+// Wiring contract:
+// - The hub emits `ui.icon_button{ icon = "ellipsis-vertical",
+//   action = ui.action("botster.session.menu.open", { sessionId,
+//   sessionUuid }) }` on each session row.
+// - This composite registers an interceptor for that action id, captures
+//   the event's currentTarget, derives availability flags from the
+//   workspace store (canPreview / canMove / canDelete), and opens a
+//   Headless UI Menu via a programmatically-clicked invisible MenuButton
+//   positioned on top of the trigger.
+// - Menu items dispatch follow-up actions back through the same UiTree
+//   dispatch — those flow over `ui_action_v1` once Phase 2b wires the
+//   matching hub handlers, with the legacy fallback table catching any
+//   un-wired ones.
+export default function SessionActionsMenu() {
+  const dispatch = useUiTreeDispatch()
+  const sessionsById = useWorkspaceStore((s) => s.sessionsById)
+  const [openState, setOpenState] = useState(null)
+  const buttonRef = useRef(null)
 
+  const handleMenuOpen = useCallback((action, source) => {
+    const element = source?.element
+    if (!element) return false
+    const rect = element.getBoundingClientRect()
+    setOpenState({
+      anchorRect: rect,
+      sessionId: action.payload?.sessionId,
+      sessionUuid: action.payload?.sessionUuid,
+      requestId: typeof globalThis.crypto?.randomUUID === 'function'
+        ? globalThis.crypto.randomUUID()
+        : `${Date.now()}-${Math.random()}`,
+    })
+    return true
+  }, [])
+
+  useUiActionInterceptor('botster.session.menu.open', handleMenuOpen)
+
+  // Trigger the invisible MenuButton once it's been positioned at the anchor.
+  // Two passes of layout: render with anchor, then click on next tick.
+  useEffect(() => {
+    if (!openState) return
+    const timer = window.setTimeout(() => {
+      buttonRef.current?.click()
+    }, 0)
+    return () => window.clearTimeout(timer)
+  }, [openState?.requestId])
+
+  const close = useCallback(() => setOpenState(null), [])
+
+  const session = openState?.sessionId
+    ? sessionsById[openState.sessionId]
+    : null
+  const preview = useMemo(
+    () => (session ? previewState(session) : null),
+    [session],
+  )
+
+  if (!openState) return null
+
+  const isAccessory = session?.session_type === 'accessory'
+  const canPreview = preview?.canPreview === true
+  const previewStatus = preview?.status ?? 'inactive'
+  const previewUrl = preview?.url ?? null
   const previewRunning = previewStatus === 'running'
   const previewReady = previewRunning && previewUrl
+  const canMove = !isAccessory
+  const canDelete = true
+  const hasPreviewItems = canPreview || previewReady
+  const hasManageItems = canMove || canDelete
 
   function previewLabel() {
     if (previewRunning) return 'Disable Cloudflare preview'
@@ -39,38 +104,48 @@ export default function SessionActionsMenu({
     return 'Enable Cloudflare preview'
   }
 
-  const hasPreviewItems = canPreview || previewReady
-  const hasManageItems = (canMove && !isAccessory) || canDelete
+  function fireAction(id, payload) {
+    dispatch({ id, payload })
+    close()
+  }
 
-  const iconSize = isSidebar ? 'size-3.5' : 'size-4'
+  // Position the invisible Headless UI MenuButton ON TOP of the original
+  // trigger so its dropdown anchors to the visible button location.
+  // Rendered into a portal so it escapes any clipping containers.
+  const anchorStyle = {
+    position: 'fixed',
+    top: `${openState.anchorRect.top}px`,
+    left: `${openState.anchorRect.left}px`,
+    width: `${openState.anchorRect.width}px`,
+    height: `${openState.anchorRect.height}px`,
+    opacity: 0,
+    pointerEvents: 'none',
+    zIndex: 50,
+  }
 
-  return (
-    <Dropdown>
+  const menu = (
+    <Dropdown key={openState.requestId}>
       <DropdownButton
-        plain
-        className={clsx(
-          'shrink-0 transition-colors',
-          isSidebar
-            ? 'p-1.5 text-zinc-600 hover:text-zinc-300 opacity-0 group-hover:opacity-100 [@media(pointer:coarse)]:opacity-100'
-            : 'p-3 text-zinc-600 hover:text-zinc-300'
-        )}
+        ref={buttonRef}
+        as="button"
+        type="button"
+        style={anchorStyle}
+        aria-hidden="true"
+        tabIndex={-1}
+        data-testid="session-actions-menu-trigger"
+      />
+      <DropdownMenu
+        anchor="bottom end"
+        // Headless UI handles outside-click + Escape close natively. When the
+        // menu closes (any reason), drop our anchored state so the invisible
+        // trigger unmounts and we're ready for the next request.
+        onClose={close}
       >
-        <span className="sr-only">Open session options</span>
-        <span
-          data-slot="icon"
-          className={clsx('inline-flex items-center justify-center', iconSize)}
-        >
-          <IconGlyph name="ellipsis-vertical" className="h-full w-full" />
-        </span>
-      </DropdownButton>
-
-      <DropdownMenu anchor="bottom end">
         {canPreview && (
           <DropdownItem
             onClick={() =>
-              dispatch({
-                action: ACTION.PREVIEW_TOGGLE,
-                payload: { hubId, sessionUuid },
+              fireAction('botster.session.preview.toggle', {
+                sessionUuid: openState.sessionUuid,
               })
             }
           >
@@ -82,9 +157,9 @@ export default function SessionActionsMenu({
         {previewReady && (
           <DropdownItem
             onClick={() =>
-              dispatch({
-                action: ACTION.PREVIEW_OPEN,
-                payload: { url: previewUrl },
+              fireAction('botster.session.preview.open', {
+                sessionUuid: openState.sessionUuid,
+                url: previewUrl,
               })
             }
           >
@@ -95,12 +170,12 @@ export default function SessionActionsMenu({
 
         {hasPreviewItems && hasManageItems && <DropdownDivider />}
 
-        {canMove && !isAccessory && (
+        {canMove && (
           <DropdownItem
             onClick={() =>
-              dispatch({
-                action: ACTION.SESSION_MOVE,
-                payload: { sessionId, sessionUuid },
+              fireAction('botster.session.move.request', {
+                sessionId: openState.sessionId,
+                sessionUuid: openState.sessionUuid,
               })
             }
           >
@@ -112,9 +187,9 @@ export default function SessionActionsMenu({
         {canDelete && (
           <DropdownItem
             onClick={() =>
-              dispatch({
-                action: ACTION.SESSION_DELETE,
-                payload: { sessionId, sessionUuid },
+              fireAction('botster.session.delete.request', {
+                sessionId: openState.sessionId,
+                sessionUuid: openState.sessionUuid,
               })
             }
           >
@@ -125,16 +200,20 @@ export default function SessionActionsMenu({
       </DropdownMenu>
     </Dropdown>
   )
+
+  if (typeof document === 'undefined') return menu
+  return createPortal(menu, document.body)
 }
 
 function MenuIcon({ name, danger = false }) {
   return (
     <span
       data-slot="icon"
-      className={clsx(
-        'inline-flex items-center justify-center',
-        danger && 'text-red-400',
-      )}
+      className={
+        danger
+          ? 'inline-flex items-center justify-center text-red-400'
+          : 'inline-flex items-center justify-center'
+      }
     >
       <IconGlyph name={name} className="h-full w-full" />
     </span>

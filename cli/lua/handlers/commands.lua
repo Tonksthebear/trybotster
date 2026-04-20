@@ -497,9 +497,53 @@ commands.register("delete_session", function(_client, _sub_id, command)
     end
 end, { description = "Delete a session (alias for delete_agent)" })
 
-commands.register("select_agent", function(_client, _sub_id, command)
-    log.debug(string.format("Select agent: %s", tostring(command.id or command.session_uuid)))
-end, { description = "Select agent (client-side only, no-op)" })
+commands.register("select_agent", function(client, _sub_id, command)
+    local new_selection = command.session_uuid or command.id
+    log.debug(string.format("Select agent: %s", tostring(new_selection)))
+
+    if not client or new_selection == nil then
+        return
+    end
+
+    -- Phase 2b: selection is baked into hub-rendered ui_layout_tree_v1
+    -- frames. Record the new selection on THIS client so its next render
+    -- (triggered below and on the next session_updated broadcast) applies
+    -- the correct `tree_item.selected` to the matching row. Other peers'
+    -- selections are untouched.
+    if client.selected_session_uuid == new_selection then
+        return
+    end
+    client.selected_session_uuid = new_selection
+
+    -- Re-broadcast this client's hub subscriptions with the new selection.
+    -- The per-subscription dedup in `layout_broadcast` compares versions
+    -- against THIS sub's baseline, so the frames ship exactly when the
+    -- selection change actually alters the rendered tree.
+    for sub_id, sub in pairs(client.subscriptions or {}) do
+        if sub.channel == "hub" then
+            pcall(client.send_ui_layout_trees, client, sub_id)
+        end
+    end
+end, { description = "Record per-client selection and re-broadcast its UI trees" })
+
+-- Phase 2b: structured browser → hub action envelopes. Wraps the Phase-1
+-- command channel with semantic action ids so plugin-registered handlers
+-- (`action.on("botster.session.select", name, handler)`) can intercept
+-- intents uniformly. Falls back to the legacy command for known action ids
+-- so browsers emitting `ui_action_v1` do not regress vs `select_agent` etc.
+commands.register("ui_action_v1", function(client, sub_id, command)
+    local envelope = command.envelope
+    if type(envelope) ~= "table" then
+        log.warn("ui_action_v1 missing envelope table")
+        return
+    end
+    local action = require("lib.action")
+    action.dispatch(envelope, {
+        client = client,
+        sub_id = sub_id,
+        target_surface = command.target_surface,
+    })
+end, { description = "Dispatch a semantic UI action envelope to hub handlers" })
 
 commands.register("clear_notification", function(_client, _sub_id, command)
     local session_uuid = command.session_uuid

@@ -1,0 +1,47 @@
+{
+  "children": [
+    {
+      "props": {
+        "name": "sparkle",
+        "size": "md",
+        "tone": "muted"
+      },
+      "type": "icon"
+    },
+    {
+      "props": {
+        "size": "md",
+        "text": "No sessions running",
+        "tone": "muted",
+        "weight": "medium"
+      },
+      "type": "text"
+    },
+    {
+      "props": {
+        "size": "sm",
+        "text": "Start a new agent or accessory to begin working",
+        "tone": "muted"
+      },
+      "type": "text"
+    },
+    {
+      "props": {
+        "action": {
+          "id": "botster.session.create.request"
+        },
+        "icon": "plus",
+        "label": "New session",
+        "tone": "default",
+        "variant": "ghost"
+      },
+      "type": "button"
+    }
+  ],
+  "props": {
+    "align": "center",
+    "direction": "vertical",
+    "gap": "3"
+  },
+  "type": "stack"
+}

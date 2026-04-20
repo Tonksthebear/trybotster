@@ -1,0 +1,174 @@
+{
+  "children": [
+    {
+      "children": [
+        {
+          "id": "ws-1",
+          "props": {
+            "action": {
+              "id": "botster.workspace.toggle",
+              "payload": {
+                "workspaceId": "ws-1"
+              }
+            },
+            "expanded": true
+          },
+          "slots": {
+            "children": [
+              {
+                "id": "sess-1",
+                "props": {
+                  "action": {
+                    "id": "botster.session.select",
+                    "payload": {
+                      "sessionId": "sess-1",
+                      "sessionUuid": "sess-1-uuid"
+                    }
+                  },
+                  "notification": true,
+                  "selected": true
+                },
+                "slots": {
+                  "end": [
+                    {
+                      "children": [
+                        {
+                          "props": {
+                            "action": {
+                              "id": "botster.session.preview.open",
+                              "payload": {
+                                "sessionId": "sess-1",
+                                "sessionUuid": "sess-1-uuid",
+                                "url": "https://preview.example.com/api-work"
+                              }
+                            },
+                            "icon": "external-link",
+                            "label": "Running",
+                            "tone": "default",
+                            "variant": "ghost"
+                          },
+                          "type": "button"
+                        },
+                        {
+                          "props": {
+                            "action": {
+                              "id": "botster.session.menu.open",
+                              "payload": {
+                                "sessionId": "sess-1",
+                                "sessionUuid": "sess-1-uuid"
+                              }
+                            },
+                            "icon": "ellipsis-vertical",
+                            "label": "Session actions"
+                          },
+                          "type": "icon_button"
+                        }
+                      ],
+                      "props": {
+                        "align": "center",
+                        "gap": "1"
+                      },
+                      "type": "inline"
+                    }
+                  ],
+                  "start": [
+                    {
+                      "props": {
+                        "label": "Active",
+                        "state": "active"
+                      },
+                      "type": "status_dot"
+                    }
+                  ],
+                  "subtitle": [
+                    {
+                      "props": {
+                        "italic": true,
+                        "size": "xs",
+                        "text": "Refactor request path · Trim dead routes",
+                        "tone": "muted",
+                        "truncate": true
+                      },
+                      "type": "text"
+                    },
+                    {
+                      "props": {
+                        "size": "xs",
+                        "text": "backend · feature/api · claude",
+                        "tone": "muted",
+                        "truncate": true
+                      },
+                      "type": "text"
+                    }
+                  ],
+                  "title": [
+                    {
+                      "props": {
+                        "monospace": true,
+                        "size": "xs",
+                        "text": "api-work",
+                        "tone": "default",
+                        "truncate": true,
+                        "weight": "medium"
+                      },
+                      "type": "text"
+                    }
+                  ]
+                },
+                "type": "tree_item"
+              }
+            ],
+            "title": [
+              {
+                "children": [
+                  {
+                    "props": {
+                      "name": "chevron-down",
+                      "size": "xs",
+                      "tone": "muted"
+                    },
+                    "type": "icon"
+                  },
+                  {
+                    "props": {
+                      "size": "xs",
+                      "text": "Backend",
+                      "tone": "muted",
+                      "truncate": true,
+                      "weight": "medium"
+                    },
+                    "type": "text"
+                  }
+                ],
+                "props": {
+                  "align": "center",
+                  "gap": "2"
+                },
+                "type": "inline"
+              }
+            ]
+          },
+          "type": "tree_item"
+        }
+      ],
+      "type": "tree"
+    },
+    {
+      "props": {
+        "action": {
+          "id": "botster.session.create.request"
+        },
+        "icon": "plus",
+        "label": "New session",
+        "tone": "default",
+        "variant": "ghost"
+      },
+      "type": "button"
+    }
+  ],
+  "props": {
+    "direction": "vertical",
+    "gap": "0"
+  },
+  "type": "stack"
+}

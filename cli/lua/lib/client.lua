@@ -33,6 +33,11 @@ function Client.new(peer_id, transport)
         subscriptions = {},
         forwarders = {},
         connected_at = os.time(),
+        -- Phase 2b: per-browser selection baked into `ui_layout_tree_v1`
+        -- broadcasts. Set by the `select_agent` command handler (or the
+        -- `botster.session.select` action fallback) so each subscriber
+        -- gets its own `tree_item.selected` row rendered hub-side.
+        selected_session_uuid = nil,
     }, Client)
 
     log.info(string.format("Client created: %s...", peer_id:sub(1, 8)))
@@ -247,6 +252,18 @@ function Client:handle_subscribe(msg)
         self:send_workspace_list(sub_id)
         self:send_spawn_target_list(sub_id)
         self:send_hub_recovery_state(sub_id)
+        -- Prime Phase 2b layout trees so a fresh subscriber renders
+        -- immediately without waiting for the next session_updated.
+        -- `force=true` bypasses dedup; this is the only call that does so
+        -- in production. Guarded: if something goes wrong building the
+        -- frames, the Phase-1 agent_list above still keeps the browser
+        -- functional.
+        local ok, err = pcall(self.send_ui_layout_trees, self, sub_id, { force = true })
+        if not ok then
+            log.warn(string.format(
+                "send_ui_layout_trees failed for %s: %s",
+                self.peer_id:sub(1, 8), tostring(err)))
+        end
     elseif channel == "mcp" then
         -- MCP is pull-based: the client sends tools/list when ready.
         self.subscriptions[sub_id].caller_context = params.context or {}
@@ -328,6 +345,38 @@ function Client:send_agent_list(sub_id)
         agents = payload.agents,
         workspaces = payload.workspaces,
     })
+end
+
+--- Send the current UI layout trees to a HubChannel subscription.
+-- The broadcast is per-subscription: input state is built with THIS client's
+-- recorded selection, the version hash is bucketed against THIS sub_id's
+-- last-sent versions, and `mark_sent` records the new baseline. Callers
+-- should set `opts.force = true` on priming (so a newly-subscribing browser
+-- always receives both densities) and leave `force` false/nil for routine
+-- broadcasts so dedup can suppress unchanged trees.
+-- @param sub_id The subscription ID to send to
+-- @param opts table? { force = bool }
+function Client:send_ui_layout_trees(sub_id, opts)
+    local LayoutInput = require("lib.layout_input")
+    local LayoutBroadcast = require("lib.layout_broadcast")
+
+    opts = opts or {}
+    local force = opts.force == true
+
+    local input = LayoutInput.build_for_subscription(self, sub_id)
+    local frames = LayoutBroadcast.build_frames(input, {
+        subscription_key = sub_id,
+        force = force,
+    })
+    if #frames == 0 then
+        return 0
+    end
+    for _, frame in ipairs(frames) do
+        frame.subscriptionId = sub_id
+        self:send(frame)
+    end
+    LayoutBroadcast.mark_sent(frames, { subscription_key = sub_id })
+    return #frames
 end
 
 --- Send workspace list to a HubChannel subscription.
@@ -449,6 +498,11 @@ function Client:handle_unsubscribe(msg)
         channel = sub.channel,
         sub_id = sub_id,
     })
+
+    -- Phase 2b: drop the per-subscription ui_layout_tree_v1 dedup state so
+    -- a reconnecting browser with a new sub_id doesn't inherit a stale
+    -- baseline. Safe to call even if no hub-channel dedup state exists.
+    pcall(require("lib.layout_broadcast").forget, sub_id)
 
     self.subscriptions[sub_id] = nil
     log.info(string.format("Unsubscribed: %s (was %s)", sub_id:sub(1, 16), sub.channel))
@@ -685,11 +739,15 @@ function Client:disconnect()
     end
     self.forwarders = {}
 
-    -- Unregister from all terminal sessions (auto-resizes to next client)
-    for _, sub in pairs(self.subscriptions) do
+    -- Unregister from all terminal sessions (auto-resizes to next client),
+    -- and drop Phase 2b ui_layout_tree_v1 dedup state so reconnecting
+    -- clients aren't silenced by stale per-sub versions.
+    local LayoutBroadcast = require("lib.layout_broadcast")
+    for sub_id, sub in pairs(self.subscriptions) do
         if sub.channel == "terminal" and sub.session_uuid then
             pty_clients.unregister(sub.session_uuid, self.peer_id)
         end
+        pcall(LayoutBroadcast.forget, sub_id)
     end
     self.subscriptions = {}
 

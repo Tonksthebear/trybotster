@@ -1,5 +1,5 @@
 import React from 'react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, fireEvent, screen } from '@testing-library/react'
 
 vi.mock('../../lib/actions', () => {
@@ -20,7 +20,11 @@ vi.mock('../../lib/actions', () => {
 })
 
 import { dispatch as legacyDispatch } from '../../lib/actions'
-import { UiTree, createHubDispatch } from '..'
+import {
+  UiTreeBody,
+  createTransportDispatch,
+  type UiActionTransport,
+} from '..'
 import type { UiNodeV1, UiViewportV1 } from '../types'
 
 const REGULAR_FINE: UiViewportV1 = {
@@ -34,35 +38,231 @@ afterEach(() => {
   vi.mocked(legacyDispatch).mockClear()
 })
 
-describe('createHubDispatch — legacy bridge', () => {
-  it('forwards UiActionV1 to legacy dispatcher with hubId merged into payload', () => {
-    const dispatch = createHubDispatch('hub-123')
-    const node: UiNodeV1 = {
-      type: 'button',
-      props: {
-        label: 'Select',
-        action: {
-          id: 'botster.session.select',
-          payload: { sessionId: 'sess-1', sessionUuid: 'uuid-1' },
-        },
+function selectButton(label: string): UiNodeV1 {
+  return {
+    type: 'button',
+    props: {
+      label,
+      action: {
+        id: 'botster.session.select',
+        payload: { sessionId: 'sess-1', sessionUuid: 'uuid-1' },
       },
-    }
-    render(<UiTree node={node} dispatch={dispatch} viewport={REGULAR_FINE} />)
+    },
+  }
+}
+
+describe('createTransportDispatch — Phase 2c default', () => {
+  function makeTransport(sendImpl?: (type: string, data: unknown) => Promise<boolean>) {
+    const send = vi.fn(sendImpl ?? (async () => true))
+    const transport: UiActionTransport = { send: send as UiActionTransport['send'] }
+    return { transport, send }
+  }
+
+  it('sends ui_action_v1 frame on the configured target_surface and skips legacy fallback', async () => {
+    const { transport, send } = makeTransport()
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-7',
+      targetSurface: 'workspace_surface',
+    })
+    render(
+      <UiTreeBody
+        node={selectButton('Select')}
+        dispatch={dispatch}
+        viewport={REGULAR_FINE}
+      />,
+    )
     fireEvent.click(screen.getByRole('button', { name: 'Select' }))
 
+    // send is async-launched inside dispatch; flush the microtask + macrotask queues
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(send).toHaveBeenCalledOnce()
+    expect(send).toHaveBeenCalledWith('ui_action_v1', {
+      target_surface: 'workspace_surface',
+      envelope: {
+        id: 'botster.session.select',
+        payload: { sessionId: 'sess-1', sessionUuid: 'uuid-1' },
+      },
+    })
+    expect(legacyDispatch).not.toHaveBeenCalled()
+  })
+
+  it('pushes session URL into history on session.select success (hub handles focus, browser owns route)', () => {
+    const { transport, send } = makeTransport()
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-7',
+      targetSurface: 'workspace_surface',
+    })
+    window.history.replaceState({}, '', '/hubs/hub-7')
+    const popstateSpy = vi.fn()
+    window.addEventListener('popstate', popstateSpy)
+
+    render(
+      <UiTreeBody
+        node={selectButton('Select')}
+        dispatch={dispatch}
+        viewport={REGULAR_FINE}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
+
+    expect(send).toHaveBeenCalledOnce()
+    // Synchronous side-effect — runs before the async transport.send resolves.
+    expect(window.location.pathname).toBe('/hubs/hub-7/sessions/uuid-1')
+    expect(popstateSpy).toHaveBeenCalledOnce()
+    window.removeEventListener('popstate', popstateSpy)
+  })
+
+  it('skips history.pushState when already on the target session path', () => {
+    const { transport } = makeTransport()
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-7',
+      targetSurface: 'workspace_surface',
+    })
+    window.history.replaceState({}, '', '/hubs/hub-7/sessions/uuid-1')
+    const pushSpy = vi.spyOn(window.history, 'pushState')
+
+    render(
+      <UiTreeBody
+        node={selectButton('Select')}
+        dispatch={dispatch}
+        viewport={REGULAR_FINE}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
+
+    expect(pushSpy).not.toHaveBeenCalled()
+    pushSpy.mockRestore()
+  })
+
+  it('falls back to legacy dispatch with synthesized url when transport send returns false', async () => {
+    const { transport, send } = makeTransport(async () => false)
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-9',
+      targetSurface: 'workspace_surface',
+    })
+    render(
+      <UiTreeBody
+        node={selectButton('Select')}
+        dispatch={dispatch}
+        viewport={REGULAR_FINE}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
+
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(send).toHaveBeenCalledOnce()
     expect(legacyDispatch).toHaveBeenCalledOnce()
+    // URL is synthesized from hubId + sessionUuid so the legacy handler can
+    // history.pushState after the anchor's preventDefault.
     expect(legacyDispatch).toHaveBeenCalledWith({
       action: 'botster.session.select',
       payload: {
-        hubId: 'hub-123',
+        hubId: 'hub-9',
         sessionId: 'sess-1',
         sessionUuid: 'uuid-1',
+        url: '/hubs/hub-9/sessions/uuid-1',
       },
     })
   })
 
-  it('skips dispatch when action.disabled is true', () => {
-    const dispatch = createHubDispatch('hub-x')
+  it('falls back to legacy dispatch when transport send throws', async () => {
+    const { transport, send } = makeTransport(async () => {
+      throw new Error('boom')
+    })
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-9',
+      targetSurface: 'workspace_surface',
+    })
+    // Silence the expected console.error
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    render(
+      <UiTreeBody
+        node={selectButton('Select')}
+        dispatch={dispatch}
+        viewport={REGULAR_FINE}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
+
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(send).toHaveBeenCalledOnce()
+    expect(legacyDispatch).toHaveBeenCalledOnce()
+    errSpy.mockRestore()
+  })
+
+  it('falls back synchronously with synthesized url when transport is null', () => {
+    const dispatch = createTransportDispatch({
+      transport: null,
+      hubId: 'hub-9',
+      targetSurface: 'workspace_surface',
+    })
+    render(
+      <UiTreeBody
+        node={selectButton('Select')}
+        dispatch={dispatch}
+        viewport={REGULAR_FINE}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
+    expect(legacyDispatch).toHaveBeenCalledOnce()
+    expect(legacyDispatch).toHaveBeenCalledWith({
+      action: 'botster.session.select',
+      payload: {
+        hubId: 'hub-9',
+        sessionId: 'sess-1',
+        sessionUuid: 'uuid-1',
+        url: '/hubs/hub-9/sessions/uuid-1',
+      },
+    })
+  })
+
+  it('does NOT fall back to legacy for non-idempotent actions like preview.toggle', async () => {
+    const { transport, send } = makeTransport(async () => false)
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-9',
+      targetSurface: 'workspace_surface',
+    })
+    const node: UiNodeV1 = {
+      type: 'button',
+      props: {
+        label: 'Toggle preview',
+        action: {
+          id: 'botster.session.preview.toggle',
+          payload: { sessionUuid: 'uuid-1' },
+        },
+      },
+    }
+    render(
+      <UiTreeBody node={node} dispatch={dispatch} viewport={REGULAR_FINE} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle preview' }))
+
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(send).toHaveBeenCalledOnce()
+    expect(legacyDispatch).not.toHaveBeenCalled()
+  })
+
+  it('skips dispatch entirely when action.disabled is true', () => {
+    const { transport, send } = makeTransport()
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-x',
+      targetSurface: 'workspace_surface',
+    })
     const node: UiNodeV1 = {
       type: 'button',
       props: {
@@ -70,28 +270,62 @@ describe('createHubDispatch — legacy bridge', () => {
         action: { id: 'botster.session.select', disabled: true },
       },
     }
-    render(<UiTree node={node} dispatch={dispatch} viewport={REGULAR_FINE} />)
-    const btn = screen.getByRole('button', { name: 'Nope' })
-    expect(btn).toBeDisabled()
-    fireEvent.click(btn)
+    render(<UiTreeBody node={node} dispatch={dispatch} viewport={REGULAR_FINE} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Nope' }))
+    expect(send).not.toHaveBeenCalled()
     expect(legacyDispatch).not.toHaveBeenCalled()
   })
 
-  it('works with empty payload', () => {
-    const dispatch = createHubDispatch('hub-q')
+  it('dispatches browser-local actions (session.create.request) directly via legacy without touching transport', () => {
+    const { transport, send } = makeTransport()
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-local',
+      targetSurface: 'workspace_sidebar',
+    })
     const node: UiNodeV1 = {
       type: 'button',
       props: {
-        label: 'Ping',
-        action: { id: 'botster.workspace.toggle' },
+        label: 'New session',
+        action: { id: 'botster.session.create.request' },
       },
     }
-    render(<UiTree node={node} dispatch={dispatch} viewport={REGULAR_FINE} />)
-    fireEvent.click(screen.getByRole('button', { name: 'Ping' }))
+    render(<UiTreeBody node={node} dispatch={dispatch} viewport={REGULAR_FINE} />)
+    fireEvent.click(screen.getByRole('button', { name: 'New session' }))
+    expect(send).not.toHaveBeenCalled()
+    expect(legacyDispatch).toHaveBeenCalledOnce()
+    expect(legacyDispatch).toHaveBeenCalledWith({
+      action: 'botster.session.create.request',
+      payload: { hubId: 'hub-local' },
+    })
+  })
 
+  it('dispatches browser-local actions locally even when transport is available for other actions', () => {
+    const { transport, send } = makeTransport()
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-mixed',
+      targetSurface: 'workspace_panel',
+    })
+    const toggleNode: UiNodeV1 = {
+      type: 'button',
+      props: {
+        label: 'Toggle',
+        action: {
+          id: 'botster.workspace.toggle',
+          payload: { workspaceId: 'ws-1' },
+        },
+      },
+    }
+    render(
+      <UiTreeBody node={toggleNode} dispatch={dispatch} viewport={REGULAR_FINE} />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle' }))
+    expect(send).not.toHaveBeenCalled()
+    expect(legacyDispatch).toHaveBeenCalledOnce()
     expect(legacyDispatch).toHaveBeenCalledWith({
       action: 'botster.workspace.toggle',
-      payload: { hubId: 'hub-q' },
+      payload: { hubId: 'hub-mixed', workspaceId: 'ws-1' },
     })
   })
 })
