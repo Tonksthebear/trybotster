@@ -202,14 +202,110 @@ struct CachedOverride {
 ///   reused verbatim (zero stats, cached content re-loaded into `lua`);
 /// - otherwise, each candidate is stat-ed to check for mtime drift. A cached
 ///   winning override whose mtime is unchanged short-circuits the read.
+///
+/// `package.loaded[EMBEDDED_LAYOUT_MODULE]` is cleared at the top so both
+/// the override path and the embedded-fallback path evaluate against a
+/// fresh copy of the embedded module. Without this, a previous override
+/// that monkey-patched `base.workspace_surface` (a common-looking
+/// wrap-the-embedded pattern) would pollute the VM singleton forever and
+/// stack wrapper layers on every re-evaluation.
 fn resolve_layout_table(lua: &Lua) -> Result<Table> {
+    reset_embedded_module(lua)?;
+
     if let Some(cached) = cache_hit() {
         match cached.winning {
-            Some(entry) => return load_override_from_str(lua, &entry.path, &entry.content),
+            Some(entry) => return load_override_cached(lua, &entry.path, &entry.content),
             None => return load_embedded(lua),
         }
     }
     scan_and_load(lua)
+}
+
+/// Clear `package.loaded[EMBEDDED_LAYOUT_MODULE]` so the next
+/// `require("web.layout")` call — whether from inside an override or from
+/// `load_embedded` — re-evaluates the embedded source and returns a fresh
+/// table. This is the defense against overrides that mutate the cached
+/// embedded module.
+fn reset_embedded_module(lua: &Lua) -> Result<()> {
+    let package: Table = lua
+        .globals()
+        .get("package")
+        .map_err(|e| anyhow!("cannot find `package` global: {e}"))?;
+    let loaded: Table = package
+        .get("loaded")
+        .map_err(|e| anyhow!("`package.loaded` missing: {e}"))?;
+    loaded
+        .set(EMBEDDED_LAYOUT_MODULE, Value::Nil)
+        .map_err(|e| anyhow!("failed to clear package.loaded[`{EMBEDDED_LAYOUT_MODULE}`]: {e}"))?;
+    Ok(())
+}
+
+/// Cache key for the Lua-side compiled-override Table. Hashed by content so
+/// re-evaluation happens at most once per content change, not once per
+/// render.
+const LUA_OVERRIDE_RESULT_KEY: &str = "__botster_web_layout_override_module";
+const LUA_OVERRIDE_HASH_KEY: &str = "__botster_web_layout_override_hash";
+
+/// Hash of the override source content, formatted as a hex string to dodge
+/// any number-representation subtleties on the Lua side. Non-cryptographic;
+/// just a collision-resistant identity for cache lookup.
+fn content_hash(content: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Attempt to load a compiled-override table from a Lua-side cache keyed by
+/// content hash. Returns `Ok(None)` if no cached entry exists for this
+/// content; evaluation proceeds normally in that case.
+fn load_override_from_cache(lua: &Lua, content: &str) -> Result<Option<Table>> {
+    let globals = lua.globals();
+    let stored_hash: Option<String> = globals
+        .get::<Option<String>>(LUA_OVERRIDE_HASH_KEY)
+        .map_err(|e| anyhow!("failed to read override-hash cache: {e}"))?;
+    if stored_hash.as_deref() != Some(content_hash(content).as_str()) {
+        return Ok(None);
+    }
+    let table: Option<Table> = globals
+        .get::<Option<Table>>(LUA_OVERRIDE_RESULT_KEY)
+        .map_err(|e| anyhow!("failed to read override-result cache: {e}"))?;
+    Ok(table)
+}
+
+/// Store a newly compiled override table in the Lua-side cache keyed by its
+/// content hash. Subsequent calls with the same content reuse this exact
+/// table instead of re-evaluating the chunk.
+fn store_override_cache(lua: &Lua, table: &Table, content: &str) -> Result<()> {
+    let globals = lua.globals();
+    globals
+        .set(LUA_OVERRIDE_HASH_KEY, content_hash(content))
+        .map_err(|e| anyhow!("failed to write override-hash cache: {e}"))?;
+    globals
+        .set(LUA_OVERRIDE_RESULT_KEY, table.clone())
+        .map_err(|e| anyhow!("failed to write override-result cache: {e}"))?;
+    Ok(())
+}
+
+/// Clear the Lua-side override-module cache. Tests use this between runs so
+/// an earlier override's compiled table doesn't leak into a fresh test.
+#[cfg(test)]
+pub fn _clear_lua_override_cache_for_tests(lua: &Lua) {
+    let globals = lua.globals();
+    let _ = globals.set(LUA_OVERRIDE_HASH_KEY, Value::Nil);
+    let _ = globals.set(LUA_OVERRIDE_RESULT_KEY, Value::Nil);
+}
+
+/// Resolve an override to a compiled Lua Table. If a previous evaluation's
+/// result is still cached for this exact content, reuse it; otherwise
+/// evaluate the chunk and cache the result.
+fn load_override_cached(lua: &Lua, path: &Path, content: &str) -> Result<Table> {
+    if let Some(cached) = load_override_from_cache(lua, content)? {
+        return Ok(cached);
+    }
+    let table = load_override_from_str(lua, path, content)?;
+    store_override_cache(lua, &table, content)?;
+    Ok(table)
 }
 
 /// Return the cached entry if it is still within its TTL window. Expiry is
@@ -255,7 +351,7 @@ fn scan_and_load(lua: &Lua) -> Result<Table> {
                         }
                     }
                 };
-                let table = load_override_from_str(lua, &entry.path, &entry.content)?;
+                let table = load_override_cached(lua, &entry.path, &entry.content)?;
                 store_cache(Some(entry));
                 return Ok(table);
             }
