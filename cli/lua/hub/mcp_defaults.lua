@@ -939,6 +939,24 @@ mcp.tool("reload_plugin", {
     end
 end)
 
+mcp.tool("reload_layout", {
+    description = "Reload the web UI layout override chain (.botster/layout_web.lua, .botster/layout.lua, etc.) after editing. The hub does not watch layout files — call this when you want changes picked up. Proactively rebroadcasts to every subscribed browser so they re-render immediately.",
+    input_schema = { type = "object", properties = {} },
+}, function(_params, _ctx)
+    local ok, err = pcall(function()
+        web_layout.reload()
+    end)
+    if not ok then
+        error(string.format("Failed to reload layout: %s", tostring(err)))
+    end
+    local connections = require("handlers.connections")
+    local ok_broadcast, broadcast_err = pcall(connections.broadcast_ui_layout_trees)
+    if not ok_broadcast then
+        return string.format("Layout reloaded, but broadcast failed: %s", tostring(broadcast_err))
+    end
+    return "Layout reloaded and rebroadcast to all subscribers."
+end)
+
 mcp.tool("enable_plugin", {
     description = "Enable a disabled plugin. Loads it immediately.",
     input_schema = {

@@ -608,6 +608,7 @@ local M = {
     broadcast_hub_event = broadcast_hub_event,
     broadcast_workspace_list = broadcast_workspace_list,
     broadcast_spawn_target_list = broadcast_spawn_target_list,
+    broadcast_ui_layout_trees = broadcast_ui_layout_trees,
 }
 
 -- Lifecycle hooks for hot-reload
