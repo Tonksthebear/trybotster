@@ -1,5 +1,6 @@
 import { HubManager } from 'connections'
 import { useWorkspaceStore } from '../store/workspace-store'
+import { useRouteRegistryStore } from '../store/route-registry-store'
 
 // Per-hub shared state
 const hubState = new Map()  // hubId → { hub, unsubscribers, callerIds: Set }
@@ -83,6 +84,30 @@ async function doConnect(hubId, callerId) {
     })
   )
 
+  // Phase 4a: seed + follow the hub-authored route registry. The hub sends
+  // `ui_route_registry_v1` on hub-channel subscribe (so the first frame
+  // arrives shortly after acquire) and on every `surfaces_changed` hook
+  // firing. `hub.transport` is the HubTransport; `uiRouteRegistry` is both
+  // an event name and a snapshot accessor.
+  const seedRoutes = () => {
+    const transport = hub.transport
+    if (transport && typeof transport.uiRouteRegistry === 'function') {
+      const initial = transport.uiRouteRegistry()
+      if (Array.isArray(initial) && initial.length > 0) {
+        useRouteRegistryStore.getState().setRoutes(hubId, initial)
+      }
+    }
+  }
+  seedRoutes()
+  if (hub.transport && typeof hub.transport.on === 'function') {
+    const off = hub.transport.on('uiRouteRegistry', (routes) => {
+      useRouteRegistryStore.getState().setRoutes(hubId, routes)
+    })
+    if (typeof off === 'function') {
+      unsubscribers.push(off)
+    }
+  }
+
   syncSelectionFromUrl(hub)
 
   state = { hub, unsubscribers, callerIds: new Set([callerId]) }
@@ -119,6 +144,7 @@ function doDisconnect(hubId, callerId) {
   hubState.delete(hubId)
   chains.delete(hubId)
   getStoreActions().setConnected(false)
+  useRouteRegistryStore.getState().clearRoutes(hubId)
 }
 
 export function getHub(hubId) {

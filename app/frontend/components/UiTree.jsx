@@ -6,12 +6,121 @@ import React, {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react'
 import {
   UiTreeBody,
   createTransportDispatch,
 } from '../ui_contract'
 import { getHub } from '../lib/hub-bridge'
+
+// ---------------------------------------------------------------------------
+// Nav-selection decorator — applies browser-local "which nav entry is the
+// current page" state on top of the hub-authored tree before it reaches the
+// primitive interpreter.
+//
+// Phase 4a registered-surface nav entries use a shared action shape:
+//
+//     ui.action("botster.nav.open", { path = "/plugins/hello" })
+//
+// The hub doesn't track per-client URL state — that's a browser-ephemeral
+// concern (parallel to the workspace collapse invariant). So we decorate
+// here: if a tree_item's action targets `botster.nav.open` with a `path`
+// that matches the current hub-scoped URL, set `selected: true` on it.
+// Pure function keyed only on `(tree, hubId, pathname)` — safe to memoise.
+// ---------------------------------------------------------------------------
+
+/** Subscribe `useSyncExternalStore` to browser history updates. Triggers
+ *  a re-render of any UiTree instance whose nav-entry highlight depends
+ *  on the current URL. Cross-component because multiple UiTrees can be
+ *  mounted (sidebar + panel) simultaneously. */
+function subscribeToPathname(onChange) {
+  if (typeof window === 'undefined') return () => {}
+  window.addEventListener('popstate', onChange)
+  return () => window.removeEventListener('popstate', onChange)
+}
+
+function getPathnameSnapshot() {
+  return typeof window !== 'undefined' ? window.location.pathname : ''
+}
+
+function getServerPathnameSnapshot() {
+  // SSR-safe placeholder. The project doesn't SSR this island but keeping
+  // a distinct value avoids hydration mismatches if that ever changes.
+  return ''
+}
+
+/** React hook wrapping the store-contract listener. */
+function useCurrentPathname() {
+  return useSyncExternalStore(
+    subscribeToPathname,
+    getPathnameSnapshot,
+    getServerPathnameSnapshot,
+  )
+}
+
+/** Is `treeItemNode`'s action a `botster.nav.open` whose hub-relative
+ *  `path` field, combined with `hubId`, matches `pathname`? Tolerant of
+ *  leading-slash discrepancies — the hub's Lua code emits a
+ *  leading-slash path ("/plugins/hello"), but users editing overrides
+ *  may omit it. */
+function navEntryMatchesPathname(actionProp, hubId, pathname) {
+  if (!actionProp || typeof actionProp !== 'object') return false
+  if (actionProp.id !== 'botster.nav.open') return false
+  const path =
+    actionProp.payload && typeof actionProp.payload.path === 'string'
+      ? actionProp.payload.path
+      : null
+  if (path == null || typeof hubId !== 'string' || hubId.length === 0) return false
+
+  const trimmed = path.startsWith('/') ? path : '/' + path
+  // Root path "/" collapses to "/hubs/<hubId>" (not "/hubs/<hubId>/") so a
+  // deep-linked `/hubs/:id` lands on the hub-root nav entry.
+  const expected = trimmed === '/' ? `/hubs/${hubId}` : `/hubs/${hubId}${trimmed}`
+  if (pathname === expected) return true
+  // Also match trailing-slash variants so either is considered "current".
+  if (expected === `/hubs/${hubId}` && pathname === `/hubs/${hubId}/`) return true
+  if (pathname === expected + '/') return true
+  return false
+}
+
+function applyNavSelectionOverrides(node, hubId, pathname) {
+  if (!node || typeof node !== 'object') return node
+
+  const decorated = { ...node }
+
+  if (node.type === 'tree_item') {
+    const action = node.props?.action
+    if (navEntryMatchesPathname(action, hubId, pathname)) {
+      decorated.props = { ...(node.props ?? {}), selected: true }
+    }
+  }
+
+  if (Array.isArray(node.children)) {
+    decorated.children = node.children.map((c) =>
+      applyNavSelectionOverrides(c, hubId, pathname),
+    )
+  }
+
+  if (node.slots && typeof node.slots === 'object') {
+    decorated.slots = Object.fromEntries(
+      Object.entries(node.slots).map(([name, children]) => [
+        name,
+        Array.isArray(children)
+          ? children.map((c) => applyNavSelectionOverrides(c, hubId, pathname))
+          : children,
+      ]),
+    )
+  }
+
+  return decorated
+}
+
+// Exported for vitest coverage without round-tripping through React.
+export {
+  applyNavSelectionOverrides as _applyNavSelectionOverridesForTests,
+  navEntryMatchesPathname as _navEntryMatchesPathnameForTests,
+}
 
 // ---------------------------------------------------------------------------
 // Interceptor context
@@ -147,6 +256,26 @@ export default function UiTree({
   const [tree, setTree] = useState(initialTree)
   const [transport, setTransport] = useState(null)
 
+  // Current browser path — drives the Phase-4a nav-selection decorator
+  // below. `useSyncExternalStore` subscribes to `popstate` so any
+  // history.pushState (including our own `botster.nav.open` handler)
+  // triggers a re-render of the nav highlight.
+  const currentPathname = useCurrentPathname()
+
+  // Decorate the tree with `selected: true` on nav entries matching the
+  // current URL. The hub doesn't know which browser sits at which URL,
+  // so this ephemeral state is owned by the client (same philosophy as
+  // workspace collapse state). Memoised on the only three inputs it
+  // depends on; malformed trees fall through to the error boundary.
+  const decoratedTree = useMemo(() => {
+    if (!tree) return tree
+    try {
+      return applyNavSelectionOverrides(tree, hubId ?? '', currentPathname)
+    } catch {
+      return tree
+    }
+  }, [tree, hubId, currentPathname])
+
   // Reset tree + transport synchronously on hubId change. Without this, a
   // hub switch (A → B) keeps the old tree visible until B's first broadcast
   // arrives and routes the user's clicks through A's transport in the
@@ -263,10 +392,10 @@ export default function UiTree({
 
   return (
     <InterceptorContext.Provider value={interceptorValue}>
-      <UiTreeErrorBoundary tree={tree} fallback={errorFallback}>
-        {tree ? (
+      <UiTreeErrorBoundary tree={decoratedTree} fallback={errorFallback}>
+        {decoratedTree ? (
           <UiTreeBody
-            node={tree}
+            node={decoratedTree}
             dispatch={dispatch}
             capabilities={capabilities}
             hubId={hubId}

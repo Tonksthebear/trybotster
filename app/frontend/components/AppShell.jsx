@@ -38,6 +38,7 @@ const HubDashboard = React.lazy(() => import('./pages/HubDashboard'))
 const HubShow = React.lazy(() => import('./pages/HubShow'))
 const SettingsRoute = React.lazy(() => import('./pages/SettingsRoute'))
 const PairingRoute = React.lazy(() => import('./pages/PairingRoute'))
+const DynamicSurfaceRoute = React.lazy(() => import('./pages/DynamicSurface'))
 
 function SuspenseFallback() {
   return (
@@ -316,6 +317,12 @@ export function AppRoutes() {
           <Route path="sessions/:sessionUuid" element={null} />
           <Route path="settings" element={<SettingsRoute />} />
           <Route path="pairing" element={<PairingRoute />} />
+          {/* Phase 4a: catch-all for hub-authored surfaces. React Router
+              v6 prefers static segments over splats, so the enumerated
+              legacy routes above still win for their paths; any other
+              hub-scoped URL falls through here and resolves against the
+              `ui_route_registry_v1` broadcast. */}
+          <Route path="*" element={<DynamicSurfaceRoute />} />
         </Route>
       </Route>
     </Routes>
