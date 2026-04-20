@@ -658,6 +658,43 @@ commands.register("reload_plugin", function(client, sub_id, command)
     end
 end, { description = "Reload a plugin by name" })
 
+-- Explicit invalidation of the web layout cache + proactive rebroadcast to
+-- every subscribed browser. Matches the `reload_plugin` pattern: the hub
+-- does NOT watch layout files, so users call this after editing
+-- `.botster/layout_web.lua` (or a shared override) to push their changes.
+commands.register("reload_layout", function(client, sub_id, _command)
+    local ok_reload, err = pcall(function()
+        web_layout.reload()
+    end)
+    if not ok_reload then
+        if client then
+            client:send({
+                subscriptionId = sub_id,
+                type = "layout_reloaded",
+                success = false,
+                error = tostring(err),
+            })
+        end
+        return
+    end
+
+    -- Trigger proactive rebroadcast so subscribers render the new layout
+    -- without waiting for the next state-change tick.
+    local connections = require("handlers.connections")
+    local broadcast_ok, broadcast_err = pcall(connections.broadcast_ui_layout_trees)
+    if not broadcast_ok then
+        log.warn(string.format("reload_layout: broadcast failed: %s", tostring(broadcast_err)))
+    end
+
+    if client then
+        client:send({
+            subscriptionId = sub_id,
+            type = "layout_reloaded",
+            success = true,
+        })
+    end
+end, { description = "Reload the web UI layout overrides and rebroadcast to subscribers" })
+
 commands.register("enable_plugin", function(client, sub_id, command)
     local name = command.name or command.plugin_name
     if not name then
