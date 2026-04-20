@@ -255,7 +255,7 @@ GEM
     memory-leak (0.7.0)
     metrics (0.15.0)
     mini_mime (1.1.5)
-    minitest (6.0.2)
+    minitest (6.0.4)
       drb (~> 2.0)
       prism (~> 1.5)
     minitest-mock (5.27.0)
