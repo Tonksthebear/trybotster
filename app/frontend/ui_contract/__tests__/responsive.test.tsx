@@ -1,7 +1,7 @@
 import React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render } from '@testing-library/react'
-import { UiTree, createRawDispatch, resolveValue } from '..'
+import { UiTreeBody, createRawDispatch, resolveValue } from '..'
 import type { UiNodeV1, UiResponsiveV1, UiViewportV1 } from '../types'
 
 afterEach(() => {
@@ -36,7 +36,7 @@ const TALL: UiViewportV1 = {
 
 function renderTree(node: UiNodeV1, viewport: UiViewportV1) {
   return render(
-    <UiTree
+    <UiTreeBody
       node={node}
       dispatch={createRawDispatch(() => {})}
       viewport={viewport}

@@ -1,10 +1,12 @@
 import { useWorkspaceStore } from '../store/workspace-store'
+import { useDialogStore } from '../store/dialog-store'
 import { getHub } from './hub-bridge'
 
 const ACTION = {
   WORKSPACE_TOGGLE: 'botster.workspace.toggle',
   WORKSPACE_RENAME: 'botster.workspace.rename.request',
   SESSION_SELECT: 'botster.session.select',
+  SESSION_CREATE: 'botster.session.create.request',
   PREVIEW_TOGGLE: 'botster.session.preview.toggle',
   PREVIEW_OPEN: 'botster.session.preview.open',
   SESSION_MOVE: 'botster.session.move.request',
@@ -47,6 +49,10 @@ const handlers = {
     )
   },
 
+  [ACTION.SESSION_CREATE]() {
+    useDialogStore.getState().openNewSession()
+  },
+
   [ACTION.SESSION_SELECT](payload) {
     useWorkspaceStore.getState().setSelectedSessionId(payload.sessionId)
     // Tell the hub (focuses the session in CLI)
@@ -54,8 +60,11 @@ const handlers = {
     if (hub && payload.sessionId) {
       hub.selectAgent(payload.sessionId)
     }
-    // Navigate via React Router (pushState)
-    if (payload.url) {
+    // Navigate via React Router (pushState). Idempotent — skip when
+    // already on the target path. The transport-success path in
+    // `ui_contract/dispatch.ts` also pushes synchronously, so on a
+    // transport-failure fallback this handler would otherwise double-push.
+    if (payload.url && window.location.pathname !== payload.url) {
       window.history.pushState({}, '', payload.url)
       window.dispatchEvent(new PopStateEvent('popstate'))
     }

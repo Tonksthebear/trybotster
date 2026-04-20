@@ -71,8 +71,17 @@ vi.mock('../components/catalyst/navbar', () => ({
   NavbarSpacer: () => <div />,
 }))
 
-vi.mock('../components/workspace/WorkspaceList', () => ({
-  default: ({ hubId, surface }) => <div>{`WorkspaceList:${hubId}:${surface}`}</div>,
+vi.mock('../components/UiTree', () => ({
+  default: ({ hubId, targetSurface, children }) => (
+    <div>
+      <div>{`UiTree:${hubId}:${targetSurface}`}</div>
+      {children}
+    </div>
+  ),
+}))
+
+vi.mock('../components/workspace/SessionActionsMenu', () => ({
+  default: () => <div>SessionActionsMenu</div>,
 }))
 
 vi.mock('../components/hub/HubSwitcher', () => ({

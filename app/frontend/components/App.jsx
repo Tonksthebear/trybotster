@@ -1,7 +1,8 @@
 import React, { useEffect } from 'react'
 import { connect, disconnect, getHub, syncSelectionFromUrl } from '../lib/hub-bridge'
 import { setHubId } from '../lib/modal-bridge'
-import WorkspaceList from './workspace/WorkspaceList'
+import UiTree from './UiTree'
+import SessionActionsMenu from './workspace/SessionActionsMenu'
 
 export default function App({ hubId, surface = 'panel' }) {
   // Hub bridge lifecycle
@@ -45,5 +46,11 @@ export default function App({ hubId, surface = 'panel' }) {
 
   if (!hubId) return null
 
-  return <WorkspaceList hubId={hubId} surface={surface} />
+  const targetSurface = surface === 'sidebar' ? 'workspace_sidebar' : 'workspace_panel'
+
+  return (
+    <UiTree hubId={hubId} targetSurface={targetSurface}>
+      <SessionActionsMenu />
+    </UiTree>
+  )
 }

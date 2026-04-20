@@ -1,6 +1,7 @@
 import React from 'react'
 import { useParams, Link } from 'react-router-dom'
-import WorkspaceList from '../workspace/WorkspaceList'
+import UiTree from '../UiTree'
+import SessionActionsMenu from '../workspace/SessionActionsMenu'
 import ShareHub from '../hub/ShareHub'
 
 export default function HubShow() {
@@ -46,7 +47,9 @@ export default function HubShow() {
 
           {/* Workspaces */}
           <div className="bg-zinc-900/50 border border-zinc-800 rounded-lg p-4 lg:p-6">
-            <WorkspaceList hubId={hubId} surface="panel" />
+            <UiTree hubId={hubId} targetSurface="workspace_panel">
+              <SessionActionsMenu />
+            </UiTree>
           </div>
         </div>
       </div>

@@ -1,0 +1,155 @@
+{
+  "children": [
+    {
+      "children": [
+        {
+          "id": "ws-real",
+          "props": {
+            "action": {
+              "id": "botster.workspace.toggle",
+              "payload": {
+                "workspaceId": "ws-real"
+              }
+            },
+            "expanded": true
+          },
+          "slots": {
+            "children": [
+              {
+                "id": "sess-real",
+                "props": {
+                  "action": {
+                    "id": "botster.session.select",
+                    "payload": {
+                      "sessionId": "sess-real",
+                      "sessionUuid": "uuid-real"
+                    }
+                  },
+                  "notification": false,
+                  "selected": false
+                },
+                "slots": {
+                  "end": [
+                    {
+                      "children": [
+                        {
+                          "props": {
+                            "action": {
+                              "id": "botster.session.menu.open",
+                              "payload": {
+                                "sessionId": "sess-real",
+                                "sessionUuid": "uuid-real"
+                              }
+                            },
+                            "icon": "ellipsis-vertical",
+                            "label": "Session actions"
+                          },
+                          "type": "icon_button"
+                        }
+                      ],
+                      "props": {
+                        "align": "center",
+                        "gap": "1"
+                      },
+                      "type": "inline"
+                    }
+                  ],
+                  "start": [
+                    {
+                      "props": {
+                        "label": "Idle",
+                        "state": "idle"
+                      },
+                      "type": "status_dot"
+                    }
+                  ],
+                  "subtitle": [
+                    {
+                      "props": {
+                        "size": "xs",
+                        "text": "t · main · claude",
+                        "tone": "muted",
+                        "truncate": true
+                      },
+                      "type": "text"
+                    }
+                  ],
+                  "title": [
+                    {
+                      "props": {
+                        "monospace": true,
+                        "size": "sm",
+                        "text": "real-one",
+                        "tone": "default",
+                        "truncate": true,
+                        "weight": "regular"
+                      },
+                      "type": "text"
+                    }
+                  ]
+                },
+                "type": "tree_item"
+              }
+            ],
+            "title": [
+              {
+                "children": [
+                  {
+                    "props": {
+                      "name": "chevron-down",
+                      "size": "sm",
+                      "tone": "muted"
+                    },
+                    "type": "icon"
+                  },
+                  {
+                    "props": {
+                      "size": "xs",
+                      "text": "RealWorkspace",
+                      "tone": "muted",
+                      "truncate": true,
+                      "weight": "medium"
+                    },
+                    "type": "text"
+                  },
+                  {
+                    "props": {
+                      "size": "xs",
+                      "text": "1",
+                      "tone": "muted"
+                    },
+                    "type": "text"
+                  }
+                ],
+                "props": {
+                  "align": "center",
+                  "gap": "2"
+                },
+                "type": "inline"
+              }
+            ]
+          },
+          "type": "tree_item"
+        }
+      ],
+      "type": "tree"
+    },
+    {
+      "props": {
+        "action": {
+          "id": "botster.session.create.request"
+        },
+        "icon": "plus",
+        "label": "New session",
+        "tone": "default",
+        "variant": "ghost"
+      },
+      "type": "button"
+    }
+  ],
+  "props": {
+    "direction": "vertical",
+    "gap": "2"
+  },
+  "type": "stack"
+}

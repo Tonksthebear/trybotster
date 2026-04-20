@@ -159,6 +159,20 @@ const ICON_SIZE: Record<UiSizeV1, string> = {
 
 // ---------- Action helpers ----------
 
+/**
+ * Mapping from well-known action ids to `data-testid` values that Rails
+ * system tests and other DOM-level consumers can target. Kept in the web
+ * renderer (not in the shared contract) because `data-testid` is a
+ * renderer-specific affordance per the spec's "renderer hints don't belong
+ * in the shared contract" rule.
+ *
+ * Add entries here when a new Lua-authored action needs a stable DOM anchor;
+ * the Lua contract stays unchanged.
+ */
+const ACTION_TEST_IDS: Record<string, string> = {
+  'botster.session.create.request': 'new-session-button',
+}
+
 function wrapActionClick(
   action: UiActionV1,
   ctx: RenderContext,
@@ -170,7 +184,7 @@ function wrapActionClick(
     }
     event.preventDefault()
     event.stopPropagation()
-    ctx.dispatch(action)
+    ctx.dispatch(action, { element: event.currentTarget as Element })
   }
 }
 
@@ -393,10 +407,12 @@ const renderButton: PrimitiveRenderer = ({ props, ctx }) => {
   const onClick = wrapActionClick(action, ctx)
   const toneClass =
     variant === 'solid' ? BUTTON_TONE_SOLID[tone] : BUTTON_TONE_GHOST[tone]
+  const testId = ACTION_TEST_IDS[action.id]
   return (
     <button
       type="button"
       data-action-id={action.id}
+      data-testid={testId}
       onClick={onClick}
       disabled={action.disabled === true}
       className={clsx(
@@ -424,11 +440,13 @@ const renderIconButton: PrimitiveRenderer = ({ props, ctx }) => {
     return <button type="button" aria-label={label} disabled />
   }
   const onClick = wrapActionClick(action, ctx)
+  const testId = ACTION_TEST_IDS[action.id]
   return (
     <button
       type="button"
       aria-label={label}
       data-action-id={action.id}
+      data-testid={testId}
       onClick={onClick}
       disabled={action.disabled === true}
       className={clsx(
@@ -465,6 +483,41 @@ const renderTreeItem: PrimitiveRenderer = ({ props, slots, ctx, node }) => {
   const endSlot = slots['end']
   const childrenSlot = slots['children']
 
+  // When a tree_item carries a session-select action, render the primary
+  // click target as an <a href> so right-click / middle-click open the
+  // session in a new tab (browser navigation semantics). The end slot stays
+  // OUTSIDE the anchor to avoid nested-interactive HTML (end slot often
+  // contains a menu icon_button).
+  const sessionUuid =
+    (action?.payload as { sessionUuid?: string } | undefined)?.sessionUuid
+  const sessionHref =
+    action?.id === 'botster.session.select' && ctx.hubId && sessionUuid
+      ? `/hubs/${ctx.hubId}/sessions/${sessionUuid}`
+      : null
+
+  const primaryClass = clsx(
+    'flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5',
+    selected
+      ? 'bg-sky-500/20 text-sky-300'
+      : action
+        ? 'cursor-pointer text-zinc-200 hover:bg-zinc-800/50'
+        : 'text-zinc-200',
+  )
+
+  const primaryContent = (
+    <>
+      {startSlot && <div className="shrink-0">{startSlot}</div>}
+      <div className="min-w-0 flex-1">
+        <div className="min-w-0 truncate">{titleSlot}</div>
+        {subtitleSlot && (
+          <div className="min-w-0 truncate text-xs text-zinc-500">
+            {subtitleSlot}
+          </div>
+        )}
+      </div>
+    </>
+  )
+
   return (
     <li
       role="treeitem"
@@ -477,26 +530,16 @@ const renderTreeItem: PrimitiveRenderer = ({ props, slots, ctx, node }) => {
         notification && 'border-l-2 border-yellow-400',
       )}
     >
-      <div
-        onClick={onClick}
-        className={clsx(
-          'flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5',
-          selected
-            ? 'bg-sky-500/20 text-sky-300'
-            : action
-              ? 'cursor-pointer text-zinc-200 hover:bg-zinc-800/50'
-              : 'text-zinc-200',
+      <div className="flex items-center gap-1">
+        {sessionHref ? (
+          <a href={sessionHref} onClick={onClick} className={primaryClass}>
+            {primaryContent}
+          </a>
+        ) : (
+          <div onClick={onClick} className={primaryClass}>
+            {primaryContent}
+          </div>
         )}
-      >
-        {startSlot && <div className="shrink-0">{startSlot}</div>}
-        <div className="min-w-0 flex-1">
-          <div className="min-w-0 truncate">{titleSlot}</div>
-          {subtitleSlot && (
-            <div className="min-w-0 truncate text-xs text-zinc-500">
-              {subtitleSlot}
-            </div>
-          )}
-        </div>
         {endSlot && <div className="shrink-0">{endSlot}</div>}
       </div>
       {childrenSlot && expanded !== false && (

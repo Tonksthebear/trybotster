@@ -22,7 +22,8 @@ import {
   SidebarSpacer,
 } from './catalyst/sidebar'
 import { Navbar, NavbarItem, NavbarSpacer } from './catalyst/navbar'
-import WorkspaceList from './workspace/WorkspaceList'
+import UiTree from './UiTree'
+import SessionActionsMenu from './workspace/SessionActionsMenu'
 import HubSwitcher from './hub/HubSwitcher'
 import SidebarConnectionStatus from './hub/SidebarConnectionStatus'
 import ConnectionOverlay from './hub/ConnectionOverlay'
@@ -247,7 +248,12 @@ function HubShell() {
               <SidebarConnectionStatus />
               <SidebarSection>
                 <SidebarHeading>Workspaces</SidebarHeading>
-                <WorkspaceList hubId={selectedHubId} surface="sidebar" />
+                <UiTree
+                  hubId={selectedHubId}
+                  targetSurface="workspace_sidebar"
+                >
+                  <SessionActionsMenu />
+                </UiTree>
               </SidebarSection>
               <SidebarSpacer />
             </SidebarBody>
