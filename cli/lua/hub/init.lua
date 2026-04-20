@@ -56,7 +56,37 @@ _G.mcp = safe_require("lib.mcp")
 -- globals keeps plugin authoring ergonomic (no boilerplate require).
 _G.action = safe_require("lib.action")
 safe_require("lib.layout_input")
+
+-- Phase 4a: surface registry. Must load BEFORE `lib.layout_broadcast` so the
+-- broadcast module can see the registry, and BEFORE `handlers.connections`
+-- so the `surfaces_changed` hook subscription lands on the real table. The
+-- surfaces global lets plugin authors call `surfaces.register(name, opts)`
+-- without boilerplate. `hub.builtin_surfaces` registers workspace_sidebar /
+-- workspace_panel so the workspace isn't special-cased anywhere else.
+_G.surfaces = safe_require("lib.surfaces")
+safe_require("hub.builtin_surfaces")
+
 safe_require("lib.layout_broadcast")
+
+-- Phase 4a demo plugin. The real plugin loader (ConfigResolver below) walks
+-- the device root and admitted spawn target repos; it does NOT scan
+-- cli/lua/plugins/. That's deliberate — shipped demo plugins load here so
+-- the substrate is always exercised, without putting user plugins on the
+-- Lua `package.path`. A plugin author follows the same `surfaces.register`
+-- contract regardless of where their `plugin.lua` lives.
+--
+-- Gated so production hubs don't ship the `/plugins/hello` route to real
+-- users. Dev hubs (BOTSTER_DEV=1) and test hubs (BOTSTER_ENV=test) still
+-- register the demo so the substrate is exercisable end-to-end in those
+-- environments. Matches the DEV_ENV_VAR convention used by
+-- `cli/src/lua/primitives/web_layout.rs` for override directory selection.
+local demo_env = os.getenv("BOTSTER_DEV") == "1"
+    or os.getenv("BOTSTER_ENV") == "test"
+if demo_env then
+    safe_require("plugins.hello_surface.plugin")
+else
+    log.debug("plugins/hello_surface skipped (BOTSTER_DEV!=1 and BOTSTER_ENV!=test)")
+end
 
 -- Register built-in default MCP prompts. Loaded here so they are available
 -- before user.init runs, allowing users to override them by re-registering

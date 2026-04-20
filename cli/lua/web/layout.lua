@@ -296,15 +296,75 @@ local function session_children(sessions, vm_state)
   return out
 end
 
+-- Phase 4a: compile a list of hub-authored routable surfaces into sidebar
+-- tree_items. Only shown in the sidebar density — the panel surface is the
+-- "current page" body, not a nav host. Entries skip themselves so a surface
+-- doesn't link to itself, and skip `hide_from_nav = true` so plugins can
+-- register routable-but-invisible surfaces (e.g. future `/404`).
+local function nav_tree_items(current_surface_name)
+  local entries = {}
+  local ok, surfaces_mod = pcall(require, "lib.surfaces")
+  if not ok or type(surfaces_mod) ~= "table" then return entries end
+  for _, entry in ipairs(surfaces_mod.list()) do
+    if entry.path and not entry.hide_from_nav and entry.name ~= current_surface_name then
+      local title_nodes = {
+        ui.text{
+          text = entry.label or entry.name,
+          size = "xs",
+          tone = "muted",
+          weight = "medium",
+          truncate = true,
+        },
+      }
+      local start_nodes = nil
+      if entry.icon then
+        start_nodes = {
+          ui.icon{ name = entry.icon, size = "xs", tone = "muted" },
+        }
+      end
+      local item_args = {
+        id = "nav:" .. entry.name,
+        action = ui.action("botster.nav.open", { path = entry.path }),
+        title = title_nodes,
+      }
+      if start_nodes then item_args.start = start_nodes end
+      entries[#entries + 1] = ui.tree_item(item_args)
+    end
+  end
+  return entries
+end
+
+-- Build the sidebar body; separating this lets the empty-state path still
+-- append nav entries so a fresh hub with no sessions still exposes plugin
+-- surfaces. Returns a UiNodeV1 or nil when there's nothing to render.
+local function sidebar_nav_section(current_surface_name)
+  local items = nav_tree_items(current_surface_name)
+  if #items == 0 then return nil end
+  return ui.tree{ children = items }
+end
+
 -- -------------------------------------------------------------------------
 -- Surface entry points
 -- -------------------------------------------------------------------------
 
 function M.workspace_surface(state)
   local vm_state = vm.build(state)
+  local is_sidebar = vm_state.density == "sidebar"
+  -- The density `"sidebar"` matches the workspace_sidebar registered
+  -- surface; the workspace_panel uses `"panel"` and should not show nav.
+  local current_name = is_sidebar and "workspace_sidebar" or "workspace_panel"
+  local nav_section = is_sidebar and sidebar_nav_section(current_name) or nil
 
   if vm_state.empty then
-    return empty_state_tree(vm_state.density)
+    local body = empty_state_tree(vm_state.density)
+    if nav_section then
+      return ui.stack{
+        direction = "vertical",
+        gap = "2",
+        children = { body, nav_section },
+      }
+    end
+    return body
   end
 
   local tree_children = {}
@@ -330,14 +390,20 @@ function M.workspace_surface(state)
 
   -- WorkspaceList.jsx wraps the groups/rows in a flat div and appends the
   -- NewSession button as a sibling. We mirror that with a vertical stack
-  -- containing the tree and the button.
+  -- containing the tree and the button. Phase 4a: in the sidebar density
+  -- we additionally append a nav section listing every routable surface
+  -- registered via `lib.surfaces` (plugin-authored + workspace_panel).
+  local children = {
+    ui.tree{ children = tree_children },
+    new_session_button(),
+  }
+  if nav_section then
+    children[#children + 1] = nav_section
+  end
   return ui.stack{
     direction = "vertical",
-    gap = vm_state.density == "sidebar" and "0" or "2",
-    children = {
-      ui.tree{ children = tree_children },
-      new_session_button(),
-    },
+    gap = is_sidebar and "0" or "2",
+    children = children,
   }
 end
 

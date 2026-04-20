@@ -133,6 +133,10 @@ fn install_lua_stubs(lua: &Lua) {
 /// - `package.path` pointing at `cli/lua/` so `require("lib.*")` finds the
 ///   shipped modules
 /// - stubs for runtime globals the shipped code expects to find pre-installed
+/// - the Phase 4a surface registry with the two workspace surfaces wired in
+///   via `hub.builtin_surfaces`, matching the production bootstrap in
+///   `hub/init.lua`. Tests that assert two-density behavior rely on these
+///   registrations; dropping them would break the Phase-2b dedup semantics.
 fn new_test_lua() -> Lua {
     let lua = Lua::new();
     register_ui_contract(&lua).expect("register ui_contract");
@@ -151,6 +155,20 @@ fn new_test_lua() -> Lua {
 
     // Reset per-test global caches.
     web_layout::_clear_override_cache_for_tests();
+
+    // Phase 4a: load the surface registry and register the workspace
+    // surfaces so `lib.layout_broadcast` has something to iterate over.
+    // Matches `cli/lua/hub/init.lua` lines that install `_G.surfaces` and
+    // require `hub.builtin_surfaces`.
+    lua.load(
+        r#"
+        _G.surfaces = require("lib.surfaces")
+        _G.surfaces._reset_for_tests()
+        require("hub.builtin_surfaces")
+        "#,
+    )
+    .exec()
+    .expect("install surfaces + builtin_surfaces");
 
     lua
 }

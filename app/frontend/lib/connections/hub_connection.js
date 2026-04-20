@@ -40,12 +40,29 @@ export class HubTransport extends HubRoute {
     this._openWorkspaces = [];
     this._spawnTargets = [];
     this._hubRecoveryState = null;
+    this._uiRouteRegistry = [];
 
     this._hasAgentListSnapshot = false;
     this._hasHubWorkspaceListSnapshot = false;
     this._hasOpenWorkspaceListSnapshot = false;
     this._hasSpawnTargetListSnapshot = false;
     this._hasHubRecoveryStateSnapshot = false;
+    this._hasUiRouteRegistrySnapshot = false;
+  }
+
+  // ========== Public snapshot accessors ==========
+
+  /**
+   * Current Phase-4a route registry (array of { path, surface, label, icon,
+   * hide_from_nav }). Empty until the hub ships the first
+   * `ui_route_registry_v1` frame.
+   */
+  uiRouteRegistry() {
+    return this._uiRouteRegistry;
+  }
+
+  hasUiRouteRegistrySnapshot() {
+    return this._hasUiRouteRegistrySnapshot;
   }
 
   // ========== Connection overrides ==========
@@ -148,6 +165,16 @@ export class HubTransport extends HubRoute {
         this._hasHubRecoveryStateSnapshot = true;
         this.emit("hubRecoveryState", message);
         if (message.state === "ready") this.emit("hubReady", message);
+        break;
+
+      case "ui_route_registry_v1":
+        // Phase 4a: hub-authored registry of routable browser surfaces.
+        // Cached so a subscriber acquiring the hub after the initial frame
+        // still sees the registry without a re-broadcast. Replaces wholesale
+        // on each frame — the hub is the source of truth.
+        this._uiRouteRegistry = Array.isArray(message.routes) ? message.routes : [];
+        this._hasUiRouteRegistrySnapshot = true;
+        this.emit("uiRouteRegistry", this._uiRouteRegistry);
         break;
 
       case "hub_ready":

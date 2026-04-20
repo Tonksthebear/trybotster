@@ -193,6 +193,32 @@ local function broadcast_ui_layout_trees()
     end
 end
 
+--- Broadcast the `ui_route_registry_v1` frame to every hub-channel
+--- subscriber. Called on `surfaces_changed` so a plugin that registers a
+--- new surface mid-session reaches existing browsers without requiring
+--- them to reconnect. Subscribers receive the full registry; the frontend
+--- replaces its copy wholesale on each frame.
+local function broadcast_ui_route_registry()
+    local sub_count = 0
+    for _, client in pairs(clients) do
+        for sub_id, sub in pairs(client.subscriptions or {}) do
+            if sub.channel == "hub" then
+                sub_count = sub_count + 1
+                local ok, err = pcall(client.send_ui_route_registry, client, sub_id)
+                if not ok then
+                    log.warn(string.format(
+                        "broadcast_ui_route_registry: %s -> %s failed: %s",
+                        client.peer_id:sub(1, 8), sub_id:sub(1, 16), tostring(err)))
+                end
+            end
+        end
+    end
+    if sub_count > 0 then
+        log.debug(string.format(
+            "Broadcast ui_route_registry_v1 to %d subscription(s)", sub_count))
+    end
+end
+
 local function broadcast_workspace_list()
     local Hub = require("lib.hub")
     local ok, workspaces = pcall(function()
@@ -228,6 +254,21 @@ end
 -- ============================================================================
 -- Hook Observers (Lua → Lua)
 -- ============================================================================
+
+-- Phase 4a: re-broadcast the route registry whenever a surface is
+-- registered/unregistered. Debounced so a plugin that registers many
+-- surfaces in a tight loop coalesces into a single emission.
+local ROUTE_REGISTRY_DEBOUNCE_SECS = 0.05
+
+hooks.on("surfaces_changed", "broadcast_ui_route_registry", function(_info)
+    timer.after_idle("ui_route_registry_broadcast", ROUTE_REGISTRY_DEBOUNCE_SECS, function()
+        broadcast_ui_route_registry()
+        -- When a surface appears/disappears, the set of layout trees
+        -- available to subscribers changes too — force a layout rebroadcast
+        -- so the new surface's initial tree reaches existing browsers.
+        broadcast_ui_layout_trees()
+    end)
+end)
 
 hooks.on("agent_created", "broadcast_agent_created", function(info)
     if Session.is_system_session(info) then
@@ -609,6 +650,7 @@ local M = {
     broadcast_workspace_list = broadcast_workspace_list,
     broadcast_spawn_target_list = broadcast_spawn_target_list,
     broadcast_ui_layout_trees = broadcast_ui_layout_trees,
+    broadcast_ui_route_registry = broadcast_ui_route_registry,
 }
 
 -- Lifecycle hooks for hot-reload
@@ -630,6 +672,8 @@ function M._before_reload()
     hooks.off("pty_prompt", "update_agent_prompt")
     hooks.off("pty_cursor_visibility", "update_agent_cursor")
     hooks.off("client_disconnected", "unfocus_on_disconnect")
+    hooks.off("surfaces_changed", "broadcast_ui_route_registry")
+    timer.cancel("ui_route_registry_broadcast")
     _set_pty_focused = nil
     _on_pty_input = nil
     _clear_session_notification = nil
