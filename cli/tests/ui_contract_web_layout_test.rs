@@ -1041,3 +1041,189 @@ fn modtime_cache_reuses_unchanged_content_without_rereading() {
     );
     let _ = touch_future; // silence warn in the common case where 2-stage touch is unused
 }
+
+// -----------------------------------------------------------------------------
+// Regression tests for the override-evaluation lifecycle.
+//
+// Phase 2a's loader re-evaluated the override chunk on every render (even on
+// cache HIT — the string content was re-loaded into Lua each call) AND
+// `require("web.layout")` inside the override returned the VM singleton from
+// `package.loaded`. Overrides that monkey-patched `base.workspace_surface`
+// therefore stacked wrapper layers on every re-evaluation, producing N
+// banners after N renders.
+//
+// These tests lock in the post-fix behavior:
+// 1. Override that mutates `base.workspace_surface` does NOT accumulate
+//    wrappers across renders — exactly one banner shows regardless of how
+//    many times render is called.
+// 2. Override is evaluated at most once per content hash — a counter
+//    incremented at eval time advances exactly once even over N renders.
+// 3. Deleting the override restores the embedded default to an unpolluted
+//    state (no residual wrappers leaking from the prior override's session).
+// -----------------------------------------------------------------------------
+
+#[test]
+fn override_monkey_patching_does_not_stack_wrappers_across_renders() {
+    let _lock = lock_render_env();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo").join(".botster");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let _env_repo = EnvGuard::set(
+        "BOTSTER_WEB_LAYOUT_REPO_DIR",
+        repo_dir.to_str().expect("utf-8 repo path"),
+    );
+
+    // Classic "wrap the embedded function" override shape — exactly what a
+    // user writing `.botster/layout_web.lua` would naïvely try. Pre-fix this
+    // pattern accumulated one wrapper per render; the test renders five times
+    // and asserts exactly ONE banner exists in the final output.
+    let override_path = repo_dir.join("layout_web.lua");
+    std::fs::write(
+        &override_path,
+        r#"
+            local base = require("web.layout")
+            local original = base.workspace_surface
+            function base.workspace_surface(state)
+                local inner = original(state)
+                return {
+                    type = "stack",
+                    props = { direction = "vertical", gap = "3" },
+                    children = {
+                        { type = "panel", props = { title = "WRAPPED", tone = "muted" } },
+                        inner,
+                    },
+                }
+            end
+            return base
+        "#,
+    )
+    .unwrap();
+
+    let lua = new_web_layout_lua();
+    let mut last: JsonValue = JsonValue::Null;
+    for _ in 0..5 {
+        last = render_via_lua(&lua, FIXTURE_EMPTY);
+    }
+    let json = last.to_string();
+    let banner_count = json.matches("\"title\":\"WRAPPED\"").count();
+    assert_eq!(
+        banner_count, 1,
+        "override that wraps base.workspace_surface must NOT stack wrappers \
+         across renders; got {banner_count} banners in: {json}"
+    );
+}
+
+#[test]
+fn override_module_evaluated_at_most_once_per_content_hash() {
+    let _lock = lock_render_env();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo").join(".botster");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let _env_repo = EnvGuard::set(
+        "BOTSTER_WEB_LAYOUT_REPO_DIR",
+        repo_dir.to_str().expect("utf-8 repo path"),
+    );
+
+    // The override increments a global counter on every module-evaluation.
+    // If the loader evaluates the chunk once per render (pre-fix), the
+    // counter will equal the render count. If the loader caches the
+    // evaluated module by content hash (post-fix), the counter stays at 1
+    // regardless of render count.
+    let override_path = repo_dir.join("layout_web.lua");
+    std::fs::write(
+        &override_path,
+        r#"
+            _G._botster_override_eval_count = (_G._botster_override_eval_count or 0) + 1
+            return {
+                workspace_surface = function(_state)
+                    return {
+                        type = "panel",
+                        props = { title = "COUNTER-TEST", tone = "muted" },
+                    }
+                end,
+            }
+        "#,
+    )
+    .unwrap();
+
+    let lua = new_web_layout_lua();
+    lua.globals().set("_botster_override_eval_count", 0i64).unwrap();
+
+    for _ in 0..4 {
+        let _ = render_via_lua(&lua, FIXTURE_EMPTY);
+    }
+
+    let count: i64 = lua.globals().get("_botster_override_eval_count").unwrap();
+    assert_eq!(
+        count, 1,
+        "override module must be evaluated at most once per unchanged content, \
+         got {count} evaluations across 4 renders"
+    );
+}
+
+#[test]
+fn override_deletion_restores_unpolluted_embedded_module() {
+    let _lock = lock_render_env();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo").join(".botster");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let _env_repo = EnvGuard::set(
+        "BOTSTER_WEB_LAYOUT_REPO_DIR",
+        repo_dir.to_str().expect("utf-8 repo path"),
+    );
+
+    // Phase 1: a mutating override that poisons `package.loaded["web.layout"]`.
+    let override_path = repo_dir.join("layout_web.lua");
+    std::fs::write(
+        &override_path,
+        r#"
+            local base = require("web.layout")
+            local original = base.workspace_surface
+            function base.workspace_surface(state)
+                local inner = original(state)
+                return {
+                    type = "stack",
+                    props = { direction = "vertical", gap = "3" },
+                    children = {
+                        { type = "panel", props = { title = "POISON", tone = "muted" } },
+                        inner,
+                    },
+                }
+            end
+            return base
+        "#,
+    )
+    .unwrap();
+
+    let lua = new_web_layout_lua();
+    let poisoned = render_via_lua(&lua, FIXTURE_EMPTY);
+    assert!(
+        poisoned.to_string().contains("\"title\":\"POISON\""),
+        "first render should see the poison banner as a sanity check: {poisoned}"
+    );
+
+    // Phase 2: delete the override. Clearing the scan cache simulates the
+    // TTL expiry production would see naturally. The next render falls back
+    // to the embedded default — and its output MUST NOT contain any residual
+    // wrapping from the poisoned module singleton.
+    std::fs::remove_file(&override_path).unwrap();
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
+
+    let restored = render_via_lua(&lua, FIXTURE_EMPTY);
+    let json = restored.to_string();
+    assert!(
+        !json.contains("\"title\":\"POISON\""),
+        "after override deletion the embedded default must NOT carry residual \
+         wrappers from the prior override: {json}"
+    );
+    // And the embedded empty-state shape is what we expect.
+    assert_eq!(
+        restored.get("type").and_then(|v| v.as_str()),
+        Some("stack"),
+        "deleted-override fallback must return the embedded empty-state stack: {restored}"
+    );
+}
+
