@@ -45,6 +45,10 @@ const LOCAL_ONLY_ACTIONS = new Set<string>([
   'botster.session.preview.open',
   'botster.session.move.request',
   'botster.session.delete.request',
+  // Phase 4a: router-level nav triggered from a Lua-authored tree (e.g.
+  // the sidebar's nav entries for plugin-registered surfaces). Hub has no
+  // server-side meaning for this action — it's pure browser navigation.
+  'botster.nav.open',
 ])
 
 /**

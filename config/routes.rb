@@ -65,11 +65,13 @@ Rails.application.routes.draw do
   # SPA frontend routes — React Router handles navigation
   root to: "spa#home"
 
-  # SPA catch-all for frontend paths that React Router manages.
+  # SPA catch-all for frontend paths that React Router manages. React
+  # Router decides whether the path corresponds to a hub-authored surface
+  # (via the ui_route_registry_v1 broadcast) or a static Rails-hosted page;
+  # Rails only has to serve the SPA shell for any `/hubs/:hub_id/...` URL,
+  # so plugins can ship new browser routes without editing this file.
   # Must be after all API/auth routes to avoid intercepting them.
-  get "/hubs/:hub_id/sessions/*path", to: "spa#hub", as: nil
-  get "/hubs/:hub_id/settings", to: "spa#hub", as: nil
-  get "/hubs/:hub_id/pairing", to: "spa#hub", as: nil
+  get "/hubs/:hub_id/*path", to: "spa#hub", as: :spa_hub
 
   # PWA
   get "manifest" => "rails/pwa#manifest", as: :pwa_manifest
