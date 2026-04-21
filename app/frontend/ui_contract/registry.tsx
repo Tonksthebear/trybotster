@@ -310,6 +310,11 @@ const renderIcon: PrimitiveRenderer = ({ props }) => {
   const glyph = (
     <IconGlyph name={name} className={clsx('h-full w-full')} />
   )
+  // Rotate chevron-down when its closest collapsible ancestor reports
+  // `aria-expanded="false"` — mirrors the Phase 1 workspace-header chevron
+  // behaviour without leaking a collapse prop into the icon primitive.
+  // Uses Tailwind 4 arbitrary variant that targets ancestor state.
+  const isCollapsibleChevron = name === 'chevron-down'
   return (
     <span
       role="img"
@@ -319,6 +324,8 @@ const renderIcon: PrimitiveRenderer = ({ props }) => {
         'inline-flex shrink-0 items-center justify-center',
         ICON_SIZE[size],
         TEXT_TONE[tone],
+        isCollapsibleChevron &&
+          'transition-transform duration-150 [[aria-expanded=false]_&]:-rotate-90',
       )}
     >
       {glyph}

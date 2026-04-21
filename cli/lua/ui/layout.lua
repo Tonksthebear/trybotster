@@ -125,10 +125,10 @@ local function session_activity_icon(agent)
     return nil
   end
 
-  -- Idle/active indicator
-  if agent.is_idle then
-    spans[#spans + 1] = { text = "◌ ", style = { fg = "blue", modifier = "dim" } }
-  else
+  -- Only mark genuinely active (non-idle) agents. Idle sessions render
+  -- without a glyph to keep the list visually quiet; only a working agent
+  -- draws the eye. Mirrors the default web layout in cli/lua/web/layout.lua.
+  if not agent.is_idle then
     spans[#spans + 1] = { text = "✺ ", style = { fg = "green" } }
   end
 

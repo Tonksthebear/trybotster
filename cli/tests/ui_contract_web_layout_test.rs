@@ -83,9 +83,10 @@ fn golden_dir() -> PathBuf {
 /// lock — the guard drops before the lock is released so subsequent tests
 /// see the known-empty baseline.
 ///
-/// Also resets the Phase-2b override cache TTL to zero so sequential file
-/// writes inside a single test are picked up without waiting for the 500 ms
-/// window to expire. Production runs leave the default TTL in place.
+/// Also clears the Rust-side override cache so one test's cached winner
+/// doesn't leak into the next. In production the cache is only cleared by
+/// an explicit `web_layout.reload()` call; tests simulate that from the
+/// Rust side via `_clear_override_cache_for_tests`.
 fn lock_render_env() -> MutexGuard<'static, ()> {
     let guard = RENDER_LOCK
         .lock()
@@ -97,11 +98,6 @@ fn lock_render_env() -> MutexGuard<'static, ()> {
         std::env::set_var("BOTSTER_CONFIG_DIR", EMPTY_SENTINEL_PATH);
         std::env::remove_var("BOTSTER_DEV");
     }
-    // Drop TTL to 0 and clear the cache — together they make sequential
-    // file edits deterministic. `_clear_override_cache_for_tests()` is safe
-    // to call without any corresponding "restore" step because production
-    // bootstrap paths never observe the test TTL.
-    botster::lua::primitives::web_layout::set_override_cache_ttl_millis(0);
     botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
     guard
 }
@@ -441,17 +437,18 @@ fn every_session_row_includes_menu_open_placeholder() {
 }
 
 #[test]
-fn accessory_session_suppresses_activity_dot() {
+fn only_active_sessions_render_activity_dot() {
     let _lock = lock_render_env();
     let lua = new_web_layout_lua();
     let tree = render_via_lua(&lua, FIXTURE_MIXED_ACTIVITY);
     let json = tree.to_string();
-    // The accessory session (session_type="accessory") must NOT contribute a
-    // status_dot; active/idle sessions must. Count is 2, not 3.
+    // Only active sessions contribute a status_dot. Accessory and idle
+    // sessions are quiet — no dot at all. Mixed-activity fixture has one
+    // active session, so exactly one dot.
     let dots = json.matches("\"type\":\"status_dot\"").count();
     assert_eq!(
-        dots, 2,
-        "accessory must skip status_dot — expected 2 dots (active+idle), got {dots}: {json}"
+        dots, 1,
+        "only active sessions render status_dot — expected 1 dot (active only), got {dots}: {json}"
     );
 }
 
@@ -674,6 +671,12 @@ fn override_chain_and_error_fallback() {
         EnvGuard::set(DEVICE_DIR_OVERRIDE_ENV, device_dir.to_string_lossy().as_ref());
     let _dev_guard = EnvGuard::set(DEV_MODE_ENV, "");
 
+    // Tests explicitly invalidate the Rust-side override cache between
+    // filesystem mutations. In production the user would call
+    // `web_layout.reload()`; from Rust tests we hit the same invalidation
+    // via `_clear_override_cache_for_tests` to avoid needing a shared Lua
+    // VM across the test steps.
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
     let lua = new_web_layout_lua();
     let embedded = render_via_lua(&lua, FIXTURE_EMPTY);
     assert_eq!(
@@ -695,6 +698,7 @@ fn override_chain_and_error_fallback() {
     )
     .unwrap();
 
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
     let lua = new_web_layout_lua();
     let device_tree = render_via_lua(&lua, FIXTURE_EMPTY);
     assert_eq!(
@@ -718,6 +722,7 @@ fn override_chain_and_error_fallback() {
     )
     .unwrap();
 
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
     let lua = new_web_layout_lua();
     let repo_tree = render_via_lua(&lua, FIXTURE_EMPTY);
     assert_eq!(
@@ -745,6 +750,7 @@ fn override_chain_and_error_fallback() {
         }"#,
     )
     .unwrap();
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
     let lua = new_web_layout_lua();
     let device_shared_tree = render_via_lua(&lua, FIXTURE_EMPTY);
     assert_eq!(
@@ -766,6 +772,7 @@ fn override_chain_and_error_fallback() {
         }"#,
     )
     .unwrap();
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
     let lua = new_web_layout_lua();
     let repo_shared_tree = render_via_lua(&lua, FIXTURE_EMPTY);
     assert_eq!(
@@ -780,6 +787,7 @@ fn override_chain_and_error_fallback() {
     // A broken override (Lua syntax error) must not crash the hub; the
     // primitive wraps the failure in a fallback `ui.panel{}` tree.
     std::fs::write(&repo_shared, "this is not valid lua }{").unwrap();
+    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
     let lua = new_web_layout_lua();
     let fallback = render_via_lua(&lua, FIXTURE_EMPTY);
     assert_eq!(
@@ -803,28 +811,13 @@ fn override_chain_and_error_fallback() {
 // mtime changes and preserve override priority on invalidation.
 // -------------------------------------------------------------------------
 
-/// Helper: bump a file's mtime forward by ~2 seconds so the next
-/// `candidate_mtime` call observes a different value even on filesystems
-/// with coarse (1s) mtime granularity.
-fn touch_future(path: &std::path::Path) {
-    // Read-then-write bumps mtime on every filesystem. Add a distinct byte
-    // so the content hash would also change if we ever key on content.
-    let prev = std::fs::read_to_string(path).unwrap_or_default();
-    let bumped = format!("{prev}\n-- touched");
-    std::fs::write(path, bumped).unwrap();
-    // Also force mtime forward explicitly in case the filesystem clamps
-    // subsecond resolution.
-    let now = std::time::SystemTime::now();
-    let future = now + std::time::Duration::from_secs(2);
-    let _ = filetime::set_file_mtime(path, filetime::FileTime::from_system_time(future));
-}
-
 #[test]
-fn modtime_cache_invalidates_on_file_edit_and_restores_embedded_when_removed() {
+fn cache_invalidates_on_reload_and_restores_embedded_when_removed() {
+    // New semantics (plugin-reload-parity): the override cache is held
+    // indefinitely and only cleared by an explicit reload. File edits are
+    // NOT auto-detected — the user invokes `web_layout.reload()` when they
+    // want their changes picked up.
     let _lock = lock_render_env();
-    // `lock_render_env` already sets TTL=0 and clears the cache; those are
-    // the right defaults for sequential file edits inside a single test.
-    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
 
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo").join(".botster");
@@ -844,108 +837,94 @@ fn modtime_cache_invalidates_on_file_edit_and_restores_embedded_when_removed() {
         "embedded default renders the empty-state stack: {base}"
     );
 
-    // 2. Add a repo override. Because the previous render cached
-    // "no override won" with a 500 ms TTL, the next render WITHIN that
-    // window must still pick up the new file — so we explicitly clear
-    // the cache the same way a cache-miss past TTL would.
-    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
+    // 2. Add a repo override. Because the previous render cached "no
+    // override won", the new file is NOT picked up until we reload.
     let override_path = repo_dir.join("layout_web.lua");
     std::fs::write(
         &override_path,
         r#"return {
             workspace_surface = function(_state)
-                return ui.panel{ title = "MODTIME-v1", tone = "muted" }
+                return ui.panel{ title = "OVERRIDE-v1", tone = "muted" }
             end,
         }"#,
     )
     .unwrap();
-    let lua = new_web_layout_lua();
+    let pre_reload = render_via_lua(&lua, FIXTURE_EMPTY);
+    assert_eq!(
+        pre_reload.get("type").and_then(|v| v.as_str()),
+        Some("stack"),
+        "without reload the cached 'no override' result still serves: {pre_reload}"
+    );
+
+    // 3. Explicit reload picks up the new file.
+    botster::lua::primitives::web_layout::reload(&lua).expect("reload");
     let v1 = render_via_lua(&lua, FIXTURE_EMPTY);
     assert_eq!(
         v1.get("props")
             .and_then(|p| p.get("title"))
             .and_then(|t| t.as_str()),
-        Some("MODTIME-v1"),
-        "override picked up after cache clear: {v1}"
+        Some("OVERRIDE-v1"),
+        "override picked up after explicit reload: {v1}"
     );
 
-    // 3. Second render within TTL reuses the cached content — still v1.
+    // 4. Subsequent renders without another reload reuse the cached v1.
     let v1_again = render_via_lua(&lua, FIXTURE_EMPTY);
     assert_eq!(
         v1_again
             .get("props")
             .and_then(|p| p.get("title"))
             .and_then(|t| t.as_str()),
-        Some("MODTIME-v1"),
-        "within-TTL render reuses cached override: {v1_again}"
+        Some("OVERRIDE-v1"),
+        "steady-state render reuses cached override without re-reading: {v1_again}"
     );
 
-    // 4. Rewrite the file with a new payload and bump mtime. Clearing the
-    // cache here stands in for "TTL elapsed" — the production behavior is
-    // identical past 500 ms.
+    // 5. Rewrite the override on disk — still ignored until we reload.
     std::fs::write(
         &override_path,
         r#"return {
             workspace_surface = function(_state)
-                return ui.panel{ title = "MODTIME-v2", tone = "muted" }
+                return ui.panel{ title = "OVERRIDE-v2", tone = "muted" }
             end,
         }"#,
     )
     .unwrap();
-    let now = std::time::SystemTime::now();
-    let future = now + std::time::Duration::from_secs(2);
-    let _ = filetime::set_file_mtime(
-        &override_path,
-        filetime::FileTime::from_system_time(future),
+    let still_v1 = render_via_lua(&lua, FIXTURE_EMPTY);
+    assert_eq!(
+        still_v1
+            .get("props")
+            .and_then(|p| p.get("title"))
+            .and_then(|t| t.as_str()),
+        Some("OVERRIDE-v1"),
+        "edit without reload must NOT take effect: {still_v1}"
     );
-    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
+
+    // 6. Reload picks up the edit.
+    botster::lua::primitives::web_layout::reload(&lua).expect("reload after edit");
     let v2 = render_via_lua(&lua, FIXTURE_EMPTY);
     assert_eq!(
         v2.get("props")
             .and_then(|p| p.get("title"))
             .and_then(|t| t.as_str()),
-        Some("MODTIME-v2"),
-        "mtime drift invalidates the cached content: {v2}"
+        Some("OVERRIDE-v2"),
+        "reload after edit picks up the new content: {v2}"
     );
 
-    // 5. Remove the override entirely. Past the TTL (or after an explicit
-    // clear) the chain must fall back to embedded again — the previous
-    // "winning override" entry must not be served once the file is gone.
+    // 7. Delete the override, reload, and fall back to embedded.
     std::fs::remove_file(&override_path).unwrap();
-    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
+    botster::lua::primitives::web_layout::reload(&lua).expect("reload after deletion");
     let after_delete = render_via_lua(&lua, FIXTURE_EMPTY);
     assert_eq!(
         after_delete.get("type").and_then(|v| v.as_str()),
         Some("stack"),
-        "removing the override must restore embedded default: {after_delete}"
+        "reload after deletion restores embedded default: {after_delete}"
     );
 }
 
 #[test]
-fn modtime_cache_reuses_unchanged_content_without_rereading() {
-    // If the cached mtime matches the filesystem's mtime, the cache must
-    // reuse the stored content. We prove this by swapping the file's
-    // content to something that WOULD raise a Lua error on evaluation,
-    // while pinning mtime to the original value. A successful render with
-    // the original title proves the cache served the old bytes.
-    //
-    // This test temporarily restores the production TTL (500 ms) so the
-    // within-TTL cache-hit branch is exercised at all — `lock_render_env`
-    // drops TTL to 0 for deterministic sequential edits.
+fn reload_is_callable_from_lua_and_clears_caches() {
+    // `web_layout.reload()` is the Lua-visible entry point that matches the
+    // `reload_plugin` pattern — users/callers explicitly opt in.
     let _lock = lock_render_env();
-    botster::lua::primitives::web_layout::set_override_cache_ttl_millis(500);
-    // Clear between TTL changes so the first `render` in this test seeds a
-    // cache with the new TTL rather than serving a zero-TTL entry.
-    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
-    // Restore test default at scope exit so later tests aren't surprised.
-    struct TtlRestore;
-    impl Drop for TtlRestore {
-        fn drop(&mut self) {
-            botster::lua::primitives::web_layout::set_override_cache_ttl_millis(0);
-            botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
-        }
-    }
-    let _ttl_restore = TtlRestore;
 
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo").join(".botster");
@@ -955,89 +934,219 @@ fn modtime_cache_reuses_unchanged_content_without_rereading() {
         repo_dir.to_str().expect("utf-8 repo path"),
     );
 
+    let lua = new_web_layout_lua();
+    // Seed the cache with "no override wins".
+    let _ = render_via_lua(&lua, FIXTURE_EMPTY);
+
+    // Add an override AFTER the first render seeded the cache.
     let override_path = repo_dir.join("layout_web.lua");
     std::fs::write(
         &override_path,
         r#"return {
             workspace_surface = function(_state)
-                return ui.panel{ title = "CACHED-CONTENT", tone = "muted" }
+                return ui.panel{ title = "LUA-RELOAD", tone = "muted" }
             end,
         }"#,
     )
     .unwrap();
-    let original_mtime =
-        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&override_path).unwrap());
 
-    // First render: populates the cache with the good content.
-    let lua = new_web_layout_lua();
-    let first = render_via_lua(&lua, FIXTURE_EMPTY);
-    assert_eq!(
-        first
-            .get("props")
-            .and_then(|p| p.get("title"))
-            .and_then(|t| t.as_str()),
-        Some("CACHED-CONTENT"),
-    );
+    // Call `web_layout.reload()` from Lua — same entrypoint users hit.
+    lua.load("web_layout.reload()").exec().expect("lua reload");
 
-    // Swap content to something that would raise on evaluation, but pin
-    // mtime back to the original so the cache considers the file
-    // unchanged and reuses the cached bytes.
-    std::fs::write(&override_path, "THIS WOULD RAISE IF RE-READ").unwrap();
-    filetime::set_file_mtime(&override_path, original_mtime).unwrap();
-
-    // Second render within TTL: reuse cache directly (zero disk reads).
-    let second = render_via_lua(&lua, FIXTURE_EMPTY);
-    assert_eq!(
-        second
-            .get("props")
-            .and_then(|p| p.get("title"))
-            .and_then(|t| t.as_str()),
-        Some("CACHED-CONTENT"),
-        "within-TTL render should reuse cached content without re-reading"
-    );
-
-    // Force a cache miss: mtime-pinned content must STILL be reused
-    // because the stat-then-content-diff path short-circuits on mtime
-    // equality.
-    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
-    // Repopulate cache with good content by rewriting, then pin mtime back.
-    std::fs::write(
-        &override_path,
-        r#"return {
-            workspace_surface = function(_state)
-                return ui.panel{ title = "CACHED-CONTENT", tone = "muted" }
-            end,
-        }"#,
-    )
-    .unwrap();
-    filetime::set_file_mtime(&override_path, original_mtime).unwrap();
-    let lua = new_web_layout_lua();
-    let _prime = render_via_lua(&lua, FIXTURE_EMPTY);
-    // Now the cache holds the good content at `original_mtime`.
-    // Swap to broken content WITHOUT bumping mtime:
-    std::fs::write(&override_path, "still broken").unwrap();
-    filetime::set_file_mtime(&override_path, original_mtime).unwrap();
-    botster::lua::primitives::web_layout::_clear_override_cache_for_tests();
-    // After clear, scan_and_load() re-stats. Mtime equals the cached mtime
-    // only if we can re-seed the cache — but _clear_override_cache_for_tests
-    // wipes it. This branch therefore EXERCISES the re-read path; it must
-    // now fail to a fallback (not crash). Regression guard: the primitive
-    // must never propagate the I/O/parse error as a Rust panic.
-    let lua = new_web_layout_lua();
     let after = render_via_lua(&lua, FIXTURE_EMPTY);
     assert_eq!(
-        after.get("type").and_then(|v| v.as_str()),
-        Some("panel"),
-        "broken re-read must land on the error fallback tree: {after}"
+        after
+            .get("props")
+            .and_then(|p| p.get("title"))
+            .and_then(|t| t.as_str()),
+        Some("LUA-RELOAD"),
+        "lua-driven reload must pick up the new override: {after}"
     );
-    let title = after
-        .get("props")
-        .and_then(|p| p.get("title"))
-        .and_then(|t| t.as_str())
-        .unwrap_or_default();
-    assert!(
-        title.contains("Layout error"),
-        "fallback title must announce the failure, got {title}"
-    );
-    let _ = touch_future; // silence warn in the common case where 2-stage touch is unused
 }
+
+// -----------------------------------------------------------------------------
+// Regression tests for the override-evaluation lifecycle.
+//
+// Phase 2a's loader re-evaluated the override chunk on every render (even on
+// cache HIT — the string content was re-loaded into Lua each call) AND
+// `require("web.layout")` inside the override returned the VM singleton from
+// `package.loaded`. Overrides that monkey-patched `base.workspace_surface`
+// therefore stacked wrapper layers on every re-evaluation, producing N
+// banners after N renders.
+//
+// These tests lock in the post-fix behavior:
+// 1. Override that mutates `base.workspace_surface` does NOT accumulate
+//    wrappers across renders — exactly one banner shows regardless of how
+//    many times render is called.
+// 2. Override is evaluated at most once per content hash — a counter
+//    incremented at eval time advances exactly once even over N renders.
+// 3. Deleting the override restores the embedded default to an unpolluted
+//    state (no residual wrappers leaking from the prior override's session).
+// -----------------------------------------------------------------------------
+
+#[test]
+fn override_monkey_patching_does_not_stack_wrappers_across_renders() {
+    let _lock = lock_render_env();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo").join(".botster");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let _env_repo = EnvGuard::set(
+        "BOTSTER_WEB_LAYOUT_REPO_DIR",
+        repo_dir.to_str().expect("utf-8 repo path"),
+    );
+
+    // Classic "wrap the embedded function" override shape — exactly what a
+    // user writing `.botster/layout_web.lua` would naïvely try. Pre-fix this
+    // pattern accumulated one wrapper per render; the test renders five times
+    // and asserts exactly ONE banner exists in the final output.
+    let override_path = repo_dir.join("layout_web.lua");
+    std::fs::write(
+        &override_path,
+        r#"
+            local base = require("web.layout")
+            local original = base.workspace_surface
+            function base.workspace_surface(state)
+                local inner = original(state)
+                return {
+                    type = "stack",
+                    props = { direction = "vertical", gap = "3" },
+                    children = {
+                        { type = "panel", props = { title = "WRAPPED", tone = "muted" } },
+                        inner,
+                    },
+                }
+            end
+            return base
+        "#,
+    )
+    .unwrap();
+
+    let lua = new_web_layout_lua();
+    let mut last: JsonValue = JsonValue::Null;
+    for _ in 0..5 {
+        last = render_via_lua(&lua, FIXTURE_EMPTY);
+    }
+    let json = last.to_string();
+    let banner_count = json.matches("\"title\":\"WRAPPED\"").count();
+    assert_eq!(
+        banner_count, 1,
+        "override that wraps base.workspace_surface must NOT stack wrappers \
+         across renders; got {banner_count} banners in: {json}"
+    );
+}
+
+#[test]
+fn override_module_evaluated_at_most_once_per_content_hash() {
+    let _lock = lock_render_env();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo").join(".botster");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let _env_repo = EnvGuard::set(
+        "BOTSTER_WEB_LAYOUT_REPO_DIR",
+        repo_dir.to_str().expect("utf-8 repo path"),
+    );
+
+    // The override increments a global counter on every module-evaluation.
+    // If the loader evaluates the chunk once per render (pre-fix), the
+    // counter will equal the render count. If the loader caches the
+    // evaluated module by content hash (post-fix), the counter stays at 1
+    // regardless of render count.
+    let override_path = repo_dir.join("layout_web.lua");
+    std::fs::write(
+        &override_path,
+        r#"
+            _G._botster_override_eval_count = (_G._botster_override_eval_count or 0) + 1
+            return {
+                workspace_surface = function(_state)
+                    return {
+                        type = "panel",
+                        props = { title = "COUNTER-TEST", tone = "muted" },
+                    }
+                end,
+            }
+        "#,
+    )
+    .unwrap();
+
+    let lua = new_web_layout_lua();
+    lua.globals().set("_botster_override_eval_count", 0i64).unwrap();
+
+    for _ in 0..4 {
+        let _ = render_via_lua(&lua, FIXTURE_EMPTY);
+    }
+
+    let count: i64 = lua.globals().get("_botster_override_eval_count").unwrap();
+    assert_eq!(
+        count, 1,
+        "override module must be evaluated at most once per unchanged content, \
+         got {count} evaluations across 4 renders"
+    );
+}
+
+#[test]
+fn override_deletion_restores_unpolluted_embedded_module() {
+    let _lock = lock_render_env();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo").join(".botster");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let _env_repo = EnvGuard::set(
+        "BOTSTER_WEB_LAYOUT_REPO_DIR",
+        repo_dir.to_str().expect("utf-8 repo path"),
+    );
+
+    // Phase 1: a mutating override that poisons `package.loaded["web.layout"]`.
+    let override_path = repo_dir.join("layout_web.lua");
+    std::fs::write(
+        &override_path,
+        r#"
+            local base = require("web.layout")
+            local original = base.workspace_surface
+            function base.workspace_surface(state)
+                local inner = original(state)
+                return {
+                    type = "stack",
+                    props = { direction = "vertical", gap = "3" },
+                    children = {
+                        { type = "panel", props = { title = "POISON", tone = "muted" } },
+                        inner,
+                    },
+                }
+            end
+            return base
+        "#,
+    )
+    .unwrap();
+
+    let lua = new_web_layout_lua();
+    let poisoned = render_via_lua(&lua, FIXTURE_EMPTY);
+    assert!(
+        poisoned.to_string().contains("\"title\":\"POISON\""),
+        "first render should see the poison banner as a sanity check: {poisoned}"
+    );
+
+    // Phase 2: delete the override. An explicit reload (matching the
+    // plugin-reload pattern) invalidates ALL caches including
+    // `package.loaded["web.layout"]`, so the next render falls back to the
+    // embedded default from a fresh copy — zero residual wrapping from the
+    // poisoned singleton.
+    std::fs::remove_file(&override_path).unwrap();
+    botster::lua::primitives::web_layout::reload(&lua).expect("reload after delete");
+
+    let restored = render_via_lua(&lua, FIXTURE_EMPTY);
+    let json = restored.to_string();
+    assert!(
+        !json.contains("\"title\":\"POISON\""),
+        "after override deletion the embedded default must NOT carry residual \
+         wrappers from the prior override: {json}"
+    );
+    // And the embedded empty-state shape is what we expect.
+    assert_eq!(
+        restored.get("type").and_then(|v| v.as_str()),
+        Some("stack"),
+        "deleted-override fallback must return the embedded empty-state stack: {restored}"
+    );
+}
+

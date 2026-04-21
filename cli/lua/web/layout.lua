@@ -24,14 +24,13 @@ local M = {}
 -- Small helpers
 -- -------------------------------------------------------------------------
 
--- status_dot parity with composites.ts:activityDotForState.
+-- Only render a dot for genuinely active sessions. Idle / accessory /
+-- hidden all suppress it so row lists stay quiet by default and only a
+-- working agent draws the eye.
 local function activity_dot(state)
-  if state == "idle" then
-    return { ui.status_dot{ state = "idle", label = "Idle" } }
-  elseif state == "active" then
+  if state == "active" then
     return { ui.status_dot{ state = "active", label = "Active" } }
   end
-  -- "accessory" and "hidden" suppress the dot
   return nil
 end
 
