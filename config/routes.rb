@@ -37,10 +37,6 @@ Rails.application.routes.draw do
       resource :webrtc, only: [ :show ], controller: :webrtc  # GET config
       resource :settings, only: [ :show, :update, :destroy ], controller: :settings
       resource :pairing, only: [ :show ], controller: :pairing
-      # Session terminal view by session UUID
-      # /hubs/:hub_id/sessions/:session_uuid - terminal for a specific session
-      resources :sessions, only: [ :show ], param: :uuid do
-      end
     end
   end
 
