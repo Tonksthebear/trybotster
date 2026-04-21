@@ -11,6 +11,11 @@ const ACTION = {
   PREVIEW_OPEN: 'botster.session.preview.open',
   SESSION_MOVE: 'botster.session.move.request',
   SESSION_DELETE: 'botster.session.delete.request',
+  // Phase 4a: router-level navigation fired from Lua-authored trees (e.g.
+  // sidebar nav entries for plugin-registered surfaces). Payload expected:
+  // { path, hubId? }. When `hubId` is present the path is prefixed with
+  // `/hubs/<id>`; callers that emit pre-qualified absolute paths can omit.
+  NAV_OPEN: 'botster.nav.open',
 }
 
 // Validate that a URL uses a safe protocol (http/https only)
@@ -103,6 +108,25 @@ const handlers = {
         },
       })
     )
+  },
+
+  [ACTION.NAV_OPEN](payload) {
+    // Phase 4a: router-level nav. Accept either a pre-qualified absolute
+    // path (`/hubs/:id/plugins/hello`) or a hub-relative one (`/plugins/hello`)
+    // alongside the hubId enriched by createTransportDispatch. Relative
+    // paths are the common case — the sidebar Lua emits the surface's own
+    // `path` field directly, which is hub-relative.
+    let target = typeof payload.path === 'string' ? payload.path : null
+    if (!target || typeof window === 'undefined' || !window.history?.pushState) {
+      return
+    }
+    if (!target.startsWith('/hubs/') && typeof payload.hubId === 'string' && payload.hubId.length > 0) {
+      const trimmed = target.startsWith('/') ? target : '/' + target
+      target = `/hubs/${payload.hubId}${trimmed === '/' ? '' : trimmed}`
+    }
+    if (window.location.pathname === target) return
+    window.history.pushState({}, '', target)
+    window.dispatchEvent(new PopStateEvent('popstate'))
   },
 }
 
