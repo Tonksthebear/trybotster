@@ -2144,7 +2144,7 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_renders_idle_icon_for_idle_agent() {
+    fn test_layout_suppresses_activity_icon_for_idle_agent() {
         let lua = make_full_lua_with_events();
 
         lua.exec(
@@ -2168,9 +2168,12 @@ mod tests {
         let items = extract_sidebar_items(&tree);
 
         assert_eq!(items.len(), 1, "Should have exactly 1 agent item");
+        // Quiet-idle contract: idle agents render no activity glyph; the row
+        // starts directly with the display name. Active rows still start with
+        // "✺ " (see test_layout_renders_active_icon_for_running_agent).
         assert!(
-            items[0].starts_with("◌ "),
-            "Idle agent row should render idle glyph, got: {}",
+            !items[0].starts_with("◌ ") && !items[0].starts_with("✺ "),
+            "Idle agent row must not render any activity glyph, got: {}",
             items[0]
         );
     }

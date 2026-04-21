@@ -12,6 +12,66 @@ import {
   createTransportDispatch,
 } from '../ui_contract'
 import { getHub } from '../lib/hub-bridge'
+import { useWorkspaceStore } from '../store/workspace-store'
+
+// ---------------------------------------------------------------------------
+// Tree decoration — applies browser-local ephemeral UI state (workspace
+// collapse/expand) on top of the hub-authored tree before it reaches the
+// primitive interpreter. The hub doesn't track per-client collapse state
+// (collapse is a purely visual concern owned by the browser per the
+// "browser owns ephemeral UI state" invariant), so when a user clicks a
+// workspace header:
+//
+//   1. The action dispatcher (LOCAL_ONLY) routes `botster.workspace.toggle`
+//      to `lib/actions.js`, which flips the id in
+//      `useWorkspaceStore.collapsedWorkspaceIds`.
+//   2. This subscription re-renders with the new Set.
+//   3. `applyCollapseOverrides` walks the hub tree and overrides
+//      `expanded: false` on matching tree_items.
+//   4. The interpreter renders; `renderTreeItem` honours `expanded === false`
+//      by hiding the children slot.
+//
+// Pure function keyed only on `(tree, collapsedIds)` — safe to memoise.
+// ---------------------------------------------------------------------------
+
+function applyCollapseOverrides(node, collapsedIds) {
+  if (!node || typeof node !== 'object') return node
+  // `$kind` discriminator marks a conditional wrapper
+  // (`ui.when` / `ui.hidden`). Recurse into its inner node so any
+  // descendant tree_items still get their expansion state overridden.
+  if (node.$kind === 'when' || node.$kind === 'hidden') {
+    return { ...node, node: applyCollapseOverrides(node.node, collapsedIds) }
+  }
+
+  const decorated = { ...node }
+
+  if (
+    node.type === 'tree_item' &&
+    typeof node.id === 'string' &&
+    collapsedIds.has(node.id)
+  ) {
+    decorated.props = { ...(node.props ?? {}), expanded: false }
+  }
+
+  if (Array.isArray(node.children)) {
+    decorated.children = node.children.map((c) =>
+      applyCollapseOverrides(c, collapsedIds),
+    )
+  }
+
+  if (node.slots && typeof node.slots === 'object') {
+    decorated.slots = Object.fromEntries(
+      Object.entries(node.slots).map(([name, children]) => [
+        name,
+        Array.isArray(children)
+          ? children.map((c) => applyCollapseOverrides(c, collapsedIds))
+          : children,
+      ]),
+    )
+  }
+
+  return decorated
+}
 
 // ---------------------------------------------------------------------------
 // Interceptor context
@@ -147,6 +207,25 @@ export default function UiTree({
   const [tree, setTree] = useState(initialTree)
   const [transport, setTransport] = useState(null)
 
+  // Browser-local collapse state. Re-renders this component when a user
+  // toggles a workspace; `applyCollapseOverrides` then injects
+  // `expanded: false` into matching tree_items before the interpreter
+  // walks the tree. See `applyCollapseOverrides` at top of file.
+  const collapsedIds = useWorkspaceStore((s) => s.collapsedWorkspaceIds)
+  const decoratedTree = useMemo(() => {
+    if (!tree) return tree
+    // Malformed trees (e.g. getter throws) must still reach the error
+    // boundary in `UiTreeErrorBoundary` so the user sees a graceful
+    // fallback. If decoration blows up, pass the original tree through
+    // — the interpreter will then throw from its own render, which React
+    // routes to the boundary.
+    try {
+      return applyCollapseOverrides(tree, collapsedIds)
+    } catch {
+      return tree
+    }
+  }, [tree, collapsedIds])
+
   // Reset tree + transport synchronously on hubId change. Without this, a
   // hub switch (A → B) keeps the old tree visible until B's first broadcast
   // arrives and routes the user's clicks through A's transport in the
@@ -263,10 +342,10 @@ export default function UiTree({
 
   return (
     <InterceptorContext.Provider value={interceptorValue}>
-      <UiTreeErrorBoundary tree={tree} fallback={errorFallback}>
-        {tree ? (
+      <UiTreeErrorBoundary tree={decoratedTree} fallback={errorFallback}>
+        {decoratedTree ? (
           <UiTreeBody
-            node={tree}
+            node={decoratedTree}
             dispatch={dispatch}
             capabilities={capabilities}
             hubId={hubId}

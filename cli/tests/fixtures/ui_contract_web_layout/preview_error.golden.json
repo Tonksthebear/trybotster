@@ -62,15 +62,6 @@
                       "type": "inline"
                     }
                   ],
-                  "start": [
-                    {
-                      "props": {
-                        "label": "Idle",
-                        "state": "idle"
-                      },
-                      "type": "status_dot"
-                    }
-                  ],
                   "subtitle": [
                     {
                       "props": {
