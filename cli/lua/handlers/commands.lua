@@ -545,6 +545,41 @@ commands.register("ui_action_v1", function(client, sub_id, command)
     })
 end, { description = "Dispatch a semantic UI action envelope to hub handlers" })
 
+-- Phase 4b: surface subpath notifier. The browser fires this whenever its
+-- URL changes within a registered surface so the hub updates per-client
+-- `surface_subpaths[surface_name]` and re-renders just that surface for
+-- this subscription. Returns `action.HANDLED` so we don't silently drop
+-- into a legacy command fallback if one is ever added.
+--
+-- Payload shape: `{ target_surface = "kanban", subpath = "/board/42" }`.
+-- Browser also accepts `surface` / `path` aliases in case a plugin emits a
+-- slightly different shape from a Lua action builder — action observers
+-- plan on normalising.
+do
+    local action = require("lib.action")
+    action.on("botster.surface.subpath", "builtin.surface.subpath", function(envelope, ctx)
+        local client = ctx and ctx.client
+        if not client then return action.HANDLED end
+        local payload = envelope.payload or {}
+        local surface_name = payload.target_surface or payload.surface
+        local subpath = payload.subpath or payload.path or "/"
+        if type(surface_name) ~= "string" or surface_name == "" then
+            log.debug("botster.surface.subpath: missing target_surface; ignoring")
+            return action.HANDLED
+        end
+        if type(subpath) ~= "string" or subpath == "" then subpath = "/" end
+        if type(client.set_surface_subpath) == "function" then
+            client:set_surface_subpath(surface_name, subpath)
+        else
+            -- Hot-reload seam: Client methods upgrade in place but defend
+            -- against a stale VM where the method hasn't landed yet.
+            client.surface_subpaths = client.surface_subpaths or {}
+            client.surface_subpaths[surface_name] = subpath
+        end
+        return action.HANDLED
+    end)
+end
+
 commands.register("clear_notification", function(_client, _sub_id, command)
     local session_uuid = command.session_uuid
     if session_uuid then

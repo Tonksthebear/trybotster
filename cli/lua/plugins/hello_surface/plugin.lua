@@ -1,7 +1,20 @@
--- Phase 4a demo plugin — registers a hub-authored surface at
--- `/plugins/hello` so the end-to-end substrate (surface registry +
--- ui_route_registry_v1 broadcast + DynamicSurfaceRoute) can be exercised
--- without any Rails route changes or hand-crafted React components.
+-- Phase 4a/4b demo plugin — registers a hub-authored surface with multiple
+-- sub-routes so the end-to-end substrate (surface registry +
+-- ui_route_registry_v1 broadcast + sub-route dispatcher + DynamicSurface) can
+-- be exercised without any Rails route changes or hand-crafted React
+-- components.
+--
+-- Phase 4b switched the API: instead of a single `render` at a declared
+-- `path`, a surface declares `routes = { { path, render }, ... }` and the
+-- base URL is derived from the registration name. For "hello" the URL tree
+-- is:
+--
+--   /hubs/<hub_id>/hello             → home (first route)
+--   /hubs/<hub_id>/hello/details/:id → details page (pattern params)
+--
+-- This file deliberately shows a cross-sub-route link via `ctx.path(...)` so
+-- the browser exercises the path-change → re-render wire design (new
+-- `botster.surface.subpath` action).
 --
 -- ENV GATE (important): this file is only loaded by `hub/init.lua` when
 -- `BOTSTER_DEV=1` OR `BOTSTER_ENV=test`. Production hubs skip it so real
@@ -17,7 +30,11 @@
 -- author follows the same `surfaces.register(...)` contract regardless of
 -- where their `plugin.lua` lives.
 
-local function build_tree(_state)
+local function home_page(_state, ctx)
+    -- The link target is built via `ctx.path` so the URL always matches the
+    -- surface's own base, even if somebody later renames the registration.
+    -- Passing `{ id = 1 }` substitutes into ":id" in the pattern.
+    local details_url = ctx.path("/details/:id", { id = 1 })
     return ui.stack{
         direction = "vertical",
         gap = "3",
@@ -32,24 +49,75 @@ local function build_tree(_state)
                         gap = "2",
                         children = {
                             ui.text{
-                                text = "Hello from a plugin-registered surface",
+                                text = "Hello — Phase 4b sub-routes demo",
                                 size = "md",
                                 weight = "semibold",
                             },
                             ui.text{
-                                text = "This page is rendered by cli/lua/plugins/hello_surface/plugin.lua. "
-                                    .. "It was reachable at /hubs/:hub_id/plugins/hello without a "
-                                    .. "single Rails route, React component, or controller change — "
-                                    .. "the hub broadcasts ui_route_registry_v1 and ui_layout_tree_v1, "
-                                    .. "and the browser mounts a UiTree bound to this surface.",
+                                text = "This surface declares TWO sub-routes: `/` (this page) and "
+                                    .. "`/details/:id`. The hub's sub-route dispatcher extracts "
+                                    .. ":id from the URL and threads it into the details render. "
+                                    .. "Click below to navigate — the browser sends a "
+                                    .. "`botster.surface.subpath` action and the hub re-renders "
+                                    .. "just this surface with the new state.",
                                 size = "sm",
                                 tone = "muted",
                             },
+                            ui.button{
+                                label = "Open details for id=1",
+                                icon = "arrow-right",
+                                variant = "ghost",
+                                tone = "default",
+                                action = ui.action("botster.nav.open", { path = details_url }),
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }
+end
+
+local function details_page(state, ctx)
+    -- state.params.id comes from the `/details/:id` pattern match. Missing
+    -- params should never happen here (the dispatcher only routes us here
+    -- on a match) but defend anyway so a bad URL typed into the bar doesn't
+    -- emit a nil-formatted string.
+    local id = (state.params and state.params.id) or "?"
+    local home_url = ctx.path("/")
+    return ui.stack{
+        direction = "vertical",
+        gap = "3",
+        padding = "4",
+        children = {
+            ui.panel{
+                tone = "default",
+                border = true,
+                children = {
+                    ui.stack{
+                        direction = "vertical",
+                        gap = "2",
+                        children = {
                             ui.text{
-                                text = "Phase 4a: substrate proven.",
-                                size = "xs",
-                                tone = "accent",
-                                monospace = true,
+                                text = string.format("Details for id=%s", id),
+                                size = "md",
+                                weight = "semibold",
+                            },
+                            ui.text{
+                                text = "Subpath params are extracted by `lib.surfaces` and handed "
+                                    .. "to your sub-route render as `state.params`. The surface "
+                                    .. "base path and `ctx.path(...)` helper mean you never "
+                                    .. "hardcode `/hubs/<hub_id>/...` — rename the registration "
+                                    .. "and every link moves with it.",
+                                size = "sm",
+                                tone = "muted",
+                            },
+                            ui.button{
+                                label = "Back to hello home",
+                                icon = "arrow-left",
+                                variant = "ghost",
+                                tone = "default",
+                                action = ui.action("botster.nav.open", { path = home_url }),
                             },
                         },
                     },
@@ -67,17 +135,19 @@ local function minimal_input(_client, _sub_id)
 end
 
 local entry = surfaces.register("hello", {
-    path = "/plugins/hello",
     label = "Hello",
     icon = "sparkle",
     order = 1000,
     source = "plugin:hello_surface",
-    render = build_tree,
+    routes = {
+        { path = "/",              render = home_page },
+        { path = "/details/:id",   render = details_page },
+    },
     input_builder = minimal_input,
 })
 
 log.info(string.format(
-    "plugins/hello_surface: registered surface `%s` at %s",
-    entry.name, entry.path))
+    "plugins/hello_surface: registered surface `%s` at %s (%d routes)",
+    entry.name, tostring(entry.base_path), #entry.compiled_routes))
 
 return true
