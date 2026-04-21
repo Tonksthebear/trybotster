@@ -1,3 +1,3 @@
 class Current < ActiveSupport::CurrentAttributes
-  attribute :user, :hub, :session_uuid
+  attribute :user, :hub
 end
