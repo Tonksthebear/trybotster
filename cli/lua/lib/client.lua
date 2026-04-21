@@ -38,6 +38,13 @@ function Client.new(peer_id, transport)
         -- `botster.session.select` action fallback) so each subscriber
         -- gets its own `tree_item.selected` row rendered hub-side.
         selected_session_uuid = nil,
+        -- Phase 4b: per-browser URL state, mirroring the selection design.
+        -- `{ [surface_name] = subpath }` — the browser sends
+        -- `botster.surface.subpath` actions (and primes this map via the
+        -- subscribe envelope) so `layout_broadcast` can thread the right
+        -- `state.path` into each surface's render dispatcher. Unset entries
+        -- default to "/".
+        surface_subpaths = {},
     }, Client)
 
     log.info(string.format("Client created: %s...", peer_id:sub(1, 8)))
@@ -263,6 +270,21 @@ function Client:handle_subscribe(msg)
                 "send_ui_route_registry failed for %s: %s",
                 self.peer_id:sub(1, 8), tostring(reg_err)))
         end
+        -- Phase 4b: prime per-surface subpaths BEFORE the force-broadcast
+        -- so cold-load deep links (e.g. /hubs/:id/kanban/board/42) produce
+        -- the right sub-page on the very first frame. Without this the hub
+        -- would render "/" first (the default), ship it, then receive the
+        -- browser's surface.subpath action and re-render. That causes a
+        -- visible flash even with dedup because the "/" and "/board/42"
+        -- trees legitimately differ. `rebroadcast = false` because the
+        -- force-broadcast call below will emit the frames anyway.
+        if type(params.surface_subpaths) == "table" then
+            for surface_name, subpath in pairs(params.surface_subpaths) do
+                if type(surface_name) == "string" and type(subpath) == "string" then
+                    self:set_surface_subpath(surface_name, subpath, { rebroadcast = false })
+                end
+            end
+        end
         -- Prime Phase 2b layout trees so a fresh subscriber renders
         -- immediately without waiting for the next session_updated.
         -- `force=true` bypasses dedup; this is the only call that does so
@@ -365,8 +387,13 @@ end
 -- should set `opts.force = true` on priming (so a newly-subscribing browser
 -- always receives both densities) and leave `force` false/nil for routine
 -- broadcasts so dedup can suppress unchanged trees.
+--
+-- Phase 4b: `opts.only_surface` re-renders a single surface, used by the
+-- `botster.surface.subpath` action handler. Other surfaces stay on their
+-- existing dedup baselines — a URL change within one surface must NOT
+-- churn every other surface's version.
 -- @param sub_id The subscription ID to send to
--- @param opts table? { force = bool }
+-- @param opts table? { force = bool, only_surface = string }
 function Client:send_ui_layout_trees(sub_id, opts)
     local LayoutInput = require("lib.layout_input")
     local LayoutBroadcast = require("lib.layout_broadcast")
@@ -386,6 +413,7 @@ function Client:send_ui_layout_trees(sub_id, opts)
         subscription_key = sub_id,
         client = self,
         force = force,
+        only_surface = opts.only_surface,
     })
     if #frames == 0 then
         return 0
@@ -396,6 +424,42 @@ function Client:send_ui_layout_trees(sub_id, opts)
     end
     LayoutBroadcast.mark_sent(frames, { subscription_key = sub_id })
     return #frames
+end
+
+--- Record the browser's current subpath for a surface and trigger a
+--- targeted re-render. Called from the `botster.surface.subpath` action
+--- handler (action.lua) and from `handle_subscribe` when the initial
+--- subscribe envelope carries `surface_subpaths` (cold-load priming).
+--
+-- @param surface_name string
+-- @param subpath string Sub-path within the surface ("/" / "/board/42" / ...)
+-- @param opts table? { rebroadcast = bool } — default true. Set false during
+--        subscribe-time priming so we don't fire a broadcast before the
+--        initial force-broadcast call runs.
+function Client:set_surface_subpath(surface_name, subpath, opts)
+    if type(surface_name) ~= "string" or surface_name == "" then return end
+    if type(subpath) ~= "string" or subpath == "" then subpath = "/" end
+    if not self.surface_subpaths then self.surface_subpaths = {} end
+    local previous = self.surface_subpaths[surface_name]
+    if previous == subpath then return end
+    self.surface_subpaths[surface_name] = subpath
+    opts = opts or {}
+    if opts.rebroadcast == false then return end
+    -- Only re-render THIS surface for subscriptions on the hub channel.
+    -- `force = true` guarantees the frame ships even if the surface's
+    -- rendered tree happens to hash-match the previous one; otherwise the
+    -- browser would stay in its loading state forever waiting for a
+    -- subpath-matched frame that dedup silently suppressed. Dedup remains
+    -- correct for ordinary data-change re-broadcasts because those use
+    -- `send_ui_layout_trees(sub_id)` without `force`.
+    for sub_id, sub in pairs(self.subscriptions or {}) do
+        if sub.channel == "hub" then
+            pcall(self.send_ui_layout_trees, self, sub_id, {
+                only_surface = surface_name,
+                force = true,
+            })
+        end
+    end
 end
 
 --- Send the `ui_route_registry_v1` frame for a HubChannel subscription.

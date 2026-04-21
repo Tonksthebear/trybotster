@@ -440,3 +440,114 @@ describe('<UiTree> interceptor context', () => {
     })
   })
 })
+
+describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
+  it('does NOT send a surface.subpath action on first mount (subscribe envelope primes)', async () => {
+    // The subscribe channelParams already include `surface_subpaths`, so
+    // the hub is primed BEFORE the UiTree mounts. Sending another action
+    // on first mount would double-send for every cold load.
+    render(
+      <UiTree hubId="hub-1" targetSurface="kanban" subpath="/board/42" />,
+    )
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 120))
+    })
+    const subpathCalls = fakeTransport.send.mock.calls.filter(
+      ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
+    )
+    expect(subpathCalls).toHaveLength(0)
+  })
+
+  it('sends surface.subpath on subpath prop change and clears the tree', async () => {
+    const { rerender } = render(
+      <UiTree hubId="hub-1" targetSurface="kanban" subpath="/" />,
+    )
+    // Wait for transport attach.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 120))
+    })
+    // Initial render has no tree yet, but the first subpath must not fire.
+    expect(
+      fakeTransport.send.mock.calls.filter(
+        ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
+      ),
+    ).toHaveLength(0)
+
+    // Push a home-render tree so the panel is visible.
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_layout_tree_v1',
+        target_surface: 'kanban',
+        subpath: '/',
+        tree: { type: 'text', props: { text: 'home' } },
+      })
+    })
+    expect(await screen.findByText('home')).toBeInTheDocument()
+
+    // Now navigate — subpath prop changes.
+    rerender(
+      <UiTree hubId="hub-1" targetSurface="kanban" subpath="/board/42" />,
+    )
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // Tree state was cleared (old subpath's tree must not paint the new
+    // sub-page for a tick).
+    expect(screen.queryByText('home')).toBeNull()
+
+    // Exactly one surface.subpath action fired.
+    const calls = fakeTransport.send.mock.calls.filter(
+      ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
+    )
+    expect(calls).toHaveLength(1)
+    expect(calls[0][1]).toEqual({
+      target_surface: 'kanban',
+      envelope: {
+        id: 'botster.surface.subpath',
+        payload: { target_surface: 'kanban', subpath: '/board/42' },
+      },
+    })
+  })
+
+  it('ignores tree frames whose subpath does not match the current prop', async () => {
+    render(<UiTree hubId="hub-1" targetSurface="kanban" subpath="/board/42" />)
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 120))
+    })
+    // Late frame from old subpath arriving after the user navigated away
+    // — UiTree must discard it, not paint it.
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_layout_tree_v1',
+        target_surface: 'kanban',
+        subpath: '/',
+        tree: { type: 'text', props: { text: 'stale home' } },
+      })
+    })
+    expect(screen.queryByText('stale home')).toBeNull()
+    // Matching-subpath frame does paint.
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_layout_tree_v1',
+        target_surface: 'kanban',
+        subpath: '/board/42',
+        tree: { type: 'text', props: { text: 'board 42' } },
+      })
+    })
+    expect(await screen.findByText('board 42')).toBeInTheDocument()
+  })
+
+  it('accepts frames with no subpath field (back-compat with older hubs)', async () => {
+    render(<UiTree hubId="hub-1" targetSurface="workspace_panel" subpath="/" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_layout_tree_v1',
+        target_surface: 'workspace_panel',
+        // no subpath field
+        tree: { type: 'text', props: { text: 'hub' } },
+      })
+    })
+    expect(await screen.findByText('hub')).toBeInTheDocument()
+  })
+})
