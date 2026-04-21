@@ -437,17 +437,18 @@ fn every_session_row_includes_menu_open_placeholder() {
 }
 
 #[test]
-fn accessory_session_suppresses_activity_dot() {
+fn only_active_sessions_render_activity_dot() {
     let _lock = lock_render_env();
     let lua = new_web_layout_lua();
     let tree = render_via_lua(&lua, FIXTURE_MIXED_ACTIVITY);
     let json = tree.to_string();
-    // The accessory session (session_type="accessory") must NOT contribute a
-    // status_dot; active/idle sessions must. Count is 2, not 3.
+    // Only active sessions contribute a status_dot. Accessory and idle
+    // sessions are quiet — no dot at all. Mixed-activity fixture has one
+    // active session, so exactly one dot.
     let dots = json.matches("\"type\":\"status_dot\"").count();
     assert_eq!(
-        dots, 2,
-        "accessory must skip status_dot — expected 2 dots (active+idle), got {dots}: {json}"
+        dots, 1,
+        "only active sessions render status_dot — expected 1 dot (active only), got {dots}: {json}"
     );
 }
 
