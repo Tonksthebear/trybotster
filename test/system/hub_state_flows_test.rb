@@ -72,8 +72,9 @@ class HubStateFlowsTest < ApplicationSystemTestCase
     sign_in_and_connect
 
     click_link "Hub Settings"
-    click_button "Device", wait: 10
-    assert_selector "[data-hub-settings-target='treePanel'][data-view='tree']", wait: 15
+    click_button "Device"
+    wait_for_settings_ready("device", state: "tree")
+    assert_selector "[data-hub-settings-target='treePanel'][data-view='tree']"
     assert_no_selector "[data-hub-setup-banner-target='banner']", wait: 2
     assert_button "+ Add Agent"
     assert_button "+ Add Accessory"
@@ -102,6 +103,9 @@ class HubStateFlowsTest < ApplicationSystemTestCase
 
     complete_pairing_for(@hub, pairing_url: url)
     assert_webrtc_connected
+
+    # Causal gate — see SystemReadinessHelpers.
+    wait_for_hub_ready
   end
 
   def assert_webrtc_connected(wait: 30)
