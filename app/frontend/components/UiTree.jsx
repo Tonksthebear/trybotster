@@ -436,36 +436,55 @@ export default function UiTree({
     return transport.on('message', handler)
   }, [transport, targetSurface, subpath])
 
-  // Phase 4b: whenever the subpath changes within this surface, tell the
-  // hub so it can re-render for this client. The initial subpath is
-  // already primed via the subscribe envelope (see
-  // `channelParams().surface_subpaths` in `hub_connection.js`), so we
-  // skip the FIRST run per (transport, targetSurface) pair to avoid a
-  // redundant send on cold load. Subsequent subpath changes — the user
-  // navigating within the surface — always fire.
-  const subpathSyncRef = useRef({
-    transport: null,
-    surface: null,
-    subpath: null,
-  })
+  // Phase 4b: whenever the (target_surface, subpath) pair changes, tell
+  // the hub so it can re-render for this client. The initial subpath for
+  // the surface the user LANDED on is already primed via the subscribe
+  // envelope (`channelParams().surface_subpaths` in `hub_connection.js`);
+  // that primed surface+subpath is skipped so we don't double-send on
+  // cold load.
+  //
+  // All other cases fire:
+  //   * Cross-surface navigation on the SAME transport (hub has never
+  //     heard about the new surface's subpath — the envelope only primed
+  //     the one surface the user cold-loaded into).
+  //   * Intra-surface navigation (subpath changes within the current
+  //     targetSurface).
+  //   * Hub switch: the new transport is brand-new, so re-prime from
+  //     whatever surface the user is currently viewing.
+  //
+  // Tracking: per-transport map of `surface -> last-sent subpath`. A
+  // brand-new transport installs a single entry reflecting the currently
+  // rendered surface (that's what the subscribe envelope primed) and
+  // suppresses the send. Every other transition updates the map and
+  // sends.
+  const subpathSyncRef = useRef({ transport: null, sentBySurface: null })
   useEffect(() => {
     if (!transport || !targetSurface) return undefined
     const sync = subpathSyncRef.current
     const normalisedSubpath =
       typeof subpath === 'string' && subpath !== '' ? subpath : '/'
-    const isFirstRun =
-      sync.transport !== transport || sync.surface !== targetSurface
-    subpathSyncRef.current = {
-      transport,
-      surface: targetSurface,
-      subpath: normalisedSubpath,
+
+    const isColdTransport = sync.transport !== transport
+    if (isColdTransport) {
+      // Brand-new subscription — the subscribe envelope already primed
+      // the hub for THIS (surface, subpath). Seed the sent-cache so
+      // future renders compare against it.
+      subpathSyncRef.current = {
+        transport,
+        sentBySurface: new Map([[targetSurface, normalisedSubpath]]),
+      }
+      return undefined
     }
-    if (isFirstRun) return undefined
-    if (sync.subpath === normalisedSubpath) return undefined
+
+    // Same transport — did we already tell the hub about this
+    // (surface, subpath)? If not, send.
+    const lastSent = sync.sentBySurface.get(targetSurface)
+    if (lastSent === normalisedSubpath) return undefined
+    sync.sentBySurface.set(targetSurface, normalisedSubpath)
 
     // Best-effort — a failed send is harmless; the hub's default is "/"
-    // and dedup will sort out any divergence on the next meaningful
-    // update. No await; fire-and-forget keeps the render path fast.
+    // and the next user action will re-fire. No await; fire-and-forget
+    // keeps the render path fast.
     try {
       void transport.send('ui_action_v1', {
         target_surface: targetSurface,
