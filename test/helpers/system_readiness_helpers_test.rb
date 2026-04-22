@@ -49,15 +49,43 @@ class SystemReadinessHelpersTest < ActiveSupport::TestCase
     assert_equal 7, opts[:wait]
   end
 
-  test "wait_for_surface_ready asserts present then absent-loading" do
+  test "wait_for_surface_ready waits on the compound ready selector in a single assertion" do
     @fake.wait_for_surface_ready("workspace_panel")
 
     assert_equal [
-      [ :assert_selector, "[data-surface-ready='workspace_panel']", { wait: 15 } ],
-      [ :assert_no_selector,
-       "[data-surface-ready='workspace_panel'][data-surface-ready-state='loading']",
-       { wait: 1 } ]
+      [ :assert_selector,
+       "[data-surface-ready='workspace_panel'][data-surface-ready-state='ready']",
+       { wait: 15 } ]
     ], @fake.calls
+  end
+
+  test "wait_for_surface_ready respects an overridden timeout" do
+    @fake.wait_for_surface_ready("kanban", timeout: 30)
+
+    assert_equal [
+      [ :assert_selector,
+       "[data-surface-ready='kanban'][data-surface-ready-state='ready']",
+       { wait: 30 } ]
+    ], @fake.calls
+  end
+
+  # Regression: the prior two-assertion shape split the wait budget
+  # (timeout for present, hidden 1s for loading-gone) and flaked under CI
+  # slowness. This test pins the new shape — the helper issues exactly ONE
+  # Capybara assertion keyed on the READY-STATE compound selector, passing
+  # the full `timeout` through. No hidden sub-budget, no separate
+  # "presence" check that would match a still-loading surface.
+  test "wait_for_surface_ready hands the full timeout to a single ready-state assertion" do
+    @fake.wait_for_surface_ready("workspace_panel", timeout: 12)
+
+    assert_equal 1, @fake.calls.size,
+      "helper must NOT split the budget across multiple assertions"
+    kind, selector, opts = @fake.calls.first
+    assert_equal :assert_selector, kind
+    assert_includes selector, "data-surface-ready-state='ready'",
+      "must wait on the READY state, not just presence of the surface-ready attribute"
+    assert_equal 12, opts[:wait],
+      "full timeout must be passed to Capybara; no fixed sub-budget"
   end
 
   test "wait_for_settings_ready with default :any asserts scope only" do

@@ -25,11 +25,17 @@ module SystemReadinessHelpers
   # Wait until a specific surface's UiTree has received its first frame.
   # `name` matches the `targetSurface` identifier (e.g. "workspace_panel",
   # "workspace_sidebar", or a plugin-registered surface).
+  #
+  # The compound selector matches ONLY when the surface has flipped to ready
+  # — there is no fixed sub-timeout budget on the loading→ready transition,
+  # so a slow surface on a slow CI still resolves as long as the total wait
+  # fits within `timeout`. The UiTree wrapper mounts in `loading` state on
+  # first paint, which is why we cannot key on the surface-ready attribute
+  # alone: its presence means "the surface mounted", not "its tree arrived".
   def wait_for_surface_ready(name, timeout: 15)
-    assert_selector "[data-surface-ready='#{name}']", wait: timeout
-    assert_no_selector(
-      "[data-surface-ready='#{name}'][data-surface-ready-state='loading']",
-      wait: 1
+    assert_selector(
+      "[data-surface-ready='#{name}'][data-surface-ready-state='ready']",
+      wait: timeout
     )
   end
 
