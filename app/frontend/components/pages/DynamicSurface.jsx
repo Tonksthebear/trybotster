@@ -3,28 +3,36 @@ import { useParams } from 'react-router-dom'
 import UiTree from '../UiTree'
 import SessionActionsMenu from '../workspace/SessionActionsMenu'
 import {
+  matchSurfaceForPath,
   useRouteRegistryStore,
   selectRoutesForHub,
   selectHasRouteRegistrySnapshot,
 } from '../../store/route-registry-store'
 
 /**
- * Phase 4a: dynamic hub-authored surface route.
+ * Phase 4a/4b: dynamic hub-authored surface route.
  *
  * Matches `useParams()`'s splat (`*`) against the hub's
- * `ui_route_registry_v1` entries and mounts `<UiTree>` for the matching
- * surface. A plugin that registers `surfaces.register("hello", { path =
- * "/plugins/hello", ... })` becomes reachable at
- * `/hubs/:hubId/plugins/hello` with zero Rails changes — the Rails
- * catch-all routes every `/hubs/:hubId/*` URL to `spa#hub`, React Router
- * routes it here, and this component subscribes the hub to the surface's
- * tree frames.
+ * `ui_route_registry_v1` entries using `matchSurfaceForPath`. The match is
+ * **prefix-scoped to `base_path`**, not an exact-path compare: the first
+ * hub-relative segment identifies the surface, and everything after it is
+ * the **subpath** (sub-route) handed to `<UiTree>` so the hub dispatcher
+ * can route to the correct sub-page. A plugin that registers
+ * `surfaces.register("kanban", { routes = { { path = "/" }, { path =
+ * "/board/:id" } } })` becomes reachable at
+ *   * `/hubs/:hubId/kanban`            → subpath "/"            → home
+ *   * `/hubs/:hubId/kanban/board/42`   → subpath "/board/42"    → board(id=42)
+ *
+ * Phase 4a's exact-match form (`path === requestedPath`) is superseded by
+ * the prefix form, which now covers both the root-of-surface case and any
+ * nested sub-path. `base_path` always falls back to `path` for backwards
+ * compat with older hubs.
  *
  * Three resolution states for the current URL:
  *   1. Registry hasn't shipped its first snapshot yet for this hub
  *      (cold deep-link, hub still connecting) → loading state.
- *   2. Snapshot received, path matches a registered surface → mount
- *      `<UiTree>` for that surface.
+ *   2. Snapshot received, path matches a registered surface's base_path →
+ *      mount `<UiTree>` for that surface with the extracted subpath.
  *   3. Snapshot received, no match → true 404.
  *
  * Distinguishing (1) from (3) avoids the "flash of 404" that would
@@ -64,7 +72,7 @@ export default function DynamicSurfaceRoute() {
     )
   }
 
-  const match = routes.find((r) => r.path === requestedPath)
+  const match = matchSurfaceForPath(routes, requestedPath)
 
   if (!match) {
     // Unknown path — render a minimal local 404. Phase 4a intentionally
@@ -91,7 +99,11 @@ export default function DynamicSurfaceRoute() {
 
   return (
     <div className="h-full overflow-y-auto p-4 lg:p-6">
-      <UiTree hubId={hubId} targetSurface={match.surface}>
+      <UiTree
+        hubId={hubId}
+        targetSurface={match.entry.surface}
+        subpath={match.subpath}
+      >
         <SessionActionsMenu />
       </UiTree>
     </div>

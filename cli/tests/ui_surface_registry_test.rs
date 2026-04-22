@@ -252,24 +252,95 @@ fn surfaces_unregister_removes_entry() {
 }
 
 #[test]
-fn surfaces_path_resolves_registered_path() {
+fn surfaces_path_derives_base_from_name_and_returns_full_url() {
     let _lock = lock_env();
     let lua = new_test_lua();
 
+    // Phase 4b: `surfaces.path(name)` returns the full hub-scoped URL
+    // (`/hubs/<id>/<name>`) — NOT the relative base. Callers writing
+    // `ui.action("botster.nav.open", { path = surfaces.path("kanban") })`
+    // expect an absolute URL that React Router can `pushState` directly.
+    // The hub id is sourced from `hub.server_id()` ("hub-test" in the
+    // test harness).
     let path: String = lua
         .load(
             r#"
-            surfaces.register("routed", {
-                path = "/foo/bar",
-                render = function() return {type="panel", props={}} end,
+            surfaces.register("kanban", {
+                routes = {
+                    { path = "/", render = function() return {type="panel", props={}} end },
+                },
             })
-            return surfaces.path("routed")
+            return surfaces.path("kanban")
             "#,
         )
         .eval()
         .expect("path");
 
-    assert_eq!(path, "/foo/bar");
+    assert_eq!(path, "/hubs/hub-test/kanban");
+}
+
+#[test]
+fn surfaces_path_interpolates_named_params() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let url: String = lua
+        .load(
+            r#"
+            surfaces.register("kanban", {
+                routes = {
+                    { path = "/board/:id", render = function() return {type="panel", props={}} end },
+                },
+            })
+            return surfaces.path("kanban", "/board/:id", { id = 42 })
+            "#,
+        )
+        .eval()
+        .expect("interpolate");
+
+    assert_eq!(url, "/hubs/hub-test/kanban/board/42");
+}
+
+#[test]
+fn surfaces_path_honours_legacy_path_escape_hatch() {
+    // Regression guard for built-in surfaces like `workspace_panel` that
+    // register with `path = "/"` (or any other legacy base) instead of
+    // using the name-derived convention. `surfaces.path` must thread the
+    // explicit base through the URL builder so
+    //   surfaces.path("legacy", "/sub") = "/hubs/:id/weird/thing/sub"
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let (root, deep): (String, String) = lua
+        .load(
+            r#"
+            surfaces.register("legacy", {
+                path = "/weird/thing",
+                render = function() return {type="panel", props={}} end,
+            })
+            local root = surfaces.path("legacy")
+            local deep = surfaces.path("legacy", "/sub", nil)
+            return root, deep
+            "#,
+        )
+        .eval()
+        .expect("legacy escape hatch");
+
+    assert_eq!(root, "/hubs/hub-test/weird/thing");
+    assert_eq!(deep, "/hubs/hub-test/weird/thing/sub");
+}
+
+#[test]
+fn surfaces_path_returns_nil_for_unknown_surface() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let value: Value = lua
+        .load(r#"return surfaces.path("never_registered")"#)
+        .eval()
+        .expect("unknown surface");
+
+    assert!(matches!(value, Value::Nil));
 }
 
 #[test]
@@ -782,4 +853,421 @@ fn route_registry_includes_hide_from_nav_entries_with_flag() {
         .collect();
     assert!(pairs.contains(&("visible".to_string(), false)));
     assert!(pairs.contains(&("hidden".to_string(), true)));
+}
+
+// -------------------------------------------------------------------------
+// Phase 4b — sub-routes, params, ctx, subpath re-render
+// -------------------------------------------------------------------------
+
+#[test]
+fn multi_route_dispatcher_routes_subpaths_and_extracts_params() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    // Register a multi-route surface; directly exercise the generated
+    // `entry.render` dispatcher with synthetic `state.path` values to prove
+    // each sub-route fires and `state.params` carries the named captures.
+    let (home_hit, details_id, settings_hit): (String, String, String) = lua
+        .load(
+            r#"
+            surfaces.register("kanban", {
+                routes = {
+                    { path = "/",           render = function(s, _ctx) return { type = "panel", props = { tag = "home", path = s.path } } end },
+                    { path = "/board/:id",  render = function(s, _ctx) return { type = "panel", props = { tag = "board", id = s.params.id } } end },
+                    { path = "/settings",   render = function(s, _ctx) return { type = "panel", props = { tag = "settings", path = s.path } } end },
+                },
+            })
+            local entry = surfaces.get("kanban")
+            local home = entry.render({ hub_id = "hub-test", path = "/" })
+            local board = entry.render({ hub_id = "hub-test", path = "/board/42" })
+            local settings = entry.render({ hub_id = "hub-test", path = "/settings" })
+            return home.props.tag, board.props.id, settings.props.tag
+            "#,
+        )
+        .eval()
+        .expect("multi-route dispatcher");
+
+    assert_eq!(home_hit, "home");
+    assert_eq!(details_id, "42");
+    assert_eq!(settings_hit, "settings");
+}
+
+#[test]
+fn multi_route_dispatcher_renders_sub_404_for_unknown_subpath() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let (ty, title): (String, String) = lua
+        .load(
+            r#"
+            surfaces.register("kanban", {
+                routes = {
+                    { path = "/", render = function() return { type = "panel", props = { tag = "home" } } end },
+                },
+            })
+            local entry = surfaces.get("kanban")
+            local tree = entry.render({ hub_id = "hub-test", path = "/does/not/exist" })
+            -- Sub-404 tree is a panel whose first text child is "Sub-route not found".
+            local text = tree.children[1].children[1].props.text
+            return tree.type, text
+            "#,
+        )
+        .eval()
+        .expect("sub-404");
+
+    assert_eq!(ty, "panel");
+    assert!(
+        title.starts_with("Sub-route not found"),
+        "expected sub-404 tree, got: {title}"
+    );
+}
+
+#[test]
+fn ctx_path_builds_full_hub_scoped_url_from_subpath_template() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let (root_url, board_url, missing_param): (String, String, String) = lua
+        .load(
+            r#"
+            local captured_root, captured_board, captured_missing
+            surfaces.register("kanban", {
+                routes = {
+                    { path = "/", render = function(_s, ctx)
+                        captured_root = ctx.path("/")
+                        captured_board = ctx.path("/board/:id", { id = 99 })
+                        -- Missing params leave the `:name` literal so tests
+                        -- can catch the miss rather than silently rendering
+                        -- a broken URL.
+                        captured_missing = ctx.path("/board/:id", {})
+                        return { type = "panel", props = {} }
+                    end },
+                },
+            })
+            local entry = surfaces.get("kanban")
+            entry.render({ hub_id = "hub-test", path = "/" })
+            return captured_root, captured_board, captured_missing
+            "#,
+        )
+        .eval()
+        .expect("ctx.path");
+
+    assert_eq!(root_url, "/hubs/hub-test/kanban");
+    assert_eq!(board_url, "/hubs/hub-test/kanban/board/99");
+    assert_eq!(missing_param, "/hubs/hub-test/kanban/board/:id");
+}
+
+#[test]
+fn ctx_surface_and_base_path_are_exposed_to_sub_route_render() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let (surface_name, base_path, hub_id): (String, String, String) = lua
+        .load(
+            r#"
+            local captured
+            surfaces.register("kanban", {
+                routes = {
+                    { path = "/", render = function(_s, ctx)
+                        captured = { surface = ctx.surface, base_path = ctx.base_path, hub_id = ctx.hub_id }
+                        return { type = "panel", props = {} }
+                    end },
+                },
+            })
+            surfaces.get("kanban").render({ hub_id = "hub-test", path = "/" })
+            return captured.surface, captured.base_path, captured.hub_id
+            "#,
+        )
+        .eval()
+        .expect("ctx introspection");
+
+    assert_eq!(surface_name, "kanban");
+    assert_eq!(base_path, "/kanban");
+    assert_eq!(hub_id, "hub-test");
+}
+
+#[test]
+fn backwards_compat_top_level_render_wraps_in_single_route() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    // Plugins that pass a single top-level `render` (Phase 4a style) are
+    // internally wrapped into `routes = { { path = "/", render = fn } }`
+    // so the dispatcher path is uniform. This test proves the wrapper:
+    //   * entry.compiled_routes contains exactly one route
+    //   * the render fn still runs for state.path == "/"
+    //   * a non-root path falls through to the sub-404 renderer
+    let (route_count, home_hit, unknown_tag): (i64, String, String) = lua
+        .load(
+            r#"
+            surfaces.register("legacy", {
+                render = function(s, _ctx) return { type = "panel", props = { tag = "legacy", path = s.path } } end,
+            })
+            local entry = surfaces.get("legacy")
+            local home = entry.render({ hub_id = "hub-test", path = "/" })
+            local miss = entry.render({ hub_id = "hub-test", path = "/elsewhere" })
+            -- Sub-404 top-level is a panel wrapping a stack that contains
+            -- a text whose text starts with "Sub-route not found".
+            local miss_text = miss.children[1].children[1].props.text
+            return #entry.compiled_routes, home.props.tag, miss_text
+            "#,
+        )
+        .eval()
+        .expect("back-compat wrapper");
+
+    assert_eq!(route_count, 1);
+    assert_eq!(home_hit, "legacy");
+    assert!(
+        unknown_tag.starts_with("Sub-route not found"),
+        "expected sub-404 for non-root path in back-compat mode, got: {unknown_tag}"
+    );
+}
+
+#[test]
+fn register_rejects_both_routes_and_top_level_render() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    // Mixing API styles is a programming error — we assert loudly.
+    let result: mlua::Result<Value> = lua
+        .load(
+            r#"
+            surfaces.register("hybrid", {
+                render = function() return { type = "panel", props = {} } end,
+                routes = {
+                    { path = "/", render = function() return { type = "panel", props = {} } end },
+                },
+            })
+            return true
+            "#,
+        )
+        .eval();
+
+    match result {
+        Ok(_) => panic!("expected assertion error for hybrid registration"),
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("EITHER") || msg.contains("routes") || msg.contains("render"),
+                "assertion should mention the hybrid API conflict, got: {msg}"
+            );
+        }
+    }
+}
+
+#[test]
+fn path_segment_matching_escapes_pattern_metacharacters() {
+    // A literal "/" in a segment is fine, but any Lua-pattern metachar (".")
+    // must be matched literally; otherwise "/board.json" would accidentally
+    // match "/boardxjson". This is a regression guard for the pattern
+    // compiler in surfaces.lua.
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let (literal_hit, wrong_type, wrong_tag, wrong_text): (bool, String, String, String) = lua
+        .load(
+            r#"
+            surfaces.register("plain", {
+                routes = {
+                    { path = "/hello.world", render = function() return { type = "panel", props = { tag = "literal" } } end },
+                },
+            })
+            local entry = surfaces.get("plain")
+            local exact = entry.render({ hub_id = "hub-test", path = "/hello.world" })
+            local wrong = entry.render({ hub_id = "hub-test", path = "/helloXworld" })
+            local is_literal = exact.props and exact.props.tag == "literal"
+            local text = ""
+            if wrong.children and wrong.children[1] and wrong.children[1].children and wrong.children[1].children[1] then
+                text = wrong.children[1].children[1].props.text or ""
+            end
+            return is_literal, wrong.type or "?", (wrong.props and wrong.props.tag) or "?", text
+            "#,
+        )
+        .eval()
+        .expect("pattern escape");
+
+    assert!(literal_hit, "literal dot must match literal dot");
+    assert_eq!(wrong_type, "panel", "wrong should be a panel (sub-404 wrapper)");
+    assert_ne!(
+        wrong_tag, "literal",
+        "literal dot must NOT match arbitrary char (got the literal render instead of sub-404); wrong={wrong_type:?} wrong_tag={wrong_tag:?} text={wrong_text:?}"
+    );
+    assert!(
+        wrong_text.contains("Sub-route not found"),
+        "expected sub-404 text for arbitrary-char mismatch; got: {wrong_text:?}"
+    );
+}
+
+#[test]
+fn route_pattern_matches_trailing_slash_variants() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let (no_slash, with_slash): (String, String) = lua
+        .load(
+            r#"
+            surfaces.register("kanban", {
+                routes = {
+                    { path = "/board/:id", render = function(s) return { type = "panel", props = { id = s.params.id } } end },
+                },
+            })
+            local entry = surfaces.get("kanban")
+            local a = entry.render({ hub_id = "hub-test", path = "/board/7" }).props.id
+            local b = entry.render({ hub_id = "hub-test", path = "/board/7/" }).props.id
+            return a, b
+            "#,
+        )
+        .eval()
+        .expect("trailing slash");
+
+    assert_eq!(no_slash, "7");
+    assert_eq!(with_slash, "7");
+}
+
+#[test]
+fn layout_broadcast_threads_client_subpath_into_render_state() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    // Simulate the client carrying a `surface_subpaths` map; `build_frames`
+    // should resolve the subpath into `state.path` before the render, so
+    // the dispatcher routes to the matching sub-route.
+    let rendered_tag: String = lua
+        .load(
+            r#"
+            surfaces.register("kanban", {
+                routes = {
+                    { path = "/",          render = function(_s, _ctx) return { type = "panel", props = { tag = "home" } } end },
+                    { path = "/board/:id", render = function(s, _ctx) return { type = "panel", props = { tag = "board", id = s.params.id } } end },
+                },
+                input_builder = function(_c, _s) return { hub_id = "hub-test" } end,
+            })
+            local LayoutBroadcast = require("lib.layout_broadcast")
+            LayoutBroadcast._reset_for_tests()
+            -- Stand-in client with a subpath map (production-side client.lua
+            -- owns this; tests stub it so we don't need to boot a full client).
+            local fake_client = { surface_subpaths = { kanban = "/board/9" } }
+            local frames = LayoutBroadcast.build_frames(nil, {
+                subscription_key = "sub-kanban",
+                client = fake_client,
+                force = true,
+            })
+            -- Find the frame for "kanban" — iteration order mirrors registration.
+            local tree
+            for _, f in ipairs(frames) do
+                if f.target_surface == "kanban" then tree = f.tree end
+            end
+            assert(tree, "expected a kanban frame")
+            return tree.props.tag
+            "#,
+        )
+        .eval()
+        .expect("layout_broadcast subpath threading");
+
+    assert_eq!(rendered_tag, "board");
+}
+
+#[test]
+fn layout_broadcast_targeted_only_surface_re_renders_one_surface() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let emitted: Vec<String> = lua
+        .load(
+            r#"
+            surfaces.register("alpha", {
+                render = function(s, _ctx) return { type = "panel", props = { path = s.path } } end,
+                input_builder = function() return { hub_id = "hub-test" } end,
+            })
+            surfaces.register("beta", {
+                render = function(s, _ctx) return { type = "panel", props = { path = s.path } } end,
+                input_builder = function() return { hub_id = "hub-test" } end,
+            })
+            local LayoutBroadcast = require("lib.layout_broadcast")
+            LayoutBroadcast._reset_for_tests()
+            local frames = LayoutBroadcast.build_frames(nil, {
+                subscription_key = "sub",
+                client = { surface_subpaths = {} },
+                only_surface = "beta",
+                force = true,
+            })
+            local names = {}
+            for _, f in ipairs(frames) do names[#names + 1] = f.target_surface end
+            return names
+            "#,
+        )
+        .eval()
+        .expect("only_surface filter");
+
+    assert_eq!(emitted, vec!["beta"]);
+}
+
+#[test]
+fn route_registry_payload_carries_base_path_and_sub_routes() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let payload_json: String = lua
+        .load(
+            r#"
+            surfaces.register("kanban", {
+                label = "Kanban",
+                icon = "squares-2x2",
+                routes = {
+                    { path = "/",          render = function() return { type = "panel", props = {} } end },
+                    { path = "/board/:id", render = function() return { type = "panel", props = {} } end },
+                    { path = "/settings",  render = function() return { type = "panel", props = {} } end },
+                },
+            })
+            return json.encode(surfaces.build_route_registry_payload("hub-test"))
+            "#,
+        )
+        .eval()
+        .expect("route registry payload");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload_json).expect("parse payload");
+    let routes = parsed.get("routes").and_then(|v| v.as_array()).unwrap();
+    let entry = routes
+        .iter()
+        .find(|r| r.get("surface").and_then(|v| v.as_str()) == Some("kanban"))
+        .expect("kanban entry");
+
+    assert_eq!(entry.get("base_path").and_then(|v| v.as_str()), Some("/kanban"));
+    // `path` mirrors `base_path` for routable surfaces so older browsers
+    // still see a valid top-level URL.
+    assert_eq!(entry.get("path").and_then(|v| v.as_str()), Some("/kanban"));
+
+    let sub_routes = entry.get("routes").and_then(|v| v.as_array()).expect("routes[]");
+    let sub_paths: Vec<&str> = sub_routes
+        .iter()
+        .filter_map(|r| r.get("path").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(sub_paths, vec!["/", "/board/:id", "/settings"]);
+}
+
+#[test]
+fn demo_hello_plugin_registers_with_two_routes() {
+    // Regression guard for `plugins/hello_surface/plugin.lua` — Phase 4b
+    // migrated it to the multi-route API. This test is the canonical
+    // "the demo still loads and the substrate is wired up" smoke test.
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    with_demo_env(None, Some("test"), || {
+        let (name, base_path, route_count): (String, String, i64) = lua
+            .load(
+                r#"
+                require("plugins.hello_surface.plugin")
+                local entry = surfaces.get("hello")
+                return entry.name, entry.base_path, #entry.compiled_routes
+                "#,
+            )
+            .eval()
+            .expect("hello demo plugin registered");
+
+        assert_eq!(name, "hello");
+        assert_eq!(base_path, "/hello");
+        assert_eq!(route_count, 2);
+    });
 }

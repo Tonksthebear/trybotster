@@ -1,14 +1,24 @@
 import { create } from 'zustand'
 
-// Phase 4a: per-hub registry of routable browser surfaces. Populated from
+// Phase 4a/4b: per-hub registry of routable browser surfaces. Populated from
 // the `ui_route_registry_v1` broadcast (see `lib/connections/hub_connection.js`
 // and the bridge in `lib/hub-bridge.js`). Components subscribe via the
 // `useRouteRegistryStore` hook; `DynamicSurfaceRoute` matches the current
-// URL splat against an entry's `path` to decide which hub-authored surface
-// to mount.
+// URL's first hub-scoped segment against an entry's `base_path` to decide
+// which hub-authored surface to mount.
 //
 // Shape:
-//   routesByHubId: { [hubId]: Array<{ path, surface, label, icon, hide_from_nav? }> }
+//   routesByHubId: {
+//     [hubId]: Array<{
+//       path,              // canonical URL path for the surface root
+//       base_path,         // matches `path`; explicit for sub-route slicing
+//       surface,           // wire target_surface identifier
+//       label,
+//       icon,
+//       hide_from_nav?,
+//       routes?,           // Phase 4b sub-patterns: [{ path }]
+//     }>,
+//   }
 //   snapshotReceivedAtByHubId: { [hubId]: number }
 //
 // Routes are replaced wholesale per frame so the hub always owns the
@@ -24,7 +34,7 @@ export const useRouteRegistryStore = create((set) => ({
 
   setRoutes(hubId, routes) {
     if (!hubId) return
-    const next = Array.isArray(routes) ? routes : []
+    const next = Array.isArray(routes) ? routes.map(normaliseEntry) : []
     set((s) => ({
       routesByHubId: { ...s.routesByHubId, [String(hubId)]: next },
       snapshotReceivedAtByHubId: {
@@ -63,6 +73,68 @@ export const useRouteRegistryStore = create((set) => ({
 // protection. A frozen module-level constant is safe here because the
 // selector never mutates.
 const EMPTY_ROUTES = Object.freeze([])
+
+/**
+ * Normalise an entry so consumers can rely on `base_path` without reaching
+ * through legacy shapes. Phase 4a emitted only `path`; Phase 4b also emits
+ * `base_path` and an optional `routes` array of sub-patterns. Older hubs
+ * talking to a newer browser fall back to `path` for `base_path`.
+ */
+function normaliseEntry(entry) {
+  if (!entry || typeof entry !== 'object') return entry
+  const basePath = typeof entry.base_path === 'string' && entry.base_path !== ''
+    ? entry.base_path
+    : typeof entry.path === 'string' ? entry.path : null
+  return {
+    ...entry,
+    base_path: basePath,
+  }
+}
+
+/**
+ * Given a set of normalised registry entries and a hub-relative URL (e.g.
+ * "/kanban/board/42"), return the matching entry AND the remaining subpath
+ * (e.g. "/board/42"). Preference order:
+ *   1. Exact base_path match with no additional segments ("/kanban" vs
+ *      entry.base_path "/kanban") → subpath "/".
+ *   2. Prefix match where the character after the base is "/" (so
+ *      "/kanban/board/42" matches base "/kanban" but "/kanbana" doesn't
+ *      match base "/kanban").
+ *   3. Root base_path ("/") matches only the literal root.
+ *
+ * When multiple entries' base_paths are prefixes of one another (e.g.
+ * "/admin" vs "/admin/users"), the longer base wins.
+ */
+export function matchSurfaceForPath(entries, pathname) {
+  if (!Array.isArray(entries) || typeof pathname !== 'string') {
+    return null
+  }
+  const normalised = pathname.length === 0 ? '/' : pathname
+
+  let best = null
+  let bestLen = -1
+  for (const entry of entries) {
+    const base = entry?.base_path
+    if (typeof base !== 'string' || base.length === 0) continue
+
+    let subpath = null
+    if (base === '/') {
+      if (normalised === '/' || normalised === '') {
+        subpath = '/'
+      }
+    } else if (normalised === base) {
+      subpath = '/'
+    } else if (normalised.startsWith(base + '/')) {
+      subpath = normalised.slice(base.length)
+    }
+
+    if (subpath !== null && base.length > bestLen) {
+      best = { entry, subpath }
+      bestLen = base.length
+    }
+  }
+  return best
+}
 
 /** Selector: return the routes for a given hub id, or an empty array. */
 export function selectRoutesForHub(state, hubId) {

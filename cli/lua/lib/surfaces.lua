@@ -1,9 +1,42 @@
--- Surface registry (Phase 4a) — the Lua-side source of truth for browser
+-- Surface registry (Phase 4a + 4b) — the Lua-side source of truth for browser
 -- surfaces. A "surface" is the unit the hub composes and ships to browsers:
 --   * it has a stable `name` (the `target_surface` on the wire)
---   * a `render(state)` function returning a UiNodeV1 table
---   * optional `path` making it a routable browser page
+--   * a `routes = { ... }` array OR a single `render(state)` function
 --   * optional `input_builder(client, sub_id)` for per-subscription state
+--
+-- Phase 4b introduces sub-routes:
+--
+--   surfaces.register("kanban", {
+--       label = "Kanban",
+--       icon  = "squares-2x2",
+--       -- base path = "/kanban" (derived from name). URL =
+--       -- /hubs/<hub_id>/kanban. Each route's `path` is relative to that base.
+--       routes = {
+--           { path = "/",           render = kanban_home },
+--           { path = "/board/:id",  render = kanban_board },
+--           { path = "/settings",   render = kanban_settings },
+--       },
+--       input_builder = function(client, sub_id) ... end,
+--   })
+--
+-- The sub-route's `render(state, ctx)` receives:
+--   * `state.path`   — the subpath the browser is currently on ("/board/42")
+--   * `state.params` — the named captures from the matched pattern
+--                      (`{ id = "42" }` for "/board/:id")
+--   * `ctx.hub_id`, `ctx.surface`, `ctx.base_path`
+--   * `ctx.path(subpath, params)` — build a full `/hubs/<hub_id>/<base>/<sub>`
+--     URL with `:name` interpolation from `params`.
+--
+-- Cross-surface helper:
+--
+--   surfaces.path("kanban", "/board/:id", { id = 42 })
+--     -> "/hubs/<current-hub>/kanban/board/42"
+--
+-- Backwards compatibility: registrations that pass a single top-level `render`
+-- (and optional top-level `path` for the URL base) are still accepted and
+-- internally wrapped into `routes = { { path = "/", render = opts.render } }`.
+-- The top-level `path` becomes the base for that surface (this is the escape
+-- hatch built-in surfaces like `workspace_panel` use to keep their URL at "/").
 --
 -- Plugins call `surfaces.register(...)` from their own Lua init and the
 -- registration flows through three places automatically:
@@ -28,7 +61,10 @@ local M = {}
 
 -- Storage shape:
 --   registry.by_name[name] = {
---       name, path, label, icon, render, input_builder,
+--       name, base_path, label, icon,
+--       render,                -- auto-generated dispatcher (or passthrough)
+--       compiled_routes,       -- array of { pattern, param_names, regex, render }
+--       input_builder,
 --       hide_from_nav, order, source,
 --   }
 --   registry.seq — monotonically increasing insertion counter for stable
@@ -51,6 +87,273 @@ local function notify_changed()
     end
 end
 
+-- Escape Lua pattern metacharacters so literal path segments can be matched
+-- via `string.match`. `/board/42.json` must match the literal pattern "/board/42.json"
+-- exactly; the dot must not act as a Lua pattern wildcard. Belt-and-suspenders
+-- — plugin-declared patterns are short strings with tight alphabets, but we
+-- don't want to constrain that in the future.
+local LUA_PATTERN_MAGIC = "([%(%)%.%%%+%-%*%?%[%]%^%$])"
+local function escape_lua_pattern(s)
+    return (s:gsub(LUA_PATTERN_MAGIC, "%%%1"))
+end
+
+-- Normalise a pattern fragment to start with "/". Plugins may write
+-- `path = "board/:id"` (no leading slash) — accept it.
+local function ensure_leading_slash(s)
+    if s == nil or s == "" then return "/" end
+    return s:sub(1, 1) == "/" and s or ("/" .. s)
+end
+
+-- Strip a trailing slash unless it's the root "/".
+local function strip_trailing_slash(s)
+    if s == "/" or s == "" then return "/" end
+    return s:gsub("/+$", "")
+end
+
+-- Compile a route pattern into a matcher.
+--
+-- Pattern syntax:
+--   * "/" — matches the empty/root subpath ("" or "/").
+--   * Literal segments like "/settings" — exact match after normalisation.
+--   * Named params like "/board/:id" — `:id` captures one segment (no slashes)
+--     and is exposed as `params.id`.
+--
+-- Returns a table:
+--   { pattern, lua_pattern, param_names, render }
+local function compile_route(path_pattern, render)
+    assert(type(render) == "function",
+        "surfaces.register: each route must declare `render = function(state, ctx) ... end`")
+    local normalised = ensure_leading_slash(path_pattern)
+    normalised = strip_trailing_slash(normalised)
+    if normalised == "" then normalised = "/" end
+
+    local param_names = {}
+    if normalised == "/" then
+        return {
+            pattern = "/",
+            lua_pattern = "^/?$",
+            param_names = param_names,
+            render = render,
+        }
+    end
+
+    local parts = { "^" }
+    for segment in normalised:gmatch("[^/]+") do
+        if segment:sub(1, 1) == ":" then
+            local name = segment:sub(2)
+            assert(name ~= "",
+                "surfaces.register: empty param name in route pattern `" .. path_pattern .. "`")
+            param_names[#param_names + 1] = name
+            parts[#parts + 1] = "/([^/]+)"
+        else
+            parts[#parts + 1] = "/" .. escape_lua_pattern(segment)
+        end
+    end
+    -- Accept either the exact form or a trailing slash so nav from `/board/42`
+    -- vs `/board/42/` lands the same route.
+    parts[#parts + 1] = "/?$"
+    return {
+        pattern = normalised,
+        lua_pattern = table.concat(parts),
+        param_names = param_names,
+        render = render,
+    }
+end
+
+-- Match a subpath against a single compiled route.
+-- @return params table on match, nil otherwise.
+local function match_compiled_route(compiled, subpath)
+    local s = ensure_leading_slash(subpath or "/")
+    -- Strip any query/fragment that leaked through — we only route by path.
+    s = s:gsub("[?#].*$", "")
+    -- For non-root routes, drop a trailing slash so "/board/42/" behaves like
+    -- "/board/42". The compiled regex already tolerates it but the `/` form
+    -- is canonical. Root stays root.
+    if s ~= "/" then s = strip_trailing_slash(s) end
+
+    if #compiled.param_names == 0 then
+        if s:match(compiled.lua_pattern) then return {} end
+        return nil
+    end
+    local captures = { s:match(compiled.lua_pattern) }
+    if captures[1] == nil then return nil end
+    local params = {}
+    for i, name in ipairs(compiled.param_names) do
+        params[name] = captures[i]
+    end
+    return params
+end
+
+-- Match `subpath` against each compiled route in order; return the first one
+-- that matches along with its extracted params, or nil.
+local function match_routes(compiled_routes, subpath)
+    for _, compiled in ipairs(compiled_routes) do
+        local params = match_compiled_route(compiled, subpath)
+        if params ~= nil then
+            return compiled, params
+        end
+    end
+    return nil, nil
+end
+
+-- Build a full hub-scoped URL by combining the hub_id, surface's base path,
+-- and a (possibly templated) subpath. `params` supplies values for `:name`
+-- placeholders in the subpath.
+--
+-- Rules:
+--   * `hub_id` must be a non-empty string; assertion otherwise.
+--   * `base_path` must start with "/"; "/" means "the hub root".
+--   * `subpath` may be "", "/", or start with "/". `:name` interpolated from
+--     params; missing params are left as `:name` literals so test output is
+--     easy to spot (and we don't paper over a bug).
+local function build_url(hub_id, base_path, subpath, params)
+    assert(is_nonempty_string(hub_id),
+        "surfaces.path: hub_id is required (pass it explicitly or ensure hub.server_id() is set)")
+    local base = base_path
+    if base == nil or base == "" then base = "/" end
+    base = ensure_leading_slash(base)
+
+    local sub = subpath
+    if sub == nil or sub == "" then sub = "/" end
+    sub = ensure_leading_slash(sub)
+
+    -- Interpolate params into the subpath. Missing params leave the literal
+    -- `:name` token so tests (and plugin authors) can spot the miss.
+    if params and next(params) ~= nil then
+        sub = sub:gsub(":([%w_]+)", function(name)
+            local v = params[name]
+            if v == nil then return ":" .. name end
+            return tostring(v)
+        end)
+    end
+
+    -- Assemble: /hubs/<hub_id> + base + sub. Avoid double slashes.
+    local prefix = "/hubs/" .. hub_id
+    local path
+    if base == "/" then
+        path = prefix
+    else
+        path = prefix .. strip_trailing_slash(base)
+    end
+    if sub == "/" then
+        if base == "/" then
+            -- Root hub page: prefer "/hubs/<id>" (no trailing slash)
+            return path
+        end
+        return path
+    end
+    return path .. sub
+end
+
+-- Construct the `ctx` table threaded to a sub-route's render fn.
+local function build_ctx(hub_id, surface_name, base_path)
+    return {
+        hub_id = hub_id,
+        surface = surface_name,
+        base_path = base_path,
+        path = function(sub, params)
+            return build_url(hub_id, base_path, sub, params)
+        end,
+    }
+end
+
+-- Derive the base path for a surface from its `name` unless `opts.path` is
+-- explicitly set (back-compat escape hatch used by `workspace_panel` to keep
+-- its URL at "/"). Pure plugin-authored surfaces always use the name-derived
+-- default so `surfaces.register("kanban", { routes = {...} })` is enough.
+local function derive_base_path(name, opts)
+    if is_nonempty_string(opts.path) then
+        return ensure_leading_slash(opts.path)
+    end
+    return "/" .. name
+end
+
+-- Build the array of compiled routes from the user's registration, applying
+-- the back-compat wrapper (top-level `render` → `routes = {{"/", render}}`).
+local function compile_routes(name, opts)
+    if opts.routes ~= nil then
+        assert(type(opts.routes) == "table" and #opts.routes > 0,
+            "surfaces.register(" .. name .. "): `routes` must be a non-empty array")
+        assert(opts.render == nil,
+            "surfaces.register(" .. name .. "): pass EITHER `routes` OR a single top-level `render`, not both")
+        local compiled = {}
+        for i, route in ipairs(opts.routes) do
+            assert(type(route) == "table",
+                "surfaces.register(" .. name .. "): routes[" .. i .. "] must be a table")
+            compiled[#compiled + 1] = compile_route(route.path or "/", route.render)
+        end
+        return compiled
+    end
+    assert(type(opts.render) == "function",
+        "surfaces.register(" .. name .. "): must provide `routes` or a top-level `render`")
+    return { compile_route("/", opts.render) }
+end
+
+-- Build the sub-route 404 fallback tree. Called when a surface's subpath
+-- doesn't match any declared route. Uses only v1 primitives so the browser
+-- renders it without Phase-4b client support.
+local function render_sub_404(surface_name, subpath)
+    return {
+        type = "panel",
+        props = { tone = "muted", border = true },
+        children = {
+            {
+                type = "stack",
+                props = { direction = "vertical", gap = "2", padding = "4" },
+                children = {
+                    {
+                        type = "text",
+                        props = {
+                            text = "Sub-route not found",
+                            size = "md",
+                            weight = "semibold",
+                            tone = "danger",
+                        },
+                    },
+                    {
+                        type = "text",
+                        props = {
+                            text = string.format(
+                                "Surface `%s` has no route matching `%s`.",
+                                surface_name, subpath or "/"
+                            ),
+                            size = "sm",
+                            tone = "muted",
+                        },
+                    },
+                },
+            },
+        },
+    }
+end
+
+-- Generate the top-level `entry.render(state)` dispatcher. Always goes through
+-- this even in the single-route back-compat case so `ctx` is available to the
+-- user's render fn uniformly.
+local function make_dispatcher(name, base_path, compiled_routes)
+    return function(render_state)
+        local s = type(render_state) == "table" and render_state or {}
+        local subpath = ensure_leading_slash(s.path or "/")
+        local compiled, params = match_routes(compiled_routes, subpath)
+        local hub_id = s.hub_id
+        local ctx = build_ctx(hub_id, name, base_path)
+        if compiled == nil then
+            log.warn(string.format(
+                "surfaces: no route matches subpath `%s` for surface `%s`",
+                subpath, name))
+            return render_sub_404(name, subpath)
+        end
+        -- Build a shallow-copied sub-state so the dispatcher's writes
+        -- (path/params) don't mutate the caller's state — some callers
+        -- reuse `state` across multiple surface renders.
+        local sub_state = {}
+        for k, v in pairs(s) do sub_state[k] = v end
+        sub_state.path = subpath
+        sub_state.params = params
+        return compiled.render(sub_state, ctx)
+    end
+end
+
 -- -------------------------------------------------------------------------
 -- Public API
 -- -------------------------------------------------------------------------
@@ -67,30 +370,53 @@ end
 function M.register(name, opts)
     assert(is_nonempty_string(name), "surfaces.register: name must be non-empty string")
     assert(type(opts) == "table", "surfaces.register: opts must be a table")
-    assert(type(opts.render) == "function", "surfaces.register: opts.render must be a function")
 
     local existing = registry.by_name[name]
     local seq = existing and existing.seq or (registry.seq + 1)
     if not existing then registry.seq = seq end
 
+    local compiled_routes = compile_routes(name, opts)
+    local base_path = derive_base_path(name, opts)
+    local render = make_dispatcher(name, base_path, compiled_routes)
+
     local entry = {
         name = name,
-        path = is_nonempty_string(opts.path) and opts.path or nil,
+        base_path = base_path,
+        -- `path` is preserved for consumers that still read the top-level
+        -- field (sidebar nav, route registry payload). It equals base_path
+        -- for routable surfaces; `nil` for surfaces that opted out via
+        -- `hide_from_nav` OR passed an empty routes+render pair. Since the
+        -- Phase-4b default always derives a base_path, `path` defaults to
+        -- it — meaning every registered surface is routable unless the
+        -- plugin explicitly sets `path = false` (or similar) to suppress it.
+        path = base_path,
         label = is_nonempty_string(opts.label) and opts.label or name,
         icon = is_nonempty_string(opts.icon) and opts.icon or nil,
-        render = opts.render,
+        render = render,
+        compiled_routes = compiled_routes,
         input_builder = type(opts.input_builder) == "function" and opts.input_builder or nil,
         hide_from_nav = opts.hide_from_nav == true,
         order = type(opts.order) == "number" and opts.order or nil,
         source = is_nonempty_string(opts.source) and opts.source or nil,
         seq = seq,
     }
+    -- A small number of legacy surfaces (workspace_sidebar) register WITHOUT
+    -- wanting to appear as a routable page. They omit both `path` and
+    -- `routes` in the old API; in the new API they still omit `routes` and
+    -- we must keep their `path` nil. Detect the "no-path, no-routes, just a
+    -- render" shape by checking that the caller did not pass `routes` AND
+    -- did not pass `path`: that means they registered for multi-surface
+    -- broadcast only, not for a URL route. In that case, strip `path`.
+    if opts.routes == nil and not is_nonempty_string(opts.path) then
+        entry.path = nil
+        entry.base_path = nil
+    end
     registry.by_name[name] = entry
 
     if log and log.debug then
         log.debug(string.format(
-            "surfaces.register: name=%s path=%s label=%s",
-            name, tostring(entry.path), tostring(entry.label)))
+            "surfaces.register: name=%s base_path=%s label=%s routes=%d",
+            name, tostring(entry.base_path), tostring(entry.label), #compiled_routes))
     end
     notify_changed()
     return entry
@@ -131,11 +457,36 @@ function M.get(name)
     return registry.by_name[name]
 end
 
---- Resolve a surface name to its declared path.
--- @return string path, or nil when the surface is non-routable (no `path`).
-function M.path(name)
+--- Build the canonical URL for a surface's subpath.
+---
+--- Cross-surface link helper. Pulls the hub_id from `hub.server_id()` so the
+--- caller doesn't have to thread it through.
+---
+--- Examples:
+---   surfaces.path("kanban", "/board/:id", { id = 42 })
+---     -> "/hubs/<hub_id>/kanban/board/42"
+---   surfaces.path("kanban")
+---     -> "/hubs/<hub_id>/kanban"
+---
+--- @param name string Registered surface name.
+--- @param subpath string? Subpath within the surface; defaults to "/".
+--- @param params table? `:name` param substitutions.
+--- @return string|nil Full URL, or nil when the surface is unknown or has no base_path.
+function M.path(name, subpath, params)
     local entry = M.get(name)
-    return entry and entry.path or nil
+    if not entry then return nil end
+    if not is_nonempty_string(entry.base_path) then
+        return nil
+    end
+    local hub_id
+    if type(hub) == "table" and type(hub.server_id) == "function" then
+        local ok, id = pcall(hub.server_id)
+        if ok and is_nonempty_string(id) then hub_id = id end
+    end
+    if not is_nonempty_string(hub_id) then
+        return nil
+    end
+    return build_url(hub_id, entry.base_path, subpath or "/", params)
 end
 
 --- Return a deterministic array view of the registry.
@@ -155,6 +506,7 @@ function M.list()
         out[#out + 1] = {
             name = name,
             path = entry.path,
+            base_path = entry.base_path,
             label = entry.label,
             icon = entry.icon,
             hide_from_nav = entry.hide_from_nav,
@@ -179,18 +531,33 @@ end
 -- routable page. `hide_from_nav` is passed through so the sidebar renderer
 -- can filter at display time; we still ship it in the registry because
 -- React Router needs to know about hidden paths in order to route to them.
+--
+-- Phase 4b: each registry entry also carries `routes` (the declared
+-- sub-patterns) so the browser can optionally pattern-match before firing
+-- its first subpath action. The hub remains the authority — mismatches
+-- fall through to the hub's auto-dispatcher 404 — but exposing the list
+-- lets the browser render an offline-friendly loading state.
 -- @param hub_id string|nil
 -- @return table
 function M.build_route_registry_payload(hub_id)
     local routes = {}
-    for _, entry in ipairs(M.list()) do
-        if entry.path then
+    for _, summary in ipairs(M.list()) do
+        if summary.path then
+            local entry = registry.by_name[summary.name]
+            local sub_patterns = {}
+            if entry and entry.compiled_routes then
+                for _, compiled in ipairs(entry.compiled_routes) do
+                    sub_patterns[#sub_patterns + 1] = { path = compiled.pattern }
+                end
+            end
             routes[#routes + 1] = {
-                path = entry.path,
-                surface = entry.name,
-                label = entry.label,
-                icon = entry.icon,
-                hide_from_nav = entry.hide_from_nav or nil,
+                path = summary.path,
+                base_path = summary.base_path,
+                surface = summary.name,
+                label = summary.label,
+                icon = summary.icon,
+                hide_from_nav = summary.hide_from_nav or nil,
+                routes = sub_patterns,
             }
         end
     end
@@ -239,6 +606,12 @@ function M._reset_for_tests()
     for k in pairs(registry.by_name) do registry.by_name[k] = nil end
     registry.seq = 0
 end
+
+-- Test-only export: expose internal helpers for unit-level coverage without
+-- requiring the full layout broadcast wire-up.
+M._build_url = build_url
+M._compile_route = compile_route
+M._match_routes = match_routes
 
 -- Hot-reload lifecycle
 function M._before_reload()

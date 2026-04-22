@@ -307,6 +307,7 @@ function defaultLoadingFallback() {
 export default function UiTree({
   hubId,
   targetSurface,
+  subpath = '/',
   capabilities,
   initialTree = null,
   loadingFallback = defaultLoadingFallback,
@@ -357,6 +358,25 @@ export default function UiTree({
     setTransport(null)
   }
 
+  // Phase 4b: subpath OR targetSurface changes within a mount must reset
+  // the tree. The hub renders a different tree for each subpath within a
+  // surface AND for each surface entirely; keeping the stale tree visible
+  // while the new one arrives would flash the wrong content for one
+  // frame. Pair this with the subpath filter in the frame subscriber
+  // below (accept only frames whose subpath matches the current prop) so
+  // we're guaranteed the next render is for the new subpath, not a
+  // late-arriving frame from the old.
+  const lastSurfaceRef = useRef(targetSurface)
+  const lastSubpathRef = useRef(subpath)
+  if (
+    lastSurfaceRef.current !== targetSurface ||
+    lastSubpathRef.current !== subpath
+  ) {
+    lastSurfaceRef.current = targetSurface
+    lastSubpathRef.current = subpath
+    setTree(null)
+  }
+
   // Acquire the hub transport (HubTransport) for send + message subscription.
   // hub-bridge.connect() resolves asynchronously, so we poll briefly until
   // getHub(hubId) returns a session. Bounded to MAX_POLL_MS so a hub that
@@ -395,15 +415,89 @@ export default function UiTree({
   }, [hubId])
 
   // Subscribe to ui_layout_tree_v1 frames matching this target_surface.
+  //
+  // Phase 4b: also filter on `subpath`. The hub echoes back the subpath it
+  // routed for, so a frame produced from the OLD subpath (still en route
+  // when the URL changed) is discarded. A frame without a subpath field
+  // (older hub) falls through the filter so back-compat still works.
   useEffect(() => {
     if (!transport || !targetSurface) return undefined
     const handler = (message) => {
       if (!message || message.type !== 'ui_layout_tree_v1') return
       if (message.target_surface !== targetSurface) return
+      if (
+        typeof message.subpath === 'string' &&
+        message.subpath !== subpath
+      ) {
+        return
+      }
       setTree(message.tree ?? null)
     }
     return transport.on('message', handler)
-  }, [transport, targetSurface])
+  }, [transport, targetSurface, subpath])
+
+  // Phase 4b: whenever the (target_surface, subpath) pair changes, tell
+  // the hub so it can re-render for this client. The initial subpath for
+  // the surface the user LANDED on is already primed via the subscribe
+  // envelope (`channelParams().surface_subpaths` in `hub_connection.js`);
+  // that primed surface+subpath is skipped so we don't double-send on
+  // cold load.
+  //
+  // All other cases fire:
+  //   * Cross-surface navigation on the SAME transport (hub has never
+  //     heard about the new surface's subpath — the envelope only primed
+  //     the one surface the user cold-loaded into).
+  //   * Intra-surface navigation (subpath changes within the current
+  //     targetSurface).
+  //   * Hub switch: the new transport is brand-new, so re-prime from
+  //     whatever surface the user is currently viewing.
+  //
+  // Tracking: per-transport map of `surface -> last-sent subpath`. A
+  // brand-new transport installs a single entry reflecting the currently
+  // rendered surface (that's what the subscribe envelope primed) and
+  // suppresses the send. Every other transition updates the map and
+  // sends.
+  const subpathSyncRef = useRef({ transport: null, sentBySurface: null })
+  useEffect(() => {
+    if (!transport || !targetSurface) return undefined
+    const sync = subpathSyncRef.current
+    const normalisedSubpath =
+      typeof subpath === 'string' && subpath !== '' ? subpath : '/'
+
+    const isColdTransport = sync.transport !== transport
+    if (isColdTransport) {
+      // Brand-new subscription — the subscribe envelope already primed
+      // the hub for THIS (surface, subpath). Seed the sent-cache so
+      // future renders compare against it.
+      subpathSyncRef.current = {
+        transport,
+        sentBySurface: new Map([[targetSurface, normalisedSubpath]]),
+      }
+      return undefined
+    }
+
+    // Same transport — did we already tell the hub about this
+    // (surface, subpath)? If not, send.
+    const lastSent = sync.sentBySurface.get(targetSurface)
+    if (lastSent === normalisedSubpath) return undefined
+    sync.sentBySurface.set(targetSurface, normalisedSubpath)
+
+    // Best-effort — a failed send is harmless; the hub's default is "/"
+    // and the next user action will re-fire. No await; fire-and-forget
+    // keeps the render path fast.
+    try {
+      void transport.send('ui_action_v1', {
+        target_surface: targetSurface,
+        envelope: {
+          id: 'botster.surface.subpath',
+          payload: { target_surface: targetSurface, subpath: normalisedSubpath },
+        },
+      })
+    } catch (err) {
+      console.warn('[UiTree] failed to send surface.subpath', err)
+    }
+    return undefined
+  }, [transport, targetSurface, subpath])
 
   // -------- Interceptor registry --------
   const interceptorsRef = useRef(new Map())
