@@ -88,8 +88,9 @@ class SpaTest < ApplicationSystemTestCase
 
   test "selecting spawn target enables agent and accessory buttons" do
     sign_in_and_connect
+    wait_for_surface_ready("workspace_panel")
 
-    all("button", text: "New session", wait: 10).last.click
+    all("button", text: "New session").last.click
 
     # Wait for spawn targets
     select_el = find("[data-testid='spawn-target-select']", wait: 10)
@@ -101,8 +102,8 @@ class SpaTest < ApplicationSystemTestCase
     }, "Expected a spawn target option"
 
     # Buttons should be disabled before selection
-    assert_selector "[data-testid='choose-agent'][disabled]", wait: 5
-    assert_selector "[data-testid='choose-accessory'][disabled]", wait: 5
+    assert_selector "[data-testid='choose-agent'][disabled]"
+    assert_selector "[data-testid='choose-accessory'][disabled]"
 
     # Select the spawn target
     select_el.select(option_text)
@@ -262,6 +263,9 @@ class SpaTest < ApplicationSystemTestCase
 
     visit "/hubs/#{@hub.id}"
     assert_webrtc_connected
+
+    # Causal gate — see SystemReadinessHelpers.
+    wait_for_hub_ready
   end
 
   def assert_webrtc_connected(wait: 30)
