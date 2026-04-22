@@ -437,56 +437,38 @@ export default function UiTree({
   }, [transport, targetSurface, subpath])
 
   // Phase 4b: whenever the (target_surface, subpath) pair changes, tell
-  // the hub so it can re-render for this client. The initial subpath for
-  // the surface the user LANDED on is already primed via the subscribe
-  // envelope (`channelParams().surface_subpaths` in `hub_connection.js`);
-  // that primed surface+subpath is skipped so we don't double-send on
-  // cold load.
+  // the hub so it can re-render for this client.
   //
-  // All other cases fire:
-  //   * Cross-surface navigation on the SAME transport (hub has never
-  //     heard about the new surface's subpath — the envelope only primed
-  //     the one surface the user cold-loaded into).
-  //   * Intra-surface navigation (subpath changes within the current
-  //     targetSurface).
-  //   * Hub switch: the new transport is brand-new, so re-prime from
-  //     whatever surface the user is currently viewing.
+  // We send unconditionally on every mount / change. Idempotency lives on
+  // the hub: `Client:set_surface_subpath` early-returns when the incoming
+  // subpath equals the previously-stored value, so repeating what the
+  // subscribe envelope already primed is a cheap no-op.
   //
-  // Tracking: per-transport map of `surface -> last-sent subpath`. A
-  // brand-new transport installs a single entry reflecting the currently
-  // rendered surface (that's what the subscribe envelope primed) and
-  // suppresses the send. Every other transition updates the map and
-  // sends.
-  const subpathSyncRef = useRef({ transport: null, sentBySurface: null })
+  // An earlier revision tried to skip the first send on a "cold transport"
+  // under the assumption that a single UiTree instance would persist
+  // across surface transitions. In practice UiTree is mounted by
+  // different parent routes (HubShow for workspace_panel, DynamicSurface
+  // for plugin surfaces), so crossing a Route boundary mounts a FRESH
+  // UiTree instance whose per-instance skip-cache looks "cold" even
+  // though the transport has been open for a while. That left the hub
+  // without the new surface's subpath and the UiTree stuck on loading.
+  // The always-send path above sidesteps the remount-vs-rerender
+  // distinction entirely.
   useEffect(() => {
     if (!transport || !targetSurface) return undefined
-    const sync = subpathSyncRef.current
     const normalisedSubpath =
       typeof subpath === 'string' && subpath !== '' ? subpath : '/'
 
-    const isColdTransport = sync.transport !== transport
-    if (isColdTransport) {
-      // Brand-new subscription — the subscribe envelope already primed
-      // the hub for THIS (surface, subpath). Seed the sent-cache so
-      // future renders compare against it.
-      subpathSyncRef.current = {
-        transport,
-        sentBySurface: new Map([[targetSurface, normalisedSubpath]]),
-      }
-      return undefined
-    }
-
-    // Same transport — did we already tell the hub about this
-    // (surface, subpath)? If not, send.
-    const lastSent = sync.sentBySurface.get(targetSurface)
-    if (lastSent === normalisedSubpath) return undefined
-    sync.sentBySurface.set(targetSurface, normalisedSubpath)
-
-    // Best-effort — a failed send is harmless; the hub's default is "/"
-    // and the next user action will re-fire. No await; fire-and-forget
-    // keeps the render path fast.
+    // transport.send returns a Promise that REJECTS when the DataChannel
+    // isn't open yet (e.g. cold mount during WebRTC handshake). If we
+    // don't attach a .catch handler, the rejection surfaces as an
+    // "Uncaught Error: DataChannel closed" in the browser console —
+    // harmless for the user (the subscribe envelope already primed the
+    // hub and the hub will dedup if we resend later) but the system
+    // tests assert on an empty console.
+    let sendPromise
     try {
-      void transport.send('ui_action_v1', {
+      sendPromise = transport.send('ui_action_v1', {
         target_surface: targetSurface,
         envelope: {
           id: 'botster.surface.subpath',
@@ -495,6 +477,12 @@ export default function UiTree({
       })
     } catch (err) {
       console.warn('[UiTree] failed to send surface.subpath', err)
+      return undefined
+    }
+    if (sendPromise && typeof sendPromise.catch === 'function') {
+      sendPromise.catch((err) => {
+        console.warn('[UiTree] surface.subpath send rejected', err)
+      })
     }
     return undefined
   }, [transport, targetSurface, subpath])

@@ -1271,3 +1271,152 @@ fn demo_hello_plugin_registers_with_two_routes() {
         assert_eq!(route_count, 2);
     });
 }
+
+// -------------------------------------------------------------------------
+// End-to-end: web_layout.render → registry fallback → plugin render
+// -------------------------------------------------------------------------
+//
+// These tests exercise the exact path the hub takes when the browser sends
+// `botster.surface.subpath` for a plugin-registered surface: the Rust
+// `web_layout.render(surface, state)` consults the override layout table
+// (nothing for plugin names), falls through to `_G.surfaces.render_node`,
+// the dispatcher matches the subpath against declared routes, and the
+// plugin's sub-route render fn returns a tree.
+//
+// Regression bar: a user clicking the Hello sidebar entry must receive a
+// real Hello home tree, NOT the error-fallback panel (`Layout error:
+// hello` / "The hub layout failed to render. Showing fallback.").
+
+fn assert_not_error_fallback(json: &serde_json::Value, surface_name: &str) {
+    let title = json
+        .pointer("/props/title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        !title.starts_with("Layout error"),
+        "web_layout.render returned the error fallback for `{surface_name}` \
+         (title={title:?}); the registry fallback did not resolve the \
+         plugin-registered surface. Full tree: {json}"
+    );
+}
+
+#[test]
+fn hello_plugin_home_renders_through_web_layout() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    with_demo_env(None, Some("test"), || {
+        let json: String = lua
+            .load(
+                r#"
+                require("plugins.hello_surface.plugin")
+                return web_layout.render("hello", { hub_id = "hub-test", path = "/" })
+                "#,
+            )
+            .eval()
+            .expect("render hello home");
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_not_error_fallback(&parsed, "hello");
+
+        let text_blob = parsed.to_string();
+        assert!(
+            text_blob.contains("Phase 4b sub-routes demo"),
+            "hello home tree must contain the home_page text, got: {text_blob}"
+        );
+    });
+}
+
+#[test]
+fn hello_plugin_details_renders_with_param_through_web_layout() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    with_demo_env(None, Some("test"), || {
+        let json: String = lua
+            .load(
+                r#"
+                require("plugins.hello_surface.plugin")
+                return web_layout.render("hello", {
+                    hub_id = "hub-test",
+                    path = "/details/7",
+                })
+                "#,
+            )
+            .eval()
+            .expect("render hello details");
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_not_error_fallback(&parsed, "hello");
+
+        let text_blob = parsed.to_string();
+        assert!(
+            text_blob.contains("Details for id=7"),
+            "details render must interpolate :id=7 into state.params, got: {text_blob}"
+        );
+    });
+}
+
+#[test]
+fn hello_plugin_default_path_falls_through_to_home() {
+    // When the browser hasn't yet announced its subpath, the hub renders
+    // with an unset state.path; the dispatcher normalises to "/" which
+    // must match the home route.
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    with_demo_env(None, Some("test"), || {
+        let json: String = lua
+            .load(
+                r#"
+                require("plugins.hello_surface.plugin")
+                return web_layout.render("hello", { hub_id = "hub-test" })
+                "#,
+            )
+            .eval()
+            .expect("render hello with no path");
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_not_error_fallback(&parsed, "hello");
+
+        let text_blob = parsed.to_string();
+        assert!(
+            text_blob.contains("Phase 4b sub-routes demo"),
+            "nil/unset state.path must route to the home sub-page, got: {text_blob}"
+        );
+    });
+}
+
+#[test]
+fn hello_plugin_unknown_subpath_renders_sub_404_not_error_fallback() {
+    // A known surface with an unknown subpath is NOT the same as an unknown
+    // surface: the dispatcher returns the sub-route 404 tree, which is
+    // still a valid UiNodeV1 and must NOT be confused with the
+    // Rust-level "Layout error:" fallback.
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    with_demo_env(None, Some("test"), || {
+        let json: String = lua
+            .load(
+                r#"
+                require("plugins.hello_surface.plugin")
+                return web_layout.render("hello", {
+                    hub_id = "hub-test",
+                    path = "/does-not-exist",
+                })
+                "#,
+            )
+            .eval()
+            .expect("render hello unknown sub");
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_not_error_fallback(&parsed, "hello");
+
+        let text_blob = parsed.to_string();
+        assert!(
+            text_blob.contains("Sub-route not found"),
+            "unknown subpath must render the dispatcher 404 tree, got: {text_blob}"
+        );
+    });
+}

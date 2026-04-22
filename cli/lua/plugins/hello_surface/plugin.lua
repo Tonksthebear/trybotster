@@ -38,7 +38,6 @@ local function home_page(_state, ctx)
     return ui.stack{
         direction = "vertical",
         gap = "3",
-        padding = "4",
         children = {
             ui.panel{
                 tone = "default",
@@ -88,7 +87,6 @@ local function details_page(state, ctx)
     return ui.stack{
         direction = "vertical",
         gap = "3",
-        padding = "4",
         children = {
             ui.panel{
                 tone = "default",
