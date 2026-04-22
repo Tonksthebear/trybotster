@@ -142,6 +142,11 @@ describe('<UiTree>', () => {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 150))
     })
+    // Clear pre-switch sends (transportA got its initial surface.subpath
+    // send on mount; that is expected and unrelated to the cross-transport
+    // routing we are asserting).
+    transportA.send.mockClear()
+    transportB.send.mockClear()
     captured?.({
       id: 'botster.session.select',
       payload: { sessionId: 's-x' },
@@ -243,7 +248,6 @@ describe('<UiTree>', () => {
   })
 
   it('falls back to legacy dispatch when transport.send returns false', async () => {
-    fakeTransport.send.mockResolvedValueOnce(false)
     render(<UiTree hubId="hub-1" targetSurface="workspace_panel" />)
 
     await act(async () => {
@@ -253,6 +257,13 @@ describe('<UiTree>', () => {
         tree: SELECT_BUTTON_TREE,
       })
     })
+
+    // Let the initial surface.subpath send settle before arming the
+    // next-send-fails behaviour we're actually testing here.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0))
+    })
+    fakeTransport.send.mockResolvedValueOnce(false)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Select' }))
     await Promise.resolve()
@@ -388,6 +399,10 @@ describe('<UiTree> interceptor context', () => {
         tree: SELECT_BUTTON_TREE,
       })
     })
+    // Clear the initial surface.subpath send (unrelated to this test's
+    // intercept semantics — we only care that the clicked action is
+    // consumed, not forwarded).
+    fakeTransport.send.mockClear()
     fireEvent.click(await screen.findByRole('button', { name: 'Select' }))
     await Promise.resolve()
     expect(intercept).toHaveBeenCalledOnce()
@@ -442,10 +457,14 @@ describe('<UiTree> interceptor context', () => {
 })
 
 describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
-  it('does NOT send a surface.subpath action on first mount (subscribe envelope primes)', async () => {
-    // The subscribe channelParams already include `surface_subpaths`, so
-    // the hub is primed BEFORE the UiTree mounts. Sending another action
-    // on first mount would double-send for every cold load.
+  it('sends surface.subpath on first mount', async () => {
+    // UiTree always announces its current (surface, subpath) to the hub on
+    // mount. The subscribe envelope also primes `surface_subpaths` server-
+    // side, so repeating the value is a no-op on the hub
+    // (`set_surface_subpath` early-returns on identical subpath). The fresh
+    // mount send is what keeps cross-Route boundary navigation correct —
+    // HubShow → DynamicSurface mounts a NEW UiTree instance for a new
+    // surface, and the hub must hear about it.
     render(
       <UiTree hubId="hub-1" targetSurface="kanban" subpath="/board/42" />,
     )
@@ -455,23 +474,27 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     const subpathCalls = fakeTransport.send.mock.calls.filter(
       ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
     )
-    expect(subpathCalls).toHaveLength(0)
+    expect(subpathCalls).toHaveLength(1)
+    expect(subpathCalls[0][1]).toEqual({
+      target_surface: 'kanban',
+      envelope: {
+        id: 'botster.surface.subpath',
+        payload: { target_surface: 'kanban', subpath: '/board/42' },
+      },
+    })
   })
 
   it('sends surface.subpath on subpath prop change and clears the tree', async () => {
     const { rerender } = render(
       <UiTree hubId="hub-1" targetSurface="kanban" subpath="/" />,
     )
-    // Wait for transport attach.
+    // Wait for transport attach + initial mount send.
     await act(async () => {
       await new Promise((r) => setTimeout(r, 120))
     })
-    // Initial render has no tree yet, but the first subpath must not fire.
-    expect(
-      fakeTransport.send.mock.calls.filter(
-        ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
-      ),
-    ).toHaveLength(0)
+    // Clear the initial mount send so the assertion below only counts the
+    // subpath-change send we're testing.
+    fakeTransport.send.mockClear()
 
     // Push a home-render tree so the panel is visible.
     await act(async () => {
@@ -496,7 +519,7 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     // sub-page for a tick).
     expect(screen.queryByText('home')).toBeNull()
 
-    // Exactly one surface.subpath action fired.
+    // Exactly one surface.subpath action fired for the new subpath.
     const calls = fakeTransport.send.mock.calls.filter(
       ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
     )
@@ -553,28 +576,16 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
 
   // Regression: codex-found blocker (2026-04-21). Cross-surface navigation
   // on the SAME transport must fire `botster.surface.subpath` for the new
-  // (surface, subpath) pair. Previously the first-mount-skip was keyed on
-  // `(transport, targetSurface)`, which incorrectly treated every surface
-  // change as "cold mount" and suppressed the send. That left the hub's
-  // `client.surface_subpaths` empty for the new surface, so the dispatcher
-  // routed to the surface's default "/" render — the user sees the wrong
-  // sub-page (or loading) indefinitely.
+  // (surface, subpath) pair so the hub's dispatcher routes to the right
+  // sub-route instead of leaving the UiTree stuck on loading.
   it('fires surface.subpath when targetSurface changes on an existing transport', async () => {
     const { rerender } = render(
       <UiTree hubId="hub-1" targetSurface="hello" subpath="/details/1" />,
     )
-    // Let the transport attach (cold mount — suppressed, correctly).
     await act(async () => {
       await new Promise((r) => setTimeout(r, 120))
     })
-    expect(
-      fakeTransport.send.mock.calls.filter(
-        ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
-      ),
-    ).toHaveLength(0)
 
-    // Navigate to a different surface with a non-root subpath. Same
-    // transport, same hubId — just a surface switch.
     rerender(
       <UiTree hubId="hub-1" targetSurface="kanban" subpath="/board/42" />,
     )
@@ -586,8 +597,14 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     const calls = fakeTransport.send.mock.calls.filter(
       ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
     )
-    expect(calls).toHaveLength(1)
-    expect(calls[0][1]).toEqual({
+    // Expect sends for BOTH the initial mount and the kanban transition.
+    // The hub-side `set_surface_subpath` early-returns on equal subpath so
+    // the extra initial send is harmless; we drop the per-instance cache.
+    const kanbanSends = calls.filter(
+      ([, body]) => body.envelope.payload.target_surface === 'kanban',
+    )
+    expect(kanbanSends).toHaveLength(1)
+    expect(kanbanSends[0][1]).toEqual({
       target_surface: 'kanban',
       envelope: {
         id: 'botster.surface.subpath',
@@ -596,47 +613,43 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     })
   })
 
-  it('does not refire when the user navigates back to a surface at a subpath already sent', async () => {
-    // Hello → Kanban(/board/42) → Hello → Kanban(/board/42). The first
-    // Kanban visit sends; the second should NOT (last-sent cache hit).
-    const { rerender } = render(
-      <UiTree hubId="hub-1" targetSurface="hello" subpath="/" />,
+  // Regression (2026-04-22): UiTree must send `botster.surface.subpath` on
+  // FRESH MOUNT, not just on prop rerender. Real-world navigation crosses
+  // Route boundaries (HubShow for workspace_panel → DynamicSurface for
+  // plugin surfaces) and each boundary mounts a NEW UiTree instance.
+  // An earlier revision kept a per-instance skip-cache that treated every
+  // new instance as "cold transport" and silently suppressed the send,
+  // leaving the hub without the new surface's subpath and the user stuck
+  // on loading.
+  it('fires surface.subpath on a fresh mount for a non-cold transport', async () => {
+    // Simulate a stable transport by mounting UiTree once first (its own
+    // initial send won't be suppressed), then UNMOUNT and mount a fresh
+    // instance for a different surface — this is the HubShow→DynamicSurface
+    // transition in the real app.
+    const first = render(
+      <UiTree hubId="hub-1" targetSurface="workspace_panel" subpath="/" />,
     )
     await act(async () => {
       await new Promise((r) => setTimeout(r, 120))
     })
+    first.unmount()
+    fakeTransport.send.mockClear()
 
-    rerender(<UiTree hubId="hub-1" targetSurface="kanban" subpath="/board/42" />)
+    render(<UiTree hubId="hub-1" targetSurface="hello" subpath="/" />)
     await act(async () => {
-      await Promise.resolve()
-      await Promise.resolve()
+      await new Promise((r) => setTimeout(r, 120))
     })
 
-    rerender(<UiTree hubId="hub-1" targetSurface="hello" subpath="/" />)
-    await act(async () => {
-      await Promise.resolve()
-      await Promise.resolve()
-    })
-
-    rerender(<UiTree hubId="hub-1" targetSurface="kanban" subpath="/board/42" />)
-    await act(async () => {
-      await Promise.resolve()
-      await Promise.resolve()
-    })
-
-    const subpathCalls = fakeTransport.send.mock.calls.filter(
+    const calls = fakeTransport.send.mock.calls.filter(
       ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
     )
-    // Expected sends:
-    //   1. hello(cold): skipped
-    //   2. kanban(new): send kanban /board/42
-    //   3. hello(new for this sync map after hello cold-skip): send hello "/"
-    //   4. kanban(cached same): skipped
-    // => 2 sends total. The important invariant (regression guard) is
-    //    that the kanban re-visit at step 4 does NOT refire.
-    const kanbanSends = subpathCalls.filter(
-      ([, body]) => body.envelope.payload.target_surface === 'kanban',
-    )
-    expect(kanbanSends).toHaveLength(1)
+    expect(calls).toHaveLength(1)
+    expect(calls[0][1]).toEqual({
+      target_surface: 'hello',
+      envelope: {
+        id: 'botster.surface.subpath',
+        payload: { target_surface: 'hello', subpath: '/' },
+      },
+    })
   })
 })

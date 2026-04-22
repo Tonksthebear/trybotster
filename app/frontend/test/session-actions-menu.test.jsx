@@ -109,6 +109,10 @@ describe('<SessionActionsMenu> interceptor', () => {
     const trigger = await screen.findByRole('button', {
       name: 'Session actions',
     })
+    // Drop the initial surface.subpath send — this test only cares that
+    // the clicked menu-open action is CONSUMED by the interceptor and
+    // never forwarded to transport.
+    fakeTransport.send.mockClear()
     fireEvent.click(trigger)
     await Promise.resolve()
     await Promise.resolve()
