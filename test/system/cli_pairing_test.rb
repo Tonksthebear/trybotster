@@ -166,10 +166,6 @@ class CliPairingTest < ApplicationSystemTestCase
 
   private
 
-  def sign_in_as(user)
-    visit "/test/sessions/new?user_id=#{user.id}"
-  end
-
   # Decode Base32 (RFC 4648) to byte array, matching the browser's base32Decode.
   def base32_decode(input)
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"

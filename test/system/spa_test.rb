@@ -21,7 +21,6 @@ class SpaTest < ApplicationSystemTestCase
   # --- Pairing + Connection ---
 
   test "full pairing flow: visit connection URL, pair, verify connected" do
-    prime_server!
     @cli = start_cli(@hub)
 
     url = @cli.connection_url
@@ -42,6 +41,7 @@ class SpaTest < ApplicationSystemTestCase
   end
 
   test "hub page shows connected status after pairing" do
+    @cli = start_cli(@hub)
     sign_in_and_connect
 
     # Connection status should show direct or relay (not connecting)
@@ -51,6 +51,7 @@ class SpaTest < ApplicationSystemTestCase
   # --- Hub page ---
 
   test "hub page renders sidebar with workspace list" do
+    @cli = start_cli(@hub)
     sign_in_and_connect
 
     # Sidebar shows Workspaces heading
@@ -61,6 +62,7 @@ class SpaTest < ApplicationSystemTestCase
   end
 
   test "hub page renders hub information card" do
+    @cli = start_cli(@hub)
     sign_in_and_connect
 
     assert_text "HUB INFORMATION", wait: 10
@@ -71,9 +73,11 @@ class SpaTest < ApplicationSystemTestCase
   # --- Session creation flow ---
 
   test "new session chooser opens and loads spawn targets" do
+    @cli = start_cli(@hub)
     sign_in_and_connect
+    wait_for_surface_ready("workspace_panel")
 
-    all("button", text: "New session", wait: 10).last.click
+    all("button", text: "New session").last.click
 
     # Chooser dialog opens
     assert_text "New Session", wait: 10
@@ -87,6 +91,7 @@ class SpaTest < ApplicationSystemTestCase
   end
 
   test "selecting spawn target enables agent and accessory buttons" do
+    @cli = start_cli(@hub)
     sign_in_and_connect
     wait_for_surface_ready("workspace_panel")
 
@@ -116,10 +121,12 @@ class SpaTest < ApplicationSystemTestCase
   # --- Session spawning ---
 
   test "full agent creation flow: chooser -> agent form -> submit without JS errors" do
+    @cli = start_cli(@hub)
     sign_in_and_connect
+    wait_for_surface_ready("workspace_panel")
 
     # Open new session chooser
-    all("button", text: "New session", wait: 10).last.click
+    all("button", text: "New session").last.click
 
     # Select spawn target
     select_el = find("[data-testid='spawn-target-select']", wait: 10)
@@ -155,10 +162,12 @@ class SpaTest < ApplicationSystemTestCase
   end
 
   test "full accessory creation flow: chooser -> accessory form -> submit without JS errors" do
+    @cli = start_cli(@hub)
     sign_in_and_connect
+    wait_for_surface_ready("workspace_panel")
 
     # Open new session chooser
-    all("button", text: "New session", wait: 10).last.click
+    all("button", text: "New session").last.click
 
     # Select spawn target
     select_el = find("[data-testid='spawn-target-select']", wait: 10)
@@ -195,6 +204,7 @@ class SpaTest < ApplicationSystemTestCase
   # --- Navigation ---
 
   test "sidebar navigation to settings and back preserves connection" do
+    @cli = start_cli(@hub)
     sign_in_and_connect
 
     # Click Hub Settings in sidebar
@@ -211,6 +221,7 @@ class SpaTest < ApplicationSystemTestCase
   end
 
   test "sidebar navigation is SPA — no full page reload" do
+    @cli = start_cli(@hub)
     sign_in_and_connect
 
     # Set a JS marker on the window — survives SPA navigation, dies on full reload
@@ -231,6 +242,7 @@ class SpaTest < ApplicationSystemTestCase
   # --- No JS errors ---
 
   test "no severe JS console errors on hub page" do
+    @cli = start_cli(@hub)
     sign_in_and_connect
 
     errors = relevant_browser_errors
@@ -238,35 +250,6 @@ class SpaTest < ApplicationSystemTestCase
   end
 
   private
-
-  def sign_in_as(user)
-    visit "/test/sessions/new?user_id=#{user.id}"
-  end
-
-  def prime_server!
-    sign_in_as(@user)
-  end
-
-  def sign_in_and_connect
-    prime_server!
-    @cli = start_cli(@hub)
-
-    url = @cli.connection_url
-    assert url.present?, "CLI should produce a connection URL"
-
-    sign_in_as(@user)
-    visit url
-
-    assert_selector "[data-testid='pairing-ready']", wait: 15
-    click_button "Complete Pairing"
-    assert_selector "[data-testid='pairing-success']", wait: 15
-
-    visit "/hubs/#{@hub.id}"
-    assert_webrtc_connected
-
-    # Causal gate — see SystemReadinessHelpers.
-    wait_for_hub_ready
-  end
 
   def assert_webrtc_connected(wait: 30)
     # Connection status shows Direct or Relay (text rendered by ConnectionStatus component)

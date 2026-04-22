@@ -241,10 +241,6 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
 
   private
 
-  def sign_in_as(user)
-    visit "/test/sessions/new?user_id=#{user.id}"
-  end
-
   # Visit connection URL, complete the pairing confirmation, and land on the hub page.
   def pair_browser_with_cli(cli)
     url = cli.connection_url
@@ -278,17 +274,6 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
   # confirmation button, then redirects to the hub after session creation.
   def complete_pairing(pairing_url = current_url)
     complete_pairing_for(@hub, pairing_url:)
-  end
-
-  def revisit_pairing_url_if_needed(url)
-    return unless page.has_button?("Start pairing", wait: 2) ||
-      page.has_selector?(
-        "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='pairing_needed']",
-        wait: 2
-      )
-
-    visit url
-    complete_pairing(url)
   end
 
   # Assert WebRTC data channel is connected (direct P2P or TURN relay).
