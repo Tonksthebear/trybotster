@@ -32,6 +32,42 @@
 
 import { HubRoute } from "connections/hub_route";
 
+/**
+ * Extract a `{ [surfaceName]: subpath }` prime map from the current
+ * browser URL. Called at subscribe time so the hub can apply the map
+ * before its initial force-broadcast.
+ *
+ * The browser does not know the surface registry yet (the registry
+ * broadcast comes back AFTER subscribe), so we guess: the first URL
+ * segment after `/hubs/<hubId>/` is the surface name; everything after
+ * is the subpath. A guessed-wrong segment is benign — the hub stores the
+ * entry under a name no surface matches, and nothing reads it.
+ *
+ * Returns `{}` when:
+ *   * `window` is unavailable (SSR / test harness)
+ *   * The current URL doesn't match `/hubs/<hubId>[/...]`
+ *   * The URL is exactly `/hubs/<hubId>` or `/hubs/<hubId>/` (no subpath)
+ */
+function computeInitialSurfaceSubpaths(hubId) {
+  if (!hubId || typeof window === "undefined" || !window.location) {
+    return {};
+  }
+  const pathname = window.location.pathname || "";
+  const prefix = `/hubs/${hubId}`;
+  if (!pathname.startsWith(prefix)) return {};
+  const tail = pathname.slice(prefix.length);
+  if (tail === "" || tail === "/") return {};
+  const match = tail.match(/^\/([^/]+)(\/.*)?$/);
+  if (!match) return {};
+  const firstSegment = match[1];
+  const rest = match[2] || "/";
+  // Skip built-in sibling routes that aren't registered surfaces. These
+  // have dedicated React components and never flow through DynamicSurface.
+  const RESERVED = new Set(["sessions", "settings", "pairing"]);
+  if (RESERVED.has(firstSegment)) return {};
+  return { [firstSegment]: rest };
+}
+
 export class HubTransport extends HubRoute {
   constructor(key, options, manager) {
     super(key, options, manager);
@@ -83,6 +119,15 @@ export class HubTransport extends HubRoute {
     return {
       hub_id: this.getHubId(),
       browser_identity: this.browserIdentity,
+      // Phase 4b: prime per-surface subpaths from the current URL so the
+      // initial `ui_layout_tree_v1` broadcast lands on the right sub-page.
+      // Without this, cold-loading a deep link (e.g.
+      // `/hubs/:id/kanban/board/42`) would flash the default "/" render
+      // of the kanban surface before the browser's follow-up
+      // `botster.surface.subpath` action landed. The hub applies these to
+      // `client.surface_subpaths` BEFORE the force-broadcast primes
+      // frames. See handle_subscribe in `cli/lua/lib/client.lua`.
+      surface_subpaths: computeInitialSurfaceSubpaths(this.getHubId()),
     };
   }
 

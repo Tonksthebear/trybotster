@@ -6,12 +6,13 @@ import { useRouteRegistryStore } from '../store/route-registry-store'
 
 // UiTree is the hub-subscribing mount. For this unit test we don't want to
 // exercise real subscription / transport code — we just want to assert that
-// DynamicSurfaceRoute passes the right `targetSurface` through.
+// DynamicSurfaceRoute passes the right `targetSurface` and `subpath` through.
 vi.mock('../components/UiTree', () => ({
-  default: ({ hubId, targetSurface, children }) => (
+  default: ({ hubId, targetSurface, subpath, children }) => (
     <div data-testid="ui-tree">
       <span>{`hubId=${hubId}`}</span>
       <span>{`targetSurface=${targetSurface}`}</span>
+      <span>{`subpath=${subpath ?? '/'}`}</span>
       {children}
     </div>
   ),
@@ -154,5 +155,77 @@ describe('DynamicSurfaceRoute', () => {
 
     expect(screen.getByText(/Not found/i)).toBeInTheDocument()
     expect(screen.queryByText(/Loading/i)).toBeNull()
+  })
+
+  // Phase 4b: prefix-match by base_path, extract subpath from the URL.
+  it('matches by base_path prefix and passes the subpath to UiTree', () => {
+    useRouteRegistryStore.getState().setRoutes('h1', [
+      {
+        path: '/kanban',
+        base_path: '/kanban',
+        surface: 'kanban',
+        label: 'Kanban',
+        routes: [{ path: '/' }, { path: '/board/:id' }, { path: '/settings' }],
+      },
+    ])
+    renderDynamic('/hubs/h1/kanban/board/42')
+
+    const tree = screen.getByTestId('ui-tree')
+    expect(tree).toHaveTextContent('targetSurface=kanban')
+    expect(tree).toHaveTextContent('subpath=/board/42')
+  })
+
+  it('surface-root URL produces subpath "/"', () => {
+    useRouteRegistryStore.getState().setRoutes('h1', [
+      { path: '/kanban', base_path: '/kanban', surface: 'kanban', label: 'Kanban' },
+    ])
+    renderDynamic('/hubs/h1/kanban')
+
+    const tree = screen.getByTestId('ui-tree')
+    expect(tree).toHaveTextContent('subpath=/')
+  })
+
+  it('prefix-matches prefer the longest matching base_path', () => {
+    // Regression guard for an "/admin" vs "/admin/users" pair — the
+    // longer base wins so `/admin/users/bob` resolves to the nested
+    // surface, not `/admin` with subpath "/users/bob".
+    useRouteRegistryStore.getState().setRoutes('h1', [
+      { path: '/admin', base_path: '/admin', surface: 'admin', label: 'Admin' },
+      {
+        path: '/admin/users',
+        base_path: '/admin/users',
+        surface: 'admin_users',
+        label: 'Admin Users',
+      },
+    ])
+    renderDynamic('/hubs/h1/admin/users/bob')
+
+    const tree = screen.getByTestId('ui-tree')
+    expect(tree).toHaveTextContent('targetSurface=admin_users')
+    expect(tree).toHaveTextContent('subpath=/bob')
+  })
+
+  it('does not confuse sibling paths that share a prefix but not a segment boundary', () => {
+    // "/kanban" should NOT match "/kanbana" even though it's a string
+    // prefix. The segment boundary ("/" after the base) is required.
+    useRouteRegistryStore.getState().setRoutes('h1', [
+      { path: '/kanban', base_path: '/kanban', surface: 'kanban', label: 'Kanban' },
+    ])
+    renderDynamic('/hubs/h1/kanbana')
+
+    expect(screen.getByText(/Not found/i)).toBeInTheDocument()
+  })
+
+  it('falls back to legacy `path` when base_path is omitted (old hub compat)', () => {
+    // Older hubs emit only `path`. The store normaliser maps it to
+    // base_path so DynamicSurfaceRoute still resolves correctly.
+    useRouteRegistryStore.getState().setRoutes('h1', [
+      { path: '/plugins/hello', surface: 'hello', label: 'Hello' },
+    ])
+    renderDynamic('/hubs/h1/plugins/hello/details')
+
+    const tree = screen.getByTestId('ui-tree')
+    expect(tree).toHaveTextContent('targetSurface=hello')
+    expect(tree).toHaveTextContent('subpath=/details')
   })
 })

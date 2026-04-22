@@ -95,8 +95,9 @@ end
 -- -------------------------------------------------------------------------
 
 --- Render one frame for `surface_name` using `surface_state` as input.
---- Returns a table `{ type, target_surface, tree, version, hub_id }` ready
---- to ship via `client:send(frame)`, or nil if rendering / decoding failed.
+--- Returns a table `{ type, target_surface, tree, version, hub_id, subpath }`
+--- ready to ship via `client:send(frame)`, or nil if rendering / decoding
+--- failed.
 ---
 --- Uses `web_layout.render(surface_name, state)` uniformly so:
 ---   * override files (`.botster/layout_web.lua`) keep their precedence
@@ -104,6 +105,12 @@ end
 ---     when the workspace wrappers delegate to it
 ---   * plugin-registered surfaces fall through to
 ---     `_G.surfaces.render_node(...)` via the Rust fallback (Phase 4a).
+---
+--- Phase 4b: the emitted frame echoes back `subpath` — the value the
+--- dispatcher routed on — so the browser can ignore frames produced for a
+--- subpath it no longer cares about. Critical for preventing the cold-load
+--- flash when the hub's initial default-"/" frame would otherwise paint the
+--- wrong sub-page before the browser's surface.subpath action lands.
 local function render_one(surface_name, surface_state)
     local ok, result_json = pcall(function()
         return web_layout.render(surface_name, surface_state)
@@ -131,7 +138,11 @@ local function render_one(surface_name, surface_state)
 
     -- Fingerprint from the JSON string directly — web_layout.render emits
     -- it via serde_json with a stable field order, so same inputs yield
-    -- identical bytes.
+    -- identical bytes. We do NOT fold the subpath into the hash: two
+    -- subpaths that render to the same tree should dedup to one frame
+    -- (rare in practice, but the invariant keeps us aligned with
+    -- `fnv1a64_hex(tree_json)` which downstream tests assert on).
+    local subpath = (type(surface_state) == "table") and surface_state.path or nil
     local version = fnv1a64_hex(result_json)
 
     return {
@@ -140,7 +151,27 @@ local function render_one(surface_name, surface_state)
         tree = tree,
         version = version,
         hub_id = (type(surface_state) == "table") and surface_state.hub_id or nil,
+        subpath = subpath,
     }
+end
+
+-- Resolve the subpath the client is currently viewing for this surface.
+-- Callers pre-build input via `entry.input_builder(...)` OR the shared
+-- `LayoutInput.build_for_subscription` default; neither of those know about
+-- the current URL. We layer the URL-bound state on top here so every
+-- surface's render gets the right `state.path` threaded through the
+-- dispatcher built by `surfaces.lua`.
+--
+-- Storage: `client.surface_subpaths` is a `{ [surface_name] = subpath }`
+-- map owned by the hub-side client (see `cli/lua/lib/client.lua`). Unset
+-- entries fall back to "/", which matches every surface's default route.
+local function resolve_subpath(client, surface_name)
+    if type(client) ~= "table" then return "/" end
+    local paths = client.surface_subpaths
+    if type(paths) ~= "table" then return "/" end
+    local sub = paths[surface_name]
+    if type(sub) == "string" and sub ~= "" then return sub end
+    return "/"
 end
 
 --- Normalise a subscription key. Missing/nil keys fall back to the global
@@ -212,33 +243,53 @@ function M.build_frames(base_state, opts)
         return {}
     end
 
+    -- Allow callers to target a single surface. Production uses this for
+    -- surface.subpath-driven re-renders — re-rendering EVERY surface per URL
+    -- change would be wasteful and also churn the dedup state. Tests leave
+    -- `only_surface` unset and fan out to the full registry.
+    local only_surface = nil
+    if type(opts.only_surface) == "string" and opts.only_surface ~= "" then
+        only_surface = opts.only_surface
+    end
+
     local frames = {}
     for _, summary in ipairs(surfaces_mod.list()) do
         local surface_name = summary.name
-        local entry = surfaces_mod.get(surface_name)
-        if entry then
-            local surface_state
-            if entry.input_builder then
-                local ok, built = pcall(entry.input_builder, opts.client, opts.subscription_key)
-                if ok then
-                    surface_state = built
+        if only_surface == nil or only_surface == surface_name then
+            local entry = surfaces_mod.get(surface_name)
+            if entry then
+                local surface_state
+                if entry.input_builder then
+                    local ok, built = pcall(entry.input_builder, opts.client, opts.subscription_key)
+                    if ok then
+                        surface_state = built
+                    else
+                        log.warn(string.format(
+                            "layout_broadcast: input_builder for %s threw: %s",
+                            surface_name, tostring(built)))
+                    end
+                elseif opts.client then
+                    local LayoutInput = require("lib.layout_input")
+                    surface_state = LayoutInput.build_for_subscription(opts.client, opts.subscription_key)
                 else
-                    log.warn(string.format(
-                        "layout_broadcast: input_builder for %s threw: %s",
-                        surface_name, tostring(built)))
+                    surface_state = base_state
                 end
-            elseif opts.client then
-                local LayoutInput = require("lib.layout_input")
-                surface_state = LayoutInput.build_for_subscription(opts.client, opts.subscription_key)
-            else
-                surface_state = base_state
-            end
 
-            if type(surface_state) == "table" then
-                local frame = render_one(surface_name, surface_state)
-                if frame then
-                    if force or bucket[surface_name] ~= frame.version then
-                        frames[#frames + 1] = frame
+                if type(surface_state) == "table" then
+                    -- Thread the current subpath through the render input so
+                    -- the surface dispatcher (lib.surfaces) can route it to
+                    -- the correct sub-route. `client.surface_subpaths` is
+                    -- updated by the `botster.surface.subpath` action, and
+                    -- primed at subscribe-time so cold-load lands on the
+                    -- right sub-page without flashing "/".
+                    if surface_state.path == nil then
+                        surface_state.path = resolve_subpath(opts.client, surface_name)
+                    end
+                    local frame = render_one(surface_name, surface_state)
+                    if frame then
+                        if force or bucket[surface_name] ~= frame.version then
+                            frames[#frames + 1] = frame
+                        end
                     end
                 end
             end
