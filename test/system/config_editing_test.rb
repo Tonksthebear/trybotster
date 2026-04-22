@@ -200,31 +200,6 @@ class ConfigEditingTest < ApplicationSystemTestCase
 
   private
 
-  def sign_in_as(user)
-    visit "/test/sessions/new?user_id=#{user.id}"
-  end
-
-  # Visit the hub page using the connection URL (which carries the E2E key
-  # bundle in the URL fragment). Wait for the WebRTC DataChannel to be fully
-  # established. The active Olm session stays in the SharedWorker while the
-  # browser session remains alive, so nearby navigations can reconnect cleanly.
-  def sign_in_and_connect
-    url = @cli.connection_url
-    assert url.present?, "CLI should produce a connection URL"
-
-    sign_in_as(@user)
-    visit url
-
-    complete_pairing_for(@hub, pairing_url: url)
-
-    # Wait for WebRTC DataChannel to be established (direct or relay)
-    assert_sidebar_webrtc_connected(wait: 30)
-
-    # Readiness gate: browser CAN dispatch AND hub has shipped its first
-    # snapshots. Prevents downstream leaf-wait flakes when CI is slow.
-    wait_for_hub_ready
-  end
-
   # Navigate to settings via Turbo by clicking the Settings link on the hub page.
   # The link is enabled by requires-connection controller once DataChannel is up.
   def click_settings_link
