@@ -20,12 +20,12 @@ class SystemReadinessHelpersTest < ActiveSupport::TestCase
     end
 
     def assert_selector(selector, **opts)
-      @calls << [:assert_selector, selector, opts]
+      @calls << [ :assert_selector, selector, opts ]
       true
     end
 
     def assert_no_selector(selector, **opts)
-      @calls << [:assert_no_selector, selector, opts]
+      @calls << [ :assert_no_selector, selector, opts ]
       true
     end
   end
