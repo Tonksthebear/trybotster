@@ -14,6 +14,7 @@ import {
 } from '../ui_contract'
 import { getHub } from '../lib/hub-bridge'
 import { useWorkspaceStore } from '../store/workspace-store'
+import { useSurfaceReadinessStore } from '../store/surface-readiness-store'
 
 // ---------------------------------------------------------------------------
 // Tree decoration — applies browser-local ephemeral UI state (workspace
@@ -432,9 +433,19 @@ export default function UiTree({
         return
       }
       setTree(message.tree ?? null)
+      // System-test readiness: first tree for this (hub, surface) pair
+      // records into the readiness store, feeding `<html data-hub-snapshot>`.
+      // Record on EVERY frame: the store is idempotent per (hub, surface),
+      // so this is cheap, and it means hub-switch + remount still records
+      // correctly after `clearForHub`.
+      if (hubId) {
+        useSurfaceReadinessStore
+          .getState()
+          .recordFirstTree(hubId, targetSurface)
+      }
     }
     return transport.on('message', handler)
-  }, [transport, targetSurface, subpath])
+  }, [transport, targetSurface, subpath, hubId])
 
   // Phase 4b: whenever the (target_surface, subpath) pair changes, tell
   // the hub so it can re-render for this client.
@@ -540,21 +551,33 @@ export default function UiTree({
     [register, dispatch],
   )
 
+  // System-test readiness attributes: Capybara waits `[data-surface-ready=X]`
+  // to exist and `[...state=loading]` to disappear before interacting with the
+  // surface. The wrapper div is a zero-cost addition (display: contents) so it
+  // doesn't affect layout of the hub-authored tree inside.
+  const surfaceReadyState = tree ? 'ready' : 'loading'
+
   return (
     <InterceptorContext.Provider value={interceptorValue}>
-      <UiTreeErrorBoundary tree={decoratedTree} fallback={errorFallback}>
-        {decoratedTree ? (
-          <UiTreeBody
-            node={decoratedTree}
-            dispatch={dispatch}
-            capabilities={capabilities}
-            hubId={hubId}
-          />
-        ) : (
-          loadingFallback()
-        )}
-      </UiTreeErrorBoundary>
-      {children}
+      <div
+        data-surface-ready={targetSurface || undefined}
+        data-surface-ready-state={targetSurface ? surfaceReadyState : undefined}
+        style={{ display: 'contents' }}
+      >
+        <UiTreeErrorBoundary tree={decoratedTree} fallback={errorFallback}>
+          {decoratedTree ? (
+            <UiTreeBody
+              node={decoratedTree}
+              dispatch={dispatch}
+              capabilities={capabilities}
+              hubId={hubId}
+            />
+          ) : (
+            loadingFallback()
+          )}
+        </UiTreeErrorBoundary>
+        {children}
+      </div>
     </InterceptorContext.Provider>
   )
 }

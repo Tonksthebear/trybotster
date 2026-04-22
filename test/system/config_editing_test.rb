@@ -59,6 +59,7 @@ class ConfigEditingTest < ApplicationSystemTestCase
     sign_in_and_connect
     click_settings_link
     switch_to_device_scope
+    wait_for_settings_ready("device")
 
     add_agent_named("alpha")
     select_agent_file("alpha")
@@ -76,7 +77,7 @@ class ConfigEditingTest < ApplicationSystemTestCase
     assert_not_equal "Select a file", editor_title.text
 
     # Textarea should be visible
-    assert_selector "[data-hub-settings-target='editor']", wait: 10
+    assert_selector "[data-hub-settings-target='editor']"
   end
 
   test "editing and saving a config file" do
@@ -218,6 +219,10 @@ class ConfigEditingTest < ApplicationSystemTestCase
 
     # Wait for WebRTC DataChannel to be established (direct or relay)
     assert_sidebar_webrtc_connected(wait: 30)
+
+    # Readiness gate: browser CAN dispatch AND hub has shipped its first
+    # snapshots. Prevents downstream leaf-wait flakes when CI is slow.
+    wait_for_hub_ready
   end
 
   # Navigate to settings via Turbo by clicking the Settings link on the hub page.

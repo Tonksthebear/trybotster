@@ -682,9 +682,21 @@ function TargetSelector() {
 export default function ConfigEditor({ agentTemplates }) {
   const treeState = useSettingsStore((s) => s.treeState)
   const treeFeedback = useSettingsStore((s) => s.treeFeedback)
+  const configScope = useSettingsStore((s) => s.configScope)
+
+  // System-test readiness signal: the scope-specific tree scan has completed.
+  // Absent during 'loading'/'disconnected'; present when 'tree' (files found)
+  // or 'empty' (scan done, nothing there). The `data-settings-ready-state`
+  // lets helpers optionally narrow to one. See test/support/system_readiness_helpers.rb.
+  const settingsReadyState =
+    treeState === 'tree' || treeState === 'empty' ? treeState : null
 
   return (
-    <div className="max-w-4xl mx-auto px-4 py-6 lg:py-8">
+    <div
+      className="max-w-4xl mx-auto px-4 py-6 lg:py-8"
+      data-settings-ready={settingsReadyState ? configScope : undefined}
+      data-settings-ready-state={settingsReadyState || undefined}
+    >
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Tree Navigation (left) */}
         <div className="lg:col-span-1">
