@@ -126,21 +126,8 @@ class FileInputTest < ApplicationSystemTestCase
 
   private
 
-  def sign_in_as(user)
-    visit "/test/sessions/new?user_id=#{user.id}"
-  end
-
   def sign_in_and_connect
-    url = @cli.connection_url
-    assert url.present?, "CLI should produce a connection URL"
-
-    sign_in_as(@user)
-    visit hub_path(runtime_hub)
-    visit url
-
-    complete_pairing_for(runtime_hub, pairing_url: url, wait: 30)
-    revisit_pairing_url_if_needed(url)
-    assert_sidebar_webrtc_connected(wait: 30)
+    super(hub: runtime_hub, prewarm_hub_page: true, retry_if_stale: true)
   end
 
   def runtime_hub
@@ -179,7 +166,8 @@ class FileInputTest < ApplicationSystemTestCase
   end
 
   def create_accessory_session
-    find("[data-testid='new-session-button']:not([disabled])", match: :first, wait: 15).click
+    wait_for_surface_ready("workspace_panel")
+    find("[data-testid='new-session-button']:not([disabled])", match: :first).click
     assert_text "New Session", wait: 10
 
     selectable_option_text = nil
@@ -213,17 +201,6 @@ class FileInputTest < ApplicationSystemTestCase
     session_link.click
     assert_current_path "/hubs/#{runtime_hub.id}/sessions/#{session_uuid}", wait: 15
     session_uuid
-  end
-
-  def revisit_pairing_url_if_needed(url)
-    return unless page.has_button?("Start pairing", wait: 2) ||
-      page.has_selector?(
-        "#{SIDEBAR_CONNECTION_STATUS_SELECTOR}[data-connection-state='pairing_needed']",
-        wait: 2
-      )
-
-    visit url
-    complete_pairing_for(runtime_hub, pairing_url: url)
   end
 
   def current_paste_files
