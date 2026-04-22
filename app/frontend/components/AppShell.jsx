@@ -31,6 +31,14 @@ import DialogHost from './DialogHost'
 import TerminalCache from './terminal/TerminalCache'
 import { setHubId } from '../lib/modal-bridge'
 import { subscribeHubListUpdates, useHubStore } from '../store/hub-store'
+import {
+  useRouteRegistryStore,
+  selectHasRouteRegistrySnapshot,
+} from '../store/route-registry-store'
+import {
+  useSurfaceReadinessStore,
+  selectHasAnySurfaceForHub,
+} from '../store/surface-readiness-store'
 
 // Lazy-loaded route components
 const Home = React.lazy(() => import('./pages/Home'))
@@ -46,6 +54,91 @@ function SuspenseFallback() {
       <div className="text-sm text-zinc-500">Loading...</div>
     </div>
   )
+}
+
+// ---------------------------------------------------------------------------
+// System-test readiness: root-level DOM signals
+//
+// These write state directly to `<html>` as data attributes so Capybara can
+// wait on causal preconditions instead of downstream leaf UI effects. See
+// `test/support/system_readiness_helpers.rb` for the test-side helpers.
+//
+//   <html data-cli-status="unknown|handshaking|connected|offline">
+//     The integrated browser-to-hub dispatch path. Derived from
+//     `useHubStore.connectionState` which already combines browser socket +
+//     relay + hub health. 'connected' means the browser CAN send and expect
+//     responses; any other value means it can't yet.
+//
+//   <html data-hub-snapshot="pending|received">
+//     Flips to 'received' when BOTH the `ui_route_registry_v1` snapshot for
+//     the selected hub has landed AND at least one `ui_layout_tree_v1` frame
+//     for that hub has arrived. Resets to 'pending' on hub switch.
+// ---------------------------------------------------------------------------
+
+function mapConnectionStateToCliStatus(connectionState, selectedHubId) {
+  if (!selectedHubId) return 'unknown'
+  switch (connectionState) {
+    case 'connected':
+      return 'connected'
+    case 'connecting':
+    case 'pairing_needed':
+      return 'handshaking'
+    case 'disconnected':
+    case 'error':
+      return 'offline'
+    default:
+      return 'unknown'
+  }
+}
+
+function RootReadinessSignals() {
+  const selectedHubId = useHubStore((s) => s.selectedHubId)
+  const connectionState = useHubStore((s) => s.connectionState)
+  const hasRouteRegistry = useRouteRegistryStore((s) =>
+    selectHasRouteRegistrySnapshot(s, selectedHubId),
+  )
+  const hasAnySurface = useSurfaceReadinessStore((s) =>
+    selectHasAnySurfaceForHub(s, selectedHubId),
+  )
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    const status = mapConnectionStateToCliStatus(
+      connectionState,
+      selectedHubId,
+    )
+    document.documentElement.dataset.cliStatus = status
+  }, [connectionState, selectedHubId])
+
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    const received = !!selectedHubId && hasRouteRegistry && hasAnySurface
+    document.documentElement.dataset.hubSnapshot = received
+      ? 'received'
+      : 'pending'
+  }, [selectedHubId, hasRouteRegistry, hasAnySurface])
+
+  // Clear the surface-readiness record for the PREVIOUS hub when the
+  // selection changes. Route-registry state is per-hub and lives in
+  // its own store; surface readiness needs the same per-hub reset so the
+  // hub-snapshot signal returns to 'pending' on hub switch until the new
+  // hub's first tree arrives.
+  const lastHubRef = useRef(null)
+  useEffect(() => {
+    const prev = lastHubRef.current
+    lastHubRef.current = selectedHubId
+    if (prev && prev !== selectedHubId) {
+      useSurfaceReadinessStore.getState().clearForHub(prev)
+    }
+  }, [selectedHubId])
+
+  return null
+}
+
+// Exported for vitest.
+export {
+  mapConnectionStateToCliStatus as _mapConnectionStateToCliStatusForTests,
+  RootReadinessSignals as _RootReadinessSignalsForTests,
 }
 
 function CogIcon() {
@@ -335,6 +428,7 @@ export function AppRoutes() {
 export default function AppShell() {
   return (
     <BrowserRouter>
+      <RootReadinessSignals />
       <React.Suspense fallback={<SuspenseFallback />}>
         <AppRoutes />
       </React.Suspense>
