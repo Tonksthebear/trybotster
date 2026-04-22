@@ -182,13 +182,21 @@ pub fn reload(lua: &Lua) -> Result<()> {
 fn render_surface(lua: &Lua, surface_name: &str, state: Value) -> Result<String> {
     let layout_table = resolve_layout_table(lua)?;
 
-    let returned = call_layout_table_surface(&layout_table, surface_name, state.clone())?
-        .or_else(|| call_surfaces_registry_fallback(lua, surface_name, state));
-
-    let Some(returned) = returned else {
-        return Err(anyhow!(
-            "no layout surface registered for `{surface_name}` (checked layout table + surfaces registry)"
-        ));
+    // Chain both sources, propagating render-time errors instead of swallowing
+    // them. `call_layout_table_surface` already returns Err when the layout
+    // file's function raised; `call_surfaces_registry_fallback` now mirrors
+    // that — so the outer "no layout surface registered" message only fires
+    // when the surface is genuinely absent from both sources.
+    let returned = match call_layout_table_surface(&layout_table, surface_name, state.clone())? {
+        Some(v) => v,
+        None => match call_surfaces_registry_fallback(lua, surface_name, state)? {
+            Some(v) => v,
+            None => {
+                return Err(anyhow!(
+                    "no layout surface registered for `{surface_name}` (checked layout table + surfaces registry)"
+                ));
+            }
+        },
     };
 
     let node: UiNodeV1 = lua
@@ -222,32 +230,35 @@ fn call_layout_table_surface(
     }
 }
 
-/// Fallback to the Phase-4a Lua-side surface registry (`_G.surfaces`). Any
-/// failure (no surfaces global, no `render_node`, registry has no such
-/// surface, or the registered render function raised) is logged and
-/// resolves to `None` so the caller emits the error fallback tree.
+/// Fallback to the Phase-4a Lua-side surface registry (`_G.surfaces`).
+///
+/// Return semantics:
+///   * `Ok(Some(value))` — the registry rendered the surface.
+///   * `Ok(None)` — no `surfaces` global, no `render_node`, or the registry
+///     has no such surface (`render_node` returned nil). Caller falls through
+///     to "surface not registered" messaging.
+///   * `Err(_)` — the registered render function raised. The error carries
+///     the plugin-author-visible Lua message so `error_fallback_json` can
+///     surface it in the fallback panel (ergonomics fix: previously the
+///     error was swallowed and the user saw the generic "no layout surface
+///     registered" message even though the surface WAS registered).
 fn call_surfaces_registry_fallback(
     lua: &Lua,
     surface_name: &str,
     state: Value,
-) -> Option<Value> {
+) -> Result<Option<Value>> {
     let surfaces: Table = match lua.globals().get("surfaces") {
         Ok(Value::Table(t)) => t,
-        _ => return None,
+        _ => return Ok(None),
     };
     let render_node: Function = match surfaces.get("render_node") {
         Ok(Value::Function(f)) => f,
-        _ => return None,
+        _ => return Ok(None),
     };
     match render_node.call::<Value>((surface_name.to_string(), state)) {
-        Ok(Value::Nil) => None,
-        Ok(v) => Some(v),
-        Err(err) => {
-            log::warn!(
-                "web_layout.render: surfaces.render_node for `{surface_name}` raised: {err}"
-            );
-            None
-        }
+        Ok(Value::Nil) => Ok(None),
+        Ok(v) => Ok(Some(v)),
+        Err(err) => Err(anyhow!("surface `{surface_name}` raised: {err}")),
     }
 }
 

@@ -1420,3 +1420,313 @@ fn hello_plugin_unknown_subpath_renders_sub_404_not_error_fallback() {
         );
     });
 }
+
+// -------------------------------------------------------------------------
+// Plugin ergonomics — Part 1: render-time errors carry the REAL message
+// -------------------------------------------------------------------------
+//
+// Before this change, a plugin whose render fn threw produced the generic
+// "Layout error: {surface} / no layout surface registered" panel — because
+// the Rust fallback swallowed the Lua error and returned None, making the
+// call site indistinguishable from "surface truly not registered".
+//
+// After the change:
+//   * If the render fn throws, the error-fallback tree carries the actual
+//     Lua message.
+//   * If the surface is GENUINELY missing from both sources, the error
+//     tree still says "no layout surface registered" (regression guard).
+
+#[test]
+fn render_throw_in_plugin_surface_yields_error_fallback_with_real_error() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let json: String = lua
+        .load(
+            r#"
+            surfaces.register("broken", {
+                render = function(_state)
+                    error("ui.stack: unknown prop padding")
+                end,
+            })
+            return web_layout.render("broken", { hub_id = "hub-test" })
+            "#,
+        )
+        .eval()
+        .expect("render broken surface");
+
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+
+    let title = parsed
+        .pointer("/props/title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        title, "Layout error: broken",
+        "render-time errors must produce the error-fallback panel for the surface"
+    );
+
+    let blob = parsed.to_string();
+    assert!(
+        blob.contains("ui.stack: unknown prop padding"),
+        "error-fallback tree must embed the real Lua error message; got: {blob}"
+    );
+    assert!(
+        !blob.contains("no layout surface registered"),
+        "a registered surface whose render threw must NOT surface the \
+         'no layout surface registered' message; got: {blob}"
+    );
+}
+
+#[test]
+fn missing_surface_still_emits_no_layout_surface_registered() {
+    // Negative guard: a future refactor that collapses error paths must not
+    // reintroduce the "swallow render errors as missing" behaviour.
+    // `web_layout_render_missing_surface_returns_error_fallback` (above)
+    // asserts the error-fallback tree appears; this test additionally pins
+    // the SPECIFIC message so the distinction with render-time errors
+    // remains observable by plugin authors.
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let json: String = lua
+        .load(r#"return web_layout.render("genuinely_missing_surface", {})"#)
+        .eval()
+        .expect("render missing surface");
+
+    let blob = json;
+    assert!(
+        blob.contains("no layout surface registered"),
+        "truly-missing surfaces must still surface the registry-miss message; got: {blob}"
+    );
+    assert!(
+        blob.contains("genuinely_missing_surface"),
+        "error message must name the missing surface; got: {blob}"
+    );
+}
+
+// -------------------------------------------------------------------------
+// Plugin ergonomics — Part 2: input_builder receives route_ctx
+// -------------------------------------------------------------------------
+//
+// Phase 4b threads `state.path` / `state.params` through the dispatcher
+// AFTER `input_builder` has already returned, so plugins that want to load
+// different data for different sub-routes (`/board/:id` → load board N)
+// had to stuff everything into render. Ergonomics: `input_builder` now
+// also sees a third arg `route_ctx = { path, params }` computed from the
+// client's current subpath so per-sub-route data-loading belongs where it
+// belongs.
+
+#[test]
+fn input_builder_receives_route_ctx_with_subpath_and_matched_params() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    // Register a multi-route surface with an input_builder that captures
+    // its third arg into a table. Then drive `build_frames` with two
+    // different client subpaths and assert the captured route_ctx for each.
+    let (first_path, first_id, second_path, second_tag): (String, String, String, String) = lua
+        .load(
+            r#"
+            _G.__captured = {}
+            local function capturing_builder(_client, sub_id, route_ctx)
+                _G.__captured[sub_id] = route_ctx
+                return { hub_id = "hub-test" }
+            end
+            surfaces.register("kanban", {
+                routes = {
+                    { path = "/",           render = function(_s, _ctx) return { type = "panel", props = { tag = "home" } } end },
+                    { path = "/board/:id",  render = function(s, _ctx) return { type = "panel", props = { tag = "board", id = s.params.id } } end },
+                },
+                input_builder = capturing_builder,
+            })
+
+            local LayoutBroadcast = require("lib.layout_broadcast")
+            LayoutBroadcast._reset_for_tests()
+
+            -- Subscription A: client is viewing /board/7
+            LayoutBroadcast.build_frames(nil, {
+                subscription_key = "sub-A",
+                client = { surface_subpaths = { kanban = "/board/7" } },
+                force = true,
+            })
+            -- Subscription B: client is viewing /
+            LayoutBroadcast.build_frames(nil, {
+                subscription_key = "sub-B",
+                client = { surface_subpaths = {} },
+                force = true,
+            })
+
+            local a = _G.__captured["sub-A"] or {}
+            local b = _G.__captured["sub-B"] or {}
+            return
+                tostring(a.path or "<nil>"),
+                tostring((a.params and a.params.id) or "<nil>"),
+                tostring(b.path or "<nil>"),
+                tostring((b.params and next(b.params)) or "<empty>")
+            "#,
+        )
+        .eval()
+        .expect("input_builder route_ctx");
+
+    assert_eq!(first_path, "/board/7");
+    assert_eq!(
+        first_id, "7",
+        "route_ctx.params must carry matched :id capture for /board/:id"
+    );
+    assert_eq!(second_path, "/");
+    assert_eq!(
+        second_tag, "<empty>",
+        "root subpath has no named captures; params must be an empty table"
+    );
+}
+
+#[test]
+fn legacy_two_arg_input_builder_still_works_with_route_ctx_fanout() {
+    // Backwards compatibility: plugins that declared an input_builder BEFORE
+    // this change took `(client, sub_id)`. Lua tolerates the extra
+    // positional arg, but we pin the behaviour here so nobody silently
+    // breaks these plugins with a future "require 3 args" refactor.
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let (frame_count, tag): (i64, String) = lua
+        .load(
+            r#"
+            local function legacy_builder(_client, _sub_id) -- only two args
+                return { hub_id = "hub-test" }
+            end
+            surfaces.register("oldschool", {
+                render = function(_s, _ctx) return { type = "panel", props = { tag = "oldschool" } } end,
+                input_builder = legacy_builder,
+            })
+
+            local LayoutBroadcast = require("lib.layout_broadcast")
+            LayoutBroadcast._reset_for_tests()
+            local frames = LayoutBroadcast.build_frames(nil, {
+                subscription_key = "sub",
+                client = { surface_subpaths = {} },
+                force = true,
+            })
+
+            local found
+            for _, f in ipairs(frames) do
+                if f.target_surface == "oldschool" then found = f end
+            end
+            assert(found, "legacy builder must still produce a frame")
+            return #frames, found.tree.props.tag
+            "#,
+        )
+        .eval()
+        .expect("legacy 2-arg builder");
+
+    assert_eq!(frame_count, 1);
+    assert_eq!(
+        tag, "oldschool",
+        "legacy 2-arg input_builder must still produce the expected tree"
+    );
+}
+
+#[test]
+fn input_builder_can_branch_on_route_ctx_params_for_different_data() {
+    // Integration test of the motivating use case: a plugin that loads
+    // different data based on the matched sub-route param. We use a
+    // fixture table as the "data store" and assert the right entry ends up
+    // in the rendered tree for each subpath.
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let (root_tag, board_id, board_title): (String, String, String) = lua
+        .load(
+            r#"
+            local BOARDS = { ["1"] = "Alpha Board", ["42"] = "The Ultimate Board" }
+            local function board_input(_client, _sub_id, route_ctx)
+                local state = { hub_id = "hub-test" }
+                if route_ctx and route_ctx.params and route_ctx.params.id then
+                    state.board = { id = route_ctx.params.id, title = BOARDS[route_ctx.params.id] }
+                else
+                    state.boards = BOARDS
+                end
+                return state
+            end
+            surfaces.register("kanban", {
+                routes = {
+                    { path = "/", render = function(s, _ctx)
+                        return { type = "panel", props = { tag = "home", count = (s.boards and 1 or 0) } }
+                    end },
+                    { path = "/board/:id", render = function(s, _ctx)
+                        return { type = "panel", props = {
+                            tag = "board",
+                            id = (s.board and s.board.id) or "?",
+                            title = (s.board and s.board.title) or "?",
+                        } }
+                    end },
+                },
+                input_builder = board_input,
+            })
+
+            local LayoutBroadcast = require("lib.layout_broadcast")
+            LayoutBroadcast._reset_for_tests()
+
+            local f_home = LayoutBroadcast.build_frames(nil, {
+                subscription_key = "home",
+                client = { surface_subpaths = {} },
+                force = true,
+            })
+            local f_board = LayoutBroadcast.build_frames(nil, {
+                subscription_key = "board",
+                client = { surface_subpaths = { kanban = "/board/42" } },
+                force = true,
+            })
+
+            local function find(frames, name)
+                for _, f in ipairs(frames) do
+                    if f.target_surface == name then return f end
+                end
+                return nil
+            end
+            local home = find(f_home, "kanban").tree
+            local board = find(f_board, "kanban").tree
+            return home.props.tag, board.props.id, board.props.title
+            "#,
+        )
+        .eval()
+        .expect("branching input_builder");
+
+    assert_eq!(root_tag, "home");
+    assert_eq!(
+        board_id, "42",
+        "input_builder must have loaded board 42 based on route_ctx.params.id"
+    );
+    assert_eq!(board_title, "The Ultimate Board");
+}
+
+#[test]
+fn surfaces_resolve_route_returns_matched_route_and_params() {
+    // Unit-level coverage for the new public helper that layout_broadcast
+    // calls. A plugin might also use this directly to prefetch.
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let (matched_id, root_match, unknown_match): (String, bool, bool) = lua
+        .load(
+            r#"
+            surfaces.register("kanban", {
+                routes = {
+                    { path = "/",          render = function() return { type = "panel", props = {} } end },
+                    { path = "/board/:id", render = function() return { type = "panel", props = {} } end },
+                },
+            })
+            local _c1, p1 = surfaces.resolve_route("kanban", "/board/13")
+            local c2, p2 = surfaces.resolve_route("kanban", "/")
+            local c3, _p3 = surfaces.resolve_route("kanban", "/totally/unknown")
+            return p1.id, (c2 ~= nil and p2 ~= nil), (c3 == nil)
+            "#,
+        )
+        .eval()
+        .expect("resolve_route");
+
+    assert_eq!(matched_id, "13");
+    assert!(root_match, "root subpath must match the / route");
+    assert!(unknown_match, "unknown subpath must return nil route");
+}
