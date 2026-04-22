@@ -299,7 +299,7 @@ local function render_sub_404(surface_name, subpath)
         children = {
             {
                 type = "stack",
-                props = { direction = "vertical", gap = "2", padding = "4" },
+                props = { direction = "vertical", gap = "2" },
                 children = {
                     {
                         type = "text",
