@@ -4,6 +4,7 @@ class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
   include Warden::Test::Helpers
   include SpaSystemHelper
   include SystemReadinessHelpers
+  include CliIntegrationHelper
 
   # Disable transactional tests - system tests spawn external processes (CLI)
   # that need to see committed data in the database

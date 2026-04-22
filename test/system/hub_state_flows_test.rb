@@ -19,9 +19,7 @@ class HubStateFlowsTest < ApplicationSystemTestCase
   end
 
   test "new session chooser loads admitted spawn targets and unlocks choices after selection" do
-    prime_server!
     @cli = start_cli(@hub)
-    associate_hub_device!
 
     sign_in_and_connect
 
@@ -46,9 +44,7 @@ class HubStateFlowsTest < ApplicationSystemTestCase
   end
 
   test "new agent modal preserves the selected target from the chooser" do
-    prime_server!
     @cli = start_cli(@hub)
-    associate_hub_device!
 
     sign_in_and_connect
 
@@ -65,9 +61,7 @@ class HubStateFlowsTest < ApplicationSystemTestCase
   end
 
   test "device config tree shows add-session controls when hub config is available" do
-    prime_server!
     @cli = start_cli(@hub)
-    associate_hub_device!
 
     sign_in_and_connect
 
@@ -82,38 +76,9 @@ class HubStateFlowsTest < ApplicationSystemTestCase
 
   private
 
-  def sign_in_as(user)
-    visit "/test/sessions/new?user_id=#{user.id}"
-  end
-
-  def prime_server!
-    sign_in_as(@user)
-  end
-
-  def associate_hub_device!
-    # No-op after Device→Hub collapse: Hub IS the device now.
-  end
-
-  def sign_in_and_connect
-    url = @cli.connection_url
-    assert url.present?, "CLI should produce a connection URL"
-
-    sign_in_as(@user)
-    visit url
-
-    complete_pairing_for(@hub, pairing_url: url)
-    assert_webrtc_connected
-
-    # Causal gate — see SystemReadinessHelpers.
-    wait_for_hub_ready
-  end
-
-  def assert_webrtc_connected(wait: 30)
-    assert_sidebar_webrtc_connected(wait:)
-  end
-
   def open_new_session_chooser
-    find("[data-testid='new-session-button']:not([disabled])", match: :first, wait: 10).click
+    wait_for_surface_ready("workspace_panel")
+    find("[data-testid='new-session-button']:not([disabled])", match: :first).click
     assert_text "New Session", wait: 10
   end
 
