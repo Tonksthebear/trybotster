@@ -63,8 +63,13 @@ if has_native_bitops then
 else
     local fallback = rawget(_G, "bit") or rawget(_G, "bit32")
     assert(fallback, "layout_broadcast: no native bitwise ops and no bit/bit32 library")
-    bxor32 = fallback.bxor
-    band32 = fallback.band
+    -- LuaJIT's `bit` library normalizes results to signed int32, which
+    -- would make downstream arithmetic diverge from a uint32 hash. Coerce
+    -- back to [0, 2^32) so the hash matches reference FNV-1a regardless
+    -- of Lua flavor.
+    local bxor, band = fallback.bxor, fallback.band
+    bxor32 = function(a, b) return bxor(a, b) % 0x100000000 end
+    band32 = function(a, b) return band(a, b) % 0x100000000 end
 end
 
 --- Compute an FNV-1a 64-bit hash over a string. Returns a 16-char lowercase
