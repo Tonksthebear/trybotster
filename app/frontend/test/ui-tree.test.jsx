@@ -484,6 +484,42 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     })
   })
 
+  // Regression (2026-04-22): system-test caught "Uncaught Error: DataChannel
+  // closed" in the browser console during WebRTC handshake because
+  // transport.send returns a rejecting Promise when the DataChannel isn't
+  // open yet. `void transport.send(...)` swallows the return value but the
+  // rejection still fires as an unhandled rejection. UiTree must attach a
+  // .catch handler so the rejection is consumed — the subscribe envelope
+  // already primed the hub and the next nav will re-fire.
+  it('handles a rejecting transport.send without raising unhandled rejection', async () => {
+    const rejected = Promise.reject(new Error('DataChannel closed'))
+    // Keep the rejection plumbing: attach a noop catch to the PROMISE WE
+    // RETURN from send so Node's test runner sees a handled rejection too.
+    rejected.catch(() => {})
+    fakeTransport.send.mockReturnValueOnce(rejected)
+
+    const unhandledSpy = vi.fn()
+    const onUnhandled = (event) => {
+      unhandledSpy(event.reason)
+    }
+    window.addEventListener('unhandledrejection', onUnhandled)
+
+    try {
+      render(<UiTree hubId="hub-1" targetSurface="kanban" subpath="/" />)
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 120))
+      })
+      // Microtask flush so the rejecting promise has a chance to report.
+      await act(async () => {
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      expect(unhandledSpy).not.toHaveBeenCalled()
+    } finally {
+      window.removeEventListener('unhandledrejection', onUnhandled)
+    }
+  })
+
   it('sends surface.subpath on subpath prop change and clears the tree', async () => {
     const { rerender } = render(
       <UiTree hubId="hub-1" targetSurface="kanban" subpath="/" />,
