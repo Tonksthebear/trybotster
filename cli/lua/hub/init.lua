@@ -50,6 +50,14 @@ safe_require("lib.accessory")
 safe_require("lib.commands")
 _G.mcp = safe_require("lib.mcp")
 
+-- Install plugin.db{} BEFORE any plugin loads. This wires `_G.plugin.db`
+-- and subscribes to `plugin_unloading` + `shutdown` so cached sqlite
+-- connections close cleanly on reload and on hub exit.
+local plugin_db_mod = safe_require("lib.plugin_db")
+if plugin_db_mod and type(plugin_db_mod.install) == "function" then
+    plugin_db_mod.install()
+end
+
 -- Phase 2b UI DSL transport libs. `lib.action` is the registry for
 -- browser-emitted UI action envelopes; `lib.layout_broadcast` wraps
 -- `web_layout.render(...)` with per-surface hash dedup. Exposing them as
