@@ -281,17 +281,9 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                 let duration = Duration::from_secs_f64(seconds);
                 let mut entries = reg_idle.lock().expect("TimerEntries mutex poisoned");
 
-                // Cancel any existing timer with this ID.
-                for (eid, entry) in &mut entries.entries {
-                    if *eid == id && !entry.cancelled {
-                        entry.cancelled = true;
-                        if let Some(handle) = entry.task_handle.take() {
-                            handle.abort();
-                        }
-                    }
-                }
-
-                // Spawn a fresh tokio task.
+                // Refresh a single slot for this ID instead of appending a new
+                // cancelled entry every reset. Hot paths such as PTY idle
+                // detection call after_idle on nearly every output chunk.
                 let task_handle = match (&entries.hub_event_tx, &entries.tokio_handle) {
                     (Some(tx), Some(handle)) => {
                         let tx = tx.clone();
@@ -304,16 +296,28 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     _ => None,
                 };
 
-                entries.entries.push((
-                    id.clone(),
-                    TimerEntry {
-                        callback_key,
-                        fire_at: Instant::now() + duration,
-                        repeat_interval: None,
-                        cancelled: false,
-                        task_handle,
-                    },
-                ));
+                if let Some((_, entry)) = entries.entries.iter_mut().find(|(eid, _)| *eid == id) {
+                    if let Some(handle) = entry.task_handle.take() {
+                        handle.abort();
+                    }
+                    let old_key = std::mem::replace(&mut entry.callback_key, callback_key);
+                    let _ = lua.remove_registry_value(old_key);
+                    entry.fire_at = Instant::now() + duration;
+                    entry.repeat_interval = None;
+                    entry.cancelled = false;
+                    entry.task_handle = task_handle;
+                } else {
+                    entries.entries.push((
+                        id.clone(),
+                        TimerEntry {
+                            callback_key,
+                            fire_at: Instant::now() + duration,
+                            repeat_interval: None,
+                            cancelled: false,
+                            task_handle,
+                        },
+                    ));
+                }
 
                 Ok(id)
             },
@@ -879,6 +883,33 @@ mod tests {
         let entries = registry.lock().expect("mutex");
         assert_eq!(entries.len(), 1, "len() should exclude cancelled timers");
         assert!(!entries.is_empty());
+    }
+
+    #[test]
+    fn test_after_idle_reuses_same_entry_for_same_id() {
+        let lua = Lua::new();
+        let registry = new_timer_registry();
+
+        register(&lua, Arc::clone(&registry)).expect("Should register");
+
+        lua.load(
+            r#"
+            timer.after_idle("idle:test", 10, function() end)
+            timer.after_idle("idle:test", 10, function() end)
+            timer.after_idle("idle:test", 10, function() end)
+        "#,
+        )
+        .exec()
+        .expect("create idle timers");
+
+        let entries = registry.lock().expect("mutex");
+        assert_eq!(
+            entries.entries.len(),
+            1,
+            "same-id after_idle resets should not accumulate entries"
+        );
+        assert_eq!(entries.entries[0].0, "idle:test");
+        assert!(!entries.entries[0].1.cancelled);
     }
 
     #[test]
