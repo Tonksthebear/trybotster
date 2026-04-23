@@ -30,6 +30,9 @@ local last_agent_list_snapshot = state.get("connections.last_agent_list_snapshot
 local hub_recovery_state = state.get("connections.hub_recovery_state", {
     state = "starting",
 })
+local pending_osc_session_updates = state.get("connections.pending_osc_session_updates", {})
+
+local OSC_SESSION_UPDATE_DEBOUNCE_SECS = 0.5
 
 -- ============================================================================
 -- Client Registry
@@ -425,20 +428,52 @@ function _clear_session_notification(session_uuid)
     return any_remaining
 end
 
+local function queue_osc_session_update(session_uuid, fields)
+    if not session_uuid or type(fields) ~= "table" then return end
+
+    local agent = Agent.get(session_uuid)
+    if not agent then return end
+
+    local pending = pending_osc_session_updates[session_uuid]
+    if type(pending) ~= "table" then
+        pending = {}
+        pending_osc_session_updates[session_uuid] = pending
+    end
+
+    local changed = false
+    for k, v in pairs(fields) do
+        if agent[k] ~= v then
+            agent[k] = v
+            pending[k] = v
+            changed = true
+        end
+    end
+    if not changed then return end
+
+    timer.after_idle("session_osc_update:" .. session_uuid, OSC_SESSION_UPDATE_DEBOUNCE_SECS, function()
+        local current = pending_osc_session_updates[session_uuid]
+        pending_osc_session_updates[session_uuid] = nil
+
+        local s = Agent.get(session_uuid)
+        if not s or type(current) ~= "table" or next(current) == nil then return end
+
+        s:_sync_session_manifest()
+        hooks.notify("session_updated", {
+            session_uuid = session_uuid,
+            source = "osc_debounced",
+            fields = current,
+        })
+    end)
+end
+
 -- Update agent title when the running program sets the terminal title (OSC 0/2).
 hooks.on("pty_title_changed", "update_agent_title", function(info)
-    local agent = (info.session_uuid and Agent.get(info.session_uuid))
-    if agent then
-        agent:update({ title = info.title })
-    end
+    queue_osc_session_update(info.session_uuid, { title = info.title })
 end)
 
 -- Update agent CWD when the shell reports a directory change (OSC 7).
 hooks.on("pty_cwd_changed", "update_agent_cwd", function(info)
-    local agent = (info.session_uuid and Agent.get(info.session_uuid))
-    if agent then
-        agent:update({ cwd = info.cwd })
-    end
+    queue_osc_session_update(info.session_uuid, { cwd = info.cwd })
 end)
 
 -- Track shell integration prompt marks (OSC 133/633).
@@ -659,6 +694,10 @@ function M._before_reload()
         events.off(sub_id)
     end
     _event_subs = {}
+    for session_uuid in pairs(pending_osc_session_updates) do
+        timer.cancel("session_osc_update:" .. session_uuid)
+        pending_osc_session_updates[session_uuid] = nil
+    end
     hooks.off("agent_created", "broadcast_agent_created")
     hooks.off("agent_deleted", "broadcast_agent_deleted")
     hooks.off("agent_lifecycle", "broadcast_lifecycle")
