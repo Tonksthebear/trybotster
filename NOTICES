@@ -1,0 +1,21 @@
+Botster — third-party notices
+=============================
+
+This project bundles third-party software. Each component below retains its
+original license; the full license text ships alongside the vendored files.
+
+-----------------------------------------------------------------------------
+sqlite.lua (vendored)
+-----------------------------------------------------------------------------
+Upstream: https://github.com/kkharji/sqlite.lua
+License: MIT
+Location: cli/lua/vendor/sqlite/
+License text: cli/lua/vendor/sqlite/LICENSE
+Modifications: cli/lua/vendor/sqlite/VENDOR_CHANGES.md
+
+-----------------------------------------------------------------------------
+ghostty (vendored submodule)
+-----------------------------------------------------------------------------
+Upstream: https://github.com/ghostty-org/ghostty (Tonksthebear/ghostty fork)
+License: MIT (see upstream LICENSE in the submodule)
+Location: cli/vendor/ghostty/
