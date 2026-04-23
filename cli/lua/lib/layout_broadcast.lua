@@ -258,9 +258,32 @@ function M.build_frames(base_state, opts)
         if only_surface == nil or only_surface == surface_name then
             local entry = surfaces_mod.get(surface_name)
             if entry then
+                -- Resolve the client's current subpath BEFORE input_builder so
+                -- plugin-authored builders can branch their data-loading on
+                -- the matched sub-route (`/board/:id` loading board N, etc.).
+                -- `client.surface_subpaths` is updated by the
+                -- `botster.surface.subpath` action, and primed at
+                -- subscribe-time so cold-load lands on the right sub-page
+                -- without flashing "/".
+                local subpath = resolve_subpath(opts.client, surface_name)
+                local route_ctx
+                if type(surfaces_mod.resolve_route) == "function" then
+                    local _compiled, params = surfaces_mod.resolve_route(surface_name, subpath)
+                    route_ctx = { path = subpath, params = params or {} }
+                end
+
                 local surface_state
                 if entry.input_builder then
-                    local ok, built = pcall(entry.input_builder, opts.client, opts.subscription_key)
+                    -- Third argument is new (Phase 4b ergonomics). Existing
+                    -- 2-arg builders tolerate the extra arg; 3-arg builders
+                    -- can branch on route_ctx.params for per-sub-route
+                    -- data-loading.
+                    local ok, built = pcall(
+                        entry.input_builder,
+                        opts.client,
+                        opts.subscription_key,
+                        route_ctx
+                    )
                     if ok then
                         surface_state = built
                     else
@@ -278,12 +301,11 @@ function M.build_frames(base_state, opts)
                 if type(surface_state) == "table" then
                     -- Thread the current subpath through the render input so
                     -- the surface dispatcher (lib.surfaces) can route it to
-                    -- the correct sub-route. `client.surface_subpaths` is
-                    -- updated by the `botster.surface.subpath` action, and
-                    -- primed at subscribe-time so cold-load lands on the
-                    -- right sub-page without flashing "/".
+                    -- the correct sub-route. We also let the input_builder
+                    -- override state.path / state.params explicitly — if it
+                    -- sets them we respect its choice.
                     if surface_state.path == nil then
-                        surface_state.path = resolve_subpath(opts.client, surface_name)
+                        surface_state.path = subpath
                     end
                     local frame = render_one(surface_name, surface_state)
                     if frame then

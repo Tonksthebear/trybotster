@@ -586,18 +586,44 @@ end
 --- default `LayoutInput.build_for_subscription`. Callers that want the
 --- workspace-shaped `AgentWorkspaceSurfaceInputV1` get it for free; plugin
 --- surfaces that need less can provide a tiny builder.
+---
+--- Phase 4b ergonomics: when `route_ctx` is passed, it threads to the
+--- plugin-authored `input_builder` as a third argument so per-sub-route
+--- data-loading (e.g. `/board/:id` loading board N) can happen at
+--- input-build time instead of inside render. Backwards compatible —
+--- existing 2-arg input_builders simply ignore the extra arg.
 --- @param name string
 --- @param client any Client instance (passed to input_builder)
 --- @param sub_id string|nil
+--- @param route_ctx table|nil { path = string, params = table }
 --- @return table input state (ready to hand to render())
-function M.build_input(name, client, sub_id)
+function M.build_input(name, client, sub_id, route_ctx)
     local entry = M.get(name)
     if not entry then return nil end
     if entry.input_builder then
-        return entry.input_builder(client, sub_id)
+        return entry.input_builder(client, sub_id, route_ctx)
     end
     local LayoutInput = require("lib.layout_input")
     return LayoutInput.build_for_subscription(client, sub_id)
+end
+
+--- Resolve the compiled route + params for `subpath` against surface `name`.
+---
+--- Pure lookup — does not render. Lets callers (notably
+--- `lib.layout_broadcast`) compute `{ path, params }` before calling the
+--- surface's `input_builder` so per-sub-route data loading has access to
+--- the matched params.
+---
+--- @param name string Registered surface name.
+--- @param subpath string? Subpath to match (defaults to "/").
+--- @return table|nil compiled_route The matched compiled route (internal shape), or nil when no route matches.
+--- @return table|nil params Named captures from the match, or nil.
+function M.resolve_route(name, subpath)
+    local entry = M.get(name)
+    if not entry or type(entry.compiled_routes) ~= "table" then
+        return nil, nil
+    end
+    return match_routes(entry.compiled_routes, subpath or "/")
 end
 
 --- Test-only reset. Production never calls this — hot-reload preserves
