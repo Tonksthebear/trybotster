@@ -140,7 +140,24 @@ impl LuaRuntime {
     /// - Lua state creation fails
     /// - Primitive registration fails
     pub fn new() -> Result<Self> {
-        let lua = Lua::new();
+        // Plugins run in the user trust tier (full pty/fs/process/http/webrtc/secrets access).
+        // FFI is consistent with that posture — a malicious plugin can already shell out or
+        // exfiltrate via existing primitives. FFI is enabled explicitly so the trust-model
+        // decision is visible at code-review time and so plugins can use
+        // `require('vendor.sqlite')` for persistence.
+        //
+        // SAFETY: `Lua::new()` creates a VM in "safe" mode which rejects loading FFI even
+        // via `load_std_libs(StdLib::FFI)`. `Lua::unsafe_new_with(ALL_SAFE | FFI, ...)`
+        // marks the VM unsafe and loads the normal safe stdlibs plus FFI — deliberately
+        // excluding `StdLib::DEBUG`, which would permit hook/upvalue manipulation we
+        // don't need. The trust decision is made here; downstream code treats the VM
+        // identically.
+        let lua = unsafe {
+            Lua::unsafe_new_with(
+                mlua::StdLib::ALL_SAFE | mlua::StdLib::FFI,
+                mlua::LuaOptions::default(),
+            )
+        };
 
         // Determine base path for Lua scripts
         let base_path = Self::resolve_base_path();
@@ -302,8 +319,11 @@ impl LuaRuntime {
         // - {base}/hub/?.lua - hub modules (state, hooks, loader)
         // - {base}/plugins/?.lua - user plugins
         // - {base}/plugins/?/init.lua - user plugin packages
+        // `{base}/vendor/?.lua` + `{base}/vendor/?/init.lua` let vendored modules
+        // (e.g. `vendor/sqlite/`) use their upstream-native internal requires
+        // (`require "sqlite.utils"`) without rewriting every call site.
         let new_path = format!(
-            "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/hub/?.lua;{path}/plugins/?.lua;{path}/plugins/?/init.lua;{current}",
+            "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/hub/?.lua;{path}/plugins/?.lua;{path}/plugins/?/init.lua;{path}/vendor/?.lua;{path}/vendor/?/init.lua;{current}",
             path = base_path.display(),
             current = current_path
         );
@@ -343,9 +363,11 @@ impl LuaRuntime {
             .get("path")
             .map_err(|e| anyhow!("Failed to get package.path: {e}"))?;
 
-        // Prepend so this path takes priority over paths already in package.path
+        // Prepend so this path takes priority over paths already in package.path.
+        // Vendor paths mirror those in `setup_package_path` so overlay layers
+        // can shadow vendored modules the same way they shadow first-party ones.
         let new_path = format!(
-            "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/hub/?.lua;{path}/plugins/?.lua;{path}/plugins/?/init.lua;{current}",
+            "{path}/?.lua;{path}/?/init.lua;{path}/lib/?.lua;{path}/handlers/?.lua;{path}/hub/?.lua;{path}/plugins/?.lua;{path}/plugins/?/init.lua;{path}/vendor/?.lua;{path}/vendor/?/init.lua;{current}",
             path = additional_path.display(),
             current = current_path
         );
@@ -4314,7 +4336,14 @@ mod tests {
     /// hanging the caller — the previous value flows through unchanged.
     #[test]
     fn hook_call_enforces_timeout_on_runaway_interceptor() {
-        let lua = mlua::Lua::new();
+        // SAFETY: mirrors `LuaRuntime::new()` — unsafe-marked VM with safe
+        // stdlibs + FFI (no DEBUG) so tests exercise the production configuration.
+        let lua = unsafe {
+            mlua::Lua::unsafe_new_with(
+                mlua::StdLib::ALL_SAFE | mlua::StdLib::FFI,
+                mlua::LuaOptions::default(),
+            )
+        };
         load_hooks_module(&lua);
 
         // Register an interceptor that spins forever. Use a small timeout so
@@ -4353,7 +4382,14 @@ mod tests {
     /// data — the timeout must not interfere with the fast path.
     #[test]
     fn hook_call_fast_interceptor_is_unaffected() {
-        let lua = mlua::Lua::new();
+        // SAFETY: mirrors `LuaRuntime::new()` — unsafe-marked VM with safe
+        // stdlibs + FFI (no DEBUG) so tests exercise the production configuration.
+        let lua = unsafe {
+            mlua::Lua::unsafe_new_with(
+                mlua::StdLib::ALL_SAFE | mlua::StdLib::FFI,
+                mlua::LuaOptions::default(),
+            )
+        };
         load_hooks_module(&lua);
 
         lua.load(
@@ -4379,7 +4415,14 @@ mod tests {
     /// later interceptors still run on it.
     #[test]
     fn hook_call_chain_continues_after_timeout() {
-        let lua = mlua::Lua::new();
+        // SAFETY: mirrors `LuaRuntime::new()` — unsafe-marked VM with safe
+        // stdlibs + FFI (no DEBUG) so tests exercise the production configuration.
+        let lua = unsafe {
+            mlua::Lua::unsafe_new_with(
+                mlua::StdLib::ALL_SAFE | mlua::StdLib::FFI,
+                mlua::LuaOptions::default(),
+            )
+        };
         load_hooks_module(&lua);
 
         // Priority ordering: higher priority runs first. The spinner runs
