@@ -19,6 +19,19 @@
 //! removed when the stack empties. This keeps the outer call's deadline
 //! enforced when an inner nested call finishes.
 //!
+//! # LuaJIT and JIT-compiled traces
+//!
+//! LuaJIT's count hooks are not fired inside JIT-compiled traces — once
+//! a tight loop like `while true do end` has been compiled to a trace,
+//! it runs as native code and the deadline hook never fires. To keep
+//! the watchdog effective under LuaJIT we mark the callback (and
+//! sub-functions it calls) as `jit.off(func, true)` before each call,
+//! which persistently excludes them from tracing. This keeps the rest
+//! of the VM JIT-enabled; only interceptor bodies pay the deopt cost,
+//! and only once per function (subsequent `jit.off` calls are no-ops).
+//! The `jit` table does not exist on PUC Lua, so the toggle is a no-op
+//! there.
+//!
 //! # Limitations
 //!
 //! The watchdog fires only on Lua VM instruction boundaries. A callback
@@ -103,6 +116,17 @@ fn hook_timed_pcall(
             })
         });
     }
+
+    // LuaJIT: persistently disable JIT tracing for this callback and any
+    // sub-functions it calls, so count hooks fire inside what would
+    // otherwise be compiled traces. Applied on every call (not just the
+    // outermost) to catch nested closures whose prototypes aren't reached
+    // by the outer recursive flag. Idempotent — second+ calls are no-ops.
+    // Scoped per-function so the rest of the VM stays JIT-enabled. No-op
+    // on PUC Lua where `jit` is nil.
+    let _ = lua
+        .load(r"if jit and jit.off then jit.off(..., true) end")
+        .call::<()>(func.clone());
 
     // RAII guard ensures the stack entry is popped and (if outermost) the
     // VM hook is removed even if `func.call` unwinds. Without this, a panic
@@ -244,5 +268,50 @@ mod tests {
             .expect("outer call returns on timeout");
 
         assert!(!ok, "outer deadline must still fire after inner completes");
+    }
+
+    /// Regression test for LuaJIT: after the callback has been hot-traced
+    /// by the JIT compiler, the deadline hook must still fire inside its
+    /// compiled trace. Without the per-function `jit.off(..., true)` the
+    /// compiled trace runs as native code and skips count hooks, which
+    /// caused the CI `cli-test` job to hang indefinitely on the first
+    /// LuaJIT build. On PUC Lua this is a no-op (there is no `jit`
+    /// table) and the test degrades to the same guarantee as
+    /// `deadline_stack_clears_after_timeout`.
+    #[test]
+    fn callback_previously_hot_traced_still_times_out() {
+        let lua = Lua::new();
+        register(&lua).expect("register primitive");
+
+        // Call the same callback enough times that LuaJIT decides it is
+        // hot and traces it — the default hotloop threshold is ~56
+        // iterations. Each successful call returns `1`, so the trace is
+        // for the early-return path. Then call it one more time with the
+        // runaway path enabled: if the hook is skipped inside the trace,
+        // the test hangs forever; if the fix is in place, the deadline
+        // aborts as expected.
+        let (ok, _err): (bool, mlua::Value) = lua
+            .load(
+                r#"
+                local function body(run_forever)
+                    if run_forever then
+                        while true do end
+                    end
+                    return 1
+                end
+                for _ = 1, 500 do
+                    local inner_ok = __hook_timed_pcall(body, 1000, false)
+                    assert(inner_ok, "warmup iteration should succeed")
+                end
+                return __hook_timed_pcall(body, 25, true)
+            "#,
+            )
+            .eval()
+            .expect("call returns even after the body has been hot-traced");
+
+        assert!(
+            !ok,
+            "deadline hook must fire inside a JIT-compiled trace (or a no-op on PUC Lua)"
+        );
     }
 }
