@@ -282,7 +282,7 @@ jobs:
 
     steps:
       - name: Install packages
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pkg-config libsqlite3-0
 
       - name: Checkout code
         uses: actions/checkout@v6
