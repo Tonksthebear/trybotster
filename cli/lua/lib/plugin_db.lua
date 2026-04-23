@@ -27,6 +27,7 @@ local sqlite = require("vendor.sqlite")
 local sqlite_tbl = require("sqlite.tbl")
 local sqlite_db_class = require("sqlite.db")
 local sqlite_defs = require("sqlite.defs")
+local hub_state = require("hub.state")
 
 -- Patch `sqlite.defs.wrap_stmts` once at module load. Upstream's implementation
 -- wraps its callback in bare BEGIN/COMMIT; when the user calls
@@ -55,23 +56,41 @@ end
 local USER_TX_SET = rawget(sqlite_defs, "__plugin_db_user_tx_set")
 
 -- ============================================================================
--- Module state
+-- Module state — backed by hub.state so it survives module hot-reload
 -- ============================================================================
+--
+-- `lib.plugin_db` is a hot-reloadable library module; core handlers reload it
+-- via `loader.reload("lib.plugin_db")` when the file changes. Plain local
+-- tables here would be torn down on reload, leaking cached sqlite fds and
+-- detaching the `_G.plugin.db` global from the current closure. Storing state
+-- in `hub.state` (which is a protected module — never reloaded) gives us the
+-- same table identity across reload so both the old and new module closures
+-- operate on one cache.
+--
+-- Cache shape: plugin_name -> { wrapper = raw_db, memory = bool, uri = string }
+local db_handles = hub_state.get("plugin_db.handles", {})
 
--- Cache: plugin_name -> { wrapper = raw_db, memory = bool, uri = string }.
--- Survives hot-reload so the sqlite fd + FFI state is reused instead of leaked.
-local db_handles = {}
+-- Guards against adding duplicate `events.on("shutdown", ...)` subscriptions
+-- on repeated install() calls. `hooks.on` is replaceable by name so it doesn't
+-- need its own guard. Wrapped in a table so the module-level local keeps a
+-- stable reference to the (mutable) state across reloads.
+local events_subscribed = hub_state.get("plugin_db.events_subscribed", { value = false })
 
--- Guard against re-subscribing to hooks/events on module reload.
-local subscribed = false
-
--- Default PRAGMAs applied after open. Applied in declaration order.
--- (journal_mode must come first so subsequent pragmas take effect in WAL.)
-local DEFAULT_PRAGMAS = {
+-- Default PRAGMAs, split by criticality.
+--
+-- `busy_timeout` MUST run first so any subsequent statement that grabs a WAL
+-- or file lock inherits the 5 s waiter. `journal_mode = WAL` and
+-- `foreign_keys = ON` are load-bearing — silently running without them is a
+-- correctness bug, so those fail LOUDLY. `synchronous = NORMAL` is a perf
+-- pragma only; a failure downgrades us to whatever sqlite's default is and
+-- is logged at WARN but does not refuse the plugin load.
+local CRITICAL_PRAGMAS = {
+    { "busy_timeout",  "5000" },  -- first: subsequent pragmas inherit the timeout
     { "journal_mode",  "WAL" },
-    { "synchronous",   "NORMAL" },
     { "foreign_keys",  "ON" },
-    { "busy_timeout",  "5000" },
+}
+local OPTIONAL_PRAGMAS = {
+    { "synchronous",   "NORMAL" },
 }
 
 -- Model names that would collide with sqlite.db methods. `wrap_db` rawsets
@@ -510,11 +529,13 @@ function M.shutdown_all()
     for _, name in ipairs(names) do close_and_evict(name) end
 end
 
--- Test-only: reset module state so each test starts clean.
+-- Test-only: reset module state so each test starts clean. The underlying
+-- hub.state tables are emptied in place so their identity is preserved for
+-- any closures that captured them.
 function M._reset_for_tests()
     M.shutdown_all()
-    db_handles = {}
-    subscribed = false
+    for k in pairs(db_handles) do db_handles[k] = nil end
+    events_subscribed.value = false
 end
 
 -- ============================================================================
@@ -612,17 +633,47 @@ function M.db(spec)
         ), 2)
     end
 
-    -- Defaults first, then any plugin-supplied overrides.
-    for _, pair in ipairs(DEFAULT_PRAGMAS) do
-        pcall(function()
+    -- Critical PRAGMAs: any failure is a correctness bug, refuse the load.
+    -- busy_timeout goes first so the WAL lock-taking statements inherit it.
+    for _, pair in ipairs(CRITICAL_PRAGMAS) do
+        local pragma_ok, pragma_err = pcall(function()
             raw:eval(string.format("PRAGMA %s = %s", pair[1], pair[2]))
         end)
+        if not pragma_ok then
+            pcall(function() raw:close() end)
+            error(string.format(
+                "plugin.db: plugin '%s' failed to apply PRAGMA %s = %s: %s",
+                plugin_name, pair[1], pair[2], tostring(pragma_err)
+            ), 2)
+        end
     end
+
+    -- Optional PRAGMAs: perf knobs only; warn but continue on failure.
+    for _, pair in ipairs(OPTIONAL_PRAGMAS) do
+        local pragma_ok, pragma_err = pcall(function()
+            raw:eval(string.format("PRAGMA %s = %s", pair[1], pair[2]))
+        end)
+        if not pragma_ok then
+            log.warn(string.format(
+                "plugin.db: PRAGMA %s = %s failed for plugin '%s' (non-fatal): %s",
+                pair[1], pair[2], plugin_name, tostring(pragma_err)
+            ))
+        end
+    end
+
+    -- Author-supplied overrides. These are plugin-managed, so a typo or bad
+    -- value shouldn't refuse the plugin load — warn and continue.
     if type(spec.pragmas) == "table" then
         for k, v in pairs(spec.pragmas) do
-            pcall(function()
+            local pragma_ok, pragma_err = pcall(function()
                 raw:eval(string.format("PRAGMA %s = %s", k, tostring(v)))
             end)
+            if not pragma_ok then
+                log.warn(string.format(
+                    "plugin.db: user PRAGMA %s = %s failed for plugin '%s' (non-fatal): %s",
+                    k, tostring(v), plugin_name, tostring(pragma_err)
+                ))
+            end
         end
     end
 
@@ -650,30 +701,67 @@ end
 
 --- Install `_G.plugin.db` and subscribe to `plugin_unloading` + `shutdown` so
 --- cached handles close cleanly. Called once from `cli/lua/hub/init.lua`
---- BEFORE any plugin is loaded.
+--- BEFORE any plugin is loaded AND again on `_after_reload` so the fresh
+--- module's closures replace the stale ones.
+--
+-- Idempotency notes:
+--   * `_G.plugin.db = M.db` is assigned every call so reloads swap to the
+--     fresh closure (without this, the global keeps pointing at the old
+--     module's `db_handles` — invisible edits + the stale-closure bug codex
+--     flagged).
+--   * `hooks.on(event, name, fn)` replaces the previous entry with the same
+--     name, so repeated calls are safe and keep the handler up-to-date with
+--     the latest closure.
+--   * `events.on("shutdown", fn)` has no by-name replacement in Lua. We
+--     guard on `events_subscribed.value` (backed by hub.state) so exactly
+--     one subscription persists across reloads. The subscribed callback
+--     resolves `M` lazily via `package.loaded` so it always runs the latest
+--     `shutdown_all` against the shared `db_handles` table.
 function M.install()
     _G.plugin = _G.plugin or {}
     _G.plugin.db = M.db
 
-    if subscribed then return end
-
-    -- plugin_unloading: hook notified by hub/loader.lua before a plugin's
-    -- registry entry is torn down. Closes the plugin's cached db handle.
+    -- Every install() re-registers the hook so the fresh closure wins.
     if hooks and type(hooks.on) == "function" then
         hooks.on("plugin_unloading", "plugin_db.close_handle", function(payload)
-            M._on_plugin_unloading(payload)
+            local mod = package.loaded["lib.plugin_db"] or M
+            mod._on_plugin_unloading(payload)
         end)
     end
 
-    -- Hub shutdown event: fires before the Rust side drops the Lua runtime.
-    -- Close all cached handles so sqlite FFI pointers release cleanly.
-    if events and type(events.on) == "function" then
+    if events and type(events.on) == "function" and not events_subscribed.value then
         events.on("shutdown", function()
-            M.shutdown_all()
+            local mod = package.loaded["lib.plugin_db"] or M
+            mod.shutdown_all()
         end)
+        events_subscribed.value = true
     end
+end
 
-    subscribed = true
+-- ============================================================================
+-- Hot-reload lifecycle
+-- ============================================================================
+-- Core Lua libraries under `lib/` are hot-reloaded by
+-- `handlers.module_watcher`. `loader.reload("lib.plugin_db")` drops the old
+-- module from `package.loaded` and re-`require`s this file. Without the hook
+-- below, the old `_G.plugin.db` closure (and the subscribed hook callbacks)
+-- keep pointing at the torn-down module. `_after_reload` reinstalls the
+-- global + replaces the hook callback with the fresh closure.
+--
+-- The underlying db handle cache lives in `hub.state` so it's preserved
+-- across the reload cycle — no fds are leaked and no plugin's data is lost.
+
+function M._before_reload()
+    if log and log.info then
+        log.info("lib.plugin_db reloading (handles + subscriptions persist via hub.state)")
+    end
+end
+
+function M._after_reload()
+    M.install()
+    if log and log.info then
+        log.info("lib.plugin_db reloaded (_G.plugin.db and plugin_unloading hook re-wired)")
+    end
 end
 
 return M

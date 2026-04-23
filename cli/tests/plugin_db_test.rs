@@ -1017,18 +1017,27 @@ fn foreign_keys_enforced_via_on_delete_cascade() {
 }
 
 // ============================================================================
-// 17. test_wal_mode_active (nice-to-have)
+// 17. test_wal_mode_active — all four default pragmas applied (contract test)
 // ============================================================================
+//
+// Codex flagged two PRAGMA-related concerns:
+//   (a) `busy_timeout` must be set BEFORE any WAL/lock-taking pragma so
+//       subsequent statements inherit the waiter.
+//   (b) Every default PRAGMA must actually take effect; we can't rely on the
+//       journal_mode + foreign_keys spot-check that the earlier test did.
+//
+// This test queries all four and asserts each one reflects the configured
+// value, so a regression in ordering or silent-swallow would trip.
 
 #[test]
-fn default_pragmas_set_wal_and_foreign_keys() {
+fn all_default_pragmas_applied_in_correct_order() {
     let _lock = lock_env();
     let tmp = TempDir::new().unwrap();
     set_config_dir(tmp.path());
     let lua = new_test_lua();
     set_loading_plugin(&lua, "pragmas");
 
-    let (jmode, fkeys): (String, i64) = lua
+    let (jmode, fkeys, busy_timeout, sync_mode): (String, i64, i64, i64) = lua
         .load(
             r#"
             local db = plugin.db{
@@ -1037,16 +1046,27 @@ fn default_pragmas_set_wal_and_foreign_keys() {
                     t = { id = true },
                 },
             }
-            local jm = db:eval("PRAGMA journal_mode")
-            local fk = db:eval("PRAGMA foreign_keys")
-            return jm[1].journal_mode, fk[1].foreign_keys
+            local jm      = db:eval("PRAGMA journal_mode")
+            local fk      = db:eval("PRAGMA foreign_keys")
+            local busy    = db:eval("PRAGMA busy_timeout")
+            local sync    = db:eval("PRAGMA synchronous")
+            return jm[1].journal_mode, fk[1].foreign_keys,
+                   busy[1].timeout, sync[1].synchronous
             "#,
         )
         .eval()
-        .expect("query pragmas");
+        .expect("query all four default pragmas");
 
     assert_eq!(jmode, "wal", "journal_mode should be WAL for file-backed db");
-    assert_eq!(fkeys, 1, "foreign_keys should be ON");
+    assert_eq!(fkeys, 1, "foreign_keys should be ON (= 1)");
+    assert_eq!(
+        busy_timeout, 5000,
+        "busy_timeout should be 5000 ms — must be set BEFORE WAL so contention is bounded"
+    );
+    assert_eq!(
+        sync_mode, 1,
+        "synchronous should be NORMAL (= 1), not FULL (= 2)"
+    );
 }
 
 // ============================================================================
@@ -1113,7 +1133,118 @@ fn redeclaring_memory_flag_is_rejected() {
 }
 
 // ============================================================================
-// 20. test_reserved_model_name_rejected
+// 20. test_lib_plugin_db_hot_reload_preserves_handle_and_rewires_global
+// ============================================================================
+//
+// Core lib/*.lua modules are hot-reloaded by `handlers.module_watcher` via
+// `loader.reload("lib.plugin_db")`. Codex flagged that without `_before_reload`
+// / `_after_reload` hooks:
+//   (a) `_G.plugin.db` stays bound to the old module's closure, so edits to
+//       plugin_db.lua are invisible at runtime.
+//   (b) the cached db handles (module-level local) vanish, silently leaking
+//       sqlite fds.
+//
+// This test simulates the reload by clearing `package.loaded["lib.plugin_db"]`
+// and calling the reload lifecycle hooks the same way `hub.loader.reload`
+// does, then verifies:
+//   - a plugin that already had a db open before reload can still call
+//     `plugin.db{...}` and get the SAME cached handle (sentinel preserved),
+//   - previously inserted data is still readable,
+//   - `_G.plugin.db` points at the NEW module's closure (added a marker to
+//     the fresh module during reload and confirm the global saw it).
+
+#[test]
+fn lib_plugin_db_hot_reload_preserves_handle_and_rewires_global() {
+    let _lock = lock_env();
+    let tmp = TempDir::new().unwrap();
+    set_config_dir(tmp.path());
+    let lua = new_test_lua();
+    set_loading_plugin(&lua, "hotmod");
+
+    // Initial load: open db, stash a sentinel on the instance, insert a row.
+    lua.load(
+        r#"
+        local db = plugin.db{
+            version = 1,
+            models = { logs = {
+                id = true,
+                msg = { 'text', required = true, default = '' },
+            } },
+        }
+        rawset(db, '__pre_reload_sentinel', 'before-reload')
+        db.logs:insert{ msg = 'survived' }
+        "#,
+    )
+    .exec()
+    .expect("pre-reload load + insert");
+
+    // Simulate `loader.reload("lib.plugin_db")` — the same sequence
+    // `cli/lua/hub/loader.lua:M.reload` runs for a lib module:
+    //   1. call `_before_reload` on the current module
+    //   2. drop it from package.loaded
+    //   3. require() it again (fresh evaluation)
+    //   4. call `_after_reload` on the new module
+    lua.load(
+        r#"
+        local old = package.loaded['lib.plugin_db']
+        assert(type(old._before_reload) == 'function',
+               'plugin_db must export _before_reload')
+        old._before_reload()
+        package.loaded['lib.plugin_db'] = nil
+
+        local fresh = require('lib.plugin_db')
+        assert(fresh ~= old, 'require after drop should return a new module table')
+        assert(type(fresh._after_reload) == 'function',
+               'plugin_db must export _after_reload')
+        fresh._after_reload()
+        _G._reloaded_module = fresh
+        "#,
+    )
+    .exec()
+    .expect("simulate hot-reload lifecycle");
+
+    // Post-reload: the global must point at the fresh module, the handle
+    // must be reused (same sentinel), and the row must still be visible.
+    let (global_rewired, same_handle, row_survived): (bool, bool, bool) = lua
+        .load(
+            r#"
+            local db2 = plugin.db{
+                version = 1,
+                models = { logs = {
+                    id = true,
+                    msg = { 'text', required = true, default = '' },
+                } },
+            }
+            local same_handle = rawget(db2, '__pre_reload_sentinel') == 'before-reload'
+
+            -- Global points at the fresh module's closure, not the old one.
+            local global_rewired = (plugin.db == _G._reloaded_module.db)
+
+            local rows = db2.logs:get{}
+            local row_survived = (#rows == 1 and rows[1].msg == 'survived')
+
+            return global_rewired, same_handle, row_survived
+            "#,
+        )
+        .eval()
+        .expect("post-reload assertions");
+
+    assert!(
+        global_rewired,
+        "_G.plugin.db must point at the FRESH module after reload — edits to plugin_db.lua wouldn't take effect otherwise"
+    );
+    assert!(
+        same_handle,
+        "cached sqlite connection must survive module hot-reload — otherwise we leak fds and break in-flight plugin state"
+    );
+    assert!(
+        row_survived,
+        "previously inserted row must still be readable through the new module's closure"
+    );
+}
+
+// ============================================================================
+// 21. test_reserved_model_name_rejected
 // ============================================================================
 //
 // A plugin that declared a model named after a sqlite.db method (e.g. `close`,
