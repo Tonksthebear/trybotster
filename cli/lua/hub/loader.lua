@@ -444,6 +444,11 @@ function M.unload_plugin(name)
     local module_key = "plugin." .. name
     local mod = package.loaded[module_key]
 
+    -- Notify subscribers (e.g. lib.plugin_db) that the plugin is about to be
+    -- torn down so they can release resources keyed by plugin name. Fires
+    -- BEFORE the plugin's own `_before_unload` so shared infra runs first.
+    hooks.notify("plugin_unloading", { name = name })
+
     -- Lifecycle: let the plugin clean up before being removed
     if mod and type(mod) == "table" and mod._before_unload then
         local ok, err = pcall(mod._before_unload)
