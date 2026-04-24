@@ -277,11 +277,90 @@ full integration suite with `./test.sh --integration`.
 - No TUI adapter — Phase B.
 - No React renderer — Phase C.
 - No `Menu` / `MenuItem` exposure to Lua.
-- No phase-1 composites (`WorkspaceList`, `SessionRow`, …) — those stay
+- ~~No phase-1 composites (`WorkspaceList`, `SessionRow`, …) — those stay
   web-runtime-internal per
-  `docs/specs/web-ui-primitives-runtime.md`.
+  `docs/specs/web-ui-primitives-runtime.md`.~~ — **Superseded:** wire protocol
+  v2 promotes these to first-class cross-client composites (see below).
+
+## Wire protocol v2 — composite primitives
+
+The v2 wire protocol replaces "rebuild + rebroadcast the entire `UiNodeV1`
+tree on every state change" with a delta protocol: structural snapshots
+ship only on connect / structural change, per-entity field deltas ship on
+data change. To keep authored layouts thin, the data-driven UI regions
+they used to inline are now first-class composites:
+
+| Constructor | Wire `type` | Required props |
+|---|---|---|
+| `ui.session_list{ density?, grouping?, show_nav_entries? }` | `session_list` | none |
+| `ui.workspace_list{ density? }` | `workspace_list` | none |
+| `ui.spawn_target_list{ on_select?, on_remove? }` | `spawn_target_list` | none |
+| `ui.worktree_list{ target_id }` | `worktree_list` | `target_id` |
+| `ui.session_row{ session_uuid, density? }` | `session_row` | `session_uuid` |
+| `ui.hub_recovery_state{}` | `hub_recovery_state` | none |
+| `ui.connection_code{}` | `connection_code` | none |
+| `ui.new_session_button{ action }` | `new_session_button` | `action` |
+
+These primitives are **data-driven**: they carry no slots and no children
+on the wire. Each renderer (web React, ratatui TUI) reads from its
+client-side entity store and expands the composite into the same flat tree
+the v1 hub-rendered layout used to ship. Both renderers honor the same
+density / grouping tokens.
+
+Density follows the `UiSurfaceDensity` token (`sidebar` | `panel`) — see
+`tokens::UiSurfaceDensity`. This is distinct from `UiInteractionDensity`
+(`compact` | `comfortable`), which is a renderer-internal hit-target token.
+
+### Action templates on list composites
+
+`spawn_target_list.on_select` / `on_remove` are **action templates**: each
+renderer merges the template's `id` (and any `payload`) with the per-row
+identifier (e.g. `target_id`) before dispatch. When omitted, the composite
+uses default action ids (`botster.spawn_target.select` /
+`botster.spawn_target.remove`). The same convention will apply to other
+list composites that grow per-row actions in the future.
+
+## Wire protocol v2 — `$bind` grammar
+
+For plugin composites that need reactive data without registering a custom
+React/TUI renderer, the v2 wire format also defines a binding sentinel:
+
+```json
+{ "$bind": "/<entity_type>/<id>/<field>" }
+```
+
+The sentinel may appear at any prop-value position. Both renderers replace
+it with the resolved value before primitive dispatch.
+
+Path grammar:
+
+| Path | Resolves to |
+|---|---|
+| `/<type>/<id>/<field>` | scalar lookup |
+| `/<type>/<id>` | whole record |
+| `/<type>` | array of records, sorted by store insertion order |
+| `@/<field>` | item-relative — only valid inside `ui.bind_list`'s `item_template` |
+
+Plus the list expansion helper:
+
+```lua
+ui.bind_list{
+  source = "/session",
+  item_template = ui.tree_item{
+    id = ui.bind("@/session_uuid"),
+    title = { ui.text{ text = ui.bind("@/title") } },
+  },
+}
+```
+
+The web resolver (`app/frontend/ui_contract/binding.tsx`) and the TUI
+resolver (`cli/src/tui/ui_contract_adapter/binding.rs`) must agree on
+this grammar; a shared spec snippet under `docs/specs/` ensures they do
+not drift. (Both resolvers land in later v2 commits; this README documents
+the wire shape they consume.)
 
 ## Versioning
 
-This is `ui-contract/v1`. Additive changes are backward-compatible; removing
-props or changing payload semantics requires `v2`.
+This is `ui-contract/v1` with the v2 wire-protocol composite extensions
+listed above. Additive changes are backward-compatible; removing props or
+changing payload semantics requires a major bump.

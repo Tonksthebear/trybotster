@@ -41,6 +41,7 @@ pub type ColorCache =
     std::sync::Arc<std::sync::Mutex<std::collections::HashMap<usize, crate::terminal::Rgb>>>;
 
 pub mod actions;
+pub mod entity_stores;
 pub mod guard;
 pub mod hot_reload;
 pub mod layout;

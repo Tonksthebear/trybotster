@@ -39,13 +39,15 @@ pub use node::{
     UiResponsiveHeightV1, UiResponsiveV1, UiResponsiveWidthV1, UiValueV1,
 };
 pub use props::{
-    BadgePropsV1, ButtonPropsV1, DialogPropsV1, EmptyStatePropsV1, IconButtonPropsV1, IconPropsV1,
-    InlinePropsV1, PanelPropsV1, ScrollAreaPropsV1, StackPropsV1, StatusDotPropsV1, TextPropsV1,
-    TreeItemPropsV1,
+    BadgePropsV1, ButtonPropsV1, ConnectionCodePropsV1, DialogPropsV1, EmptyStatePropsV1,
+    HubRecoveryStatePropsV1, IconButtonPropsV1, IconPropsV1, InlinePropsV1, NewSessionButtonPropsV1,
+    PanelPropsV1, ScrollAreaPropsV1, SessionListPropsV1, SessionRowPropsV1, SpawnTargetListPropsV1,
+    StackPropsV1, StatusDotPropsV1, TextPropsV1, TreeItemPropsV1, WorkspaceListPropsV1,
+    WorktreeListPropsV1,
 };
 pub use tokens::{
     UiAlign, UiBadgeSize, UiBadgeTone, UiButtonTone, UiButtonVariant, UiInteractionDensity,
-    UiJustify, UiPanelTone, UiPresentation, UiScrollAxis, UiSize, UiSpace, UiStackDirection,
-    UiStatusDotState, UiTextWeight, UiTone,
+    UiJustify, UiPanelTone, UiPresentation, UiScrollAxis, UiSessionListGrouping, UiSize, UiSpace,
+    UiStackDirection, UiStatusDotState, UiSurfaceDensity, UiTextWeight, UiTone,
 };
 pub use viewport::{UiHeightClass, UiOrientation, UiPointer, UiViewportV1, UiWidthClass};

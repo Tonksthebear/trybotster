@@ -43,23 +43,25 @@ end
 -- Query Commands
 -- ============================================================================
 
+-- Wire protocol v2: list_agents / list_worktrees / list_spawn_targets re-ship
+-- the matching entity_snapshot. Clients should not need to call these in
+-- normal operation — entity stores are kept live by entity_patch /
+-- entity_upsert / entity_remove from the broadcaster — but the handlers
+-- remain available for debug / forced-resync flows.
 commands.register("list_agents", function(client, sub_id, _command)
-    client:send_agent_list(sub_id)
-end, { description = "Send agent list to client" })
+    local EB = require("lib.entity_broadcast")
+    pcall(EB.send_snapshots_to, client, sub_id)
+end, { description = "Re-send the entity_snapshot batch (v2 force-resync)" })
 
 commands.register("list_worktrees", function(client, sub_id, _command)
-    local target, target_err = resolve_command_target(_command)
-    if not target then
-        send_command_error(client, sub_id, "worktree_list_error", target_err)
-        log.warn(string.format("list_worktrees failed: %s", tostring(target_err)))
-        return
-    end
-    client:send_worktree_list(sub_id, target)
-end, { description = "Send worktree list to client" })
+    local EB = require("lib.entity_broadcast")
+    pcall(EB.send_snapshots_to, client, sub_id)
+end, { description = "Re-send the entity_snapshot batch (v2 force-resync)" })
 
 commands.register("list_spawn_targets", function(client, sub_id, _command)
-    client:send_spawn_target_list(sub_id)
-end, { description = "Send admitted spawn target list to client" })
+    local EB = require("lib.entity_broadcast")
+    pcall(EB.send_snapshots_to, client, sub_id)
+end, { description = "Re-send the entity_snapshot batch (v2 force-resync)" })
 
 commands.register("add_spawn_target", function(client, sub_id, command)
     local registry = rawget(_G, "spawn_targets")
@@ -82,14 +84,23 @@ commands.register("add_spawn_target", function(client, sub_id, command)
         return
     end
 
-    local connections = require("handlers.connections")
     send_spawn_target_feedback(
         client,
         sub_id,
         "success",
         string.format("Admitted spawn target %s", target.path or target.name or target.id or path)
     )
-    connections.broadcast_spawn_target_list()
+    -- Wire protocol v2: re-snapshot spawn_target so clients see the new entry.
+    local EB = require("lib.entity_broadcast")
+    if EB.is_registered("spawn_target") then
+        local registry = rawget(_G, "spawn_targets")
+        local list_ok, listed = pcall(registry.list)
+        if list_ok and type(listed) == "table" then
+            for _, t in ipairs(listed) do
+                if t.target_id then EB.upsert("spawn_target", t) end
+            end
+        end
+    end
 end, { description = "Admit a directory as a spawn target" })
 
 commands.register("remove_spawn_target", function(client, sub_id, command)
@@ -112,9 +123,12 @@ commands.register("remove_spawn_target", function(client, sub_id, command)
         return
     end
 
-    local connections = require("handlers.connections")
     send_spawn_target_feedback(client, sub_id, "success", "Removed spawn target.")
-    connections.broadcast_spawn_target_list()
+    -- Wire protocol v2: drop the removed entity, then re-snapshot the rest.
+    local EB = require("lib.entity_broadcast")
+    if EB.is_registered("spawn_target") then
+        EB.remove("spawn_target", target_id)
+    end
 end, { description = "Remove an admitted spawn target" })
 
 commands.register("rename_spawn_target", function(client, sub_id, command)
@@ -143,9 +157,12 @@ commands.register("rename_spawn_target", function(client, sub_id, command)
         return
     end
 
-    local connections = require("handlers.connections")
     send_spawn_target_feedback(client, sub_id, "success", string.format("Renamed spawn target to %s.", new_name))
-    connections.broadcast_spawn_target_list()
+    -- Wire protocol v2: patch the renamed entity.
+    local EB = require("lib.entity_broadcast")
+    if EB.is_registered("spawn_target") then
+        EB.patch("spawn_target", target_id, { target_name = new_name })
+    end
 end, { description = "Rename an admitted spawn target" })
 
 commands.register("list_workspaces", function(client, sub_id, _command)
@@ -165,8 +182,11 @@ commands.register("list_workspaces", function(client, sub_id, _command)
 end, { description = "Send workspace list to client" })
 
 commands.register("list_open_workspaces", function(client, sub_id, _command)
-    client:send_open_workspace_list(sub_id)
-end, { description = "Send currently open workspaces to client" })
+    -- Wire protocol v2: re-snapshot — clients keep workspace state in their
+    -- entity store and derive open/closed by joining sessions.
+    local EB = require("lib.entity_broadcast")
+    pcall(EB.send_snapshots_to, client, sub_id)
+end, { description = "Re-send the entity_snapshot batch (v2 force-resync)" })
 
 local function send_agent_config(client, sub_id, command)
     local ConfigResolver = require("lib.config_resolver")
@@ -329,11 +349,12 @@ commands.register("rename_workspace", function(client, sub_id, command)
             end
         end
 
-        local connections = require("handlers.connections")
-        connections.broadcast_hub_event("agent_list", {
-            agents = Agent.all_info(),
-        })
-        connections.broadcast_workspace_list()
+        -- Wire protocol v2: patch the workspace name. Affected sessions
+        -- emit their own session_updated → entity_patch via Session:update.
+        local EB = require("lib.entity_broadcast")
+        if EB.is_registered("workspace") then
+            EB.patch("workspace", workspace_id, { name = new_name })
+        end
         log.info(string.format("Workspace %s renamed to '%s'", workspace_id, new_name))
     end
 end, { description = "Rename a workspace" })
@@ -369,11 +390,22 @@ commands.register("move_agent_workspace", function(_client, _sub_id, command)
         return
     end
 
-    local connections = require("handlers.connections")
-    connections.broadcast_hub_event("agent_list", {
-        agents = Agent.all_info(),
-    })
-    connections.broadcast_workspace_list()
+    -- Wire protocol v2: Session:update inside move_to_workspace already
+    -- emitted the entity_patch for the session. Re-snapshot workspaces so
+    -- the target workspace materialises in clients filtering for non-empty
+    -- workspaces.
+    local EB = require("lib.entity_broadcast")
+    if EB.is_registered("workspace") then
+        local Hub = require("lib.hub")
+        local ok, workspaces = pcall(function() return Hub.get():list_workspaces() end)
+        if ok and type(workspaces) == "table" then
+            for _, workspace in ipairs(workspaces) do
+                if workspace.workspace_id then
+                    EB.upsert("workspace", workspace)
+                end
+            end
+        end
+    end
 
     log.info(string.format("Moved session %s to workspace %s (%s)",
         session.session_uuid, moved.workspace_id, moved.workspace_name or "unnamed"))
@@ -497,34 +529,16 @@ commands.register("delete_session", function(_client, _sub_id, command)
     end
 end, { description = "Delete a session (alias for delete_agent)" })
 
-commands.register("select_agent", function(client, _sub_id, command)
+commands.register("select_agent", function(_client, _sub_id, command)
+    -- Wire protocol v2: selection is purely client-side (web
+    -- ui-presentation-store, TUI widget_state). Hub no longer tracks
+    -- per-client selection or re-renders trees on selection changes. This
+    -- handler is kept as a no-op acknowledgment for cross-client handoff
+    -- flows that may evolve later (e.g. focus a session in the TUI from a
+    -- browser click).
     local new_selection = command.session_uuid or command.id
-    log.debug(string.format("Select agent: %s", tostring(new_selection)))
-
-    if not client or new_selection == nil then
-        return
-    end
-
-    -- Phase 2b: selection is baked into hub-rendered ui_layout_tree_v1
-    -- frames. Record the new selection on THIS client so its next render
-    -- (triggered below and on the next session_updated broadcast) applies
-    -- the correct `tree_item.selected` to the matching row. Other peers'
-    -- selections are untouched.
-    if client.selected_session_uuid == new_selection then
-        return
-    end
-    client.selected_session_uuid = new_selection
-
-    -- Re-broadcast this client's hub subscriptions with the new selection.
-    -- The per-subscription dedup in `layout_broadcast` compares versions
-    -- against THIS sub's baseline, so the frames ship exactly when the
-    -- selection change actually alters the rendered tree.
-    for sub_id, sub in pairs(client.subscriptions or {}) do
-        if sub.channel == "hub" then
-            pcall(client.send_ui_layout_trees, client, sub_id)
-        end
-    end
-end, { description = "Record per-client selection and re-broadcast its UI trees" })
+    log.debug(string.format("select_agent (v2 noop): %s", tostring(new_selection)))
+end, { description = "Acknowledge selection (v2: client-side only)" })
 
 -- Phase 2b: structured browser → hub action envelopes. Wraps the Phase-1
 -- command channel with semantic action ids so plugin-registered handlers
@@ -716,7 +730,11 @@ commands.register("reload_layout", function(client, sub_id, _command)
     -- Trigger proactive rebroadcast so subscribers render the new layout
     -- without waiting for the next state-change tick.
     local connections = require("handlers.connections")
-    local broadcast_ok, broadcast_err = pcall(connections.broadcast_ui_layout_trees)
+    -- Wire protocol v2: tree dedup is global, so invalidate first to force
+    -- the broadcast through.
+    local TreeSnapshot = require("lib.tree_snapshot")
+    pcall(TreeSnapshot.invalidate)
+    local broadcast_ok, broadcast_err = pcall(connections.broadcast_ui_tree_snapshots)
     if not broadcast_ok then
         log.warn(string.format("reload_layout: broadcast failed: %s", tostring(broadcast_err)))
     end

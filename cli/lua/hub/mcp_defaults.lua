@@ -950,7 +950,9 @@ mcp.tool("reload_layout", {
         error(string.format("Failed to reload layout: %s", tostring(err)))
     end
     local connections = require("handlers.connections")
-    local ok_broadcast, broadcast_err = pcall(connections.broadcast_ui_layout_trees)
+    local TreeSnapshot = require("lib.tree_snapshot")
+    pcall(TreeSnapshot.invalidate)
+    local ok_broadcast, broadcast_err = pcall(connections.broadcast_ui_tree_snapshots)
     if not ok_broadcast then
         return string.format("Layout reloaded, but broadcast failed: %s", tostring(broadcast_err))
     end

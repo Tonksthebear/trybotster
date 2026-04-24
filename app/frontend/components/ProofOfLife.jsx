@@ -1,11 +1,11 @@
 import React, { useState } from 'react'
 import { Button } from './catalyst/button'
-import { useWorkspaceStore } from '../store/workspace-store'
+import { useSessionStore } from '../store/entities'
 
 export default function ProofOfLife() {
   const [clicked, setClicked] = useState(false)
-  const surface = useWorkspaceStore((s) => s.surface)
-  const sessionCount = useWorkspaceStore((s) => s.sessionOrder.length)
+  const sessionCount = useSessionStore((s) => s.order.length)
+  const surface = 'panel'
 
   return (
     <div className="space-y-6 p-8 max-w-lg mx-auto">

@@ -232,6 +232,67 @@ export type DialogPropsV1 = {
   presentation?: UiPresentationV1
 }
 
+// ---------- Wire protocol v2 — surface tokens ----------
+
+/**
+ * Surface-density token for v2 composites. Distinct from
+ * `UiInteractionDensityV1` (compact / comfortable hit targets) — this is the
+ * public sidebar / panel variant from the Phase-1 web layout.
+ */
+export type UiSurfaceDensityV1 = 'sidebar' | 'panel'
+
+/** Grouping mode for `session_list`. */
+export type UiSessionListGroupingV1 = 'workspace' | 'flat'
+
+// ---------- Wire protocol v2 — composite primitive Props ----------
+
+export type SessionListPropsV1 = {
+  density?: UiValueV1<UiSurfaceDensityV1>
+  grouping?: UiSessionListGroupingV1
+  showNavEntries?: boolean
+}
+
+export type WorkspaceListPropsV1 = {
+  density?: UiValueV1<UiSurfaceDensityV1>
+}
+
+export type SpawnTargetListPropsV1 = {
+  onSelect?: UiActionV1
+  onRemove?: UiActionV1
+}
+
+export type WorktreeListPropsV1 = {
+  targetId: string
+}
+
+export type SessionRowPropsV1 = {
+  sessionUuid: string
+  density?: UiValueV1<UiSurfaceDensityV1>
+}
+
+export type HubRecoveryStatePropsV1 = Record<string, never>
+export type ConnectionCodePropsV1 = Record<string, never>
+
+export type NewSessionButtonPropsV1 = {
+  action: UiActionV1
+}
+
+// ---------- Wire protocol v2 — `$bind` sentinel ----------
+
+/**
+ * Wire shape of a `$bind` sentinel. May appear at any prop-value position.
+ * Resolved client-side against the per-entity-type stores before primitive
+ * dispatch. See `app/frontend/ui_contract/binding.tsx`.
+ */
+export type UiBindV1 = { $bind: string }
+
+/** Wire shape of a `$kind = "bind_list"` envelope. */
+export type UiBindListV1 = {
+  $kind: 'bind_list'
+  source: string
+  item_template: UiNodeV1
+}
+
 // ---------- Primitive type-name union ----------
 
 export type UiPrimitiveTypeV1 =
@@ -249,12 +310,35 @@ export type UiPrimitiveTypeV1 =
   | 'tree'
   | 'tree_item'
   | 'dialog'
+  // Wire protocol v2 composites
+  | 'session_list'
+  | 'workspace_list'
+  | 'spawn_target_list'
+  | 'worktree_list'
+  | 'session_row'
+  | 'hub_recovery_state'
+  | 'connection_code'
+  | 'new_session_button'
 
 // ---------- Narrow child-kind guards ----------
 
 export function isConditional(child: UiChildV1): child is UiConditionalV1 {
   return (child as UiConditionalV1).$kind === 'when' ||
     (child as UiConditionalV1).$kind === 'hidden'
+}
+
+/** Returns true when `value` is a `$bind` sentinel object. */
+export function isBindSentinel(value: unknown): value is UiBindV1 {
+  if (value === null || typeof value !== 'object') return false
+  const v = value as Record<string, unknown>
+  return Object.keys(v).length === 1 && typeof v.$bind === 'string'
+}
+
+/** Returns true when `value` is a `$kind = "bind_list"` envelope. */
+export function isBindList(value: unknown): value is UiBindListV1 {
+  if (value === null || typeof value !== 'object') return false
+  const v = value as Record<string, unknown>
+  return v.$kind === 'bind_list' && typeof v.source === 'string'
 }
 
 export function isResponsive<T>(

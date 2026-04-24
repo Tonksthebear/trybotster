@@ -58,14 +58,14 @@ if plugin_db_mod and type(plugin_db_mod.install) == "function" then
     plugin_db_mod.install()
 end
 
--- Phase 2b UI DSL transport libs. `lib.action` is the registry for
--- browser-emitted UI action envelopes; `lib.layout_broadcast` wraps
--- `web_layout.render(...)` with per-surface hash dedup. Exposing them as
--- globals keeps plugin authoring ergonomic (no boilerplate require).
+-- UI DSL transport libs. `lib.action` is the registry for browser-emitted
+-- UI action envelopes; `lib.tree_snapshot` (formerly layout_broadcast) wraps
+-- `web_layout.render(...)` with global per-(surface,subpath) hash dedup.
+-- Wire protocol v2 dropped per-subscription dedup — selection is client-side
+-- now, so the same tree ships to every subscriber and dedup is global.
 _G.action = safe_require("lib.action")
-safe_require("lib.layout_input")
 
--- Phase 4a: surface registry. Must load BEFORE `lib.layout_broadcast` so the
+-- Phase 4a: surface registry. Must load BEFORE `lib.tree_snapshot` so the
 -- broadcast module can see the registry, and BEFORE `handlers.connections`
 -- so the `surfaces_changed` hook subscription lands on the real table. The
 -- surfaces global lets plugin authors call `surfaces.register(name, opts)`
@@ -74,7 +74,102 @@ safe_require("lib.layout_input")
 _G.surfaces = safe_require("lib.surfaces")
 safe_require("hub.builtin_surfaces")
 
-safe_require("lib.layout_broadcast")
+safe_require("lib.tree_snapshot")
+
+-- ============================================================================
+-- Wire protocol v2 — entity broadcast registry
+-- ============================================================================
+-- Load EB and register every built-in entity type BEFORE handlers/connections
+-- so `Session:update` (which calls EB.patch) and the agent_created/deleted
+-- hooks (which call EB.upsert/remove) always land on a populated registry.
+-- Plugins can also register their own entity types after this point via
+-- `EB.register("<plugin>.<type>", { id_field, all, filter? })`.
+
+local EB = safe_require("lib.entity_broadcast")
+if EB then
+    local Session = require("lib.session")
+    local Agent = require("lib.agent")
+    local ClientSessionPayload = require("lib.client_session_payload")
+
+    EB.register("session", {
+        id_field = "session_uuid",
+        all = function()
+            return ClientSessionPayload.build_many(Session.all_info())
+        end,
+        filter = function(info)
+            return not Session.is_system_session(info)
+        end,
+    })
+    EB.register("workspace", {
+        id_field = "workspace_id",
+        all = function()
+            local Hub = require("lib.hub")
+            local ok, workspaces = pcall(function()
+                return Hub.get():list_workspaces()
+            end)
+            return ok and workspaces or {}
+        end,
+    })
+    EB.register("spawn_target", {
+        id_field = "target_id",
+        all = function()
+            local registry = rawget(_G, "spawn_targets")
+            if not registry or type(registry.list) ~= "function" then
+                return {}
+            end
+            local ok, listed = pcall(registry.list)
+            if not ok or type(listed) ~= "table" then return {} end
+            local out = {}
+            for _, target in ipairs(listed) do
+                local merged = target
+                if type(registry.inspect) == "function" and target.path then
+                    local inspect_ok, inspection = pcall(registry.inspect, target.path)
+                    if inspect_ok and type(inspection) == "table" then
+                        merged = {}
+                        for k, v in pairs(target) do merged[k] = v end
+                        for k, v in pairs(inspection) do merged[k] = v end
+                    end
+                end
+                out[#out + 1] = merged
+            end
+            return out
+        end,
+    })
+    EB.register("worktree", {
+        id_field = "worktree_path",
+        all = function()
+            local worktrees = hub.get_worktrees()
+            return worktrees or {}
+        end,
+    })
+    EB.register("hub", {
+        id_field = "hub_id",
+        all = function()
+            local hub_id = hub.server_id and hub.server_id() or nil
+            local recovery = state.get("connections.hub_recovery_state", { state = "starting" })
+            local payload = { hub_id = hub_id }
+            for k, v in pairs(recovery) do payload[k] = v end
+            return { payload }
+        end,
+    })
+    EB.register("connection_code", {
+        id_field = "hub_id",
+        all = function()
+            local hub_id = hub.server_id and hub.server_id() or nil
+            local code = state.get("connections.last_connection_code", nil)
+            -- state.get auto-inits nil default to `{}`, so `type == "table"`
+            -- is not sufficient — also check `next(code) ~= nil` so a hub
+            -- that never fired connection_code_ready / _error reports an
+            -- empty snapshot instead of a bare `{hub_id}` entity.
+            if not hub_id or type(code) ~= "table" or next(code) == nil then
+                return {}
+            end
+            local payload = { hub_id = hub_id }
+            for k, v in pairs(code) do payload[k] = v end
+            return { payload }
+        end,
+    })
+end
 
 -- Phase 4a demo plugin. The real plugin loader (ConfigResolver below) walks
 -- the device root and admitted spawn target repos; it does NOT scan
