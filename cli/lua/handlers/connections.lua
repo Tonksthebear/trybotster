@@ -135,7 +135,6 @@ EB.set_broadcaster(broadcast_frame_to_hub)
 --- which subpath each client renders (via the hub's resolve_subpath in
 --- tree_snapshot), so a deep-linked browser still gets its sub-page.
 local function broadcast_ui_tree_snapshots()
-    local TreeSnapshot = require("lib.tree_snapshot")
     local total_sent = 0
     for _, client in pairs(clients) do
         for sub_id, sub in pairs(client.subscriptions or {}) do
@@ -155,8 +154,6 @@ local function broadcast_ui_tree_snapshots()
         log.debug(string.format(
             "Broadcast ui_tree_snapshot (%d frame(s))", total_sent))
     end
-    -- Avoid lints when TreeSnapshot is unused — module preload only.
-    local _ = TreeSnapshot
 end
 
 local function broadcast_ui_route_registry()
