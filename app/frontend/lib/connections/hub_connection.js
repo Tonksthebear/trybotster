@@ -31,6 +31,7 @@
  */
 
 import { HubRoute } from "connections/hub_route";
+import { applyEntityFrame, isEntityFrame } from "../../store/entities";
 
 /**
  * Extract a `{ [surfaceName]: subpath }` prime map from the current
@@ -137,6 +138,36 @@ export class HubTransport extends HubRoute {
   handleMessage(message) {
     // Let base class handle handshake and health messages
     if (this.processMessage(message)) {
+      return;
+    }
+
+    // Wire protocol v2 — entity envelopes flow into the per-type Zustand
+    // stores BEFORE the v1 switch. Recognised frames stop here; v1 frames
+    // fall through to the legacy branches below. This dispatch is dormant
+    // in production until the cold-turkey switch in commit 7 makes the hub
+    // start emitting v2 frames; landing it now gives the wire flip a
+    // single integration point.
+    if (isEntityFrame(message?.type)) {
+      applyEntityFrame(message);
+      return;
+    }
+
+    // Wire protocol v2 — transient_event delivers ephemeral notifications
+    // (`pty_notification` and friends) that should fire toasts but never
+    // populate a store. Re-emit as the legacy `pty_notification` event so
+    // existing consumers keep working until commit 7 flips the wire.
+    if (message?.type === "transient_event") {
+      const eventType = message.event_type || message.eventType || "";
+      if (eventType === "pty_notification") {
+        this.emit("ptyNotification", {
+          title: message.title || "",
+          body: message.body || "",
+          sessionUuid: message.session_uuid || message.sessionUuid || null,
+        });
+      } else {
+        // Future transient event types — re-emit verbatim under the wire name.
+        this.emit("transientEvent", message);
+      }
       return;
     }
 
