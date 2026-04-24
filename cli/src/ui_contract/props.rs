@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use crate::ui_contract::node::{UiActionV1, UiValueV1};
 use crate::ui_contract::tokens::{
     UiAlign, UiBadgeSize, UiBadgeTone, UiButtonTone, UiButtonVariant, UiInteractionDensity,
-    UiJustify, UiPanelTone, UiPresentation, UiScrollAxis, UiSize, UiSpace, UiStackDirection,
-    UiStatusDotState, UiTextWeight, UiTone,
+    UiJustify, UiPanelTone, UiPresentation, UiScrollAxis, UiSessionListGrouping, UiSize, UiSpace,
+    UiStackDirection, UiStatusDotState, UiSurfaceDensity, UiTextWeight, UiTone,
 };
 
 /// `Stack` props.
@@ -250,6 +250,108 @@ pub struct TreeItemPropsV1 {
     /// Primary action emitted on activation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<UiActionV1>,
+}
+
+// =========================================================================
+// Wire protocol v2 composite primitives.
+//
+// These primitives are data-driven: they carry no children, no slots. Each
+// reads from the client-side entity store (session, workspace, …) and
+// expands into the same flat tree the v1 hub-rendered layout used to ship.
+// Both renderers (web React, ratatui TUI) consume the same wire shape.
+// =========================================================================
+
+/// `SessionList` props — the v2 replacement for the per-broadcast workspace
+/// surface tree. Reads sessions, workspaces, and presentation state from
+/// the client-side entity stores; renders the workspace-grouped tree, empty
+/// state, hosted-preview indicators, and the New Session button.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListPropsV1 {
+    /// Surface density (`sidebar` / `panel`). Defaults to `panel` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub density: Option<UiValueV1<UiSurfaceDensity>>,
+    /// Grouping mode. Defaults to `workspace` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grouping: Option<UiSessionListGrouping>,
+    /// When `true` (and density is `sidebar`), append plugin-registered nav
+    /// entries after the session tree. The default is the surface-aware
+    /// behaviour (`true` only for sidebar).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_nav_entries: Option<bool>,
+}
+
+/// `WorkspaceList` props — renders the bare list of workspaces (without the
+/// session children join). Used by surfaces that need a workspace switcher
+/// independent of the session tree.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceListPropsV1 {
+    /// Surface density (`sidebar` / `panel`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub density: Option<UiValueV1<UiSurfaceDensity>>,
+}
+
+/// `SpawnTargetList` props — renders the configured spawn targets.
+///
+/// `on_select` and `on_remove` are **action templates**: their `id` (and
+/// optionally `payload`) are emitted with the per-row `target_id` merged
+/// in by the renderer. When omitted, the composite uses default action ids
+/// (`botster.spawn_target.select`, `botster.spawn_target.remove`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnTargetListPropsV1 {
+    /// Action template emitted when a target row is activated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_select: Option<UiActionV1>,
+    /// Action template emitted when a target row's remove control fires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_remove: Option<UiActionV1>,
+}
+
+/// `WorktreeList` props — renders the worktrees for one spawn target.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeListPropsV1 {
+    /// Required: the spawn target whose worktrees should be listed.
+    pub target_id: String,
+}
+
+/// `SessionRow` props — single-row variant of `SessionList` for surfaces
+/// that need to render one specific session (e.g. a header row inside a
+/// session-scoped surface).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRowPropsV1 {
+    /// Required: the session_uuid the row should bind to.
+    pub session_uuid: String,
+    /// Surface density. Defaults to `panel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub density: Option<UiValueV1<UiSurfaceDensity>>,
+}
+
+/// `HubRecoveryState` props — renders the hub lifecycle banner. Reads the
+/// `hub` singleton entity (id = hub_id) from the client store; carries no
+/// props in the typical case.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HubRecoveryStatePropsV1 {}
+
+/// `ConnectionCode` props — renders the QR code + URL for hub pairing. Reads
+/// the `connection_code` singleton entity from the client store.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionCodePropsV1 {}
+
+/// `NewSessionButton` props — the "+" button that opens the new-session
+/// chooser. Lifted into its own composite so both renderers stay parity-free
+/// when the chooser UX evolves (button label / icon / preset-selector
+/// substitutions can land here without rebroadcasting trees).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewSessionButtonPropsV1 {
+    /// Required: the action emitted on press.
+    pub action: UiActionV1,
 }
 
 /// `Dialog` props.
@@ -672,6 +774,175 @@ mod tests {
         assert!(serde_json::from_value::<DialogPropsV1>(json!({ "open": true })).is_err());
         assert!(serde_json::from_value::<DialogPropsV1>(json!({ "title": "x" })).is_err());
     }
+
+    // ---------- SessionList ----------
+
+    #[test]
+    fn session_list_default_round_trip_is_empty_object() {
+        let v = serde_json::to_value(SessionListPropsV1::default()).expect("serialize");
+        assert_eq!(v, json!({}));
+    }
+
+    #[test]
+    fn session_list_round_trip_all_fields() {
+        let p = SessionListPropsV1 {
+            density: Some(UiValueV1::scalar(UiSurfaceDensity::Sidebar)),
+            grouping: Some(UiSessionListGrouping::Workspace),
+            show_nav_entries: Some(true),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(
+            v,
+            json!({ "density": "sidebar", "grouping": "workspace", "showNavEntries": true })
+        );
+        let back: SessionListPropsV1 = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn session_list_density_supports_responsive() {
+        let p = SessionListPropsV1 {
+            density: Some(UiValueV1::Responsive(UiResponsiveV1::Responsive {
+                width: Some(UiResponsiveWidthV1 {
+                    compact: Some(UiSurfaceDensity::Sidebar),
+                    expanded: Some(UiSurfaceDensity::Panel),
+                    ..Default::default()
+                }),
+                height: None,
+            })),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        let back: SessionListPropsV1 = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    // ---------- WorkspaceList ----------
+
+    #[test]
+    fn workspace_list_round_trip() {
+        let p = WorkspaceListPropsV1 {
+            density: Some(UiValueV1::scalar(UiSurfaceDensity::Panel)),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(v, json!({ "density": "panel" }));
+        let back: WorkspaceListPropsV1 = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    // ---------- SpawnTargetList ----------
+
+    #[test]
+    fn spawn_target_list_default_omits_actions() {
+        let v = serde_json::to_value(SpawnTargetListPropsV1::default()).expect("serialize");
+        assert_eq!(v, json!({}));
+    }
+
+    #[test]
+    fn spawn_target_list_round_trip_with_action_templates() {
+        let p = SpawnTargetListPropsV1 {
+            on_select: Some(UiActionV1::new("custom.target.select")),
+            on_remove: Some(UiActionV1::new("custom.target.remove")),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(
+            v,
+            json!({
+                "onSelect": { "id": "custom.target.select" },
+                "onRemove": { "id": "custom.target.remove" }
+            })
+        );
+        let back: SpawnTargetListPropsV1 = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    // ---------- WorktreeList ----------
+
+    #[test]
+    fn worktree_list_requires_target_id() {
+        let err = serde_json::from_value::<WorktreeListPropsV1>(json!({}));
+        assert!(err.is_err(), "WorktreeList must require target_id");
+    }
+
+    #[test]
+    fn worktree_list_round_trip() {
+        let p = WorktreeListPropsV1 {
+            target_id: "target-abc".into(),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(v, json!({ "targetId": "target-abc" }));
+        let back: WorktreeListPropsV1 = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    // ---------- SessionRow ----------
+
+    #[test]
+    fn session_row_requires_session_uuid() {
+        let err = serde_json::from_value::<SessionRowPropsV1>(json!({}));
+        assert!(err.is_err(), "SessionRow must require session_uuid");
+    }
+
+    #[test]
+    fn session_row_round_trip() {
+        let p = SessionRowPropsV1 {
+            session_uuid: "sess-abc".into(),
+            density: Some(UiValueV1::scalar(UiSurfaceDensity::Sidebar)),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(
+            v,
+            json!({ "sessionUuid": "sess-abc", "density": "sidebar" })
+        );
+        let back: SessionRowPropsV1 = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    // ---------- HubRecoveryState ----------
+
+    #[test]
+    fn hub_recovery_state_round_trip_is_empty_object() {
+        let p = HubRecoveryStatePropsV1::default();
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(v, json!({}));
+        let back: HubRecoveryStatePropsV1 = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    // ---------- ConnectionCode ----------
+
+    #[test]
+    fn connection_code_round_trip_is_empty_object() {
+        let p = ConnectionCodePropsV1::default();
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(v, json!({}));
+        let back: ConnectionCodePropsV1 = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    // ---------- NewSessionButton ----------
+
+    #[test]
+    fn new_session_button_requires_action() {
+        let err = serde_json::from_value::<NewSessionButtonPropsV1>(json!({}));
+        assert!(err.is_err(), "NewSessionButton must require action");
+    }
+
+    #[test]
+    fn new_session_button_round_trip() {
+        let p = NewSessionButtonPropsV1 {
+            action: UiActionV1::new("botster.session.create.request"),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(
+            v,
+            json!({ "action": { "id": "botster.session.create.request" } })
+        );
+        let back: NewSessionButtonPropsV1 = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    // ---------- Dialog ----------
 
     #[test]
     fn dialog_round_trip_with_presentation() {

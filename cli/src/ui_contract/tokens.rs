@@ -221,6 +221,37 @@ pub enum UiButtonTone {
     Danger,
 }
 
+/// Surface-density token for v2 composite primitives (`session_list`,
+/// `workspace_list`, `session_row`).
+///
+/// Distinct from [`UiInteractionDensity`] — that one is renderer-internal
+/// (compact / comfortable hit targets). This one is the public, cross-client
+/// surface variant: `sidebar` (xs typography, no workspace count) versus
+/// `panel` (sm typography, count visible). Both renderers honor it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiSurfaceDensity {
+    /// Sidebar density — tighter typography, no count.
+    Sidebar,
+    /// Panel density — standard typography, count shown.
+    Panel,
+}
+
+/// Grouping mode for `session_list`.
+///
+/// `workspace` (default) groups sessions under their workspace headers and
+/// renders an "ungrouped" bucket for sessions without a workspace.
+/// `flat` skips the grouping pass and renders one row per session in
+/// insertion order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiSessionListGrouping {
+    /// Group rows under workspace headers.
+    Workspace,
+    /// One row per session, no grouping.
+    Flat,
+}
+
 /// Dialog presentation policy (`UiPresentationV1`).
 ///
 /// `auto` lets the renderer pick the best native presentation based on the
