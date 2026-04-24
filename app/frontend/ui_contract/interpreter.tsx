@@ -15,6 +15,7 @@ import type {
 } from './types'
 import { isConditional } from './types'
 import { matchesCondition, useViewport } from './viewport'
+import { resolveBindings } from './binding'
 
 function renderChild(
   child: UiChildV1,
@@ -77,9 +78,28 @@ function renderInternal(
   return <Fragment key={node.id ?? key}>{element}</Fragment>
 }
 
-/** Walk a UiNodeV1 tree into React elements, driven by `ctx`. */
+/** Walk a UiNodeV1 tree into React elements, driven by `ctx`.
+ *
+ * Wire protocol v2: any `$bind` / `$kind = "bind_list"` sentinels in the
+ * tree are resolved via the entity stores BEFORE primitive dispatch — see
+ * `binding.tsx`. Trees that contain no sentinels are unaffected (the
+ * walker is a no-op on plain JSON). This snapshot resolution is independent
+ * of the per-component subscriptions some plugin layouts use via
+ * `BindResolver`.
+ *
+ * If the resolver throws (most likely because the tree contains a non-plain
+ * object whose getters throw — see ui-tree.test.jsx error-boundary tests),
+ * fall back to the unresolved node and let the downstream error boundary
+ * catch any render-time failure.
+ */
 export function renderNode(node: UiNodeV1, ctx: RenderContext): ReactElement {
-  const rendered = renderInternal(node, ctx, 'root')
+  let resolved: UiNodeV1
+  try {
+    resolved = resolveBindings(node) as UiNodeV1
+  } catch {
+    resolved = node
+  }
+  const rendered = renderInternal(resolved, ctx, 'root')
   return <>{rendered}</>
 }
 
