@@ -154,20 +154,13 @@ export class HubTransport extends HubRoute {
 
     // Wire protocol v2 — transient_event delivers ephemeral notifications
     // (`pty_notification` and friends) that should fire toasts but never
-    // populate a store. Re-emit as the legacy `pty_notification` event so
-    // existing consumers keep working until commit 7 flips the wire.
+    // populate a store. Drop silently for now: no browser consumer wires a
+    // toast today (the v1 consumer lived in workspace-store.js which was
+    // deleted in commit 8). This short-circuit stops the frame from
+    // falling through to the `default:` branch and emitting a generic
+    // `"message"` event that would only confuse future subscribers. When a
+    // toast UI ships, the consumer hook goes here.
     if (message?.type === "transient_event") {
-      const eventType = message.event_type || message.eventType || "";
-      if (eventType === "pty_notification") {
-        this.emit("ptyNotification", {
-          title: message.title || "",
-          body: message.body || "",
-          sessionUuid: message.session_uuid || message.sessionUuid || null,
-        });
-      } else {
-        // Future transient event types — re-emit verbatim under the wire name.
-        this.emit("transientEvent", message);
-      }
       return;
     }
 
