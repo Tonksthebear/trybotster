@@ -1,6 +1,5 @@
 import { HubManager } from 'connections'
 import { useUiPresentationStore } from '../store/ui-presentation-store'
-import { useSessionStore } from '../store/entities'
 import { useRouteRegistryStore } from '../store/route-registry-store'
 
 // Per-hub shared state
@@ -119,7 +118,6 @@ function doDisconnect(hubId, callerId) {
   state.hub.release()
   hubState.delete(hubId)
   chains.delete(hubId)
-  useRouteRegistryStore.getState().setSelectedSessionId?.(null)
   useUiPresentationStore.getState().setSelectedSessionId(null)
   useRouteRegistryStore.getState().clearRoutes(hubId)
 }
@@ -137,20 +135,12 @@ export function syncSelectionFromUrl(_hub) {
   const match = window.location.pathname.match(
     /\/hubs\/[^/]+\/sessions\/([^/]+)/
   )
-  if (!match) {
-    useUiPresentationStore.getState().setSelectedSessionId(null)
-    return
-  }
-
-  const sessionUuid = match[1]
-  const sessionStore = useSessionStore.getState()
-  if (sessionStore.byId[sessionUuid]) {
-    useUiPresentationStore.getState().setSelectedSessionId(sessionUuid)
-  } else {
-    // Session not in store yet — set anyway; the SessionList will pick it up
-    // when the entity_snapshot arrives.
-    useUiPresentationStore.getState().setSelectedSessionId(sessionUuid)
-  }
+  // When the URL doesn't name a session, clear selection; otherwise set it
+  // from the URL. The selection is applied eagerly even if the session isn't
+  // in the entity store yet — the SessionList picks it up once the next
+  // entity_snapshot arrives and the byId[uuid] lookup succeeds.
+  const sessionUuid = match ? match[1] : null
+  useUiPresentationStore.getState().setSelectedSessionId(sessionUuid)
 }
 
 function resolveHubManager() {
