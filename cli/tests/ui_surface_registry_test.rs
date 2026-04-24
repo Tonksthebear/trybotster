@@ -157,7 +157,6 @@ fn lock_env() -> std::sync::MutexGuard<'static, ()> {
 // surfaces.lua API
 // -------------------------------------------------------------------------
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn surfaces_register_stores_entry_and_list_returns_it() {
     let _lock = lock_env();
@@ -187,7 +186,6 @@ fn surfaces_register_stores_entry_and_list_returns_it() {
     assert_eq!(list_len, 1);
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn surfaces_list_is_deterministically_ordered() {
     let _lock = lock_env();
@@ -227,7 +225,6 @@ fn surfaces_list_is_deterministically_ordered() {
     assert_eq!(ordered, vec!["middle", "zeta", "alpha", "last"]);
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn surfaces_unregister_removes_entry() {
     let _lock = lock_env();
@@ -254,7 +251,6 @@ fn surfaces_unregister_removes_entry() {
     assert!(matches!(get_after, Value::Nil));
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn surfaces_path_derives_base_from_name_and_returns_full_url() {
     let _lock = lock_env();
@@ -283,7 +279,6 @@ fn surfaces_path_derives_base_from_name_and_returns_full_url() {
     assert_eq!(path, "/hubs/hub-test/kanban");
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn surfaces_path_interpolates_named_params() {
     let _lock = lock_env();
@@ -306,7 +301,6 @@ fn surfaces_path_interpolates_named_params() {
     assert_eq!(url, "/hubs/hub-test/kanban/board/42");
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn surfaces_path_honours_legacy_path_escape_hatch() {
     // Regression guard for built-in surfaces like `workspace_panel` that
@@ -336,7 +330,6 @@ fn surfaces_path_honours_legacy_path_escape_hatch() {
     assert_eq!(deep, "/hubs/hub-test/weird/thing/sub");
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn surfaces_path_returns_nil_for_unknown_surface() {
     let _lock = lock_env();
@@ -350,7 +343,6 @@ fn surfaces_path_returns_nil_for_unknown_surface() {
     assert!(matches!(value, Value::Nil));
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn surfaces_changed_hook_fires_on_register_and_unregister() {
     let _lock = lock_env();
@@ -382,7 +374,6 @@ fn surfaces_changed_hook_fires_on_register_and_unregister() {
 // web_layout.render falls back to surfaces.render_node
 // -------------------------------------------------------------------------
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn web_layout_render_falls_back_to_surfaces_registry() {
     let _lock = lock_env();
@@ -426,7 +417,6 @@ fn web_layout_render_falls_back_to_surfaces_registry() {
     );
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn web_layout_render_missing_surface_returns_error_fallback() {
     let _lock = lock_env();
@@ -452,8 +442,8 @@ fn web_layout_render_missing_surface_returns_error_fallback() {
 // Multi-surface broadcast: layout_broadcast iterates the registry
 // -------------------------------------------------------------------------
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn layout_broadcast_emits_one_frame_per_registered_surface() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -493,8 +483,8 @@ fn layout_broadcast_emits_one_frame_per_registered_surface() {
     assert_eq!(names, vec!["alpha", "beta"]);
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn layout_broadcast_dedups_per_subscription_per_surface() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -529,8 +519,8 @@ fn layout_broadcast_dedups_per_subscription_per_surface() {
     );
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn unregister_purges_per_subscription_dedup_baselines() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -605,8 +595,8 @@ fn unregister_purges_per_subscription_dedup_baselines() {
     );
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn layout_broadcast_reemits_when_one_surface_changes() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -651,7 +641,6 @@ fn layout_broadcast_reemits_when_one_surface_changes() {
 // Route registry payload
 // -------------------------------------------------------------------------
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn route_registry_payload_includes_routable_surfaces_and_excludes_pathless() {
     let _lock = lock_env();
@@ -757,7 +746,6 @@ const DEMO_GATE_LUA: &str = r#"
     return surfaces.get("hello") ~= nil
 "#;
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn demo_plugin_registered_when_botster_dev_set() {
     let _lock = lock_env();
@@ -775,7 +763,6 @@ fn demo_plugin_registered_when_botster_dev_set() {
     });
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn demo_plugin_registered_when_botster_env_test() {
     let _lock = lock_env();
@@ -793,7 +780,6 @@ fn demo_plugin_registered_when_botster_env_test() {
     });
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn demo_plugin_skipped_when_neither_env_var_set() {
     let _lock = lock_env();
@@ -811,7 +797,6 @@ fn demo_plugin_skipped_when_neither_env_var_set() {
     });
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn demo_plugin_skipped_when_production_like_env_vars_set() {
     let _lock = lock_env();
@@ -830,7 +815,6 @@ fn demo_plugin_skipped_when_production_like_env_vars_set() {
     });
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn route_registry_includes_hide_from_nav_entries_with_flag() {
     let _lock = lock_env();
@@ -879,7 +863,6 @@ fn route_registry_includes_hide_from_nav_entries_with_flag() {
 // Phase 4b — sub-routes, params, ctx, subpath re-render
 // -------------------------------------------------------------------------
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn multi_route_dispatcher_routes_subpaths_and_extracts_params() {
     let _lock = lock_env();
@@ -913,7 +896,6 @@ fn multi_route_dispatcher_routes_subpaths_and_extracts_params() {
     assert_eq!(settings_hit, "settings");
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn multi_route_dispatcher_renders_sub_404_for_unknown_subpath() {
     let _lock = lock_env();
@@ -944,7 +926,6 @@ fn multi_route_dispatcher_renders_sub_404_for_unknown_subpath() {
     );
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn ctx_path_builds_full_hub_scoped_url_from_subpath_template() {
     let _lock = lock_env();
@@ -980,7 +961,6 @@ fn ctx_path_builds_full_hub_scoped_url_from_subpath_template() {
     assert_eq!(missing_param, "/hubs/hub-test/kanban/board/:id");
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn ctx_surface_and_base_path_are_exposed_to_sub_route_render() {
     let _lock = lock_env();
@@ -1010,7 +990,6 @@ fn ctx_surface_and_base_path_are_exposed_to_sub_route_render() {
     assert_eq!(hub_id, "hub-test");
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn backwards_compat_top_level_render_wraps_in_single_route() {
     let _lock = lock_env();
@@ -1048,7 +1027,6 @@ fn backwards_compat_top_level_render_wraps_in_single_route() {
     );
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn register_rejects_both_routes_and_top_level_render() {
     let _lock = lock_env();
@@ -1081,7 +1059,6 @@ fn register_rejects_both_routes_and_top_level_render() {
     }
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn path_segment_matching_escapes_pattern_metacharacters() {
     // A literal "/" in a segment is fine, but any Lua-pattern metachar (".")
@@ -1125,7 +1102,6 @@ fn path_segment_matching_escapes_pattern_metacharacters() {
     );
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn route_pattern_matches_trailing_slash_variants() {
     let _lock = lock_env();
@@ -1152,8 +1128,8 @@ fn route_pattern_matches_trailing_slash_variants() {
     assert_eq!(with_slash, "7");
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn layout_broadcast_threads_client_subpath_into_render_state() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -1196,8 +1172,8 @@ fn layout_broadcast_threads_client_subpath_into_render_state() {
     assert_eq!(rendered_tag, "board");
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn layout_broadcast_targeted_only_surface_re_renders_one_surface() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -1232,7 +1208,6 @@ fn layout_broadcast_targeted_only_surface_re_renders_one_surface() {
     assert_eq!(emitted, vec!["beta"]);
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn route_registry_payload_carries_base_path_and_sub_routes() {
     let _lock = lock_env();
@@ -1277,7 +1252,6 @@ fn route_registry_payload_carries_base_path_and_sub_routes() {
     assert_eq!(sub_paths, vec!["/", "/board/:id", "/settings"]);
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn demo_hello_plugin_registers_with_two_routes() {
     // Regression guard for `plugins/hello_surface/plugin.lua` — Phase 4b
@@ -1332,7 +1306,6 @@ fn assert_not_error_fallback(json: &serde_json::Value, surface_name: &str) {
     );
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn hello_plugin_home_renders_through_web_layout() {
     let _lock = lock_env();
@@ -1360,7 +1333,6 @@ fn hello_plugin_home_renders_through_web_layout() {
     });
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn hello_plugin_details_renders_with_param_through_web_layout() {
     let _lock = lock_env();
@@ -1391,7 +1363,6 @@ fn hello_plugin_details_renders_with_param_through_web_layout() {
     });
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn hello_plugin_default_path_falls_through_to_home() {
     // When the browser hasn't yet announced its subpath, the hub renders
@@ -1422,7 +1393,6 @@ fn hello_plugin_default_path_falls_through_to_home() {
     });
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn hello_plugin_unknown_subpath_renders_sub_404_not_error_fallback() {
     // A known surface with an unknown subpath is NOT the same as an unknown
@@ -1472,7 +1442,6 @@ fn hello_plugin_unknown_subpath_renders_sub_404_not_error_fallback() {
 //   * If the surface is GENUINELY missing from both sources, the error
 //     tree still says "no layout surface registered" (regression guard).
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn render_throw_in_plugin_surface_yields_error_fallback_with_real_error() {
     let _lock = lock_env();
@@ -1515,7 +1484,6 @@ fn render_throw_in_plugin_surface_yields_error_fallback_with_real_error() {
     );
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn missing_surface_still_emits_no_layout_surface_registered() {
     // Negative guard: a future refactor that collapses error paths must not
@@ -1555,8 +1523,8 @@ fn missing_surface_still_emits_no_layout_surface_registered() {
 // client's current subpath so per-sub-route data-loading belongs where it
 // belongs.
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn input_builder_receives_route_ctx_with_subpath_and_matched_params() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -1620,8 +1588,8 @@ fn input_builder_receives_route_ctx_with_subpath_and_matched_params() {
     );
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn legacy_two_arg_input_builder_still_works_with_route_ctx_fanout() {
     // Backwards compatibility: plugins that declared an input_builder BEFORE
     // this change took `(client, sub_id)`. Lua tolerates the extra
@@ -1667,8 +1635,8 @@ fn legacy_two_arg_input_builder_still_works_with_route_ctx_fanout() {
     );
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn input_builder_can_branch_on_route_ctx_params_for_different_data() {
     // Integration test of the motivating use case: a plugin that loads
     // different data based on the matched sub-route param. We use a
@@ -1742,7 +1710,6 @@ fn input_builder_can_branch_on_route_ctx_params_for_different_data() {
     assert_eq!(board_title, "The Ultimate Board");
 }
 
-#[ignore = "v1 layout_broadcast / layout_input behavior — replaced by tree_snapshot + entity_broadcast in v2 (commit 7); test rewritten in commit 9"]
 #[test]
 fn surfaces_resolve_route_returns_matched_route_and_params() {
     // Unit-level coverage for the new public helper that layout_broadcast
