@@ -29,7 +29,7 @@
 //! `timer.after` and `timer.every` return a timer ID string.
 //! `timer.cancel` returns `true` if the timer was found, `false` otherwise.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -71,6 +71,15 @@ pub struct TimerEntries {
     hub_event_tx: Option<crate::hub::events::HubEventTx>,
     /// Tokio runtime handle for spawning timer tasks from sync Lua closures.
     tokio_handle: Option<tokio::runtime::Handle>,
+}
+
+fn timer_perf_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BOTSTER_LUA_PERF")
+            .map(|value| value != "0" && !value.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 impl Default for TimerEntries {
@@ -468,6 +477,9 @@ pub fn poll_timers(lua: &Lua, registry: &TimerRegistry) -> usize {
 /// The registry lock is released before firing the Lua callback, allowing
 /// the callback to call `timer.cancel()` or create new timers.
 pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &str) {
+    let perf = timer_perf_enabled();
+    let total_started = Instant::now();
+
     // Phase 1: look up entry under lock, clone callback, handle one-shot.
     let callback_key = {
         let mut entries = registry.lock().expect("TimerEntries mutex poisoned");
@@ -508,6 +520,7 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
 
         cloned_key
     };
+    let lookup_done = Instant::now();
     // Lock released — callback can safely call timer functions.
 
     // Phase 2: fire callback.
@@ -516,6 +529,7 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
         callback.call::<()>(())?;
         Ok(())
     })();
+    let callback_done = Instant::now();
 
     if let Err(e) = result {
         log::warn!("[timer] Callback error for {timer_id}: {e}");
@@ -531,6 +545,18 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
         for (_, entry) in removed {
             let _ = lua.remove_registry_value(entry.callback_key);
         }
+    }
+    let cleanup_done = Instant::now();
+
+    if perf {
+        log::info!(
+            "[PERF][lua] timer_fired id={} lookup_us={} callback_us={} cleanup_us={} total_us={}",
+            timer_id,
+            lookup_done.duration_since(total_started).as_micros(),
+            callback_done.duration_since(lookup_done).as_micros(),
+            cleanup_done.duration_since(callback_done).as_micros(),
+            cleanup_done.duration_since(total_started).as_micros()
+        );
     }
 }
 
