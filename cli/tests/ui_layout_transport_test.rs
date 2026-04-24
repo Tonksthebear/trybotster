@@ -336,6 +336,7 @@ fn layout_broadcast_dedups_unchanged_renders() {
 }
 
 #[test]
+#[ignore = "v1 selection-baked-in-tree behavior — selection moved to the client in v2 (commit 7); ui_tree_snapshot is no longer per-subscription. Replaced by entity-store-driven selection tests in commit 9."]
 fn layout_broadcast_reemits_when_selection_changes() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -813,6 +814,7 @@ fn ui_action_v1_command_registers_and_routes_through_action_dispatch() {
 // -------------------------------------------------------------------------
 
 #[test]
+#[ignore = "v1 per-subscription dedup — selection moved to client in v2 (commit 7); dedup is global on (surface, subpath). Test rewritten in commit 9."]
 fn layout_broadcast_versions_diverge_per_subscription() {
     // Two subscriptions on the same hub with different selections must
     // produce different version hashes for the same logical surface. If

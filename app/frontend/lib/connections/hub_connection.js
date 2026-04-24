@@ -172,92 +172,33 @@ export class HubTransport extends HubRoute {
     }
 
     switch (message.type) {
-      case "agents":
-      case "agent_list": {
-        // Handle Lua's empty table {} serializing as object instead of array
-        const agents = Array.isArray(message.agents) ? message.agents : [];
-        const workspaces = Array.isArray(message.workspaces) ? message.workspaces : [];
-        this._agents = agents;
-        this._openWorkspaces = workspaces;
-        this._hasAgentListSnapshot = true;
-        this._hasOpenWorkspaceListSnapshot = true;
-        this.emit("agentList", agents);
-        this.emit("openWorkspaceList", workspaces);
-        this.emit("workspaceList", workspaces);
-        // Sync app badge with notification count from agent list
-        this.#updateAppBadge(agents);
-        break;
-      }
-
-      case "worktrees":
-      case "worktree_list":
-        // Handle Lua's empty table {} serializing as object instead of array
-        this.emit("worktreeList", {
-          targetId: message.target_id || null,
-          worktrees: Array.isArray(message.worktrees) ? message.worktrees : [],
-        });
-        break;
-
-      case "workspace_list":
-        this._hubWorkspaces = Array.isArray(message.workspaces) ? message.workspaces : [];
-        this._hasHubWorkspaceListSnapshot = true;
-        this.emit("hubWorkspaceList", this._hubWorkspaces);
-        this.emit("workspaceList", this._hubWorkspaces);
-        break;
-
-      case "open_workspace_list":
-        this._openWorkspaces = Array.isArray(message.workspaces) ? message.workspaces : [];
-        this._hasOpenWorkspaceListSnapshot = true;
-        this.emit("openWorkspaceList", this._openWorkspaces);
-        break;
-
-      case "spawn_target_list":
-        this._spawnTargets = Array.isArray(message.targets) ? message.targets : [];
-        this._hasSpawnTargetListSnapshot = true;
-        this.emit("spawnTargetList", this._spawnTargets);
-        break;
-
       case "spawn_target_feedback":
+        // Spawn-target add/remove confirmation toast — kept (not data, just
+        // user feedback for an in-flight request).
         this.emit("spawnTargetFeedback", {
           tone: message.tone || "neutral",
           message: message.message || "",
         });
         break;
 
-      case "agent_created":
-        this.emit("agentCreated", message);
-        break;
-
-      case "agent_deleted":
-        this.emit("agentDeleted", message);
-        break;
-
-      case "connection_code":
-        this.emit("connectionCode", message);
-        break;
-
-      case "hub_recovery_state":
-        this._hubRecoveryState = message;
-        this._hasHubRecoveryStateSnapshot = true;
-        this.emit("hubRecoveryState", message);
-        if (message.state === "ready") this.emit("hubReady", message);
-        break;
-
+      case "ui_route_registry":
       case "ui_route_registry_v1":
-        // Phase 4a: hub-authored registry of routable browser surfaces.
-        // Cached so a subscriber acquiring the hub after the initial frame
-        // still sees the registry without a re-broadcast. Replaces wholesale
-        // on each frame — the hub is the source of truth.
+        // Wire protocol v2 renamed `_v1` → bare; both names accepted in
+        // case a stale Lua chain still emits the legacy name. Cached so a
+        // subscriber acquiring the hub after the initial frame still sees
+        // the registry without a re-broadcast. Replaces wholesale on each
+        // frame — the hub is the source of truth.
         this._uiRouteRegistry = Array.isArray(message.routes) ? message.routes : [];
         this._hasUiRouteRegistrySnapshot = true;
         this.emit("uiRouteRegistry", this._uiRouteRegistry);
         break;
 
-      case "hub_ready":
-        this.emit("hubReady", message);
-        break;
-
       case "agent_config":
+        // The "agent config" RPC response (target-scoped list of available
+        // agent/accessory/workspace templates) stays as a one-shot wire
+        // frame because it's not entity-shaped — it's a discovery response
+        // for the new-session chooser. Future iteration may turn it into
+        // a `<plugin>.agent_template` entity type.
         this.emit("agentConfig", {
           targetId: message.target_id || null,
           agents: Array.isArray(message.agents) ? message.agents : [],

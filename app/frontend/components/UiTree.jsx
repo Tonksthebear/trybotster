@@ -13,7 +13,10 @@ import {
   createTransportDispatch,
 } from '../ui_contract'
 import { getHub } from '../lib/hub-bridge'
-import { useWorkspaceStore } from '../store/workspace-store'
+// Wire protocol v2: useWorkspaceStore is gone. Composite primitives
+// subscribe to ui-presentation-store / entity stores directly. The
+// decoration helpers below survive only as test-importable pure functions
+// (the v2 tree no longer runs them through decoratedTree).
 import { useSurfaceReadinessStore } from '../store/surface-readiness-store'
 
 // ---------------------------------------------------------------------------
@@ -318,33 +321,18 @@ export default function UiTree({
   const [tree, setTree] = useState(initialTree)
   const [transport, setTransport] = useState(null)
 
-  // Browser-local ephemeral UI state — two independent decorators stack
-  // on top of the hub-authored tree before it reaches the interpreter:
+  // Wire protocol v2: collapse + nav-selection state moved into the
+  // composite primitives themselves. `<SessionList>` reads collapse state
+  // from `useUiPresentationStore.collapsedWorkspaceIds`; the nav-selection
+  // highlight lives inside the (future) `NavTreeItem` wrapper. The hub
+  // tree no longer needs decoration passes — it ships the same composite
+  // bundle to every subscriber.
   //
-  //   1. `applyCollapseOverrides` — workspace collapse/expand state owned
-  //      by `useWorkspaceStore.collapsedWorkspaceIds`. Triggered by the
-  //      LOCAL_ONLY `botster.workspace.toggle` action.
-  //   2. `applyNavSelectionOverrides` — Phase 4a nav highlight for the
-  //      current URL, subscribed via `useSyncExternalStore` on popstate
-  //      so `botster.nav.open` pushState updates re-render automatically.
-  //
-  // Both are pure functions; order is fixed (collapse first, then
-  // selection) because selection walks the same node shape collapse
-  // produces and never depends on collapse state. Malformed trees must
-  // still reach `UiTreeErrorBoundary` — if decoration blows up, pass the
-  // original tree through and let the interpreter's render routes React
-  // to the error boundary.
-  const collapsedIds = useWorkspaceStore((s) => s.collapsedWorkspaceIds)
-  const currentPathname = useCurrentPathname()
-  const decoratedTree = useMemo(() => {
-    if (!tree) return tree
-    try {
-      const collapsed = applyCollapseOverrides(tree, collapsedIds)
-      return applyNavSelectionOverrides(collapsed, hubId ?? '', currentPathname)
-    } catch {
-      return tree
-    }
-  }, [tree, collapsedIds, hubId, currentPathname])
+  // We still subscribe to URL changes so URL-driven nav re-renders (e.g.
+  // selection following a back-button press); the subscription is a no-op
+  // for layouts that don't depend on URL state.
+  const _currentPathname = useCurrentPathname()
+  const decoratedTree = tree
 
   // Reset tree + transport synchronously on hubId change. Without this, a
   // hub switch (A → B) keeps the old tree visible until B's first broadcast

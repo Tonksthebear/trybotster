@@ -603,8 +603,13 @@ function M.build_input(name, client, sub_id, route_ctx)
     if entry.input_builder then
         return entry.input_builder(client, sub_id, route_ctx)
     end
-    local LayoutInput = require("lib.layout_input")
-    return LayoutInput.build_for_subscription(client, sub_id)
+    -- Wire protocol v2 default: trees no longer carry per-client selection
+    -- or pre-fetched session lists. The composite primitives (session_list,
+    -- workspace_list, …) read from the client-side entity stores. Built-in
+    -- surfaces without an input_builder receive only the hub identity.
+    return {
+        hub_id = hub.server_id and hub.server_id() or nil,
+    }
 end
 
 --- Resolve the compiled route + params for `subpath` against surface `name`.

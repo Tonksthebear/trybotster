@@ -235,7 +235,11 @@ _event_sub = events.on("sessions_discovered", function(data)
                 end
             end
             HostedPreview.reconcile()
-            connections.broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+            -- Wire protocol v2: agent_created hook handler emits
+            -- entity_upsert(session) per recovered session via EB. No
+            -- separate agent_list broadcast needed.
+            local _ = connections
+            local _ = Agent
         end)
 
         if not ok then

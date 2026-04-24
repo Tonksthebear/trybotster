@@ -611,11 +611,13 @@ local RUNTIME_ONLY_FIELDS = {
 
 function Session:update(fields)
     local changed = false
+    local changed_fields = {}
     local needs_sync = false
     for k, v in pairs(fields) do
         if self[k] ~= v then
             self[k] = v
             changed = true
+            changed_fields[k] = v
             if not RUNTIME_ONLY_FIELDS[k] then
                 needs_sync = true
             end
@@ -625,7 +627,21 @@ function Session:update(fields)
         if needs_sync then
             self:_sync_session_manifest()
         end
-        hooks.notify("session_updated", { session_uuid = self.session_uuid })
+        hooks.notify("session_updated", { session_uuid = self.session_uuid, fields = changed_fields })
+
+        -- Wire protocol v2 — emit a single entity_patch frame per
+        -- Session:update covering exactly the changed fields plus any
+        -- re-derived ones (display_name when title/agent_name/branch_name
+        -- moved). System sessions stay off the wire — the EB filter on
+        -- the `session` registration drops them.
+        local EB = require("lib.entity_broadcast")
+        local ClientSessionPayload = require("lib.client_session_payload")
+        if EB.is_registered("session") and not Session.is_system_session(self) then
+            local patch = ClientSessionPayload.project_fields(changed_fields, self)
+            if next(patch) ~= nil then
+                EB.patch("session", self.session_uuid, patch)
+            end
+        end
     end
 end
 
