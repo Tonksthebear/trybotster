@@ -4,7 +4,7 @@ import { cleanup, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import DeleteSessionDialog from '../components/dialogs/DeleteSessionDialog'
 import { useDialogStore } from '../store/dialog-store'
-import { useWorkspaceStore } from '../store/workspace-store'
+import { useSessionStore } from '../store/entities'
 
 const mockHub = {
   deleteAgent: vi.fn(),
@@ -38,16 +38,11 @@ function setDialogState(sessionId = 'sess-1') {
 }
 
 function setSession(session) {
-  useWorkspaceStore.setState({
-    sessionsById: { [session.id]: session },
-    sessionOrder: [session.id],
-    workspacesById: {},
-    workspaceOrder: [],
-    ungroupedSessionIds: [session.id],
-    selectedSessionId: session.id,
-    collapsedWorkspaceIds: new Set(),
-    connected: true,
-    surface: 'agent_list',
+  // Wire protocol v2: seed the session entity store directly.
+  useSessionStore.setState({
+    byId: { [session.id]: session },
+    order: [session.id],
+    snapshotSeq: 1,
   })
 }
 
@@ -55,17 +50,7 @@ describe('DeleteSessionDialog', () => {
   beforeEach(() => {
     mockHub.deleteAgent.mockReset()
     useDialogStore.setState({ activeDialog: null, context: {} })
-    useWorkspaceStore.setState({
-      sessionsById: {},
-      sessionOrder: [],
-      workspacesById: {},
-      workspaceOrder: [],
-      ungroupedSessionIds: [],
-      selectedSessionId: null,
-      collapsedWorkspaceIds: new Set(),
-      connected: false,
-      surface: 'agent_list',
-    })
+    useSessionStore.getState()._reset()
   })
 
   afterEach(() => {

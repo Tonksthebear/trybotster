@@ -443,6 +443,7 @@ fn web_layout_render_missing_surface_returns_error_fallback() {
 // -------------------------------------------------------------------------
 
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn layout_broadcast_emits_one_frame_per_registered_surface() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -483,6 +484,7 @@ fn layout_broadcast_emits_one_frame_per_registered_surface() {
 }
 
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn layout_broadcast_dedups_per_subscription_per_surface() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -518,6 +520,7 @@ fn layout_broadcast_dedups_per_subscription_per_surface() {
 }
 
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn unregister_purges_per_subscription_dedup_baselines() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -593,6 +596,7 @@ fn unregister_purges_per_subscription_dedup_baselines() {
 }
 
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn layout_broadcast_reemits_when_one_surface_changes() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -1125,6 +1129,7 @@ fn route_pattern_matches_trailing_slash_variants() {
 }
 
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn layout_broadcast_threads_client_subpath_into_render_state() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -1168,6 +1173,7 @@ fn layout_broadcast_threads_client_subpath_into_render_state() {
 }
 
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn layout_broadcast_targeted_only_surface_re_renders_one_surface() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -1518,6 +1524,7 @@ fn missing_surface_still_emits_no_layout_surface_registered() {
 // belongs.
 
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn input_builder_receives_route_ctx_with_subpath_and_matched_params() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -1582,6 +1589,7 @@ fn input_builder_receives_route_ctx_with_subpath_and_matched_params() {
 }
 
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn legacy_two_arg_input_builder_still_works_with_route_ctx_fanout() {
     // Backwards compatibility: plugins that declared an input_builder BEFORE
     // this change took `(client, sub_id)`. Lua tolerates the extra
@@ -1628,6 +1636,7 @@ fn legacy_two_arg_input_builder_still_works_with_route_ctx_fanout() {
 }
 
 #[test]
+#[ignore = "Architecturally dead under wire v2: layout_broadcast/per-subscription dedup + input_builder semantics were removed in commit 7. Replaced by global (surface,subpath) dedup in lib.tree_snapshot (no per-sub state to test)."]
 fn input_builder_can_branch_on_route_ctx_params_for_different_data() {
     // Integration test of the motivating use case: a plugin that loads
     // different data based on the matched sub-route param. We use a

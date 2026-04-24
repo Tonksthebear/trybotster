@@ -625,6 +625,46 @@ const renderDialog: PrimitiveRenderer = ({ props, slots, ctx }) => {
   )
 }
 
+// ---------- Wire protocol v2 composite adapters ----------
+//
+// Composite renderers live in `components/composites/` so they own their own
+// CSS / Zustand subscriptions. The thin adapters below pull props out of the
+// generic `PrimitiveRendererArgs` shape and forward them as typed props.
+
+import { SessionList } from '../components/composites/SessionList'
+import { WorkspaceList } from '../components/composites/WorkspaceList'
+import { SpawnTargetList } from '../components/composites/SpawnTargetList'
+import { WorktreeList } from '../components/composites/WorktreeList'
+import { SessionRow } from '../components/composites/SessionRow'
+import { HubRecoveryState } from '../components/composites/HubRecoveryState'
+import { ConnectionCode } from '../components/composites/ConnectionCode'
+import { NewSessionButton } from '../components/composites/NewSessionButton'
+
+const renderSessionList: PrimitiveRenderer = ({ props, ctx }) => (
+  <SessionList {...(props as any)} ctx={ctx} />
+)
+const renderWorkspaceList: PrimitiveRenderer = ({ props, ctx }) => (
+  <WorkspaceList {...(props as any)} ctx={ctx} />
+)
+const renderSpawnTargetList: PrimitiveRenderer = ({ props, ctx }) => (
+  <SpawnTargetList {...(props as any)} ctx={ctx} />
+)
+const renderWorktreeList: PrimitiveRenderer = ({ props, ctx }) => (
+  <WorktreeList {...(props as any)} ctx={ctx} />
+)
+const renderSessionRow: PrimitiveRenderer = ({ props, ctx }) => (
+  <SessionRow {...(props as any)} ctx={ctx} />
+)
+const renderHubRecoveryState: PrimitiveRenderer = ({ props, ctx }) => (
+  <HubRecoveryState {...(props as any)} ctx={ctx} />
+)
+const renderConnectionCode: PrimitiveRenderer = ({ props, ctx }) => (
+  <ConnectionCode {...(props as any)} ctx={ctx} />
+)
+const renderNewSessionButton: PrimitiveRenderer = ({ props, ctx }) => (
+  <NewSessionButton {...(props as any)} ctx={ctx} />
+)
+
 // ---------- Registry ----------
 
 export const PRIMITIVE_REGISTRY: Record<string, PrimitiveRenderer> = {
@@ -642,4 +682,13 @@ export const PRIMITIVE_REGISTRY: Record<string, PrimitiveRenderer> = {
   tree: renderTree,
   tree_item: renderTreeItem,
   dialog: renderDialog,
+  // Wire protocol v2 composites — data-driven, no children/slots on the wire.
+  session_list: renderSessionList,
+  workspace_list: renderWorkspaceList,
+  spawn_target_list: renderSpawnTargetList,
+  worktree_list: renderWorktreeList,
+  session_row: renderSessionRow,
+  hub_recovery_state: renderHubRecoveryState,
+  connection_code: renderConnectionCode,
+  new_session_button: renderNewSessionButton,
 }

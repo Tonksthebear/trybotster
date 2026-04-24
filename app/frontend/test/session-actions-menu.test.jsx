@@ -21,7 +21,7 @@ vi.mock('../lib/actions', () => ({
 }))
 
 import * as hubBridge from '../lib/hub-bridge'
-import { useWorkspaceStore } from '../store/workspace-store'
+import { useSessionStore } from '../store/entities'
 import UiTree, { useUiTreeDispatch } from '../components/UiTree'
 import SessionActionsMenu from '../components/workspace/SessionActionsMenu'
 
@@ -61,10 +61,9 @@ beforeEach(() => {
   vi.spyOn(hubBridge, 'getHub').mockReturnValue({
     transport: fakeTransport,
   })
-  // Seed the workspace store with a session so the interceptor can resolve
-  // availability flags (canPreview, etc.).
-  useWorkspaceStore.setState({
-    sessionsById: {
+  // Wire protocol v2: seed the session entity store directly.
+  useSessionStore.setState({
+    byId: {
       's-1': {
         id: 's-1',
         session_uuid: 'u-1',
@@ -73,21 +72,15 @@ beforeEach(() => {
         hosted_preview: { status: 'inactive' },
       },
     },
-    sessionOrder: ['s-1'],
+    order: ['s-1'],
+    snapshotSeq: 1,
   })
 })
 
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
-  useWorkspaceStore.setState({
-    sessionsById: {},
-    sessionOrder: [],
-    workspacesById: {},
-    workspaceOrder: [],
-    ungroupedSessionIds: [],
-    selectedSessionId: null,
-  })
+  useSessionStore.getState()._reset()
 })
 
 describe('<SessionActionsMenu> interceptor', () => {

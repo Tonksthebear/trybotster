@@ -224,10 +224,13 @@ _event_sub = events.on("sessions_discovered", function(data)
 
     -- Broadcast recovered sessions to clients
     if #recovered > 0 then
-        local connections = require("handlers.connections")
         local Session = require("lib.session")
         local HostedPreview = require("lib.hosted_preview")
 
+        -- Wire protocol v2: the agent_created hook handler in
+        -- handlers.connections emits entity_upsert(session) per recovered
+        -- session via EB. No separate agent_list broadcast or hub-channel
+        -- fanout is needed here.
         local ok, err = pcall(function()
             for _, session in ipairs(recovered) do
                 if not Session.is_system_session(session) then
@@ -235,7 +238,6 @@ _event_sub = events.on("sessions_discovered", function(data)
                 end
             end
             HostedPreview.reconcile()
-            connections.broadcast_hub_event("agent_list", { agents = Agent.all_info() })
         end)
 
         if not ok then

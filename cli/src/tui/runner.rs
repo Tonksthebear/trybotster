@@ -247,6 +247,15 @@ pub struct TuiRunner<B: Backend> {
     /// cleared on mouse-up. While set, all mouse events route to this
     /// widget regardless of cursor position.
     mouse_capture: Option<MouseCapture>,
+
+    // === Wire protocol v2 entity stores (see brief §6.2) ===
+    /// Per-entity-type stores populated by v2 wire envelopes
+    /// (`entity_snapshot`/`upsert`/`patch`/`remove`). Read by the v2
+    /// composite renderers (`session_list`, `workspace_list`, …) and the
+    /// `$bind` resolver. Empty until the hub starts emitting v2 frames
+    /// (commit 7); the dispatcher in `dispatch_hub_event` treats any
+    /// recognised v2 envelope as authoritative.
+    pub(super) entity_stores: super::entity_stores::TuiEntityStores,
 }
 
 /// State for an active mouse drag capture.
@@ -369,6 +378,7 @@ where
             notification_focused: false,
             last_widget_areas: std::collections::HashMap::new(),
             mouse_capture: None,
+            entity_stores: super::entity_stores::TuiEntityStores::new(),
         }
     }
 
@@ -1648,6 +1658,24 @@ where
     /// to logging for unhandled events.
     fn dispatch_hub_event(&mut self, msg: serde_json::Value, layout_lua: Option<&LayoutLua>) {
         let event_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Wire protocol v2 entity envelopes (`entity_snapshot`/`upsert`/
+        // `patch`/`remove`) flow into the local entity stores BEFORE Lua
+        // sees them. The store dispatcher returns true when it recognised
+        // and applied the frame; we mark the TUI dirty so the next render
+        // picks up the new entity state and stop here. The composite
+        // renderers added in commit 4 read straight from these stores.
+        //
+        // Until commit 7 flips the wire to v2, this branch never fires in
+        // production — the hub still ships v1 frames which fall through to
+        // the Lua dispatcher below. Keeping the dispatch here in commit 3
+        // gives the cold-turkey switch a single landing point.
+        if super::entity_stores::TuiEntityStores::handles_frame(event_type) {
+            if self.entity_stores.apply_frame(&msg) {
+                self.dirty = true;
+            }
+            return;
+        }
 
         // Handle kitty_changed directly — sets outer terminal keyboard mode.
         // Only apply if the message is for the currently focused PTY.

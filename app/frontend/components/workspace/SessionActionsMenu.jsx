@@ -15,11 +15,23 @@ import {
   DropdownDivider,
 } from '../catalyst/dropdown'
 import { useUiActionInterceptor, useUiTreeDispatch } from '../UiTree'
-import {
-  useWorkspaceStore,
-  previewState,
-} from '../../store/workspace-store'
+import { useSessionStore } from '../../store/entities'
 import { IconGlyph } from '../../ui_contract/icons'
+
+// Wire protocol v2: previewState selector lifted out of the (deleted)
+// workspace-store and inlined here. Same shape so callers downstream don't
+// need to change.
+function previewState(session) {
+  if (!session) return { canPreview: false }
+  const hp = session.hosted_preview
+  return {
+    canPreview: !!session.port,
+    status: hp?.status || 'inactive',
+    url: typeof hp?.url === 'string' ? hp.url : null,
+    error: hp?.error || null,
+    installUrl: typeof hp?.install_url === 'string' ? hp.install_url : null,
+  }
+}
 
 // SessionActionsMenu intercepts the placeholder action emitted by Phase 2a's
 // `web/layout.lua:actions_menu_trigger` (`botster.session.menu.open`). Phase
@@ -43,7 +55,7 @@ import { IconGlyph } from '../../ui_contract/icons'
 //   un-wired ones.
 export default function SessionActionsMenu() {
   const dispatch = useUiTreeDispatch()
-  const sessionsById = useWorkspaceStore((s) => s.sessionsById)
+  const sessionsById = useSessionStore((s) => s.byId)
   const [openState, setOpenState] = useState(null)
   const buttonRef = useRef(null)
 
