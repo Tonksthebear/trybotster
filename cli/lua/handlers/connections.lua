@@ -473,6 +473,20 @@ hooks.on("agent_lifecycle", "broadcast_lifecycle", function(info)
     end
 end)
 
+-- Wire protocol v2 B2 fix: when a workspace transitions to closed (fired
+-- by lib/session.lua:_sync_workspace_manifest on the final session close),
+-- emit an entity_patch so clients see the status change and filter the
+-- workspace out of their UI. Pre-fix, closed workspaces kept showing up in
+-- the client's byId store forever because nothing wrote status=closed to
+-- the wire. No EB.remove — workspace manifests persist on disk (session
+-- recovery may re-open them), so the client-side filter on status is the
+-- right semantics, not a hard delete.
+hooks.on("workspace_closed", "broadcast_workspace_closed", function(info)
+    local ws_id = info and info.workspace_id
+    if not ws_id then return end
+    EB.patch("workspace", ws_id, { status = "closed" })
+end)
+
 -- ============================================================================
 -- Rust Event Handlers (Rust → Lua)
 -- ============================================================================
@@ -639,6 +653,7 @@ function M._before_reload()
     hooks.off("pty_cursor_visibility", "update_agent_cursor")
     hooks.off("client_disconnected", "unfocus_on_disconnect")
     hooks.off("surfaces_changed", "broadcast_ui_route_registry")
+    hooks.off("workspace_closed", "broadcast_workspace_closed")
     timer.cancel("ui_route_registry_broadcast")
     -- Wire protocol v2 B6 fix: we DO NOT clear the broadcaster here. The
     -- top-level `EB.set_broadcaster(broadcast_frame_to_hub)` on reload
