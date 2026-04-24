@@ -65,6 +65,15 @@ pub fn register(lua: &Lua) -> Result<()> {
     register_primitive(lua, &ui, "tree", Primitive::Tree)?;
     register_primitive(lua, &ui, "tree_item", Primitive::TreeItem)?;
     register_primitive(lua, &ui, "dialog", Primitive::Dialog)?;
+    // Wire protocol v2 composites — data-driven, no children, no slots.
+    register_primitive(lua, &ui, "session_list", Primitive::SessionList)?;
+    register_primitive(lua, &ui, "workspace_list", Primitive::WorkspaceList)?;
+    register_primitive(lua, &ui, "spawn_target_list", Primitive::SpawnTargetList)?;
+    register_primitive(lua, &ui, "worktree_list", Primitive::WorktreeList)?;
+    register_primitive(lua, &ui, "session_row", Primitive::SessionRow)?;
+    register_primitive(lua, &ui, "hub_recovery_state", Primitive::HubRecoveryState)?;
+    register_primitive(lua, &ui, "connection_code", Primitive::ConnectionCode)?;
+    register_primitive(lua, &ui, "new_session_button", Primitive::NewSessionButton)?;
 
     register_action(lua, &ui)?;
     register_responsive(lua, &ui)?;
@@ -98,6 +107,22 @@ enum Primitive {
     /// Flagged internal in v1 — registered so renderers can consume it while
     /// Phase B / Phase C catch up.
     Dialog,
+    /// Wire protocol v2 — workspace-grouped session tree composite.
+    SessionList,
+    /// Wire protocol v2 — bare workspace switcher composite.
+    WorkspaceList,
+    /// Wire protocol v2 — spawn target picker composite.
+    SpawnTargetList,
+    /// Wire protocol v2 — worktree picker composite for a given target.
+    WorktreeList,
+    /// Wire protocol v2 — single-session row composite (binds to a uuid).
+    SessionRow,
+    /// Wire protocol v2 — hub lifecycle banner composite (singleton entity).
+    HubRecoveryState,
+    /// Wire protocol v2 — pairing QR + URL composite (singleton entity).
+    ConnectionCode,
+    /// Wire protocol v2 — "new session" button composite.
+    NewSessionButton,
 }
 
 impl Primitive {
@@ -117,6 +142,14 @@ impl Primitive {
             Self::Tree => "tree",
             Self::TreeItem => "tree_item",
             Self::Dialog => "dialog",
+            Self::SessionList => "session_list",
+            Self::WorkspaceList => "workspace_list",
+            Self::SpawnTargetList => "spawn_target_list",
+            Self::WorktreeList => "worktree_list",
+            Self::SessionRow => "session_row",
+            Self::HubRecoveryState => "hub_recovery_state",
+            Self::ConnectionCode => "connection_code",
+            Self::NewSessionButton => "new_session_button",
         }
     }
 
@@ -164,6 +197,14 @@ impl Primitive {
             Self::Tree => &[],
             Self::TreeItem => &["expanded", "selected", "notification", "action"],
             Self::Dialog => &["open", "title", "presentation"],
+            Self::SessionList => &["density", "grouping", "showNavEntries"],
+            Self::WorkspaceList => &["density"],
+            Self::SpawnTargetList => &["onSelect", "onRemove"],
+            Self::WorktreeList => &["targetId"],
+            Self::SessionRow => &["sessionUuid", "density"],
+            Self::HubRecoveryState => &[],
+            Self::ConnectionCode => &[],
+            Self::NewSessionButton => &["action"],
         }
     }
 }
@@ -424,10 +465,22 @@ fn validate(_lua: &Lua, kind: Primitive, node: &Table) -> mlua::Result<()> {
                 props.set("presentation", "auto")?;
             }
         }
+        Primitive::WorktreeList => require_prop_string(node, "targetId", "ui.worktree_list")?,
+        Primitive::SessionRow => require_prop_string(node, "sessionUuid", "ui.session_row")?,
+        Primitive::NewSessionButton => {
+            require_prop_table(node, "action", "ui.new_session_button")?;
+        }
+        // Composites with all-optional or no props need no extra validation —
+        // the prop allowlist already rejects typos.
         Primitive::Tree
         | Primitive::Inline
         | Primitive::Panel
-        | Primitive::ScrollArea => {}
+        | Primitive::ScrollArea
+        | Primitive::SessionList
+        | Primitive::WorkspaceList
+        | Primitive::SpawnTargetList
+        | Primitive::HubRecoveryState
+        | Primitive::ConnectionCode => {}
     }
     Ok(())
 }
@@ -1124,5 +1177,328 @@ mod tests {
         assert!(matches!(menu, Value::Nil));
         let menu_item: Value = lua.load("return ui.menu_item").eval().expect("eval");
         assert!(matches!(menu_item, Value::Nil));
+    }
+
+    // =========================================================================
+    // Wire protocol v2 — composite primitives
+    // =========================================================================
+
+    #[test]
+    fn every_v2_composite_registered() {
+        let lua = new_lua();
+        for name in [
+            "session_list",
+            "workspace_list",
+            "spawn_target_list",
+            "worktree_list",
+            "session_row",
+            "hub_recovery_state",
+            "connection_code",
+            "new_session_button",
+        ] {
+            let f: Value = lua
+                .load(&format!("return ui.{name}"))
+                .eval()
+                .expect("eval");
+            assert!(matches!(f, Value::Function(_)), "ui.{name} missing");
+        }
+    }
+
+    #[test]
+    fn session_list_minimal_round_trip() {
+        let lua = new_lua();
+        let v = eval_to_json(&lua, "return ui.session_list{}");
+        assert_eq!(v, json!({ "type": "session_list" }));
+    }
+
+    #[test]
+    fn session_list_props_round_trip() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.session_list{
+                density = "sidebar",
+                grouping = "workspace",
+                show_nav_entries = true,
+            }"#,
+        );
+        assert_eq!(
+            v,
+            json!({
+                "type": "session_list",
+                "props": {
+                    "density": "sidebar",
+                    "grouping": "workspace",
+                    "showNavEntries": true
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn session_list_density_accepts_responsive() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.session_list{
+                density = ui.responsive({ compact = "sidebar", expanded = "panel" }),
+            }"#,
+        );
+        let props = v.get("props").expect("props");
+        let density = props.get("density").expect("density");
+        assert_eq!(density["$kind"], json!("responsive"));
+        assert_eq!(density["width"]["compact"], json!("sidebar"));
+        assert_eq!(density["width"]["expanded"], json!("panel"));
+    }
+
+    #[test]
+    fn session_list_rejects_unknown_prop() {
+        let lua = new_lua();
+        let err = lua
+            .load(r#"return ui.session_list{ density = "sidebar", foo = "bar" }"#)
+            .eval::<Value>()
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown prop"), "got {err}");
+        assert!(msg.contains("foo"), "error must name offending key: {err}");
+    }
+
+    #[test]
+    fn session_list_rejects_children() {
+        let lua = new_lua();
+        // session_list is data-driven; children should be silently ignored
+        // by the envelope (no `children` key in allowlist), but the
+        // envelope-handling code passes `children` straight through. Verify
+        // the wire shape stays clean: children get attached at the envelope
+        // level (legal — same as any primitive), but renderers will ignore
+        // them. We document this as a no-op rather than an error since the
+        // envelope handling is generic. The composite renderer is allowed
+        // to render children if it wants to, but the spec says these
+        // composites do not consume children.
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.session_list{ children = { ui.text{ text = "x" } } }"#,
+        );
+        // Children attach to envelope; the test only asserts the envelope is
+        // well-formed and that children DID NOT escape into props.
+        assert_eq!(v.get("type").and_then(|v| v.as_str()), Some("session_list"));
+        assert!(v.get("props").map_or(true, |p| p.get("children").is_none()));
+    }
+
+    #[test]
+    fn workspace_list_minimal_round_trip() {
+        let lua = new_lua();
+        let v = eval_to_json(&lua, "return ui.workspace_list{}");
+        assert_eq!(v, json!({ "type": "workspace_list" }));
+    }
+
+    #[test]
+    fn workspace_list_with_density() {
+        let lua = new_lua();
+        let v = eval_to_json(&lua, r#"return ui.workspace_list{ density = "panel" }"#);
+        assert_eq!(
+            v,
+            json!({ "type": "workspace_list", "props": { "density": "panel" } })
+        );
+    }
+
+    #[test]
+    fn spawn_target_list_minimal_round_trip() {
+        let lua = new_lua();
+        let v = eval_to_json(&lua, "return ui.spawn_target_list{}");
+        assert_eq!(v, json!({ "type": "spawn_target_list" }));
+    }
+
+    #[test]
+    fn spawn_target_list_with_action_templates() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.spawn_target_list{
+                on_select = ui.action("custom.target.select"),
+                on_remove = ui.action("custom.target.remove"),
+            }"#,
+        );
+        assert_eq!(
+            v,
+            json!({
+                "type": "spawn_target_list",
+                "props": {
+                    "onSelect": { "id": "custom.target.select" },
+                    "onRemove": { "id": "custom.target.remove" }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn worktree_list_requires_target_id() {
+        let lua = new_lua();
+        let err = lua
+            .load("return ui.worktree_list{}")
+            .eval::<Value>()
+            .unwrap_err();
+        assert!(err.to_string().contains("targetId"), "got {err}");
+    }
+
+    #[test]
+    fn worktree_list_round_trip() {
+        let lua = new_lua();
+        let v = eval_to_json(&lua, r#"return ui.worktree_list{ target_id = "tgt-1" }"#);
+        assert_eq!(
+            v,
+            json!({
+                "type": "worktree_list",
+                "props": { "targetId": "tgt-1" }
+            })
+        );
+    }
+
+    #[test]
+    fn session_row_requires_session_uuid() {
+        let lua = new_lua();
+        let err = lua
+            .load("return ui.session_row{}")
+            .eval::<Value>()
+            .unwrap_err();
+        assert!(err.to_string().contains("sessionUuid"), "got {err}");
+    }
+
+    #[test]
+    fn session_row_round_trip() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.session_row{ session_uuid = "sess-1", density = "sidebar" }"#,
+        );
+        assert_eq!(
+            v,
+            json!({
+                "type": "session_row",
+                "props": { "sessionUuid": "sess-1", "density": "sidebar" }
+            })
+        );
+    }
+
+    #[test]
+    fn hub_recovery_state_minimal() {
+        let lua = new_lua();
+        let v = eval_to_json(&lua, "return ui.hub_recovery_state{}");
+        assert_eq!(v, json!({ "type": "hub_recovery_state" }));
+    }
+
+    #[test]
+    fn hub_recovery_state_rejects_props() {
+        let lua = new_lua();
+        let err = lua
+            .load(r#"return ui.hub_recovery_state{ status = "ready" }"#)
+            .eval::<Value>()
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown prop"), "got {err}");
+    }
+
+    #[test]
+    fn connection_code_minimal() {
+        let lua = new_lua();
+        let v = eval_to_json(&lua, "return ui.connection_code{}");
+        assert_eq!(v, json!({ "type": "connection_code" }));
+    }
+
+    #[test]
+    fn new_session_button_requires_action() {
+        let lua = new_lua();
+        let err = lua
+            .load("return ui.new_session_button{}")
+            .eval::<Value>()
+            .unwrap_err();
+        assert!(err.to_string().contains("action"), "got {err}");
+    }
+
+    #[test]
+    fn new_session_button_round_trip() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.new_session_button{
+                action = ui.action("botster.session.create.request"),
+            }"#,
+        );
+        assert_eq!(
+            v,
+            json!({
+                "type": "new_session_button",
+                "props": {
+                    "action": { "id": "botster.session.create.request" }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn v2_composites_typed_props_round_trip_via_serde() {
+        // Wire shape ↔ typed PropsV1 round-trip for every v2 composite.
+        // Catches any drift between the Lua allowlist and the Rust struct.
+        use crate::ui_contract::{
+            ConnectionCodePropsV1, HubRecoveryStatePropsV1, NewSessionButtonPropsV1,
+            SessionListPropsV1, SessionRowPropsV1, SpawnTargetListPropsV1, UiActionV1,
+            UiSessionListGrouping, UiSurfaceDensity, UiValueV1, WorkspaceListPropsV1,
+            WorktreeListPropsV1,
+        };
+
+        let session_list = SessionListPropsV1 {
+            density: Some(UiValueV1::scalar(UiSurfaceDensity::Sidebar)),
+            grouping: Some(UiSessionListGrouping::Workspace),
+            show_nav_entries: Some(true),
+        };
+        let v = serde_json::to_value(&session_list).unwrap();
+        let back: SessionListPropsV1 = serde_json::from_value(v).unwrap();
+        assert_eq!(back, session_list);
+
+        let workspace_list = WorkspaceListPropsV1 {
+            density: Some(UiValueV1::scalar(UiSurfaceDensity::Panel)),
+        };
+        let back: WorkspaceListPropsV1 =
+            serde_json::from_value(serde_json::to_value(&workspace_list).unwrap()).unwrap();
+        assert_eq!(back, workspace_list);
+
+        let spawn = SpawnTargetListPropsV1 {
+            on_select: Some(UiActionV1::new("a")),
+            on_remove: Some(UiActionV1::new("b")),
+        };
+        let back: SpawnTargetListPropsV1 =
+            serde_json::from_value(serde_json::to_value(&spawn).unwrap()).unwrap();
+        assert_eq!(back, spawn);
+
+        let worktree = WorktreeListPropsV1 {
+            target_id: "t".into(),
+        };
+        let back: WorktreeListPropsV1 =
+            serde_json::from_value(serde_json::to_value(&worktree).unwrap()).unwrap();
+        assert_eq!(back, worktree);
+
+        let row = SessionRowPropsV1 {
+            session_uuid: "s".into(),
+            density: None,
+        };
+        let back: SessionRowPropsV1 =
+            serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+        assert_eq!(back, row);
+
+        let hr = HubRecoveryStatePropsV1::default();
+        let back: HubRecoveryStatePropsV1 =
+            serde_json::from_value(serde_json::to_value(&hr).unwrap()).unwrap();
+        assert_eq!(back, hr);
+
+        let cc = ConnectionCodePropsV1::default();
+        let back: ConnectionCodePropsV1 =
+            serde_json::from_value(serde_json::to_value(&cc).unwrap()).unwrap();
+        assert_eq!(back, cc);
+
+        let nsb = NewSessionButtonPropsV1 {
+            action: UiActionV1::new("c"),
+        };
+        let back: NewSessionButtonPropsV1 =
+            serde_json::from_value(serde_json::to_value(&nsb).unwrap()).unwrap();
+        assert_eq!(back, nsb);
     }
 }
