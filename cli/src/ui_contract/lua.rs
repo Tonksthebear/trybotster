@@ -79,6 +79,9 @@ pub fn register(lua: &Lua) -> Result<()> {
     register_responsive(lua, &ui)?;
     register_when(lua, &ui)?;
     register_hidden(lua, &ui)?;
+    // Wire protocol v2 — reactive data sentinels for plugin layouts.
+    register_bind(lua, &ui)?;
+    register_bind_list(lua, &ui)?;
 
     lua.globals()
         .set("ui", ui)
@@ -268,6 +271,85 @@ fn register_hidden(lua: &Lua, ui: &Table) -> Result<()> {
         .map_err(|e| anyhow!("Failed to create ui.hidden: {e}"))?;
     ui.set("hidden", constructor)
         .map_err(|e| anyhow!("Failed to attach ui.hidden: {e}"))?;
+    Ok(())
+}
+
+/// `ui.bind(path)` — wire protocol v2 sentinel. Emits `{ "$bind": path }`.
+///
+/// Resolved client-side against the per-entity-type stores. Path grammar:
+///
+/// * `/<type>/<id>/<field>` — scalar lookup
+/// * `/<type>/<id>` — whole record
+/// * `/<type>` — list of records sorted by store insertion order
+/// * `@/<field>` — item-relative (only valid inside `ui.bind_list`)
+///
+/// Both renderers (TUI binding.rs, web binding.tsx) honor the same grammar.
+fn register_bind(lua: &Lua, ui: &Table) -> Result<()> {
+    let constructor = lua
+        .create_function(|lua, path: String| {
+            if path.is_empty() {
+                return Err(mlua::Error::RuntimeError(
+                    "ui.bind: path must be a non-empty string".to_string(),
+                ));
+            }
+            let out = lua.create_table()?;
+            out.set("$bind", path)?;
+            Ok(out)
+        })
+        .map_err(|e| anyhow!("Failed to create ui.bind: {e}"))?;
+    ui.set("bind", constructor)
+        .map_err(|e| anyhow!("Failed to attach ui.bind: {e}"))?;
+    Ok(())
+}
+
+/// `ui.bind_list{ source, item_template }` — wire protocol v2 sentinel for
+/// reactive list expansion. Emits a `$kind = "bind_list"` envelope:
+///
+/// ```json
+/// { "$kind": "bind_list",
+///   "source": "/<entity_type>",
+///   "item_template": <UiNodeV1> }
+/// ```
+///
+/// The client-side resolver walks the `source` store and clones
+/// `item_template` once per record, replacing `@/<field>` paths with the
+/// per-item values before primitive dispatch.
+fn register_bind_list(lua: &Lua, ui: &Table) -> Result<()> {
+    let constructor = lua
+        .create_function(|lua, args: Table| {
+            let source: String = args.get("source").map_err(|e| {
+                mlua::Error::RuntimeError(format!(
+                    "ui.bind_list: `source` (string) required: {e}"
+                ))
+            })?;
+            if source.is_empty() {
+                return Err(mlua::Error::RuntimeError(
+                    "ui.bind_list: `source` must be a non-empty string".to_string(),
+                ));
+            }
+            let template = match args.get::<Value>("item_template") {
+                Ok(Value::Table(t)) => t,
+                Ok(other) => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "ui.bind_list: `item_template` must be a UiNode table, got {}",
+                        other.type_name()
+                    )));
+                }
+                Err(e) => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "ui.bind_list: `item_template` (UiNode table) required: {e}"
+                    )));
+                }
+            };
+            let out = lua.create_table()?;
+            out.set("$kind", "bind_list")?;
+            out.set("source", source)?;
+            out.set("item_template", template)?;
+            Ok(out)
+        })
+        .map_err(|e| anyhow!("Failed to create ui.bind_list: {e}"))?;
+    ui.set("bind_list", constructor)
+        .map_err(|e| anyhow!("Failed to attach ui.bind_list: {e}"))?;
     Ok(())
 }
 
@@ -485,6 +567,26 @@ fn validate(_lua: &Lua, kind: Primitive, node: &Table) -> mlua::Result<()> {
     Ok(())
 }
 
+/// Returns `true` when `value` is a wire-protocol-v2 `$bind` sentinel
+/// (i.e. a single-key Lua table `{ ["$bind"] = "/<path>" }`). Required-prop
+/// validators accept the sentinel as a stand-in for the eventual resolved
+/// value — the resolver runs client-side before primitive dispatch.
+fn is_bind_sentinel(value: &Value) -> bool {
+    let Value::Table(t) = value else { return false };
+    let mut count = 0usize;
+    let mut has_bind = false;
+    let Ok(pairs) = t.clone().pairs::<String, Value>().collect::<mlua::Result<Vec<_>>>() else {
+        return false;
+    };
+    for (key, val) in pairs {
+        count += 1;
+        if key == "$bind" && matches!(val, Value::String(_)) {
+            has_bind = true;
+        }
+    }
+    count == 1 && has_bind
+}
+
 fn require_prop(node: &Table, key: &str, ctor: &str) -> mlua::Result<()> {
     let props = node.get::<Value>("props").ok();
     let Some(Value::Table(props)) = props else {
@@ -509,6 +611,7 @@ fn require_prop_string(node: &Table, key: &str, ctor: &str) -> mlua::Result<()> 
     };
     match props.get::<Value>(key) {
         Ok(Value::String(_)) => Ok(()),
+        Ok(ref v) if is_bind_sentinel(v) => Ok(()),
         _ => Err(mlua::Error::RuntimeError(format!(
             "{ctor} requires a `{key}` string"
         ))),
@@ -1432,6 +1535,82 @@ mod tests {
                 }
             })
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Wire protocol v2 — ui.bind / ui.bind_list
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn bind_emits_sentinel_object() {
+        let lua = new_lua();
+        let v = eval_to_json(&lua, r#"return ui.bind("/session/sess-1/title")"#);
+        assert_eq!(v, json!({ "$bind": "/session/sess-1/title" }));
+    }
+
+    #[test]
+    fn bind_rejects_empty_path() {
+        let lua = new_lua();
+        let err = lua.load(r#"return ui.bind("")"#).eval::<Value>().unwrap_err();
+        assert!(err.to_string().contains("ui.bind"), "got {err}");
+    }
+
+    #[test]
+    fn bind_inside_text_prop_is_passed_through_verbatim() {
+        // The constructor itself doesn't resolve — it just emits the
+        // sentinel. Renderers resolve at render time. Verify the wire shape
+        // round-trips cleanly inside an enclosing primitive's prop.
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.text{ text = ui.bind("/session/sess-1/title") }"#,
+        );
+        assert_eq!(
+            v,
+            json!({
+                "type": "text",
+                "props": { "text": { "$bind": "/session/sess-1/title" } }
+            })
+        );
+    }
+
+    #[test]
+    fn bind_list_emits_kind_sentinel_with_source_and_template() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.bind_list{
+                source = "/session",
+                item_template = ui.text{ text = ui.bind("@/title") },
+            }"#,
+        );
+        assert_eq!(v["$kind"], json!("bind_list"));
+        assert_eq!(v["source"], json!("/session"));
+        assert_eq!(v["item_template"]["type"], json!("text"));
+        assert_eq!(
+            v["item_template"]["props"]["text"],
+            json!({ "$bind": "@/title" })
+        );
+    }
+
+    #[test]
+    fn bind_list_rejects_missing_source() {
+        let lua = new_lua();
+        let err = lua
+            .load(r#"return ui.bind_list{ item_template = ui.text{ text = "x" } }"#)
+            .eval::<Value>()
+            .unwrap_err();
+        assert!(err.to_string().contains("source"), "got {err}");
+    }
+
+    #[test]
+    fn bind_list_rejects_non_table_item_template() {
+        let lua = new_lua();
+        let err = lua
+            .load(r#"return ui.bind_list{ source = "/session", item_template = "not a node" }"#)
+            .eval::<Value>()
+            .unwrap_err();
+        assert!(err.to_string().contains("item_template"), "got {err}");
     }
 
     #[test]

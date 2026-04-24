@@ -44,19 +44,23 @@
 
 use anyhow::{anyhow, Result};
 use mlua::{Lua, LuaSerdeExt, Table as LuaTable, Value as LuaValue};
+use serde_json::Value as JsonValue;
 
+use crate::tui::entity_stores::TuiEntityStores;
 use crate::tui::render_tree::RenderNode;
 use crate::ui_contract::node::UiNodeV1;
 use crate::ui_contract::viewport::UiViewportV1;
 
 pub mod action;
+pub mod binding;
 pub mod primitive;
 pub mod responsive;
 pub mod style;
 pub mod viewport;
 
 pub use action::ActionTable;
-pub use primitive::{is_ui_node_type, render_ui_node};
+pub use binding::resolve_bindings;
+pub use primitive::{is_ui_node_type, render_ui_node, render_ui_node_with_stores};
 pub use viewport::{
     derive_viewport_from_terminal, height_class_for_rows, width_class_for_cols,
 };
@@ -81,11 +85,49 @@ pub fn render_lua_ui_node(
     table: &LuaTable,
     viewport: &UiViewportV1,
 ) -> Result<(RenderNode, ActionTable)> {
-    let value = LuaValue::Table(table.clone());
-    let node: UiNodeV1 = lua
-        .from_value(value)
-        .map_err(|e| anyhow!("ui_contract_adapter: Lua → UiNodeV1 failed: {e}"))?;
+    render_lua_ui_node_with_stores(lua, table, viewport, None)
+}
+
+/// Render a Lua-built UiNodeV1 tree with optional access to the v2 entity
+/// stores for binding resolution + composite data.
+///
+/// The pipeline is:
+///
+/// 1. Lua table → `serde_json::Value` (preserving the wire shape including
+///    any `$bind` / `$kind = "bind_list"` sentinels).
+/// 2. [`resolve_bindings`] walks the tree replacing every sentinel with
+///    the resolved value(s) from `stores`. Skipped when `stores` is None.
+/// 3. JSON → [`UiNodeV1`].
+/// 4. [`render_ui_node_with_stores`] dispatches to the per-primitive
+///    renderer with `stores` threaded so v2 composites
+///    (`session_list`, `workspace_list`, …) can read their data.
+///
+/// # Errors
+///
+/// Returns an error if the table does not deserialise into a
+/// [`UiNodeV1`] post-binding-resolution, or if a primitive renderer fails.
+pub fn render_lua_ui_node_with_stores(
+    lua: &Lua,
+    table: &LuaTable,
+    viewport: &UiViewportV1,
+    stores: Option<&TuiEntityStores>,
+) -> Result<(RenderNode, ActionTable)> {
+    // Step 1: Lua → JSON (preserves $bind / $kind sentinels verbatim).
+    let mut json: JsonValue = lua
+        .from_value(LuaValue::Table(table.clone()))
+        .map_err(|e| anyhow!("ui_contract_adapter: Lua → JSON failed: {e}"))?;
+
+    // Step 2: resolve sentinels in-place when stores are available.
+    if let Some(stores) = stores {
+        resolve_bindings(&mut json, stores);
+    }
+
+    // Step 3: JSON → typed node.
+    let node: UiNodeV1 = serde_json::from_value(json)
+        .map_err(|e| anyhow!("ui_contract_adapter: JSON → UiNodeV1 failed: {e}"))?;
+
+    // Step 4: dispatch.
     let mut actions = ActionTable::new();
-    let rendered = render_ui_node(&node, viewport, &mut actions)?;
+    let rendered = render_ui_node_with_stores(&node, viewport, &mut actions, stores)?;
     Ok((rendered, actions))
 }
