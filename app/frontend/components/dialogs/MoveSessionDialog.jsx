@@ -4,28 +4,43 @@ import { Field, Label, Description } from '../catalyst/fieldset'
 import { Input } from '../catalyst/input'
 import { Button } from '../catalyst/button'
 import { useDialogStore } from '../../store/dialog-store'
-import { useWorkspaceStore, displayName } from '../../store/workspace-store'
+import {
+  useSessionStore,
+  useWorkspaceEntityStore,
+} from '../../store/entities'
 import { getHub } from '../../lib/hub-bridge'
+
+// Wire protocol v2: workspace.agents arrays are gone — membership is
+// derived client-side by joining sessions where workspace_id matches. The
+// displayName selector lives here too (used to be on workspace-store).
+function displayName(session) {
+  if (!session) return ''
+  const label = typeof session.label === 'string' ? session.label.trim() : ''
+  if (label) return label
+  return session.display_name || session.title || session.session_uuid || ''
+}
 
 export default function MoveSessionDialog({ hubId }) {
   const { activeDialog, context, close } = useDialogStore()
   const open = activeDialog === 'move'
   const [newWorkspaceName, setNewWorkspaceName] = useState('')
 
-  const workspacesById = useWorkspaceStore((s) => s.workspacesById)
-  const sessionsById = useWorkspaceStore((s) => s.sessionsById)
+  const workspacesById = useWorkspaceEntityStore((s) => s.byId)
+  const sessionsById = useSessionStore((s) => s.byId)
 
   const session = sessionsById[context.sessionId]
   const sessionName = session ? displayName(session) : 'this session'
 
-  // Find current workspace for this session
+  // Wire protocol v2: derive membership client-side. Active workspaces are
+  // any with status==='active'; current workspace is the one whose id
+  // matches this session's workspace_id.
   const workspaces = Object.values(workspacesById).filter(
     (ws) => ws && ws.status === 'active'
   )
-  const currentWs = workspaces.find(
-    (ws) => Array.isArray(ws?.agents) && ws.agents.includes(context.sessionId)
+  const currentWorkspaceId = session?.workspace_id ?? null
+  const otherWorkspaces = workspaces.filter(
+    (ws) => (ws?.workspace_id ?? ws?.id) !== currentWorkspaceId
   )
-  const otherWorkspaces = workspaces.filter((ws) => ws?.id !== currentWs?.id)
 
   useEffect(() => {
     if (open) setNewWorkspaceName('')
@@ -58,18 +73,21 @@ export default function MoveSessionDialog({ hubId }) {
           <div className="space-y-2">
             <Label>Existing workspaces</Label>
             <div className="space-y-2">
-              {otherWorkspaces.map((ws) => (
+              {otherWorkspaces.map((ws) => {
+                const id = ws.workspace_id ?? ws.id
+                return (
                 <button
-                  key={ws.id}
+                  key={id}
                   type="button"
-                  onClick={() => moveToExisting(ws.id, ws.name)}
+                  onClick={() => moveToExisting(id, ws.name)}
                   className="w-full text-left px-4 py-3 rounded-lg border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:border-zinc-600 transition-colors"
                 >
                   <div className="text-sm font-medium text-zinc-100">
-                    {ws.name || ws.id}
+                    {ws.name || id}
                   </div>
                 </button>
-              ))}
+                )
+              })}
             </div>
           </div>
         )}

@@ -432,19 +432,17 @@ function M.unregister(name)
     if log and log.debug then
         log.debug(string.format("surfaces.unregister: name=%s", name))
     end
-    -- Purge the broadcast module's per-subscription dedup baselines for
-    -- this surface. Without this, versions_by_key[sub_id][name] would
-    -- accumulate forever (one entry per subscription that ever saw the
-    -- old tree), AND a re-registration of the same name could be
-    -- silently swallowed by dedup if the new tree's hash matched the
-    -- stale one. Synchronous so the next render in this tick already
-    -- sees a clean baseline. pcall in case lib.layout_broadcast isn't
-    -- loaded (test harnesses that only import surfaces.lua).
-    local ok_broadcast, broadcast = pcall(require, "lib.layout_broadcast")
-    if ok_broadcast and type(broadcast) == "table"
-        and type(broadcast.forget_surface) == "function"
+    -- Wire protocol v2: purge tree_snapshot's dedup baselines for this
+    -- surface across all subpaths. Without this a re-registration of the
+    -- same surface name could be silently swallowed by dedup if the new
+    -- tree happened to hash-match the stale one. pcall in case
+    -- lib.tree_snapshot isn't loaded (test harnesses that only import
+    -- surfaces.lua).
+    local ok_snap, snap = pcall(require, "lib.tree_snapshot")
+    if ok_snap and type(snap) == "table"
+        and type(snap.forget_surface) == "function"
     then
-        pcall(broadcast.forget_surface, name)
+        pcall(snap.forget_surface, name)
     end
     notify_changed()
     return true
