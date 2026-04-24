@@ -5,7 +5,8 @@
 //! on environment configuration.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use mlua::{IntoLuaMulti, Lua};
@@ -81,6 +82,15 @@ pub struct LuaRuntime {
     /// (99.9% of the time), the Lua call is skipped entirely.
     /// Cleared when the last notification is dismissed.
     pty_input_listening: bool,
+}
+
+fn lua_perf_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BOTSTER_LUA_PERF")
+            .map(|value| value != "0" && !value.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 impl std::fmt::Debug for LuaRuntime {
@@ -1004,10 +1014,13 @@ impl LuaRuntime {
         peer_id: &str,
         message: serde_json::Value,
     ) -> Result<()> {
+        let perf = lua_perf_enabled();
+        let total_started = Instant::now();
         let key_result: mlua::Result<mlua::RegistryKey> =
             self.lua.named_registry_value(registry_keys::ON_MESSAGE);
 
         if let Ok(key) = key_result {
+            let registry_done = Instant::now();
             let callback: mlua::Function = self
                 .lua
                 .registry_value(&key)
@@ -1016,10 +1029,23 @@ impl LuaRuntime {
             // Convert JSON to Lua value, mapping null → nil (not userdata)
             let lua_value = crate::lua::primitives::json::json_to_lua(&self.lua, &message)
                 .map_err(|e| anyhow!("Failed to convert JSON to Lua value: {e}"))?;
+            let json_done = Instant::now();
 
             callback
                 .call::<()>((peer_id, lua_value))
                 .map_err(|e| anyhow!("webrtc_message callback failed: {e}"))?;
+
+            if perf {
+                let done = Instant::now();
+                log::info!(
+                    "[PERF][lua] webrtc_message peer_id={} registry_us={} json_us={} call_us={} total_us={}",
+                    peer_id,
+                    registry_done.duration_since(total_started).as_micros(),
+                    json_done.duration_since(registry_done).as_micros(),
+                    done.duration_since(json_done).as_micros(),
+                    done.duration_since(total_started).as_micros()
+                );
+            }
         }
 
         Ok(())
@@ -1290,19 +1316,34 @@ impl LuaRuntime {
         client_id: &str,
         message: serde_json::Value,
     ) -> Result<()> {
+        let perf = lua_perf_enabled();
+        let total_started = Instant::now();
         let key_result: mlua::Result<mlua::RegistryKey> = self
             .lua
             .named_registry_value(socket_registry_keys::ON_MESSAGE);
         if let Ok(key) = key_result {
+            let registry_done = Instant::now();
             let callback: mlua::Function = self
                 .lua
                 .registry_value(&key)
                 .map_err(|e| anyhow!("Failed to get socket_message callback: {e}"))?;
             let lua_value = crate::lua::primitives::json::json_to_lua(&self.lua, &message)
                 .map_err(|e| anyhow!("Failed to convert JSON to Lua value: {e}"))?;
+            let json_done = Instant::now();
             callback
                 .call::<()>((client_id, lua_value))
                 .map_err(|e| anyhow!("socket_message callback failed: {e}"))?;
+            if perf {
+                let done = Instant::now();
+                log::info!(
+                    "[PERF][lua] socket_message client_id={} registry_us={} json_us={} call_us={} total_us={}",
+                    client_id,
+                    registry_done.duration_since(total_started).as_micros(),
+                    json_done.duration_since(registry_done).as_micros(),
+                    done.duration_since(json_done).as_micros(),
+                    done.duration_since(total_started).as_micros()
+                );
+            }
         }
         Ok(())
     }
@@ -1685,6 +1726,8 @@ impl LuaRuntime {
     where
         F: Fn(&Lua) -> Result<mlua::Value>,
     {
+        let perf = lua_perf_enabled();
+        let total_started = Instant::now();
         // Collect callbacks and their functions in one lock acquisition
         let callbacks_to_call: Vec<mlua::Function> = {
             let callbacks = self
@@ -1697,20 +1740,46 @@ impl LuaRuntime {
                 .filter_map(|key| self.lua.registry_value::<mlua::Function>(key).ok())
                 .collect()
         };
+        let callbacks_collected = Instant::now();
         // Lock released here
 
         if callbacks_to_call.is_empty() {
             return Ok(());
         }
 
+        let callback_count = callbacks_to_call.len();
+
         // Build args once
         let args = args_fn(&self.lua)?;
+        let args_built = Instant::now();
 
         // Call callbacks without holding the lock
+        let mut callback_total_us = 0u128;
+        let mut callback_max_us = 0u128;
         for callback in callbacks_to_call {
+            let callback_started = perf.then(Instant::now);
             if let Err(e) = callback.call::<()>(args.clone()) {
                 log::error!("Event callback error for '{}': {}", event, e);
             }
+            if let Some(started) = callback_started {
+                let elapsed = started.elapsed().as_micros();
+                callback_total_us += elapsed;
+                callback_max_us = callback_max_us.max(elapsed);
+            }
+        }
+
+        if perf {
+            let done = Instant::now();
+            log::info!(
+                "[PERF][lua] fire_event event={} callbacks={} collect_us={} args_us={} callbacks_us={} callback_max_us={} total_us={}",
+                event,
+                callback_count,
+                callbacks_collected.duration_since(total_started).as_micros(),
+                args_built.duration_since(callbacks_collected).as_micros(),
+                callback_total_us,
+                callback_max_us,
+                done.duration_since(total_started).as_micros()
+            );
         }
 
         Ok(())
@@ -1916,6 +1985,8 @@ impl LuaRuntime {
     ) {
         use crate::agent::pty::PtyEvent;
 
+        let perf = lua_perf_enabled();
+        let total_started = Instant::now();
         let result: mlua::Result<()> = (|| {
             let data = self.lua.create_table()?;
             data.set("session_uuid", session_uuid)?;
@@ -1944,6 +2015,14 @@ impl LuaRuntime {
             let hooks: mlua::Table = self.lua.globals().get("hooks")?;
             let notify: mlua::Function = hooks.get("notify")?;
             notify.call::<mlua::Value>((hook_name, data))?;
+            if perf {
+                log::info!(
+                    "[PERF][lua] pty_osc hook={} session_uuid={} total_us={}",
+                    hook_name,
+                    session_uuid,
+                    total_started.elapsed().as_micros()
+                );
+            }
             Ok(())
         })();
 
@@ -4289,8 +4368,7 @@ mod tests {
     /// and the `__hook_timed_pcall` primitive registered (production VMs have
     /// this registered by `primitives::register_all`).
     fn load_hooks_module(lua: &mlua::Lua) {
-        crate::lua::primitives::hook_timeout::register(lua)
-            .expect("register __hook_timed_pcall");
+        crate::lua::primitives::hook_timeout::register(lua).expect("register __hook_timed_pcall");
 
         // hooks.lua calls log.debug/log.error on register/error paths.
         lua.load(
@@ -4318,9 +4396,8 @@ mod tests {
                     .join("lua")
                     .join("hub")
                     .join("hooks.lua");
-                std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                    panic!("read hub/hooks.lua from {}: {e}", path.display())
-                })
+                std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read hub/hooks.lua from {}: {e}", path.display()))
             }
         };
 
