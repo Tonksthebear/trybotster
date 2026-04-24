@@ -33,18 +33,16 @@ function Client.new(peer_id, transport)
         subscriptions = {},
         forwarders = {},
         connected_at = os.time(),
-        -- Phase 2b: per-browser selection baked into `ui_layout_tree_v1`
-        -- broadcasts. Set by the `select_agent` command handler (or the
-        -- `botster.session.select` action fallback) so each subscriber
-        -- gets its own `tree_item.selected` row rendered hub-side.
-        selected_session_uuid = nil,
-        -- Phase 4b: per-browser URL state, mirroring the selection design.
-        -- `{ [surface_name] = subpath }` — the browser sends
-        -- `botster.surface.subpath` actions (and primes this map via the
-        -- subscribe envelope) so `layout_broadcast` can thread the right
-        -- `state.path` into each surface's render dispatcher. Unset entries
-        -- default to "/".
+        -- Phase 4b: per-browser URL state. `{ [surface_name] = subpath }` —
+        -- the browser sends `botster.surface.subpath` actions (and primes
+        -- this map via the subscribe envelope) so tree_snapshot can thread
+        -- the right `state.path` into each surface's render dispatcher.
+        -- Unset entries default to "/".
         surface_subpaths = {},
+        -- Wire protocol v2: `selected_session_uuid` is GONE. Selection
+        -- moved to the client (web ui-presentation-store, TUI widget_state).
+        -- Trees are no longer per-client; the same ui_tree_snapshot ships
+        -- to every subscriber.
     }, Client)
 
     log.info(string.format("Client created: %s...", peer_id:sub(1, 8)))
@@ -253,31 +251,30 @@ function Client:handle_subscribe(msg)
             pty_clients.register(session_uuid, self.peer_id, rows, cols)
         end
     elseif channel == "hub" then
-        -- Send initial agent and worktree lists
         log.info(string.format("Hub subscription from %s...", self.peer_id:sub(1, 8)))
-        self:send_agent_list(sub_id)
-        self:send_workspace_list(sub_id)
-        self:send_spawn_target_list(sub_id)
-        self:send_hub_recovery_state(sub_id)
-        -- Phase 4a: prime the route registry BEFORE the layout trees so a
-        -- fresh browser knows which surfaces it can route to before it
-        -- receives their trees. The browser store replaces the registry
-        -- wholesale on each frame, so ordering matters only for the first
-        -- render; subsequent mutations flow via hooks.
+
+        -- Wire protocol v2 — strict ordering per design brief §12.6:
+        --   1. ui_route_registry (so the client knows the surface set)
+        --   2. entity_snapshot per registered type (stores populated
+        --      BEFORE trees that reference them)
+        --   3. surface_subpaths priming (so cold-load deep links land on
+        --      the right sub-page on the first ui_tree_snapshot)
+        --   4. ui_tree_snapshot per surface (force=true for priming)
         local reg_ok, reg_err = pcall(self.send_ui_route_registry, self, sub_id)
         if not reg_ok then
             log.warn(string.format(
                 "send_ui_route_registry failed for %s: %s",
                 self.peer_id:sub(1, 8), tostring(reg_err)))
         end
-        -- Phase 4b: prime per-surface subpaths BEFORE the force-broadcast
-        -- so cold-load deep links (e.g. /hubs/:id/kanban/board/42) produce
-        -- the right sub-page on the very first frame. Without this the hub
-        -- would render "/" first (the default), ship it, then receive the
-        -- browser's surface.subpath action and re-render. That causes a
-        -- visible flash even with dedup because the "/" and "/board/42"
-        -- trees legitimately differ. `rebroadcast = false` because the
-        -- force-broadcast call below will emit the frames anyway.
+
+        local EB = require("lib.entity_broadcast")
+        local snap_ok, snap_err = pcall(EB.send_snapshots_to, self, sub_id)
+        if not snap_ok then
+            log.warn(string.format(
+                "EB.send_snapshots_to failed for %s: %s",
+                self.peer_id:sub(1, 8), tostring(snap_err)))
+        end
+
         if type(params.surface_subpaths) == "table" then
             for surface_name, subpath in pairs(params.surface_subpaths) do
                 if type(surface_name) == "string" and type(subpath) == "string" then
@@ -285,16 +282,11 @@ function Client:handle_subscribe(msg)
                 end
             end
         end
-        -- Prime Phase 2b layout trees so a fresh subscriber renders
-        -- immediately without waiting for the next session_updated.
-        -- `force=true` bypasses dedup; this is the only call that does so
-        -- in production. Guarded: if something goes wrong building the
-        -- frames, the Phase-1 agent_list above still keeps the browser
-        -- functional.
-        local ok, err = pcall(self.send_ui_layout_trees, self, sub_id, { force = true })
+
+        local ok, err = pcall(self.send_ui_tree_snapshots, self, sub_id, { force = true })
         if not ok then
             log.warn(string.format(
-                "send_ui_layout_trees failed for %s: %s",
+                "send_ui_tree_snapshots failed for %s: %s",
                 self.peer_id:sub(1, 8), tostring(err)))
         end
     elseif channel == "mcp" then
@@ -308,36 +300,12 @@ function Client:handle_subscribe(msg)
     end
 end
 
---- Send admitted spawn targets to a HubChannel subscription.
--- Includes live inspection metadata such as git status and current branch.
--- @param sub_id The subscription ID to send to
-function Client:send_spawn_target_list(sub_id)
-    local targets = {}
-    local registry = rawget(_G, "spawn_targets")
-    if registry and type(registry.list) == "function" then
-        local ok, listed = pcall(registry.list)
-        if ok and type(listed) == "table" then
-            for _, target in ipairs(listed) do
-                local merged = target
-                if type(registry.inspect) == "function" and target.path then
-                    local inspect_ok, inspection = pcall(registry.inspect, target.path)
-                    if inspect_ok and type(inspection) == "table" then
-                        merged = {}
-                        for k, v in pairs(target) do merged[k] = v end
-                        for k, v in pairs(inspection) do merged[k] = v end
-                    end
-                end
-                targets[#targets + 1] = merged
-            end
-        end
-    end
-
-    self:send({
-        subscriptionId = sub_id,
-        type = "spawn_target_list",
-        targets = targets,
-    })
-end
+-- Wire protocol v2: send_spawn_target_list, send_agent_list,
+-- send_workspace_list, send_open_workspace_list, send_worktree_list, and
+-- send_hub_recovery_state are GONE. Subscribe-time priming now goes through
+-- `EB.send_snapshots_to(self, sub_id)` (see handle_subscribe), which ships
+-- one entity_snapshot per registered type. Subsequent updates flow as
+-- entity_patch / entity_upsert / entity_remove from EB.
 
 --- Set up terminal subscription with PTY forwarder.
 -- Creates a transport-agnostic forwarder that streams PTY output to the client.
@@ -368,51 +336,23 @@ function Client:setup_terminal_subscription(sub_id, session_uuid, rows, cols)
         sub_id:sub(1, 16), session_uuid:sub(1, 16), cols, rows))
 end
 
---- Send agent list to a HubChannel subscription.
--- @param sub_id The subscription ID to send to
-function Client:send_agent_list(sub_id)
-    local payload = require("lib.agent_list_payload").build(Agent.all_info())
-    self:send({
-        subscriptionId = sub_id,
-        type = "agent_list",
-        agents = payload.agents,
-        workspaces = payload.workspaces,
-    })
-end
-
---- Send the current UI layout trees to a HubChannel subscription.
--- The broadcast is per-subscription: input state is built with THIS client's
--- recorded selection, the version hash is bucketed against THIS sub_id's
--- last-sent versions, and `mark_sent` records the new baseline. Callers
--- should set `opts.force = true` on priming (so a newly-subscribing browser
--- always receives both densities) and leave `force` false/nil for routine
--- broadcasts so dedup can suppress unchanged trees.
+--- Send the current UI tree snapshots to a HubChannel subscription.
 --
--- Phase 4b: `opts.only_surface` re-renders a single surface, used by the
--- `botster.surface.subpath` action handler. Other surfaces stay on their
--- existing dedup baselines — a URL change within one surface must NOT
--- churn every other surface's version.
+-- Wire protocol v2: trees are no longer per-client — selection moved to the
+-- client. `tree_snapshot.build_frames` dedups globally on
+-- `(surface, subpath)`. Per-client `surface_subpaths` still feeds the
+-- per-surface subpath resolution so a deep-linked browser still gets its
+-- sub-page even though the dedup bucket is shared.
+--
 -- @param sub_id The subscription ID to send to
 -- @param opts table? { force = bool, only_surface = string }
-function Client:send_ui_layout_trees(sub_id, opts)
-    local LayoutInput = require("lib.layout_input")
-    local LayoutBroadcast = require("lib.layout_broadcast")
+function Client:send_ui_tree_snapshots(sub_id, opts)
+    local TreeSnapshot = require("lib.tree_snapshot")
 
     opts = opts or {}
-    local force = opts.force == true
-
-    -- Phase 4a: layout_broadcast iterates `lib.surfaces` and asks each
-    -- surface for its own input via its `input_builder`. We still precompute
-    -- the canonical workspace input here so layout_broadcast can fall back
-    -- to it for the built-in workspace surfaces (which don't declare their
-    -- own input_builder — Phase 2b kept the builder inlined). Passing
-    -- `client = self` additionally lets surfaces that DO declare an
-    -- input_builder thread the per-subscription identity through.
-    local input = LayoutInput.build_for_subscription(self, sub_id)
-    local frames = LayoutBroadcast.build_frames(input, {
-        subscription_key = sub_id,
+    local frames = TreeSnapshot.build_frames({
         client = self,
-        force = force,
+        force = opts.force == true,
         only_surface = opts.only_surface,
     })
     if #frames == 0 then
@@ -422,7 +362,7 @@ function Client:send_ui_layout_trees(sub_id, opts)
         frame.subscriptionId = sub_id
         self:send(frame)
     end
-    LayoutBroadcast.mark_sent(frames, { subscription_key = sub_id })
+    TreeSnapshot.mark_sent(frames)
     return #frames
 end
 
@@ -454,7 +394,7 @@ function Client:set_surface_subpath(surface_name, subpath, opts)
     -- `send_ui_layout_trees(sub_id)` without `force`.
     for sub_id, sub in pairs(self.subscriptions or {}) do
         if sub.channel == "hub" then
-            pcall(self.send_ui_layout_trees, self, sub_id, {
+            pcall(self.send_ui_tree_snapshots, self, sub_id, {
                 only_surface = surface_name,
                 force = true,
             })
@@ -485,91 +425,12 @@ function Client:send_ui_route_registry(sub_id)
     self:send(payload)
 end
 
---- Send workspace list to a HubChannel subscription.
--- @param sub_id The subscription ID to send to
-function Client:send_workspace_list(sub_id)
-    local Hub = require("lib.hub")
-    local ok, workspaces = pcall(function()
-        return Hub.get():list_workspaces()
-    end)
-    if not ok then
-        log.warn(string.format("Failed to build workspace list: %s", tostring(workspaces)))
-        workspaces = {}
-    end
-    self:send({
-        subscriptionId = sub_id,
-        type = "workspace_list",
-        workspaces = workspaces,
-    })
-end
-
---- Send open workspace list to a HubChannel subscription.
--- Includes only workspaces that currently have running sessions.
--- @param sub_id The subscription ID to send to
-function Client:send_open_workspace_list(sub_id)
-    local payload = require("lib.agent_list_payload").build(Agent.all_info())
-    self:send({
-        subscriptionId = sub_id,
-        type = "open_workspace_list",
-        workspaces = payload.workspaces,
-    })
-end
-
---- Send worktree list to a HubChannel subscription.
--- @param sub_id The subscription ID to send to
-function Client:send_worktree_list(sub_id, target)
-    local worktrees = {}
-    local WorktreeListPayload = require("lib.worktree_list_payload")
-    local registry = rawget(_G, "spawn_targets")
-    local inspection = nil
-    if registry and target and target.target_path and type(registry.inspect) == "function" then
-        local ok, result = pcall(registry.inspect, target.target_path)
-        if ok then
-            inspection = result
-        end
-    end
-
-    if inspection and inspection.supports_worktrees then
-        local repo_root = inspection.repo_root or target.target_path
-        local ok, listed = pcall(worktree.list_for_root, repo_root)
-        if ok and type(listed) == "table" then
-            worktrees = listed
-        else
-            log.warn(string.format(
-                "Failed to list worktrees for target %s: %s",
-                tostring(target and target.target_id),
-                tostring(listed)
-            ))
-        end
-    end
-    worktrees = WorktreeListPayload.build(target, worktrees, Agent.all_info())
-    log.info(string.format("Sending worktree list: %d worktrees", #worktrees))
-    for i, wt in ipairs(worktrees) do
-        log.debug(string.format("  Worktree %d: %s (%s)", i, wt.path or "?", wt.branch or "?"))
-    end
-    self:send({
-        subscriptionId = sub_id,
-        type = "worktree_list",
-        target_id = target and target.target_id or nil,
-        target_path = target and target.target_path or nil,
-        target_repo = target and target.target_repo or nil,
-        worktrees = worktrees,
-    })
-end
-
---- Send current hub recovery lifecycle state to a HubChannel subscription.
--- @param sub_id The subscription ID to send to
-function Client:send_hub_recovery_state(sub_id)
-    local recovery = state.get("connections.hub_recovery_state", { state = "starting" })
-    local message = {
-        subscriptionId = sub_id,
-        type = "hub_recovery_state",
-    }
-    for k, v in pairs(recovery) do
-        message[k] = v
-    end
-    self:send(message)
-end
+-- Wire protocol v2: send_workspace_list, send_open_workspace_list,
+-- send_worktree_list, and send_hub_recovery_state are GONE. The hub now
+-- ships those as `entity_snapshot(workspace)` / `entity_snapshot(worktree)`
+-- / `entity_snapshot(hub)` at subscribe time and `entity_patch` /
+-- `entity_upsert` / `entity_remove` thereafter — see lib.entity_broadcast
+-- and the registrations in cli/lua/hub/init.lua.
 
 --- Handle unsubscribe message - remove virtual subscription.
 -- @param msg The unsubscribe message
@@ -605,10 +466,11 @@ function Client:handle_unsubscribe(msg)
         sub_id = sub_id,
     })
 
-    -- Phase 2b: drop the per-subscription ui_layout_tree_v1 dedup state so
-    -- a reconnecting browser with a new sub_id doesn't inherit a stale
-    -- baseline. Safe to call even if no hub-channel dedup state exists.
-    pcall(require("lib.layout_broadcast").forget, sub_id)
+    -- Wire protocol v2: tree_snapshot dedup is GLOBAL on (surface, subpath),
+    -- not per-subscription, so unsubscribe leaves the dedup state alone.
+    -- A reconnecting browser receives a fresh entity_snapshot per type
+    -- (subscribe-time priming) plus the next ui_tree_snapshot if anything
+    -- changed.
 
     self.subscriptions[sub_id] = nil
     log.info(string.format("Unsubscribed: %s (was %s)", sub_id:sub(1, 16), sub.channel))
@@ -845,15 +707,13 @@ function Client:disconnect()
     end
     self.forwarders = {}
 
-    -- Unregister from all terminal sessions (auto-resizes to next client),
-    -- and drop Phase 2b ui_layout_tree_v1 dedup state so reconnecting
-    -- clients aren't silenced by stale per-sub versions.
-    local LayoutBroadcast = require("lib.layout_broadcast")
-    for sub_id, sub in pairs(self.subscriptions) do
+    -- Unregister from all terminal sessions (auto-resizes to next client).
+    -- Wire protocol v2: tree_snapshot dedup is global on
+    -- (surface, subpath), so disconnect leaves it alone.
+    for _, sub in pairs(self.subscriptions) do
         if sub.channel == "terminal" and sub.session_uuid then
             pty_clients.unregister(sub.session_uuid, self.peer_id)
         end
-        pcall(LayoutBroadcast.forget, sub_id)
     end
     self.subscriptions = {}
 

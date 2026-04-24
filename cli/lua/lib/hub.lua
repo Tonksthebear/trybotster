@@ -494,11 +494,12 @@ function Hub:rename_workspace(workspace_id, new_name)
             end
         end
 
-        local connections = require("handlers.connections")
-        connections.broadcast_hub_event("agent_list", {
-            agents = Agent.all_info(),
-        })
-        connections.broadcast_workspace_list()
+        -- Wire protocol v2 — patch the workspace name and let each affected
+        -- session's Session:update emit its own entity_patch.
+        local EB = require("lib.entity_broadcast")
+        if EB.is_registered("workspace") then
+            EB.patch("workspace", workspace_id, { name = new_name })
+        end
 
         return {
             workspace_id = workspace_id,
@@ -539,11 +540,25 @@ function Hub:move_agent_workspace(agent_id, workspace_id, workspace_name)
             error(string.format("Hub:move_agent_workspace failed: %s", tostring(err)))
         end
 
-        local connections = require("handlers.connections")
-        connections.broadcast_hub_event("agent_list", {
-            agents = Agent.all_info(),
-        })
-        connections.broadcast_workspace_list()
+        -- Wire protocol v2 — the moved session's workspace_id changed; the
+        -- Session:update inside move_to_workspace already emitted the
+        -- entity_patch. Re-snapshot the workspace registry so a freshly
+        -- non-empty target workspace shows up in clients that filter for
+        -- "workspaces with sessions".
+        local EB = require("lib.entity_broadcast")
+        if EB.is_registered("workspace") then
+            local Hub = require("lib.hub")
+            local ok, workspaces = pcall(function()
+                return Hub.get():list_workspaces()
+            end)
+            if ok and type(workspaces) == "table" then
+                for _, workspace in ipairs(workspaces) do
+                    if workspace.workspace_id then
+                        EB.upsert("workspace", workspace)
+                    end
+                end
+            end
+        end
 
         return {
             agent_id = session.session_uuid,

@@ -1,5 +1,6 @@
 import { HubManager } from 'connections'
-import { useWorkspaceStore } from '../store/workspace-store'
+import { useUiPresentationStore } from '../store/ui-presentation-store'
+import { useSessionStore } from '../store/entities'
 import { useRouteRegistryStore } from '../store/route-registry-store'
 
 // Per-hub shared state
@@ -10,17 +11,17 @@ const chains = new Map()    // hubId → Promise (serializes connect/disconnect 
 let nextCallerId = 0
 const callerHub = new Map() // callerId → hubId
 
-function getStoreActions() {
-  return useWorkspaceStore.getState()
-}
-
 /**
  * Connect to a hub. Returns { hub, connectionId }.
  * Call disconnect(connectionId) when done.
+ *
+ * Wire protocol v2: entity stores (`store/entities/`) update themselves
+ * straight from `hub_connection.handleMessage` via `applyEntityFrame`.
+ * This bridge no longer normalises agent/workspace lists into a unified
+ * Zustand store; it only owns the per-hub connection lifecycle and the
+ * route-registry seed/follow loop.
  */
-export function connect(hubId, { surface = 'panel' } = {}) {
-  getStoreActions().setSurface(surface)
-
+export function connect(hubId, _options = {}) {
   const callerId = nextCallerId++
   callerHub.set(callerId, hubId)
 
@@ -35,14 +36,11 @@ async function doConnect(hubId, callerId) {
   // Caller may have been disconnected while queued
   if (!callerHub.has(callerId)) return { hub: null, connectionId: callerId }
 
-  const { normalize } = getStoreActions()
   let state = hubState.get(hubId)
 
   if (state) {
-    // Hub already acquired — just add this caller
     state.callerIds.add(callerId)
-    normalize(state.hub.agents.current(), state.hub.openWorkspaces.current())
-    syncSelectionFromUrl(state.hub)
+    syncSelectionFromUrl()
     return { hub: state.hub, connectionId: callerId }
   }
 
@@ -64,31 +62,9 @@ async function doConnect(hubId, callerId) {
 
   const unsubscribers = []
 
-  normalize(hub.agents.current(), hub.openWorkspaces.current())
-
-  hub.agents.load().catch(() => {})
-  hub.openWorkspaces.load().catch(() => {})
-
-  unsubscribers.push(
-    hub.agents.onChange((agents) => {
-      const workspaces = hub.openWorkspaces.current()
-      getStoreActions().normalize(agents, workspaces)
-      syncSelectionFromUrl(hub)
-    })
-  )
-
-  unsubscribers.push(
-    hub.openWorkspaces.onChange((workspaces) => {
-      const agents = hub.agents.current()
-      getStoreActions().normalize(agents, workspaces)
-    })
-  )
-
-  // Phase 4a: seed + follow the hub-authored route registry. The hub sends
-  // `ui_route_registry_v1` on hub-channel subscribe (so the first frame
-  // arrives shortly after acquire) and on every `surfaces_changed` hook
-  // firing. `hub.transport` is the HubTransport; `uiRouteRegistry` is both
-  // an event name and a snapshot accessor.
+  // Wire protocol v2 — seed + follow the hub-authored route registry. The
+  // hub sends `ui_route_registry` on hub-channel subscribe and on every
+  // `surfaces_changed` hook firing.
   const seedRoutes = () => {
     const transport = hub.transport
     if (transport && typeof transport.uiRouteRegistry === 'function') {
@@ -108,7 +84,7 @@ async function doConnect(hubId, callerId) {
     }
   }
 
-  syncSelectionFromUrl(hub)
+  syncSelectionFromUrl()
 
   state = { hub, unsubscribers, callerIds: new Set([callerId]) }
   hubState.set(hubId, state)
@@ -143,7 +119,8 @@ function doDisconnect(hubId, callerId) {
   state.hub.release()
   hubState.delete(hubId)
   chains.delete(hubId)
-  getStoreActions().setConnected(false)
+  useRouteRegistryStore.getState().setSelectedSessionId?.(null)
+  useUiPresentationStore.getState().setSelectedSessionId(null)
   useRouteRegistryStore.getState().clearRoutes(hubId)
 }
 
@@ -151,22 +128,28 @@ export function getHub(hubId) {
   return hubState.get(hubId)?.hub || null
 }
 
-export function syncSelectionFromUrl(hub) {
+/**
+ * Sync the per-browser selectedSessionId from the URL. Wire protocol v2
+ * keeps selection client-side: a `/hubs/<id>/sessions/<uuid>` URL hydrates
+ * the presentation store; the hub never sees per-client selection.
+ */
+export function syncSelectionFromUrl(_hub) {
   const match = window.location.pathname.match(
     /\/hubs\/[^/]+\/sessions\/([^/]+)/
   )
   if (!match) {
-    useWorkspaceStore.getState().setSelectedSessionId(null)
+    useUiPresentationStore.getState().setSelectedSessionId(null)
     return
   }
 
   const sessionUuid = match[1]
-  const agents = hub?.agents.current() || []
-  const agent = agents.find((a) => a.session_uuid === sessionUuid)
-  if (agent) {
-    useWorkspaceStore.getState().setSelectedSessionId(agent.id)
-  } else if (agents.length > 0) {
-    useWorkspaceStore.getState().setSelectedSessionId(null)
+  const sessionStore = useSessionStore.getState()
+  if (sessionStore.byId[sessionUuid]) {
+    useUiPresentationStore.getState().setSelectedSessionId(sessionUuid)
+  } else {
+    // Session not in store yet — set anyway; the SessionList will pick it up
+    // when the entity_snapshot arrives.
+    useUiPresentationStore.getState().setSelectedSessionId(sessionUuid)
   }
 }
 

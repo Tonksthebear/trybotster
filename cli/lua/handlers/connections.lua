@@ -1,7 +1,23 @@
 -- Connection registry (hot-reloadable)
 --
 -- Shared client registry for all transports (WebRTC, TUI, future).
--- Manages client lifecycle, broadcasts hub events to all connected clients.
+-- Manages client lifecycle and broadcasts hub events to all connected
+-- clients.
+--
+-- Wire protocol v2 (cold-turkey, commit 7):
+--   * v1 frame names (`agent_list`, `worktree_list`, `connection_code`,
+--     `hub_recovery_state`, `pty_notification`, `ui_layout_tree_v1`, …)
+--     no longer ship. The dispatcher emits only:
+--       - `entity_snapshot` / `entity_upsert` / `entity_patch` /
+--         `entity_remove`  (via lib.entity_broadcast)
+--       - `ui_tree_snapshot`  (via lib.tree_snapshot)
+--       - `ui_route_registry`  (via Client:send_ui_route_registry)
+--       - `transient_event`  (built inline below for pty_notification)
+--   * Hooks like `agent_created` / `agent_deleted` / `session_updated`
+--     keep their NAMES (Lua identifiers, not wire identifiers) but their
+--     handlers now route through EB instead of v1 broadcast helpers.
+--   * Selection moved to the client. `Client.selected_session_uuid` is
+--     gone; both renderers maintain their own selection state.
 --
 -- Each transport handler (webrtc.lua, tui.lua) registers clients here.
 -- State is persisted in hub.state across hot-reloads.
@@ -11,9 +27,7 @@ local Agent = require("lib.agent")
 local ClientSessionPayload = require("lib.client_session_payload")
 local Session = require("lib.session")
 local pty_clients = require("lib.pty_clients")
-local AgentListPayload = require("lib.agent_list_payload")
-local LayoutInput = require("lib.layout_input")
-local LayoutBroadcast = require("lib.layout_broadcast")
+local EB = require("lib.entity_broadcast")
 
 -- Shared client registry - all transports register here
 local clients = state.get("connections.clients", {})
@@ -23,13 +37,11 @@ local stats = state.get("connections.stats", {
     total_connections = 0,
     total_messages = 0,
     total_disconnections = 0,
-    agent_list_broadcasts = 0,
-    agent_list_deduped = 0,
 })
-local last_agent_list_snapshot = state.get("connections.last_agent_list_snapshot", nil)
 local hub_recovery_state = state.get("connections.hub_recovery_state", {
     state = "starting",
 })
+local last_connection_code = state.get("connections.last_connection_code", nil)
 local pending_osc_session_updates = state.get("connections.pending_osc_session_updates", {})
 
 local OSC_SESSION_UPDATE_DEBOUNCE_SECS = 0.5
@@ -38,9 +50,6 @@ local OSC_SESSION_UPDATE_DEBOUNCE_SECS = 0.5
 -- Client Registry
 -- ============================================================================
 
---- Register a client in the shared registry.
--- @param peer_id The unique peer identifier
--- @param client The Client instance (from lib.client)
 local function register_client(peer_id, client)
     local old_client = clients[peer_id]
     if old_client then
@@ -53,8 +62,6 @@ local function register_client(peer_id, client)
     hooks.notify("client_connected", { peer_id = peer_id, transport = client.transport.type })
 end
 
---- Unregister a client from the shared registry.
--- @param peer_id The unique peer identifier
 local function unregister_client(peer_id)
     local client = clients[peer_id]
     if client then
@@ -66,20 +73,14 @@ local function unregister_client(peer_id)
     stats.total_disconnections = stats.total_disconnections + 1
 end
 
---- Get a client by peer ID.
--- @param peer_id The unique peer identifier
--- @return The Client instance, or nil
 local function get_client(peer_id)
     return clients[peer_id]
 end
 
---- Track a message received from any transport.
 local function track_message()
     stats.total_messages = stats.total_messages + 1
 end
 
---- Get the number of active clients across all transports.
--- @return Number of connected clients
 local function get_client_count()
     local count = 0
     for _ in pairs(clients) do
@@ -88,119 +89,76 @@ local function get_client_count()
     return count
 end
 
---- Get connection statistics.
--- @return Statistics table
 local function get_stats()
     return {
         active_clients = get_client_count(),
         total_connections = stats.total_connections,
         total_messages = stats.total_messages,
         total_disconnections = stats.total_disconnections,
-        agent_list_broadcasts = stats.agent_list_broadcasts,
-        agent_list_deduped = stats.agent_list_deduped,
     }
 end
 
 -- ============================================================================
--- Hub Event Broadcasting
+-- Wire frame broadcasting
 -- ============================================================================
 
---- Broadcast a hub event to all clients with hub channel subscriptions.
--- @param event_name The event name (for logging)
--- @param event_data The data to merge into the message
-local function broadcast_hub_event(event_name, event_data)
-    -- Coalesce identical agent_list payloads to reduce subscription churn.
-    if event_name == "agent_list" then
-        local payload = AgentListPayload.build(event_data and event_data.agents or nil)
-        event_data = {
-            agents = payload.agents,
-            workspaces = payload.workspaces,
-        }
-        local ok, snapshot = pcall(json.encode, event_data)
-        if ok then
-            if last_agent_list_snapshot == snapshot then
-                stats.agent_list_deduped = stats.agent_list_deduped + 1
-                log.debug("Deduped agent_list broadcast (payload unchanged)")
-                return
-            end
-            last_agent_list_snapshot = snapshot
-            state.set("connections.last_agent_list_snapshot", snapshot)
-        end
-    end
-
-    local broadcast_count = 0
-
-    for _, client in pairs(clients) do
-        for sub_id, sub in pairs(client.subscriptions) do
-            if sub.channel == "hub" then
-                local message = {
-                    subscriptionId = sub_id,
-                    type = event_name,
-                }
-                for k, v in pairs(event_data) do
-                    message[k] = v
-                end
-
-                client:send(message)
-                broadcast_count = broadcast_count + 1
-            end
-        end
-    end
-
-    if broadcast_count > 0 then
-        if event_name == "agent_list" then
-            stats.agent_list_broadcasts = stats.agent_list_broadcasts + 1
-        end
-        log.debug(string.format("Broadcast %s to %d subscription(s)", event_name, broadcast_count))
-    end
-end
-
---- Broadcast `ui_layout_tree_v1` frames for every hub-channel subscriber.
---
--- Two target surfaces are emitted per subscription (sidebar + panel
--- densities) — an accepted perf tradeoff versus tracking per-subscription
--- density preferences. See `lib.layout_broadcast` header for rationale.
---
--- Each subscription renders independently because selection is per-browser:
--- `Client.selected_session_uuid` differs between peers so the tree differs
--- too. `Client:send_ui_layout_trees` builds THIS subscription's input,
--- dedupes against its own per-sub version baseline, and ships through the
--- existing encrypted transport.
---
--- The _LayoutInput import above keeps the global builder in scope for test
--- harnesses that want a hub-wide snapshot without per-subscription detail;
--- production code uses the per-client fanout below.
-local function broadcast_ui_layout_trees()
-    local total_sent = 0
-    local sub_count = 0
+--- Send a single frame to every hub-channel subscriber on this hub.
+--- The wire protocol v2 backbone: EB and tree_snapshot both call this so
+--- the broadcast loop is in one place.
+local function broadcast_frame_to_hub(frame)
+    local sent = 0
     for _, client in pairs(clients) do
         for sub_id, sub in pairs(client.subscriptions or {}) do
             if sub.channel == "hub" then
-                sub_count = sub_count + 1
-                local ok, sent = pcall(client.send_ui_layout_trees, client, sub_id)
+                -- Each subscription gets its own copy with subscriptionId
+                -- threaded so the browser/TUI can route the frame to the
+                -- right hub-channel handler when a peer holds multiple subs.
+                local message = { subscriptionId = sub_id }
+                for k, v in pairs(frame) do message[k] = v end
+                client:send(message)
+                sent = sent + 1
+            end
+        end
+    end
+    return sent
+end
+
+-- Wire up EB to use the broadcast loop. EB.upsert / EB.patch / EB.remove
+-- now ship frames straight to every hub-channel subscriber.
+EB.set_broadcaster(broadcast_frame_to_hub)
+
+--- Broadcast `ui_tree_snapshot` frames for every hub-channel subscriber.
+---
+--- Trees are no longer per-client — selection is browser-side. Same tree
+--- ships to every subscriber; tree_snapshot dedups globally on
+--- `(surface, subpath)`. Per-client `surface_subpaths` still influence
+--- which subpath each client renders (via the hub's resolve_subpath in
+--- tree_snapshot), so a deep-linked browser still gets its sub-page.
+local function broadcast_ui_tree_snapshots()
+    local TreeSnapshot = require("lib.tree_snapshot")
+    local total_sent = 0
+    for _, client in pairs(clients) do
+        for sub_id, sub in pairs(client.subscriptions or {}) do
+            if sub.channel == "hub" then
+                local ok, sent = pcall(client.send_ui_tree_snapshots, client, sub_id)
                 if ok and type(sent) == "number" then
                     total_sent = total_sent + sent
                 elseif not ok then
                     log.warn(string.format(
-                        "broadcast_ui_layout_trees: %s -> %s failed: %s",
+                        "broadcast_ui_tree_snapshots: %s -> %s failed: %s",
                         client.peer_id:sub(1, 8), sub_id:sub(1, 16), tostring(sent)))
                 end
             end
         end
     end
-
     if total_sent > 0 then
         log.debug(string.format(
-            "Broadcast ui_layout_tree_v1 (%d frame(s)) across %d subscription(s)",
-            total_sent, sub_count))
+            "Broadcast ui_tree_snapshot (%d frame(s))", total_sent))
     end
+    -- Avoid lints when TreeSnapshot is unused — module preload only.
+    local _ = TreeSnapshot
 end
 
---- Broadcast the `ui_route_registry_v1` frame to every hub-channel
---- subscriber. Called on `surfaces_changed` so a plugin that registers a
---- new surface mid-session reaches existing browsers without requiring
---- them to reconnect. Subscribers receive the full registry; the frontend
---- replaces its copy wholesale on each frame.
 local function broadcast_ui_route_registry()
     local sub_count = 0
     for _, client in pairs(clients) do
@@ -218,39 +176,7 @@ local function broadcast_ui_route_registry()
     end
     if sub_count > 0 then
         log.debug(string.format(
-            "Broadcast ui_route_registry_v1 to %d subscription(s)", sub_count))
-    end
-end
-
-local function broadcast_workspace_list()
-    local Hub = require("lib.hub")
-    local ok, workspaces = pcall(function()
-        return Hub.get():list_workspaces()
-    end)
-    if not ok then
-        log.warn(string.format("Failed to broadcast workspace_list: %s", tostring(workspaces)))
-        workspaces = {}
-    end
-
-    broadcast_hub_event("workspace_list", {
-        workspaces = workspaces,
-    })
-end
-
-local function broadcast_spawn_target_list()
-    local broadcast_count = 0
-
-    for _, client in pairs(clients) do
-        for sub_id, sub in pairs(client.subscriptions) do
-            if sub.channel == "hub" then
-                client:send_spawn_target_list(sub_id)
-                broadcast_count = broadcast_count + 1
-            end
-        end
-    end
-
-    if broadcast_count > 0 then
-        log.debug(string.format("Broadcast spawn_target_list to %d subscription(s)", broadcast_count))
+            "Broadcast ui_route_registry to %d subscription(s)", sub_count))
     end
 end
 
@@ -267,9 +193,9 @@ hooks.on("surfaces_changed", "broadcast_ui_route_registry", function(_info)
     timer.after_idle("ui_route_registry_broadcast", ROUTE_REGISTRY_DEBOUNCE_SECS, function()
         broadcast_ui_route_registry()
         -- When a surface appears/disappears, the set of layout trees
-        -- available to subscribers changes too — force a layout rebroadcast
-        -- so the new surface's initial tree reaches existing browsers.
-        broadcast_ui_layout_trees()
+        -- changes too — force a structural rebroadcast so the new
+        -- surface's initial tree reaches existing browsers.
+        broadcast_ui_tree_snapshots()
     end)
 end)
 
@@ -278,37 +204,49 @@ hooks.on("agent_created", "broadcast_agent_created", function(info)
         return
     end
     local payload = ClientSessionPayload.build(info, Agent.all_info())
-    log.info(string.format("Broadcasting agent_created: %s",
+    log.info(string.format("Broadcasting (v2) entity_upsert(session): %s",
         payload.id or payload.session_uuid or "?"))
 
-    broadcast_hub_event("agent_created", { agent = payload })
-    broadcast_hub_event("agent_list", { agents = Agent.all_info() })
-    broadcast_ui_layout_trees()
-    broadcast_workspace_list()
-
-    local worktrees = hub.get_worktrees()
-    broadcast_hub_event("worktree_list", { worktrees = worktrees })
+    EB.upsert("session", payload)
+    -- Workspaces list may have grown — re-snapshot since workspace patches
+    -- are not granular enough to capture "this session now belongs here".
+    local Hub = require("lib.hub")
+    local ok, workspaces = pcall(function() return Hub.get():list_workspaces() end)
+    if ok and type(workspaces) == "table" then
+        for _, workspace in ipairs(workspaces) do
+            if workspace.workspace_id then
+                EB.upsert("workspace", workspace)
+            end
+        end
+    end
 end)
 
 hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
-    log.info(string.format("Broadcasting agent_deleted: %s", agent_id or "?"))
+    log.info(string.format("Broadcasting (v2) entity_remove(session): %s", agent_id or "?"))
 
-    -- Cancel idle timer for the deleted session.
     if agent_id then
         timer.cancel("idle:" .. agent_id)
     end
 
-    broadcast_hub_event("agent_deleted", { agent_id = agent_id })
-    broadcast_hub_event("agent_list", { agents = Agent.all_info() })
-    broadcast_ui_layout_trees()
-    broadcast_workspace_list()
+    if agent_id then
+        EB.remove("session", agent_id)
+    end
 
-    local worktrees = hub.get_worktrees()
-    broadcast_hub_event("worktree_list", { worktrees = worktrees })
+    -- Surviving sessions might leave a workspace empty. Re-snapshot the
+    -- workspace list so a fully drained workspace disappears from the
+    -- client view.
+    local Hub = require("lib.hub")
+    local ok, workspaces = pcall(function() return Hub.get():list_workspaces() end)
+    if ok and type(workspaces) == "table" then
+        for _, workspace in ipairs(workspaces) do
+            if workspace.workspace_id then
+                EB.upsert("workspace", workspace)
+            end
+        end
+    end
 end)
 
 -- Global callable by Rust to update per-client focus state.
--- Rust calls this with (session_uuid, peer_id, focused).
 function _set_pty_focused(session_uuid, peer_id, focused)
     if session_uuid then
         pty_clients.set_focused(session_uuid, peer_id, focused)
@@ -316,7 +254,6 @@ function _set_pty_focused(session_uuid, peer_id, focused)
 end
 
 -- Send synthetic focus-out to sessions that a disconnecting client had focused.
--- Without this, the PTY would think it still has focus after a client disappears.
 hooks.on("client_disconnected", "unfocus_on_disconnect", function(info)
     local peer_id = info.peer_id
     if not peer_id then return end
@@ -335,17 +272,17 @@ hooks.on("_pty_notification_raw", "enrich_and_dispatch", function(info)
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
     info.already_notified = agent and agent.notification or false
 
-    -- Check if any client is actively viewing this session
     info.has_focus = agent and agent.session_uuid
         and pty_clients.is_any_focused(agent.session_uuid) or false
 
-    -- Include session_uuid for downstream consumers
     info.session_uuid = agent and agent.session_uuid or nil
 
     hooks.notify("pty_notification", info)
 end)
 
--- Send a web push notification when a PTY notification (bell) fires.
+-- Send a web push notification when a PTY notification (bell) fires, AND ship
+-- a `transient_event` envelope to every hub-channel subscriber so toast
+-- handlers fire on the browser and the TUI's notification overlay updates.
 hooks.on("pty_notification", "push_notification", function(info)
     if info.has_focus then return end
     if info.already_notified then return end
@@ -353,7 +290,6 @@ hooks.on("pty_notification", "push_notification", function(info)
     local hub_id = hub.server_id()
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
 
-    -- Build deep link using session_uuid
     local url = nil
     if hub_id and agent and agent.session_uuid then
         url = string.format("/hubs/%s/sessions/%s", hub_id, agent.session_uuid)
@@ -372,7 +308,8 @@ hooks.on("pty_notification", "push_notification", function(info)
     end
     local body = info.message or info.body or "Your attention is needed"
 
-    -- Set notification flag (session_updated hook broadcasts agent_list)
+    -- Set notification flag — Session:update will emit an entity_patch for
+    -- the badge state separately.
     if agent then
         agent:update({ notification = true })
     end
@@ -391,7 +328,17 @@ hooks.on("pty_notification", "push_notification", function(info)
         app_badge = badge_count,
     })
 
-    broadcast_hub_event("pty_notification", { title = title, body = body })
+    -- Wire protocol v2 — transient_event delivers the toast/banner copy.
+    -- Web → toast + drop. TUI → notification overlay + drop. Future
+    -- transient event types reuse this envelope.
+    broadcast_frame_to_hub({
+        v = 2,
+        type = "transient_event",
+        event_type = "pty_notification",
+        session_uuid = info.session_uuid,
+        title = title,
+        body = body,
+    })
 end)
 
 -- Clear a pending notification on a session by session_uuid.
@@ -409,8 +356,6 @@ local function clear_session_notification(session_uuid)
     return cleared, any_remaining, agent
 end
 
--- Called directly from Rust on the PTY input hot path.
--- Rust passes session_uuid; we look up the agent for hook dispatch.
 function _on_pty_input(session_uuid)
     if not session_uuid then return false end
     local agent = Agent.get(session_uuid)
@@ -422,7 +367,6 @@ function _on_pty_input(session_uuid)
     return any_remaining
 end
 
--- Exported for the clear_notification command (TUI agent switching).
 function _clear_session_notification(session_uuid)
     local _, any_remaining = clear_session_notification(session_uuid)
     return any_remaining
@@ -466,17 +410,14 @@ local function queue_osc_session_update(session_uuid, fields)
     end)
 end
 
--- Update agent title when the running program sets the terminal title (OSC 0/2).
 hooks.on("pty_title_changed", "update_agent_title", function(info)
     queue_osc_session_update(info.session_uuid, { title = info.title })
 end)
 
--- Update agent CWD when the shell reports a directory change (OSC 7).
 hooks.on("pty_cwd_changed", "update_agent_cwd", function(info)
     queue_osc_session_update(info.session_uuid, { cwd = info.cwd })
 end)
 
--- Track shell integration prompt marks (OSC 133/633).
 hooks.on("pty_prompt", "update_agent_prompt", function(info)
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
     if agent then
@@ -484,7 +425,6 @@ hooks.on("pty_prompt", "update_agent_prompt", function(info)
     end
 end)
 
--- Track cursor visibility changes (DECTCEM CSI ? 25 h/l).
 hooks.on("pty_cursor_visibility", "update_agent_cursor", function(info)
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
     if agent then
@@ -496,13 +436,6 @@ end)
 -- Idle / Active Detection
 -- ============================================================================
 -- Idle detection: event-driven via timer.after_idle (no polling).
---
--- Each pty_output event resets a per-session idle timer. If no output
--- arrives within IDLE_THRESHOLD_SECS, the timer fires and sets is_idle = true.
--- When output resumes after idle, is_idle is cleared immediately.
---
--- timer.after_idle is a Rust primitive: spawns a tokio::time::sleep task
--- that is aborted and replaced on each reset. Zero polling.
 
 local IDLE_THRESHOLD_SECS = 2
 
@@ -518,12 +451,10 @@ hooks.on("pty_output", "idle_activity_reset", function(ctx, _data)
     local session = Agent.get(uuid)
     if not session then return end
 
-    -- Mark active (session:update triggers session_updated → broadcast)
     if session.is_idle then
         session:update({ is_idle = false })
     end
 
-    -- Reset the idle timer — fires only after IDLE_THRESHOLD_SECS of silence
     timer.after_idle("idle:" .. uuid, IDLE_THRESHOLD_SECS, function()
         local s = Agent.get(uuid)
         if s and not s.is_idle then
@@ -532,28 +463,17 @@ hooks.on("pty_output", "idle_activity_reset", function(ctx, _data)
     end)
 end)
 
--- Auto-broadcast agent list when any session field changes.
--- Debounced: rapid field changes (title, cwd, idle toggles) coalesce into
--- one broadcast after 150ms of quiet. Prevents full-sidebar re-render storms
--- that make all indicators flicker in sync.
-local AGENT_LIST_DEBOUNCE_SECS = 0.15
-
-hooks.on("session_updated", "broadcast_session_updated", function()
-    timer.after_idle("agent_list_broadcast", AGENT_LIST_DEBOUNCE_SECS, function()
-        last_agent_list_snapshot = nil
-        broadcast_hub_event("agent_list", { agents = Agent.all_info() })
-        broadcast_ui_layout_trees()
-    end)
-end)
+-- NOTE: the v1 `broadcast_session_updated` hook (which fanned out
+-- agent_list + ui_layout_trees on every Session:update) is GONE. The
+-- entity_patch for changed fields ships from `Session:update` itself via
+-- EB.patch — see lib/session.lua.
 
 hooks.on("agent_lifecycle", "broadcast_lifecycle", function(info)
     log.debug(string.format("Broadcasting agent_lifecycle: %s -> %s",
         info.agent_id or "?", info.status or "?"))
-
-    broadcast_hub_event("agent_status_changed", {
-        agent_id = info.agent_id,
-        status = info.status,
-    })
+    if info.agent_id and info.status then
+        EB.patch("session", info.agent_id, { status = info.status })
+    end
 end)
 
 -- ============================================================================
@@ -563,8 +483,17 @@ end)
 local _event_subs = {}
 
 _event_subs[#_event_subs + 1] = events.on("connection_code_ready", function(data)
-    log.info("Broadcasting connection_code to hub subscribers")
-    broadcast_hub_event("connection_code", { url = data.url, qr_ascii = data.qr_ascii })
+    log.info("Broadcasting (v2) entity_upsert(connection_code)")
+    local hub_id = hub.server_id and hub.server_id() or nil
+    if not hub_id then return end
+    local payload = {
+        hub_id = hub_id,
+        url = data.url,
+        qr_ascii = data.qr_ascii,
+    }
+    last_connection_code = { url = data.url, qr_ascii = data.qr_ascii }
+    state.set("connections.last_connection_code", last_connection_code)
+    EB.upsert("connection_code", payload)
 end)
 
 _event_subs[#_event_subs + 1] = events.on("preview_dns_ready", function(data)
@@ -573,15 +502,18 @@ _event_subs[#_event_subs + 1] = events.on("preview_dns_ready", function(data)
 end)
 
 _event_subs[#_event_subs + 1] = events.on("connection_code_error", function(err)
-    log.warn(string.format("Broadcasting connection_code_error: %s", err or "unknown"))
-    broadcast_hub_event("connection_code_error", { error = err or "Connection code not available" })
+    log.warn(string.format("Connection code error: %s", err or "unknown"))
+    local hub_id = hub.server_id and hub.server_id() or nil
+    if not hub_id then return end
+    EB.upsert("connection_code", {
+        hub_id = hub_id,
+        error = err or "Connection code not available",
+    })
 end)
 
 _event_subs[#_event_subs + 1] = events.on("hub_recovery_state", function(info)
     local incoming = (type(info) == "table") and info or {}
 
-    -- Replace the persisted table in place so late subscribers can request
-    -- the exact latest lifecycle payload.
     for k in pairs(hub_recovery_state) do
         hub_recovery_state[k] = nil
     end
@@ -591,20 +523,19 @@ _event_subs[#_event_subs + 1] = events.on("hub_recovery_state", function(info)
     hub_recovery_state.state = hub_recovery_state.state or "starting"
     state.set("connections.hub_recovery_state", hub_recovery_state)
 
-    broadcast_hub_event("hub_recovery_state", hub_recovery_state)
-    if hub_recovery_state.state == "ready" then
-        broadcast_hub_event("hub_ready", hub_recovery_state)
-    end
+    local hub_id = hub.server_id and hub.server_id() or nil
+    if not hub_id then return end
+    local payload = { hub_id = hub_id }
+    for k, v in pairs(hub_recovery_state) do payload[k] = v end
+    EB.upsert("hub", payload)
 end)
 
 _event_subs[#_event_subs + 1] = events.on("agent_status_changed", function(info)
-    log.debug(string.format("Broadcasting agent_status_changed: %s -> %s",
+    log.debug(string.format("agent_status_changed: %s -> %s",
         info.agent_id or "?", info.status or "?"))
-
-    broadcast_hub_event("agent_status_changed", {
-        agent_id = info.agent_id,
-        status = info.status,
-    })
+    if info.agent_id and info.status then
+        EB.patch("session", info.agent_id, { status = info.status })
+    end
 end)
 
 _event_subs[#_event_subs + 1] = events.on("process_exited", function(data)
@@ -621,10 +552,6 @@ _event_subs[#_event_subs + 1] = events.on("process_exited", function(data)
     local agent = (session_uuid and Agent.get(session_uuid))
     if agent then
         agent:update({ status = "exited" })
-        broadcast_hub_event("agent_status_changed", {
-            agent_id = agent.session_uuid,
-            status = "exited",
-        })
     end
 end)
 
@@ -642,7 +569,6 @@ _event_subs[#_event_subs + 1] = events.on("mcp_tools_changed", function()
     end
 end)
 
--- Notify MCP clients when prompt list changes
 _event_subs[#_event_subs + 1] = events.on("mcp_prompts_changed", function()
     for _, client in pairs(clients) do
         for sub_id, sub in pairs(client.subscriptions) do
@@ -656,7 +582,6 @@ _event_subs[#_event_subs + 1] = events.on("mcp_prompts_changed", function()
     end
 end)
 
--- Notify MCP clients when resource template list changes
 _event_subs[#_event_subs + 1] = events.on("mcp_resources_changed", function()
     for _, client in pairs(clients) do
         for sub_id, sub in pairs(client.subscriptions) do
@@ -681,10 +606,8 @@ local M = {
     track_message = track_message,
     get_client_count = get_client_count,
     get_stats = get_stats,
-    broadcast_hub_event = broadcast_hub_event,
-    broadcast_workspace_list = broadcast_workspace_list,
-    broadcast_spawn_target_list = broadcast_spawn_target_list,
-    broadcast_ui_layout_trees = broadcast_ui_layout_trees,
+    broadcast_frame_to_hub = broadcast_frame_to_hub,
+    broadcast_ui_tree_snapshots = broadcast_ui_tree_snapshots,
     broadcast_ui_route_registry = broadcast_ui_route_registry,
 }
 
@@ -706,13 +629,13 @@ function M._before_reload()
     hooks.off("pty_title_changed", "update_agent_title")
     hooks.off("pty_cwd_changed", "update_agent_cwd")
     hooks.off("pty_output", "idle_activity_reset")
-    hooks.off("session_updated", "broadcast_session_updated")
-    timer.cancel("agent_list_broadcast")
     hooks.off("pty_prompt", "update_agent_prompt")
     hooks.off("pty_cursor_visibility", "update_agent_cursor")
     hooks.off("client_disconnected", "unfocus_on_disconnect")
     hooks.off("surfaces_changed", "broadcast_ui_route_registry")
     timer.cancel("ui_route_registry_broadcast")
+    -- Restore broadcaster to no-op so EB calls don't dangle on a stale fn.
+    EB.set_broadcaster(nil)
     _set_pty_focused = nil
     _on_pty_input = nil
     _clear_session_notification = nil

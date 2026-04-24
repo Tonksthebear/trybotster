@@ -52,4 +52,62 @@ function M.build_many(subjects)
     return list
 end
 
+-- Wire protocol v2 — fields whose change requires re-deriving another
+-- field on the client. When a `Session:update` patches a derived input
+-- (title, agent_name, branch_name), include the derivation (display_name)
+-- in the same patch so clients don't have to re-fetch.
+local DERIVATION_INPUTS = {
+    title = "display_name",
+    agent_name = "display_name",
+    branch_name = "display_name",
+}
+
+local function display_name_for(session)
+    if type(session) ~= "table" then return nil end
+    -- Mirrors the web/TUI displayName selector logic: label > display_name >
+    -- title > session_uuid. Hub-side computation matters because patches go
+    -- straight to the client store without re-running selectors.
+    if type(session.label) == "string" and session.label ~= "" then
+        return session.label
+    end
+    if type(session.display_name) == "string" and session.display_name ~= "" then
+        return session.display_name
+    end
+    if type(session.title) == "string" and session.title ~= "" then
+        return session.title
+    end
+    return session.session_uuid
+end
+
+--- Project a sparse `Session:update(...)` field set into the patch payload
+--- the wire ships, including any re-derived fields. Per design brief §12.4:
+---   * title         → { title, display_name }
+---   * agent_name    → { agent_name, display_name }
+---   * branch_name   → { branch_name, display_name }
+---   * notification  → { notification }
+---   * is_idle       → { is_idle }
+---   * cwd           → { cwd }
+---   * status        → { status }
+---   * hosted_preview→ { hosted_preview = { ...whole nested object... } }
+---
+--- @param changed_fields table Sparse {field=value} table from Session:update.
+--- @param session table The Session record AFTER applying changes (used to
+---   compute derivations like display_name).
+--- @return table {field=value} payload ready for EB.patch.
+function M.project_fields(changed_fields, session)
+    if type(changed_fields) ~= "table" then return {} end
+    local out = {}
+    local needs_display_name = false
+    for k, v in pairs(changed_fields) do
+        out[k] = v
+        if DERIVATION_INPUTS[k] then
+            needs_display_name = true
+        end
+    end
+    if needs_display_name then
+        out.display_name = display_name_for(session)
+    end
+    return out
+end
+
 return M
