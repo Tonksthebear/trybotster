@@ -157,7 +157,13 @@ if EB then
         all = function()
             local hub_id = hub.server_id and hub.server_id() or nil
             local code = state.get("connections.last_connection_code", nil)
-            if not hub_id or type(code) ~= "table" then return {} end
+            -- state.get auto-inits nil default to `{}`, so `type == "table"`
+            -- is not sufficient — also check `next(code) ~= nil` so a hub
+            -- that never fired connection_code_ready / _error reports an
+            -- empty snapshot instead of a bare `{hub_id}` entity.
+            if not hub_id or type(code) ~= "table" or next(code) == nil then
+                return {}
+            end
             local payload = { hub_id = hub_id }
             for k, v in pairs(code) do payload[k] = v end
             return { payload }

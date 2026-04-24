@@ -502,9 +502,18 @@ _event_subs[#_event_subs + 1] = events.on("connection_code_error", function(err)
     log.warn(string.format("Connection code error: %s", err or "unknown"))
     local hub_id = hub.server_id and hub.server_id() or nil
     if not hub_id then return end
+    -- Persist the error shape FIRST so the `connection_code` entity
+    -- registration in hub/init.lua can rehydrate late subscribers from
+    -- state. Without this, a browser connecting after the error fires
+    -- would get an empty entity_snapshot(connection_code) instead of
+    -- seeing the error banner.
+    last_connection_code = {
+        error = err or "Connection code not available",
+    }
+    state.set("connections.last_connection_code", last_connection_code)
     EB.upsert("connection_code", {
         hub_id = hub_id,
-        error = err or "Connection code not available",
+        error = last_connection_code.error,
     })
 end)
 
