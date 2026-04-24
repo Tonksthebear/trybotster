@@ -170,7 +170,7 @@ function defaultLoadingFallback() {
  * Hub-subscribing React island that renders the active layout tree for a
  * given `targetSurface`. Wire shape (confirmed with Phase 2b transport):
  *
- *     { type: "ui_layout_tree_v1", target_surface: string,
+ *     { type: "ui_tree_snapshot", target_surface: string,
  *       tree: UiNodeV1, version: string, hub_id: string }
  *
  * Mount points (Phase 2c): the workspace surface splits into
@@ -277,7 +277,7 @@ export default function UiTree({
     }
   }, [hubId])
 
-  // Subscribe to ui_layout_tree_v1 frames matching this target_surface.
+  // Subscribe to ui_tree_snapshot frames matching this target_surface.
   //
   // Phase 4b: also filter on `subpath`. The hub echoes back the subpath it
   // routed for, so a frame produced from the OLD subpath (still en route
@@ -286,7 +286,13 @@ export default function UiTree({
   useEffect(() => {
     if (!transport || !targetSurface) return undefined
     const handler = (message) => {
-      if (!message || message.type !== 'ui_layout_tree_v1') return
+      if (
+        !message ||
+        (message.type !== 'ui_tree_snapshot' &&
+          message.type !== 'ui_layout_tree_v1')
+      ) {
+        return
+      }
       if (message.target_surface !== targetSurface) return
       if (
         typeof message.subpath === 'string' &&

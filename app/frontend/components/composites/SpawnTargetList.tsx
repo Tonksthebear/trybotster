@@ -4,8 +4,7 @@
 // templates: their `id` (and optional payload base) is merged with the
 // per-row `target_id` before dispatch (design brief §5).
 
-import React, { type MouseEvent, type ReactElement } from 'react'
-import { useShallow } from 'zustand/react/shallow'
+import React, { useMemo, type MouseEvent, type ReactElement } from 'react'
 
 import { useSpawnTargetStore } from '../../store/entities'
 import type { SpawnTargetListPropsV1, UiActionV1 } from '../../ui_contract/types'
@@ -29,10 +28,15 @@ export function SpawnTargetList({
   onRemove,
   ctx,
 }: SpawnTargetListProps): ReactElement {
-  const targets = useSpawnTargetStore(
-    useShallow((state) =>
-      state.order.map((id) => [id, state.byId[id] as SpawnTargetRecord]),
-    ),
+  const targetOrder = useSpawnTargetStore((state) => state.order)
+  const targetsById = useSpawnTargetStore((state) => state.byId)
+  const targets = useMemo(
+    () =>
+      targetOrder.map((id) => [
+        id,
+        targetsById[id] as SpawnTargetRecord,
+      ] as const),
+    [targetOrder, targetsById],
   )
   if (targets.length === 0) {
     return <div className="text-sm text-zinc-500">No spawn targets</div>

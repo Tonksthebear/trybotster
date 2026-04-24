@@ -1,8 +1,7 @@
 // Wire protocol v2 — composite renderer for `ui.workspace_list{}`.
 // Renders the bare list of workspaces without the session children join.
 
-import React, { type ReactElement } from 'react'
-import { useShallow } from 'zustand/react/shallow'
+import React, { useMemo, type ReactElement } from 'react'
 
 import { useWorkspaceEntityStore } from '../../store/entities'
 import type { WorkspaceListPropsV1 } from '../../ui_contract/types'
@@ -13,10 +12,15 @@ type WorkspaceRecord = { workspace_id?: string; name?: string }
 export type WorkspaceListProps = WorkspaceListPropsV1 & { ctx: RenderContext }
 
 export function WorkspaceList(_props: WorkspaceListProps): ReactElement {
-  const workspaces = useWorkspaceEntityStore(
-    useShallow((state) =>
-      state.order.map((id) => [id, state.byId[id] as WorkspaceRecord]),
-    ),
+  const workspaceOrder = useWorkspaceEntityStore((state) => state.order)
+  const workspacesById = useWorkspaceEntityStore((state) => state.byId)
+  const workspaces = useMemo(
+    () =>
+      workspaceOrder.map((id) => [
+        id,
+        workspacesById[id] as WorkspaceRecord,
+      ] as const),
+    [workspaceOrder, workspacesById],
   )
   if (workspaces.length === 0) {
     return <div className="text-sm text-zinc-500">No workspaces</div>

@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 
-// Per-hub, per-surface record of "first ui_layout_tree_v1 frame landed".
+// Per-hub, per-surface record of "first ui_tree_snapshot frame landed".
 // Feeds the root-level `<html data-hub-snapshot>` signal (in AppShell) and
 // is the second precondition alongside the route-registry snapshot.
 //

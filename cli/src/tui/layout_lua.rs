@@ -168,6 +168,16 @@ impl LayoutLua {
 
     /// Call Lua `render(state)` and return the render tree.
     pub fn call_render(&self, ctx: &RenderContext) -> Result<RenderNode> {
+        self.call_render_with_stores(ctx, None)
+    }
+
+    /// Call Lua `render(state)` and return the render tree, optionally
+    /// threading v2 entity stores into the UI contract adapter.
+    pub fn call_render_with_stores(
+        &self,
+        ctx: &RenderContext,
+        stores: Option<&crate::tui::entity_stores::TuiEntityStores>,
+    ) -> Result<RenderNode> {
         let state = render_context_to_lua(&self.lua, ctx)?;
 
         let globals = self.lua.globals();
@@ -190,9 +200,10 @@ impl LayoutLua {
                     ctx.terminal_rows,
                     false,
                 );
-                let (render, _actions) = crate::tui::ui_contract_adapter::render_lua_ui_node(
-                    &self.lua, &result, &viewport,
-                )?;
+                let (render, _actions) =
+                    crate::tui::ui_contract_adapter::render_lua_ui_node_with_stores(
+                        &self.lua, &result, &viewport, stores,
+                    )?;
                 return Ok(render);
             }
         }
@@ -202,6 +213,16 @@ impl LayoutLua {
 
     /// Call Lua `render_overlay(state)` and return optional overlay tree.
     pub fn call_render_overlay(&self, ctx: &RenderContext) -> Result<Option<RenderNode>> {
+        self.call_render_overlay_with_stores(ctx, None)
+    }
+
+    /// Call Lua `render_overlay(state)` and return optional overlay tree,
+    /// optionally threading v2 entity stores into the UI contract adapter.
+    pub fn call_render_overlay_with_stores(
+        &self,
+        ctx: &RenderContext,
+        stores: Option<&crate::tui::entity_stores::TuiEntityStores>,
+    ) -> Result<Option<RenderNode>> {
         let state = render_context_to_lua(&self.lua, ctx)?;
 
         let globals = self.lua.globals();
@@ -230,8 +251,8 @@ impl LayoutLua {
                                 false,
                             );
                         let (node, _actions) =
-                            crate::tui::ui_contract_adapter::render_lua_ui_node(
-                                &self.lua, &table, &viewport,
+                            crate::tui::ui_contract_adapter::render_lua_ui_node_with_stores(
+                                &self.lua, &table, &viewport, stores,
                             )?;
                         return Ok(Some(node));
                     }
@@ -2360,6 +2381,61 @@ mod tests {
         assert!(
             items[1].contains("main"),
             "Second item should be agent row containing 'main'"
+        );
+    }
+
+    #[test]
+    fn entity_snapshot_populates_legacy_tui_state_for_current_layout() {
+        let lua = make_full_lua_with_events();
+        let ctx = ActionContext::default();
+
+        let sessions = serde_json::json!({
+            "type": "entity_snapshot",
+            "entity_type": "session",
+            "items": [{
+                "session_uuid": "sess-v2",
+                "display_name": "agent one",
+                "branch_name": "main",
+                "workspace_id": "ws-v2",
+                "session_type": "agent",
+                "status": "running"
+            }],
+            "snapshot_seq": 1
+        });
+        lua.call_on_hub_event("entity_snapshot", &sessions, &ctx)
+            .unwrap();
+
+        let workspaces = serde_json::json!({
+            "type": "entity_snapshot",
+            "entity_type": "workspace",
+            "items": [{
+                "workspace_id": "ws-v2",
+                "name": "Workspace V2",
+                "agents": ["sess-v2"],
+                "status": "active"
+            }],
+            "snapshot_seq": 1
+        });
+        lua.call_on_hub_event("entity_snapshot", &workspaces, &ctx)
+            .unwrap();
+
+        let count = lua.eval_usize("return #_tui_state.agents").unwrap();
+        assert_eq!(count, 1);
+        let selected_id = lua
+            .eval_string("return _tui_state.agents[1].id or 'NIL'")
+            .unwrap();
+        assert_eq!(selected_id, "sess-v2");
+
+        let render_ctx = make_test_ctx("list");
+        let tree = lua.call_render(&render_ctx).unwrap();
+        let items = extract_sidebar_items(&tree);
+        assert!(
+            items.iter().any(|item| item.contains("Workspace V2")),
+            "workspace snapshot should render a workspace header, got {items:?}"
+        );
+        assert!(
+            items.iter().any(|item| item.contains("agent one")),
+            "session snapshot should render an agent row, got {items:?}"
         );
     }
 

@@ -26,6 +26,10 @@ import UiTree, {
   useUiActionInterceptor,
   useUiTreeDispatch,
 } from '../components/UiTree'
+import {
+  useSessionStore,
+  useWorkspaceEntityStore,
+} from '../store/entities'
 
 // ---------- Mock hub-bridge.getHub returning a fake transport ----------
 
@@ -57,6 +61,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  useSessionStore.getState()._reset()
+  useWorkspaceEntityStore.getState()._reset()
   vi.mocked(legacyDispatch).mockClear()
   vi.restoreAllMocks()
 })
@@ -84,6 +90,54 @@ describe('<UiTree>', () => {
       <UiTree hubId="hub-1" targetSurface="workspace_panel" />,
     )
     expect(container.textContent).toMatch(/Loading/i)
+  })
+
+  it('renders ui_tree_snapshot frames from the v2 hub wire', async () => {
+    render(<UiTree hubId="hub-1" targetSurface="workspace_panel" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'workspace_panel',
+        tree: HELLO_TREE,
+      })
+    })
+    expect(await screen.findByText('hello world')).toBeInTheDocument()
+  })
+
+  it('renders v2 session_list composites without uncached selector loops', async () => {
+    const consoleError = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => {})
+    useWorkspaceEntityStore.getState().applySnapshot(
+      [{ workspace_id: 'ws-1', name: 'Main' }],
+      1,
+    )
+    useSessionStore.getState().applySnapshot(
+      [
+        {
+          session_uuid: 'sess-1',
+          title: 'Agent One',
+          workspace_id: 'ws-1',
+        },
+      ],
+      1,
+    )
+
+    render(<UiTree hubId="hub-1" targetSurface="workspace_panel" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'workspace_panel',
+        tree: { type: 'session_list', props: { grouping: 'workspace' } },
+      })
+    })
+
+    expect(await screen.findByText('Agent One')).toBeInTheDocument()
+    expect(
+      consoleError.mock.calls.some(([first]) =>
+        String(first).includes('getSnapshot should be cached'),
+      ),
+    ).toBe(false)
   })
 
   it('drops stale tree + unsubscribes from old transport when hubId switches', async () => {

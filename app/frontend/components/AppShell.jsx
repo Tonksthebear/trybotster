@@ -71,7 +71,7 @@ function SuspenseFallback() {
 //
 //   <html data-hub-snapshot="pending|received">
 //     Flips to 'received' when BOTH the `ui_route_registry_v1` snapshot for
-//     the selected hub has landed AND at least one `ui_layout_tree_v1` frame
+//     the selected hub has landed AND at least one `ui_tree_snapshot` frame
 //     for that hub has arrived. Resets to 'pending' on hub switch.
 // ---------------------------------------------------------------------------
 

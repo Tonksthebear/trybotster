@@ -6,10 +6,9 @@
 // session lists — membership is derived client-side by filtering sessions
 // where session.workspace_id == workspace.id (design brief §12.5).
 
-import React, { type MouseEvent, type ReactElement } from 'react'
+import React, { useMemo, type MouseEvent, type ReactElement } from 'react'
 import clsx from 'clsx'
 
-import { useShallow } from 'zustand/react/shallow'
 import {
   useSessionStore,
   useWorkspaceEntityStore,
@@ -58,15 +57,25 @@ export function SessionList({
     ) ?? 'panel'
   const groupingMode = grouping ?? 'workspace'
 
-  const sessions = useSessionStore(
-    useShallow((state) =>
-      state.order.map((id) => [id, state.byId[id] as SessionRecord]),
-    ),
+  const sessionOrder = useSessionStore((state) => state.order)
+  const sessionsById = useSessionStore((state) => state.byId)
+  const sessions = useMemo(
+    () =>
+      sessionOrder.map((id) => [
+        id,
+        sessionsById[id] as SessionRecord,
+      ] as const),
+    [sessionOrder, sessionsById],
   )
-  const workspaces = useWorkspaceEntityStore(
-    useShallow((state) =>
-      state.order.map((id) => [id, state.byId[id] as WorkspaceRecord]),
-    ),
+  const workspaceOrder = useWorkspaceEntityStore((state) => state.order)
+  const workspacesById = useWorkspaceEntityStore((state) => state.byId)
+  const workspaces = useMemo(
+    () =>
+      workspaceOrder.map((id) => [
+        id,
+        workspacesById[id] as WorkspaceRecord,
+      ] as const),
+    [workspaceOrder, workspacesById],
   )
 
   const selectedSessionId = useUiPresentationStore((s) => s.selectedSessionId)
