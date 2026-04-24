@@ -640,8 +640,14 @@ function M._before_reload()
     hooks.off("client_disconnected", "unfocus_on_disconnect")
     hooks.off("surfaces_changed", "broadcast_ui_route_registry")
     timer.cancel("ui_route_registry_broadcast")
-    -- Restore broadcaster to no-op so EB calls don't dangle on a stale fn.
-    EB.set_broadcaster(nil)
+    -- Wire protocol v2 B6 fix: we DO NOT clear the broadcaster here. The
+    -- top-level `EB.set_broadcaster(broadcast_frame_to_hub)` on reload
+    -- replaces it atomically, and the old closure keeps working in the
+    -- meantime (it captures `clients` via state.get, which survives
+    -- reload). Clearing to nil opened a mutator-blackout window where a
+    -- Session:update during the reload would silently lose its
+    -- entity_patch. If the new module fails to load, the old broadcaster
+    -- stays live — safer than dropping frames.
     _set_pty_focused = nil
     _on_pty_input = nil
     _clear_session_notification = nil
