@@ -14,7 +14,9 @@
 --   { type = "entity_patch",    entity_type, id, patch, snapshot_seq }
 --   { type = "entity_remove",   entity_type, id, snapshot_seq }
 --
--- `snapshot_seq` is monotonic per entity type per hub process. Clients keep
+-- `snapshot_seq` is monotonic per entity type per hub process, seeded from a
+-- wall-clock boot epoch so a reboot does not restart at 0 and trip older
+-- reconnecting clients that still gate snapshots by sequence. Clients keep
 -- their own `last_snapshot_seq` per type and drop out-of-order deltas. On
 -- subscribe, the hub re-ships an `entity_snapshot` for every registered
 -- type (see `send_snapshots_to`), which resets the client's baseline.
@@ -56,10 +58,18 @@ local broadcaster = function(_frame) end
 -- -------------------------------------------------------------------------
 
 local function next_seq(entity_type)
-    local n = (seq_by_type[entity_type] or 0) + 1
+    local current = seq_by_type[entity_type]
+    if type(current) ~= "number" then current = M.seq_epoch() end
+    local n = current + 1
     seq_by_type[entity_type] = n
     state.set("entity_broadcast.seq_by_type", seq_by_type)
     return n
+end
+
+local function current_seq(entity_type)
+    local n = seq_by_type[entity_type]
+    if type(n) == "number" then return n end
+    return M.seq_epoch()
 end
 
 local function get_entry(entity_type, op_label)
@@ -115,6 +125,22 @@ function M.set_broadcaster(fn)
     end
     assert(type(fn) == "function", "entity_broadcast.set_broadcaster requires a function")
     broadcaster = fn
+end
+
+--- Sequence floor for this hub process.
+---
+--- The value is persisted in hub.state across Lua hot-reloads, but recomputed
+--- on a real hub process reboot. Using an epoch-sized floor keeps fresh
+--- subscribe snapshots greater than any ordinary pre-reboot delta sequence,
+--- which protects clients that have not yet learned that snapshots are
+--- authoritative resyncs.
+function M.seq_epoch()
+    local n = state.get("entity_broadcast.seq_epoch")
+    if type(n) ~= "number" then
+        n = os.time() * 1000
+        state.set("entity_broadcast.seq_epoch", n)
+    end
+    return n
 end
 
 --- Register an entity type.
@@ -275,6 +301,7 @@ end
 function M.send_snapshots_to(client, sub_id)
     assert(client and type(client.send) == "function",
         "entity_broadcast.send_snapshots_to: client must support :send(msg)")
+    local sent = 0
     for _, entity_type in ipairs(registered_type_names()) do
         local entry = registry[entity_type]
         local items = snapshot_items(entry, entity_type)
@@ -283,11 +310,22 @@ function M.send_snapshots_to(client, sub_id)
             type = "entity_snapshot",
             entity_type = entity_type,
             items = items,
-            snapshot_seq = seq_by_type[entity_type] or 0,
+            snapshot_seq = current_seq(entity_type),
         }
         if sub_id ~= nil then frame.subscriptionId = sub_id end
         client:send(frame)
+        sent = sent + 1
+        log.info(string.format(
+            "entity_broadcast.snapshot: type=%s items=%d seq=%s sub=%s",
+            tostring(entity_type),
+            #items,
+            tostring(frame.snapshot_seq),
+            tostring(sub_id or "nil")))
     end
+    log.info(string.format(
+        "entity_broadcast.snapshot: sent %d type snapshot(s) to sub=%s",
+        sent,
+        tostring(sub_id or "nil")))
 end
 
 -- -------------------------------------------------------------------------
@@ -299,7 +337,7 @@ function M.is_registered(entity_type)
 end
 
 function M.snapshot_seq(entity_type)
-    return seq_by_type[entity_type] or 0
+    return current_seq(entity_type)
 end
 
 function M.registered_types()
@@ -325,6 +363,7 @@ function M._reset_for_tests()
     for k in pairs(registry) do registry[k] = nil end
     for k in pairs(seq_by_type) do seq_by_type[k] = nil end
     state.set("entity_broadcast.seq_by_type", seq_by_type)
+    state.set("entity_broadcast.seq_epoch", 0)
     broadcaster = function(_frame) end
 end
 

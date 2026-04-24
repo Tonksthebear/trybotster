@@ -20,6 +20,7 @@
 local ws_helpers = require("ui.workspace_helpers")
 
 local M = {}
+local rebuild_workspaces
 
 --- Set mode in _tui_state and return the set_mode op for Rust's shadow.
 local function set_mode_ops(mode)
@@ -34,6 +35,8 @@ end
 -- =============================================================================
 
 local function upsert_agent(agent)
+  if not agent then return end
+  agent.id = agent.id or agent.session_uuid
   for i, a in ipairs(_tui_state.agents) do
     if a.id == agent.id then
       _tui_state.agents[i] = agent
@@ -50,6 +53,180 @@ local function remove_agent(agent_id)
       return
     end
   end
+end
+
+local function merge_patch(existing, patch)
+  if type(existing) ~= "table" then existing = {} end
+  if type(patch) ~= "table" then return existing end
+  local merged = {}
+  for k, v in pairs(existing) do merged[k] = v end
+  for k, v in pairs(patch) do merged[k] = v end
+  return merged
+end
+
+local function normalise_workspace(workspace)
+  if type(workspace) ~= "table" then return nil end
+  workspace.id = workspace.id or workspace.workspace_id
+  if not workspace.id then return nil end
+  workspace.name = workspace.name or workspace.workspace_name or workspace.title or workspace.id
+  return workspace
+end
+
+local function normalise_spawn_target(target)
+  if type(target) ~= "table" then return nil end
+  target.id = target.id or target.target_id
+  target.name = target.name or target.target_name or target.id
+  target.path = target.path or target.target_path or target.target_repo
+  if not target.id and not target.path then return nil end
+  return target
+end
+
+local function handle_entity_snapshot(event_data)
+  local entity_type = event_data and event_data.entity_type or nil
+  local items = event_data and event_data.items or nil
+  if type(entity_type) ~= "string" or type(items) ~= "table" then return nil end
+
+  if entity_type == "session" then
+    _tui_state.agents = {}
+    for _, item in ipairs(items) do
+      if type(item) == "table" then
+        item.id = item.id or item.session_uuid
+        _tui_state.agents[#_tui_state.agents + 1] = item
+      end
+    end
+    rebuild_workspaces()
+    return {}
+  end
+
+  if entity_type == "workspace" then
+    _tui_state._workspace_meta = {}
+    for _, item in ipairs(items) do
+      local ws = normalise_workspace(item)
+      if ws then _tui_state._workspace_meta[ws.id] = ws end
+    end
+    rebuild_workspaces()
+    return {}
+  end
+
+  if entity_type == "spawn_target" then
+    _tui_state.available_targets = {}
+    for _, item in ipairs(items) do
+      local target = normalise_spawn_target(item)
+      if target then _tui_state.available_targets[#_tui_state.available_targets + 1] = target end
+    end
+    return {}
+  end
+
+  if entity_type == "worktree" then
+    _tui_state.available_worktrees = items
+    return {}
+  end
+
+  if entity_type == "connection_code" then
+    local first = items[1]
+    if type(first) == "table" and first.url and first.qr_ascii then
+      return {
+        { op = "set_connection_code", url = first.url, qr_ascii = first.qr_ascii },
+      }
+    end
+    return {}
+  end
+
+  return {}
+end
+
+local function handle_entity_upsert(event_data)
+  local entity_type = event_data and event_data.entity_type or nil
+  local entity = event_data and event_data.entity or nil
+  if type(entity_type) ~= "string" or type(entity) ~= "table" then return nil end
+
+  if entity_type == "session" then
+    upsert_agent(entity)
+    rebuild_workspaces()
+    return {}
+  end
+
+  if entity_type == "workspace" then
+    local ws = normalise_workspace(entity)
+    if ws then
+      _tui_state._workspace_meta = _tui_state._workspace_meta or {}
+      _tui_state._workspace_meta[ws.id] = ws
+      rebuild_workspaces()
+    end
+    return {}
+  end
+
+  if entity_type == "spawn_target" then
+    local target = normalise_spawn_target(entity)
+    if target then
+      local found = false
+      for i, existing in ipairs(_tui_state.available_targets or {}) do
+        if existing.id == target.id then
+          _tui_state.available_targets[i] = target
+          found = true
+          break
+        end
+      end
+      if not found then
+        _tui_state.available_targets = _tui_state.available_targets or {}
+        _tui_state.available_targets[#_tui_state.available_targets + 1] = target
+      end
+    end
+    return {}
+  end
+
+  return {}
+end
+
+local function handle_entity_patch(event_data)
+  local entity_type = event_data and event_data.entity_type or nil
+  local id = event_data and event_data.id or nil
+  local patch = event_data and event_data.patch or nil
+  if type(entity_type) ~= "string" or type(id) ~= "string" or type(patch) ~= "table" then
+    return nil
+  end
+
+  if entity_type == "session" then
+    for i, existing in ipairs(_tui_state.agents or {}) do
+      if existing.id == id or existing.session_uuid == id then
+        _tui_state.agents[i] = merge_patch(existing, patch)
+        _tui_state.agents[i].id = _tui_state.agents[i].id or _tui_state.agents[i].session_uuid
+        rebuild_workspaces()
+        return {}
+      end
+    end
+    return {}
+  end
+
+  if entity_type == "workspace" then
+    _tui_state._workspace_meta = _tui_state._workspace_meta or {}
+    local current = _tui_state._workspace_meta[id] or { id = id, workspace_id = id }
+    _tui_state._workspace_meta[id] = normalise_workspace(merge_patch(current, patch))
+    rebuild_workspaces()
+    return {}
+  end
+
+  return {}
+end
+
+local function handle_entity_remove(event_data)
+  local entity_type = event_data and event_data.entity_type or nil
+  local id = event_data and event_data.id or nil
+  if type(entity_type) ~= "string" or type(id) ~= "string" then return nil end
+
+  if entity_type == "session" then
+    remove_agent(id)
+    rebuild_workspaces()
+    return {}
+  end
+
+  if entity_type == "workspace" then
+    if _tui_state._workspace_meta then _tui_state._workspace_meta[id] = nil end
+    rebuild_workspaces()
+    return {}
+  end
+
+  return {}
 end
 
 local function update_agent_status(agent_id, status)
@@ -101,7 +278,7 @@ end
 -- Groups agents by workspace_id; falls back to per-agent pseudo-workspace
 -- for agents without workspace_id (older hub versions).
 -- Uses server-provided workspace metadata when available (name, status).
-local function rebuild_workspaces()
+rebuild_workspaces = function()
   local workspace_meta = _tui_state._workspace_meta or {}
 
   -- Index agents by id for O(1) lookup
@@ -223,6 +400,22 @@ end
 -- @param context table      Current TUI state
 -- @return table|nil List of op tables, or nil for no action
 function M.on_hub_event(event_type, event_data, context)
+
+  if event_type == "entity_snapshot" then
+    return handle_entity_snapshot(event_data)
+  end
+
+  if event_type == "entity_upsert" then
+    return handle_entity_upsert(event_data)
+  end
+
+  if event_type == "entity_patch" then
+    return handle_entity_patch(event_data)
+  end
+
+  if event_type == "entity_remove" then
+    return handle_entity_remove(event_data)
+  end
 
   if event_type == "agent_created" then
     local agent = event_data.agent

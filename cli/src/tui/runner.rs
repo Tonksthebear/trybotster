@@ -1674,7 +1674,10 @@ where
             if self.entity_stores.apply_frame(&msg) {
                 self.dirty = true;
             }
-            return;
+            // Keep flowing into Lua. The current TUI layout is still the
+            // legacy Lua renderer backed by `_tui_state`, so v2 entity frames
+            // must also update Lua state until that layout fully moves to
+            // UiNodeV1 composites backed directly by `TuiEntityStores`.
         }
 
         // Handle kitty_changed directly — sets outer terminal keyboard mode.
@@ -1823,6 +1826,7 @@ where
                 &mut self.terminal,
                 layout_lua,
                 &ctx,
+                &self.entity_stores,
                 &mut self.widget_states,
             ) {
                 Ok(result) => Some(result),
@@ -2104,6 +2108,7 @@ fn render_with_lua<B>(
     terminal: &mut Terminal<B>,
     layout_lua: &LayoutLua,
     ctx: &super::render::RenderContext,
+    entity_stores: &super::entity_stores::TuiEntityStores,
     widget_states: &mut super::widget_state::WidgetStateStore,
 ) -> Result<LuaRenderResult>
 where
@@ -2113,10 +2118,10 @@ where
     use super::render_tree::interpret_tree;
 
     // Get main layout tree from Lua
-    let tree = layout_lua.call_render(ctx)?;
+    let tree = layout_lua.call_render_with_stores(ctx, Some(entity_stores))?;
 
     // Get optional overlay tree from Lua
-    let overlay = layout_lua.call_render_overlay(ctx)?;
+    let overlay = layout_lua.call_render_overlay_with_stores(ctx, Some(entity_stores))?;
 
     // Render to terminal
     terminal.draw(|f| {

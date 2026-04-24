@@ -1,8 +1,7 @@
 // Wire protocol v2 — composite renderer for `ui.worktree_list{ target_id }`.
 // Filters worktrees to those belonging to the supplied spawn target.
 
-import React, { type ReactElement } from 'react'
-import { useShallow } from 'zustand/react/shallow'
+import React, { useMemo, type ReactElement } from 'react'
 
 import { useWorktreeStore } from '../../store/entities'
 import type { WorktreeListPropsV1 } from '../../ui_contract/types'
@@ -18,14 +17,14 @@ type WorktreeRecord = {
 export type WorktreeListProps = WorktreeListPropsV1 & { ctx: RenderContext }
 
 export function WorktreeList({ targetId }: WorktreeListProps): ReactElement {
-  const worktrees = useWorktreeStore(
-    useShallow((state) =>
-      state.order
-        .map((id) => [id, state.byId[id] as WorktreeRecord])
-        .filter(
-          ([, wt]) => (wt as WorktreeRecord)?.target_id === targetId,
-        ),
-    ),
+  const worktreeOrder = useWorktreeStore((state) => state.order)
+  const worktreesById = useWorktreeStore((state) => state.byId)
+  const worktrees = useMemo(
+    () =>
+      worktreeOrder
+        .map((id) => [id, worktreesById[id] as WorktreeRecord] as const)
+        .filter(([, wt]) => wt?.target_id === targetId),
+    [targetId, worktreeOrder, worktreesById],
   )
   if (worktrees.length === 0) {
     return <div className="text-sm text-zinc-500">No worktrees</div>

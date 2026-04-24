@@ -29,10 +29,10 @@
 //!
 //! ## snapshot_seq
 //!
-//! Each store keeps the most recent `snapshot_seq` it received. Frames
+//! Each store keeps the most recent `snapshot_seq` it received. Delta frames
 //! older than the current seq (out-of-order or replayed) are dropped.
-//! Reconnect re-ships an `entity_snapshot` per type; the snapshot's seq
-//! resets the store's baseline.
+//! Reconnect re-ships an `entity_snapshot` per type; snapshots always replace
+//! local contents and reset the store's baseline.
 
 use std::collections::HashMap;
 
@@ -79,9 +79,7 @@ impl EntityStore {
     /// from the items array so the renderer's iteration order matches the
     /// hub's intent.
     pub fn apply_snapshot(&mut self, items: Vec<JsonValue>, id_field: &str, snapshot_seq: u64) {
-        if !self.accept_seq(snapshot_seq, "snapshot") {
-            return;
-        }
+        self.snapshot_seq = snapshot_seq;
         self.order.clear();
         self.by_id.clear();
         for item in items {
@@ -158,10 +156,10 @@ impl EntityStore {
     }
 
     fn accept_seq(&mut self, snapshot_seq: u64, op: &str) -> bool {
-        // snapshot_seq == 0 is allowed for the very first frame the hub
-        // ships (an empty registered type); subsequent frames must strictly
-        // increase. Equal sequences are dropped — they indicate the hub
-        // re-shipped without bumping (programmer error) or a replayed frame.
+        // snapshot_seq == 0 is allowed for the very first delta the hub
+        // ships. Subsequent deltas must strictly increase. Snapshots bypass
+        // this check because subscribe/reconnect uses them as authoritative
+        // resync frames, often with the same seq as the most recent delta.
         if snapshot_seq == 0 {
             self.snapshot_seq = 0;
             return true;
@@ -480,6 +478,29 @@ mod tests {
         let store = stores.store("session").expect("store");
         assert_eq!(store.snapshot_seq, 5);
         assert_eq!(store.by_id["sess-a"]["title"], json!("a"));
+    }
+
+    #[test]
+    fn snapshot_with_same_or_lower_seq_still_resyncs_store() {
+        let mut stores = TuiEntityStores::new();
+        stores.apply_frame(&snap_frame(
+            vec![json!({ "session_uuid": "sess-a", "title": "stale" })],
+            5,
+        ));
+        stores.apply_frame(&snap_frame(
+            vec![json!({ "session_uuid": "sess-b", "title": "fresh" })],
+            5,
+        ));
+        stores.apply_frame(&snap_frame(
+            vec![json!({ "session_uuid": "sess-c", "title": "reset" })],
+            4,
+        ));
+
+        let store = stores.store("session").expect("store");
+        assert_eq!(store.order, vec!["sess-c"]);
+        assert!(!store.by_id.contains_key("sess-a"));
+        assert_eq!(store.by_id["sess-c"]["title"], json!("reset"));
+        assert_eq!(store.snapshot_seq, 4);
     }
 
     #[test]

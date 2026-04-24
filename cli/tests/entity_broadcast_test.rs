@@ -349,6 +349,42 @@ fn send_snapshots_to_carries_current_snapshot_seq() {
     assert_eq!(frames[0]["snapshot_seq"], json!(2));
 }
 
+#[test]
+fn fresh_type_sequences_start_from_process_epoch_floor() {
+    let (lua, eb) = new_eb_lua();
+    register_session_type(&lua, &eb);
+
+    lua.load("require('hub.state').set('entity_broadcast.seq_epoch', 1234)")
+        .exec()
+        .unwrap();
+
+    let captured: Table = lua.create_table().unwrap();
+    let client: Table = lua.create_table().unwrap();
+    let captured_for_send = captured.clone();
+    let send: Function = lua
+        .create_function(move |_, (_self, frame): (Table, Table)| {
+            let next_idx = captured_for_send.raw_len() + 1;
+            captured_for_send.raw_set(next_idx, frame)?;
+            Ok(())
+        })
+        .unwrap();
+    client.set("send", send).unwrap();
+
+    let send_snapshots_to: Function = eb.get("send_snapshots_to").unwrap();
+    send_snapshots_to.call::<()>((client, "sub-epoch")).unwrap();
+    let frames = frames_as_json(&lua, &captured);
+    assert_eq!(frames[0]["snapshot_seq"], json!(1234));
+
+    let frames = install_capturing_broadcaster(&lua, &eb);
+    let patch: Function = eb.get("patch").unwrap();
+    let p: Table = lua.create_table().unwrap();
+    p.set("title", "after epoch").unwrap();
+    patch.call::<()>(("session", "sess-a", p)).unwrap();
+
+    let captured = frames_as_json(&lua, &frames);
+    assert_eq!(captured[0]["snapshot_seq"], json!(1235));
+}
+
 // =============================================================================
 // filter
 // =============================================================================

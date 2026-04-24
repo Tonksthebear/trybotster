@@ -8,9 +8,9 @@
 //
 // Patch merging matches design brief §12.4: top-level fields merge, nested
 // objects (e.g. `hosted_preview`) replace wholesale rather than deep
-// merging. Out-of-order frames (snapshot_seq <= last applied) are dropped
-// so a re-ordered network delivery doesn't corrupt the local view; the
-// next snapshot reset re-syncs the baseline.
+// merging. Out-of-order delta frames (snapshot_seq <= last applied) are
+// dropped so a re-ordered network delivery doesn't corrupt the local view.
+// Snapshots always replace local contents and reset the baseline.
 
 import { create } from 'zustand'
 
@@ -39,7 +39,6 @@ export function createEntityStore(entityType, { idField = 'id' } = {}) {
      * renderer's iteration matches the hub's intent.
      */
     applySnapshot(items, snapshotSeq) {
-      if (!acceptSeq(get(), snapshotSeq, 'snapshot')) return
       const order = []
       const byId = {}
       for (const item of items || []) {
@@ -138,9 +137,10 @@ function extractId(entity, idField) {
 }
 
 function acceptSeq(current, snapshotSeq, op) {
-  // snapshot_seq == 0 marks the very first frame for an empty registered
-  // type; subsequent frames must strictly increase. Equal sequences indicate
-  // a replay or a hub bug — drop and warn.
+  // snapshot_seq == 0 marks the very first delta for an empty registered
+  // type; subsequent deltas must strictly increase. Snapshots intentionally
+  // bypass this check because subscribe/reconnect uses them as authoritative
+  // resync frames, often with the same seq as the latest delta.
   const seq = normaliseSeq(snapshotSeq)
   if (seq === SNAPSHOT_RESET_SEQ) return true
   if (seq <= current.snapshotSeq) {
