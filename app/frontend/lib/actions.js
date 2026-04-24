@@ -1,4 +1,4 @@
-import { useWorkspaceStore } from '../store/workspace-store'
+import { useUiPresentationStore } from '../store/ui-presentation-store'
 import { useDialogStore } from '../store/dialog-store'
 import { getHub } from './hub-bridge'
 
@@ -43,7 +43,7 @@ function dispatch(actionBinding) {
 
 const handlers = {
   [ACTION.WORKSPACE_TOGGLE](payload) {
-    useWorkspaceStore.getState().toggleWorkspaceCollapsed(payload.workspaceId)
+    useUiPresentationStore.getState().toggleWorkspaceCollapsed(payload.workspaceId)
   },
 
   [ACTION.WORKSPACE_RENAME](payload) {
@@ -59,8 +59,13 @@ const handlers = {
   },
 
   [ACTION.SESSION_SELECT](payload) {
-    useWorkspaceStore.getState().setSelectedSessionId(payload.sessionId)
-    // Tell the hub (focuses the session in CLI)
+    useUiPresentationStore
+      .getState()
+      .setSelectedSessionId(payload.sessionUuid || payload.sessionId)
+    // Tell the hub (focuses the session in CLI). Wire protocol v2 keeps
+    // the select_agent command for cross-client handoff (browser click
+    // focuses the session in the TUI), even though selection state is no
+    // longer baked into broadcast trees.
     const hub = getHub(payload.hubId)
     if (hub && payload.sessionId) {
       hub.selectAgent(payload.sessionId)
