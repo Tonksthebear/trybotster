@@ -1,4 +1,4 @@
-// Wire protocol v2 — composite renderer for `ui.new_session_button{ action }`.
+// Wire protocol — composite renderer for `ui.new_session_button{ action }`.
 // Lifted into its own composite so the chooser UX can evolve without
 // rebroadcasting trees: substituting label / icon / preset selectors all
 // happen inside this component without a wire change.

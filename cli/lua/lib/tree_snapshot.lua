@@ -1,15 +1,10 @@
--- Wire protocol v2 — structural tree-snapshot broadcaster.
+-- Wire protocol — structural tree-snapshot broadcaster.
 --
--- Replaces the v1 `layout_broadcast.lua`. Two changes from v1:
---
---   1. Dedup is now keyed on `(surface, subpath)` GLOBALLY, not per
---      subscription. Selection moved to the client (`ui-presentation-store`
---      on web, `widget_state.rs` on the TUI), so the same tree ships to
---      every subscriber. One bucket of versions for the whole hub process.
---
---   2. The wire envelope name is `ui_tree_snapshot` (was
---      `ui_layout_tree_v1`). Cold-turkey rename — no fallback to the old
---      name. Both clients accept only the new name as of commit 7.
+-- Dedup is keyed on `(surface, subpath)` GLOBALLY, not per subscription.
+-- Selection lives on the client (`ui-presentation-store` on web,
+-- `widget_state.rs` on the TUI), so the same tree ships to every
+-- subscriber — one bucket of versions for the whole hub process. The
+-- wire envelope name is `ui_tree_snapshot`.
 --
 -- Builds frames via `web_layout.render(surface, state)`. Surfaces declare
 -- their own `input_builder` if they need state; otherwise they receive a
@@ -24,9 +19,8 @@ local M = {}
 local versions = state.get("tree_snapshot.versions", {})
 
 -- -------------------------------------------------------------------------
--- FNV-1a 64-bit (pure Lua) — reused from layout_broadcast for stability so
--- the same tree JSON produces the same version hash across the rename. This
--- preserves dedup across hot-reload at the boundary.
+-- FNV-1a 64-bit (pure Lua) — same JSON produces the same version hash, so
+-- dedup is stable across hot-reload at the broadcaster boundary.
 -- -------------------------------------------------------------------------
 
 local FNV_OFFSET_HI = 0xcbf29ce4
@@ -164,7 +158,7 @@ function M.build_frames(opts)
                     route_ctx = { path = subpath, params = params or {} }
                 end
 
-                -- Build surface state. Wire protocol v2 dropped
+                -- Build surface state. Wire protocol dropped
                 -- `LayoutInput.build_for_subscription` (selection moved to
                 -- the client). Surfaces with their own input_builder still
                 -- get to compose their state; surfaces without one receive

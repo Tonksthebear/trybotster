@@ -1,7 +1,7 @@
-// Wire protocol v2 — entity store registry + wire-frame dispatcher.
+// Wire protocol — entity store registry + wire-frame dispatcher.
 //
 // This module is the SINGLE entry point used by `hub_connection.js` to
-// route incoming v2 envelopes (`entity_snapshot` / `entity_upsert` /
+// route incoming wire envelopes (`entity_snapshot` / `entity_upsert` /
 // `entity_patch` / `entity_remove`) into the right Zustand store. Plugin
 // entity types (`<plugin>.<type>`) are registered lazily on first frame
 // via `pluginEntityStore`.
@@ -56,7 +56,7 @@ export function storeFor(entityType) {
 }
 
 /**
- * Returns true when `messageType` is one of the four v2 entity envelope
+ * Returns true when `messageType` is one of the four entity envelope
  * names. Used by hub_connection.handleMessage to short-circuit before
  * branching into the legacy switch.
  */
@@ -70,9 +70,9 @@ export function isEntityFrame(messageType) {
 }
 
 /**
- * Apply a single v2 entity envelope to the appropriate store. Returns
+ * Apply a single entity envelope to the appropriate store. Returns
  * true when the frame was recognised; the caller can stop forwarding
- * to legacy v1 handlers.
+ * to the legacy switch.
  */
 export function applyEntityFrame(frame) {
   const messageType = frame?.type

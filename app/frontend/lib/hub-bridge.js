@@ -14,7 +14,7 @@ const callerHub = new Map() // callerId → hubId
  * Connect to a hub. Returns { hub, connectionId }.
  * Call disconnect(connectionId) when done.
  *
- * Wire protocol v2: entity stores (`store/entities/`) update themselves
+ * Wire protocol: entity stores (`store/entities/`) update themselves
  * straight from `hub_connection.handleMessage` via `applyEntityFrame`.
  * This bridge no longer normalises agent/workspace lists into a unified
  * Zustand store; it only owns the per-hub connection lifecycle and the
@@ -61,7 +61,7 @@ async function doConnect(hubId, callerId) {
 
   const unsubscribers = []
 
-  // Wire protocol v2 — seed + follow the hub-authored route registry. The
+  // Wire protocol — seed + follow the hub-authored route registry. The
   // hub sends `ui_route_registry` on hub-channel subscribe and on every
   // `surfaces_changed` hook firing.
   const seedRoutes = () => {
@@ -127,7 +127,7 @@ export function getHub(hubId) {
 }
 
 /**
- * Sync the per-browser selectedSessionId from the URL. Wire protocol v2
+ * Sync the per-browser selectedSessionId from the URL. Wire protocol
  * keeps selection client-side: a `/hubs/<id>/sessions/<uuid>` URL hydrates
  * the presentation store; the hub never sees per-client selection.
  */

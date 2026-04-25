@@ -62,7 +62,7 @@ const handlers = {
     useUiPresentationStore
       .getState()
       .setSelectedSessionId(payload.sessionUuid || payload.sessionId)
-    // Tell the hub (focuses the session in CLI). Wire protocol v2 keeps
+    // Tell the hub (focuses the session in CLI). Wire protocol keeps
     // the select_agent command for cross-client handoff (browser click
     // focuses the session in the TUI), even though selection state is no
     // longer baked into broadcast trees.

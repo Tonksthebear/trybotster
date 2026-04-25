@@ -1,4 +1,4 @@
-//! Wire protocol v2 — regression test for the `connection_code_error`
+//! Wire protocol — regression test for the `connection_code_error`
 //! → `entity_snapshot` pipeline (blocker B5).
 //!
 //! The handler in `cli/lua/handlers/connections.lua` must `state.set` the

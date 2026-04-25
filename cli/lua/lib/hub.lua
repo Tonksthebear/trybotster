@@ -494,7 +494,7 @@ function Hub:rename_workspace(workspace_id, new_name)
             end
         end
 
-        -- Wire protocol v2 — patch the workspace name and let each affected
+        -- Wire protocol — patch the workspace name and let each affected
         -- session's Session:update emit its own entity_patch.
         local EB = require("lib.entity_broadcast")
         if EB.is_registered("workspace") then
@@ -540,7 +540,7 @@ function Hub:move_agent_workspace(agent_id, workspace_id, workspace_name)
             error(string.format("Hub:move_agent_workspace failed: %s", tostring(err)))
         end
 
-        -- Wire protocol v2 — the moved session's workspace_id changed; the
+        -- Wire protocol — the moved session's workspace_id changed; the
         -- Session:update inside move_to_workspace already emitted the
         -- entity_patch. Re-snapshot the workspace registry so a freshly
         -- non-empty target workspace shows up in clients that filter for

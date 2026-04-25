@@ -1,4 +1,4 @@
-// Wire protocol v2 — per-entity-type store factory.
+// Wire protocol — per-entity-type store factory.
 //
 // Each entity type (`session`, `workspace`, `spawn_target`, `worktree`,
 // `hub`, `connection_code`, plus plugin types `<plugin>.<type>`) gets a

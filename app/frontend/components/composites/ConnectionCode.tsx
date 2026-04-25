@@ -1,4 +1,4 @@
-// Wire protocol v2 — composite renderer for `ui.connection_code{}`.
+// Wire protocol — composite renderer for `ui.connection_code{}`.
 // Reads the singleton `connection_code` entity and renders the pairing
 // QR + URL.
 

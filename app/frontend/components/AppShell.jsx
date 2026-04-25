@@ -70,7 +70,7 @@ function SuspenseFallback() {
 //     responses; any other value means it can't yet.
 //
 //   <html data-hub-snapshot="pending|received">
-//     Flips to 'received' when BOTH the `ui_route_registry_v1` snapshot for
+//     Flips to 'received' when BOTH the `ui_route_registry` snapshot for
 //     the selected hub has landed AND at least one `ui_tree_snapshot` frame
 //     for that hub has arrived. Resets to 'pending' on hub switch.
 // ---------------------------------------------------------------------------
@@ -414,7 +414,7 @@ export function AppRoutes() {
               v6 prefers static segments over splats, so the enumerated
               legacy routes above still win for their paths; any other
               hub-scoped URL falls through here and resolves against the
-              `ui_route_registry_v1` broadcast. */}
+              `ui_route_registry` broadcast. */}
           <Route path="*" element={<DynamicSurfaceRoute />} />
         </Route>
       </Route>

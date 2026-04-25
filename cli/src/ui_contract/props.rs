@@ -253,7 +253,7 @@ pub struct TreeItemPropsV1 {
 }
 
 // =========================================================================
-// Wire protocol v2 composite primitives.
+// Wire protocol composite primitives.
 //
 // These primitives are data-driven: they carry no children, no slots. Each
 // reads from the client-side entity store (session, workspace, …) and
@@ -261,7 +261,7 @@ pub struct TreeItemPropsV1 {
 // Both renderers (web React, ratatui TUI) consume the same wire shape.
 // =========================================================================
 
-/// `SessionList` props — the v2 replacement for the per-broadcast workspace
+/// `SessionList` props — the replacement for the per-broadcast workspace
 /// surface tree. Reads sessions, workspaces, and presentation state from
 /// the client-side entity stores; renders the workspace-grouped tree, empty
 /// state, hosted-preview indicators, and the New Session button.

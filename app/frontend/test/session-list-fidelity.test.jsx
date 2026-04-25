@@ -1,4 +1,4 @@
-// Wire protocol v2 — fidelity restoration tests for `<SessionList>`.
+// Wire protocol — fidelity restoration tests for `<SessionList>`.
 //
 // Verifies the v1 row contract: activity dot, two-line content
 // (primaryName + titleLine + subtext), inline hosted-preview indicator,
@@ -209,5 +209,43 @@ describe('<SessionList> v1-fidelity row', () => {
   it('renders the empty state when no sessions are in the store', () => {
     render(<SessionList density="panel" grouping="flat" ctx={fakeCtx()} />)
     expect(screen.getByText(/No sessions running/i)).toBeInTheDocument()
+  })
+
+  it('does not render a header for a workspace whose status === "closed"', () => {
+    useWorkspaceEntityStore.setState({
+      byId: {
+        'ws-open': { workspace_id: 'ws-open', name: 'open-ws' },
+        'ws-closed': {
+          workspace_id: 'ws-closed',
+          name: 'closed-ws',
+          status: 'closed',
+        },
+      },
+      order: ['ws-open', 'ws-closed'],
+      snapshotSeq: 1,
+    })
+    useSessionStore.setState({
+      byId: {
+        'sess-open': {
+          id: 'sess-open',
+          session_uuid: 'uuid-open',
+          session_type: 'agent',
+          label: 'live',
+          workspace_id: 'ws-open',
+        },
+        'sess-closed': {
+          id: 'sess-closed',
+          session_uuid: 'uuid-closed',
+          session_type: 'agent',
+          label: 'orphan',
+          workspace_id: 'ws-closed',
+        },
+      },
+      order: ['sess-open', 'sess-closed'],
+      snapshotSeq: 1,
+    })
+    render(<SessionList density="panel" grouping="workspace" ctx={fakeCtx()} />)
+    expect(screen.getByText('open-ws')).toBeInTheDocument()
+    expect(screen.queryByText('closed-ws')).toBeNull()
   })
 })

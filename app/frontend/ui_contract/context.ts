@@ -13,7 +13,7 @@ export type ActionDispatchSource = {
 
 /**
  * Called when a primitive's bound action is activated. Implementations route
- * the `UiActionV1` envelope to hub transport (Phase 2b's `ui_action_v1` wire
+ * the `UiActionV1` envelope to hub transport (Phase 2b's `ui_action` wire
  * message), local store updates, or composite interceptors depending on the
  * action id.
  */

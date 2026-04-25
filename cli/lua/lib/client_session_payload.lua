@@ -52,7 +52,7 @@ function M.build_many(subjects)
     return list
 end
 
--- Wire protocol v2 — fields whose change requires re-deriving another
+-- Wire protocol — fields whose change requires re-deriving another
 -- field on the client. When a `Session:update` patches a derived input
 -- (title, agent_name, branch_name), include the derivation (display_name)
 -- in the same patch so clients don't have to re-fetch.

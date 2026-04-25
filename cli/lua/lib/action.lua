@@ -1,7 +1,7 @@
 -- UI Action envelope registry (Phase 2b).
 --
 -- Plugins register handlers for semantic action ids emitted by browser
--- clients via the `ui_action_v1` message type. Every handler in the chain
+-- clients via the `ui_action` message type. Every handler in the chain
 -- runs (handlers observe; they don't short-circuit each other). A handler
 -- that wants to suppress the legacy-command fallback must return
 -- `action.HANDLED`. Any other return value — including `nil`, `false`, or a

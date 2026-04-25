@@ -172,7 +172,7 @@ impl LayoutLua {
     }
 
     /// Call Lua `render(state)` and return the render tree, optionally
-    /// threading v2 entity stores into the UI contract adapter.
+    /// threading entity stores into the UI contract adapter.
     pub fn call_render_with_stores(
         &self,
         ctx: &RenderContext,
@@ -217,7 +217,7 @@ impl LayoutLua {
     }
 
     /// Call Lua `render_overlay(state)` and return optional overlay tree,
-    /// optionally threading v2 entity stores into the UI contract adapter.
+    /// optionally threading entity stores into the UI contract adapter.
     pub fn call_render_overlay_with_stores(
         &self,
         ctx: &RenderContext,

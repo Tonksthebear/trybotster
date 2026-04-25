@@ -92,7 +92,7 @@ export class HubTransport extends HubRoute {
   /**
    * Current Phase-4a route registry (array of { path, surface, label, icon,
    * hide_from_nav }). Empty until the hub ships the first
-   * `ui_route_registry_v1` frame.
+   * `ui_route_registry` frame.
    */
   uiRouteRegistry() {
     return this._uiRouteRegistry;
@@ -120,14 +120,14 @@ export class HubTransport extends HubRoute {
     return {
       hub_id: this.getHubId(),
       browser_identity: this.browserIdentity,
-      // Phase 4b: prime per-surface subpaths from the current URL so the
-      // initial `ui_layout_tree_v1` broadcast lands on the right sub-page.
-      // Without this, cold-loading a deep link (e.g.
-      // `/hubs/:id/kanban/board/42`) would flash the default "/" render
-      // of the kanban surface before the browser's follow-up
-      // `botster.surface.subpath` action landed. The hub applies these to
-      // `client.surface_subpaths` BEFORE the force-broadcast primes
-      // frames. See handle_subscribe in `cli/lua/lib/client.lua`.
+      // Prime per-surface subpaths from the current URL so the initial
+      // `ui_tree_snapshot` broadcast lands on the right sub-page. Without
+      // this, cold-loading a deep link (e.g. `/hubs/:id/kanban/board/42`)
+      // would flash the default "/" render of the kanban surface before
+      // the browser's follow-up `botster.surface.subpath` action landed.
+      // The hub applies these to `client.surface_subpaths` BEFORE the
+      // force-broadcast primes frames. See handle_subscribe in
+      // `cli/lua/lib/client.lua`.
       surface_subpaths: computeInitialSurfaceSubpaths(this.getHubId()),
     };
   }
@@ -141,25 +141,21 @@ export class HubTransport extends HubRoute {
       return;
     }
 
-    // Wire protocol v2 — entity envelopes flow into the per-type Zustand
-    // stores BEFORE the v1 switch. Recognised frames stop here; v1 frames
-    // fall through to the legacy branches below. This dispatch is dormant
-    // in production until the cold-turkey switch in commit 7 makes the hub
-    // start emitting v2 frames; landing it now gives the wire flip a
-    // single integration point.
+    // Entity envelopes (entity_snapshot/upsert/patch/remove) flow into
+    // the per-type Zustand stores. The dispatcher below sees only the
+    // structural / RPC-response frames left after entity routing.
     if (isEntityFrame(message?.type)) {
       applyEntityFrame(message);
       return;
     }
 
-    // Wire protocol v2 — transient_event delivers ephemeral notifications
+    // `transient_event` delivers ephemeral notifications
     // (`pty_notification` and friends) that should fire toasts but never
-    // populate a store. Drop silently for now: no browser consumer wires a
-    // toast today (the v1 consumer lived in workspace-store.js which was
-    // deleted in commit 8). This short-circuit stops the frame from
-    // falling through to the `default:` branch and emitting a generic
-    // `"message"` event that would only confuse future subscribers. When a
-    // toast UI ships, the consumer hook goes here.
+    // populate a store. Drop silently for now: no browser consumer wires
+    // a toast today. This short-circuit stops the frame from falling
+    // through to the `default:` branch and emitting a generic `"message"`
+    // event that would only confuse future subscribers. When a toast UI
+    // ships, the consumer hook goes here.
     if (message?.type === "transient_event") {
       return;
     }
@@ -175,9 +171,7 @@ export class HubTransport extends HubRoute {
         break;
 
       case "ui_route_registry":
-      case "ui_route_registry_v1":
-        // Wire protocol v2 renamed `_v1` → bare; both names accepted in
-        // case a stale Lua chain still emits the legacy name. Cached so a
+        // Hub-authored registry of routable surfaces. Cached so a
         // subscriber acquiring the hub after the initial frame still sees
         // the registry without a re-broadcast. Replaces wholesale on each
         // frame — the hub is the source of truth.

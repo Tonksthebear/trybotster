@@ -629,7 +629,7 @@ function Session:update(fields)
         end
         hooks.notify("session_updated", { session_uuid = self.session_uuid, fields = changed_fields })
 
-        -- Wire protocol v2 — emit a single entity_patch frame per
+        -- Wire protocol — emit a single entity_patch frame per
         -- Session:update covering exactly the changed fields plus any
         -- re-derived ones (display_name when title/agent_name/branch_name
         -- moved). System sessions stay off the wire — the EB filter on

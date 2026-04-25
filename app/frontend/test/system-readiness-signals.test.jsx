@@ -274,7 +274,7 @@ describe('UiTree [data-surface-ready]', () => {
 
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: HELLO_TREE,
       })
@@ -301,7 +301,7 @@ describe('UiTree [data-surface-ready]', () => {
 
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: HELLO_TREE,
       })
