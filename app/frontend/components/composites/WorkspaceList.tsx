@@ -7,7 +7,7 @@ import { useWorkspaceEntityStore } from '../../store/entities'
 import type { WorkspaceListPropsV1 } from '../../ui_contract/types'
 import type { RenderContext } from '../../ui_contract/context'
 
-type WorkspaceRecord = { workspace_id?: string; name?: string }
+type WorkspaceRecord = { workspace_id?: string; name?: string; status?: string }
 
 export type WorkspaceListProps = WorkspaceListPropsV1 & { ctx: RenderContext }
 
@@ -16,10 +16,9 @@ export function WorkspaceList(_props: WorkspaceListProps): ReactElement {
   const workspacesById = useWorkspaceEntityStore((state) => state.byId)
   const workspaces = useMemo(
     () =>
-      workspaceOrder.map((id) => [
-        id,
-        workspacesById[id] as WorkspaceRecord,
-      ] as const),
+      workspaceOrder
+        .map((id) => [id, workspacesById[id] as WorkspaceRecord] as const)
+        .filter(([, ws]) => ws && ws.status !== 'closed'),
     [workspaceOrder, workspacesById],
   )
   if (workspaces.length === 0) {
