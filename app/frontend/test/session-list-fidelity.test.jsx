@@ -211,6 +211,26 @@ describe('<SessionList> v1-fidelity row', () => {
     expect(screen.getByText(/No sessions running/i)).toBeInTheDocument()
   })
 
+  it('renders SVG icons (IconGlyph) for the workspace chevron and the actions trigger', () => {
+    useWorkspaceEntityStore.setState({
+      byId: { 'ws-1': { workspace_id: 'ws-1', name: 'live' } },
+      order: ['ws-1'],
+      snapshotSeq: 1,
+    })
+    seedSession({
+      id: 'sess-1',
+      session_uuid: 'uuid-1',
+      session_type: 'agent',
+      label: 'work',
+      workspace_id: 'ws-1',
+    })
+    render(<SessionList density="panel" grouping="workspace" ctx={fakeCtx()} />)
+    const trigger = screen.getByTestId('session-actions-trigger')
+    expect(trigger.querySelector('svg[data-slot="icon"]')).not.toBeNull()
+    const chevronHeader = screen.getByRole('button', { name: /live/i })
+    expect(chevronHeader.querySelector('svg[data-slot="icon"]')).not.toBeNull()
+  })
+
   it('does not render a header for a workspace whose status === "closed"', () => {
     useWorkspaceEntityStore.setState({
       byId: {

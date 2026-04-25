@@ -4,13 +4,14 @@
 // happen inside this component without a wire change.
 
 import React, { type MouseEvent, type ReactElement } from 'react'
-import clsx from 'clsx'
 
 import type {
   NewSessionButtonPropsV1,
   UiActionV1,
 } from '../../ui_contract/types'
 import type { RenderContext } from '../../ui_contract/context'
+import { Button } from '../catalyst/button'
+import { IconGlyph } from '../../ui_contract/icons'
 
 export type NewSessionButtonProps = NewSessionButtonPropsV1 & {
   ctx: RenderContext
@@ -29,19 +30,16 @@ export function NewSessionButton({
     })
   }
   return (
-    <button
+    <Button
+      plain
       type="button"
       onClick={handleClick}
       data-action-id={action.id}
       data-testid="new-session-button"
       disabled={action.disabled === true}
-      className={clsx(
-        'inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium',
-        'text-zinc-200 hover:bg-zinc-800/60 disabled:cursor-not-allowed disabled:opacity-50',
-      )}
     >
-      <span aria-hidden="true">+</span>
+      <IconGlyph name="plus" />
       New session
-    </button>
+    </Button>
   )
 }

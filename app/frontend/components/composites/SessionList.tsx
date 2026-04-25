@@ -36,6 +36,8 @@ import type {
   UiSurfaceDensityV1,
   UiValueV1,
 } from '../../ui_contract/types'
+import { IconGlyph } from '../../ui_contract/icons'
+import { Badge, BadgeButton } from '../catalyst/badge'
 
 type SessionRecord = {
   session_uuid?: string
@@ -179,23 +181,26 @@ export function SessionList({
         ? `/hubs/${ctx.hubId}/sessions/${sessionUuid}`
         : undefined
 
-    // Activity dot: green only when actively running. Idle / accessory /
-    // hidden render no dot so quiet rows stay quiet.
+    // Activity dot: green pulse only when actively running. Idle /
+    // accessory / hidden render no dot so quiet rows stay quiet. Bumped
+    // to 10px + ring + animate-pulse so the indicator actually registers
+    // at row scale.
     const dot = activity === 'active' ? (
       <span
         aria-label="Active"
-        className="size-2 shrink-0 rounded-full bg-emerald-400"
+        className="size-2.5 shrink-0 animate-pulse rounded-full bg-emerald-400 ring-2 ring-emerald-400/30"
       />
     ) : null
 
-    // Hosted-preview indicator. Running + url → clickable button. Other
-    // statuses → small status badge. Inactive / unavailable → null.
+    // Hosted-preview indicator. Running + url → clickable Catalyst
+    // BadgeButton. Other statuses → Catalyst Badge with the right tone.
+    // Inactive / unavailable → null.
     let previewIndicator: ReactElement | null = null
     if (preview.canPreview) {
       if (preview.status === 'running' && preview.url) {
         previewIndicator = (
-          <button
-            type="button"
+          <BadgeButton
+            color="emerald"
             onClick={(event) => {
               event.preventDefault()
               event.stopPropagation()
@@ -211,32 +216,35 @@ export function SessionList({
                 { element: event.currentTarget as Element },
               )
             }}
-            className="inline-flex items-center gap-1 rounded text-xs text-emerald-300 hover:underline"
             data-testid="hosted-preview-running"
           >
             Running
-          </button>
+          </BadgeButton>
         )
       } else if (preview.status !== 'inactive' && preview.status !== 'unavailable') {
         const label =
           preview.status === 'starting' ? 'Starting…'
           : preview.status === 'error' ? 'Error'
           : preview.status
-        const tone =
-          preview.status === 'error' ? 'text-red-400'
-          : preview.status === 'starting' ? 'text-amber-400'
-          : 'text-zinc-400'
+        const color =
+          preview.status === 'error' ? 'red'
+          : preview.status === 'starting' ? 'amber'
+          : 'zinc'
         previewIndicator = (
-          <span
+          <Badge
+            color={color as 'red' | 'amber' | 'zinc'}
             data-testid={`hosted-preview-status-${preview.status}`}
-            className={clsx('text-xs', tone)}
           >
             {label}
-          </span>
+          </Badge>
         )
       }
     }
 
+    // In-row actions trigger. Catalyst <Button plain> doesn't fit here —
+    // its base padding is row-sized, which would visually balloon every
+    // session row. We keep a styled <button> sized for the row but use
+    // IconGlyph for the ellipsis so it's an actual SVG, not unicode.
     const actionsTrigger = (
       <button
         type="button"
@@ -249,7 +257,7 @@ export function SessionList({
           'hover:bg-zinc-800/50 hover:text-zinc-200',
         )}
       >
-        ⋮
+        <IconGlyph name="ellipsis-vertical" className="size-4" />
       </button>
     )
 
@@ -442,7 +450,10 @@ export function SessionList({
             'flex items-center gap-1 px-2 py-1 text-xs font-medium uppercase tracking-wider text-zinc-400 hover:text-zinc-300',
           )}
         >
-          <span aria-hidden="true">{collapsed ? '▸' : '▾'}</span>
+          <IconGlyph
+            name={collapsed ? 'chevron-right' : 'chevron-down'}
+            className="size-3.5 shrink-0"
+          />
           <span className="min-w-0 truncate">{ws.name || id}</span>
         </button>
         {!collapsed && (
