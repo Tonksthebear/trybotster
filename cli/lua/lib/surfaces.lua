@@ -432,7 +432,7 @@ function M.unregister(name)
     if log and log.debug then
         log.debug(string.format("surfaces.unregister: name=%s", name))
     end
-    -- Wire protocol v2: purge tree_snapshot's dedup baselines for this
+    -- Wire protocol: purge tree_snapshot's dedup baselines for this
     -- surface across all subpaths. Without this a re-registration of the
     -- same surface name could be silently swallowed by dedup if the new
     -- tree happened to hash-match the stale one. pcall in case
@@ -601,7 +601,7 @@ function M.build_input(name, client, sub_id, route_ctx)
     if entry.input_builder then
         return entry.input_builder(client, sub_id, route_ctx)
     end
-    -- Wire protocol v2 default: trees no longer carry per-client selection
+    -- Wire protocol default: trees no longer carry per-client selection
     -- or pre-fetched session lists. The composite primitives (session_list,
     -- workspace_list, …) read from the client-side entity stores. Built-in
     -- surfaces without an input_builder receive only the hub identity.

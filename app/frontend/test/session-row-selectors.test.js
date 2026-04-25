@@ -2,7 +2,7 @@
 //
 // These selectors used to live on workspace-store.js (deleted in commit
 // 25b6900d). Tests assert the v1-fidelity contract: same shapes returned
-// for the same inputs, just driven off the v2 session entity record.
+// for the same inputs, just driven off the session entity record.
 
 import { describe, expect, it } from 'vitest'
 

@@ -387,7 +387,7 @@ const renderEmptyState: PrimitiveRenderer = ({ props, ctx }) => {
         // Phase A spec gap: EmptyStatePropsV1.primaryAction has no label
         // field, so we fall back to a generic "Get started" string. Surfaces
         // that need a specific action label should compose Stack+Button
-        // directly instead of using the empty_state primitive. v2 spec
+        // directly instead of using the empty_state primitive. spec
         // candidate: EmptyStatePropsV1.primaryActionLabel.
         <button
           type="button"
@@ -625,7 +625,7 @@ const renderDialog: PrimitiveRenderer = ({ props, slots, ctx }) => {
   )
 }
 
-// ---------- Wire protocol v2 composite adapters ----------
+// ---------- Wire protocol composite adapters ----------
 //
 // Composite renderers live in `components/composites/` so they own their own
 // CSS / Zustand subscriptions. The thin adapters below pull props out of the
@@ -682,7 +682,7 @@ export const PRIMITIVE_REGISTRY: Record<string, PrimitiveRenderer> = {
   tree: renderTree,
   tree_item: renderTreeItem,
   dialog: renderDialog,
-  // Wire protocol v2 composites — data-driven, no children/slots on the wire.
+  // Wire protocol composites — data-driven, no children/slots on the wire.
   session_list: renderSessionList,
   workspace_list: renderWorkspaceList,
   spawn_target_list: renderSpawnTargetList,

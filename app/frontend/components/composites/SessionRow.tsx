@@ -1,4 +1,4 @@
-// Wire protocol v2 — composite renderer for `ui.session_row{ session_uuid }`.
+// Wire protocol — composite renderer for `ui.session_row{ session_uuid }`.
 // Single-row variant of SessionList; reads one session from the store and
 // renders the same two-line content (primary name + titleLine + subtext)
 // plus the activity dot and an actions-menu trigger.

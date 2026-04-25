@@ -1,4 +1,4 @@
-// Wire protocol v2 — composite renderer for `ui.hub_recovery_state{}`.
+// Wire protocol — composite renderer for `ui.hub_recovery_state{}`.
 // Reads the singleton `hub` entity (id = hub_id) and renders the lifecycle
 // banner that v1 used to ship as inline panels in the layout tree.
 

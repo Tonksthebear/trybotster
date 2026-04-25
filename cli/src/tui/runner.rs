@@ -248,13 +248,13 @@ pub struct TuiRunner<B: Backend> {
     /// widget regardless of cursor position.
     mouse_capture: Option<MouseCapture>,
 
-    // === Wire protocol v2 entity stores (see brief §6.2) ===
-    /// Per-entity-type stores populated by v2 wire envelopes
-    /// (`entity_snapshot`/`upsert`/`patch`/`remove`). Read by the v2
+    // === Wire protocol entity stores (see brief §6.2) ===
+    /// Per-entity-type stores populated by wire envelopes
+    /// (`entity_snapshot`/`upsert`/`patch`/`remove`). Read by the
     /// composite renderers (`session_list`, `workspace_list`, …) and the
-    /// `$bind` resolver. Empty until the hub starts emitting v2 frames
+    /// `$bind` resolver. Empty until the hub starts emitting entity frames
     /// (commit 7); the dispatcher in `dispatch_hub_event` treats any
-    /// recognised v2 envelope as authoritative.
+    /// recognised entity envelope as authoritative.
     pub(super) entity_stores: super::entity_stores::TuiEntityStores,
 }
 
@@ -1659,14 +1659,14 @@ where
     fn dispatch_hub_event(&mut self, msg: serde_json::Value, layout_lua: Option<&LayoutLua>) {
         let event_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-        // Wire protocol v2 entity envelopes (`entity_snapshot`/`upsert`/
+        // Wire protocol entity envelopes (`entity_snapshot`/`upsert`/
         // `patch`/`remove`) flow into the local entity stores BEFORE Lua
         // sees them. The store dispatcher returns true when it recognised
         // and applied the frame; we mark the TUI dirty so the next render
         // picks up the new entity state and stop here. The composite
         // renderers added in commit 4 read straight from these stores.
         //
-        // Until commit 7 flips the wire to v2, this branch never fires in
+        // Before this branch landed, this branch did not fire in
         // production — the hub still ships v1 frames which fall through to
         // the Lua dispatcher below. Keeping the dispatch here in commit 3
         // gives the cold-turkey switch a single landing point.
@@ -1675,7 +1675,7 @@ where
                 self.dirty = true;
             }
             // Keep flowing into Lua. The current TUI layout is still the
-            // legacy Lua renderer backed by `_tui_state`, so v2 entity frames
+            // legacy Lua renderer backed by `_tui_state`, so entity frames
             // must also update Lua state until that layout fully moves to
             // UiNodeV1 composites backed directly by `TuiEntityStores`.
         }

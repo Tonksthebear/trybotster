@@ -1,4 +1,4 @@
-// Wire protocol v2 — composite renderer for `ui.session_list{}`.
+// Wire protocol — composite renderer for `ui.session_list{}`.
 //
 // Reads from the session + workspace entity stores and the
 // ui-presentation-store (selection / collapse). Renders the workspace-grouped

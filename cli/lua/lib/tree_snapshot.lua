@@ -1,4 +1,4 @@
--- Wire protocol v2 — structural tree-snapshot broadcaster.
+-- Wire protocol — structural tree-snapshot broadcaster.
 --
 -- Replaces the v1 `layout_broadcast.lua`. Two changes from v1:
 --
@@ -164,7 +164,7 @@ function M.build_frames(opts)
                     route_ctx = { path = subpath, params = params or {} }
                 end
 
-                -- Build surface state. Wire protocol v2 dropped
+                -- Build surface state. Wire protocol dropped
                 -- `LayoutInput.build_for_subscription` (selection moved to
                 -- the client). Surfaces with their own input_builder still
                 -- get to compose their state; surfaces without one receive

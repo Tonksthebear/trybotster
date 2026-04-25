@@ -227,7 +227,7 @@ _event_sub = events.on("sessions_discovered", function(data)
         local Session = require("lib.session")
         local HostedPreview = require("lib.hosted_preview")
 
-        -- Wire protocol v2: the agent_created hook handler in
+        -- Wire protocol: the agent_created hook handler in
         -- handlers.connections emits entity_upsert(session) per recovered
         -- session via EB. No separate agent_list broadcast or hub-channel
         -- fanout is needed here.

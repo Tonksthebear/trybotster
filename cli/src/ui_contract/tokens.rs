@@ -221,7 +221,7 @@ pub enum UiButtonTone {
     Danger,
 }
 
-/// Surface-density token for v2 composite primitives (`session_list`,
+/// Surface-density token for composite primitives (`session_list`,
 /// `workspace_list`, `session_row`).
 ///
 /// Distinct from [`UiInteractionDensity`] — that one is renderer-internal

@@ -1,4 +1,4 @@
-// Wire protocol v2 — client-only UI presentation state.
+// Wire protocol — client-only UI presentation state.
 //
 // Anything the user controls in the browser session (selection, collapse
 // state, scroll positions, modal-open flags) lives here, NOT on the wire

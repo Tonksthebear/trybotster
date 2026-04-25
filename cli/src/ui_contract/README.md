@@ -280,11 +280,11 @@ full integration suite with `./test.sh --integration`.
 - ~~No phase-1 composites (`WorkspaceList`, `SessionRow`, …) — those stay
   web-runtime-internal per
   `docs/specs/web-ui-primitives-runtime.md`.~~ — **Superseded:** wire protocol
-  v2 promotes these to first-class cross-client composites (see below).
+  the wire protocol promotes these to first-class cross-client composites (see below).
 
-## Wire protocol v2 — composite primitives
+## Wire protocol — composite primitives
 
-The v2 wire protocol replaces "rebuild + rebroadcast the entire `UiNodeV1`
+The wire protocol replaces "rebuild + rebroadcast the entire `UiNodeV1`
 tree on every state change" with a delta protocol: structural snapshots
 ship only on connect / structural change, per-entity field deltas ship on
 data change. To keep authored layouts thin, the data-driven UI regions
@@ -320,10 +320,10 @@ uses default action ids (`botster.spawn_target.select` /
 `botster.spawn_target.remove`). The same convention will apply to other
 list composites that grow per-row actions in the future.
 
-## Wire protocol v2 — `$bind` grammar
+## Wire protocol — `$bind` grammar
 
 For plugin composites that need reactive data without registering a custom
-React/TUI renderer, the v2 wire format also defines a binding sentinel:
+React/TUI renderer, the wire format also defines a binding sentinel:
 
 ```json
 { "$bind": "/<entity_type>/<id>/<field>" }
@@ -356,11 +356,11 @@ ui.bind_list{
 The web resolver (`app/frontend/ui_contract/binding.tsx`) and the TUI
 resolver (`cli/src/tui/ui_contract_adapter/binding.rs`) must agree on
 this grammar; a shared spec snippet under `docs/specs/` ensures they do
-not drift. (Both resolvers land in later v2 commits; this README documents
+not drift. (Both resolvers land in later commits; this README documents
 the wire shape they consume.)
 
 ## Versioning
 
-This is `ui-contract/v1` with the v2 wire-protocol composite extensions
+This is `ui-contract/v1` with the wire-protocol composite extensions
 listed above. Additive changes are backward-compatible; removing props or
 changing payload semantics requires a major bump.

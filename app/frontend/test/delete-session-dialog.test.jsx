@@ -38,7 +38,7 @@ function setDialogState(sessionId = 'sess-1') {
 }
 
 function setSession(session) {
-  // Wire protocol v2: seed the session entity store directly.
+  // Wire protocol: seed the session entity store directly.
   useSessionStore.setState({
     byId: { [session.id]: session },
     order: [session.id],

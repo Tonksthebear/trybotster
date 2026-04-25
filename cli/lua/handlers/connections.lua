@@ -4,7 +4,7 @@
 -- Manages client lifecycle and broadcasts hub events to all connected
 -- clients.
 --
--- Wire protocol v2 (cold-turkey, commit 7):
+-- Wire protocol (cold-turkey, commit 7):
 --   * v1 frame names (`agent_list`, `worktree_list`, `connection_code`,
 --     `hub_recovery_state`, `pty_notification`, `ui_layout_tree_v1`, …)
 --     no longer ship. The dispatcher emits only:
@@ -103,7 +103,7 @@ end
 -- ============================================================================
 
 --- Send a single frame to every hub-channel subscriber on this hub.
---- The wire protocol v2 backbone: EB and tree_snapshot both call this so
+--- The wire protocol backbone: EB and tree_snapshot both call this so
 --- the broadcast loop is in one place.
 local function broadcast_frame_to_hub(frame)
     local sent = 0
@@ -201,7 +201,7 @@ hooks.on("agent_created", "broadcast_agent_created", function(info)
         return
     end
     local payload = ClientSessionPayload.build(info, Agent.all_info())
-    log.info(string.format("Broadcasting (v2) entity_upsert(session): %s",
+    log.info(string.format("Broadcasting entity_upsert(session): %s",
         payload.id or payload.session_uuid or "?"))
 
     EB.upsert("session", payload)
@@ -219,7 +219,7 @@ hooks.on("agent_created", "broadcast_agent_created", function(info)
 end)
 
 hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
-    log.info(string.format("Broadcasting (v2) entity_remove(session): %s", agent_id or "?"))
+    log.info(string.format("Broadcasting entity_remove(session): %s", agent_id or "?"))
 
     if agent_id then
         timer.cancel("idle:" .. agent_id)
@@ -325,7 +325,7 @@ hooks.on("pty_notification", "push_notification", function(info)
         app_badge = badge_count,
     })
 
-    -- Wire protocol v2 — transient_event delivers the toast/banner copy.
+    -- Wire protocol — transient_event delivers the toast/banner copy.
     -- Web → toast + drop. TUI → notification overlay + drop. Future
     -- transient event types reuse this envelope.
     broadcast_frame_to_hub({
@@ -473,7 +473,7 @@ hooks.on("agent_lifecycle", "broadcast_lifecycle", function(info)
     end
 end)
 
--- Wire protocol v2 B2 fix: when a workspace transitions to closed (fired
+-- Wire protocol B2 fix: when a workspace transitions to closed (fired
 -- by lib/session.lua:_sync_workspace_manifest on the final session close),
 -- emit an entity_patch so clients see the status change and filter the
 -- workspace out of their UI. Pre-fix, closed workspaces kept showing up in
@@ -494,7 +494,7 @@ end)
 local _event_subs = {}
 
 _event_subs[#_event_subs + 1] = events.on("connection_code_ready", function(data)
-    log.info("Broadcasting (v2) entity_upsert(connection_code)")
+    log.info("Broadcasting entity_upsert(connection_code)")
     local hub_id = hub.server_id and hub.server_id() or nil
     if not hub_id then return end
     local payload = {
@@ -655,7 +655,7 @@ function M._before_reload()
     hooks.off("surfaces_changed", "broadcast_ui_route_registry")
     hooks.off("workspace_closed", "broadcast_workspace_closed")
     timer.cancel("ui_route_registry_broadcast")
-    -- Wire protocol v2 B6 fix: we DO NOT clear the broadcaster here. The
+    -- Wire protocol B6 fix: we DO NOT clear the broadcaster here. The
     -- top-level `EB.set_broadcaster(broadcast_frame_to_hub)` on reload
     -- replaces it atomically, and the old closure keeps working in the
     -- meantime (it captures `clients` via state.get, which survives
