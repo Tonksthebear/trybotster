@@ -21,6 +21,7 @@ import type {
 } from '../../ui_contract/types'
 import type { RenderContext } from '../../ui_contract/context'
 import { resolveValue } from '../../ui_contract/viewport'
+import { IconGlyph } from '../../ui_contract/icons'
 
 type SessionRecord = {
   session_uuid?: string
@@ -97,7 +98,7 @@ export function SessionRow({
       {activity === 'active' && (
         <span
           aria-label="Active"
-          className="mt-1 size-2 shrink-0 rounded-full bg-emerald-400"
+          className="mt-1 size-2.5 shrink-0 animate-pulse rounded-full bg-emerald-400 ring-2 ring-emerald-400/30"
         />
       )}
       <div className="min-w-0 flex-1">
@@ -151,7 +152,7 @@ export function SessionRow({
           'hover:bg-zinc-800/50 hover:text-zinc-200',
         )}
       >
-        ⋮
+        <IconGlyph name="ellipsis-vertical" className="size-4" />
       </button>
     </div>
   )
