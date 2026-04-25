@@ -9,6 +9,7 @@ import type {
   HubRecoveryStatePropsV1,
 } from '../../ui_contract/types'
 import type { RenderContext } from '../../ui_contract/context'
+import { IconGlyph } from '../../ui_contract/icons'
 
 type HubRecord = { state?: string; reason?: string; [key: string]: unknown }
 
@@ -28,7 +29,7 @@ export function HubRecoveryState(_props: HubRecoveryStateProps): ReactElement {
       data-hub-state={hub.state ?? 'starting'}
       className="flex items-center gap-2 rounded-md bg-amber-500/10 px-3 py-2 text-sm text-amber-300"
     >
-      <span aria-hidden="true">⏳</span>
+      <IconGlyph name="clock" className="size-4 shrink-0" />
       <span className="font-medium">Hub: {hub.state ?? 'starting'}</span>
       {hub.reason && <span className="text-xs text-amber-200">{hub.reason}</span>}
     </aside>
