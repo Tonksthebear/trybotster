@@ -10,7 +10,7 @@ import {
 } from '../../store/entities'
 import { getHub } from '../../lib/hub-bridge'
 
-// Wire protocol v2: workspace.agents arrays are gone — membership is
+// Wire protocol: workspace.agents arrays are gone — membership is
 // derived client-side by joining sessions where workspace_id matches. The
 // displayName selector lives here too (used to be on workspace-store).
 function displayName(session) {
@@ -31,7 +31,7 @@ export default function MoveSessionDialog({ hubId }) {
   const session = sessionsById[context.sessionId]
   const sessionName = session ? displayName(session) : 'this session'
 
-  // Wire protocol v2: derive membership client-side. Active workspaces are
+  // Wire protocol: derive membership client-side. Active workspaces are
   // any with status==='active'; current workspace is the one whose id
   // matches this session's workspace_id.
   const workspaces = Object.values(workspacesById).filter(

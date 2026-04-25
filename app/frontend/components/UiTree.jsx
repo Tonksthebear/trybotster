@@ -16,7 +16,7 @@ import { getHub } from '../lib/hub-bridge'
 import { useSurfaceReadinessStore } from '../store/surface-readiness-store'
 
 // ---------------------------------------------------------------------------
-// Wire protocol v2: pre-dispatch tree decoration is gone. The v1 flow
+// Wire protocol: pre-dispatch tree decoration is gone. The v1 flow
 // (hub tree → applyCollapseOverrides → applyNavSelectionOverrides →
 // interpreter) turned into (hub tree → interpreter), because:
 //
@@ -195,7 +195,7 @@ export default function UiTree({
   const [tree, setTree] = useState(initialTree)
   const [transport, setTransport] = useState(null)
 
-  // Wire protocol v2: collapse + nav-selection state moved into the
+  // Wire protocol: collapse + nav-selection state moved into the
   // composite primitives themselves. `<SessionList>` reads collapse state
   // from `useUiPresentationStore.collapsedWorkspaceIds`; the nav-selection
   // highlight lives inside the (future) `NavTreeItem` wrapper. The hub

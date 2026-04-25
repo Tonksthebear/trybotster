@@ -1,4 +1,4 @@
-// Wire protocol v2 — singleton entity stores for hub metadata.
+// Wire protocol — singleton entity stores for hub metadata.
 //
 // Both `hub` (lifecycle / recovery state) and `connection_code` (pairing
 // QR + URL) are modelled as singleton entity types whose id is the hub_id

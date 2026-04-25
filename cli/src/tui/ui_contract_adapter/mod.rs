@@ -88,7 +88,7 @@ pub fn render_lua_ui_node(
     render_lua_ui_node_with_stores(lua, table, viewport, None)
 }
 
-/// Render a Lua-built UiNodeV1 tree with optional access to the v2 entity
+/// Render a Lua-built UiNodeV1 tree with optional access to the entity
 /// stores for binding resolution + composite data.
 ///
 /// The pipeline is:
@@ -99,7 +99,7 @@ pub fn render_lua_ui_node(
 ///    the resolved value(s) from `stores`. Skipped when `stores` is None.
 /// 3. JSON → [`UiNodeV1`].
 /// 4. [`render_ui_node_with_stores`] dispatches to the per-primitive
-///    renderer with `stores` threaded so v2 composites
+///    renderer with `stores` threaded so composites
 ///    (`session_list`, `workspace_list`, …) can read their data.
 ///
 /// # Errors

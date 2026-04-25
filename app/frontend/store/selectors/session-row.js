@@ -1,7 +1,7 @@
 // Pure-function selectors for rendering one session row.
 //
 // These fns used to live on the v1 `app/frontend/store/workspace-store.js`
-// (deleted in commit 25b6900d as part of the wire protocol v2 cold-turkey
+// (deleted in commit 25b6900d as part of the wire protocol cold-turkey
 // switch). They're ported here as pure fns — they take a session entity
 // record and return derived display strings — so they can be reused by:
 //
@@ -10,7 +10,7 @@
 //   * `<SessionActionsMenu>` — derives `previewState` for menu enablement
 //
 // No Zustand store. No side effects. The session record itself is the same
-// shape `ClientSessionPayload.build` ships under v2 — every field referenced
+// shape `ClientSessionPayload.build` ships under the wire protocol — every field referenced
 // below is already projected through `Session.info()` in lib/session.lua.
 
 /**

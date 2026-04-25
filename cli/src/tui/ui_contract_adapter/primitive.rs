@@ -118,7 +118,7 @@ const UI_NODE_TYPE_NAMES: &[&str] = &[
     "dialog",
     "menu",
     "menu_item",
-    // Wire protocol v2 composites — data-driven, read from TuiEntityStores.
+    // Wire protocol composites — data-driven, read from TuiEntityStores.
     "session_list",
     "workspace_list",
     "spawn_target_list",
@@ -155,7 +155,7 @@ pub fn is_ui_node_type(type_name: &str) -> bool {
 /// [`UiActionV1`] encountered along the way.
 ///
 /// Backward-compat wrapper around [`render_ui_node_with_stores`] for v1
-/// callers that have no [`TuiEntityStores`] context. Wire protocol v2
+/// callers that have no [`TuiEntityStores`] context. Wire protocol
 /// composites (`session_list`, `workspace_list`, …) render their empty
 /// state when called this way — pass stores explicitly via
 /// [`render_ui_node_with_stores`] to render real content.
@@ -173,7 +173,7 @@ pub fn render_ui_node(
 }
 
 /// Render a single [`UiNodeV1`] into a [`RenderNode`] with optional
-/// access to the v2 entity stores. The wire protocol v2 composites
+/// access to the entity stores. The wire protocol composites
 /// (`session_list`, `workspace_list`, …) read their data from these
 /// stores; existing primitives ignore them.
 ///
@@ -203,13 +203,13 @@ pub fn render_ui_node_with_stores(
         "list" => render_list(node, viewport, actions),
         "list_item" => render_standalone_list_item(node, viewport, actions),
         // `tree` / `tree_item` use flatten_tree_item which extracts text
-        // from slots; no v2 composite recursion through them today.
+        // from slots; no composite recursion through them today.
         "tree" => render_tree(node, viewport, actions),
         "tree_item" => render_standalone_tree_item(node, viewport, actions),
         "dialog" => render_dialog(node, viewport, actions, stores),
         "menu" => render_menu(node, viewport, actions, stores),
         "menu_item" => render_standalone_menu_item(node, viewport, actions, stores),
-        // Wire protocol v2 composites.
+        // Wire protocol composites.
         "session_list" => render_session_list(node, viewport, actions, stores),
         "workspace_list" => render_workspace_list(node, viewport, actions, stores),
         "spawn_target_list" => render_spawn_target_list(node, viewport, actions, stores),
@@ -1379,7 +1379,7 @@ fn slots_have_children(
 }
 
 // =============================================================================
-// Wire protocol v2 — composite primitives.
+// Wire protocol — composite primitives.
 //
 // These renderers consume zero authored children/slots; they read their data
 // from `stores` (the per-entity-type TUI store aggregate) and expand into
@@ -1391,7 +1391,7 @@ fn slots_have_children(
 // path never fires in production.
 // =============================================================================
 
-/// Helper used by every v2 composite to short-circuit when the legacy
+/// Helper used by every composite to short-circuit when the legacy
 /// entry point (no stores) was used. Returns a one-line paragraph that
 /// makes the missing-stores case visible without spamming the log.
 fn placeholder_widget(label: &str) -> RenderNode {
@@ -1896,7 +1896,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Wire protocol v2 composite renderer tests
+    // Wire protocol composite renderer tests
     // =========================================================================
 
     fn populated_stores() -> TuiEntityStores {

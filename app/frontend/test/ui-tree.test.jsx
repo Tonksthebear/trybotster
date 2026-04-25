@@ -92,7 +92,7 @@ describe('<UiTree>', () => {
     expect(container.textContent).toMatch(/Loading/i)
   })
 
-  it('renders ui_tree_snapshot frames from the v2 hub wire', async () => {
+  it('renders ui_tree_snapshot frames from the hub wire', async () => {
     render(<UiTree hubId="hub-1" targetSurface="workspace_panel" />)
     await act(async () => {
       fakeTransport.emit('message', {
@@ -104,7 +104,7 @@ describe('<UiTree>', () => {
     expect(await screen.findByText('hello world')).toBeInTheDocument()
   })
 
-  it('renders v2 session_list composites without uncached selector loops', async () => {
+  it('renders session_list composites without uncached selector loops', async () => {
     const consoleError = vi
       .spyOn(console, 'error')
       .mockImplementation(() => {})

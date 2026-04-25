@@ -61,7 +61,7 @@ end
 -- UI DSL transport libs. `lib.action` is the registry for browser-emitted
 -- UI action envelopes; `lib.tree_snapshot` (formerly layout_broadcast) wraps
 -- `web_layout.render(...)` with global per-(surface,subpath) hash dedup.
--- Wire protocol v2 dropped per-subscription dedup — selection is client-side
+-- Wire protocol dropped per-subscription dedup — selection is client-side
 -- now, so the same tree ships to every subscriber and dedup is global.
 _G.action = safe_require("lib.action")
 
@@ -77,7 +77,7 @@ safe_require("hub.builtin_surfaces")
 safe_require("lib.tree_snapshot")
 
 -- ============================================================================
--- Wire protocol v2 — entity broadcast registry
+-- Wire protocol — entity broadcast registry
 -- ============================================================================
 -- Load EB and register every built-in entity type BEFORE handlers/connections
 -- so `Session:update` (which calls EB.patch) and the agent_created/deleted

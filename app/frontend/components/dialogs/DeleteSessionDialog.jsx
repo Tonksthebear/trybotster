@@ -5,7 +5,7 @@ import { useDialogStore } from '../../store/dialog-store'
 import { useSessionStore } from '../../store/entities'
 import { getHub } from '../../lib/hub-bridge'
 
-// Wire protocol v2: displayName resolution moved into this component.
+// Wire protocol: displayName resolution moved into this component.
 // Selectors used to live on workspace-store.js; they re-derive from the
 // session entity record now (label > display_name > title > session_uuid).
 function displayName(session) {

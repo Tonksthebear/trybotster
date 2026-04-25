@@ -1,4 +1,4 @@
-// Wire protocol v2 — spawn target entity store. Wire id field is `target_id`.
+// Wire protocol — spawn target entity store. Wire id field is `target_id`.
 
 import { createEntityStore } from './createEntityStore'
 

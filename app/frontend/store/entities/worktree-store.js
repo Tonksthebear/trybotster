@@ -1,4 +1,4 @@
-// Wire protocol v2 — worktree entity store. Wire id field is `worktree_path`.
+// Wire protocol — worktree entity store. Wire id field is `worktree_path`.
 
 import { createEntityStore } from './createEntityStore'
 

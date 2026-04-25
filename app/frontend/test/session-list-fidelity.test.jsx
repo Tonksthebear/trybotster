@@ -1,4 +1,4 @@
-// Wire protocol v2 — fidelity restoration tests for `<SessionList>`.
+// Wire protocol — fidelity restoration tests for `<SessionList>`.
 //
 // Verifies the v1 row contract: activity dot, two-line content
 // (primaryName + titleLine + subtext), inline hosted-preview indicator,

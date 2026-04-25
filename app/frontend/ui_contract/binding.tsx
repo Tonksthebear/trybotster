@@ -1,4 +1,4 @@
-// Wire protocol v2 — `$bind` / `bind_list` resolver for the React renderer.
+// Wire protocol — `$bind` / `bind_list` resolver for the React renderer.
 //
 // Mirrors `cli/src/tui/ui_contract_adapter/binding.rs`. Both renderers must
 // agree on the path grammar so a plugin layout that uses `ui.bind()` /
@@ -175,7 +175,7 @@ function resolveItemRelative(path: string, item: ItemContext): unknown {
  * wrapper re-renders on patches to the bound entity — the enclosing tree
  * stays stable.
  *
- * Currently unused by the built-in v2 composites (they read from stores
+ * Currently unused by the built-in composites (they read from stores
  * directly). Plugin authors hooking `$bind` into existing primitives use
  * this via the auto-wrap inside `interpreter.tsx`.
  */

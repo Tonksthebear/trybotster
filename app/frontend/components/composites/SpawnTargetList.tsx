@@ -1,4 +1,4 @@
-// Wire protocol v2 — composite renderer for `ui.spawn_target_list{}`.
+// Wire protocol — composite renderer for `ui.spawn_target_list{}`.
 //
 // Renders configured spawn targets. `on_select` / `on_remove` are action
 // templates: their `id` (and optional payload base) is merged with the

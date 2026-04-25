@@ -1,4 +1,4 @@
--- Entity broadcast registry — wire protocol v2 (delta) source of truth.
+-- Entity broadcast registry — wire protocol (delta) source of truth.
 --
 -- Replaces the v1 "rebuild + broadcast every UiNodeV1 tree on any state
 -- change" pattern with "snapshot once on subscribe, ship per-entity field

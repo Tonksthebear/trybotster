@@ -39,7 +39,7 @@ function Client.new(peer_id, transport)
         -- the right `state.path` into each surface's render dispatcher.
         -- Unset entries default to "/".
         surface_subpaths = {},
-        -- Wire protocol v2: `selected_session_uuid` is GONE. Selection
+        -- Wire protocol: `selected_session_uuid` is GONE. Selection
         -- moved to the client (web ui-presentation-store, TUI widget_state).
         -- Trees are no longer per-client; the same ui_tree_snapshot ships
         -- to every subscriber.
@@ -253,7 +253,7 @@ function Client:handle_subscribe(msg)
     elseif channel == "hub" then
         log.info(string.format("Hub subscription from %s...", self.peer_id:sub(1, 8)))
 
-        -- Wire protocol v2 — strict ordering per design brief §12.6:
+        -- Wire protocol — strict ordering per design brief §12.6:
         --   1. ui_route_registry (so the client knows the surface set)
         --   2. entity_snapshot per registered type (stores populated
         --      BEFORE trees that reference them)
@@ -300,7 +300,7 @@ function Client:handle_subscribe(msg)
     end
 end
 
--- Wire protocol v2: send_spawn_target_list, send_agent_list,
+-- Wire protocol: send_spawn_target_list, send_agent_list,
 -- send_workspace_list, send_open_workspace_list, send_worktree_list, and
 -- send_hub_recovery_state are GONE. Subscribe-time priming now goes through
 -- `EB.send_snapshots_to(self, sub_id)` (see handle_subscribe), which ships
@@ -338,7 +338,7 @@ end
 
 --- Send the current UI tree snapshots to a HubChannel subscription.
 --
--- Wire protocol v2: trees are no longer per-client — selection moved to the
+-- Wire protocol: trees are no longer per-client — selection moved to the
 -- client. `tree_snapshot.build_frames` dedups globally on
 -- `(surface, subpath)`. Per-client `surface_subpaths` still feeds the
 -- per-surface subpath resolution so a deep-linked browser still gets its
@@ -425,7 +425,7 @@ function Client:send_ui_route_registry(sub_id)
     self:send(payload)
 end
 
--- Wire protocol v2: send_workspace_list, send_open_workspace_list,
+-- Wire protocol: send_workspace_list, send_open_workspace_list,
 -- send_worktree_list, and send_hub_recovery_state are GONE. The hub now
 -- ships those as `entity_snapshot(workspace)` / `entity_snapshot(worktree)`
 -- / `entity_snapshot(hub)` at subscribe time and `entity_patch` /
@@ -466,7 +466,7 @@ function Client:handle_unsubscribe(msg)
         sub_id = sub_id,
     })
 
-    -- Wire protocol v2: tree_snapshot dedup is GLOBAL on (surface, subpath),
+    -- Wire protocol: tree_snapshot dedup is GLOBAL on (surface, subpath),
     -- not per-subscription, so unsubscribe leaves the dedup state alone.
     -- A reconnecting browser receives a fresh entity_snapshot per type
     -- (subscribe-time priming) plus the next ui_tree_snapshot if anything
@@ -708,7 +708,7 @@ function Client:disconnect()
     self.forwarders = {}
 
     -- Unregister from all terminal sessions (auto-resizes to next client).
-    -- Wire protocol v2: tree_snapshot dedup is global on
+    -- Wire protocol: tree_snapshot dedup is global on
     -- (surface, subpath), so disconnect leaves it alone.
     for _, sub in pairs(self.subscriptions) do
         if sub.channel == "terminal" and sub.session_uuid then

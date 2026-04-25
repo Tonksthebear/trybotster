@@ -80,7 +80,7 @@ function renderInternal(
 
 /** Walk a UiNodeV1 tree into React elements, driven by `ctx`.
  *
- * Wire protocol v2: any `$bind` / `$kind = "bind_list"` sentinels in the
+ * Wire protocol: any `$bind` / `$kind = "bind_list"` sentinels in the
  * tree are resolved via the entity stores BEFORE primitive dispatch — see
  * `binding.tsx`. Trees that contain no sentinels are unaffected (the
  * walker is a no-op on plain JSON). This snapshot resolution is independent

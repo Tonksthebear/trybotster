@@ -1,4 +1,4 @@
-// Wire protocol v2 — composite renderer for `ui.workspace_list{}`.
+// Wire protocol — composite renderer for `ui.workspace_list{}`.
 // Renders the bare list of workspaces without the session children join.
 
 import React, { useMemo, type ReactElement } from 'react'

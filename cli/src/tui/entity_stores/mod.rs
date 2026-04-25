@@ -1,4 +1,4 @@
-//! TUI-side entity stores for wire protocol v2.
+//! TUI-side entity stores for wire protocol.
 //!
 //! The hub ships per-entity-type wire envelopes (`entity_snapshot`,
 //! `entity_upsert`, `entity_patch`, `entity_remove`) which the TUI applies
@@ -224,14 +224,14 @@ impl TuiEntityStores {
         names
     }
 
-    /// Returns true iff the given message looks like one of the four v2
+    /// Returns true iff the given message looks like one of the four
     /// entity envelope types. Used by the wire dispatcher to short-circuit
     /// before deserialising.
     pub fn handles_frame(msg_type: &str) -> bool {
         ENTITY_FRAME_TYPES.contains(&msg_type)
     }
 
-    /// Apply one v2 entity envelope. Returns true when the frame was
+    /// Apply one entity envelope. Returns true when the frame was
     /// recognised and applied (or rejected as out-of-order); returns false
     /// when the frame was unhandled (the caller should forward it to Lua).
     ///
