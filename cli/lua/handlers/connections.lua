@@ -430,7 +430,11 @@ end)
 -- ============================================================================
 -- Idle detection: event-driven via timer.after_idle (no polling).
 
-local IDLE_THRESHOLD_SECS = 2
+-- 5s matches the v1 TUI window. With Claude's bursty agent output
+-- (5-10s pauses between chunks) a 2s threshold made the activity dot
+-- blip on for milliseconds and hard to perceive; 5s keeps the indicator
+-- lit through normal think-pauses without spuriously latching idle.
+local IDLE_THRESHOLD_SECS = 5
 
 hooks.on("pty_output", "idle_activity_reset", function(ctx, _data)
     local uuid = ctx.session_uuid
