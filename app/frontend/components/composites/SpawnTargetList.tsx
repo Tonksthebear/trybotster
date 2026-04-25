@@ -9,6 +9,7 @@ import React, { useMemo, type MouseEvent, type ReactElement } from 'react'
 import { useSpawnTargetStore } from '../../store/entities'
 import type { SpawnTargetListPropsV1, UiActionV1 } from '../../ui_contract/types'
 import type { RenderContext } from '../../ui_contract/context'
+import { IconGlyph } from '../../ui_contract/icons'
 
 type SpawnTargetRecord = {
   target_id?: string
@@ -78,9 +79,9 @@ export function SpawnTargetList({
               type="button"
               onClick={handleRemove}
               aria-label="Remove spawn target"
-              className="rounded text-zinc-500 hover:text-red-400"
+              className="inline-flex size-6 shrink-0 items-center justify-center rounded text-zinc-500 hover:text-red-400"
             >
-              ×
+              <IconGlyph name="close" className="size-4" />
             </button>
           </li>
         )

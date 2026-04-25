@@ -45,6 +45,8 @@ const ICON_PATHS: Record<string, IconPath> = {
   workspace:
     // folder icon stand-in for workspace groups
     'M3.75 3A1.75 1.75 0 002 4.75v10.5C2 16.216 2.784 17 3.75 17h12.5A1.75 1.75 0 0018 15.25v-8.5A1.75 1.75 0 0016.25 5h-4.836a.25.25 0 01-.177-.073L9.823 3.513A1.75 1.75 0 008.586 3H3.75z',
+  clock:
+    'M10 18a8 8 0 100-16 8 8 0 000 16zm.75-13a.75.75 0 00-1.5 0v5c0 .2.08.39.22.53l3.25 3.25a.75.75 0 101.06-1.06l-3.03-3.03V5z',
 }
 
 type IconGlyphProps = {
