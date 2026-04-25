@@ -4,20 +4,16 @@
 -- Manages client lifecycle and broadcasts hub events to all connected
 -- clients.
 --
--- Wire protocol (cold-turkey, commit 7):
---   * v1 frame names (`agent_list`, `worktree_list`, `connection_code`,
---     `hub_recovery_state`, `pty_notification`, `ui_layout_tree_v1`, …)
---     no longer ship. The dispatcher emits only:
---       - `entity_snapshot` / `entity_upsert` / `entity_patch` /
---         `entity_remove`  (via lib.entity_broadcast)
---       - `ui_tree_snapshot`  (via lib.tree_snapshot)
---       - `ui_route_registry`  (via Client:send_ui_route_registry)
---       - `transient_event`  (built inline below for pty_notification)
---   * Hooks like `agent_created` / `agent_deleted` / `session_updated`
---     keep their NAMES (Lua identifiers, not wire identifiers) but their
---     handlers now route through EB instead of v1 broadcast helpers.
---   * Selection moved to the client. `Client.selected_session_uuid` is
---     gone; both renderers maintain their own selection state.
+-- Wire protocol:
+--   The dispatcher emits only:
+--     - `entity_snapshot` / `entity_upsert` / `entity_patch` /
+--       `entity_remove`  (via lib.entity_broadcast)
+--     - `ui_tree_snapshot`  (via lib.tree_snapshot)
+--     - `ui_route_registry`  (via Client:send_ui_route_registry)
+--     - `transient_event`   (built inline below for pty notifications)
+--   Hooks like `agent_created` / `agent_deleted` / `session_updated`
+--   are local Lua identifiers; their handlers route through EB.
+--   Selection lives on the client — both renderers maintain their own.
 --
 -- Each transport handler (webrtc.lua, tui.lua) registers clients here.
 -- State is persisted in hub.state across hot-reloads.
