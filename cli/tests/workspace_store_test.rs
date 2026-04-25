@@ -362,6 +362,65 @@ fn test_list_workspaces_returns_sorted_manifests_with_status() {
     );
 }
 
+#[test]
+fn test_list_workspaces_normalizes_workspace_id_field() {
+    // Regression: the entity_broadcast registration uses
+    // `id_field = "workspace_id"`, and hub-side upsert paths in
+    // handlers/connections.lua + lib/hub.lua guard on
+    // `if workspace.workspace_id then EB.upsert(...)`. Workspace manifests
+    // historically only carried `id`, so a fresh workspace's record hit the
+    // guard and never reached the client store — new sessions created in a
+    // brand-new workspace appeared in the "Ungrouped" bucket on the web UI
+    // until a full page refresh re-shipped the entity_snapshot.
+    //
+    // normalize_workspace_manifest now mirrors `id` into `workspace_id` so
+    // every consumer sees both names.
+    let dir = TempDir::new().unwrap();
+    let lua = create_lua_vm(dir.path());
+    load_workspace_store(&lua);
+
+    let (id_set, ws_id_set, fields_match): (bool, bool, bool) = lua
+        .load(format!(
+            r#"
+            local dd = "{dd}"
+            ws.init_dir(dd)
+
+            -- Manifest written WITHOUT workspace_id field (legacy shape).
+            ws.write_workspace(dd, "ws-fresh", {{
+                id = "ws-fresh",
+                name = "Fresh",
+                status = "active",
+                created_at = "2026-04-25T00:00:00Z",
+                updated_at = "2026-04-25T00:00:00Z",
+                metadata = {{}},
+            }})
+
+            local list = ws.list_workspaces(dd)
+            assert(#list == 1, "expected exactly one workspace")
+            local entry = list[1]
+
+            local id_set = entry.id == "ws-fresh"
+            local ws_id_set = entry.workspace_id == "ws-fresh"
+            local fields_match = entry.id == entry.workspace_id
+            return id_set, ws_id_set, fields_match
+            "#,
+            dd = dir.path().to_str().unwrap()
+        ))
+        .eval()
+        .expect("list_workspaces returns workspace_id-bearing records");
+
+    assert!(id_set, "workspace.id should be set");
+    assert!(
+        ws_id_set,
+        "workspace.workspace_id must be populated so EB.upsert guards \
+         in connections.lua + hub.lua don't drop fresh workspaces"
+    );
+    assert!(
+        fields_match,
+        "id and workspace_id must agree — they're aliases of the same identifier"
+    );
+}
+
 // =============================================================================
 // Tier 1: workspace schema tests
 // =============================================================================

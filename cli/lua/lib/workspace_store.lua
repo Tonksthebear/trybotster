@@ -46,6 +46,14 @@ end
 local function normalize_workspace_manifest(manifest, workspace_id)
     if not manifest then return nil end
     manifest.id = manifest.id or workspace_id
+    -- Wire protocol — entity_broadcast's workspace registration uses
+    -- `id_field = "workspace_id"`. The hub-side upsert path in
+    -- handlers/connections.lua + lib/hub.lua guards on `workspace.workspace_id`
+    -- before shipping, so manifests that only carry `id` get silently dropped
+    -- and brand-new workspaces never reach the client store. Mirror id into
+    -- workspace_id so every consumer (entity broadcast, EB.register's all(),
+    -- session_close_policy) sees both names without case-by-case fallbacks.
+    manifest.workspace_id = manifest.workspace_id or manifest.id
     local target = extract_target_identity(manifest)
     manifest.target_id = manifest.target_id or target.target_id
     manifest.target_path = manifest.target_path or target.target_path
