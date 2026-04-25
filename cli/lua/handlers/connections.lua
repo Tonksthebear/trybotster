@@ -430,7 +430,7 @@ end)
 -- ============================================================================
 -- Idle detection: event-driven via timer.after_idle (no polling).
 
-local IDLE_THRESHOLD_SECS = 2
+local IDLE_THRESHOLD_SECS = 1
 
 hooks.on("pty_output", "idle_activity_reset", function(ctx, _data)
     local uuid = ctx.session_uuid
