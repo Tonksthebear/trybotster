@@ -181,15 +181,18 @@ export function SessionList({
         ? `/hubs/${ctx.hubId}/sessions/${sessionUuid}`
         : undefined
 
-    // Activity dot: green pulse only when actively running. Idle /
-    // accessory / hidden render no dot so quiet rows stay quiet. Bumped
-    // to 10px + ring + animate-pulse so the indicator actually registers
-    // at row scale.
+    // Activity dot: solid emerald beacon with an outward ping halo so
+    // the indicator is visible at row scale without `animate-pulse`
+    // dropping the dot's opacity to the floor. Only rendered while the
+    // session is actively producing output.
     const dot = activity === 'active' ? (
       <span
         aria-label="Active"
-        className="size-2.5 shrink-0 animate-pulse rounded-full bg-emerald-400 ring-2 ring-emerald-400/30"
-      />
+        className="relative inline-flex size-3 shrink-0"
+      >
+        <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+        <span className="relative inline-flex size-3 rounded-full bg-emerald-500" />
+      </span>
     ) : null
 
     // Hosted-preview indicator. Running + url → clickable Catalyst

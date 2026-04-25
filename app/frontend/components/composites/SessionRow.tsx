@@ -98,8 +98,11 @@ export function SessionRow({
       {activity === 'active' && (
         <span
           aria-label="Active"
-          className="mt-1 size-2.5 shrink-0 animate-pulse rounded-full bg-emerald-400 ring-2 ring-emerald-400/30"
-        />
+          className="relative mt-1 inline-flex size-3 shrink-0"
+        >
+          <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+          <span className="relative inline-flex size-3 rounded-full bg-emerald-500" />
+        </span>
       )}
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-center gap-2">
