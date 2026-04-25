@@ -1,6 +1,6 @@
 -- Phase 4a/4b demo plugin — registers a hub-authored surface with multiple
 -- sub-routes so the end-to-end substrate (surface registry +
--- ui_route_registry_v1 broadcast + sub-route dispatcher + DynamicSurface) can
+-- ui_route_registry broadcast + sub-route dispatcher + DynamicSurface) can
 -- be exercised without any Rails route changes or hand-crafted React
 -- components.
 --

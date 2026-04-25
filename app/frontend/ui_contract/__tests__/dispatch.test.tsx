@@ -58,7 +58,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
     return { transport, send }
   }
 
-  it('sends ui_action_v1 frame on the configured target_surface and skips legacy fallback', async () => {
+  it('sends ui_action frame on the configured target_surface and skips legacy fallback', async () => {
     const { transport, send } = makeTransport()
     const dispatch = createTransportDispatch({
       transport,
@@ -79,7 +79,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
     await Promise.resolve()
 
     expect(send).toHaveBeenCalledOnce()
-    expect(send).toHaveBeenCalledWith('ui_action_v1', {
+    expect(send).toHaveBeenCalledWith('ui_action', {
       target_surface: 'workspace_surface',
       envelope: {
         id: 'botster.session.select',

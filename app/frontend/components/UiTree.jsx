@@ -168,15 +168,15 @@ function defaultLoadingFallback() {
 
 /**
  * Hub-subscribing React island that renders the active layout tree for a
- * given `targetSurface`. Wire shape (confirmed with Phase 2b transport):
+ * given `targetSurface`. Wire shape:
  *
  *     { type: "ui_tree_snapshot", target_surface: string,
- *       tree: UiNodeV1, version: string, hub_id: string }
+ *       tree: UiNodeV1, tree_version: string, hub_id: string }
  *
- * Mount points (Phase 2c): the workspace surface splits into
+ * Mount points: the workspace surface splits into
  *   - `targetSurface="workspace_sidebar"` for the AppShell sidebar
  *   - `targetSurface="workspace_panel"` for HubShow's main panel
- * Phase 2b broadcasts both with the appropriate `state.surface` density.
+ * The hub broadcasts both with the appropriate density.
  *
  * Children are rendered inside the same `InterceptorContext` so composites
  * like `<SessionActionsMenu>` can register handlers via
@@ -279,18 +279,15 @@ export default function UiTree({
 
   // Subscribe to ui_tree_snapshot frames matching this target_surface.
   //
-  // Phase 4b: also filter on `subpath`. The hub echoes back the subpath it
-  // routed for, so a frame produced from the OLD subpath (still en route
-  // when the URL changed) is discarded. A frame without a subpath field
-  // (older hub) falls through the filter so back-compat still works.
+  // Subpath filter: the hub echoes back the subpath it routed for, so a
+  // frame produced from the OLD subpath (still en route when the URL
+  // changed) is discarded. A frame without a subpath field falls through
+  // the filter, which is the right behaviour for surfaces that don't
+  // declare any sub-routes.
   useEffect(() => {
     if (!transport || !targetSurface) return undefined
     const handler = (message) => {
-      if (
-        !message ||
-        (message.type !== 'ui_tree_snapshot' &&
-          message.type !== 'ui_layout_tree_v1')
-      ) {
+      if (!message || message.type !== 'ui_tree_snapshot') {
         return
       }
       if (message.target_surface !== targetSurface) return
@@ -347,7 +344,7 @@ export default function UiTree({
     // tests assert on an empty console.
     let sendPromise
     try {
-      sendPromise = transport.send('ui_action_v1', {
+      sendPromise = transport.send('ui_action', {
         target_surface: targetSurface,
         envelope: {
           id: 'botster.surface.subpath',

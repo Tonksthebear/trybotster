@@ -163,7 +163,7 @@ describe('<UiTree>', () => {
     )
     await act(async () => {
       transportA.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: HUB_A_TREE,
       })
@@ -176,7 +176,7 @@ describe('<UiTree>', () => {
     expect(screen.queryByText('hub A list')).toBeNull()
     expect(screen.getByText(/Loading/i)).toBeInTheDocument()
 
-    // Old transport must NOT receive a stray ui_action_v1 send for any
+    // Old transport must NOT receive a stray ui_action send for any
     // dispatch issued during the switch window. Programmatically dispatch
     // through the InterceptorContext to verify routing follows hub-b.
     let captured = null
@@ -208,7 +208,7 @@ describe('<UiTree>', () => {
     await Promise.resolve()
     await Promise.resolve()
     expect(transportA.send).not.toHaveBeenCalled()
-    expect(transportB.send).toHaveBeenCalledWith('ui_action_v1', {
+    expect(transportB.send).toHaveBeenCalledWith('ui_action', {
       target_surface: 'workspace_panel',
       envelope: {
         id: 'botster.session.select',
@@ -219,7 +219,7 @@ describe('<UiTree>', () => {
     // Hub-b broadcasts; new tree renders.
     await act(async () => {
       transportB.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: HUB_B_TREE,
       })
@@ -230,7 +230,7 @@ describe('<UiTree>', () => {
     // attempt when hub-a re-emits).
     await act(async () => {
       transportA.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: HUB_A_TREE,
       })
@@ -247,7 +247,7 @@ describe('<UiTree>', () => {
 
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: HELLO_TREE,
         version: 'v0',
@@ -263,7 +263,7 @@ describe('<UiTree>', () => {
 
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_sidebar',
         tree: HELLO_TREE,
       })
@@ -274,12 +274,12 @@ describe('<UiTree>', () => {
     expect(screen.queryByText('hello world')).toBeNull()
   })
 
-  it('routes primitive button clicks through ui_action_v1 transport', async () => {
+  it('routes primitive button clicks through ui_action transport', async () => {
     render(<UiTree hubId="hub-1" targetSurface="workspace_panel" />)
 
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: SELECT_BUTTON_TREE,
         version: 'v0',
@@ -291,7 +291,7 @@ describe('<UiTree>', () => {
     await Promise.resolve()
     await Promise.resolve()
 
-    expect(fakeTransport.send).toHaveBeenCalledWith('ui_action_v1', {
+    expect(fakeTransport.send).toHaveBeenCalledWith('ui_action', {
       target_surface: 'workspace_panel',
       envelope: {
         id: 'botster.session.select',
@@ -306,7 +306,7 @@ describe('<UiTree>', () => {
 
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: SELECT_BUTTON_TREE,
       })
@@ -342,7 +342,7 @@ describe('<UiTree>', () => {
 
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: { ...malformed },
       })
@@ -353,7 +353,7 @@ describe('<UiTree>', () => {
     // the renderer throws.
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: { type: 'stack', children: 'not-an-array' },
       })
@@ -378,7 +378,7 @@ describe('<UiTree>', () => {
     render(<UiTree hubId="hub-1" targetSurface="workspace_panel" />)
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: new Boom(),
       })
@@ -387,7 +387,7 @@ describe('<UiTree>', () => {
 
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: HELLO_TREE,
       })
@@ -412,7 +412,7 @@ describe('<UiTree>', () => {
     render(<UiTree hubId="hub-1" targetSurface="workspace_panel" />)
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: new Boom(),
       })
@@ -448,7 +448,7 @@ describe('<UiTree> interceptor context', () => {
     )
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: SELECT_BUTTON_TREE,
       })
@@ -474,7 +474,7 @@ describe('<UiTree> interceptor context', () => {
     )
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: SELECT_BUTTON_TREE,
       })
@@ -500,7 +500,7 @@ describe('<UiTree> interceptor context', () => {
     })
     await Promise.resolve()
     await Promise.resolve()
-    expect(fakeTransport.send).toHaveBeenCalledWith('ui_action_v1', {
+    expect(fakeTransport.send).toHaveBeenCalledWith('ui_action', {
       target_surface: 'workspace_panel',
       envelope: {
         id: 'botster.session.select',
@@ -589,7 +589,7 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     // Push a home-render tree so the panel is visible.
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'kanban',
         subpath: '/',
         tree: { type: 'text', props: { text: 'home' } },
@@ -632,7 +632,7 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     // — UiTree must discard it, not paint it.
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'kanban',
         subpath: '/',
         tree: { type: 'text', props: { text: 'stale home' } },
@@ -642,7 +642,7 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     // Matching-subpath frame does paint.
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'kanban',
         subpath: '/board/42',
         tree: { type: 'text', props: { text: 'board 42' } },
@@ -655,7 +655,7 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     render(<UiTree hubId="hub-1" targetSurface="workspace_panel" subpath="/" />)
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         // no subpath field
         tree: { type: 'text', props: { text: 'hub' } },

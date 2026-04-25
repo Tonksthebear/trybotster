@@ -13,7 +13,7 @@ import {
  * Phase 4a/4b: dynamic hub-authored surface route.
  *
  * Matches `useParams()`'s splat (`*`) against the hub's
- * `ui_route_registry_v1` entries using `matchSurfaceForPath`. The match is
+ * `ui_route_registry` entries using `matchSurfaceForPath`. The match is
  * **prefix-scoped to `base_path`**, not an exact-path compare: the first
  * hub-relative segment identifies the surface, and everything after it is
  * the **subpath** (sub-route) handed to `<UiTree>` so the hub dispatcher
