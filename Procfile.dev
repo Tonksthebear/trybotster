@@ -3,3 +3,4 @@ css: bin/rails tailwindcss:watch
 jobs: bin/jobs
 vite: bin/vite dev
 mcp: bin/rails s -c mcp.ru -p 62770 -b 0.0.0.0 -P tmp/pids/mcp.pid
+tunnel: cloudflared tunnel run dev-laptop
