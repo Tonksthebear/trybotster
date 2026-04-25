@@ -203,13 +203,13 @@ hooks.on("agent_created", "broadcast_agent_created", function(info)
     EB.upsert("session", payload)
     -- Workspaces list may have grown — re-snapshot since workspace patches
     -- are not granular enough to capture "this session now belongs here".
+    -- EB.upsert resolves the entity id via `payload[id_field] or payload.id`
+    -- so no pre-guard needed; workspace_store normalizes id+workspace_id.
     local Hub = require("lib.hub")
     local ok, workspaces = pcall(function() return Hub.get():list_workspaces() end)
     if ok and type(workspaces) == "table" then
         for _, workspace in ipairs(workspaces) do
-            if workspace.workspace_id then
-                EB.upsert("workspace", workspace)
-            end
+            EB.upsert("workspace", workspace)
         end
     end
 end)

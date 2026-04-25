@@ -553,9 +553,7 @@ function Hub:move_agent_workspace(agent_id, workspace_id, workspace_name)
             end)
             if ok and type(workspaces) == "table" then
                 for _, workspace in ipairs(workspaces) do
-                    if workspace.workspace_id then
-                        EB.upsert("workspace", workspace)
-                    end
+                    EB.upsert("workspace", workspace)
                 end
             end
         end
