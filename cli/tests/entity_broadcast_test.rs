@@ -221,6 +221,49 @@ fn upsert_emits_entity_upsert_frame_with_id_resolution() {
 }
 
 #[test]
+fn upsert_falls_back_to_id_when_registered_id_field_is_absent() {
+    // Regression: spawn_target records carry `id` (from the SpawnTarget
+    // struct) but the EB registration uses `id_field = "target_id"`. Hub
+    // call sites used to guard `if t.target_id then EB.upsert(...)` before
+    // shipping, dropping every record. EB internally falls back to
+    // `payload.id` when the configured id_field is missing — this test
+    // pins that contract so call sites can drop their pre-guards.
+    let (lua, eb) = new_eb_lua();
+    let register: Function = eb.get("register").unwrap();
+    let opts: Table = lua.create_table().unwrap();
+    opts.set("id_field", "target_id").unwrap();
+    let all_fn: Function = lua
+        .create_function(|lua, ()| Ok(lua.create_table()?))
+        .unwrap();
+    opts.set("all", all_fn).unwrap();
+    register
+        .call::<()>(("spawn_target", opts))
+        .expect("register spawn_target");
+    let frames = install_capturing_broadcaster(&lua, &eb);
+
+    let upsert: Function = eb.get("upsert").unwrap();
+    // Mimic SpawnTarget serde shape: `id` present, `target_id` absent.
+    let payload: Table = lua.create_table().unwrap();
+    payload.set("id", "tgt-abc").unwrap();
+    payload.set("name", "primary").unwrap();
+    payload.set("path", "/tmp/repo").unwrap();
+    payload.set("enabled", true).unwrap();
+    upsert.call::<()>(("spawn_target", payload)).unwrap();
+
+    let captured = frames_as_json(&lua, &frames);
+    assert_eq!(captured.len(), 1, "upsert must emit one frame even without target_id");
+    let frame = &captured[0];
+    assert_eq!(frame["type"], json!("entity_upsert"));
+    assert_eq!(frame["entity_type"], json!("spawn_target"));
+    assert_eq!(
+        frame["id"],
+        json!("tgt-abc"),
+        "id should fall back to payload.id when target_id is missing"
+    );
+    assert_eq!(frame["entity"]["name"], json!("primary"));
+}
+
+#[test]
 fn remove_emits_entity_remove_frame() {
     let (lua, eb) = new_eb_lua();
     register_session_type(&lua, &eb);

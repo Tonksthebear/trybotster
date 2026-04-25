@@ -91,13 +91,15 @@ commands.register("add_spawn_target", function(client, sub_id, command)
         string.format("Admitted spawn target %s", target.path or target.name or target.id or path)
     )
     -- Wire protocol: re-snapshot spawn_target so clients see the new entry.
+    -- SpawnTarget records carry `id` not `target_id`; EB.upsert resolves the
+    -- entity id via `payload[id_field] or payload.id`, so no pre-guard needed.
     local EB = require("lib.entity_broadcast")
     if EB.is_registered("spawn_target") then
         local registry = rawget(_G, "spawn_targets")
         local list_ok, listed = pcall(registry.list)
         if list_ok and type(listed) == "table" then
             for _, t in ipairs(listed) do
-                if t.target_id then EB.upsert("spawn_target", t) end
+                EB.upsert("spawn_target", t)
             end
         end
     end
