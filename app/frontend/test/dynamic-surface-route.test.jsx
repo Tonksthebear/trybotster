@@ -101,7 +101,7 @@ describe('DynamicSurfaceRoute', () => {
   // F4: distinguish "registry hasn't arrived yet" from "true 404".
   it('renders the loading state while the registry snapshot is unresolved', () => {
     // Deliberately do NOT call setRoutes — the hub is still connecting
-    // and the first ui_route_registry_v1 frame hasn't arrived.
+    // and the first ui_route_registry frame hasn't arrived.
     renderDynamic('/hubs/brand-new-hub/plugins/hello')
 
     // Loading placeholder, NOT 404.

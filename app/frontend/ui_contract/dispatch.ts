@@ -3,7 +3,7 @@ import type { ActionDispatch, ActionDispatchSource } from './context'
 import type { UiActionV1 } from './types'
 
 /**
- * Minimal transport surface we need to send `ui_action_v1` frames. Anything
+ * Minimal transport surface we need to send `ui_action` frames. Anything
  * with an async `send(type, data)` method (e.g. `HubTransport.send`) satisfies
  * this. Kept as a structural type so tests can pass a plain mock.
  */
@@ -154,7 +154,7 @@ function navigateToSessionLocally(
  * Build an `ActionDispatch` that routes through the Phase 2b transport as the
  * default path. Serialized wire shape (confirmed with Phase 2b):
  *
- *     { type: "ui_action_v1", target_surface, envelope: UiActionV1 }
+ *     { type: "ui_action", target_surface, envelope: UiActionV1 }
  *
  * When transport send returns falsy (no subscription, send failed), the
  * dispatcher falls back to the legacy `lib/actions.js` handler for
@@ -201,7 +201,7 @@ export function createTransportDispatch(
       let sent = false
       try {
         sent =
-          (await transport.send('ui_action_v1', {
+          (await transport.send('ui_action', {
             target_surface: targetSurface,
             envelope,
           })) === true

@@ -675,7 +675,7 @@ fn route_registry_payload_includes_routable_surfaces_and_excludes_pathless() {
         .expect("build route registry payload");
 
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse JSON");
-    assert_eq!(parsed.get("type").and_then(|v| v.as_str()), Some("ui_route_registry_v1"));
+    assert_eq!(parsed.get("type").and_then(|v| v.as_str()), Some("ui_route_registry"));
     assert_eq!(parsed.get("hub_id").and_then(|v| v.as_str()), Some("hub-test"));
     let routes = parsed.get("routes").and_then(|v| v.as_array()).expect("routes array");
     let paths: Vec<&str> = routes

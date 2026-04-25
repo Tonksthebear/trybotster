@@ -402,7 +402,7 @@ function Client:set_surface_subpath(surface_name, subpath, opts)
     end
 end
 
---- Send the `ui_route_registry_v1` frame for a HubChannel subscription.
+--- Send the `ui_route_registry` frame for a HubChannel subscription.
 --
 -- The payload enumerates every registered surface that declares a `path`,
 -- giving the browser's React Router everything it needs to render the

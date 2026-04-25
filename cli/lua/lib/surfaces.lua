@@ -47,7 +47,7 @@
 --      when they define the same name, but otherwise the Lua registry wins.
 --   2. `lib.layout_broadcast` iterates `surfaces.list()` when building
 --      per-subscription frame lists — every registered surface fans out.
---   3. `handlers.connections` broadcasts `ui_route_registry_v1` on every
+--   3. `handlers.connections` broadcasts `ui_route_registry` on every
 --      `surfaces_changed` hook firing, so browsers can discover new routes
 --      without a Rails change.
 --
@@ -523,7 +523,7 @@ function M.list()
     return out
 end
 
---- Build the `ui_route_registry_v1` payload from the registry.
+--- Build the `ui_route_registry` payload from the registry.
 --
 -- Only surfaces with a `path` are included — that's the definition of a
 -- routable page. `hide_from_nav` is passed through so the sidebar renderer
@@ -560,7 +560,7 @@ function M.build_route_registry_payload(hub_id)
         end
     end
     return {
-        type = "ui_route_registry_v1",
+        type = "ui_route_registry",
         hub_id = hub_id,
         routes = routes,
     }

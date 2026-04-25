@@ -36,7 +36,7 @@ import { IconGlyph } from '../../ui_contract/icons'
 //   Headless UI Menu via a programmatically-clicked invisible MenuButton
 //   positioned on top of the trigger.
 // - Menu items dispatch follow-up actions back through the same UiTree
-//   dispatch — those flow over `ui_action_v1` once Phase 2b wires the
+//   dispatch — those flow over `ui_action` once Phase 2b wires the
 //   matching hub handlers, with the legacy fallback table catching any
 //   un-wired ones.
 export default function SessionActionsMenu() {

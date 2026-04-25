@@ -544,11 +544,11 @@ end, { description = "Acknowledge selection (v2: client-side only)" })
 -- command channel with semantic action ids so plugin-registered handlers
 -- (`action.on("botster.session.select", name, handler)`) can intercept
 -- intents uniformly. Falls back to the legacy command for known action ids
--- so browsers emitting `ui_action_v1` do not regress vs `select_agent` etc.
-commands.register("ui_action_v1", function(client, sub_id, command)
+-- so browsers emitting `ui_action` do not regress vs `select_agent` etc.
+commands.register("ui_action", function(client, sub_id, command)
     local envelope = command.envelope
     if type(envelope) ~= "table" then
-        log.warn("ui_action_v1 missing envelope table")
+        log.warn("ui_action missing envelope table")
         return
     end
     local action = require("lib.action")
