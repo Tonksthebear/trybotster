@@ -1,14 +1,14 @@
-//! Wire protocol v2 — end-to-end integration test for Session:update.
+//! Wire protocol — end-to-end integration test for Session:update.
 //!
-//! Asserts the cold-turkey contract: a single `Session:update(...)` call
+//! Asserts the contract: a single `Session:update(...)` call
 //! produces exactly one `entity_patch(session, ...)` wire frame, zero
 //! `ui_tree_snapshot` frames, and the patch payload includes any re-derived
 //! fields per `ClientSessionPayload.project_fields` semantics
 //! (design brief §12.4).
 //!
 //! This test exists to prevent regression of the §1 motivating
-//! measurement: pre-v2 a single field change triggered a 1.7s broadcast
-//! rebuilding 3 surfaces × 2 densities × N subscriptions; post-v2 the
+//! measurement: pre-rewrite a single field change triggered a 1.7s broadcast
+//! rebuilding 3 surfaces × 2 densities × N subscriptions; post-rewrite the
 //! broadcaster emits ~50 bytes per subscriber.
 
 #![expect(
@@ -257,7 +257,7 @@ fn empty_session_update_emits_zero_frames() {
 
 #[test]
 fn no_ui_tree_snapshot_emitted_during_session_update_path() {
-    // The cold-turkey win: before v2 a Session:update would trigger
+    // The wire-flip win: before this rewrite a Session:update would trigger
     // broadcast_ui_layout_trees() and ship a 1.7s tree rebuild. Now the
     // EB.patch path is the only thing that fires — verified here by
     // counting frame types.
@@ -277,7 +277,7 @@ fn no_ui_tree_snapshot_emitted_during_session_update_path() {
         assert_eq!(frame["type"], json!("entity_patch"));
         assert_ne!(
             frame["type"], json!("ui_tree_snapshot"),
-            "Session:update must not trigger ui_tree_snapshot in v2"
+            "Session:update must not trigger ui_tree_snapshot"
         );
     }
 }

@@ -1,4 +1,4 @@
-//! Wire protocol v2 — regression test for the hot-reload broadcaster gap
+//! Wire protocol — regression test for the hot-reload broadcaster gap
 //! (blocker B6).
 //!
 //! Before the fix, `connections.lua::_before_reload` called

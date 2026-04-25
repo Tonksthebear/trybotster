@@ -1,13 +1,13 @@
--- Embedded default web layout (wire protocol v2).
+-- Embedded default web layout (wire protocol).
 --
 -- Entry point for `web_layout.render(surface, state)`. Produces a `UiNodeV1`
 -- tree that authors composite primitives (`ui.session_list{}`,
 -- `ui.new_session_button{}`, etc.) and lets each renderer expand them by
 -- reading from its own entity store.
 --
--- Pre-v2 the workspace surface inlined the entire workspace-grouped tree
+-- Pre-rewrite the workspace surface inlined the entire workspace-grouped tree
 -- here (~400 lines, hosted-preview indicators, accessory subtitles, nav
--- entries). Under v2 the renderers own that complexity:
+-- entries). Under the wire protocol the renderers own that complexity:
 --
 --   * Web:  app/frontend/components/composites/SessionList.tsx
 --   * TUI:  cli/src/tui/ui_contract_adapter/primitive.rs::render_session_list

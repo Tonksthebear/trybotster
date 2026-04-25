@@ -65,7 +65,7 @@ pub fn register(lua: &Lua) -> Result<()> {
     register_primitive(lua, &ui, "tree", Primitive::Tree)?;
     register_primitive(lua, &ui, "tree_item", Primitive::TreeItem)?;
     register_primitive(lua, &ui, "dialog", Primitive::Dialog)?;
-    // Wire protocol v2 composites — data-driven, no children, no slots.
+    // Wire protocol composites — data-driven, no children, no slots.
     register_primitive(lua, &ui, "session_list", Primitive::SessionList)?;
     register_primitive(lua, &ui, "workspace_list", Primitive::WorkspaceList)?;
     register_primitive(lua, &ui, "spawn_target_list", Primitive::SpawnTargetList)?;
@@ -79,7 +79,7 @@ pub fn register(lua: &Lua) -> Result<()> {
     register_responsive(lua, &ui)?;
     register_when(lua, &ui)?;
     register_hidden(lua, &ui)?;
-    // Wire protocol v2 — reactive data sentinels for plugin layouts.
+    // Wire protocol — reactive data sentinels for plugin layouts.
     register_bind(lua, &ui)?;
     register_bind_list(lua, &ui)?;
 
@@ -110,21 +110,21 @@ enum Primitive {
     /// Flagged internal in v1 — registered so renderers can consume it while
     /// Phase B / Phase C catch up.
     Dialog,
-    /// Wire protocol v2 — workspace-grouped session tree composite.
+    /// Wire protocol — workspace-grouped session tree composite.
     SessionList,
-    /// Wire protocol v2 — bare workspace switcher composite.
+    /// Wire protocol — bare workspace switcher composite.
     WorkspaceList,
-    /// Wire protocol v2 — spawn target picker composite.
+    /// Wire protocol — spawn target picker composite.
     SpawnTargetList,
-    /// Wire protocol v2 — worktree picker composite for a given target.
+    /// Wire protocol — worktree picker composite for a given target.
     WorktreeList,
-    /// Wire protocol v2 — single-session row composite (binds to a uuid).
+    /// Wire protocol — single-session row composite (binds to a uuid).
     SessionRow,
-    /// Wire protocol v2 — hub lifecycle banner composite (singleton entity).
+    /// Wire protocol — hub lifecycle banner composite (singleton entity).
     HubRecoveryState,
-    /// Wire protocol v2 — pairing QR + URL composite (singleton entity).
+    /// Wire protocol — pairing QR + URL composite (singleton entity).
     ConnectionCode,
-    /// Wire protocol v2 — "new session" button composite.
+    /// Wire protocol — "new session" button composite.
     NewSessionButton,
 }
 
@@ -274,7 +274,7 @@ fn register_hidden(lua: &Lua, ui: &Table) -> Result<()> {
     Ok(())
 }
 
-/// `ui.bind(path)` — wire protocol v2 sentinel. Emits `{ "$bind": path }`.
+/// `ui.bind(path)` — wire protocol sentinel. Emits `{ "$bind": path }`.
 ///
 /// Resolved client-side against the per-entity-type stores. Path grammar:
 ///
@@ -302,7 +302,7 @@ fn register_bind(lua: &Lua, ui: &Table) -> Result<()> {
     Ok(())
 }
 
-/// `ui.bind_list{ source, item_template }` — wire protocol v2 sentinel for
+/// `ui.bind_list{ source, item_template }` — wire protocol sentinel for
 /// reactive list expansion. Emits a `$kind = "bind_list"` envelope:
 ///
 /// ```json
@@ -567,7 +567,7 @@ fn validate(_lua: &Lua, kind: Primitive, node: &Table) -> mlua::Result<()> {
     Ok(())
 }
 
-/// Returns `true` when `value` is a wire-protocol-v2 `$bind` sentinel
+/// Returns `true` when `value` is a wire protocol `$bind` sentinel
 /// (i.e. a single-key Lua table `{ ["$bind"] = "/<path>" }`). Required-prop
 /// validators accept the sentinel as a stand-in for the eventual resolved
 /// value — the resolver runs client-side before primitive dispatch.
@@ -1283,7 +1283,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Wire protocol v2 — composite primitives
+    // Wire protocol — composite primitives
     // =========================================================================
 
     #[test]
@@ -1538,7 +1538,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Wire protocol v2 — ui.bind / ui.bind_list
+    // Wire protocol — ui.bind / ui.bind_list
     // -------------------------------------------------------------------------
 
     #[test]
@@ -1615,7 +1615,7 @@ mod tests {
 
     #[test]
     fn v2_composites_typed_props_round_trip_via_serde() {
-        // Wire shape ↔ typed PropsV1 round-trip for every v2 composite.
+        // Wire shape ↔ typed PropsV1 round-trip for every composite.
         // Catches any drift between the Lua allowlist and the Rust struct.
         use crate::ui_contract::{
             ConnectionCodePropsV1, HubRecoveryStatePropsV1, NewSessionButtonPropsV1,

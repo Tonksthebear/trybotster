@@ -61,7 +61,7 @@ beforeEach(() => {
   vi.spyOn(hubBridge, 'getHub').mockReturnValue({
     transport: fakeTransport,
   })
-  // Wire protocol v2: seed the session entity store directly.
+  // Wire protocol: seed the session entity store directly.
   useSessionStore.setState({
     byId: {
       's-1': {
@@ -93,7 +93,7 @@ describe('<SessionActionsMenu> interceptor', () => {
 
     await act(async () => {
       fakeTransport.emit('message', {
-        type: 'ui_layout_tree_v1',
+        type: 'ui_tree_snapshot',
         target_surface: 'workspace_panel',
         tree: MENU_TRIGGER_TREE,
       })

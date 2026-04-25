@@ -1,4 +1,4 @@
-// Wire protocol v2 — composite renderer for `ui.session_list{}`.
+// Wire protocol — composite renderer for `ui.session_list{}`.
 //
 // Reads from the session + workspace entity stores and the
 // ui-presentation-store (selection / collapse). Renders the workspace-grouped
@@ -97,12 +97,18 @@ export function SessionList({
   )
   const workspaceOrder = useWorkspaceEntityStore((state) => state.order)
   const workspacesById = useWorkspaceEntityStore((state) => state.byId)
+  // Filter out closed workspaces. The hub emits
+  // `entity_patch(workspace, status="closed")` when the last session in a
+  // workspace closes (handlers/connections.lua workspace_closed hook); the
+  // record stays in the store so a future re-open is just an upsert away,
+  // but headers + groups should not render until then.
   const workspaces = useMemo(
     () =>
-      workspaceOrder.map((id) => [
-        id,
-        workspacesById[id] as WorkspaceRecord,
-      ] as const),
+      workspaceOrder
+        .map(
+          (id) => [id, workspacesById[id] as WorkspaceRecord] as const,
+        )
+        .filter(([, ws]) => ws && ws.status !== 'closed'),
     [workspaceOrder, workspacesById],
   )
 

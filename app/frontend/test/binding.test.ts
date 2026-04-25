@@ -1,4 +1,4 @@
-// Wire protocol v2 — frontend $bind / bind_list resolver tests.
+// Wire protocol — frontend $bind / bind_list resolver tests.
 //
 // Mirrors `cli/src/tui/ui_contract_adapter/binding.rs` test cases. Both
 // resolvers must agree on path grammar, sentinel detection, and bind_list

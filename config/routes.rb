@@ -63,7 +63,7 @@ Rails.application.routes.draw do
 
   # SPA catch-all for frontend paths that React Router manages. React
   # Router decides whether the path corresponds to a hub-authored surface
-  # (via the ui_route_registry_v1 broadcast) or a static Rails-hosted page;
+  # (via the ui_route_registry broadcast) or a static Rails-hosted page;
   # Rails only has to serve the SPA shell for any `/hubs/:hub_id/...` URL,
   # so plugins can ship new browser routes without editing this file.
   # Must be after all API/auth routes to avoid intercepting them.

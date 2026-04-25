@@ -1,4 +1,4 @@
-// Wire protocol v2 — B2 regression test: a workspace transitioning to
+// Wire protocol — B2 regression test: a workspace transitioning to
 // `status: "closed"` via entity_patch updates the client-side workspace
 // store, and the MoveSessionDialog's status==="active" filter drops it.
 //

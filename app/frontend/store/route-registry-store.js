@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 
 // Phase 4a/4b: per-hub registry of routable browser surfaces. Populated from
-// the `ui_route_registry_v1` broadcast (see `lib/connections/hub_connection.js`
+// the `ui_route_registry` broadcast (see `lib/connections/hub_connection.js`
 // and the bridge in `lib/hub-bridge.js`). Components subscribe via the
 // `useRouteRegistryStore` hook; `DynamicSurfaceRoute` matches the current
 // URL's first hub-scoped segment against an entry's `base_path` to decide
@@ -142,7 +142,7 @@ export function selectRoutesForHub(state, hubId) {
   return state.routesByHubId[String(hubId)] ?? EMPTY_ROUTES
 }
 
-/** Selector: has this hub shipped its first `ui_route_registry_v1` frame?
+/** Selector: has this hub shipped its first `ui_route_registry` frame?
  *  Consumers should render a loading state while this is false and fall
  *  back to the 404 / no-match branch only after it turns true. */
 export function selectHasRouteRegistrySnapshot(state, hubId) {

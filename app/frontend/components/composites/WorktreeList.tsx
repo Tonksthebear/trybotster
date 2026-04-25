@@ -1,4 +1,4 @@
-// Wire protocol v2 — composite renderer for `ui.worktree_list{ target_id }`.
+// Wire protocol — composite renderer for `ui.worktree_list{ target_id }`.
 // Filters worktrees to those belonging to the supplied spawn target.
 
 import React, { useMemo, type ReactElement } from 'react'

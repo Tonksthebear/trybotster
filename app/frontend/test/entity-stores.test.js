@@ -1,4 +1,4 @@
-// Wire protocol v2 — frontend entity store tests.
+// Wire protocol — frontend entity store tests.
 //
 // Mirrors `cli/tests/entity_broadcast_test.rs` and the TUI's
 // `cli/src/tui/entity_stores/mod.rs` test cases. Both clients must apply
@@ -147,7 +147,7 @@ describe('frontend entity store dispatch', () => {
     _resetEntityStoresForTest()
   })
 
-  it('isEntityFrame recognises only the four v2 envelope types', () => {
+  it('isEntityFrame recognises only the four entity envelope types', () => {
     expect(isEntityFrame('entity_snapshot')).toBe(true)
     expect(isEntityFrame('entity_upsert')).toBe(true)
     expect(isEntityFrame('entity_patch')).toBe(true)
