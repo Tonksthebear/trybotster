@@ -53,27 +53,46 @@ afterEach(() => {
 })
 
 describe('<SessionList> v1-fidelity row', () => {
-  it('renders the green activity dot only when is_idle === false', () => {
+  it('left-border color reflects row state with notification > active > idle priority', () => {
+    // Active session → emerald border, no notification.
     seedSession({
-      id: 'sess-1',
-      session_uuid: 'uuid-1',
+      id: 'sess-active',
+      session_uuid: 'uuid-active',
       session_type: 'agent',
       label: 'api-work',
       is_idle: false,
     })
     const ctx = fakeCtx()
     render(<SessionList density="panel" grouping="flat" ctx={ctx} />)
-    expect(screen.getByLabelText('Active')).toBeInTheDocument()
+    expect(screen.getByTestId('session-row-primary').closest('[data-row-state]'))
+      .toHaveAttribute('data-row-state', 'active')
 
     cleanup()
+
+    // Idle session → zinc/gray border.
     seedSession({
-      id: 'sess-2',
-      session_uuid: 'uuid-2',
+      id: 'sess-idle',
+      session_uuid: 'uuid-idle',
       session_type: 'agent',
       is_idle: true,
     })
     render(<SessionList density="panel" grouping="flat" ctx={ctx} />)
-    expect(screen.queryByLabelText('Active')).toBeNull()
+    expect(screen.getByTestId('session-row-primary').closest('[data-row-state]'))
+      .toHaveAttribute('data-row-state', 'idle')
+
+    cleanup()
+
+    // Notification + active → notification wins.
+    seedSession({
+      id: 'sess-notif',
+      session_uuid: 'uuid-notif',
+      session_type: 'agent',
+      is_idle: false,
+      notification: true,
+    })
+    render(<SessionList density="panel" grouping="flat" ctx={ctx} />)
+    expect(screen.getByTestId('session-row-primary').closest('[data-row-state]'))
+      .toHaveAttribute('data-row-state', 'notification')
   })
 
   it('renders primaryName + titleLine + subtext on separate lines', () => {
