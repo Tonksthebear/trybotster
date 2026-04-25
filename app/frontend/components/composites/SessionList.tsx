@@ -181,19 +181,19 @@ export function SessionList({
         ? `/hubs/${ctx.hubId}/sessions/${sessionUuid}`
         : undefined
 
-    // Activity dot: solid emerald beacon with an outward ping halo so
-    // the indicator is visible at row scale without `animate-pulse`
-    // dropping the dot's opacity to the floor. Only rendered while the
-    // session is actively producing output.
-    const dot = activity === 'active' ? (
-      <span
-        aria-label="Active"
-        className="relative inline-flex size-3 shrink-0"
-      >
-        <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-        <span className="relative inline-flex size-3 rounded-full bg-emerald-500" />
-      </span>
-    ) : null
+    // Row state → left-border color. Priority: notification beats active
+    // beats idle so an alert always wins surface attention. One color at
+    // a time. Idle rows still carry a gray border so the column edge stays
+    // visually consistent regardless of state.
+    const rowState = session.notification
+      ? 'notification'
+      : activity === 'active'
+        ? 'active'
+        : 'idle'
+    const rowStateBorder =
+      rowState === 'notification' ? 'border-amber-400'
+      : rowState === 'active' ? 'border-emerald-500'
+      : 'border-zinc-700'
 
     // Hosted-preview indicator. Running + url → clickable Catalyst
     // BadgeButton. Other statuses → Catalyst Badge with the right tone.
@@ -265,7 +265,8 @@ export function SessionList({
     )
 
     const containerClass = clsx(
-      'group flex min-w-0 items-start gap-2 rounded-md px-2 py-1.5 text-sm',
+      'group flex min-w-0 items-start gap-2 rounded-md border-l-4 px-2 py-1.5 text-sm',
+      rowStateBorder,
       indent > 0 && 'ml-4',
       selected
         ? 'bg-sky-500/20 text-sky-300'
@@ -276,15 +277,8 @@ export function SessionList({
     const isAccessory = session.session_type === 'accessory'
 
     const lines = (
-      <div className="min-w-0 flex-1">
+      <div className="min-w-0 flex-1" data-row-state={rowState}>
         <div className="flex min-w-0 items-center gap-2">
-          {session.notification && (
-            <span
-              aria-hidden="true"
-              data-testid="notification-dot"
-              className="size-2 shrink-0 rounded-full bg-amber-400"
-            />
-          )}
           <span
             className={clsx(
               titleSize,
@@ -322,7 +316,6 @@ export function SessionList({
 
     const innerSlots = (
       <>
-        {dot && <div className="pt-1.5">{dot}</div>}
         {lines}
         <div className="flex shrink-0 items-center gap-1 pt-0.5">
           {previewIndicator}

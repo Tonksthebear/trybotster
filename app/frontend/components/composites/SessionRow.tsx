@@ -74,6 +74,19 @@ export function SessionRow({
   const isAccessory = session.session_type === 'accessory'
   const titleSize = resolvedDensity === 'sidebar' ? 'text-xs' : 'text-sm'
 
+  // Row state → left-border color. Priority: notification > active > idle.
+  // One color at a time; idle rows still get a gray border for column-edge
+  // consistency.
+  const rowState = session.notification
+    ? 'notification'
+    : activity === 'active'
+      ? 'active'
+      : 'idle'
+  const rowStateBorder =
+    rowState === 'notification' ? 'border-amber-400'
+    : rowState === 'active' ? 'border-emerald-500'
+    : 'border-zinc-700'
+
   const handleMenuOpen = (event: MouseEvent) => {
     event.preventDefault()
     event.stopPropagation()
@@ -89,30 +102,16 @@ export function SessionRow({
   return (
     <div
       className={clsx(
-        'flex items-start gap-2 px-2 py-1.5 text-zinc-200',
+        'flex items-start gap-2 rounded-md border-l-4 px-2 py-1.5 text-zinc-200',
+        rowStateBorder,
         resolvedDensity === 'sidebar' && 'py-0.5',
       )}
       data-session-uuid={sessionUuid}
       data-session-id={sessionId}
+      data-row-state={rowState}
     >
-      {activity === 'active' && (
-        <span
-          aria-label="Active"
-          className="relative mt-1 inline-flex size-3 shrink-0"
-        >
-          <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-          <span className="relative inline-flex size-3 rounded-full bg-emerald-500" />
-        </span>
-      )}
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-center gap-2">
-          {session.notification && (
-            <span
-              aria-hidden="true"
-              data-testid="notification-dot"
-              className="size-2 shrink-0 rounded-full bg-amber-400"
-            />
-          )}
           <span
             className={clsx(
               titleSize,
