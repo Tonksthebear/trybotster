@@ -1061,10 +1061,25 @@ impl Hub {
     ///
     /// In headless mode there is no TUI to trigger lazy generation, so
     /// external tools (system tests, automation) need the URL written to
-    /// disk at startup.
+    /// disk at startup. TUI mode now also calls this so the in-app
+    /// `ui.connection_code{}` composite (cli/lua/web/layout.lua) renders
+    /// the URL/QR as soon as a browser subscribes — without a separate
+    /// `get_connection_code` round-trip.
+    ///
+    /// Fires `connection_code_ready` on success so the Lua handler at
+    /// `cli/lua/handlers/connections.lua` persists the URL into
+    /// `connections.last_connection_code` state and ships the
+    /// `connection_code` entity. Without that, the snapshot path
+    /// (`cli/lua/hub/init.lua`) returns an empty array even after the
+    /// bundle is generated.
     pub fn eager_generate_connection_url(&mut self) {
         match self.generate_connection_url() {
-            Ok(url) => log::info!("Connection URL generated ({} chars)", url.len()),
+            Ok(url) => {
+                log::info!("Connection URL generated ({} chars)", url.len());
+                if let Err(e) = self.lua.fire_connection_code_ready(&url) {
+                    log::warn!("Failed to fire connection_code_ready: {e}");
+                }
+            }
             Err(e) => log::warn!("Failed to generate connection URL: {e}"),
         }
     }
