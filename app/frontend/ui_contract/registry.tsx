@@ -637,7 +637,6 @@ import { SpawnTargetList } from '../components/composites/SpawnTargetList'
 import { WorktreeList } from '../components/composites/WorktreeList'
 import { SessionRow } from '../components/composites/SessionRow'
 import { HubRecoveryState } from '../components/composites/HubRecoveryState'
-import { ConnectionCode } from '../components/composites/ConnectionCode'
 import { NewSessionButton } from '../components/composites/NewSessionButton'
 
 const renderSessionList: PrimitiveRenderer = ({ props, ctx }) => (
@@ -657,9 +656,6 @@ const renderSessionRow: PrimitiveRenderer = ({ props, ctx }) => (
 )
 const renderHubRecoveryState: PrimitiveRenderer = ({ props, ctx }) => (
   <HubRecoveryState {...(props as any)} ctx={ctx} />
-)
-const renderConnectionCode: PrimitiveRenderer = ({ props, ctx }) => (
-  <ConnectionCode {...(props as any)} ctx={ctx} />
 )
 const renderNewSessionButton: PrimitiveRenderer = ({ props, ctx }) => (
   <NewSessionButton {...(props as any)} ctx={ctx} />
@@ -689,6 +685,5 @@ export const PRIMITIVE_REGISTRY: Record<string, PrimitiveRenderer> = {
   worktree_list: renderWorktreeList,
   session_row: renderSessionRow,
   hub_recovery_state: renderHubRecoveryState,
-  connection_code: renderConnectionCode,
   new_session_button: renderNewSessionButton,
 }

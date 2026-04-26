@@ -12,8 +12,6 @@ const EMPTY_CONFIG = Object.freeze({
   workspaces: [],
 });
 
-const DEFAULT_PREFETCH = Object.freeze([]);
-
 function cloneConfig(value) {
   return {
     targetId: value?.targetId || null,
@@ -74,7 +72,6 @@ export class HubSession {
 
     this.#bindTransport();
     this.#hydrateFromTransport();
-    this.#schedulePrefetch();
     return this;
   }
 
@@ -146,10 +143,6 @@ export class HubSession {
 
   onConnectionStatusChange(callback) {
     return this.connectionStatus.onChange(callback);
-  }
-
-  async prefetch(_resources = DEFAULT_PREFETCH) {
-    return Promise.resolve();
   }
 
   ensureAgentConfig(targetId, options = {}) {
@@ -225,23 +218,6 @@ export class HubSession {
     if (this.transport.hasHubRecoveryStateSnapshot()) {
       this.recoveryState.set(this.transport.getHubRecoveryState());
     }
-  }
-
-  #schedulePrefetch() {
-    const prefetch = this.options.prefetch === false
-      ? []
-      : Array.isArray(this.options.prefetch)
-        ? this.options.prefetch
-        : DEFAULT_PREFETCH;
-
-    if (prefetch.length === 0) return;
-
-    queueMicrotask(() => {
-      if (this.destroyed) return;
-      this.prefetch(prefetch).catch((error) => {
-        console.debug("[HubSession] Prefetch failed:", error?.message || error);
-      });
-    });
   }
 
   async #requestCollection({

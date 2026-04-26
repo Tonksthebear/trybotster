@@ -1,11 +1,11 @@
 import { waitFor } from '@testing-library/react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { queryClient } from '../lib/query-client'
 import { resetHubListSubscriptionForTest, subscribeHubListUpdates, useHubStore } from '../store/hub-store'
 
 // Mock hub-bridge
 const mockConnect = vi.fn(() => Promise.resolve({ connectionId: 42 }))
 const mockDisconnect = vi.fn()
-const mockGetHub = vi.fn(() => null)
 
 vi.mock('../lib/hub-bridge', () => ({
   connect: (...args) => mockConnect(...args),
@@ -31,6 +31,7 @@ const mockHubs = [
 describe('hub-store', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    queryClient.clear()
     localStorage.clear()
     resetHubListSubscriptionForTest()
     useHubStore.setState({

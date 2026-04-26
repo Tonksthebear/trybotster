@@ -2,7 +2,7 @@
 
 ## Goal
 
-Replace the old browser-side "template cloning plus Stimulus reconciliation" approach for live operator surfaces with a Rails-owned React runtime that renders trusted Botster primitives from structured data.
+Replace the old browser-side "template cloning plus Stimulus reconciliation" approach for live operator surfaces with a Rails-owned React/Catalyst runtime that renders trusted Botster primitives from structured data.
 
 This spec is the web renderer application of the shared contract in [cross-client-ui-primitives.md](cross-client-ui-primitives.md). The cross-client spec owns primitive names, shared action semantics, and renderer-neutral state ownership rules. This document only defines the web-specific rollout and the phase-1 adapter boundary.
 
@@ -33,6 +33,9 @@ That is the wrong shape for Stimulus. The next runtime must render from normaliz
 ## Decision Summary
 
 - React is the browser runtime for live operator surfaces
+- Catalyst/Tailwind components are the browser component system
+- React Query owns browser request caches and loading/error states
+- Zustand owns local UI state plus hub-pushed entity collections
 - Rails owns the primitive/component registry
 - hub/Lua does not send HTML, CSS, or JavaScript
 - phase 1 stays state-first, not tree-first
@@ -62,10 +65,30 @@ Phase 1 originally covered only the agent/workspace UI:
 
 Later phases move the remaining frontend surfaces onto the same runtime. The React/Catalyst direction explicitly does not include:
 
-- settings/forms primitives
-- dialog schema from Lua
+- Turbo/Stimulus compatibility paths for hub-owned UI
+- server-rendered HTML fragments for live hub surfaces
+- duplicate browser renderers for the same hub-owned surface
+- connection-code cards in plugin/layout surfaces; pairing URLs are requested and shown only by the React `Share` modal
+- request caches implemented in Zustand
 - arbitrary user-authored browser composition
-- carrying Turbo/Stimulus compatibility paths for hub-owned UI
+
+Settings/forms remain Rails-authenticated React/Catalyst surfaces until a shared Lua form contract exists.
+
+## Browser State Ownership
+
+The browser has three state classes:
+
+- Hub-pushed collections and events: normalized into Zustand entity stores from the shared hub connection.
+- Request/response data: loaded through React Query. This includes `/hubs.json`, `/hubs/:id/settings.json`, and target-scoped agent/accessory config discovery.
+- Pure UI state: kept in Zustand or component-local state when it is not remote data.
+
+Rules:
+
+- Components do not call ad hoc `fetch()` for cacheable remote data. Add a query in `app/frontend/lib/queries.js`.
+- Components do not add getter-style request caches to hub sessions. The hub session may expose transport commands; React Query owns request lifecycle, dedupe, stale state, and invalidation.
+- Settings mutations that change agent/accessory config invalidate the matching React Query keys instead of forcing a legacy hub cache refresh.
+- Loading UI must describe unknown/pending state as loading. Empty or "not configured" states render only after the query resolves successfully.
+- Hub UI uses the single shared hub connection acquired through `hub-bridge`; React is not a privileged second client and must use the same wire-format events and collections as other clients.
 
 ## Contract Layers
 

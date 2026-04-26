@@ -1,5 +1,7 @@
 import { create } from 'zustand'
 import { connect, disconnect } from '../lib/hub-bridge'
+import { queryClient } from '../lib/query-client'
+import { fetchHubList, queryKeys } from '../lib/queries'
 import { getActionCableConsumer } from '../lib/transport/hub_signaling_client'
 
 const LAST_HUB_KEY = 'botster:lastHubId'
@@ -21,17 +23,11 @@ export const useHubStore = create((set, get) => ({
   fetchHubList: async () => {
     set({ hubListLoading: true })
     try {
-      const res = await fetch('/hubs.json', {
-        headers: { Accept: 'application/json' },
-        credentials: 'same-origin',
+      const hubs = await queryClient.fetchQuery({
+        queryKey: queryKeys.hubList(),
+        queryFn: fetchHubList,
+        staleTime: 30_000,
       })
-      if (res.status === 401 || res.redirected) {
-        window.location.href = '/github/authorization/new'
-        return []
-      }
-      if (!res.ok) throw new Error(`${res.status}`)
-      const data = await res.json()
-      const hubs = Array.isArray(data) ? data : data.hubs || []
       set({ hubList: hubs, hubListLoading: false })
       return hubs
     } catch {
@@ -148,7 +144,10 @@ export async function subscribeHubListUpdates() {
         { channel: 'HubListChannel' },
         {
           received: (data) => {
-            if (data?.type === 'refresh') void useHubStore.getState().fetchHubList()
+            if (data?.type === 'refresh') {
+              queryClient.invalidateQueries({ queryKey: queryKeys.hubList() })
+              void useHubStore.getState().fetchHubList()
+            }
           },
         }
       )

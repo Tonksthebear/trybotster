@@ -69,6 +69,11 @@ class SpaTest < ApplicationSystemTestCase
     assert_text "Settings"
     assert_text "Share"
     assert_no_text "Pair a new device"
+
+    click_button "Share"
+    assert_text "Share Hub Access", wait: 10
+    assert_text(/Generating connection code|Connection URL/i, wait: 10)
+    assert_no_text "Pair a new device"
   end
 
   # --- Session creation flow ---

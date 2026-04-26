@@ -271,7 +271,6 @@ export type SessionRowPropsV1 = {
 }
 
 export type HubRecoveryStatePropsV1 = Record<string, never>
-export type ConnectionCodePropsV1 = Record<string, never>
 
 export type NewSessionButtonPropsV1 = {
   action: UiActionV1
@@ -317,7 +316,6 @@ export type UiPrimitiveTypeV1 =
   | 'worktree_list'
   | 'session_row'
   | 'hub_recovery_state'
-  | 'connection_code'
   | 'new_session_button'
 
 // ---------- Narrow child-kind guards ----------
