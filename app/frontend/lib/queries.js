@@ -40,6 +40,46 @@ export async function fetchSettingsBootstrap(hubId) {
   return res.json()
 }
 
+function csrfToken() {
+  return document.querySelector('meta[name="csrf-token"]')?.content || ''
+}
+
+export async function updateHubSettings(hubSettingsPath, values) {
+  const response = await fetch(hubSettingsPath, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': csrfToken(),
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ hub: values }),
+    redirect: 'follow',
+  })
+
+  if (!response.ok && !response.redirected) {
+    throw new Error(`Save failed (${response.status})`)
+  }
+
+  return response.redirected ? {} : response.json().catch(() => ({}))
+}
+
+export async function deleteHubSettings(hubSettingsPath) {
+  const response = await fetch(hubSettingsPath, {
+    method: 'DELETE',
+    headers: {
+      'X-CSRF-Token': csrfToken(),
+      Accept: 'application/json',
+    },
+    redirect: 'follow',
+  })
+
+  if (!response.ok && !response.redirected) {
+    throw new Error(`Delete failed (${response.status})`)
+  }
+
+  return true
+}
+
 export function useSettingsBootstrapQuery(hubId) {
   return useQuery({
     queryKey: queryKeys.settingsBootstrap(hubId),
