@@ -37,4 +37,22 @@ class Hubs::SettingsControllerTest < ActionDispatch::IntegrationTest
     templates = json["templates"]
     assert templates.is_a?(Hash), "Expected templates to be a hash"
   end
+
+  test "settings update returns JSON for JSON requests" do
+    patch hub_settings_path(@hub), params: { hub: { name: "Updated Hub" } }, as: :json
+    assert_response :success
+
+    json = JSON.parse(response.body)
+    assert_equal @hub.id, json["id"]
+    assert_equal "Updated Hub", json["name"]
+    assert_equal @hub.identifier, json["identifier"]
+  end
+
+  test "settings destroy returns no content for JSON requests" do
+    assert_difference("Hub.count", -1) do
+      delete hub_settings_path(@hub), as: :json
+    end
+
+    assert_response :no_content
+  end
 end
