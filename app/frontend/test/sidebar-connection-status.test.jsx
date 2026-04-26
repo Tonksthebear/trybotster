@@ -91,9 +91,13 @@ describe('SidebarConnectionStatus', () => {
     // pairing, so cliStatus stays UNKNOWN and the transport hub badge is null.
     // The local `hub` entity reaches `recovery_state.state === "ready"` once
     // the hub finishes startup; the sidebar treats that as "online".
+    //
+    // Entity key is String(Rails.Hub.id) — Rust's botster_id is the stringified
+    // Hub.id returned from register_hub_with_server. selectedHubId in the
+    // fixture is 1, so the entity store key is "1".
     useHubMetaStore.setState({
-      byId: { 'test-hub': { hub_id: 'test-hub', state: 'ready' } },
-      order: ['test-hub'],
+      byId: { '1': { hub_id: '1', state: 'ready' } },
+      order: ['1'],
       snapshotSeq: 1,
     })
 
@@ -105,8 +109,8 @@ describe('SidebarConnectionStatus', () => {
 
   it('keeps hub-status="connecting" when the local hub entity is still starting', () => {
     useHubMetaStore.setState({
-      byId: { 'test-hub': { hub_id: 'test-hub', state: 'starting' } },
-      order: ['test-hub'],
+      byId: { '1': { hub_id: '1', state: 'starting' } },
+      order: ['1'],
       snapshotSeq: 1,
     })
 
@@ -114,6 +118,21 @@ describe('SidebarConnectionStatus', () => {
 
     const toggle = screen.getByTestId('sidebar-connection-status')
     // null hubStatus → component renders 'connecting' on the data attr.
+    expect(toggle.dataset.hubStatus).toBe('connecting')
+  })
+
+  it('does not promote to online when the entity belongs to a different hub', () => {
+    // Regression: an earlier draft mistakenly used hub.identifier (local hash)
+    // as the entity key, which would have matched the wrong hub.
+    useHubMetaStore.setState({
+      byId: { '999': { hub_id: '999', state: 'ready' } },
+      order: ['999'],
+      snapshotSeq: 1,
+    })
+
+    renderStatus()
+
+    const toggle = screen.getByTestId('sidebar-connection-status')
     expect(toggle.dataset.hubStatus).toBe('connecting')
   })
 })

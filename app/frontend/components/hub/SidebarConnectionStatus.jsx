@@ -45,18 +45,19 @@ const HUB_LABEL = {
 
 export default function SidebarConnectionStatus() {
   const selectedHubId = useHubStore((s) => s.selectedHubId)
-  const hubList = useHubStore((s) => s.hubList)
   const hubMetaById = useHubMetaStore((s) => s.byId)
   const [browser, setBrowser] = useState('connecting')
   const [connection, setConnection] = useState('disconnected')
   const [transportHubStatus, setTransportHubStatus] = useState(null)
   const [expanded, setExpanded] = useState(false)
 
-  // The hub entity is keyed by Rust's server_hub_id() — botster_id when
-  // assigned, else the local hub_identifier. The Rails-side `hubs.json` row
-  // exposes that as `identifier`, distinct from the database `id` we route by.
-  const selectedHub = hubList.find((h) => String(h.id) === String(selectedHubId))
-  const entityKey = selectedHub?.identifier
+  // The hub entity is keyed by Rust's server_hub_id() — the botster_id
+  // returned by `register_hub_with_server` (cli/src/hub/registration.rs:84),
+  // which is `String(Rails.Hub.id)`. selectedHubId from useHubStore is the
+  // same Rails Hub.id (coerced to string at hub-store.js:44), so the URL we
+  // route by IS the entity store key — no mapping through hub.identifier
+  // (the local hash) is needed.
+  const entityKey = selectedHubId == null ? null : String(selectedHubId)
   const hubEntity = entityKey ? hubMetaById[entityKey] : null
   const entityReady = hubEntity?.state === 'ready'
 
