@@ -13,4 +13,14 @@ export PORT="${PORT:-3000}"
 export RUBY_DEBUG_OPEN="true"
 export RUBY_DEBUG_LAZY="true"
 
+if [ -f Procfile.local ]; then
+  mkdir -p tmp
+  {
+    cat Procfile.dev
+    printf '\n'
+    cat Procfile.local
+  } > tmp/Procfile.dev.local
+  exec mise exec -- foreman start -f tmp/Procfile.dev.local "$@"
+fi
+
 exec mise exec -- foreman start -f Procfile.dev "$@"
