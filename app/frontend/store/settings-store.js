@@ -6,16 +6,18 @@ import {
   createSettingsFile,
   deleteSettingsFile,
   initializeBotsterConfig,
+  installSettingsTemplate,
   readSettingsFile,
+  reloadSettingsPlugin,
   removeSessionConfig,
   renameSettingsFile,
   setPortForward,
+  uninstallSettingsTemplate,
   writeSettingsFile,
 } from '../lib/settings-commands'
 import {
   defaultSettingsContent,
   invalidateAgentConfigQueries,
-  pluginName,
   scanSettingsTree,
   settingsFsContext,
 } from '../lib/settings-store-helpers'
@@ -558,13 +560,11 @@ export const useSettingsStore = create((set, get) => ({
     if (!hub) return false
 
     try {
-      await hub.installTemplate(dest, content, scope, targetId)
-      const name = pluginName(dest)
+      const name = await installSettingsTemplate({ hub, dest, content, scope, targetId })
       const key = scope === 'repo' ? 'installedRepo' : 'installedDevice'
       const next = new Set(get()[key])
       next.add(name)
       set({ [key]: next })
-      await hub.loadPlugin(name, targetId).catch(() => {})
       return true
     } catch {
       return false
@@ -576,8 +576,7 @@ export const useSettingsStore = create((set, get) => ({
     if (!hub) return false
 
     try {
-      await hub.uninstallTemplate(dest, scope, targetId)
-      const name = pluginName(dest)
+      const name = await uninstallSettingsTemplate({ hub, dest, scope, targetId })
       const key = scope === 'repo' ? 'installedRepo' : 'installedDevice'
       const next = new Set(get()[key])
       next.delete(name)
@@ -591,7 +590,7 @@ export const useSettingsStore = create((set, get) => ({
   async reloadPlugin(name, targetId) {
     const { hub } = get()
     if (!hub) throw new Error('Hub not connected')
-    await hub.reloadPlugin(name, targetId)
+    await reloadSettingsPlugin({ hub, name, targetId })
   },
 
   restartHub() {

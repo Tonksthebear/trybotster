@@ -56,11 +56,11 @@ export async function updateHubSettings(hubSettingsPath, values) {
     redirect: 'follow',
   })
 
-  if (!response.ok && !response.redirected) {
+  if (!response.ok) {
     throw new Error(`Save failed (${response.status})`)
   }
 
-  return response.redirected ? {} : response.json().catch(() => ({}))
+  return response.json().catch(() => ({}))
 }
 
 export async function deleteHubSettings(hubSettingsPath) {
@@ -73,7 +73,7 @@ export async function deleteHubSettings(hubSettingsPath) {
     redirect: 'follow',
   })
 
-  if (!response.ok && !response.redirected) {
+  if (!response.ok) {
     throw new Error(`Delete failed (${response.status})`)
   }
 

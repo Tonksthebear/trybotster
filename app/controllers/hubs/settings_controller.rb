@@ -24,13 +24,25 @@ module Hubs
     end
 
     def update
-      Current.hub.update(hub_params)
-      redirect_to hub_settings_path(Current.hub)
+      if Current.hub.update(hub_params)
+        respond_to do |format|
+          format.html { redirect_to hub_settings_path(Current.hub) }
+          format.json { render json: hub_json(Current.hub) }
+        end
+      else
+        respond_to do |format|
+          format.html { redirect_to hub_settings_path(Current.hub), alert: Current.hub.errors.full_messages.to_sentence }
+          format.json { render json: { errors: Current.hub.errors.full_messages }, status: :unprocessable_entity }
+        end
+      end
     end
 
     def destroy
       Current.hub.destroy!
-      redirect_to hubs_path
+      respond_to do |format|
+        format.html { redirect_to hubs_path }
+        format.json { head :no_content }
+      end
     end
 
     private
@@ -42,6 +54,14 @@ module Hubs
 
     def hub_params
       params.require(:hub).permit(:name)
+    end
+
+    def hub_json(hub)
+      {
+        id: hub.id,
+        name: hub.name,
+        identifier: hub.identifier
+      }
     end
 
     def config_metadata
