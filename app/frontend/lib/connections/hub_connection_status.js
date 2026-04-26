@@ -33,6 +33,33 @@ function hubIsOnline(cliStatus) {
   return hubBadgeStatus(cliStatus) === "online";
 }
 
+/**
+ * Combine the transport-derived hub status with the local hub entity's
+ * recovery_state to produce the dot the sidebar renders.
+ *
+ * Priority (highest to lowest):
+ *   1. transport says "offline"  → "offline"   (paired-then-dropped beats local)
+ *   2. transport says "online"   → "online"
+ *   3. local hub entity is ready → "online"    (unpaired-but-running shows green)
+ *   4. otherwise                 → null        (renders as "connecting")
+ *
+ * Health events from Rails ActionCable only fire after the hub is paired,
+ * so an unpaired-but-locally-running hub would otherwise stay amber forever.
+ * The local `hub` entity (cli/lua/hub/init.lua) ships
+ * `recovery_state.state === "ready"` once the hub finishes startup, which we
+ * treat as proof of liveness independent of the server-side health channel.
+ *
+ * @param {string|null|undefined} transportHubStatus - from hubBadgeStatus().
+ * @param {boolean} entityReady - hubEntity?.state === "ready".
+ * @returns {"online"|"offline"|null}
+ */
+export function resolveHubStatus(transportHubStatus, entityReady) {
+  if (transportHubStatus === "offline") return "offline";
+  if (transportHubStatus === "online") return "online";
+  if (entityReady) return "online";
+  return null;
+}
+
 function browserSocketConnected(socketState) {
   return socketState === "connected";
 }

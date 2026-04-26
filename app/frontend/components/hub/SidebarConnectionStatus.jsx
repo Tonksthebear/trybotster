@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react'
 import { getHub } from '../../lib/hub-bridge'
 import { useHubStore } from '../../store/hub-store'
+import { useHubMetaStore } from '../../store/entities/hub-meta-store'
+import { resolveHubStatus } from '../../lib/connections/hub_connection_status'
 
 const DOT_BG = {
   connected: 'bg-emerald-500',
@@ -43,10 +45,22 @@ const HUB_LABEL = {
 
 export default function SidebarConnectionStatus() {
   const selectedHubId = useHubStore((s) => s.selectedHubId)
+  const hubList = useHubStore((s) => s.hubList)
+  const hubMetaById = useHubMetaStore((s) => s.byId)
   const [browser, setBrowser] = useState('connecting')
   const [connection, setConnection] = useState('disconnected')
-  const [hubStatus, setHubStatus] = useState(null)
+  const [transportHubStatus, setTransportHubStatus] = useState(null)
   const [expanded, setExpanded] = useState(false)
+
+  // The hub entity is keyed by Rust's server_hub_id() — botster_id when
+  // assigned, else the local hub_identifier. The Rails-side `hubs.json` row
+  // exposes that as `identifier`, distinct from the database `id` we route by.
+  const selectedHub = hubList.find((h) => String(h.id) === String(selectedHubId))
+  const entityKey = selectedHub?.identifier
+  const hubEntity = entityKey ? hubMetaById[entityKey] : null
+  const entityReady = hubEntity?.state === 'ready'
+
+  const hubStatus = resolveHubStatus(transportHubStatus, entityReady)
 
   useEffect(() => {
     if (!selectedHubId) return
@@ -76,13 +90,13 @@ export default function SidebarConnectionStatus() {
       const current = hubObj.connectionStatus?.current()
       if (current) {
         setConnection(current.connection || 'disconnected')
-        setHubStatus(current.hub || null)
+        setTransportHubStatus(current.hub || null)
       }
 
       const unsub = hubObj.onConnectionStatusChange?.((status) => {
         if (!status) return
         setConnection(status.connection || 'disconnected')
-        setHubStatus(status.hub || null)
+        setTransportHubStatus(status.hub || null)
       })
       if (unsub) teardowns.push(unsub)
     }
