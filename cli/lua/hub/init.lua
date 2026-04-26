@@ -145,10 +145,20 @@ if EB then
     EB.register("hub", {
         id_field = "hub_id",
         all = function()
-            local hub_id = hub.server_id and hub.server_id() or nil
+            -- Prefer the server-assigned botster_id; fall back to the local
+            -- hub_identifier so fresh / unregistered hubs still ship a stable
+            -- snapshot. Rust's hub_recovery_state event already mirrors this
+            -- choice via Hub::server_hub_id() so the in-flight `recovery.hub_id`
+            -- typically wins the merge below.
+            local hub_id = (hub.server_id and hub.server_id())
+                or (hub.hub_id and hub.hub_id())
+                or nil
             local recovery = state.get("connections.hub_recovery_state", { state = "starting" })
             local payload = { hub_id = hub_id }
             for k, v in pairs(recovery) do payload[k] = v end
+            if type(payload.hub_id) ~= "string" or payload.hub_id == "" then
+                return {}
+            end
             return { payload }
         end,
     })

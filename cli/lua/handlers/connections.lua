@@ -539,10 +539,18 @@ _event_subs[#_event_subs + 1] = events.on("hub_recovery_state", function(info)
     hub_recovery_state.state = hub_recovery_state.state or "starting"
     state.set("connections.hub_recovery_state", hub_recovery_state)
 
-    local hub_id = hub.server_id and hub.server_id() or nil
-    if not hub_id then return end
-    local payload = { hub_id = hub_id }
+    -- Rust populates `hub_id` in the event payload via Hub::server_hub_id()
+    -- (cli/src/hub/mod.rs:935), which falls back to the local `hub_identifier`
+    -- when no botster_id has been assigned yet. The merge above carries that
+    -- through to `hub_recovery_state.hub_id`, so EB.upsert always has a stable
+    -- id. Fall back to hub.hub_id() defensively if the field is missing.
+    local payload = {}
     for k, v in pairs(hub_recovery_state) do payload[k] = v end
+    if type(payload.hub_id) ~= "string" or payload.hub_id == "" then
+        payload.hub_id = (hub.server_id and hub.server_id())
+            or (hub.hub_id and hub.hub_id())
+            or nil
+    end
     EB.upsert("hub", payload)
 end)
 
