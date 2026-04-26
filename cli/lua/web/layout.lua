@@ -27,19 +27,30 @@ function M.workspace_surface(state)
     local density = density_for(state)
     local is_sidebar = density == "sidebar"
 
+    -- The pairing card lives at the top of the panel surface so users can
+    -- scan a QR or copy the URL to add a second device (phone, laptop)
+    -- without dropping back to the CLI or hunting for the Share button.
+    -- Sidebar density skips the card — the panel already shows it, and the
+    -- sidebar is too cramped for an ASCII QR. The composite reads from the
+    -- `connection_code` entity store; the hub eager-generates the bundle on
+    -- startup so the card is populated by the time a browser subscribes.
+    local children = {}
+    if not is_sidebar then
+        children[#children + 1] = ui.connection_code{}
+    end
+    children[#children + 1] = ui.session_list{
+        density = density,
+        grouping = "workspace",
+        show_nav_entries = is_sidebar,
+    }
+    children[#children + 1] = ui.new_session_button{
+        action = ui.action("botster.session.create.request"),
+    }
+
     return ui.stack{
         direction = "vertical",
         gap = is_sidebar and "0" or "2",
-        children = {
-            ui.session_list{
-                density = density,
-                grouping = "workspace",
-                show_nav_entries = is_sidebar,
-            },
-            ui.new_session_button{
-                action = ui.action("botster.session.create.request"),
-            },
-        },
+        children = children,
     }
 end
 
