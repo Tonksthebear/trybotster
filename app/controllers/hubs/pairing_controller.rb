@@ -1,8 +1,14 @@
 # frozen_string_literal: true
 
 module Hubs
+  # Pairing is a public route — the URL fragment carries the cryptographic
+  # bundle, which is the credential. Requiring authenticate_user! before
+  # rendering forced an OAuth bounce that stripped the fragment in the
+  # redirect (browsers don't send fragments to the server, and Devise's
+  # stored_location_for path doesn't preserve them across the GitHub
+  # round-trip). The SPA validates the bundle client-side and only then
+  # establishes session state.
   class PairingController < ApplicationController
-    before_action :authenticate_user!
     before_action :set_hub
 
     def show
@@ -12,8 +18,7 @@ module Hubs
     private
 
     def set_hub
-      Current.hub = current_user.hubs.find_by(id: params[:hub_id])
-      redirect_to hubs_path, alert: "Hub not found" unless Current.hub
+      Current.hub = Hub.find_by(id: params[:hub_id])
     end
   end
 end
