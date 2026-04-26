@@ -1,6 +1,18 @@
 import { create } from 'zustand'
 import { waitForHub } from '../lib/hub-bridge'
 import {
+  applyQuickSetup,
+  createSessionConfig,
+  createSettingsFile,
+  deleteSettingsFile,
+  initializeBotsterConfig,
+  readSettingsFile,
+  removeSessionConfig,
+  renameSettingsFile,
+  setPortForward,
+  writeSettingsFile,
+} from '../lib/settings-commands'
+import {
   defaultSettingsContent,
   invalidateAgentConfigQueries,
   pluginName,
@@ -214,17 +226,18 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId } = get()
     if (!filePath || !hub) return
 
-    const { fs, tid } = settingsFsContext(configScope, selectedTargetId)
-
     set({ currentFilePath: filePath })
 
     try {
-      const stat = await hub.statFile(filePath, fs, tid)
-      if (!get().hub) return
-      if (stat.exists) {
+      const result = await readSettingsFile({
+        hub,
+        configScope,
+        selectedTargetId,
+        filePath,
+      })
+      if (get().hub !== hub) return
+      if (result.exists) {
         set({ editorState: 'loading' })
-        const result = await hub.readFile(filePath, fs, tid)
-        if (!get().hub) return
         set({
           originalContent: result.content,
           editorContent: result.content,
@@ -252,10 +265,14 @@ export const useSettingsStore = create((set, get) => ({
       get()
     if (!currentFilePath || !hub) return false
 
-    const { fs, tid } = settingsFsContext(configScope, selectedTargetId)
-
     try {
-      await hub.writeFile(currentFilePath, editorContent, fs, tid)
+      await writeSettingsFile({
+        hub,
+        configScope,
+        selectedTargetId,
+        filePath: currentFilePath,
+        content: editorContent,
+      })
       set({ originalContent: editorContent })
       get().scanTree()
       return true
@@ -277,13 +294,15 @@ export const useSettingsStore = create((set, get) => ({
       get()
     if (!currentFilePath || !hub) return false
 
-    const { fs, tid } = settingsFsContext(configScope, selectedTargetId)
-    const content = editorContent || get()._defaultContent(currentFilePath)
-
     try {
-      const parentDir = currentFilePath.replace(/\/[^/]+$/, '')
-      await hub.mkDir(parentDir, fs, tid).catch(() => {})
-      await hub.writeFile(currentFilePath, content, fs, tid)
+      const content = await createSettingsFile({
+        hub,
+        configMetadata: get()._configMetadata,
+        configScope,
+        selectedTargetId,
+        filePath: currentFilePath,
+        content: editorContent,
+      })
       set({ originalContent: content, editorState: 'editing' })
       get().scanTree()
       return true
@@ -297,10 +316,13 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, currentFilePath, configScope, selectedTargetId } = get()
     if (!currentFilePath || !hub) return false
 
-    const { fs, tid } = settingsFsContext(configScope, selectedTargetId)
-
     try {
-      await hub.deleteFile(currentFilePath, fs, tid)
+      await deleteSettingsFile({
+        hub,
+        configScope,
+        selectedTargetId,
+        filePath: currentFilePath,
+      })
       set({
         originalContent: null,
         editorContent: get()._defaultContent(currentFilePath),
@@ -318,10 +340,14 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, currentFilePath, configScope, selectedTargetId } = get()
     if (!currentFilePath || !hub || newPath === currentFilePath) return false
 
-    const { fs, tid } = settingsFsContext(configScope, selectedTargetId)
-
     try {
-      await hub.renameFile(currentFilePath, newPath, fs, tid)
+      await renameSettingsFile({
+        hub,
+        configScope,
+        selectedTargetId,
+        filePath: currentFilePath,
+        newPath,
+      })
       set({ currentFilePath: newPath })
       get().scanTree()
       return true
@@ -335,16 +361,8 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId } = get()
     if (!filePath || !hub) return
 
-    const { fs, tid } = settingsFsContext(configScope, selectedTargetId)
-
     try {
-      if (enabled) {
-        const parentDir = filePath.replace(/\/[^/]+$/, '')
-        await hub.mkDir(parentDir, fs, tid).catch(() => {})
-        await hub.writeFile(filePath, '', fs, tid)
-      } else {
-        await hub.deleteFile(filePath, fs, tid)
-      }
+      await setPortForward({ hub, configScope, selectedTargetId, filePath, enabled })
       get().scanTree()
     } catch {
       // Will resync on next scan
@@ -357,19 +375,15 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId } = get()
     if (!hub) return false
 
-    const { fs, tid, prefix } = settingsFsContext(configScope, selectedTargetId)
-
     try {
-      await hub.mkDir(`${prefix}agents/${name}`, fs, tid)
-      const defaultInit =
-        get()._configMetadata?.session_files?.initialization?.default ||
-        '#!/bin/bash\n'
-      await hub.writeFile(
-        `${prefix}agents/${name}/initialization`,
-        defaultInit,
-        fs,
-        tid
-      )
+      await createSessionConfig({
+        hub,
+        configMetadata: get()._configMetadata,
+        configScope,
+        selectedTargetId,
+        type: 'agents',
+        name,
+      })
       get().scanTree()
       return true
     } catch (error) {
@@ -385,10 +399,14 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId, currentFilePath } = get()
     if (!agentName || !hub) return false
 
-    const { fs, tid, prefix } = settingsFsContext(configScope, selectedTargetId)
-
     try {
-      await hub.rmDir(`${prefix}agents/${agentName}`, fs, tid)
+      await removeSessionConfig({
+        hub,
+        configScope,
+        selectedTargetId,
+        type: 'agents',
+        name: agentName,
+      })
       if (currentFilePath?.includes(`/agents/${agentName}/`)) {
         set({
           currentFilePath: null,
@@ -412,19 +430,15 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId } = get()
     if (!hub) return false
 
-    const { fs, tid, prefix } = settingsFsContext(configScope, selectedTargetId)
-
     try {
-      await hub.mkDir(`${prefix}accessories/${name}`, fs, tid)
-      const defaultInit =
-        get()._configMetadata?.session_files?.initialization?.default ||
-        '#!/bin/bash\n'
-      await hub.writeFile(
-        `${prefix}accessories/${name}/initialization`,
-        defaultInit,
-        fs,
-        tid
-      )
+      await createSessionConfig({
+        hub,
+        configMetadata: get()._configMetadata,
+        configScope,
+        selectedTargetId,
+        type: 'accessories',
+        name,
+      })
       get().scanTree()
       return true
     } catch (error) {
@@ -440,10 +454,14 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId, currentFilePath } = get()
     if (!accessoryName || !hub) return false
 
-    const { fs, tid, prefix } = settingsFsContext(configScope, selectedTargetId)
-
     try {
-      await hub.rmDir(`${prefix}accessories/${accessoryName}`, fs, tid)
+      await removeSessionConfig({
+        hub,
+        configScope,
+        selectedTargetId,
+        type: 'accessories',
+        name: accessoryName,
+      })
       if (currentFilePath?.includes(`/accessories/${accessoryName}/`)) {
         set({
           currentFilePath: null,
@@ -470,14 +488,7 @@ export const useSettingsStore = create((set, get) => ({
     if (!dest || !content || !hub) return false
 
     try {
-      const parentDir = dest.replace(/\/[^/]+$/, '')
-      if (configScope === 'device') {
-        await hub.mkDir(parentDir, 'device')
-        await hub.writeFile(dest, content, 'device')
-      } else {
-        await hub.mkDir(`.botster/${parentDir}`, 'repo', selectedTargetId)
-        await hub.writeFile(`.botster/${dest}`, content, 'repo', selectedTargetId)
-      }
+      await applyQuickSetup({ hub, configScope, selectedTargetId, dest, content })
       get().scanTree()
       return true
     } catch (error) {
@@ -494,21 +505,12 @@ export const useSettingsStore = create((set, get) => ({
     if (!hub) return
 
     try {
-      const defaultInit =
-        get()._configMetadata?.session_files?.initialization?.default ||
-        '#!/bin/bash\n'
-      if (configScope === 'device') {
-        await hub.mkDir('agents/claude', 'device')
-        await hub.writeFile('agents/claude/initialization', defaultInit, 'device')
-      } else {
-        await hub.mkDir('.botster/agents/claude', 'repo', selectedTargetId)
-        await hub.writeFile(
-          '.botster/agents/claude/initialization',
-          defaultInit,
-          'repo',
-          selectedTargetId
-        )
-      }
+      await initializeBotsterConfig({
+        hub,
+        configMetadata: get()._configMetadata,
+        configScope,
+        selectedTargetId,
+      })
       get().scanTree()
     } catch (error) {
       set({
