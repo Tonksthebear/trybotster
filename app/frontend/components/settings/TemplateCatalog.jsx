@@ -2,9 +2,9 @@ import React, { useState } from 'react'
 import clsx from 'clsx'
 import {
   useSettingsStore,
-  pluginName,
   getInstallScope,
 } from '../../store/settings-store'
+import { pluginName } from '../../lib/settings-store-helpers'
 import { Button } from '../catalyst/button'
 import { Badge } from '../catalyst/badge'
 import { Select } from '../catalyst/select'

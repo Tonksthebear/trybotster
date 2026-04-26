@@ -1,6 +1,12 @@
 import React, { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useSettingsStore } from '../../store/settings-store'
+import {
+  deleteHubSettings,
+  queryKeys,
+  updateHubSettings,
+} from '../../lib/queries'
 import { Button } from '../catalyst/button'
 import {
   Dialog,
@@ -17,41 +23,22 @@ import PushNotificationsCard from './PushNotificationsCard'
 
 // ─── Hub Identity Form ─────────────────────────────────────────────
 
-function HubIdentityForm({ hubName, hubIdentifier, hubSettingsPath, hubPath }) {
+function HubIdentityForm({ hubId, hubName, hubIdentifier, hubSettingsPath, hubPath }) {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const [name, setName] = useState(hubName || '')
-  const [saving, setSaving] = useState(false)
-  const [error, setError] = useState(null)
+  const updateMutation = useMutation({
+    mutationFn: () => updateHubSettings(hubSettingsPath, { name }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.hubList() })
+      queryClient.invalidateQueries({ queryKey: queryKeys.settingsBootstrap(hubId) })
+      navigate(hubPath)
+    },
+  })
 
   async function handleSubmit(e) {
     e.preventDefault()
-    setSaving(true)
-    setError(null)
-
-    try {
-      const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content
-      const response = await fetch(hubSettingsPath, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-CSRF-Token': csrfToken,
-          Accept: 'text/html',
-        },
-        body: JSON.stringify({ hub: { name } }),
-        redirect: 'follow',
-      })
-
-      if (response.ok || response.redirected) {
-        // Navigate back to hub to see updated name
-        navigate(hubPath)
-      } else {
-        setError(`Save failed (${response.status})`)
-        setSaving(false)
-      }
-    } catch (err) {
-      setError(`Save failed: ${err.message}`)
-      setSaving(false)
-    }
+    updateMutation.mutate()
   }
 
   return (
@@ -72,16 +59,18 @@ function HubIdentityForm({ hubName, hubIdentifier, hubSettingsPath, hubPath }) {
             Identifier: <span className="font-mono">{hubIdentifier}</span>
           </Description>
         </Field>
-        {error && (
-          <p className="text-sm text-red-400">{error}</p>
+        {updateMutation.isError && (
+          <p className="text-sm text-red-400">
+            {updateMutation.error?.message || 'Save failed'}
+          </p>
         )}
         <div className="flex justify-end">
           <Button
             type="submit"
             color="emerald"
-            disabled={saving}
+            disabled={updateMutation.isPending}
           >
-            {saving ? 'Saving...' : 'Save'}
+            {updateMutation.isPending ? 'Saving...' : 'Save'}
           </Button>
         </div>
       </form>
@@ -146,31 +135,24 @@ function HubControls() {
 
 // ─── Danger Zone ───────────────────────────────────────────────────
 
-function DangerZone({ hubSettingsPath, hubName }) {
+function DangerZone({ hubId, hubSettingsPath, hubName }) {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const [confirmOpen, setConfirmOpen] = useState(false)
-  const [deleting, setDeleting] = useState(false)
+  const deleteMutation = useMutation({
+    mutationFn: () => deleteHubSettings(hubSettingsPath),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.hubList() })
+      queryClient.removeQueries({ queryKey: queryKeys.settingsBootstrap(hubId) })
+      navigate('/hubs')
+    },
+    onError: () => {
+      setConfirmOpen(false)
+    },
+  })
 
   async function handleDelete() {
-    setDeleting(true)
-    try {
-      const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content
-      const response = await fetch(hubSettingsPath, {
-        method: 'DELETE',
-        headers: {
-          'X-CSRF-Token': csrfToken,
-          Accept: 'text/html',
-        },
-        redirect: 'follow',
-      })
-
-      if (response.ok || response.redirected) {
-        navigate('/hubs')
-      }
-    } catch {
-      setDeleting(false)
-      setConfirmOpen(false)
-    }
+    deleteMutation.mutate()
   }
 
   return (
@@ -213,8 +195,8 @@ function DangerZone({ hubSettingsPath, hubName }) {
           <Button plain onClick={() => setConfirmOpen(false)}>
             Cancel
           </Button>
-          <Button color="red" disabled={deleting} onClick={handleDelete}>
-            {deleting ? 'Deleting...' : 'Delete'}
+          <Button color="red" disabled={deleteMutation.isPending} onClick={handleDelete}>
+            {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
           </Button>
         </DialogActions>
       </Dialog>
@@ -234,6 +216,7 @@ export default function HubInfoPanel({
   return (
     <div className="max-w-3xl mx-auto px-4 py-6 lg:py-8 space-y-6">
       <HubIdentityForm
+        hubId={hubId}
         hubName={hubName}
         hubIdentifier={hubIdentifier}
         hubSettingsPath={hubSettingsPath}
@@ -242,7 +225,7 @@ export default function HubInfoPanel({
       <SpawnTargetsPanel hubId={hubId} />
       <PushNotificationsCard hubId={hubId} />
       <HubControls />
-      <DangerZone hubSettingsPath={hubSettingsPath} hubName={hubName} />
+      <DangerZone hubId={hubId} hubSettingsPath={hubSettingsPath} hubName={hubName} />
     </div>
   )
 }

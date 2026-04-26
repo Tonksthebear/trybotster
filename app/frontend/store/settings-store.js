@@ -1,7 +1,12 @@
 import { create } from 'zustand'
 import { waitForHub } from '../lib/hub-bridge'
-import { queryClient } from '../lib/query-client'
-import { queryKeys } from '../lib/queries'
+import {
+  defaultSettingsContent,
+  invalidateAgentConfigQueries,
+  pluginName,
+  scanSettingsTree,
+  settingsFsContext,
+} from '../lib/settings-store-helpers'
 import { useSpawnTargetStore } from './entities'
 import { orderedEntities } from '../lib/entity-selectors'
 
@@ -155,8 +160,7 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId, spawnTargets } = get()
     if (!hub) return
     const scope = configScope
-    const fs = scope === 'device' ? 'device' : 'repo'
-    const tid = scope === 'repo' ? selectedTargetId : undefined
+    const { tid } = settingsFsContext(scope, selectedTargetId)
     const token = get()._scanTreeToken + 1
     set({ _scanTreeToken: token })
     const isCurrentScan = () =>
@@ -183,114 +187,18 @@ export const useSettingsStore = create((set, get) => ({
     }
 
     try {
-      const tree = { agents: {}, accessories: {}, workspaces: {}, plugins: {} }
-      const prefix = scope === 'device' ? '' : '.botster/'
-
-      // Check config root exists
-      if (scope === 'device') {
-        const [a, c, p, w] = await Promise.all([
-          hub.statFile('agents', fs, tid).catch(() => ({ exists: false })),
-          hub.statFile('accessories', fs, tid).catch(() => ({ exists: false })),
-          hub.statFile('plugins', fs, tid).catch(() => ({ exists: false })),
-          hub.statFile('workspaces', fs, tid).catch(() => ({ exists: false })),
-        ])
-        if (!a.exists && !c.exists && !p.exists && !w.exists) {
-          if (!isCurrentScan()) return
-          set({ treeState: 'empty' })
-          get()._invalidateAgentConfigQueries()
-          return
-        }
-      } else {
-        const stat = await hub
-          .statFile('.botster', fs, tid)
-          .catch(() => ({ exists: false }))
-        if (!stat.exists) {
-          if (!isCurrentScan()) return
-          set({ treeState: 'empty' })
-          get()._invalidateAgentConfigQueries()
-          return
-        }
+      const result = await scanSettingsTree({ hub, configScope: scope, selectedTargetId })
+      if (!isCurrentScan()) return
+      if (result.state === 'empty') {
+        set({ treeState: 'empty' })
+        get()._invalidateAgentConfigQueries()
+        return
       }
 
-      // Scan all sections in parallel
-      const listDirs = async (path) => {
-        try {
-          const result = await hub.listDir(path, fs, tid)
-          return (result.entries || [])
-            .filter((e) => e.type === 'dir')
-            .map((e) => e.name)
-            .sort()
-        } catch {
-          return []
-        }
-      }
-
-      const listFiles = async (path, ext) => {
-        try {
-          const result = await hub.listDir(path, fs, tid)
-          return (result.entries || [])
-            .filter((e) => e.type === 'file' && (!ext || e.name.endsWith(ext)))
-            .map((e) => e.name)
-            .sort()
-        } catch {
-          return []
-        }
-      }
-
-      const [agentNames, accessoryNames, workspaceEntries, pluginNames] =
-        await Promise.all([
-          listDirs(`${prefix}agents`),
-          listDirs(`${prefix}accessories`),
-          listFiles(`${prefix}workspaces`, '.json'),
-          listDirs(`${prefix}plugins`),
-        ])
-
-      // Scan agents
-      await Promise.all(
-        agentNames.map(async (name) => {
-          const initStat = await hub
-            .statFile(`${prefix}agents/${name}/initialization`, fs, tid)
-            .catch(() => ({ exists: false }))
-          tree.agents[name] = { initialization: initStat.exists }
-        })
-      )
-
-      // Scan accessories
-      await Promise.all(
-        accessoryNames.map(async (name) => {
-          const path = `${prefix}accessories/${name}`
-          const [initStat, pfStat] = await Promise.all([
-            hub.statFile(`${path}/initialization`, fs, tid).catch(() => ({ exists: false })),
-            hub.statFile(`${path}/port_forward`, fs, tid).catch(() => ({ exists: false })),
-          ])
-          tree.accessories[name] = {
-            initialization: initStat.exists,
-            port_forward: pfStat.exists,
-          }
-        })
-      )
-
-      // Scan workspaces
-      for (const fileName of workspaceEntries) {
-        tree.workspaces[fileName.replace(/\.json$/, '')] = {
-          file: `${prefix}workspaces/${fileName}`,
-        }
-      }
-
-      // Scan plugins (only include those with init.lua)
-      await Promise.all(
-        pluginNames.map(async (name) => {
-          const initStat = await hub
-            .statFile(`${prefix}plugins/${name}/init.lua`, fs, tid)
-            .catch(() => ({ exists: false }))
-          if (initStat.exists) tree.plugins[name] = { init: true }
-        })
-      )
-
+      const tree = result.tree
       const update = { tree, treeState: 'tree' }
       if (scope === 'device') update.deviceTree = tree
       else update.repoTree = tree
-      if (!isCurrentScan()) return
       set(update)
       get()._invalidateAgentConfigQueries()
     } catch (error) {
@@ -306,8 +214,7 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId } = get()
     if (!filePath || !hub) return
 
-    const fs = configScope === 'device' ? 'device' : 'repo'
-    const tid = configScope === 'repo' ? selectedTargetId : undefined
+    const { fs, tid } = settingsFsContext(configScope, selectedTargetId)
 
     set({ currentFilePath: filePath })
 
@@ -345,8 +252,7 @@ export const useSettingsStore = create((set, get) => ({
       get()
     if (!currentFilePath || !hub) return false
 
-    const fs = configScope === 'device' ? 'device' : 'repo'
-    const tid = configScope === 'repo' ? selectedTargetId : undefined
+    const { fs, tid } = settingsFsContext(configScope, selectedTargetId)
 
     try {
       await hub.writeFile(currentFilePath, editorContent, fs, tid)
@@ -371,8 +277,7 @@ export const useSettingsStore = create((set, get) => ({
       get()
     if (!currentFilePath || !hub) return false
 
-    const fs = configScope === 'device' ? 'device' : 'repo'
-    const tid = configScope === 'repo' ? selectedTargetId : undefined
+    const { fs, tid } = settingsFsContext(configScope, selectedTargetId)
     const content = editorContent || get()._defaultContent(currentFilePath)
 
     try {
@@ -392,8 +297,7 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, currentFilePath, configScope, selectedTargetId } = get()
     if (!currentFilePath || !hub) return false
 
-    const fs = configScope === 'device' ? 'device' : 'repo'
-    const tid = configScope === 'repo' ? selectedTargetId : undefined
+    const { fs, tid } = settingsFsContext(configScope, selectedTargetId)
 
     try {
       await hub.deleteFile(currentFilePath, fs, tid)
@@ -414,8 +318,7 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, currentFilePath, configScope, selectedTargetId } = get()
     if (!currentFilePath || !hub || newPath === currentFilePath) return false
 
-    const fs = configScope === 'device' ? 'device' : 'repo'
-    const tid = configScope === 'repo' ? selectedTargetId : undefined
+    const { fs, tid } = settingsFsContext(configScope, selectedTargetId)
 
     try {
       await hub.renameFile(currentFilePath, newPath, fs, tid)
@@ -432,8 +335,7 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId } = get()
     if (!filePath || !hub) return
 
-    const fs = configScope === 'device' ? 'device' : 'repo'
-    const tid = configScope === 'repo' ? selectedTargetId : undefined
+    const { fs, tid } = settingsFsContext(configScope, selectedTargetId)
 
     try {
       if (enabled) {
@@ -455,9 +357,7 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId } = get()
     if (!hub) return false
 
-    const fs = configScope === 'device' ? 'device' : 'repo'
-    const tid = configScope === 'repo' ? selectedTargetId : undefined
-    const prefix = configScope === 'device' ? '' : '.botster/'
+    const { fs, tid, prefix } = settingsFsContext(configScope, selectedTargetId)
 
     try {
       await hub.mkDir(`${prefix}agents/${name}`, fs, tid)
@@ -485,9 +385,7 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId, currentFilePath } = get()
     if (!agentName || !hub) return false
 
-    const fs = configScope === 'device' ? 'device' : 'repo'
-    const tid = configScope === 'repo' ? selectedTargetId : undefined
-    const prefix = configScope === 'device' ? '' : '.botster/'
+    const { fs, tid, prefix } = settingsFsContext(configScope, selectedTargetId)
 
     try {
       await hub.rmDir(`${prefix}agents/${agentName}`, fs, tid)
@@ -514,9 +412,7 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId } = get()
     if (!hub) return false
 
-    const fs = configScope === 'device' ? 'device' : 'repo'
-    const tid = configScope === 'repo' ? selectedTargetId : undefined
-    const prefix = configScope === 'device' ? '' : '.botster/'
+    const { fs, tid, prefix } = settingsFsContext(configScope, selectedTargetId)
 
     try {
       await hub.mkDir(`${prefix}accessories/${name}`, fs, tid)
@@ -544,9 +440,7 @@ export const useSettingsStore = create((set, get) => ({
     const { hub, configScope, selectedTargetId, currentFilePath } = get()
     if (!accessoryName || !hub) return false
 
-    const fs = configScope === 'device' ? 'device' : 'repo'
-    const tid = configScope === 'repo' ? selectedTargetId : undefined
-    const prefix = configScope === 'device' ? '' : '.botster/'
+    const { fs, tid, prefix } = settingsFsContext(configScope, selectedTargetId)
 
     try {
       await hub.rmDir(`${prefix}accessories/${accessoryName}`, fs, tid)
@@ -707,40 +601,21 @@ export const useSettingsStore = create((set, get) => ({
   // --- Internal helpers ---
 
   _defaultContent(filePath) {
-    const meta = get()._configMetadata || {}
-    if (filePath.endsWith('/initialization')) {
-      return meta.session_files?.initialization?.default || '#!/bin/bash\n'
-    }
-    if (filePath.endsWith('.json')) {
-      return '{\n  "agents": [],\n  "accessories": []\n}\n'
-    }
-    return ''
+    return defaultSettingsContent(filePath, get()._configMetadata || {})
   },
 
   _invalidateAgentConfigQueries() {
     const { configScope, hub, spawnTargets, selectedTargetId } = get()
-    const hubId = hub?.hubId
-    if (!hubId) return
-
-    const targetIds =
-      configScope === 'repo'
-        ? [selectedTargetId]
-        : spawnTargets.map((t) => t?.id)
-
-    targetIds.filter(Boolean).forEach((tid) => {
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.agentConfig(hubId, tid),
-      })
+    invalidateAgentConfigQueries({
+      configScope,
+      hubId: hub?.hubId,
+      spawnTargets,
+      selectedTargetId,
     })
   },
 }))
 
 // --- Selectors ---
-
-export function pluginName(dest) {
-  const match = dest?.match(/plugins\/([^/]+)\//)
-  return match ? match[1] : dest
-}
 
 export function isDirty(state) {
   return (
