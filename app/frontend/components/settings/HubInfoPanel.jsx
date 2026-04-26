@@ -13,6 +13,7 @@ import { Input } from '../catalyst/input'
 import { Field, Label, Description } from '../catalyst/fieldset'
 import { Text } from '../catalyst/text'
 import SpawnTargetBrowser from '../forms/SpawnTargetBrowser'
+import PushNotificationsCard from './PushNotificationsCard'
 
 // ─── Hub Identity Form ─────────────────────────────────────────────
 
@@ -239,6 +240,7 @@ export default function HubInfoPanel({
         hubPath={hubPath}
       />
       <SpawnTargetsPanel hubId={hubId} />
+      <PushNotificationsCard hubId={hubId} />
       <HubControls />
       <DangerZone hubSettingsPath={hubSettingsPath} hubName={hubName} />
     </div>
