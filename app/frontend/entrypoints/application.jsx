@@ -6,14 +6,25 @@ import AppShell from '../components/AppShell'
 // rename/move/delete CustomEvents dispatched by the action system.
 import '../lib/modal-bridge'
 
-// Dev-only: unregister stale service workers from earlier frontend setups.
-// The current app registers no SW, so any active registration is orphaned
-// and can intercept fetches in confusing ways. Cheap to run; runs once
-// per page load and is a no-op if nothing is registered.
-if (import.meta.env.DEV && 'serviceWorker' in navigator) {
-  navigator.serviceWorker.getRegistrations().then((regs) => {
-    regs.forEach((reg) => reg.unregister())
-  }).catch(() => {})
+// Service worker — production only. Registers `/service-worker` (served by
+// Rails PWA middleware, see app/views/pwa/service-worker.js) so the
+// PushNotificationsCard flow can subscribe via PushManager and receive web
+// push events even when the tab is closed.
+//
+// Dev mode unregisters instead. Vite HMR + an active service worker
+// intercepting fetches is a known footgun; the SW caches stale module
+// graphs and HMR updates stop arriving. Push notifications can be tested
+// in production builds.
+if ('serviceWorker' in navigator) {
+  if (import.meta.env.DEV) {
+    navigator.serviceWorker.getRegistrations().then((regs) => {
+      regs.forEach((reg) => reg.unregister())
+    }).catch(() => {})
+  } else {
+    navigator.serviceWorker.register('/service-worker', { scope: '/' }).catch((e) => {
+      console.warn('[boot] service worker registration failed:', e)
+    })
+  }
 }
 
 const container = document.getElementById('app')
