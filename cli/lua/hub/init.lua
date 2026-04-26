@@ -139,7 +139,35 @@ if EB then
         id_field = "worktree_path",
         all = function()
             local worktrees = hub.get_worktrees()
-            return worktrees or {}
+            local targets = {}
+            local registry = rawget(_G, "spawn_targets")
+            if registry and type(registry.list) == "function" then
+                local ok, listed = pcall(registry.list)
+                if ok and type(listed) == "table" then targets = listed end
+            end
+            local out = {}
+            for _, worktree_entry in ipairs(worktrees or {}) do
+                if type(worktree_entry) == "table" then
+                    local payload = {}
+                    for k, v in pairs(worktree_entry) do payload[k] = v end
+                    payload.worktree_path = payload.worktree_path or payload.path
+                    for _, target in ipairs(targets) do
+                        local target_path = type(target) == "table" and target.path or nil
+                        if type(target_path) == "string"
+                            and type(payload.worktree_path) == "string"
+                            and (
+                                payload.worktree_path == target_path
+                                or payload.worktree_path:sub(1, #target_path + 1) == (target_path .. "/")
+                            )
+                        then
+                            payload.target_id = target.target_id or target.id
+                            break
+                        end
+                    end
+                    out[#out + 1] = payload
+                end
+            end
+            return out
         end,
     })
     EB.register("hub", {

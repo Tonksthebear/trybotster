@@ -5,9 +5,8 @@
 // and NOT in the entity stores. The hub never reads this store; it survives
 // hub reconnects but resets on browser reload.
 //
-// When the legacy `workspace-store.js` retires (commit 8), every selector
-// it exposed (`displayName`, `selectSessionRowProps`, …) re-points at the
-// new entity stores plus this presentation store.
+// Row/display selectors compose the wire entity stores with this
+// presentation store so local browser state stays out of hub snapshots.
 
 import { create } from 'zustand'
 

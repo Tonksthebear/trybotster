@@ -9,7 +9,6 @@ import { useHubStore } from '../store/hub-store'
 vi.mock('../lib/hub-bridge', () => ({
   connect: vi.fn(() => Promise.resolve({ connectionId: 1 })),
   disconnect: vi.fn(),
-  getHub: vi.fn(() => null),
 }))
 
 function renderSwitcher(storeOverrides = {}) {

@@ -10,7 +10,7 @@ import {
 } from '../../store/route-registry-store'
 
 /**
- * Phase 4a/4b: dynamic hub-authored surface route.
+ * Dynamic hub-authored surface route.
  *
  * Matches `useParams()`'s splat (`*`) against the hub's
  * `ui_route_registry` entries using `matchSurfaceForPath`. The match is
@@ -23,10 +23,8 @@ import {
  *   * `/hubs/:hubId/kanban`            → subpath "/"            → home
  *   * `/hubs/:hubId/kanban/board/42`   → subpath "/board/42"    → board(id=42)
  *
- * Phase 4a's exact-match form (`path === requestedPath`) is superseded by
- * the prefix form, which now covers both the root-of-surface case and any
- * nested sub-path. `base_path` always falls back to `path` for backwards
- * compat with older hubs.
+ * Prefix matching covers both the root-of-surface case and any nested
+ * sub-path. `base_path` is derived from `path` if the frame omits it.
  *
  * Three resolution states for the current URL:
  *   1. Registry hasn't shipped its first snapshot yet for this hub
@@ -50,8 +48,8 @@ export default function DynamicSurfaceRoute() {
   // `TerminalCache` branch, NOT by a registered surface. React Router
   // matches specific routes before the wildcard in Router v6, so this
   // check only fires on rare misroutes (e.g. a session-like URL that
-  // isn't actually a real session). Defer to the legacy fallback by
-  // rendering nothing; AppShell's own detection takes over.
+  // isn't actually a real session). Render nothing; AppShell's own
+  // detection takes over.
   if (typeof splat === 'string' && splat.startsWith('sessions/')) {
     return null
   }
@@ -75,10 +73,8 @@ export default function DynamicSurfaceRoute() {
   const match = matchSurfaceForPath(routes, requestedPath)
 
   if (!match) {
-    // Unknown path — render a minimal local 404. Phase 4a intentionally
-    // skips hub-authored 404 surfaces (the orchestrator flagged that as
-    // optional); a plugin can still register one at path "/404" if it
-    // wants consistent chrome.
+    // Unknown path — render a minimal local 404. A plugin can still
+    // register one at path "/404" if it wants consistent chrome.
     return (
       <div className="h-full flex items-center justify-center p-4">
         <div className="max-w-md text-center">

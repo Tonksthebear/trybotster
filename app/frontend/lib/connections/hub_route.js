@@ -386,6 +386,30 @@ export class HubRoute {
         }
         this.#ensureConnected().catch(() => {});
       }),
+      bridge.on("push:status", (event) => {
+        if (event.hubId !== hubId) return;
+        this.emit("push:status", event);
+      }),
+      bridge.on("push:vapid_key", (event) => {
+        if (event.hubId !== hubId) return;
+        this.emit("push:vapid_key", event);
+      }),
+      bridge.on("push:sub_ack", (event) => {
+        if (event.hubId !== hubId) return;
+        this.emit("push:sub_ack", event);
+      }),
+      bridge.on("push:vapid_keys", (event) => {
+        if (event.hubId !== hubId) return;
+        this.emit("push:vapid_keys", event);
+      }),
+      bridge.on("push:test_ack", (event) => {
+        if (event.hubId !== hubId) return;
+        this.emit("push:test_ack", event);
+      }),
+      bridge.on("push:disable_ack", (event) => {
+        if (event.hubId !== hubId) return;
+        this.emit("push:disable_ack", event);
+      }),
     );
 
     const onVisibilityChange = () => {

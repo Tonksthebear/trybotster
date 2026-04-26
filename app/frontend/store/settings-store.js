@@ -1,5 +1,7 @@
 import { create } from 'zustand'
-import { HubManager } from 'connections'
+import { waitForHub } from '../lib/hub-bridge'
+import { useSpawnTargetStore } from './entities'
+import { orderedEntities } from '../lib/entity-selectors'
 
 export const useSettingsStore = create((set, get) => ({
   // --- Connection ---
@@ -21,6 +23,7 @@ export const useSettingsStore = create((set, get) => ({
   tree: null,
   deviceTree: null,
   repoTree: null,
+  _scanTreeToken: 0,
 
   // --- Editor ---
   currentFilePath: null,
@@ -59,26 +62,33 @@ export const useSettingsStore = create((set, get) => ({
   // --- Hub lifecycle ---
 
   async connectHub(hubId) {
-    // HubManager imported at module level
-    const hub = await HubManager.acquire(hubId)
+    const hub = await waitForHub(hubId)
+    if (!hub) {
+      set({
+        connected: false,
+        treeState: 'disconnected',
+        treeFeedback: 'Hub connection is not ready.',
+      })
+      return null
+    }
 
-    const targets = hub.spawnTargets.current()
-    hub.spawnTargets.load().catch(() => {})
-    const selectedTargetId = targets.length === 1 ? targets[0].id : null
+    const targets = orderedEntities(useSpawnTargetStore.getState())
+    hub.requestSpawnTargets?.()
+    const selectedTargetId = targets.length === 1 ? targets[0].id || targets[0].target_id : null
 
     const unsubs = []
 
     unsubs.push(
-      hub.spawnTargets.onChange((targets) => {
-        const arr = Array.isArray(targets) ? targets : []
+      useSpawnTargetStore.subscribe((state) => {
+        const arr = orderedEntities(state)
         const { selectedTargetId: currentId } = get()
-        const valid = arr.some((t) => t.id === currentId)
+        const valid = arr.some((t) => (t.id || t.target_id) === currentId)
         set({
           spawnTargets: arr,
           selectedTargetId: valid
             ? currentId
             : arr.length === 1
-              ? arr[0].id
+              ? arr[0].id || arr[0].target_id
               : null,
         })
       })
@@ -106,10 +116,9 @@ export const useSettingsStore = create((set, get) => ({
   },
 
   disconnectHub() {
-    const { hub, _unsubscribers } = get()
+    const { _unsubscribers } = get()
     _unsubscribers.forEach((fn) => fn())
     set({ _unsubscribers: [], hub: null })
-    hub?.release()
   },
 
   // --- Config scope + target ---
@@ -143,17 +152,24 @@ export const useSettingsStore = create((set, get) => ({
   async scanTree() {
     const { hub, configScope, selectedTargetId, spawnTargets } = get()
     if (!hub) return
+    const scope = configScope
+    const fs = scope === 'device' ? 'device' : 'repo'
+    const tid = scope === 'repo' ? selectedTargetId : undefined
+    const token = get()._scanTreeToken + 1
+    set({ _scanTreeToken: token })
+    const isCurrentScan = () =>
+      get().hub === hub &&
+      get()._scanTreeToken === token &&
+      get().configScope === scope &&
+      get().selectedTargetId === selectedTargetId
 
     const isFirstLoad = !get().tree
     if (isFirstLoad) {
       set({ treeState: 'loading', treeFeedback: 'Loading configuration...' })
     }
 
-    const scope = configScope
-    const fs = scope === 'device' ? 'device' : 'repo'
-    const tid = scope === 'repo' ? selectedTargetId : undefined
-
     if (scope === 'repo' && !tid) {
+      if (!isCurrentScan()) return
       set({
         treeState: 'loading',
         treeFeedback:
@@ -177,6 +193,7 @@ export const useSettingsStore = create((set, get) => ({
           hub.statFile('workspaces', fs, tid).catch(() => ({ exists: false })),
         ])
         if (!a.exists && !c.exists && !p.exists && !w.exists) {
+          if (!isCurrentScan()) return
           set({ treeState: 'empty' })
           get()._refreshAgentConfigCache()
           return
@@ -186,6 +203,7 @@ export const useSettingsStore = create((set, get) => ({
           .statFile('.botster', fs, tid)
           .catch(() => ({ exists: false }))
         if (!stat.exists) {
+          if (!isCurrentScan()) return
           set({ treeState: 'empty' })
           get()._refreshAgentConfigCache()
           return
@@ -270,10 +288,11 @@ export const useSettingsStore = create((set, get) => ({
       const update = { tree, treeState: 'tree' }
       if (scope === 'device') update.deviceTree = tree
       else update.repoTree = tree
+      if (!isCurrentScan()) return
       set(update)
       get()._refreshAgentConfigCache()
     } catch (error) {
-      if (isFirstLoad) {
+      if (isFirstLoad && isCurrentScan()) {
         set({ treeFeedback: `Failed to scan: ${error.message}` })
       }
     }

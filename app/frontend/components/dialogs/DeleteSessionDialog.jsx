@@ -3,7 +3,7 @@ import { Dialog, DialogTitle, DialogDescription, DialogBody, DialogActions } fro
 import { Button } from '../catalyst/button'
 import { useDialogStore } from '../../store/dialog-store'
 import { useSessionStore } from '../../store/entities'
-import { getHub } from '../../lib/hub-bridge'
+import { waitForHub } from '../../lib/hub-bridge'
 
 // Wire protocol: displayName resolution moved into this component.
 // Selectors used to live on workspace-store.js; they re-derive from the
@@ -27,14 +27,14 @@ export default function DeleteSessionDialog({ hubId }) {
   const deleteWorktreeReason = closeActions.delete_worktree_reason || null
   const otherActiveSessions = Number(closeActions.other_active_sessions || 0)
 
-  function confirmKeep() {
-    const hub = getHub(hubId)
+  async function confirmKeep() {
+    const hub = await waitForHub(hubId)
     if (hub) hub.deleteAgent(context.sessionId, false)
     close()
   }
 
-  function confirmDelete() {
-    const hub = getHub(hubId)
+  async function confirmDelete() {
+    const hub = await waitForHub(hubId)
     if (hub) hub.deleteAgent(context.sessionId, true)
     close()
   }

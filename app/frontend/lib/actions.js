@@ -1,6 +1,6 @@
 import { useUiPresentationStore } from '../store/ui-presentation-store'
 import { useDialogStore } from '../store/dialog-store'
-import { getHub } from './hub-bridge'
+import { waitForHub } from './hub-bridge'
 
 const ACTION = {
   WORKSPACE_TOGGLE: 'botster.workspace.toggle',
@@ -11,8 +11,8 @@ const ACTION = {
   PREVIEW_OPEN: 'botster.session.preview.open',
   SESSION_MOVE: 'botster.session.move.request',
   SESSION_DELETE: 'botster.session.delete.request',
-  // Phase 4a: router-level navigation fired from Lua-authored trees (e.g.
-  // sidebar nav entries for plugin-registered surfaces). Payload expected:
+  // Router-level navigation fired from Lua-authored trees (e.g. sidebar
+  // nav entries for plugin-registered surfaces). Payload expected:
   // { path, hubId? }. When `hubId` is present the path is prefixed with
   // `/hubs/<id>`; callers that emit pre-qualified absolute paths can omit.
   NAV_OPEN: 'botster.nav.open',
@@ -66,9 +66,10 @@ const handlers = {
     // the select_agent command for cross-client handoff (browser click
     // focuses the session in the TUI), even though selection state is no
     // longer baked into broadcast trees.
-    const hub = getHub(payload.hubId)
-    if (hub && payload.sessionId) {
-      hub.selectAgent(payload.sessionId)
+    if (payload.hubId && payload.sessionId) {
+      void waitForHub(payload.hubId).then((hub) => {
+        hub?.selectAgent(payload.sessionId)
+      })
     }
     // Navigate via React Router (pushState). Idempotent — skip when
     // already on the target path. The transport-success path in
@@ -81,9 +82,9 @@ const handlers = {
   },
 
   [ACTION.PREVIEW_TOGGLE](payload) {
-    const hub = getHub(payload.hubId)
-    if (!hub) return
-    hub.toggleHostedPreview(payload.sessionUuid)
+    void waitForHub(payload.hubId).then((hub) => {
+      hub?.toggleHostedPreview(payload.sessionUuid)
+    })
   },
 
   [ACTION.PREVIEW_OPEN](payload) {
@@ -116,7 +117,7 @@ const handlers = {
   },
 
   [ACTION.NAV_OPEN](payload) {
-    // Phase 4a: router-level nav. Accept either a pre-qualified absolute
+    // Router-level nav. Accept either a pre-qualified absolute
     // path (`/hubs/:id/plugins/hello`) or a hub-relative one (`/plugins/hello`)
     // alongside the hubId enriched by createTransportDispatch. Relative
     // paths are the common case — the sidebar Lua emits the surface's own

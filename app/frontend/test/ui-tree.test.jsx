@@ -23,6 +23,7 @@ vi.mock('../lib/actions', () => {
 import { dispatch as legacyDispatch } from '../lib/actions'
 import * as hubBridge from '../lib/hub-bridge'
 import UiTree, {
+  _resetUiTreeSnapshotCacheForTests,
   useUiActionInterceptor,
   useUiTreeDispatch,
 } from '../components/UiTree'
@@ -31,7 +32,7 @@ import {
   useWorkspaceEntityStore,
 } from '../store/entities'
 
-// ---------- Mock hub-bridge.getHub returning a fake transport ----------
+// ---------- Mock hub-bridge.waitForHub returning a fake transport ----------
 
 class FakeTransport {
   constructor() {
@@ -52,11 +53,19 @@ class FakeTransport {
 
 let fakeTransport
 
+function immediateHub(transport) {
+  return {
+    then(resolve) {
+      resolve({ transport })
+      return Promise.resolve({ transport })
+    },
+  }
+}
+
 beforeEach(() => {
+  _resetUiTreeSnapshotCacheForTests()
   fakeTransport = new FakeTransport()
-  vi.spyOn(hubBridge, 'getHub').mockReturnValue({
-    transport: fakeTransport,
-  })
+  vi.spyOn(hubBridge, 'waitForHub').mockImplementation(() => immediateHub(fakeTransport))
 })
 
 afterEach(() => {
@@ -104,6 +113,28 @@ describe('<UiTree>', () => {
     expect(await screen.findByText('hello world')).toBeInTheDocument()
   })
 
+  it('hydrates from the cached tree when a surface remounts', async () => {
+    const first = render(
+      <UiTree hubId="hub-1" targetSurface="workspace_panel" subpath="/" />,
+    )
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'workspace_panel',
+        subpath: '/',
+        tree: HELLO_TREE,
+      })
+    })
+    expect(await screen.findByText('hello world')).toBeInTheDocument()
+
+    first.unmount()
+    fakeTransport.send.mockClear()
+
+    render(<UiTree hubId="hub-1" targetSurface="workspace_panel" subpath="/" />)
+    expect(screen.getByText('hello world')).toBeInTheDocument()
+    expect(screen.queryByText(/Loading/i)).toBeNull()
+  })
+
   it('renders session_list composites without uncached selector loops', async () => {
     const consoleError = vi
       .spyOn(console, 'error')
@@ -143,10 +174,10 @@ describe('<UiTree>', () => {
   it('drops stale tree + unsubscribes from old transport when hubId switches', async () => {
     const transportA = fakeTransport
     const transportB = new FakeTransport()
-    vi.mocked(hubBridge.getHub).mockImplementation((hubId) => {
-      if (hubId === 'hub-a') return { transport: transportA }
-      if (hubId === 'hub-b') return { transport: transportB }
-      return null
+    vi.mocked(hubBridge.waitForHub).mockImplementation((hubId) => {
+      if (hubId === 'hub-a') return immediateHub(transportA)
+      if (hubId === 'hub-b') return immediateHub(transportB)
+      return Promise.resolve(null)
     })
 
     const HUB_A_TREE = {
@@ -242,7 +273,7 @@ describe('<UiTree>', () => {
   it('renders a hub-broadcast layout tree via the primitive registry', async () => {
     render(<UiTree hubId="hub-1" targetSurface="workspace_panel" />)
 
-    // Wait for hub-bridge polling to acquire the transport.
+    // Wait for hub-bridge to resolve the shared transport.
     await screen.findByText(/Loading/i)
 
     await act(async () => {
@@ -301,7 +332,7 @@ describe('<UiTree>', () => {
     expect(legacyDispatch).not.toHaveBeenCalled()
   })
 
-  it('falls back to legacy dispatch when transport.send returns false', async () => {
+  it('does not locally dispatch hub-authored actions when transport.send returns false', async () => {
     render(<UiTree hubId="hub-1" targetSurface="workspace_panel" />)
 
     await act(async () => {
@@ -323,16 +354,7 @@ describe('<UiTree>', () => {
     await Promise.resolve()
     await Promise.resolve()
 
-    expect(legacyDispatch).toHaveBeenCalledOnce()
-    expect(legacyDispatch).toHaveBeenCalledWith({
-      action: 'botster.session.select',
-      payload: {
-        hubId: 'hub-1',
-        sessionId: 's-1',
-        sessionUuid: 'u-1',
-        url: '/hubs/hub-1/sessions/u-1',
-      },
-    })
+    expect(legacyDispatch).not.toHaveBeenCalled()
   })
 
   it('renders the error fallback when the tree throws during render', async () => {

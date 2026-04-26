@@ -22,6 +22,18 @@
 // WASM module state
 let wasmModule = null
 
+const DEBUG_CRYPTO = (() => {
+  try {
+    return globalThis.localStorage?.getItem("botster:debug_crypto") === "1"
+  } catch {
+    return false
+  }
+})()
+
+function debugLog(...args) {
+  if (DEBUG_CRYPTO) console.log(...args)
+}
+
 // Per-hub crypto state (in-memory, restored from IndexedDB on demand)
 const accounts = new Map()  // hubId -> VodozemacAccount
 const sessions = new Map()  // hubId -> VodozemacSession
@@ -228,7 +240,7 @@ async function getPickleKey() {
 
   const stored = await dbGet(PICKLE_KEY_ID)
   if (stored) {
-    // Handle both Array and Uint8Array (legacy) formats
+    // IndexedDB may return Array or Uint8Array depending on browser storage.
     pickleKeyCache = new Uint8Array(stored)
     return pickleKeyCache
   }
@@ -292,7 +304,7 @@ async function restoreState(hubId) {
 
   if (!wasmModule) return false
 
-  console.log(`[VodozemacCrypto] restoreState start for hub ${hubId.substring(0, 8)}...`)
+  debugLog(`[VodozemacCrypto] restoreState start for hub ${hubId.substring(0, 8)}...`)
   const raw = await dbGet(`hub:${hubId}`)
   if (!raw) return false
 
@@ -322,7 +334,7 @@ async function restoreState(hubId) {
 
     // Legacy session pickles are intentionally ignored so fresh connections
     // always recreate an active ratchet from a signed CLI bundle.
-    console.log(`[VodozemacCrypto] Restored pairing for hub ${hubId.substring(0, 8)}...`)
+    debugLog(`[VodozemacCrypto] Restored pairing for hub ${hubId.substring(0, 8)}...`)
     return true
   } catch (e) {
     console.warn("[VodozemacCrypto] Failed to restore state, clearing:", e)
@@ -378,7 +390,7 @@ async function handleInit(wasmJsUrl, wasmBinaryUrl) {
     throw new Error("wasmJsUrl is required - SharedWorkers cannot resolve bare module specifiers")
   }
 
-  console.log("[VodozemacCrypto] Loading WASM module from:", wasmJsUrl)
+  debugLog("[VodozemacCrypto] Loading WASM module from:", wasmJsUrl)
   wasmModule = await import(wasmJsUrl)
 
   // Pass the explicit .wasm binary URL so Propshaft-fingerprinted paths resolve correctly.
@@ -388,7 +400,7 @@ async function handleInit(wasmJsUrl, wasmBinaryUrl) {
     await wasmModule.default(wasmBinaryUrl || undefined)
   }
 
-  console.log("[VodozemacCrypto] WASM module initialized")
+  debugLog("[VodozemacCrypto] WASM module initialized")
   return { initialized: true }
 }
 
@@ -467,7 +479,7 @@ async function handleCreateSession(hubId, bundleJson, sessionOwner = null) {
 
   const identityKey = account.curve25519Key()
 
-  console.log(`[VodozemacCrypto] Created session for hub ${hubId.substring(0, 8)}...`)
+  debugLog(`[VodozemacCrypto] Created session for hub ${hubId.substring(0, 8)}...`)
   return { created: true, identityKey }
 }
 
@@ -476,13 +488,13 @@ async function handleCreateSession(hubId, bundleJson, sessionOwner = null) {
  * Restores persisted pairing metadata first, but live sessions remain memory-only.
  */
 async function handleHasSession(hubId, sessionOwner = null) {
-  console.log(`[VodozemacCrypto] hasSession start for hub ${hubId.substring(0, 8)}...`)
+  debugLog(`[VodozemacCrypto] hasSession start for hub ${hubId.substring(0, 8)}...`)
   if (sessions.has(hubId)) {
     return { hasSession: sessionOwners.get(hubId) === sessionOwner }
   }
 
   await restoreStateSafely(hubId, "hasSession")
-  console.log(`[VodozemacCrypto] hasSession result for hub ${hubId.substring(0, 8)}... inMemory=${sessions.has(hubId)}`)
+  debugLog(`[VodozemacCrypto] hasSession result for hub ${hubId.substring(0, 8)}... inMemory=${sessions.has(hubId)}`)
   return { hasSession: sessions.has(hubId) && sessionOwners.get(hubId) === sessionOwner }
 }
 
@@ -708,7 +720,7 @@ async function handleClearActiveSession(hubId) {
   sessions.delete(hubId)
   sessionOwners.delete(hubId)
 
-  console.log(`[VodozemacCrypto] Cleared active session for hub ${hubId.substring(0, 8)}...`)
+  debugLog(`[VodozemacCrypto] Cleared active session for hub ${hubId.substring(0, 8)}...`)
   return { cleared: true }
 }
 
@@ -728,7 +740,7 @@ async function handleClearSession(hubId) {
 
   await dbDelete(`hub:${hubId}`)
 
-  console.log(`[VodozemacCrypto] Cleared pairing for hub ${hubId.substring(0, 8)}...`)
+  debugLog(`[VodozemacCrypto] Cleared pairing for hub ${hubId.substring(0, 8)}...`)
   return { cleared: true }
 }
 
@@ -766,7 +778,7 @@ async function handleClearAllSessions() {
     dbInstance = null
   }
 
-  console.log(`[VodozemacCrypto] Cleared all sessions (${deleted} IDB entries)`)
+  debugLog(`[VodozemacCrypto] Cleared all sessions (${deleted} IDB entries)`)
   return { cleared: true, count: deleted }
 }
 
@@ -850,7 +862,7 @@ function generatePortId() {
 
 function cleanupPort(portId) {
   ports.delete(portId)
-  console.log(`[VodozemacCrypto] Cleaned up port ${portId}, ${ports.size} ports remaining`)
+  debugLog(`[VodozemacCrypto] Cleaned up port ${portId}, ${ports.size} ports remaining`)
 }
 
 // =============================================================================
@@ -898,7 +910,7 @@ setInterval(() => {
 
   for (const [portId, state] of ports) {
     if (now - state.lastPong > PORT_TTL) {
-      console.log(`[VodozemacCrypto] Port ${portId} timed out, cleaning up`)
+      debugLog(`[VodozemacCrypto] Port ${portId} timed out, cleaning up`)
       cleanupPort(portId)
       continue
     }
@@ -906,7 +918,7 @@ setInterval(() => {
     try {
       state.port.postMessage({ event: "ping" })
     } catch (e) {
-      console.log(`[VodozemacCrypto] Port ${portId} unreachable, cleaning up`)
+      debugLog(`[VodozemacCrypto] Port ${portId} unreachable, cleaning up`)
       cleanupPort(portId)
     }
   }

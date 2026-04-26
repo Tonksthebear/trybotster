@@ -4,13 +4,20 @@ import { Field, Label } from '../catalyst/fieldset'
 import { Select } from '../catalyst/select'
 import { Button } from '../catalyst/button'
 import { useDialogStore } from '../../store/dialog-store'
-import { getHub } from '../../lib/hub-bridge'
+import { waitForHub } from '../../lib/hub-bridge'
+import { useSpawnTargetStore } from '../../store/entities'
+import { entityId, spawnTargetLabel } from '../../lib/entity-selectors'
 
 export default function NewSessionChooser({ hubId }) {
   const { activeDialog, close, openNewAgent, openNewAccessory } = useDialogStore()
   const open = activeDialog === 'newSession'
 
-  const [spawnTargets, setSpawnTargets] = useState([])
+  const spawnTargetOrder = useSpawnTargetStore((state) => state.order)
+  const spawnTargetsById = useSpawnTargetStore((state) => state.byId)
+  const spawnTargets = React.useMemo(
+    () => spawnTargetOrder.map((id) => spawnTargetsById[id]).filter(Boolean),
+    [spawnTargetOrder, spawnTargetsById],
+  )
   const [selectedTargetId, setSelectedTargetId] = useState('')
   const [hubReady, setHubReady] = useState(false)
 
@@ -18,43 +25,18 @@ export default function NewSessionChooser({ hubId }) {
     if (!open || !hubId) return
 
     setHubReady(false)
-    let unsub = null
     let cancelled = false
 
     function attachToHub(hub) {
       if (cancelled) return
       setHubReady(true)
-      setSpawnTargets(hub.spawnTargets.current())
-      hub.spawnTargets.load().catch(() => {})
-      unsub = hub.spawnTargets.onChange((targets) => {
-        setSpawnTargets(Array.isArray(targets) ? targets : [])
-      })
+      hub.requestSpawnTargets?.()
     }
 
-    const hub = getHub(hubId)
-    if (hub) {
-      attachToHub(hub)
-    } else {
-      // Hub not connected yet — poll until it appears
-      const interval = setInterval(() => {
-        const h = getHub(hubId)
-        if (h) {
-          clearInterval(interval)
-          attachToHub(h)
-        }
-      }, 200)
-      // Clean up poll on unmount/close
-      const clearPoll = () => clearInterval(interval)
-      return () => {
-        cancelled = true
-        clearPoll()
-        unsub?.()
-      }
-    }
+    waitForHub(hubId).then(attachToHub)
 
     return () => {
       cancelled = true
-      unsub?.()
     }
   }, [open, hubId])
 
@@ -101,11 +83,11 @@ export default function NewSessionChooser({ hubId }) {
             <option value="">
               {spawnTargets.length ? 'Select a spawn target' : 'No admitted spawn targets'}
             </option>
-            {spawnTargets.map((target) => {
-              const branchSuffix = target.current_branch ? ` (${target.current_branch})` : ''
+            {spawnTargets.map((target, index) => {
+              const id = entityId(target, `target:${index}`)
               return (
-                <option key={target.id} value={target.id}>
-                  {(target.name || target.path) + branchSuffix}
+                <option key={id} value={id}>
+                  {spawnTargetLabel(target)}
                 </option>
               )
             })}

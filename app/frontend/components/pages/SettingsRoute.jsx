@@ -1,28 +1,19 @@
-import React, { useState, useEffect } from 'react'
+import React, { useEffect } from 'react'
 import { useParams } from 'react-router-dom'
 import SettingsApp from '../settings/SettingsApp'
+import { useSettingsBootstrapStore } from '../../store/settings-bootstrap-store'
 
 export default function SettingsRoute() {
   const { hubId } = useParams()
-  const [data, setData] = useState(null)
+  const data = useSettingsBootstrapStore((s) =>
+    s.hubId === String(hubId) ? s.data : null
+  )
+  const load = useSettingsBootstrapStore((s) => s.load)
 
   useEffect(() => {
     if (!hubId) return
-
-    fetch(`/hubs/${hubId}/settings.json`, {
-      headers: { Accept: 'application/json' },
-      credentials: 'same-origin',
-    })
-      .then((res) => {
-        if (!res.ok) throw new Error(`${res.status}`)
-        return res.json()
-      })
-      .then(setData)
-      .catch((err) => {
-        console.warn('[SettingsRoute] Failed to fetch settings data:', err)
-        setData({})
-      })
-  }, [hubId])
+    load(hubId)
+  }, [hubId, load])
 
   if (!data) {
     return (

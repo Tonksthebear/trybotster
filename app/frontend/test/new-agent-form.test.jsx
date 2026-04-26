@@ -1,30 +1,27 @@
 import React from 'react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import NewAgentForm from '../components/forms/NewAgentForm'
 import { useDialogStore } from '../store/dialog-store'
+import {
+  _resetEntityStoresForTest,
+  useSpawnTargetStore,
+  useWorktreeStore,
+} from '../store/entities'
 
 const listeners = {}
 
 const mockHub = {
-  spawnTargets: {
-    current: vi.fn(() => [{ id: 'target-1', name: 'Repo' }]),
-    load: vi.fn(() => Promise.resolve()),
-    onChange: vi.fn(() => () => {}),
-  },
-  openWorkspaces: {
-    current: vi.fn(() => []),
-    load: vi.fn(() => Promise.resolve()),
-    onChange: vi.fn(() => () => {}),
-  },
   agents: {
     load: vi.fn(() => Promise.resolve([])),
   },
-  getWorktrees: vi.fn(() => []),
   getAgentConfig: vi.fn(() => ({ agents: [], accessories: [], workspaces: [] })),
-  hasWorktrees: vi.fn(() => false),
-  ensureWorktrees: vi.fn(() => Promise.resolve([])),
+  hasAgentConfig: vi.fn(() => false),
   ensureAgentConfig: vi.fn(() => Promise.resolve()),
+  requestSpawnTargets: vi.fn(),
+  requestOpenWorkspaces: vi.fn(),
+  requestWorktrees: vi.fn(),
   on: vi.fn((eventName, callback) => {
     listeners[eventName] = callback
     return () => {
@@ -34,7 +31,7 @@ const mockHub = {
 }
 
 vi.mock('../lib/hub-bridge', () => ({
-  getHub: vi.fn(() => mockHub),
+  waitForHub: vi.fn(() => Promise.resolve(mockHub)),
 }))
 
 vi.mock('../components/catalyst/dialog', () => ({
@@ -67,6 +64,14 @@ describe('NewAgentForm', () => {
   beforeEach(() => {
     Object.keys(listeners).forEach((key) => delete listeners[key])
     vi.clearAllMocks()
+    mockHub.getAgentConfig.mockReturnValue({ agents: [], accessories: [], workspaces: [] })
+    mockHub.hasAgentConfig.mockReturnValue(false)
+    mockHub.ensureAgentConfig.mockResolvedValue({ agents: [], accessories: [], workspaces: [] })
+    _resetEntityStoresForTest()
+    useSpawnTargetStore.getState().applySnapshot(
+      [{ id: 'target-1', name: 'Repo' }],
+      1,
+    )
     useDialogStore.setState({
       activeDialog: 'newAgent',
       context: { targetId: 'target-1' },
@@ -75,28 +80,59 @@ describe('NewAgentForm', () => {
 
   afterEach(() => {
     cleanup()
+    _resetEntityStoresForTest()
   })
 
-  it('keeps target-scoped worktrees when an unscoped broadcast arrives later', async () => {
+  it('renders worktrees from the target-scoped worktree entity store', async () => {
     render(<NewAgentForm hubId="hub-1" />)
 
     await act(async () => {
-      listeners.worktreeList({
-        targetId: 'target-1',
-        worktrees: [{ path: '/wt/feature-a', branch: 'feature-a', active_sessions: 1 }],
-      })
+      useWorktreeStore.getState().applySnapshot(
+        [
+          {
+            worktree_path: '/wt/feature-a',
+            path: '/wt/feature-a',
+            target_id: 'target-1',
+            branch: 'feature-a',
+            active_sessions: 1,
+          },
+          {
+            worktree_path: '/wt/wrong',
+            path: '/wt/wrong',
+            target_id: 'target-2',
+            branch: 'wrong-branch',
+          },
+        ],
+        1,
+      )
     })
 
     expect(screen.getByText('feature-a')).toBeInTheDocument()
     expect(screen.getByText('1 active')).toBeInTheDocument()
+    expect(screen.queryByText('wrong-branch')).not.toBeInTheDocument()
+  })
+
+  it('shows loading instead of empty-config warning while agent config is pending', async () => {
+    const user = userEvent.setup()
+    let resolveConfig
+    mockHub.ensureAgentConfig.mockImplementation(
+      () => new Promise((resolve) => {
+        resolveConfig = resolve
+      }),
+    )
+
+    render(<NewAgentForm hubId="hub-1" />)
+
+    await user.click(screen.getByText('Main branch'))
+
+    expect(screen.getByText('Loading agent configurations for this spawn target...')).toBeInTheDocument()
+    expect(screen.queryByText(/No agent configurations found/)).not.toBeInTheDocument()
 
     await act(async () => {
-      listeners.worktreeList({
-        worktrees: [{ path: '/wt/wrong', branch: 'wrong-branch' }],
-      })
+      resolveConfig({ agents: ['claude'], accessories: [], workspaces: [] })
     })
 
-    expect(screen.getByText('feature-a')).toBeInTheDocument()
-    expect(screen.queryByText('wrong-branch')).not.toBeInTheDocument()
+    expect(await screen.findByText('Claude')).toBeInTheDocument()
+    expect(screen.queryByText(/No agent configurations found/)).not.toBeInTheDocument()
   })
 })

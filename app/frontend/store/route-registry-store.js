@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 
-// Phase 4a/4b: per-hub registry of routable browser surfaces. Populated from
+// Per-hub registry of routable browser surfaces. Populated from
 // the `ui_route_registry` broadcast (see `lib/connections/hub_connection.js`
 // and the bridge in `lib/hub-bridge.js`). Components subscribe via the
 // `useRouteRegistryStore` hook; `DynamicSurfaceRoute` matches the current
@@ -16,7 +16,7 @@ import { create } from 'zustand'
 //       label,
 //       icon,
 //       hide_from_nav?,
-//       routes?,           // Phase 4b sub-patterns: [{ path }]
+//       routes?,           // sub-patterns: [{ path }]
 //     }>,
 //   }
 //   snapshotReceivedAtByHubId: { [hubId]: number }
@@ -75,10 +75,9 @@ export const useRouteRegistryStore = create((set) => ({
 const EMPTY_ROUTES = Object.freeze([])
 
 /**
- * Normalise an entry so consumers can rely on `base_path` without reaching
- * through legacy shapes. Phase 4a emitted only `path`; Phase 4b also emits
- * `base_path` and an optional `routes` array of sub-patterns. Older hubs
- * talking to a newer browser fall back to `path` for `base_path`.
+ * Normalise an entry so consumers can rely on `base_path`. The current wire
+ * format emits `base_path`; `path` remains the canonical surface root and is
+ * used as the derived `base_path` when the field is absent.
  */
 function normaliseEntry(entry) {
   if (!entry || typeof entry !== 'object') return entry

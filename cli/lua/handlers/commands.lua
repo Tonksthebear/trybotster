@@ -167,6 +167,24 @@ commands.register("rename_spawn_target", function(client, sub_id, command)
     end
 end, { description = "Rename an admitted spawn target" })
 
+local function route_push_control(client, _sub_id, command)
+    local push = rawget(_G, "push")
+    if not push or type(push.control) ~= "function" then
+        log.warn("push control primitive is unavailable")
+        return
+    end
+    push.control(client.peer_id, command)
+end
+
+commands.register("push_status_req", route_push_control, { description = "Query browser push status" })
+commands.register("vapid_generate", route_push_control, { description = "Generate VAPID keys for browser push" })
+commands.register("vapid_pub_req", route_push_control, { description = "Request VAPID public key" })
+commands.register("vapid_key_req", route_push_control, { description = "Request VAPID keypair for copy flow" })
+commands.register("vapid_key_set", route_push_control, { description = "Install copied VAPID keypair" })
+commands.register("push_sub", route_push_control, { description = "Store browser push subscription" })
+commands.register("push_test", route_push_control, { description = "Send a browser push test notification" })
+commands.register("push_disable", route_push_control, { description = "Disable browser push notifications" })
+
 commands.register("list_workspaces", function(client, sub_id, _command)
     local Hub = require("lib.hub")
     local ok, workspaces = pcall(function()

@@ -9,7 +9,7 @@ import { useHubMetaStore } from '../store/entities/hub-meta-store'
 vi.mock('../lib/hub-bridge', () => ({
   connect: vi.fn(() => Promise.resolve({ connectionId: 1 })),
   disconnect: vi.fn(),
-  getHub: vi.fn(() => null),
+  waitForHub: vi.fn(() => Promise.resolve(null)),
 }))
 
 // Mock the transport module to avoid import errors

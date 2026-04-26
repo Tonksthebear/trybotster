@@ -15,6 +15,7 @@ import { Switch } from '../catalyst/switch'
 import { Badge } from '../catalyst/badge'
 import { Field, Label, ErrorMessage } from '../catalyst/fieldset'
 import { Text } from '../catalyst/text'
+import { configTreeSections } from '../../store/selectors/settings-selectors'
 
 // ─── Name validation ───────────────────────────────────────────────
 
@@ -306,10 +307,7 @@ function TreeView({ agentTemplates }) {
   if (!tree) return null
 
   const prefix = configScope === 'device' ? '' : '.botster/'
-  const agentNames = Object.keys(tree.agents).sort()
-  const accessoryNames = Object.keys(tree.accessories).sort()
-  const workspaceNames = Object.keys(tree.workspaces).sort()
-  const pluginNames = Object.keys(tree.plugins).sort()
+  const { agentNames, accessoryNames, workspaceNames, pluginNames } = configTreeSections(tree)
 
   async function handleAddAgent(name) {
     setAddAgentOpen(false)
@@ -642,7 +640,7 @@ function TargetSelector() {
 
   function handleChange(e) {
     setSelectedTargetId(e.target.value)
-    setTimeout(() => useSettingsStore.getState().scanTree(), 0)
+    useSettingsStore.getState().scanTree()
   }
 
   const hint = selectedTargetId

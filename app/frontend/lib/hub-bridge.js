@@ -5,6 +5,7 @@ import { useRouteRegistryStore } from '../store/route-registry-store'
 // Per-hub shared state
 const hubState = new Map()  // hubId → { hub, unsubscribers, callerIds: Set }
 const chains = new Map()    // hubId → Promise (serializes connect/disconnect per hub)
+const hubWaiters = new Map() // hubId → Set<callback>
 
 // Caller identity
 let nextCallerId = 0
@@ -87,6 +88,7 @@ async function doConnect(hubId, callerId) {
 
   state = { hub, unsubscribers, callerIds: new Set([callerId]) }
   hubState.set(hubId, state)
+  notifyHubAvailable(hubId, hub)
   return { hub, connectionId: callerId }
 }
 
@@ -122,8 +124,35 @@ function doDisconnect(hubId, callerId) {
   useRouteRegistryStore.getState().clearRoutes(hubId)
 }
 
-export function getHub(hubId) {
+function currentHub(hubId) {
   return hubState.get(hubId)?.hub || null
+}
+
+export function waitForHub(hubId, timeoutMs = 10000) {
+  if (!hubId) return Promise.resolve(null)
+  const existing = currentHub(hubId)
+  if (existing) return Promise.resolve(existing)
+
+  const key = String(hubId)
+  return new Promise((resolve) => {
+    let settled = false
+    let timer = null
+
+    const finish = (hub) => {
+      if (settled) return
+      settled = true
+      if (timer) window.clearTimeout(timer)
+      const set = hubWaiters.get(key)
+      set?.delete(finish)
+      if (set && set.size === 0) hubWaiters.delete(key)
+      resolve(hub || null)
+    }
+
+    if (!hubWaiters.has(key)) hubWaiters.set(key, new Set())
+    hubWaiters.get(key).add(finish)
+
+    timer = window.setTimeout(() => finish(currentHub(key)), timeoutMs)
+  })
 }
 
 /**
@@ -145,4 +174,12 @@ export function syncSelectionFromUrl(_hub) {
 
 function resolveHubManager() {
   return HubManager
+}
+
+function notifyHubAvailable(hubId, hub) {
+  const key = String(hubId)
+  const waiters = hubWaiters.get(key)
+  if (!waiters) return
+  hubWaiters.delete(key)
+  for (const callback of waiters) callback(hub)
 }

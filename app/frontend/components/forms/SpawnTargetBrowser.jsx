@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react'
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Field, Label, Description } from '../catalyst/fieldset'
 import { Input } from '../catalyst/input'
 import { Button } from '../catalyst/button'
@@ -9,7 +9,8 @@ import {
   DialogBody,
   DialogActions,
 } from '../catalyst/dialog'
-import { getHub } from '../../lib/hub-bridge'
+import { waitForHub } from '../../lib/hub-bridge'
+import { useSpawnTargetStore } from '../../store/entities'
 
 function normalizePath(path) {
   if (!path) return ''
@@ -61,7 +62,12 @@ function StatusBadge({ target }) {
 }
 
 export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
-  const [targets, setTargets] = useState([])
+  const targetOrder = useSpawnTargetStore((state) => state.order)
+  const targetsById = useSpawnTargetStore((state) => state.byId)
+  const targets = useMemo(
+    () => targetOrder.map((id) => targetsById[id]).filter(Boolean).map(normalizeTarget),
+    [targetOrder, targetsById],
+  )
   const [selectedTargetId, setSelectedTargetId] = useState('')
   const [filterQuery, setFilterQuery] = useState('')
   const [pathInput, setPathInput] = useState('')
@@ -79,25 +85,11 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
     if (!hubId) return
 
     let cancelled = false
-    let pollId = null
     const unsubs = []
 
     function attach(hub) {
       if (cancelled) return
-      const rawTargets = hub.spawnTargets.current()
-      setTargets(rawTargets.map(normalizeTarget))
-      hub.spawnTargets.load().catch(() => {})
-
-      unsubs.push(
-        hub.spawnTargets.onChange((raw) => {
-          const normalized = (Array.isArray(raw) ? raw : []).map(normalizeTarget)
-          setTargets(normalized)
-          setSelectedTargetId((prev) => {
-            if (normalized.some((t) => t.id === prev)) return prev
-            return normalized[0]?.id || ''
-          })
-        })
-      )
+      hub.requestSpawnTargets?.()
 
       unsubs.push(
         hub.on('spawnTargetFeedback', ({ tone, message }) => {
@@ -109,27 +101,21 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
       )
     }
 
-    const hub = getHub(hubId)
-    if (hub) {
-      attach(hub)
-    } else {
-      pollId = setInterval(() => {
-        const h = getHub(hubId)
-        if (h) {
-          clearInterval(pollId)
-          pollId = null
-          attach(h)
-        }
-      }, 200)
-    }
+    waitForHub(hubId).then(attach)
 
     return () => {
       cancelled = true
-      if (pollId) clearInterval(pollId)
       unsubs.forEach((unsub) => unsub())
       if (browseTimerRef.current) clearTimeout(browseTimerRef.current)
     }
   }, [hubId])
+
+  useEffect(() => {
+    setSelectedTargetId((prev) => {
+      if (targets.some((target) => target.id === prev)) return prev
+      return targets[0]?.id || ''
+    })
+  }, [targets])
 
   // Path browsing with debounce
   const handlePathInputChange = useCallback((e) => {
@@ -141,7 +127,7 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
   }, [hubId])
 
   async function refreshPathSuggestions(rawInput) {
-    const hub = getHub(hubId)
+    const hub = await waitForHub(hubId)
     if (!hub) return
 
     const ctx = browseContext(rawInput, homePath)
@@ -170,7 +156,7 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
     }
   }
 
-  function admitTarget(e) {
+  async function admitTarget(e) {
     e.preventDefault()
     const path = normalizePath(pathInput.trim())
 
@@ -179,7 +165,7 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
       return
     }
 
-    const hub = getHub(hubId)
+    const hub = await waitForHub(hubId)
     if (!hub) {
       setFeedback({ message: 'Hub is not ready yet.', tone: 'error' })
       return
@@ -193,8 +179,8 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
     setPathSuggestions([])
   }
 
-  function removeTarget(targetId) {
-    const hub = getHub(hubId)
+  async function removeTarget(targetId) {
+    const hub = await waitForHub(hubId)
     if (!hub) {
       setFeedback({ message: 'Hub is not ready yet.', tone: 'error' })
       return
@@ -213,7 +199,7 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
     setRenameValue('')
   }
 
-  function confirmRename() {
+  async function confirmRename() {
     if (!renameTargetId) return
     const target = targets.find((t) => t.id === renameTargetId)
     const newName = renameValue.trim()
@@ -222,7 +208,7 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
       return
     }
 
-    const hub = getHub(hubId)
+    const hub = await waitForHub(hubId)
     if (!hub) {
       setFeedback({ message: 'Hub is not ready yet.', tone: 'error' })
       closeRenameDialog()

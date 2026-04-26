@@ -153,6 +153,32 @@ fn lock_env() -> std::sync::MutexGuard<'static, ()> {
     guard
 }
 
+fn tree_contains_type(node: &serde_json::Value, target_type: &str) -> bool {
+    if node.get("type").and_then(|v| v.as_str()) == Some(target_type) {
+        return true;
+    }
+
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        if children
+            .iter()
+            .any(|child| tree_contains_type(child, target_type))
+        {
+            return true;
+        }
+    }
+
+    if let Some(slots) = node.get("slots").and_then(|v| v.as_object()) {
+        if slots
+            .values()
+            .any(|slot| tree_contains_type(slot, target_type))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 // -------------------------------------------------------------------------
 // surfaces.lua API
 // -------------------------------------------------------------------------
@@ -414,6 +440,31 @@ fn web_layout_render_falls_back_to_surfaces_registry() {
     assert_eq!(
         custom, "from-state",
         "state should flow through the registered render fn"
+    );
+}
+
+#[test]
+fn workspace_panel_layout_keeps_pairing_out_of_main_surface() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let json: String = lua
+        .load(r#"return web_layout.render("workspace_panel", { surface = "panel" })"#)
+        .eval()
+        .expect("render workspace panel");
+
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse JSON");
+    assert!(
+        !tree_contains_type(&parsed, "connection_code"),
+        "pairing UI belongs in the Share modal, not the workspace panel: {parsed}"
+    );
+    assert!(
+        tree_contains_type(&parsed, "session_list"),
+        "workspace panel should still render the session list: {parsed}"
+    );
+    assert!(
+        tree_contains_type(&parsed, "new_session_button"),
+        "workspace panel should still render the new-session affordance: {parsed}"
     );
 }
 

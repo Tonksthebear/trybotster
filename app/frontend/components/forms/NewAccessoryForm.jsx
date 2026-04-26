@@ -1,21 +1,39 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useMemo } from 'react'
 import { Dialog, DialogTitle, DialogDescription, DialogBody, DialogActions } from '../catalyst/dialog'
 import { Field, Label, Description } from '../catalyst/fieldset'
 import { Select } from '../catalyst/select'
 import { Button } from '../catalyst/button'
 import { useDialogStore } from '../../store/dialog-store'
-import { getHub } from '../../lib/hub-bridge'
+import { waitForHub } from '../../lib/hub-bridge'
 import WorkspacePicker from './WorkspacePicker'
+import {
+  useSpawnTargetStore,
+  useWorkspaceEntityStore,
+} from '../../store/entities'
+import {
+  entityId,
+  normalizedWorkspace,
+  spawnTargetLabel,
+} from '../../lib/entity-selectors'
 
 export default function NewAccessoryForm({ hubId }) {
   const { activeDialog, context, close } = useDialogStore()
   const open = activeDialog === 'newAccessory'
 
-  const unsubscribersRef = useRef([])
-
-  const [spawnTargets, setSpawnTargets] = useState([])
+  const spawnTargetOrder = useSpawnTargetStore((state) => state.order)
+  const spawnTargetsById = useSpawnTargetStore((state) => state.byId)
+  const spawnTargets = useMemo(
+    () => spawnTargetOrder.map((id) => spawnTargetsById[id]).filter(Boolean),
+    [spawnTargetOrder, spawnTargetsById],
+  )
+  const workspaceOrder = useWorkspaceEntityStore((state) => state.order)
+  const workspacesById = useWorkspaceEntityStore((state) => state.byId)
+  const workspaces = useMemo(
+    () => workspaceOrder.map((id) => normalizedWorkspace(workspacesById[id])).filter(Boolean),
+    [workspaceOrder, workspacesById],
+  )
   const [accessories, setAccessories] = useState([])
-  const [workspaces, setWorkspaces] = useState([])
+  const [configStatus, setConfigStatus] = useState('idle') // idle | loading | loaded | error
 
   const [selectedTargetId, setSelectedTargetId] = useState('')
   const [selectedAccessory, setSelectedAccessory] = useState(null)
@@ -27,45 +45,50 @@ export default function NewAccessoryForm({ hubId }) {
   useEffect(() => {
     if (!open || !hubId) return
 
-    const hub = getHub(hubId)
-    if (!hub) return
-
+    let cancelled = false
     const unsubs = []
 
-    setSpawnTargets(hub.spawnTargets.current())
-    setWorkspaces(hub.openWorkspaces.current())
-    hub.spawnTargets.load().catch(() => {})
-    hub.openWorkspaces.load().catch(() => {})
+    waitForHub(hubId).then((hub) => {
+      if (cancelled || !hub) return
 
-    unsubs.push(
-      hub.spawnTargets.onChange((targets) => {
-        setSpawnTargets(Array.isArray(targets) ? targets : [])
-      })
-    )
+      hub.requestSpawnTargets?.()
+      hub.requestOpenWorkspaces?.()
 
-    unsubs.push(
-      hub.on('agentConfig', ({ targetId, accessories: accs }) => {
-        setSelectedTargetId((currentTarget) => {
-          if (targetId && currentTarget && targetId !== currentTarget) return currentTarget
-          setAccessories(Array.isArray(accs) ? accs : [])
-          return currentTarget
+      unsubs.push(
+        hub.on('agentConfig', ({ targetId, accessories: accs }) => {
+          setSelectedTargetId((currentTarget) => {
+            if (targetId && currentTarget !== targetId) return currentTarget
+            setAccessories(Array.isArray(accs) ? accs : [])
+            setConfigStatus('loaded')
+            return currentTarget
+          })
         })
-      })
-    )
-
-    unsubs.push(
-      hub.openWorkspaces.onChange((wss) => {
-        setWorkspaces(Array.isArray(wss) ? wss : [])
-      })
-    )
-
-    unsubscribersRef.current = unsubs
+      )
+    })
 
     return () => {
+      cancelled = true
       unsubs.forEach((unsub) => unsub())
-      unsubscribersRef.current = []
     }
   }, [open, hubId])
+
+  useEffect(() => {
+    if (!open || !hubId || spawnTargets.length === 0) return
+    let cancelled = false
+
+    waitForHub(hubId).then((hub) => {
+      if (cancelled || !hub) return
+      spawnTargets.forEach((target, index) => {
+        const targetId = entityId(target, `target:${index}`)
+        if (!targetId || hub.hasAgentConfig?.(targetId)) return
+        hub.ensureAgentConfig?.(targetId).catch(() => {})
+      })
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [open, hubId, spawnTargets])
 
   // Apply pre-selected target from context
   useEffect(() => {
@@ -81,20 +104,46 @@ export default function NewAccessoryForm({ hubId }) {
       setSelectedAccessory(null)
       setWorkspaceChoice(null)
       setAccessories([])
+      setConfigStatus('idle')
       setSubmitting(false)
     }
   }, [open])
 
-  function applyTarget(targetId) {
+  async function applyTarget(targetId) {
     setSelectedTargetId(targetId)
     setSelectedAccessory(null)
+    setAccessories([])
 
-    const hub = getHub(hubId)
-    if (!hub || !targetId) return
+    const hub = await waitForHub(hubId)
+    if (!hub || !targetId) {
+      setConfigStatus('idle')
+      return
+    }
 
-    const config = hub.getAgentConfig(targetId)
-    setAccessories(Array.isArray(config.accessories) ? config.accessories : [])
-    hub.ensureAgentConfig(targetId, { force: true }).catch(() => {})
+    const cached = hub.getAgentConfigState?.(targetId)
+    if (cached?.status === 'loaded') {
+      const config = cached.value
+      setAccessories(Array.isArray(config.accessories) ? config.accessories : [])
+      setConfigStatus('loaded')
+    } else {
+      setConfigStatus('loading')
+    }
+
+    hub.ensureAgentConfig(targetId)
+      .then((config) => {
+        setSelectedTargetId((currentTarget) => {
+          if (currentTarget !== targetId) return currentTarget
+          setAccessories(Array.isArray(config?.accessories) ? config.accessories : [])
+          setConfigStatus('loaded')
+          return currentTarget
+        })
+      })
+      .catch(() => {
+        setSelectedTargetId((currentTarget) => {
+          if (currentTarget === targetId) setConfigStatus('error')
+          return currentTarget
+        })
+      })
   }
 
   function handleTargetChange(e) {
@@ -104,7 +153,7 @@ export default function NewAccessoryForm({ hubId }) {
   async function handleSubmit() {
     if (!selectedAccessory || !selectedTargetId) return
 
-    const hub = getHub(hubId)
+    const hub = await waitForHub(hubId)
     if (!hub) return
 
     setSubmitting(true)
@@ -121,10 +170,8 @@ export default function NewAccessoryForm({ hubId }) {
       return
     }
 
-    await Promise.allSettled([
-      hub.agents.load({ force: true }),
-      hub.openWorkspaces.load({ force: true }),
-    ])
+    hub.requestAgents?.()
+    hub.requestOpenWorkspaces?.()
 
     close()
   }
@@ -148,11 +195,11 @@ export default function NewAccessoryForm({ hubId }) {
             <option value="">
               {spawnTargets.length ? 'Select a spawn target' : 'No admitted spawn targets'}
             </option>
-            {spawnTargets.map((target) => {
-              const branchSuffix = target.current_branch ? ` (${target.current_branch})` : ''
+            {spawnTargets.map((target, index) => {
+              const id = entityId(target, `target:${index}`)
               return (
-                <option key={target.id} value={target.id}>
-                  {(target.name || target.path) + branchSuffix}
+                <option key={id} value={id}>
+                  {spawnTargetLabel(target)}
                 </option>
               )
             })}
@@ -162,7 +209,13 @@ export default function NewAccessoryForm({ hubId }) {
         {/* Accessory list */}
         {selectedTargetId && (
           <div className="mt-6">
-            {accessories.length > 0 ? (
+            {configStatus === 'loading' ? (
+              <div className="rounded-lg border border-zinc-700 bg-zinc-900/70 px-4 py-3">
+                <p className="text-sm text-zinc-300">
+                  Loading accessory configurations for this spawn target...
+                </p>
+              </div>
+            ) : accessories.length > 0 ? (
               <>
                 <p className="text-sm/6 font-medium text-zinc-950 dark:text-white">Accessory configuration</p>
                 <div className="mt-2 space-y-2">
@@ -186,6 +239,12 @@ export default function NewAccessoryForm({ hubId }) {
                   ))}
                 </div>
               </>
+            ) : configStatus === 'error' ? (
+              <div className="rounded-lg border border-red-500/20 bg-red-500/5 px-4 py-3">
+                <p className="text-sm text-red-300">
+                  Could not load accessory configurations for this target.
+                </p>
+              </div>
             ) : (
               <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-4 py-3">
                 <p className="text-sm text-amber-300">

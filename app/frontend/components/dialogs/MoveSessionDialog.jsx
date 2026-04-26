@@ -8,7 +8,8 @@ import {
   useSessionStore,
   useWorkspaceEntityStore,
 } from '../../store/entities'
-import { getHub } from '../../lib/hub-bridge'
+import { waitForHub } from '../../lib/hub-bridge'
+import { activeWorkspacesExcept } from '../../store/selectors/settings-selectors'
 
 // Wire protocol: workspace.agents arrays are gone — membership is
 // derived client-side by joining sessions where workspace_id matches. The
@@ -31,32 +32,24 @@ export default function MoveSessionDialog({ hubId }) {
   const session = sessionsById[context.sessionId]
   const sessionName = session ? displayName(session) : 'this session'
 
-  // Wire protocol: derive membership client-side. Active workspaces are
-  // any with status==='active'; current workspace is the one whose id
-  // matches this session's workspace_id.
-  const workspaces = Object.values(workspacesById).filter(
-    (ws) => ws && ws.status === 'active'
-  )
   const currentWorkspaceId = session?.workspace_id ?? null
-  const otherWorkspaces = workspaces.filter(
-    (ws) => (ws?.workspace_id ?? ws?.id) !== currentWorkspaceId
-  )
+  const otherWorkspaces = activeWorkspacesExcept(workspacesById, currentWorkspaceId)
 
   useEffect(() => {
     if (open) setNewWorkspaceName('')
   }, [open])
 
-  function moveToExisting(workspaceId, workspaceName) {
-    const hub = getHub(hubId)
+  async function moveToExisting(workspaceId, workspaceName) {
+    const hub = await waitForHub(hubId)
     if (hub) hub.moveAgentWorkspace(context.sessionId, workspaceId, workspaceName)
     close()
   }
 
-  function moveToNew(e) {
+  async function moveToNew(e) {
     e.preventDefault()
     const target = newWorkspaceName.trim()
     if (!target) return
-    const hub = getHub(hubId)
+    const hub = await waitForHub(hubId)
     if (hub) hub.moveAgentWorkspace(context.sessionId, null, target)
     close()
   }

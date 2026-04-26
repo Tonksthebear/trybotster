@@ -283,88 +283,72 @@ end
 
 ### Goal
 
-Hub serves its own web UI using Hotwire (Turbo + Stimulus), customizable via Lua and templates.
+Hub feeds a Rails-hosted React/Catalyst web UI with structured Lua layout/state definitions. Rails owns the trusted renderer, styling, accessibility, and routing shell; hub/Lua owns authoritative state and declarative composition.
 
 ### Architecture
 
 ```
 Browser
-├── Turbo (Drive, Frames, Streams)
-├── Stimulus controllers
-├── botster.js (WebSocket connection)
-└── User's custom JS (optional)
+├── React runtime
+├── Catalyst/Tailwind components
+├── Shared hub connection
+└── Structured action dispatch
         │
-        │ WebSocket
+        │ Hub transport
         ▼
 Hub (Lua)
-├── routes.lua (HTTP endpoints)
-├── hooks.lua (Turbo Stream broadcasts)
-├── templates/*.liquid
-└── static/controllers/*.js
+├── layout.lua (surface composition)
+├── collections.lua (normalized state)
+├── actions.lua (structured commands)
+└── hooks.lua (state/event production)
 ```
 
-### Lua Routes
+### Lua Surfaces
 
 ```lua
-routes.get("/dashboard", function(req)
-    return render("dashboard.liquid", {
-        agents = hub:list_agents(),
-        user = req.user,
+web.surface("dashboard", function(ctx)
+    return ui.column({
+        ui.workspace_list({ collection = "workspaces" }),
+        ui.session_table({ collection = "sessions" }),
+    })
+end)
+```
+
+### State Events from Hooks
+
+```lua
+hooks.register("on_agent_spawned", "session_collection", function(agent)
+    collections.sessions:upsert(agent.id, {
+        title = agent.title,
+        status = agent.status,
+        workspace_id = agent.workspace_id,
     })
 end)
 
-routes.post("/agents/:id/kill", function(req)
-    hub:kill_agent(req.params.id)
-    return redirect("/dashboard")
+hooks.register("on_agent_exited", "session_collection", function(agent)
+    collections.sessions:patch(agent.id, { status = "exited" })
 end)
 ```
 
-### Turbo Streams from Hooks
+### React Renderer
 
-```lua
-hooks.register("on_agent_spawned", "turbo_broadcast", function(agent)
-    web.turbo_stream("append", "agents",
-        render("_agent_card.liquid", { agent = agent })
-    )
-end)
+The browser renders trusted primitives. Plugins provide data and primitive composition, not arbitrary JavaScript:
 
-hooks.register("on_agent_output", "turbo_broadcast", function(agent, output)
-    web.turbo_stream("append", "terminal-" .. agent.id,
-        render("_terminal_output.liquid", { output = output })
-    )
-end)
-```
-
-### Stimulus Controllers
-
-Ship default controllers for terminal, agent cards, etc. Users can override:
-
-```javascript
-// user/controllers/agent_controller.js
-import { Controller } from "@hotwired/stimulus"
-
-export default class extends Controller {
-    celebrate() {
-        confetti({ particleCount: 100 })
-    }
-}
+```tsx
+registry.register("session_table", SessionTable)
+registry.register("workspace_list", WorkspaceList)
 ```
 
 ### User Customization
 
-**Templates:**
-```liquid
-<!-- user/templates/dashboard.liquid -->
-<div class="my-custom-dashboard">
-    <!-- Their design -->
-</div>
-```
-
-**Routes:**
+**Surfaces:**
 ```lua
--- user/routes.lua
-routes.get("/dashboard", function(req)
-    return render("user/my_dashboard.liquid", { ... })
+-- user/web.lua
+web.surface("dashboard", function(ctx)
+    return ui.row({
+        ui.workspace_list({ width = "30%" }),
+        ui.session_detail({ width = "70%" }),
+    })
 end)
 ```
 
@@ -378,10 +362,10 @@ end)
 
 ### Success Criteria
 
-1. Hub serves functional web UI with Hotwire
-2. Real-time updates via Turbo Streams
-3. User can override templates, routes, hooks
-4. Stimulus controllers work for interactivity
+1. Web UI renders from React/Catalyst primitives
+2. Real-time updates flow through hub collections/events
+3. User/plugin Lua can override surfaces and hooks
+4. Browser actions dispatch structured commands back to the hub
 
 ---
 
@@ -497,10 +481,10 @@ Phase 3: TUI
 └── Verify performance
 
 Phase 4: Web
-├── Add HTTP/WebSocket primitives
-├── Lua routes + Liquid templates
-├── Turbo Stream integration
-├── Stimulus controllers
+├── Add hub collection/event primitives
+├── Lua surface composition
+├── React/Catalyst primitive registry
+├── Structured action dispatch
 
 Phase 5: Self-improvement
 ├── File watching
@@ -542,22 +526,22 @@ Feature flags per component allow gradual rollout.
 │   │   ├── widgets.lua
 │   │   └── layout.lua
 │   └── web/
-│       ├── routes.lua
-│       ├── turbo.lua
-│       └── templates/
+│       ├── layout.lua
+│       ├── collections.lua
+│       └── actions.lua
 │
 ├── default/                   # Default behaviors (overridable)
 │   ├── hooks.lua
 │   ├── layout.lua
 │   ├── keybindings.lua
 │   └── web/
-│       ├── routes.lua
-│       └── templates/
+│       ├── layout.lua
+│       └── actions.lua
 │
 ├── user/                      # User customizations
 │   ├── hooks.lua
 │   ├── layout.lua
-│   ├── routes.lua
+│   ├── web.lua
 │   └── templates/
 │
 └── improvements/              # Agent-written code

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { getHub } from '../../lib/hub-bridge'
+import { waitForHub } from '../../lib/hub-bridge'
 import { useHubStore } from '../../store/hub-store'
 import { useHubMetaStore } from '../../store/entities/hub-meta-store'
 import { resolveHubStatus } from '../../lib/connections/hub_connection_status'
@@ -77,16 +77,11 @@ export default function SidebarConnectionStatus() {
       })
     })
 
-    // Hub connection status — poll until hub is available
+    // Hub connection status from the route-owned shared hub session.
     let cancelled = false
-    let pollTimer = null
 
-    function trySubscribe() {
-      const hubObj = getHub(selectedHubId)
-      if (!hubObj) {
-        if (!cancelled) pollTimer = setTimeout(trySubscribe, 500)
-        return
-      }
+    const subscribe = (hubObj) => {
+      if (cancelled || !hubObj) return
 
       const current = hubObj.connectionStatus?.current()
       if (current) {
@@ -102,11 +97,10 @@ export default function SidebarConnectionStatus() {
       if (unsub) teardowns.push(unsub)
     }
 
-    trySubscribe()
+    waitForHub(selectedHubId).then(subscribe)
 
     return () => {
       cancelled = true
-      clearTimeout(pollTimer)
       teardowns.forEach((fn) => fn())
     }
   }, [selectedHubId])

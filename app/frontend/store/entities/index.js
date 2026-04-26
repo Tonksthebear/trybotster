@@ -58,7 +58,7 @@ export function storeFor(entityType) {
 /**
  * Returns true when `messageType` is one of the four entity envelope
  * names. Used by hub_connection.handleMessage to short-circuit before
- * branching into the legacy switch.
+ * checking one-shot RPC response frames.
  */
 export function isEntityFrame(messageType) {
   return (
@@ -72,7 +72,7 @@ export function isEntityFrame(messageType) {
 /**
  * Apply a single entity envelope to the appropriate store. Returns
  * true when the frame was recognised; the caller can stop forwarding
- * to the legacy switch.
+ * to one-shot RPC response handling.
  */
 export function applyEntityFrame(frame) {
   const messageType = frame?.type

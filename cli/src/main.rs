@@ -322,10 +322,9 @@ fn run_with_tui() -> Result<()> {
     // Start socket server for IPC (allows `botster attach` and plugin access)
     hub.start_socket_server()?;
 
-    // Eagerly generate the pairing URL so the in-app `ui.connection_code{}`
-    // composite (cli/lua/web/layout.lua) can render as soon as a browser
-    // subscribes — without waiting for the user to open the Share dialog or
-    // press the TUI's QR shortcut. Headless mode does the same at line 236.
+    // Eagerly generate the pairing URL so the connection_code entity is ready
+    // for late subscribers and the Share dialog can render without waiting
+    // for the TUI's QR shortcut. Headless mode does the same at line 236.
     if !botster::env::is_offline() {
         hub.eager_generate_connection_url();
     }

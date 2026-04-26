@@ -1,6 +1,6 @@
 import { HubConnectionManager } from "connections/hub_connection_manager";
 import { HubTransport } from "connections/hub_connection";
-import { HubCollection, HubResource, HubScopedResource } from "connections/hub_resource";
+import { HubResource, HubScopedResource } from "connections/hub_resource";
 import {
   buildHubConnectionStatus,
   DEFAULT_HUB_CONNECTION_STATUS,
@@ -12,11 +12,7 @@ const EMPTY_CONFIG = Object.freeze({
   workspaces: [],
 });
 
-const DEFAULT_PREFETCH = Object.freeze([
-  "agents",
-  "openWorkspaces",
-  "spawnTargets",
-]);
+const DEFAULT_PREFETCH = Object.freeze([]);
 
 function cloneConfig(value) {
   return {
@@ -37,35 +33,6 @@ export class HubSession {
     this.subscribers = new Map();
     this.unsubscribers = [];
     this.destroyed = false;
-
-    this.agents = new HubCollection({
-      load: () => this.#requestCollection({
-        eventName: "agentList",
-        request: () => this.transport?.requestAgents(),
-        timeoutMs: 8000,
-      }),
-    });
-
-    this.workspaces = new HubCollection({
-      load: () => this.#requestCollection({
-        eventName: "hubWorkspaceList",
-        request: () => this.transport?.requestWorkspaces(),
-      }),
-    });
-
-    this.openWorkspaces = new HubCollection({
-      load: () => this.#requestCollection({
-        eventName: "openWorkspaceList",
-        request: () => this.transport?.requestOpenWorkspaces(),
-      }),
-    });
-
-    this.spawnTargets = new HubCollection({
-      load: () => this.#requestCollection({
-        eventName: "spawnTargetList",
-        request: () => this.transport?.requestSpawnTargets(),
-      }),
-    });
 
     this.recoveryState = new HubResource({
       initialValue: null,
@@ -91,18 +58,6 @@ export class HubSession {
       }),
     });
 
-    this.worktrees = new HubScopedResource({
-      createEntry: (targetId) => new HubCollection({
-        load: () => {
-          if (!targetId) return Promise.resolve([]);
-          return this.#requestCollection({
-            eventName: "worktreeList",
-            request: () => this.transport?.requestWorktrees(targetId),
-            match: (payload) => (payload?.targetId || null) === targetId,
-          });
-        },
-      }),
-    });
   }
 
   async initialize() {
@@ -189,72 +144,12 @@ export class HubSession {
     return this.on("stateChange", callback);
   }
 
-  onAgentList(callback) {
-    return this.agents.onChange(callback);
-  }
-
   onConnectionStatusChange(callback) {
     return this.connectionStatus.onChange(callback);
   }
 
-  onWorkspaceList(callback) {
-    return this.workspaces.onChange(callback);
-  }
-
-  onOpenWorkspaceList(callback) {
-    return this.openWorkspaces.onChange(callback);
-  }
-
-  onWorktreeList(callback) {
-    return this.on("worktreeList", callback);
-  }
-
-  onSpawnTargetList(callback) {
-    return this.spawnTargets.onChange(callback);
-  }
-
-  async prefetch(resources = DEFAULT_PREFETCH) {
-    const loaders = [];
-
-    for (const resource of resources) {
-      switch (resource) {
-        case "agents":
-          loaders.push(this.agents.load().catch(() => {}));
-          break;
-        case "workspaces":
-          loaders.push(this.workspaces.load().catch(() => {}));
-          break;
-        case "openWorkspaces":
-          loaders.push(this.openWorkspaces.load().catch(() => {}));
-          break;
-        case "spawnTargets":
-          loaders.push(this.spawnTargets.load().catch(() => {}));
-          break;
-      }
-    }
-
-    await Promise.all(loaders);
-  }
-
-  ensureAgents(options = {}) {
-    return this.agents.load(options);
-  }
-
-  ensureWorkspaces(options = {}) {
-    return this.workspaces.load(options);
-  }
-
-  ensureOpenWorkspaces(options = {}) {
-    return this.openWorkspaces.load(options);
-  }
-
-  ensureSpawnTargets(options = {}) {
-    return this.spawnTargets.load(options);
-  }
-
-  ensureWorktrees(targetId, options = {}) {
-    if (!targetId) return Promise.resolve([]);
-    return this.worktrees.load(targetId, options);
+  async prefetch(_resources = DEFAULT_PREFETCH) {
+    return Promise.resolve();
   }
 
   ensureAgentConfig(targetId, options = {}) {
@@ -266,55 +161,31 @@ export class HubSession {
     return this.configs.current(targetId);
   }
 
+  getAgentConfigState(targetId) {
+    return this.configs.snapshot(targetId);
+  }
+
   hasAgentConfig(targetId) {
     return this.configs.isLoaded(targetId);
   }
 
-  getWorktrees(targetId) {
-    return this.worktrees.current(targetId);
-  }
-
-  hasWorktrees(targetId) {
-    return this.worktrees.isLoaded(targetId);
-  }
-
   #bindTransport() {
     const passthroughEvents = [
-      "agentCreated",
-      "agentDeleted",
       "spawnTargetFeedback",
-      "connectionCode",
       "hubReady",
       "sessionTypes",
+      "push:status",
+      "push:vapid_key",
+      "push:sub_ack",
+      "push:vapid_keys",
+      "push:test_ack",
+      "push:disable_ack",
       "message",
       "error",
       "connectionModeChange",
     ];
 
     this.unsubscribers.push(
-      this.transport.onAgentList((agents) => {
-        const normalized = this.agents.set(agents);
-        this.emit("agentList", normalized);
-      }),
-      this.transport.onOpenWorkspaceList((workspaces) => {
-        const normalized = this.openWorkspaces.set(workspaces);
-        this.emit("openWorkspaceList", normalized);
-      }),
-      this.transport.on("hubWorkspaceList", (workspaces) => {
-        const normalized = this.workspaces.set(workspaces);
-        this.emit("workspaceList", normalized);
-      }),
-      this.transport.on("spawnTargetList", (targets) => {
-        const normalized = this.spawnTargets.set(targets);
-        this.#pruneTargetScopedCaches(normalized);
-        this.emit("spawnTargetList", normalized);
-      }),
-      this.transport.on("worktreeList", (payload) => {
-        const targetId = payload?.targetId || null;
-        const worktrees = Array.isArray(payload?.worktrees) ? payload.worktrees : [];
-        this.worktrees.set(targetId, worktrees);
-        this.emit("worktreeList", { targetId, worktrees });
-      }),
       this.transport.on("agentConfig", (payload) => {
         const normalized = cloneConfig(payload);
         const targetId = normalized.targetId || null;
@@ -362,22 +233,6 @@ export class HubSession {
 
   #hydrateFromTransport() {
     this.#syncConnectionStatus();
-
-    if (this.transport.hasAgentListSnapshot()) {
-      this.agents.set(this.transport.getAgents());
-    }
-
-    if (this.transport.hasHubWorkspaceListSnapshot()) {
-      this.workspaces.set(this.transport.getHubWorkspaces());
-    }
-
-    if (this.transport.hasOpenWorkspaceListSnapshot()) {
-      this.openWorkspaces.set(this.transport.getOpenWorkspaces());
-    }
-
-    if (this.transport.hasSpawnTargetListSnapshot()) {
-      this.spawnTargets.set(this.transport.getSpawnTargets());
-    }
 
     if (this.transport.hasHubRecoveryStateSnapshot()) {
       this.recoveryState.set(this.transport.getHubRecoveryState());
@@ -446,15 +301,6 @@ export class HubSession {
     }
 
     return resourceEvent;
-  }
-
-  #pruneTargetScopedCaches(targets) {
-    const targetIds = (Array.isArray(targets) ? targets : [])
-      .map((target) => target?.id)
-      .filter(Boolean);
-
-    this.configs.retain(targetIds);
-    this.worktrees.retain(targetIds);
   }
 
   #syncConnectionStatus() {

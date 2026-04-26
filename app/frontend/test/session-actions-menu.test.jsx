@@ -44,6 +44,15 @@ class FakeTransport {
 
 let fakeTransport
 
+function immediateHub(transport) {
+  return {
+    then(resolve) {
+      resolve({ transport })
+      return Promise.resolve({ transport })
+    },
+  }
+}
+
 const MENU_TRIGGER_TREE = {
   type: 'icon_button',
   props: {
@@ -58,9 +67,7 @@ const MENU_TRIGGER_TREE = {
 
 beforeEach(() => {
   fakeTransport = new FakeTransport()
-  vi.spyOn(hubBridge, 'getHub').mockReturnValue({
-    transport: fakeTransport,
-  })
+  vi.spyOn(hubBridge, 'waitForHub').mockImplementation(() => immediateHub(fakeTransport))
   // Wire protocol: seed the session entity store directly.
   useSessionStore.setState({
     byId: {
