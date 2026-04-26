@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { Dialog, DialogTitle, DialogDescription, DialogBody, DialogActions } from '../catalyst/dialog'
 import { Field, Label, Description } from '../catalyst/fieldset'
 import { Input } from '../catalyst/input'
@@ -6,6 +7,7 @@ import { Select } from '../catalyst/select'
 import { Button } from '../catalyst/button'
 import { useDialogStore } from '../../store/dialog-store'
 import { waitForHub } from '../../lib/hub-bridge'
+import { agentConfigQueryOptions, useAgentConfigQuery } from '../../lib/queries'
 import WorkspacePicker from './WorkspacePicker'
 import {
   useSpawnTargetStore,
@@ -23,8 +25,7 @@ export default function NewAgentForm({ hubId }) {
   const { activeDialog, context, close } = useDialogStore()
   const open = activeDialog === 'newAgent'
 
-  const [agents, setAgents] = useState([])
-  const [configStatus, setConfigStatus] = useState('idle') // idle | loading | loaded | error
+  const queryClient = useQueryClient()
 
   // Form state
   const [selectedTargetId, setSelectedTargetId] = useState('')
@@ -57,6 +58,20 @@ export default function NewAgentForm({ hubId }) {
     () => workspaceOrder.map((id) => normalizedWorkspace(workspacesById[id])).filter(Boolean),
     [workspaceOrder, workspacesById],
   )
+  const agentConfigQuery = useAgentConfigQuery(hubId, selectedTargetId, {
+    enabled: open && !!selectedTargetId,
+  })
+  const agents = useMemo(
+    () => Array.isArray(agentConfigQuery.data?.agents) ? agentConfigQuery.data.agents : [],
+    [agentConfigQuery.data],
+  )
+  const configStatus = !selectedTargetId
+    ? 'idle'
+    : agentConfigQuery.isError
+      ? 'error'
+      : agentConfigQuery.isPending
+        ? 'loading'
+        : 'loaded'
 
   // Subscribe to hub data when dialog opens
   useEffect(() => {
@@ -71,19 +86,6 @@ export default function NewAgentForm({ hubId }) {
       hub.requestSpawnTargets?.()
       hub.requestOpenWorkspaces?.()
       hub.requestWorktrees?.(context.targetId || null)
-
-      unsubs.push(
-        hub.on('agentConfig', ({ targetId, agents: ags }) => {
-          setSelectedTargetId((currentTarget) => {
-            if (targetId && currentTarget !== targetId) return currentTarget
-            const list = Array.isArray(ags) ? ags : []
-            setAgents(list)
-            setSelectedAgent((prev) => (prev && list.includes(prev)) ? prev : (list[0] || ''))
-            setConfigStatus('loaded')
-            return currentTarget
-          })
-        })
-      )
     })
 
     return () => {
@@ -102,15 +104,19 @@ export default function NewAgentForm({ hubId }) {
       if (cancelled || !hub) return
       spawnTargets.forEach((target, index) => {
         const targetId = entityId(target, `target:${index}`)
-        if (!targetId || hub.hasAgentConfig?.(targetId)) return
-        hub.ensureAgentConfig?.(targetId).catch(() => {})
+        if (!targetId) return
+        queryClient.prefetchQuery(agentConfigQueryOptions(hubId, targetId))
       })
     })
 
     return () => {
       cancelled = true
     }
-  }, [open, hubId, spawnTargets])
+  }, [open, hubId, spawnTargets, queryClient])
+
+  useEffect(() => {
+    setSelectedAgent((prev) => (prev && agents.includes(prev)) ? prev : (agents[0] || ''))
+  }, [agents])
 
   // Apply pre-selected target from context (from NewSessionChooser)
   useEffect(() => {
@@ -130,8 +136,6 @@ export default function NewAgentForm({ hubId }) {
       setSelectedAgent('')
       setWorkspaceChoice(null)
       setSelectedTargetId('')
-      setAgents([])
-      setConfigStatus('idle')
       setSubmitting(false)
     }
   }, [open])
@@ -139,44 +143,12 @@ export default function NewAgentForm({ hubId }) {
   async function applyTarget(targetId) {
     setSelectedTargetId(targetId)
     setPendingSelection(null)
-    setAgents([])
     setSelectedAgent('')
 
     const hub = await waitForHub(hubId)
-    if (!hub || !targetId) {
-      setConfigStatus('idle')
-      return
-    }
-
-    const cached = hub.getAgentConfigState?.(targetId)
-    if (cached?.status === 'loaded') {
-      const config = cached.value
-      const agentList = Array.isArray(config.agents) ? config.agents : []
-      setAgents(agentList)
-      setSelectedAgent(agentList[0] || '')
-      setConfigStatus('loaded')
-    } else {
-      setConfigStatus('loading')
-    }
+    if (!hub || !targetId) return
 
     hub.requestWorktrees?.(targetId)
-    hub.ensureAgentConfig(targetId)
-      .then((config) => {
-        setSelectedTargetId((currentTarget) => {
-          if (currentTarget !== targetId) return currentTarget
-          const agentList = Array.isArray(config?.agents) ? config.agents : []
-          setAgents(agentList)
-          setSelectedAgent((prev) => (prev && agentList.includes(prev)) ? prev : (agentList[0] || ''))
-          setConfigStatus('loaded')
-          return currentTarget
-        })
-      })
-      .catch(() => {
-        setSelectedTargetId((currentTarget) => {
-          if (currentTarget === targetId) setConfigStatus('error')
-          return currentTarget
-        })
-      })
   }
 
   function handleTargetChange(e) {
@@ -216,17 +188,11 @@ export default function NewAgentForm({ hubId }) {
     const hub = await waitForHub(hubId)
     if (!hub) return
     hub.requestWorktrees?.(selectedTargetId)
-    setConfigStatus('loading')
-    setAgents([])
     setSelectedAgent('')
-    hub.ensureAgentConfig(selectedTargetId, { force: true })
-      .then((config) => {
-        const agentList = Array.isArray(config?.agents) ? config.agents : []
-        setAgents(agentList)
-        setSelectedAgent(agentList[0] || '')
-        setConfigStatus('loaded')
-      })
-      .catch(() => setConfigStatus('error'))
+    await queryClient.fetchQuery(agentConfigQueryOptions(hubId, selectedTargetId, {
+      force: true,
+      staleTime: 0,
+    }))
   }
 
   async function handleSubmit() {

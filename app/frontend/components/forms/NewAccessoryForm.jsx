@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useMemo } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { Dialog, DialogTitle, DialogDescription, DialogBody, DialogActions } from '../catalyst/dialog'
 import { Field, Label, Description } from '../catalyst/fieldset'
 import { Select } from '../catalyst/select'
 import { Button } from '../catalyst/button'
 import { useDialogStore } from '../../store/dialog-store'
 import { waitForHub } from '../../lib/hub-bridge'
+import { agentConfigQueryOptions, useAgentConfigQuery } from '../../lib/queries'
 import WorkspacePicker from './WorkspacePicker'
 import {
   useSpawnTargetStore,
@@ -19,6 +21,7 @@ import {
 export default function NewAccessoryForm({ hubId }) {
   const { activeDialog, context, close } = useDialogStore()
   const open = activeDialog === 'newAccessory'
+  const queryClient = useQueryClient()
 
   const spawnTargetOrder = useSpawnTargetStore((state) => state.order)
   const spawnTargetsById = useSpawnTargetStore((state) => state.byId)
@@ -32,14 +35,25 @@ export default function NewAccessoryForm({ hubId }) {
     () => workspaceOrder.map((id) => normalizedWorkspace(workspacesById[id])).filter(Boolean),
     [workspaceOrder, workspacesById],
   )
-  const [accessories, setAccessories] = useState([])
-  const [configStatus, setConfigStatus] = useState('idle') // idle | loading | loaded | error
-
   const [selectedTargetId, setSelectedTargetId] = useState('')
   const [selectedAccessory, setSelectedAccessory] = useState(null)
   // { id: string|null, name: string|null } | null
   const [workspaceChoice, setWorkspaceChoice] = useState(null)
   const [submitting, setSubmitting] = useState(false)
+  const agentConfigQuery = useAgentConfigQuery(hubId, selectedTargetId, {
+    enabled: open && !!selectedTargetId,
+  })
+  const accessories = useMemo(
+    () => Array.isArray(agentConfigQuery.data?.accessories) ? agentConfigQuery.data.accessories : [],
+    [agentConfigQuery.data],
+  )
+  const configStatus = !selectedTargetId
+    ? 'idle'
+    : agentConfigQuery.isError
+      ? 'error'
+      : agentConfigQuery.isPending
+        ? 'loading'
+        : 'loaded'
 
   // Subscribe to hub data
   useEffect(() => {
@@ -53,17 +67,6 @@ export default function NewAccessoryForm({ hubId }) {
 
       hub.requestSpawnTargets?.()
       hub.requestOpenWorkspaces?.()
-
-      unsubs.push(
-        hub.on('agentConfig', ({ targetId, accessories: accs }) => {
-          setSelectedTargetId((currentTarget) => {
-            if (targetId && currentTarget !== targetId) return currentTarget
-            setAccessories(Array.isArray(accs) ? accs : [])
-            setConfigStatus('loaded')
-            return currentTarget
-          })
-        })
-      )
     })
 
     return () => {
@@ -80,15 +83,15 @@ export default function NewAccessoryForm({ hubId }) {
       if (cancelled || !hub) return
       spawnTargets.forEach((target, index) => {
         const targetId = entityId(target, `target:${index}`)
-        if (!targetId || hub.hasAgentConfig?.(targetId)) return
-        hub.ensureAgentConfig?.(targetId).catch(() => {})
+        if (!targetId) return
+        queryClient.prefetchQuery(agentConfigQueryOptions(hubId, targetId))
       })
     })
 
     return () => {
       cancelled = true
     }
-  }, [open, hubId, spawnTargets])
+  }, [open, hubId, spawnTargets, queryClient])
 
   // Apply pre-selected target from context
   useEffect(() => {
@@ -103,8 +106,6 @@ export default function NewAccessoryForm({ hubId }) {
       setSelectedTargetId('')
       setSelectedAccessory(null)
       setWorkspaceChoice(null)
-      setAccessories([])
-      setConfigStatus('idle')
       setSubmitting(false)
     }
   }, [open])
@@ -112,38 +113,9 @@ export default function NewAccessoryForm({ hubId }) {
   async function applyTarget(targetId) {
     setSelectedTargetId(targetId)
     setSelectedAccessory(null)
-    setAccessories([])
 
     const hub = await waitForHub(hubId)
-    if (!hub || !targetId) {
-      setConfigStatus('idle')
-      return
-    }
-
-    const cached = hub.getAgentConfigState?.(targetId)
-    if (cached?.status === 'loaded') {
-      const config = cached.value
-      setAccessories(Array.isArray(config.accessories) ? config.accessories : [])
-      setConfigStatus('loaded')
-    } else {
-      setConfigStatus('loading')
-    }
-
-    hub.ensureAgentConfig(targetId)
-      .then((config) => {
-        setSelectedTargetId((currentTarget) => {
-          if (currentTarget !== targetId) return currentTarget
-          setAccessories(Array.isArray(config?.accessories) ? config.accessories : [])
-          setConfigStatus('loaded')
-          return currentTarget
-        })
-      })
-      .catch(() => {
-        setSelectedTargetId((currentTarget) => {
-          if (currentTarget === targetId) setConfigStatus('error')
-          return currentTarget
-        })
-      })
+    if (!hub || !targetId) return
   }
 
   function handleTargetChange(e) {

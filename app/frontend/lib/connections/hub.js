@@ -157,18 +157,6 @@ export class HubSession {
     return this.configs.load(targetId, options);
   }
 
-  getAgentConfig(targetId) {
-    return this.configs.current(targetId);
-  }
-
-  getAgentConfigState(targetId) {
-    return this.configs.snapshot(targetId);
-  }
-
-  hasAgentConfig(targetId) {
-    return this.configs.isLoaded(targetId);
-  }
-
   #bindTransport() {
     const passthroughEvents = [
       "spawnTargetFeedback",
