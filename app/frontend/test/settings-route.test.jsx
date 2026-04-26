@@ -2,33 +2,39 @@ import React from 'react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import SettingsRoute from '../components/pages/SettingsRoute'
-import { resetSettingsBootstrapCacheForTests } from '../store/settings-bootstrap-store'
 
 vi.mock('../components/settings/SettingsApp', () => ({
   default: ({ hubName }) => <div>{`SettingsApp:${hubName}`}</div>,
 }))
 
-function renderSettingsRoute() {
+function createTestQueryClient() {
+  return new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+}
+
+function renderSettingsRoute(queryClient = createTestQueryClient()) {
   return render(
-    <MemoryRouter initialEntries={['/hubs/1/settings']}>
-      <Routes>
-        <Route path="/hubs/:hubId/settings" element={<SettingsRoute />} />
-      </Routes>
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={['/hubs/1/settings']}>
+        <Routes>
+          <Route path="/hubs/:hubId/settings" element={<SettingsRoute />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
   )
 }
 
 describe('SettingsRoute', () => {
   beforeEach(() => {
-    resetSettingsBootstrapCacheForTests()
     vi.clearAllMocks()
   })
 
   afterEach(() => {
     cleanup()
-    resetSettingsBootstrapCacheForTests()
   })
 
   it('uses cached settings data on warm remounts instead of flashing loading', async () => {
@@ -39,13 +45,14 @@ describe('SettingsRoute', () => {
       }),
     )
 
-    const first = renderSettingsRoute()
+    const queryClient = createTestQueryClient()
+    const first = renderSettingsRoute(queryClient)
     expect(screen.getByText('Loading settings...')).toBeInTheDocument()
     expect(await screen.findByText('SettingsApp:Hub One')).toBeInTheDocument()
     first.unmount()
 
     globalThis.fetch = vi.fn(() => new Promise(() => {}))
-    renderSettingsRoute()
+    renderSettingsRoute(queryClient)
 
     expect(screen.getByText('SettingsApp:Hub One')).toBeInTheDocument()
     await waitFor(() => {

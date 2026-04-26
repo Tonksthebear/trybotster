@@ -33,25 +33,6 @@ export class HubResource {
     return this._loaded;
   }
 
-  isPending() {
-    return this._pending != null;
-  }
-
-  status() {
-    if (this._loaded) return "loaded";
-    if (this._pending) return "loading";
-    return "idle";
-  }
-
-  snapshot() {
-    return {
-      status: this.status(),
-      value: this._value,
-      loaded: this._loaded,
-      pending: this._pending != null,
-    };
-  }
-
   invalidate() {
     this._loaded = false;
   }
@@ -138,14 +119,6 @@ export class HubScopedResource {
 
   isLoaded(targetId = null) {
     return this.forTarget(targetId).isLoaded();
-  }
-
-  status(targetId = null) {
-    return this.forTarget(targetId).status();
-  }
-
-  snapshot(targetId = null) {
-    return this.forTarget(targetId).snapshot();
   }
 
   load(targetId = null, options = {}) {

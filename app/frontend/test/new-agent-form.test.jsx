@@ -1,7 +1,8 @@
 import React from 'react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import NewAgentForm from '../components/forms/NewAgentForm'
 import { useDialogStore } from '../store/dialog-store'
 import {
@@ -16,8 +17,6 @@ const mockHub = {
   agents: {
     load: vi.fn(() => Promise.resolve([])),
   },
-  getAgentConfig: vi.fn(() => ({ agents: [], accessories: [], workspaces: [] })),
-  hasAgentConfig: vi.fn(() => false),
   ensureAgentConfig: vi.fn(() => Promise.resolve()),
   requestSpawnTargets: vi.fn(),
   requestOpenWorkspaces: vi.fn(),
@@ -60,12 +59,24 @@ vi.mock('../components/catalyst/button', () => ({
   Button: ({ children, ...props }) => <button type="button" {...props}>{children}</button>,
 }))
 
+function createTestQueryClient() {
+  return new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+}
+
+function renderNewAgentForm() {
+  return render(
+    <QueryClientProvider client={createTestQueryClient()}>
+      <NewAgentForm hubId="hub-1" />
+    </QueryClientProvider>,
+  )
+}
+
 describe('NewAgentForm', () => {
   beforeEach(() => {
     Object.keys(listeners).forEach((key) => delete listeners[key])
     vi.clearAllMocks()
-    mockHub.getAgentConfig.mockReturnValue({ agents: [], accessories: [], workspaces: [] })
-    mockHub.hasAgentConfig.mockReturnValue(false)
     mockHub.ensureAgentConfig.mockResolvedValue({ agents: [], accessories: [], workspaces: [] })
     _resetEntityStoresForTest()
     useSpawnTargetStore.getState().applySnapshot(
@@ -84,7 +95,7 @@ describe('NewAgentForm', () => {
   })
 
   it('renders worktrees from the target-scoped worktree entity store', async () => {
-    render(<NewAgentForm hubId="hub-1" />)
+    renderNewAgentForm()
 
     await act(async () => {
       useWorktreeStore.getState().applySnapshot(
@@ -121,7 +132,7 @@ describe('NewAgentForm', () => {
       }),
     )
 
-    render(<NewAgentForm hubId="hub-1" />)
+    renderNewAgentForm()
 
     await user.click(screen.getByText('Main branch'))
 
