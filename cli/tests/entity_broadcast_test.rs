@@ -524,6 +524,55 @@ fn upsert_without_registration_warns_and_drops() {
 }
 
 #[test]
+fn hub_upsert_ships_even_when_server_id_is_nil() {
+    // Regression: connections.lua hub_recovery_state listener used to guard
+    // `if not hub.server_id() then return end` before EB.upsert("hub", ...).
+    // Fresh / unpaired hubs have no botster_id yet, so the guard dropped every
+    // recovery transition and the React sidebar stayed stuck on "offline".
+    //
+    // The Rust event source (cli/src/hub/mod.rs:935) already populates the
+    // payload's `hub_id` via Hub::server_hub_id(), which falls back to the
+    // local hub_identifier when no botster_id is assigned. So as long as the
+    // listener forwards the incoming payload (instead of overriding it with a
+    // fresh hub.server_id() call), EB.upsert always has a stable id.
+    //
+    // This test pins the contract: an upsert with `hub_id` supplied in the
+    // payload ships exactly as expected, regardless of server_id state.
+    let (lua, eb) = new_eb_lua();
+    let register: Function = eb.get("register").unwrap();
+    let opts: Table = lua.create_table().unwrap();
+    opts.set("id_field", "hub_id").unwrap();
+    let all_fn: Function = lua
+        .create_function(|lua, ()| Ok(lua.create_table()?))
+        .unwrap();
+    opts.set("all", all_fn).unwrap();
+    register
+        .call::<()>(("hub", opts))
+        .expect("register hub entity");
+    let frames = install_capturing_broadcaster(&lua, &eb);
+
+    // Mimic the listener's payload after merging the Rust-supplied event.
+    // hub_id comes from server_hub_id() fallback; state from the transition.
+    let upsert: Function = eb.get("upsert").unwrap();
+    let payload: Table = lua.create_table().unwrap();
+    payload.set("hub_id", "local-hub-identifier-deadbeef").unwrap();
+    payload.set("state", "ready").unwrap();
+    upsert.call::<()>(("hub", payload)).unwrap();
+
+    let captured = frames_as_json(&lua, &frames);
+    assert_eq!(captured.len(), 1, "hub upsert must emit one frame");
+    let frame = &captured[0];
+    assert_eq!(frame["type"], json!("entity_upsert"));
+    assert_eq!(frame["entity_type"], json!("hub"));
+    assert_eq!(
+        frame["id"],
+        json!("local-hub-identifier-deadbeef"),
+        "id should resolve from payload.hub_id even when no botster_id is set"
+    );
+    assert_eq!(frame["entity"]["state"], json!("ready"));
+}
+
+#[test]
 fn broadcaster_throwing_does_not_propagate() {
     let (lua, eb) = new_eb_lua();
     register_session_type(&lua, &eb);
