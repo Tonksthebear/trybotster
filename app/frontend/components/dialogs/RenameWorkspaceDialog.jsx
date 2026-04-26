@@ -4,7 +4,7 @@ import { Field, Label } from '../catalyst/fieldset'
 import { Input } from '../catalyst/input'
 import { Button } from '../catalyst/button'
 import { useDialogStore } from '../../store/dialog-store'
-import { getHub } from '../../lib/hub-bridge'
+import { waitForHub } from '../../lib/hub-bridge'
 
 export default function RenameWorkspaceDialog({ hubId }) {
   const { activeDialog, context, close } = useDialogStore()
@@ -27,12 +27,12 @@ export default function RenameWorkspaceDialog({ hubId }) {
     }
   }, [open])
 
-  function handleSubmit(e) {
+  async function handleSubmit(e) {
     e.preventDefault()
     const trimmed = name.trim()
     if (!trimmed || trimmed === context.title) return
 
-    const hub = getHub(hubId)
+    const hub = await waitForHub(hubId)
     if (hub) hub.renameWorkspace(context.workspaceId, trimmed)
     close()
   }

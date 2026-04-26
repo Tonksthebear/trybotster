@@ -9,6 +9,7 @@ import { Button } from '../catalyst/button'
 import { Badge } from '../catalyst/badge'
 import { Select } from '../catalyst/select'
 import { Text } from '../catalyst/text'
+import { flattenedTemplates, templateCategories } from '../../store/selectors/settings-selectors'
 
 // ─── Scope Buttons ─────────────────────────────────────────────────
 
@@ -259,7 +260,7 @@ function TemplateTargetSelector() {
 
   function handleChange(e) {
     setSelectedTargetId(e.target.value)
-    setTimeout(() => useSettingsStore.getState().checkInstalled(), 0)
+    useSettingsStore.getState().checkInstalled()
   }
 
   const hint = selectedTargetId
@@ -311,8 +312,7 @@ export default function TemplateCatalog({ templates }) {
     )
   }
 
-  // Flatten templates for preview lookup
-  const allTemplates = Object.values(templates).flat()
+  const allTemplates = flattenedTemplates(templates)
   const previewTemplate = previewSlug
     ? allTemplates.find((t) => t.slug === previewSlug)
     : null
@@ -329,8 +329,7 @@ export default function TemplateCatalog({ templates }) {
         <TemplatePreview template={previewTemplate} />
       ) : (
         <div>
-          {Object.keys(templates)
-            .sort()
+          {templateCategories(templates)
             .map((category) => (
               <div key={category} className="mb-6">
                 <h3 className="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-3">

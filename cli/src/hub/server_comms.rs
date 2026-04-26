@@ -699,6 +699,12 @@ impl Hub {
             HubEvent::LuaPushRequest { payload } => {
                 self.handle_lua_push_request(payload);
             }
+            HubEvent::BrowserPushControl {
+                browser_identity,
+                payload,
+            } => {
+                self.handle_browser_push_control(&browser_identity, &payload);
+            }
             HubEvent::PushSubscriptionsExpired { identities } => {
                 for identity in &identities {
                     self.push_subscriptions.remove(identity);
@@ -2650,41 +2656,8 @@ impl Hub {
             }
         };
 
-        // Intercept push notification protocol messages before Lua
         if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
             match msg_type {
-                "push_sub" => {
-                    self.handle_push_subscription(browser_identity, &msg);
-                    return;
-                }
-                "vapid_generate" => {
-                    self.handle_vapid_generate(browser_identity);
-                    return;
-                }
-                "vapid_key_req" => {
-                    self.handle_vapid_key_request(browser_identity);
-                    return;
-                }
-                "vapid_key_set" => {
-                    self.handle_vapid_key_set(browser_identity, &msg);
-                    return;
-                }
-                "vapid_pub_req" => {
-                    self.handle_vapid_pub_request(browser_identity);
-                    return;
-                }
-                "push_test" => {
-                    self.handle_push_test(browser_identity);
-                    return;
-                }
-                "push_disable" => {
-                    self.handle_push_disable(browser_identity);
-                    return;
-                }
-                "push_status_req" => {
-                    self.handle_push_status_request(browser_identity, &msg);
-                    return;
-                }
                 "dc_ping" => {
                     // Browser sent a heartbeat ping — respond immediately so it
                     // doesn't declare the connection stalled after 3 missed pongs.
@@ -5525,6 +5498,25 @@ impl Hub {
             "[WebPush] Queued VAPID public key for {}",
             &browser_identity[..browser_identity.len().min(8)]
         );
+    }
+
+    fn handle_browser_push_control(&mut self, browser_identity: &str, msg: &serde_json::Value) {
+        let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) else {
+            log::warn!("[WebPush] Browser push control missing type");
+            return;
+        };
+
+        match msg_type {
+            "push_sub" => self.handle_push_subscription(browser_identity, msg),
+            "vapid_generate" => self.handle_vapid_generate(browser_identity),
+            "vapid_key_req" => self.handle_vapid_key_request(browser_identity),
+            "vapid_key_set" => self.handle_vapid_key_set(browser_identity, msg),
+            "vapid_pub_req" => self.handle_vapid_pub_request(browser_identity),
+            "push_test" => self.handle_push_test(browser_identity),
+            "push_disable" => self.handle_push_disable(browser_identity),
+            "push_status_req" => self.handle_push_status_request(browser_identity, msg),
+            other => log::warn!("[WebPush] Unknown browser push control: {other}"),
+        }
     }
 
     /// Handle a push subscription from a browser.

@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { connect, disconnect, getHub } from '../lib/hub-bridge'
+import { connect, disconnect } from '../lib/hub-bridge'
 import { getActionCableConsumer } from '../lib/transport/hub_signaling_client'
 
 const LAST_HUB_KEY = 'botster:lastHubId'
@@ -68,7 +68,7 @@ export const useHubStore = create((set, get) => ({
     localStorage.setItem(LAST_HUB_KEY, hubId)
 
     try {
-      const { connectionId } = await connect(hubId, { surface: 'panel' })
+      const { hub, connectionId } = await connect(hubId, { surface: 'panel' })
 
       // Hub may have changed while awaiting
       if (get().selectedHubId !== hubId) {
@@ -78,7 +78,6 @@ export const useHubStore = create((set, get) => ({
 
       set({ _connectionRef: connectionId })
 
-      const hub = getHub(hubId)
       if (hub) {
         // Read initial status
         const initial = hub.connectionStatus?.current()

@@ -33,6 +33,25 @@ export class HubResource {
     return this._loaded;
   }
 
+  isPending() {
+    return this._pending != null;
+  }
+
+  status() {
+    if (this._loaded) return "loaded";
+    if (this._pending) return "loading";
+    return "idle";
+  }
+
+  snapshot() {
+    return {
+      status: this.status(),
+      value: this._value,
+      loaded: this._loaded,
+      pending: this._pending != null,
+    };
+  }
+
   invalidate() {
     this._loaded = false;
   }
@@ -97,40 +116,6 @@ export class HubResource {
   }
 }
 
-export class HubCollection extends HubResource {
-  constructor(options = {}) {
-    super({
-      initialValue: [],
-      normalize: (value) => (Array.isArray(value) ? value : []),
-      ...options,
-    });
-  }
-
-  async all(options = {}) {
-    return this.load(options);
-  }
-
-  first() {
-    return this.current()[0] || null;
-  }
-
-  find(id, key = "id") {
-    return this.current().find((record) => record?.[key] === id) || null;
-  }
-
-  filter(callback) {
-    return this.current().filter(callback);
-  }
-
-  map(callback) {
-    return this.current().map(callback);
-  }
-
-  forEach(callback) {
-    return this.current().forEach(callback);
-  }
-}
-
 export class HubScopedResource {
   constructor({
     createEntry,
@@ -153,6 +138,14 @@ export class HubScopedResource {
 
   isLoaded(targetId = null) {
     return this.forTarget(targetId).isLoaded();
+  }
+
+  status(targetId = null) {
+    return this.forTarget(targetId).status();
+  }
+
+  snapshot(targetId = null) {
+    return this.forTarget(targetId).snapshot();
   }
 
   load(targetId = null, options = {}) {

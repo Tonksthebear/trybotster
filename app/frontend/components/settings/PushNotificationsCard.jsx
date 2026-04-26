@@ -1,7 +1,7 @@
-// Web push notifications card — restores the v1 Stimulus
-// `push_subscription_controller.js` flow as a React component.
+// Web push notifications card — React implementation of the original
+// push subscription flow.
 //
-// Wire protocol (cli/src/hub/server_comms.rs):
+// Wire protocol:
 //   browser → CLI: { type: "push_status_req", browser_id }
 //   CLI → browser: { type: "push_status", hub_id, has_keys, browser_subscribed, vapid_pub }
 //   browser → CLI: { type: "vapid_generate" }                             (no keys yet)
@@ -25,12 +25,12 @@
 // see commit message for the omission notice.
 
 import React, { useEffect, useState, useCallback, useRef } from 'react'
-import bridge from 'workers/bridge'
 import { Subheading } from '../catalyst/heading'
 import { Text } from '../catalyst/text'
 import { Button } from '../catalyst/button'
 import { Badge } from '../catalyst/badge'
 import { IconGlyph } from '../../ui_contract/icons'
+import { waitForHub } from '../../lib/hub-bridge'
 
 const VAPID_LOCAL_KEY = 'botster_vapid_key'
 const BROWSER_ID_KEY = 'botster_browser_id'
@@ -104,14 +104,14 @@ export default function PushNotificationsCard({ hubId }) {
   const browserIdRef = useRef(null)
   const browserId = (browserIdRef.current ??= getBrowserId())
 
-  // Send a control message to the CLI; quietly no-ops if the bridge isn't
-  // ready (the user can retry by clicking the button again).
+  // Send through the shared hub subscription so client.lua command dispatch
+  // sees push controls before Rust performs VAPID/subscription mechanics.
   const sendCli = useCallback(async (message) => {
     try {
-      await bridge.send('sendControlMessage', { hubId, message })
-      return true
+      const hub = await waitForHub(hubId)
+      return await hub?.send(message.type, message)
     } catch (e) {
-      console.warn('[PushNotifications] sendControlMessage failed:', e)
+      console.warn('[PushNotifications] hub command failed:', e)
       return false
     }
   }, [hubId])
@@ -123,69 +123,69 @@ export default function PushNotificationsCard({ hubId }) {
     }
     if (!hubId) return
 
+    let cancelled = false
     const cleanups = []
 
-    cleanups.push(
-      bridge.on('push:status', ({ hubId: eventHubId, hasKeys, browserSubscribed, vapidPub }) => {
-        if (eventHubId !== hubId) return
-        // Detect VAPID rotation: CLI thinks we're subscribed but our stored
-        // key disagrees. Resubscribe transparently.
-        if (hasKeys && browserSubscribed && vapidPub) {
-          const stored = localStorage.getItem(VAPID_LOCAL_KEY)
-          if (stored && stored !== vapidPub) {
-            handleVapidKey(vapidPub).catch(() => {})
-            return
+    waitForHub(hubId).then((hub) => {
+      if (cancelled || !hub) return
+
+      cleanups.push(
+        hub.on('push:status', ({ hasKeys, browserSubscribed, vapidPub }) => {
+          // Detect VAPID rotation: CLI thinks we're subscribed but our stored
+          // key disagrees. Resubscribe transparently.
+          if (hasKeys && browserSubscribed && vapidPub) {
+            const stored = localStorage.getItem(VAPID_LOCAL_KEY)
+            if (stored && stored !== vapidPub) {
+              handleVapidKey(vapidPub).catch(() => {})
+              return
+            }
           }
-        }
-        if (!hasKeys) {
-          setState(STATE_NO_KEYS)
-        } else if (!browserSubscribed) {
-          setState(STATE_HAS_KEYS_UNSUBSCRIBED)
-        } else {
+          if (!hasKeys) {
+            setState(STATE_NO_KEYS)
+          } else if (!browserSubscribed) {
+            setState(STATE_HAS_KEYS_UNSUBSCRIBED)
+          } else {
+            setState(STATE_SUBSCRIBED)
+          }
+          setStatusDetail('')
+        }),
+      )
+
+      cleanups.push(
+        hub.on('push:vapid_key', ({ key }) => {
+          handleVapidKey(key).catch((e) => {
+            console.error('[PushNotifications] subscribe failed:', e)
+            setErrorMessage(e?.message || 'Subscribe failed')
+            setState(STATE_HAS_KEYS_UNSUBSCRIBED)
+          })
+        }),
+      )
+
+      cleanups.push(
+        hub.on('push:sub_ack', () => {
           setState(STATE_SUBSCRIBED)
-        }
-        setStatusDetail('')
-      }),
-    )
+          setStatusDetail('')
+          setErrorMessage('')
+        }),
+      )
 
-    cleanups.push(
-      bridge.on('push:vapid_key', ({ hubId: eventHubId, key }) => {
-        if (eventHubId !== hubId) return
-        handleVapidKey(key).catch((e) => {
-          console.error('[PushNotifications] subscribe failed:', e)
-          setErrorMessage(e?.message || 'Subscribe failed')
-          setState(STATE_HAS_KEYS_UNSUBSCRIBED)
-        })
-      }),
-    )
+      cleanups.push(
+        hub.on('push:test_ack', ({ sent }) => {
+          setStatusDetail(sent > 0 ? 'Test notification sent' : 'No active subscriptions')
+        }),
+      )
 
-    cleanups.push(
-      bridge.on('push:sub_ack', ({ hubId: eventHubId }) => {
-        if (eventHubId !== hubId) return
-        setState(STATE_SUBSCRIBED)
-        setStatusDetail('')
-        setErrorMessage('')
-      }),
-    )
+      cleanups.push(
+        hub.on('push:disable_ack', async () => {
+          await unsubscribeBrowser().catch(() => {})
+          setState(STATE_NO_KEYS)
+          setStatusDetail('')
+          setErrorMessage('')
+        }),
+      )
 
-    cleanups.push(
-      bridge.on('push:test_ack', ({ hubId: eventHubId, sent }) => {
-        if (eventHubId !== hubId) return
-        setStatusDetail(sent > 0 ? 'Test notification sent' : 'No active subscriptions')
-      }),
-    )
-
-    cleanups.push(
-      bridge.on('push:disable_ack', async ({ hubId: eventHubId }) => {
-        if (eventHubId !== hubId) return
-        await unsubscribeBrowser().catch(() => {})
-        setState(STATE_NO_KEYS)
-        setStatusDetail('')
-        setErrorMessage('')
-      }),
-    )
-
-    sendCli({ type: 'push_status_req', browser_id: browserId })
+      sendCli({ type: 'push_status_req', browser_id: browserId })
+    })
 
     async function handleVapidKey(key) {
       const sub = await subscribeBrowser(key)
@@ -198,7 +198,10 @@ export default function PushNotificationsCard({ hubId }) {
       })
     }
 
-    return () => cleanups.forEach((fn) => fn())
+    return () => {
+      cancelled = true
+      cleanups.forEach((fn) => fn())
+    }
   }, [hubId, browserId, sendCli])
 
   async function handleEnable() {

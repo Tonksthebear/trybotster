@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react'
+import React, { useState, useCallback, useEffect, useMemo } from 'react'
 import {
   Dialog,
   DialogTitle,
@@ -7,73 +7,60 @@ import {
   DialogActions,
 } from '../catalyst/dialog'
 import { Button } from '../catalyst/button'
-import { getHub } from '../../lib/hub-bridge'
+import { waitForHub } from '../../lib/hub-bridge'
+import { useConnectionCodeStore } from '../../store/entities'
 
 export default function ShareHub({ hubId }) {
   const [open, setOpen] = useState(false)
   const [status, setStatus] = useState('idle') // idle | loading | success | error
   const [errorMessage, setErrorMessage] = useState('')
-  const [url, setUrl] = useState('')
-  const [qrAscii, setQrAscii] = useState('')
   const [copyStatus, setCopyStatus] = useState('')
-  const unsubRef = useRef(null)
+  const connectionCodeOrder = useConnectionCodeStore((state) => state.order)
+  const connectionCodesById = useConnectionCodeStore((state) => state.byId)
+  const connectionCode = connectionCodesById[connectionCodeOrder[0]]
+  const url = connectionCode?.url || ''
+  const qrAscii = useMemo(() => {
+    const value = connectionCode?.qr_ascii
+    return Array.isArray(value) ? value.join('\n') : value || ''
+  }, [connectionCode?.qr_ascii])
 
-  // Clean up listener on unmount
   useEffect(() => {
-    return () => {
-      unsubRef.current?.()
-      unsubRef.current = null
+    if (!open) return
+    if (connectionCode?.error) {
+      setStatus('error')
+      setErrorMessage(String(connectionCode.error))
+    } else if (url && qrAscii) {
+      setStatus('success')
     }
-  }, [])
+  }, [open, connectionCode?.error, url, qrAscii])
 
   const requestCode = useCallback(async () => {
-    // Clean up any previous listener
-    unsubRef.current?.()
-    unsubRef.current = null
+    if (url && qrAscii) {
+      setStatus('success')
+      return
+    }
 
-    setStatus('loading')
+    setStatus(connectionCode?.error ? 'error' : 'loading')
     setErrorMessage('')
 
-    const hub = getHub(hubId)
+    const hub = await waitForHub(hubId)
     if (!hub) {
       setStatus('error')
       setErrorMessage('Connection unavailable')
       return
     }
 
-    const unsub = hub.on('connectionCode', (message) => {
-      unsub()
-      unsubRef.current = null
-      const { url: codeUrl, qr_ascii } = message
-      if (!codeUrl || !qr_ascii) {
-        setStatus('error')
-        setErrorMessage('Invalid response from hub')
-        return
-      }
-      setUrl(codeUrl)
-      setQrAscii(
-        Array.isArray(qr_ascii) ? qr_ascii.join('\n') : qr_ascii
-      )
-      setStatus('success')
-    })
-
-    unsubRef.current = unsub
-
     try {
       const sent = await hub.requestConnectionCode()
       if (!sent) {
-        unsub()
-        unsubRef.current = null
         setStatus('error')
         setErrorMessage('Failed to send request - not connected')
       }
     } catch (err) {
-      unsub()
-      unsubRef.current = null
       setStatus('error')
       setErrorMessage(err.message || 'Connection failed')
     }
-  }, [hubId])
+  }, [connectionCode?.error, hubId, qrAscii, url])
 
   function handleOpen() {
     setOpen(true)
@@ -81,8 +68,6 @@ export default function ShareHub({ hubId }) {
   }
 
   function handleClose() {
-    unsubRef.current?.()
-    unsubRef.current = null
     setOpen(false)
     setStatus('idle')
     setCopyStatus('')

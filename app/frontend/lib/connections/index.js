@@ -4,13 +4,9 @@
  * Usage:
  *   import { HubConnectionManager, HubManager, HubTransport, TerminalConnection } from "connections";
  *
- *   // Hub state object (mirrored read model)
- *   const hub = await HubManager.acquire(hubId);
- *   hub.onAgentList((agents) => render(agents));
- *
- *   // Low-level hub transport (control plane)
- *   const transport = await HubConnectionManager.acquire(HubTransport, hubId, { hubId });
- *   transport.on("connected", () => transport.requestAgents());
+ *   // Hub control plane is owned by store/hub-store.js via lib/hub-bridge.js.
+ *   // React components should await that shared session with waitForHub(hubId),
+ *   // not acquire their own HubTransport or read HubManager directly.
  *
  *   // Terminal connection (data plane)
  *   const key = TerminalConnection.key(hubId, sessionUuid);

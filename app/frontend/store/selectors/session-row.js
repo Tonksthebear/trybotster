@@ -1,9 +1,7 @@
 // Pure-function selectors for rendering one session row.
 //
-// These fns used to live on the v1 `app/frontend/store/workspace-store.js`
-// (deleted in commit 25b6900d as part of the wire protocol cold-turkey
-// switch). They're ported here as pure fns — they take a session entity
-// record and return derived display strings — so they can be reused by:
+// These pure selectors take a session entity record and return derived
+// display strings so they can be reused by:
 //
 //   * `<SessionList>` — the main multi-row composite
 //   * `<SessionRow>`  — the single-row variant (`ui.session_row{}`)
@@ -24,7 +22,7 @@
  * @property {string} [target_name]        spawn target friendly name
  * @property {string} [branch_name]
  * @property {string} [agent_name]
- * @property {string} [profile_name]       legacy alias for agent_name
+ * @property {string} [profile_name]       alternate profile label
  * @property {string} [session_type]       'agent' | 'accessory'
  * @property {boolean} [is_idle]
  * @property {boolean} [notification]

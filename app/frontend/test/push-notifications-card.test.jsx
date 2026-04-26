@@ -2,21 +2,28 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, cleanup, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
-const sendMock = vi.fn(() => Promise.resolve())
+const sendMock = vi.fn(() => Promise.resolve(true))
 const listeners = new Map()
 function emit(eventName, payload) {
   listeners.get(eventName)?.forEach((cb) => cb(payload))
 }
 
-vi.mock('workers/bridge', () => ({
-  default: {
-    send: (...args) => sendMock(...args),
-    on: (eventName, cb) => {
-      if (!listeners.has(eventName)) listeners.set(eventName, new Set())
-      listeners.get(eventName).add(cb)
-      return () => listeners.get(eventName)?.delete(cb)
-    },
+const fakeHub = {
+  send: (...args) => sendMock(...args),
+  on: (eventName, cb) => {
+    if (!listeners.has(eventName)) listeners.set(eventName, new Set())
+    listeners.get(eventName).add(cb)
+    return () => listeners.get(eventName)?.delete(cb)
   },
+}
+
+vi.mock('../lib/hub-bridge', () => ({
+  waitForHub: vi.fn(() => ({
+    then(resolve) {
+      resolve(fakeHub)
+      return Promise.resolve(fakeHub)
+    },
+  })),
 }))
 
 import PushNotificationsCard from '../components/settings/PushNotificationsCard'
@@ -64,10 +71,10 @@ describe('PushNotificationsCard', () => {
   it('queries push status on mount', async () => {
     render_()
     await waitFor(() => {
-      expect(sendMock).toHaveBeenCalledWith('sendControlMessage', expect.objectContaining({
-        hubId: 'hub-1',
-        message: expect.objectContaining({ type: 'push_status_req' }),
-      }))
+      expect(sendMock).toHaveBeenCalledWith(
+        'push_status_req',
+        expect.objectContaining({ type: 'push_status_req' }),
+      )
     })
   })
 
@@ -108,10 +115,7 @@ describe('PushNotificationsCard', () => {
 
     expect(global.Notification.requestPermission).toHaveBeenCalled()
     await waitFor(() => {
-      expect(sendMock).toHaveBeenCalledWith('sendControlMessage', expect.objectContaining({
-        hubId: 'hub-1',
-        message: { type: 'vapid_generate' },
-      }))
+      expect(sendMock).toHaveBeenCalledWith('vapid_generate', { type: 'vapid_generate' })
     })
   })
 
@@ -129,15 +133,15 @@ describe('PushNotificationsCard', () => {
     })
 
     await waitFor(() => {
-      expect(sendMock).toHaveBeenCalledWith('sendControlMessage', expect.objectContaining({
-        hubId: 'hub-1',
-        message: expect.objectContaining({
+      expect(sendMock).toHaveBeenCalledWith(
+        'push_sub',
+        expect.objectContaining({
           type: 'push_sub',
           endpoint: 'https://push.test/abc',
           p256dh: 'p256dh-key',
           auth: 'auth-key',
         }),
-      }))
+      )
     })
   })
 
@@ -158,12 +162,13 @@ describe('PushNotificationsCard', () => {
     expect(screen.getByText(/does not support web push/i)).toBeInTheDocument()
   })
 
-  it('ignores events for other hubs', async () => {
+  it('handles hub-scoped events from the shared hub session', async () => {
     render_()
-    emit('push:status', { hubId: 'other-hub', hasKeys: true, browserSubscribed: true, vapidPub: 'pub' })
+    emit('push:status', { hasKeys: true, browserSubscribed: true, vapidPub: 'pub' })
 
-    // Should still be in loading state (the only push:status was for a different hub)
-    const card = screen.getByTestId('push-notifications-card')
-    expect(card.dataset.pushState).toBe('loading')
+    await waitFor(() => {
+      const card = screen.getByTestId('push-notifications-card')
+      expect(card.dataset.pushState).toBe('subscribed')
+    })
   })
 })

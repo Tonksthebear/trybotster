@@ -19,7 +19,7 @@ vi.mock('../../lib/actions', () => {
   }
 })
 
-import { dispatch as legacyDispatch } from '../../lib/actions'
+import { dispatch as localDispatch } from '../../lib/actions'
 import {
   UiTreeBody,
   createTransportDispatch,
@@ -35,7 +35,7 @@ const REGULAR_FINE: UiViewportV1 = {
 
 afterEach(() => {
   cleanup()
-  vi.mocked(legacyDispatch).mockClear()
+  vi.mocked(localDispatch).mockClear()
 })
 
 function selectButton(label: string): UiNodeV1 {
@@ -58,7 +58,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
     return { transport, send }
   }
 
-  it('sends ui_action frame on the configured target_surface and skips legacy fallback', async () => {
+  it('sends ui_action frame on the configured target_surface and skips local dispatch', async () => {
     const { transport, send } = makeTransport()
     const dispatch = createTransportDispatch({
       transport,
@@ -86,7 +86,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
         payload: { sessionId: 'sess-1', sessionUuid: 'uuid-1' },
       },
     })
-    expect(legacyDispatch).not.toHaveBeenCalled()
+    expect(localDispatch).not.toHaveBeenCalled()
   })
 
   it('pushes session URL into history on session.select success (hub handles focus, browser owns route)', () => {
@@ -139,7 +139,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
     pushSpy.mockRestore()
   })
 
-  it('falls back to legacy dispatch with synthesized url when transport send returns false', async () => {
+  it('does not locally dispatch hub-authored actions when transport send returns false', async () => {
     const { transport, send } = makeTransport(async () => false)
     const dispatch = createTransportDispatch({
       transport,
@@ -159,21 +159,10 @@ describe('createTransportDispatch — Phase 2c default', () => {
     await Promise.resolve()
 
     expect(send).toHaveBeenCalledOnce()
-    expect(legacyDispatch).toHaveBeenCalledOnce()
-    // URL is synthesized from hubId + sessionUuid so the legacy handler can
-    // history.pushState after the anchor's preventDefault.
-    expect(legacyDispatch).toHaveBeenCalledWith({
-      action: 'botster.session.select',
-      payload: {
-        hubId: 'hub-9',
-        sessionId: 'sess-1',
-        sessionUuid: 'uuid-1',
-        url: '/hubs/hub-9/sessions/uuid-1',
-      },
-    })
+    expect(localDispatch).not.toHaveBeenCalled()
   })
 
-  it('falls back to legacy dispatch when transport send throws', async () => {
+  it('does not locally dispatch hub-authored actions when transport send throws', async () => {
     const { transport, send } = makeTransport(async () => {
       throw new Error('boom')
     })
@@ -197,11 +186,11 @@ describe('createTransportDispatch — Phase 2c default', () => {
     await Promise.resolve()
 
     expect(send).toHaveBeenCalledOnce()
-    expect(legacyDispatch).toHaveBeenCalledOnce()
+    expect(localDispatch).not.toHaveBeenCalled()
     errSpy.mockRestore()
   })
 
-  it('falls back synchronously with synthesized url when transport is null', () => {
+  it('drops hub-authored actions when transport is null', () => {
     const dispatch = createTransportDispatch({
       transport: null,
       hubId: 'hub-9',
@@ -215,19 +204,10 @@ describe('createTransportDispatch — Phase 2c default', () => {
       />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Select' }))
-    expect(legacyDispatch).toHaveBeenCalledOnce()
-    expect(legacyDispatch).toHaveBeenCalledWith({
-      action: 'botster.session.select',
-      payload: {
-        hubId: 'hub-9',
-        sessionId: 'sess-1',
-        sessionUuid: 'uuid-1',
-        url: '/hubs/hub-9/sessions/uuid-1',
-      },
-    })
+    expect(localDispatch).not.toHaveBeenCalled()
   })
 
-  it('does NOT fall back to legacy for non-idempotent actions like preview.toggle', async () => {
+  it('does NOT fall back to local dispatch for non-idempotent actions like preview.toggle', async () => {
     const { transport, send } = makeTransport(async () => false)
     const dispatch = createTransportDispatch({
       transport,
@@ -253,7 +233,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
     await Promise.resolve()
 
     expect(send).toHaveBeenCalledOnce()
-    expect(legacyDispatch).not.toHaveBeenCalled()
+    expect(localDispatch).not.toHaveBeenCalled()
   })
 
   it('skips dispatch entirely when action.disabled is true', () => {
@@ -273,10 +253,10 @@ describe('createTransportDispatch — Phase 2c default', () => {
     render(<UiTreeBody node={node} dispatch={dispatch} viewport={REGULAR_FINE} />)
     fireEvent.click(screen.getByRole('button', { name: 'Nope' }))
     expect(send).not.toHaveBeenCalled()
-    expect(legacyDispatch).not.toHaveBeenCalled()
+    expect(localDispatch).not.toHaveBeenCalled()
   })
 
-  it('dispatches browser-local actions (session.create.request) directly via legacy without touching transport', () => {
+  it('dispatches browser-local actions (session.create.request) directly without touching transport', () => {
     const { transport, send } = makeTransport()
     const dispatch = createTransportDispatch({
       transport,
@@ -293,8 +273,8 @@ describe('createTransportDispatch — Phase 2c default', () => {
     render(<UiTreeBody node={node} dispatch={dispatch} viewport={REGULAR_FINE} />)
     fireEvent.click(screen.getByRole('button', { name: 'New session' }))
     expect(send).not.toHaveBeenCalled()
-    expect(legacyDispatch).toHaveBeenCalledOnce()
-    expect(legacyDispatch).toHaveBeenCalledWith({
+    expect(localDispatch).toHaveBeenCalledOnce()
+    expect(localDispatch).toHaveBeenCalledWith({
       action: 'botster.session.create.request',
       payload: { hubId: 'hub-local' },
     })
@@ -322,8 +302,8 @@ describe('createTransportDispatch — Phase 2c default', () => {
     )
     fireEvent.click(screen.getByRole('button', { name: 'Toggle' }))
     expect(send).not.toHaveBeenCalled()
-    expect(legacyDispatch).toHaveBeenCalledOnce()
-    expect(legacyDispatch).toHaveBeenCalledWith({
+    expect(localDispatch).toHaveBeenCalledOnce()
+    expect(localDispatch).toHaveBeenCalledWith({
       action: 'botster.workspace.toggle',
       payload: { hubId: 'hub-mixed', workspaceId: 'ws-1' },
     })

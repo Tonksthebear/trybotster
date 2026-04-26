@@ -1,25 +1,30 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react'
+import React, { useState, useEffect, useMemo } from 'react'
 import { Dialog, DialogTitle, DialogDescription, DialogBody, DialogActions } from '../catalyst/dialog'
 import { Field, Label, Description } from '../catalyst/fieldset'
 import { Input } from '../catalyst/input'
 import { Select } from '../catalyst/select'
 import { Button } from '../catalyst/button'
 import { useDialogStore } from '../../store/dialog-store'
-import { getHub } from '../../lib/hub-bridge'
+import { waitForHub } from '../../lib/hub-bridge'
 import WorkspacePicker from './WorkspacePicker'
+import {
+  useSpawnTargetStore,
+  useWorktreeStore,
+  useWorkspaceEntityStore,
+} from '../../store/entities'
+import {
+  entityId,
+  normalizedWorkspace,
+  normalizedWorktree,
+  spawnTargetLabel,
+} from '../../lib/entity-selectors'
 
 export default function NewAgentForm({ hubId }) {
   const { activeDialog, context, close } = useDialogStore()
   const open = activeDialog === 'newAgent'
 
-  // Hub subscriptions
-  const unsubscribersRef = useRef([])
-
-  // Data from hub
-  const [spawnTargets, setSpawnTargets] = useState([])
-  const [worktrees, setWorktrees] = useState([])
   const [agents, setAgents] = useState([])
-  const [workspaces, setWorkspaces] = useState([])
+  const [configStatus, setConfigStatus] = useState('idle') // idle | loading | loaded | error
 
   // Form state
   const [selectedTargetId, setSelectedTargetId] = useState('')
@@ -32,67 +37,80 @@ export default function NewAgentForm({ hubId }) {
   // { id: string|null, name: string|null } | null
   const [workspaceChoice, setWorkspaceChoice] = useState(null)
   const [submitting, setSubmitting] = useState(false)
+  const spawnTargetOrder = useSpawnTargetStore((state) => state.order)
+  const spawnTargetsById = useSpawnTargetStore((state) => state.byId)
+  const spawnTargets = useMemo(
+    () => spawnTargetOrder.map((id) => spawnTargetsById[id]).filter(Boolean),
+    [spawnTargetOrder, spawnTargetsById],
+  )
+  const worktreeOrder = useWorktreeStore((state) => state.order)
+  const worktreesById = useWorktreeStore((state) => state.byId)
+  const worktrees = useMemo(() => {
+    return worktreeOrder
+      .map((id) => worktreesById[id])
+      .filter((worktree) => worktree && (!selectedTargetId || worktree.target_id === selectedTargetId))
+      .map(normalizedWorktree)
+  }, [selectedTargetId, worktreeOrder, worktreesById])
+  const workspaceOrder = useWorkspaceEntityStore((state) => state.order)
+  const workspacesById = useWorkspaceEntityStore((state) => state.byId)
+  const workspaces = useMemo(
+    () => workspaceOrder.map((id) => normalizedWorkspace(workspacesById[id])).filter(Boolean),
+    [workspaceOrder, workspacesById],
+  )
 
   // Subscribe to hub data when dialog opens
   useEffect(() => {
     if (!open || !hubId) return
 
-    const hub = getHub(hubId)
-    if (!hub) return
-
+    let cancelled = false
     const unsubs = []
 
-    setSpawnTargets(hub.spawnTargets.current())
-    setWorkspaces(hub.openWorkspaces.current())
-    hub.spawnTargets.load().catch(() => {})
-    hub.openWorkspaces.load().catch(() => {})
+    waitForHub(hubId).then((hub) => {
+      if (cancelled || !hub) return
 
-    unsubs.push(
-      hub.spawnTargets.onChange((targets) => {
-        setSpawnTargets(Array.isArray(targets) ? targets : [])
-      })
-    )
+      hub.requestSpawnTargets?.()
+      hub.requestOpenWorkspaces?.()
+      hub.requestWorktrees?.(context.targetId || null)
 
-    unsubs.push(
-      hub.on('worktreeList', ({ targetId, worktrees: wts }) => {
-        // Ignore unscoped broadcasts once a target is selected; only explicit
-        // target responses are authoritative for the picker.
-        setSelectedTargetId((currentTarget) => {
-          if (currentTarget) {
-            if (!targetId) return currentTarget
-            if (targetId !== currentTarget) return currentTarget
-          }
-          setWorktrees(Array.isArray(wts) ? wts : [])
-          return currentTarget
+      unsubs.push(
+        hub.on('agentConfig', ({ targetId, agents: ags }) => {
+          setSelectedTargetId((currentTarget) => {
+            if (targetId && currentTarget !== targetId) return currentTarget
+            const list = Array.isArray(ags) ? ags : []
+            setAgents(list)
+            setSelectedAgent((prev) => (prev && list.includes(prev)) ? prev : (list[0] || ''))
+            setConfigStatus('loaded')
+            return currentTarget
+          })
         })
-      })
-    )
-
-    unsubs.push(
-      hub.on('agentConfig', ({ targetId, agents: ags }) => {
-        setSelectedTargetId((currentTarget) => {
-          if (targetId && currentTarget && targetId !== currentTarget) return currentTarget
-          const list = Array.isArray(ags) ? ags : []
-          setAgents(list)
-          setSelectedAgent((prev) => (prev && list.includes(prev)) ? prev : (list[0] || ''))
-          return currentTarget
-        })
-      })
-    )
-
-    unsubs.push(
-      hub.openWorkspaces.onChange((wss) => {
-        setWorkspaces(Array.isArray(wss) ? wss : [])
-      })
-    )
-
-    unsubscribersRef.current = unsubs
+      )
+    })
 
     return () => {
+      cancelled = true
       unsubs.forEach((unsub) => unsub())
-      unsubscribersRef.current = []
     }
-  }, [open, hubId])
+  }, [open, hubId, context.targetId])
+
+  // Eagerly warm config for visible spawn targets. The selected-target UI still
+  // shows a loading state if a user gets ahead of this prefetch.
+  useEffect(() => {
+    if (!open || !hubId || spawnTargets.length === 0) return
+    let cancelled = false
+
+    waitForHub(hubId).then((hub) => {
+      if (cancelled || !hub) return
+      spawnTargets.forEach((target, index) => {
+        const targetId = entityId(target, `target:${index}`)
+        if (!targetId || hub.hasAgentConfig?.(targetId)) return
+        hub.ensureAgentConfig?.(targetId).catch(() => {})
+      })
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [open, hubId, spawnTargets])
 
   // Apply pre-selected target from context (from NewSessionChooser)
   useEffect(() => {
@@ -112,31 +130,53 @@ export default function NewAgentForm({ hubId }) {
       setSelectedAgent('')
       setWorkspaceChoice(null)
       setSelectedTargetId('')
-      setWorktrees([])
       setAgents([])
+      setConfigStatus('idle')
       setSubmitting(false)
     }
   }, [open])
 
-  function applyTarget(targetId) {
+  async function applyTarget(targetId) {
     setSelectedTargetId(targetId)
     setPendingSelection(null)
+    setAgents([])
+    setSelectedAgent('')
 
-    const hub = getHub(hubId)
-    if (!hub || !targetId) return
-
-    const wts = hub.getWorktrees(targetId)
-    setWorktrees(Array.isArray(wts) ? wts : [])
-
-    const config = hub.getAgentConfig(targetId)
-    const agentList = Array.isArray(config.agents) ? config.agents : []
-    setAgents(agentList)
-    setSelectedAgent(agentList[0] || '')
-
-    if (!hub.hasWorktrees(targetId)) {
-      hub.ensureWorktrees(targetId)
+    const hub = await waitForHub(hubId)
+    if (!hub || !targetId) {
+      setConfigStatus('idle')
+      return
     }
-    hub.ensureAgentConfig(targetId, { force: true }).catch(() => {})
+
+    const cached = hub.getAgentConfigState?.(targetId)
+    if (cached?.status === 'loaded') {
+      const config = cached.value
+      const agentList = Array.isArray(config.agents) ? config.agents : []
+      setAgents(agentList)
+      setSelectedAgent(agentList[0] || '')
+      setConfigStatus('loaded')
+    } else {
+      setConfigStatus('loading')
+    }
+
+    hub.requestWorktrees?.(targetId)
+    hub.ensureAgentConfig(targetId)
+      .then((config) => {
+        setSelectedTargetId((currentTarget) => {
+          if (currentTarget !== targetId) return currentTarget
+          const agentList = Array.isArray(config?.agents) ? config.agents : []
+          setAgents(agentList)
+          setSelectedAgent((prev) => (prev && agentList.includes(prev)) ? prev : (agentList[0] || ''))
+          setConfigStatus('loaded')
+          return currentTarget
+        })
+      })
+      .catch(() => {
+        setSelectedTargetId((currentTarget) => {
+          if (currentTarget === targetId) setConfigStatus('error')
+          return currentTarget
+        })
+      })
   }
 
   function handleTargetChange(e) {
@@ -171,18 +211,28 @@ export default function NewAgentForm({ hubId }) {
     setPromptInput('')
   }
 
-  function handleRefresh() {
+  async function handleRefresh() {
     if (!selectedTargetId) return
-    const hub = getHub(hubId)
+    const hub = await waitForHub(hubId)
     if (!hub) return
-    hub.ensureWorktrees(selectedTargetId, { force: true })
-    hub.ensureAgentConfig(selectedTargetId, { force: true }).catch(() => {})
+    hub.requestWorktrees?.(selectedTargetId)
+    setConfigStatus('loading')
+    setAgents([])
+    setSelectedAgent('')
+    hub.ensureAgentConfig(selectedTargetId, { force: true })
+      .then((config) => {
+        const agentList = Array.isArray(config?.agents) ? config.agents : []
+        setAgents(agentList)
+        setSelectedAgent(agentList[0] || '')
+        setConfigStatus('loaded')
+      })
+      .catch(() => setConfigStatus('error'))
   }
 
   async function handleSubmit() {
     if (!pendingSelection || !selectedTargetId) return
 
-    const hub = getHub(hubId)
+    const hub = await waitForHub(hubId)
     if (!hub) return
 
     const prompt = promptInput.trim() || null
@@ -225,10 +275,8 @@ export default function NewAgentForm({ hubId }) {
       return
     }
 
-    await Promise.allSettled([
-      hub.agents.load({ force: true }),
-      hub.openWorkspaces.load({ force: true }),
-    ])
+    hub.requestAgents?.()
+    hub.requestOpenWorkspaces?.()
 
     close()
   }
@@ -257,11 +305,11 @@ export default function NewAgentForm({ hubId }) {
               <option value="">
                 {spawnTargets.length ? 'Select a spawn target' : 'No admitted spawn targets'}
               </option>
-              {spawnTargets.map((target) => {
-                const branchSuffix = target.current_branch ? ` (${target.current_branch})` : ''
+              {spawnTargets.map((target, index) => {
+                const id = entityId(target, `target:${index}`)
                 return (
-                  <option key={target.id} value={target.id}>
-                    {(target.name || target.path) + branchSuffix}
+                  <option key={id} value={id}>
+                    {spawnTargetLabel(target)}
                   </option>
                 )
               })}
@@ -388,7 +436,13 @@ export default function NewAgentForm({ hubId }) {
 
           <div className="space-y-6">
             {/* Agent config */}
-            {agents.length > 0 ? (
+            {configStatus === 'loading' ? (
+              <div className="rounded-lg border border-zinc-700 bg-zinc-900/70 px-4 py-3">
+                <p className="text-sm text-zinc-300">
+                  Loading agent configurations for this spawn target...
+                </p>
+              </div>
+            ) : agents.length > 0 ? (
               <Field>
                 <Label>Agent configuration</Label>
                 <Select value={selectedAgent} onChange={(e) => setSelectedAgent(e.target.value)}>
@@ -399,6 +453,12 @@ export default function NewAgentForm({ hubId }) {
                   ))}
                 </Select>
               </Field>
+            ) : configStatus === 'error' ? (
+              <div className="rounded-lg border border-red-500/20 bg-red-500/5 px-4 py-3">
+                <p className="text-sm text-red-300">
+                  Could not load agent configurations. The agent will use default settings.
+                </p>
+              </div>
             ) : (
               <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 px-4 py-3">
                 <p className="text-sm text-amber-300">

@@ -202,6 +202,17 @@ pub(crate) enum HubEvent {
         payload: serde_json::Value,
     },
 
+    /// Browser push-notification control routed through Lua command dispatch.
+    ///
+    /// Sent by Lua's `push.control(peer_id, command)` from hub command
+    /// handlers. Rust still owns push subscription persistence and VAPID
+    /// mechanics, but browser-originated commands pass through `client.lua`
+    /// first like other hub UI commands.
+    BrowserPushControl {
+        browser_identity: String,
+        payload: serde_json::Value,
+    },
+
     /// Stale push subscriptions to remove (410 Gone from push service).
     ///
     /// Sent from the async web push broadcast task when subscriptions expire.
@@ -383,6 +394,7 @@ impl HubEvent {
             Self::HubClientMessage { .. } => "hub_client_message",
             Self::HubClientDisconnected { .. } => "hub_client_disconnected",
             Self::LuaPushRequest { .. } => "lua_push_request",
+            Self::BrowserPushControl { .. } => "browser_push_control",
             Self::PushSubscriptionsExpired { .. } => "push_subscriptions_expired",
             Self::PreviewDnsReady { .. } => "preview_dns_ready",
             Self::SocketClientConnected { .. } => "socket_client_connected",

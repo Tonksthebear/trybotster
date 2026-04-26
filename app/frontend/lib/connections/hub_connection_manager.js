@@ -10,8 +10,9 @@
  *   import { HubTransport } from "connections/hub_connection";
  *
  *   // On component mount:
- *   this.transport = await HubConnectionManager.acquire(HubTransport, hubId, { hubId });
- *   this.transport.on("connected", () => this.transport.requestAgents());
+ *   HubTransport is control-plane state. In the React app it is owned by
+ *   hub-store -> hub-bridge -> HubSession; leaf components should not acquire
+ *   another HubTransport.
  *
  *   // On component unmount:
  *   this.transport?.release();

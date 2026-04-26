@@ -11,7 +11,7 @@ const mockHub = {
 }
 
 vi.mock('../lib/hub-bridge', () => ({
-  getHub: vi.fn(() => mockHub),
+  waitForHub: vi.fn(() => Promise.resolve(mockHub)),
 }))
 
 vi.mock('../components/catalyst/dialog', () => ({

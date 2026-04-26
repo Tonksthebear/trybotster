@@ -2,7 +2,7 @@
 
 ## Goal
 
-Replace the current browser-side "template cloning plus Stimulus reconciliation" approach for live operator surfaces with a Rails-owned React runtime that renders trusted Botster primitives from structured data.
+Replace the old browser-side "template cloning plus Stimulus reconciliation" approach for live operator surfaces with a Rails-owned React runtime that renders trusted Botster primitives from structured data.
 
 This spec is the web renderer application of the shared contract in [cross-client-ui-primitives.md](cross-client-ui-primitives.md). The cross-client spec owns primitive names, shared action semantics, and renderer-neutral state ownership rules. This document only defines the web-specific rollout and the phase-1 adapter boundary.
 
@@ -14,7 +14,7 @@ This is the web equivalent of the TUI model:
 - hub/Lua owns authoritative state and declarative composition
 - the browser renders locally and emits structured actions
 
-Botster is not becoming a React SPA. Rails still owns the shell, routing, settings pages, forms, and mostly static screens. React is introduced first as an island for the agent/workspace surface because that surface already behaves like a miniature application.
+Botster's operator frontend is a React/Catalyst application hosted by Rails. Rails still owns authentication, persistence, and HTTP endpoints, but live hub surfaces, settings workflows, and plugin-defined UI should use the React runtime and the hub collection/event contract instead of Turbo, Stimulus, or server-rendered HTML fragments.
 
 ## Problem
 
@@ -52,7 +52,7 @@ Rules:
 
 ## Phase 1 Boundary
 
-Phase 1 covers only the agent/workspace UI:
+Phase 1 originally covered only the agent/workspace UI:
 
 - sidebar workspace tree
 - main hub workspace list
@@ -60,12 +60,12 @@ Phase 1 covers only the agent/workspace UI:
 - hosted preview indicator and error state
 - row actions menu
 
-Phase 1 explicitly does not include:
+Later phases move the remaining frontend surfaces onto the same runtime. The React/Catalyst direction explicitly does not include:
 
 - settings/forms primitives
 - dialog schema from Lua
 - arbitrary user-authored browser composition
-- replacing the rest of Rails/Turbo/Stimulus
+- carrying Turbo/Stimulus compatibility paths for hub-owned UI
 
 ## Contract Layers
 

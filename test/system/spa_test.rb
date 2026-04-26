@@ -68,6 +68,7 @@ class SpaTest < ApplicationSystemTestCase
     assert_text "HUB INFORMATION", wait: 10
     assert_text "Settings"
     assert_text "Share"
+    assert_no_text "Pair a new device"
   end
 
   # --- Session creation flow ---
@@ -213,8 +214,19 @@ class SpaTest < ApplicationSystemTestCase
     assert_current_path "/hubs/#{@hub.id}/settings"
 
     # Navigate back to hub
-    visit "/hubs/#{@hub.id}"
+    find("a[href='/hubs/#{@hub.id}']", match: :first).click
     assert_text "HUB INFORMATION", wait: 10
+    wait_for_surface_ready("workspace_panel")
+    assert_no_text "Loading…"
+
+    # Repeat once: this catches remounts that dropped the panel tree and then
+    # waited forever for an idempotent hub re-broadcast.
+    click_link "Hub Settings"
+    assert_text "Config", wait: 10
+    find("a[href='/hubs/#{@hub.id}']", match: :first).click
+    assert_text "HUB INFORMATION", wait: 10
+    wait_for_surface_ready("workspace_panel")
+    assert_no_text "Loading…"
 
     # Connection should still be alive
     assert_webrtc_connected

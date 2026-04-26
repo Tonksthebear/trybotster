@@ -1,5 +1,4 @@
 import React, { useEffect } from 'react'
-import { connect, disconnect } from '../../lib/hub-bridge'
 import { useSettingsStore } from '../../store/settings-store'
 import SettingsPage from './SettingsPage'
 
@@ -24,17 +23,10 @@ export default function SettingsApp({
     const store = useSettingsStore.getState()
     store.setConfigMetadata(configMetadata)
 
-    // Hub bridge (for ConnectionStatus)
-    const state = { unmounted: false, bridgeConnectionId: null }
-    connect(hubId, { surface: 'settings' }).then(({ connectionId }) => {
-      if (state.unmounted) {
-        disconnect(connectionId)
-      } else {
-        state.bridgeConnectionId = connectionId
-      }
-    })
+    const state = { unmounted: false }
 
-    store.connectHub(hubId).then(() => {
+    store.connectHub(hubId).then((hub) => {
+      if (state.unmounted || !hub) return
       useSettingsStore.getState().scanTree()
       useSettingsStore.getState().checkInstalled()
     })
@@ -42,7 +34,6 @@ export default function SettingsApp({
     return () => {
       state.unmounted = true
       useSettingsStore.getState().disconnectHub()
-      if (state.bridgeConnectionId != null) disconnect(state.bridgeConnectionId)
     }
   }, [hubId])
 

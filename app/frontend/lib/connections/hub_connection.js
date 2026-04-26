@@ -1,10 +1,8 @@
 /**
  * HubTransport - Typed wrapper for hub control plane.
  *
- * Manages:
- *   - Agent lifecycle (list, create, select, delete)
- *   - Worktree operations
- *   - Invite/share functionality
+ * Manages hub control commands and dispatches new-wire entity frames into the
+ * per-type Zustand stores.
  *
  * Handshake is handled by base Connection class.
  *
@@ -13,21 +11,15 @@
  *   - disconnected - Channel closed
  *   - stateChange - { state, prevState, error }
  *   - error - { reason, message }
- *   - agentList - Array of agents
- *   - workspaceList - Array of workspace groups (from agent_list message)
- *   - worktreeList - Array of worktrees
- *   - agentCreated - New agent data
- *   - agentDeleted - { id }
- *   - connectionCode - { url, qr_ascii }
  *   - hubRecoveryState - { state, ... }
  *   - hubReady - { state: "ready", ... }
  *   - agentConfig - { agents, accessories, workspaces }
  *
  * Usage:
- *   const transport = await HubConnectionManager.acquire(HubTransport, hubId, { hubId });
- *   transport.on("agentList", (agents) => render(agents));
+ *   HubTransport is acquired only by HubSession via hub-bridge/hub-store.
+ *   React leaves should await waitForHub(hubId) and use the shared session.
  *   transport.on("connected", () => transport.requestAgents());
- *   transport.requestAgents();
+ *   transport.requestAgents(); // asks the hub to re-ship entity snapshots
  */
 
 import { HubRoute } from "connections/hub_route";
@@ -72,17 +64,9 @@ function computeInitialSurfaceSubpaths(hubId) {
 export class HubTransport extends HubRoute {
   constructor(key, options, manager) {
     super(key, options, manager);
-    this._agents = [];
-    this._hubWorkspaces = [];
-    this._openWorkspaces = [];
-    this._spawnTargets = [];
     this._hubRecoveryState = null;
     this._uiRouteRegistry = [];
 
-    this._hasAgentListSnapshot = false;
-    this._hasHubWorkspaceListSnapshot = false;
-    this._hasOpenWorkspaceListSnapshot = false;
-    this._hasSpawnTargetListSnapshot = false;
     this._hasHubRecoveryStateSnapshot = false;
     this._hasUiRouteRegistrySnapshot = false;
   }
@@ -220,40 +204,8 @@ export class HubTransport extends HubRoute {
 
   // ========== Hub Commands ==========
 
-  hasAgentListSnapshot() {
-    return this._hasAgentListSnapshot;
-  }
-
-  hasHubWorkspaceListSnapshot() {
-    return this._hasHubWorkspaceListSnapshot;
-  }
-
-  hasOpenWorkspaceListSnapshot() {
-    return this._hasOpenWorkspaceListSnapshot;
-  }
-
-  hasSpawnTargetListSnapshot() {
-    return this._hasSpawnTargetListSnapshot;
-  }
-
   hasHubRecoveryStateSnapshot() {
     return this._hasHubRecoveryStateSnapshot;
-  }
-
-  getAgents() {
-    return this._agents;
-  }
-
-  getHubWorkspaces() {
-    return this._hubWorkspaces;
-  }
-
-  getOpenWorkspaces() {
-    return this._openWorkspaces;
-  }
-
-  getSpawnTargets() {
-    return this._spawnTargets;
   }
 
   getHubRecoveryState() {
@@ -579,35 +531,6 @@ export class HubTransport extends HubRoute {
   // ========== Convenience event helpers ==========
 
   /**
-   * Subscribe to agent list updates.
-   */
-  onAgentList(callback) {
-    return this.on("agentList", callback);
-  }
-
-  /**
-   * Subscribe to workspace list updates.
-   * Workspaces arrive alongside agent_list messages.
-   */
-  onWorkspaceList(callback) {
-    return this.on("workspaceList", callback);
-  }
-
-  /**
-   * Subscribe to open workspace list updates.
-   */
-  onOpenWorkspaceList(callback) {
-    return this.on("openWorkspaceList", callback);
-  }
-
-  /**
-   * Subscribe to worktree list updates.
-   */
-  onWorktreeList(callback) {
-    return this.on("worktreeList", callback);
-  }
-
-  /**
    * Subscribe to connection established (handshake complete).
    * Fires immediately if already connected.
    */
@@ -643,17 +566,4 @@ export class HubTransport extends HubRoute {
 
   // ========== Private ==========
 
-  /**
-   * Update the PWA app badge to reflect notification count from agent list.
-   * Uses the Badging API (navigator.setAppBadge / clearAppBadge).
-   */
-  #updateAppBadge(agents) {
-    if (!navigator.setAppBadge) return;
-    const count = agents.filter((a) => a.notification).length;
-    if (count > 0) {
-      navigator.setAppBadge(count);
-    } else if (navigator.clearAppBadge) {
-      navigator.clearAppBadge();
-    }
-  }
 }

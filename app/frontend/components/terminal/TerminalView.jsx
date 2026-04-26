@@ -1,9 +1,8 @@
 import React, { useRef, useEffect, useCallback } from 'react'
 import { Button } from '../catalyst/button'
-import { connect, disconnect } from '../../lib/hub-bridge'
+import { waitForHub } from '../../lib/hub-bridge'
 
 import { Restty } from 'restty'
-import { HubConnectionManager, HubTransport } from 'connections'
 import { WebRtcPtyTransport } from 'transport/webrtc_pty_transport'
 
 const CONNECT_DEBOUNCE_MS = 30
@@ -423,29 +422,14 @@ export default function TerminalView({ hubId, sessionUuid }) {
     )
     onActivity()
 
-    // --- Hub bridge (for ConnectionStatus) ---
-    let bridgeConnectionId = null
-    connect(hubId, { surface: 'terminal' }).then(({ connectionId }) => {
-      if (state.destroyed) {
-        disconnect(connectionId)
-      } else {
-        bridgeConnectionId = connectionId
-      }
-    })
-
     // --- Init terminal ---
     async function init() {
-      // 1. Acquire hub transport
-      state.hubTransport = await HubConnectionManager.acquire(
-        HubTransport,
-        hubId,
-        { hubId }
-      )
+      // 1. Reuse the route-owned hub transport.
+      const hub = await waitForHub(hubId)
       if (state.destroyed) {
-        state.hubTransport.release()
-        state.hubTransport = null
         return
       }
+      state.hubTransport = hub?.transport ?? null
 
       // 2. Create PTY transport
       state.transport = new WebRtcPtyTransport({ hubId, sessionUuid })
@@ -641,11 +625,7 @@ export default function TerminalView({ hubId, sessionUuid }) {
       if (state.toastTimeout) clearTimeout(state.toastTimeout)
       if (state.connectPtyTimer) clearTimeout(state.connectPtyTimer)
 
-      // Hub bridge
-      if (bridgeConnectionId != null) disconnect(bridgeConnectionId)
-
       // Resources
-      state.hubTransport?.release()
       state.hubTransport = null
       state.restty?.destroy()
       state.restty = null

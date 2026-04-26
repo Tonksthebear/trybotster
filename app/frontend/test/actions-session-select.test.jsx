@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // live hub session.
 
 vi.mock('../lib/hub-bridge', () => ({
-  getHub: () => null,
+  waitForHub: () => Promise.resolve(null),
 }))
 
 import { dispatch, ACTION } from '../lib/actions'

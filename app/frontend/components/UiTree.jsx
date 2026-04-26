@@ -12,7 +12,7 @@ import {
   UiTreeBody,
   createTransportDispatch,
 } from '../ui_contract'
-import { getHub } from '../lib/hub-bridge'
+import { waitForHub } from '../lib/hub-bridge'
 import { useSurfaceReadinessStore } from '../store/surface-readiness-store'
 
 // ---------------------------------------------------------------------------
@@ -65,6 +65,29 @@ function useCurrentPathname() {
 // ---------------------------------------------------------------------------
 
 const InterceptorContext = createContext(null)
+const treeSnapshotCache = new Map()
+
+function treeCacheKey(hubId, targetSurface, subpath = '/') {
+  if (!hubId || !targetSurface) return null
+  const normalisedSubpath =
+    typeof subpath === 'string' && subpath !== '' ? subpath : '/'
+  return `${String(hubId)}\u0000${targetSurface}\u0000${normalisedSubpath}`
+}
+
+function readCachedTree(hubId, targetSurface, subpath) {
+  const key = treeCacheKey(hubId, targetSurface, subpath)
+  return key ? (treeSnapshotCache.get(key) ?? null) : null
+}
+
+function writeCachedTree(hubId, targetSurface, subpath, tree) {
+  const key = treeCacheKey(hubId, targetSurface, subpath)
+  if (!key || !tree) return
+  treeSnapshotCache.set(key, tree)
+}
+
+export function _resetUiTreeSnapshotCacheForTests() {
+  treeSnapshotCache.clear()
+}
 
 /**
  * Register a per-action interceptor on the surrounding `<UiTree>`. Returning
@@ -192,7 +215,9 @@ export default function UiTree({
   errorFallback = defaultErrorFallback,
   children,
 }) {
-  const [tree, setTree] = useState(initialTree)
+  const [tree, setTree] = useState(() =>
+    initialTree ?? readCachedTree(hubId, targetSurface, subpath),
+  )
   const [transport, setTransport] = useState(null)
 
   // Wire protocol: collapse + nav-selection state moved into the
@@ -217,12 +242,12 @@ export default function UiTree({
   const lastHubIdRef = useRef(hubId)
   if (lastHubIdRef.current !== hubId) {
     lastHubIdRef.current = hubId
-    setTree(null)
+    setTree(readCachedTree(hubId, targetSurface, subpath))
     setTransport(null)
   }
 
-  // Phase 4b: subpath OR targetSurface changes within a mount must reset
-  // the tree. The hub renders a different tree for each subpath within a
+  // Subpath OR targetSurface changes within a mount must reset the tree.
+  // The hub renders a different tree for each subpath within a
   // surface AND for each surface entirely; keeping the stale tree visible
   // while the new one arrives would flash the wrong content for one
   // frame. Pair this with the subpath filter in the frame subscriber
@@ -237,43 +262,30 @@ export default function UiTree({
   ) {
     lastSurfaceRef.current = targetSurface
     lastSubpathRef.current = subpath
-    setTree(null)
+    setTree(readCachedTree(hubId, targetSurface, subpath))
   }
 
-  // Acquire the hub transport (HubTransport) for send + message subscription.
-  // hub-bridge.connect() resolves asynchronously, so we poll briefly until
-  // getHub(hubId) returns a session. Bounded to MAX_POLL_MS so a hub that
-  // never connects (network failure, paused tab) does not leak a forever
-  // timer. After that, the dispatch path falls through to the legacy
-  // fallback for well-known action ids and the loading fallback stays put
-  // until either a tree arrives or hubId changes.
+  // Read the route-owned hub transport (HubTransport) for send + message
+  // subscription. `hub-store` is the single owner that calls
+  // hub-bridge.connect(); leaf components wait for that shared session.
+  // After timeout, hub-directed clicks are ignored until a transport is
+  // available; browser-local actions still run through their local handlers.
   useEffect(() => {
     if (!hubId) {
       setTransport(null)
       return undefined
     }
     let cancelled = false
-    let pollTimer = null
-    const startedAt = Date.now()
-    const MAX_POLL_MS = 10000
-    const POLL_INTERVAL_MS = 100
-
-    function attach() {
+    waitForHub(hubId).then((hub) => {
       if (cancelled) return
-      const hub = getHub(hubId)
       const t = hub?.transport ?? null
       if (t) {
         setTransport(t)
-        return
       }
-      if (Date.now() - startedAt >= MAX_POLL_MS) return
-      pollTimer = window.setTimeout(attach, POLL_INTERVAL_MS)
-    }
-    attach()
+    })
 
     return () => {
       cancelled = true
-      if (pollTimer) window.clearTimeout(pollTimer)
     }
   }, [hubId])
 
@@ -297,7 +309,9 @@ export default function UiTree({
       ) {
         return
       }
-      setTree(message.tree ?? null)
+      const nextTree = message.tree ?? null
+      setTree(nextTree)
+      writeCachedTree(hubId, targetSurface, subpath, nextTree)
       // System-test readiness: first tree for this (hub, surface) pair
       // records into the readiness store, feeding `<html data-hub-snapshot>`.
       // Record on EVERY frame: the store is idempotent per (hub, surface),
@@ -312,8 +326,8 @@ export default function UiTree({
     return transport.on('message', handler)
   }, [transport, targetSurface, subpath, hubId])
 
-  // Phase 4b: whenever the (target_surface, subpath) pair changes, tell
-  // the hub so it can re-render for this client.
+  // Whenever the (target_surface, subpath) pair changes, tell the hub so it
+  // can re-render for this client.
   //
   // We send unconditionally on every mount / change. Idempotency lives on
   // the hub: `Client:set_surface_subpath` early-returns when the incoming

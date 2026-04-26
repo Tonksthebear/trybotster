@@ -253,7 +253,12 @@ describe('UiTree [data-surface-ready]', () => {
   beforeEach(() => {
     resetSurfaceReadinessStoreForTest()
     fakeTransport = new FakeTransport()
-    vi.spyOn(hubBridge, 'getHub').mockReturnValue({ transport: fakeTransport })
+    vi.spyOn(hubBridge, 'waitForHub').mockImplementation(() => ({
+      then(resolve) {
+        resolve({ transport: fakeTransport })
+        return Promise.resolve({ transport: fakeTransport })
+      },
+    }))
   })
 
   afterEach(() => {

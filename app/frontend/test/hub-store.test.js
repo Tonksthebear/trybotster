@@ -10,7 +10,6 @@ const mockGetHub = vi.fn(() => null)
 vi.mock('../lib/hub-bridge', () => ({
   connect: (...args) => mockConnect(...args),
   disconnect: (...args) => mockDisconnect(...args),
-  getHub: (...args) => mockGetHub(...args),
 }))
 
 const mockSubscriptionCreate = vi.fn()
