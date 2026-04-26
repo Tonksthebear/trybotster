@@ -2,8 +2,31 @@ import { useQuery } from '@tanstack/react-query'
 import { waitForHub } from './hub-bridge'
 
 export const queryKeys = {
+  hubList: () => ['hubs'],
   settingsBootstrap: (hubId) => ['hub', String(hubId), 'settingsBootstrap'],
   agentConfig: (hubId, targetId) => ['hub', String(hubId), 'agentConfig', String(targetId)],
+}
+
+export async function fetchHubList() {
+  const res = await fetch('/hubs.json', {
+    headers: { Accept: 'application/json' },
+    credentials: 'same-origin',
+  })
+  if (res.status === 401 || res.redirected) {
+    window.location.href = '/github/authorization/new'
+    return []
+  }
+  if (!res.ok) throw new Error(`${res.status}`)
+  const data = await res.json()
+  return Array.isArray(data) ? data : data.hubs || []
+}
+
+export function useHubListQuery() {
+  return useQuery({
+    queryKey: queryKeys.hubList(),
+    queryFn: fetchHubList,
+    staleTime: 30_000,
+  })
 }
 
 export async function fetchSettingsBootstrap(hubId) {

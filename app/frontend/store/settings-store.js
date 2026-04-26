@@ -1,5 +1,7 @@
 import { create } from 'zustand'
 import { waitForHub } from '../lib/hub-bridge'
+import { queryClient } from '../lib/query-client'
+import { queryKeys } from '../lib/queries'
 import { useSpawnTargetStore } from './entities'
 import { orderedEntities } from '../lib/entity-selectors'
 
@@ -195,7 +197,7 @@ export const useSettingsStore = create((set, get) => ({
         if (!a.exists && !c.exists && !p.exists && !w.exists) {
           if (!isCurrentScan()) return
           set({ treeState: 'empty' })
-          get()._refreshAgentConfigCache()
+          get()._invalidateAgentConfigQueries()
           return
         }
       } else {
@@ -205,7 +207,7 @@ export const useSettingsStore = create((set, get) => ({
         if (!stat.exists) {
           if (!isCurrentScan()) return
           set({ treeState: 'empty' })
-          get()._refreshAgentConfigCache()
+          get()._invalidateAgentConfigQueries()
           return
         }
       }
@@ -290,7 +292,7 @@ export const useSettingsStore = create((set, get) => ({
       else update.repoTree = tree
       if (!isCurrentScan()) return
       set(update)
-      get()._refreshAgentConfigCache()
+      get()._invalidateAgentConfigQueries()
     } catch (error) {
       if (isFirstLoad && isCurrentScan()) {
         set({ treeFeedback: `Failed to scan: ${error.message}` })
@@ -715,9 +717,10 @@ export const useSettingsStore = create((set, get) => ({
     return ''
   },
 
-  _refreshAgentConfigCache() {
-    const { hub, configScope, spawnTargets, selectedTargetId } = get()
-    if (!hub) return
+  _invalidateAgentConfigQueries() {
+    const { configScope, hub, spawnTargets, selectedTargetId } = get()
+    const hubId = hub?.hubId
+    if (!hubId) return
 
     const targetIds =
       configScope === 'repo'
@@ -725,7 +728,9 @@ export const useSettingsStore = create((set, get) => ({
         : spawnTargets.map((t) => t?.id)
 
     targetIds.filter(Boolean).forEach((tid) => {
-      hub.ensureAgentConfig(tid, { force: true }).catch(() => {})
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.agentConfig(hubId, tid),
+      })
     })
   },
 }))

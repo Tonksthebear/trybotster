@@ -421,6 +421,14 @@ describe('ui_contract registry — dialog', () => {
 })
 
 describe('ui_contract registry — unknown primitive', () => {
+  it('does not expose the old web connection_code card', () => {
+    const spy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { container } = renderTree({ type: 'connection_code' })
+    expect(container.firstChild).toBeNull()
+    expect(spy).toHaveBeenCalledWith('[ui_contract] unknown primitive type: connection_code')
+    spy.mockRestore()
+  })
+
   it('warns and renders nothing for an unknown type', () => {
     const spy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const { container } = renderTree({ type: 'never-seen-before' })
