@@ -8,7 +8,7 @@
       "name": "botster",
       "source": {
         "source": "local",
-        "path": "./plugins/botster"
+        "path": "./.agents/plugins/botster"
       },
       "policy": {
         "installation": "AVAILABLE",
