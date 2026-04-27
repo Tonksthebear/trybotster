@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 
 import { SessionList } from '../components/composites/SessionList'
+import { WorkspaceList } from '../components/composites/WorkspaceList'
 import { useSessionStore, useWorkspaceEntityStore } from '../store/entities'
 import { useUiPresentationStore } from '../store/ui-presentation-store'
 
@@ -246,8 +247,37 @@ describe('<SessionList> fidelity row', () => {
     render(<SessionList density="panel" grouping="workspace" ctx={fakeCtx()} />)
     const trigger = screen.getByTestId('session-actions-trigger')
     expect(trigger.querySelector('svg[data-slot="icon"]')).not.toBeNull()
-    const chevronHeader = screen.getByRole('button', { name: /live/i })
+    const chevronHeader = screen
+      .getAllByRole('button', { name: /live/i })
+      .find((button) => button.getAttribute('aria-expanded') === 'true')
     expect(chevronHeader.querySelector('svg[data-slot="icon"]')).not.toBeNull()
+  })
+
+  it('workspace rename button dispatches botster.workspace.rename.request', () => {
+    useWorkspaceEntityStore.setState({
+      byId: { 'ws-1': { workspace_id: 'ws-1', name: 'live' } },
+      order: ['ws-1'],
+      snapshotSeq: 1,
+    })
+    seedSession({
+      id: 'sess-1',
+      session_uuid: 'uuid-1',
+      session_type: 'agent',
+      label: 'work',
+      workspace_id: 'ws-1',
+    })
+    const ctx = fakeCtx()
+    render(<SessionList density="panel" grouping="workspace" ctx={ctx} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /rename workspace live/i }))
+
+    expect(ctx.dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'botster.workspace.rename.request',
+        payload: { workspaceId: 'ws-1', title: 'live' },
+      }),
+      expect.any(Object),
+    )
   })
 
   it('does not render a header for a workspace whose status === "closed"', () => {
@@ -286,5 +316,81 @@ describe('<SessionList> fidelity row', () => {
     render(<SessionList density="panel" grouping="workspace" ctx={fakeCtx()} />)
     expect(screen.getByText('open-ws')).toBeInTheDocument()
     expect(screen.queryByText('closed-ws')).toBeNull()
+  })
+
+  it('does not render workspace headers after the last active agent leaves', () => {
+    useWorkspaceEntityStore.setState({
+      byId: {
+        'ws-live': { workspace_id: 'ws-live', name: 'live-ws' },
+        'ws-empty': { workspace_id: 'ws-empty', name: 'empty-ws' },
+        'ws-accessory': { workspace_id: 'ws-accessory', name: 'accessory-ws' },
+      },
+      order: ['ws-live', 'ws-empty', 'ws-accessory'],
+      snapshotSeq: 1,
+    })
+    useSessionStore.setState({
+      byId: {
+        'sess-live': {
+          id: 'sess-live',
+          session_uuid: 'uuid-live',
+          session_type: 'agent',
+          label: 'agent',
+          workspace_id: 'ws-live',
+        },
+        'sess-accessory': {
+          id: 'sess-accessory',
+          session_uuid: 'uuid-accessory',
+          session_type: 'accessory',
+          label: 'editor',
+          workspace_id: 'ws-accessory',
+        },
+      },
+      order: ['sess-live', 'sess-accessory'],
+      snapshotSeq: 1,
+    })
+
+    render(<SessionList density="panel" grouping="workspace" ctx={fakeCtx()} />)
+
+    expect(screen.getByText('live-ws')).toBeInTheDocument()
+    expect(screen.queryByText('empty-ws')).toBeNull()
+    expect(screen.queryByText('accessory-ws')).toBeNull()
+  })
+})
+
+describe('<WorkspaceList>', () => {
+  it('only renders workspaces that have an active agent session', () => {
+    useWorkspaceEntityStore.setState({
+      byId: {
+        'ws-live': { workspace_id: 'ws-live', name: 'live-ws' },
+        'ws-empty': { workspace_id: 'ws-empty', name: 'empty-ws' },
+        'ws-accessory': { workspace_id: 'ws-accessory', name: 'accessory-ws' },
+      },
+      order: ['ws-live', 'ws-empty', 'ws-accessory'],
+      snapshotSeq: 1,
+    })
+    useSessionStore.setState({
+      byId: {
+        'sess-live': {
+          id: 'sess-live',
+          session_uuid: 'uuid-live',
+          session_type: 'agent',
+          workspace_id: 'ws-live',
+        },
+        'sess-accessory': {
+          id: 'sess-accessory',
+          session_uuid: 'uuid-accessory',
+          session_type: 'accessory',
+          workspace_id: 'ws-accessory',
+        },
+      },
+      order: ['sess-live', 'sess-accessory'],
+      snapshotSeq: 1,
+    })
+
+    render(<WorkspaceList ctx={fakeCtx()} />)
+
+    expect(screen.getByText('live-ws')).toBeInTheDocument()
+    expect(screen.queryByText('empty-ws')).toBeNull()
+    expect(screen.queryByText('accessory-ws')).toBeNull()
   })
 })

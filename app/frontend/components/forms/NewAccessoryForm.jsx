@@ -10,11 +10,12 @@ import { agentConfigQueryOptions, useAgentConfigQuery } from '../../lib/queries'
 import WorkspacePicker from './WorkspacePicker'
 import {
   useSpawnTargetStore,
+  useSessionStore,
   useWorkspaceEntityStore,
 } from '../../store/entities'
 import {
+  activeAgentWorkspaces,
   entityId,
-  normalizedWorkspace,
   spawnTargetLabel,
 } from '../../lib/entity-selectors'
 
@@ -31,9 +32,16 @@ export default function NewAccessoryForm({ hubId }) {
   )
   const workspaceOrder = useWorkspaceEntityStore((state) => state.order)
   const workspacesById = useWorkspaceEntityStore((state) => state.byId)
+  const sessionOrder = useSessionStore((state) => state.order)
+  const sessionsById = useSessionStore((state) => state.byId)
   const workspaces = useMemo(
-    () => workspaceOrder.map((id) => normalizedWorkspace(workspacesById[id])).filter(Boolean),
-    [workspaceOrder, workspacesById],
+    () => activeAgentWorkspaces({
+      workspaceOrder,
+      workspacesById,
+      sessionOrder,
+      sessionsById,
+    }),
+    [workspaceOrder, workspacesById, sessionOrder, sessionsById],
   )
   const [selectedTargetId, setSelectedTargetId] = useState('')
   const [selectedAccessory, setSelectedAccessory] = useState(null)
@@ -64,9 +72,6 @@ export default function NewAccessoryForm({ hubId }) {
 
     waitForHub(hubId).then((hub) => {
       if (cancelled || !hub) return
-
-      hub.requestSpawnTargets?.()
-      hub.requestOpenWorkspaces?.()
     })
 
     return () => {
@@ -141,9 +146,6 @@ export default function NewAccessoryForm({ hubId }) {
       setSubmitting(false)
       return
     }
-
-    hub.requestAgents?.()
-    hub.requestOpenWorkspaces?.()
 
     close()
   }

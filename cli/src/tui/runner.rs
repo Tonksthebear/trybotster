@@ -1660,24 +1660,13 @@ where
         let event_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         // Wire protocol entity envelopes (`entity_snapshot`/`upsert`/
-        // `patch`/`remove`) flow into the local entity stores BEFORE Lua
-        // sees them. The store dispatcher returns true when it recognised
-        // and applied the frame; we mark the TUI dirty so the next render
-        // picks up the new entity state and stop here. The composite
-        // renderers added in commit 4 read straight from these stores.
-        //
-        // Before this branch landed, this branch did not fire in
-        // production — the hub still ships legacy frames which fall through to
-        // the Lua dispatcher below. Keeping the dispatch here in commit 3
-        // gives the cold-turkey switch a single landing point.
+        // `patch`/`remove`) belong to TuiEntityStores. Lua owns workflow
+        // state; it should not maintain a second entity cache.
         if super::entity_stores::TuiEntityStores::handles_frame(event_type) {
             if self.entity_stores.apply_frame(&msg) {
                 self.dirty = true;
             }
-            // Keep flowing into Lua. The current TUI layout is still the
-            // legacy Lua renderer backed by `_tui_state`, so entity frames
-            // must also update Lua state until that layout fully moves to
-            // UiNode composites backed directly by `TuiEntityStores`.
+            return;
         }
 
         // Handle kitty_changed directly — sets outer terminal keyboard mode.
@@ -4307,6 +4296,46 @@ mod tests {
             runner.panel_pool.panels().len(),
             0,
             "bridge reconnect should hard-reset panel state"
+        );
+    }
+
+    #[test]
+    fn entity_frames_update_store_without_mutating_lua_state() {
+        let (mut runner, _request_rx) = create_test_runner();
+        let lua = make_test_layout_with_keybindings();
+
+        runner.dispatch_hub_event(
+            serde_json::json!({
+                "type": "entity_snapshot",
+                "entity_type": "session",
+                "items": [{
+                    "session_uuid": "sess-modern",
+                    "display_name": "agent one",
+                    "branch_name": "main",
+                    "session_type": "agent"
+                }],
+                "snapshot_seq": 1
+            }),
+            Some(&lua),
+        );
+
+        let store = runner
+            .entity_stores
+            .store("session")
+            .expect("session store should be created");
+        assert_eq!(store.order, vec!["sess-modern".to_string()]);
+        assert_eq!(
+            store
+                .by_id
+                .get("sess-modern")
+                .and_then(|session| session.get("display_name"))
+                .and_then(serde_json::Value::as_str),
+            Some("agent one")
+        );
+        assert_eq!(
+            lua.eval_usize("return #_tui_state.agents").unwrap(),
+            0,
+            "entity envelopes should not maintain a second Lua entity cache"
         );
     }
 

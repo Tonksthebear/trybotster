@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useMemo, useState, useEffect } from 'react'
 import { Dialog, DialogTitle, DialogDescription, DialogBody, DialogActions } from '../catalyst/dialog'
 import { Field, Label, Description } from '../catalyst/fieldset'
 import { Input } from '../catalyst/input'
@@ -9,7 +9,7 @@ import {
   useWorkspaceEntityStore,
 } from '../../store/entities'
 import { waitForHub } from '../../lib/hub-bridge'
-import { activeWorkspacesExcept } from '../../store/selectors/settings-selectors'
+import { activeAgentWorkspaces } from '../../lib/entity-selectors'
 
 // Wire protocol: workspace.agents arrays are gone — membership is
 // derived client-side by joining sessions where workspace_id matches. The
@@ -26,14 +26,25 @@ export default function MoveSessionDialog({ hubId }) {
   const open = activeDialog === 'move'
   const [newWorkspaceName, setNewWorkspaceName] = useState('')
 
+  const workspaceOrder = useWorkspaceEntityStore((s) => s.order)
   const workspacesById = useWorkspaceEntityStore((s) => s.byId)
+  const sessionOrder = useSessionStore((s) => s.order)
   const sessionsById = useSessionStore((s) => s.byId)
 
   const session = sessionsById[context.sessionId]
   const sessionName = session ? displayName(session) : 'this session'
 
   const currentWorkspaceId = session?.workspace_id ?? null
-  const otherWorkspaces = activeWorkspacesExcept(workspacesById, currentWorkspaceId)
+  const otherWorkspaces = useMemo(
+    () => activeAgentWorkspaces({
+      workspaceOrder,
+      workspacesById,
+      sessionOrder,
+      sessionsById,
+      excludeWorkspaceId: currentWorkspaceId,
+    }),
+    [workspaceOrder, workspacesById, sessionOrder, sessionsById, currentWorkspaceId],
+  )
 
   useEffect(() => {
     if (open) setNewWorkspaceName('')

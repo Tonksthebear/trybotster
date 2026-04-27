@@ -31,3 +31,27 @@ export function normalizedWorkspace(workspace) {
     workspace_id: workspace?.workspace_id || id,
   }
 }
+
+export function isActiveAgentInWorkspace(session, workspaceId) {
+  if (!session || session.workspace_id !== workspaceId) return false
+  if (session.status === 'closed') return false
+  return (session.session_type ?? 'agent') !== 'accessory'
+}
+
+export function activeAgentWorkspaces({
+  workspaceOrder = [],
+  workspacesById = {},
+  sessionOrder = [],
+  sessionsById = {},
+  excludeWorkspaceId = null,
+} = {}) {
+  return workspaceOrder
+    .map((id) => normalizedWorkspace(workspacesById[id]))
+    .filter((workspace) => {
+      if (!workspace || workspace.status === 'closed') return false
+      if (excludeWorkspaceId && workspace.id === excludeWorkspaceId) return false
+      return sessionOrder.some((sessionId) =>
+        isActiveAgentInWorkspace(sessionsById[sessionId], workspace.id),
+      )
+    })
+}

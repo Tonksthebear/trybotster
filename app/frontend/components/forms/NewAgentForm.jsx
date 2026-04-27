@@ -11,12 +11,13 @@ import { agentConfigQueryOptions, useAgentConfigQuery } from '../../lib/queries'
 import WorkspacePicker from './WorkspacePicker'
 import {
   useSpawnTargetStore,
+  useSessionStore,
   useWorktreeStore,
   useWorkspaceEntityStore,
 } from '../../store/entities'
 import {
+  activeAgentWorkspaces,
   entityId,
-  normalizedWorkspace,
   normalizedWorktree,
   spawnTargetLabel,
 } from '../../lib/entity-selectors'
@@ -54,9 +55,16 @@ export default function NewAgentForm({ hubId }) {
   }, [selectedTargetId, worktreeOrder, worktreesById])
   const workspaceOrder = useWorkspaceEntityStore((state) => state.order)
   const workspacesById = useWorkspaceEntityStore((state) => state.byId)
+  const sessionOrder = useSessionStore((state) => state.order)
+  const sessionsById = useSessionStore((state) => state.byId)
   const workspaces = useMemo(
-    () => workspaceOrder.map((id) => normalizedWorkspace(workspacesById[id])).filter(Boolean),
-    [workspaceOrder, workspacesById],
+    () => activeAgentWorkspaces({
+      workspaceOrder,
+      workspacesById,
+      sessionOrder,
+      sessionsById,
+    }),
+    [workspaceOrder, workspacesById, sessionOrder, sessionsById],
   )
   const agentConfigQuery = useAgentConfigQuery(hubId, selectedTargetId, {
     enabled: open && !!selectedTargetId,
@@ -82,10 +90,6 @@ export default function NewAgentForm({ hubId }) {
 
     waitForHub(hubId).then((hub) => {
       if (cancelled || !hub) return
-
-      hub.requestSpawnTargets?.()
-      hub.requestOpenWorkspaces?.()
-      hub.requestWorktrees?.(context.targetId || null)
     })
 
     return () => {
@@ -144,11 +148,6 @@ export default function NewAgentForm({ hubId }) {
     setSelectedTargetId(targetId)
     setPendingSelection(null)
     setSelectedAgent('')
-
-    const hub = await waitForHub(hubId)
-    if (!hub || !targetId) return
-
-    hub.requestWorktrees?.(targetId)
   }
 
   function handleTargetChange(e) {
@@ -185,9 +184,6 @@ export default function NewAgentForm({ hubId }) {
 
   async function handleRefresh() {
     if (!selectedTargetId) return
-    const hub = await waitForHub(hubId)
-    if (!hub) return
-    hub.requestWorktrees?.(selectedTargetId)
     setSelectedAgent('')
     await queryClient.fetchQuery(agentConfigQueryOptions(hubId, selectedTargetId, {
       force: true,
@@ -240,9 +236,6 @@ export default function NewAgentForm({ hubId }) {
       setSubmitting(false)
       return
     }
-
-    hub.requestAgents?.()
-    hub.requestOpenWorkspaces?.()
 
     close()
   }

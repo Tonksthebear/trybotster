@@ -89,7 +89,6 @@ export default function SpawnTargetBrowser({ hubId, homePath = '/' }) {
 
     function attach(hub) {
       if (cancelled) return
-      hub.requestSpawnTargets?.()
 
       unsubs.push(
         hub.on('spawnTargetFeedback', ({ tone, message }) => {

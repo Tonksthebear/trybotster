@@ -597,16 +597,22 @@ fn resolve_local_hub_id() -> Option<String> {
 
 /// Resolve a socket path for `mcp-serve`.
 ///
-/// Requires `BOTSTER_SESSION_UUID` — looks up the session manifest in the
-/// workspace store, reads `hub_manifest_path` from it, then reads the hub
-/// manifest for the socket path.
-fn resolve_mcp_serve_socket() -> Result<String> {
+/// When `BOTSTER_SESSION_UUID` is missing, returns `Ok(None)` so the MCP server
+/// can start in degraded outside-Botster mode. When it is present, looks up the
+/// session manifest in the workspace store, reads `hub_manifest_path` from it,
+/// then reads the hub manifest for the socket path.
+fn resolve_mcp_serve_socket() -> Result<Option<String>> {
     use botster::hub::daemon::HubManifest;
 
-    let session_uuid = std::env::var("BOTSTER_SESSION_UUID")
+    let Some(session_uuid) = std::env::var("BOTSTER_SESSION_UUID")
         .ok()
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("BOTSTER_SESSION_UUID is required for mcp-serve"))?;
+    else {
+        log::warn!(
+            "BOTSTER_SESSION_UUID is not set; starting mcp-serve without Botster hub tools"
+        );
+        return Ok(None);
+    };
 
     let session_manifest = botster::env::session_manifest_path(&session_uuid).ok_or_else(|| {
         anyhow::anyhow!("Session manifest not found for BOTSTER_SESSION_UUID={session_uuid}")
@@ -648,7 +654,7 @@ fn resolve_mcp_serve_socket() -> Result<String> {
         );
     }
 
-    Ok(hub_manifest.socket_path)
+    Ok(Some(hub_manifest.socket_path))
 }
 
 ///
@@ -1126,8 +1132,12 @@ fn main() -> Result<()> {
             run_attach(hub_arg)?;
         }
         Commands::McpServe => {
-            let socket_path = resolve_mcp_serve_socket()?;
-            botster::mcp_gateway::run(&socket_path)?;
+            match resolve_mcp_serve_socket()? {
+                Some(socket_path) => botster::mcp_gateway::run(&socket_path)?,
+                None => botster::mcp_gateway::run_disconnected(
+                    "Botster MCP is available only inside a Botster-managed session",
+                )?,
+            }
         }
         Commands::Context { key, value } => {
             commands::context::run(key.as_deref(), value.as_deref())?;

@@ -93,7 +93,6 @@ export const useSettingsStore = create((set, get) => ({
     }
 
     const targets = orderedEntities(useSpawnTargetStore.getState())
-    hub.requestSpawnTargets?.()
     const selectedTargetId = targets.length === 1 ? targets[0].id || targets[0].target_id : null
 
     const unsubs = []

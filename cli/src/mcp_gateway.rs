@@ -39,6 +39,9 @@ const RECONNECT_RETRY_MS: u64 = 1_000;
 /// intentionally very generous. The legacy bridge had no timeout at all.
 const HUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(86_400);
 
+/// Diagnostic tool exposed when the MCP server is launched outside Botster.
+const DISCONNECTED_STATUS_TOOL: &str = "botster_status";
+
 // ============================================================================
 // Hub Bridge
 // ============================================================================
@@ -370,6 +373,8 @@ pub struct McpGateway {
     call_counter: Mutex<u64>,
     /// Notification receiver — taken once in `on_initialized`.
     notification_rx: Mutex<Option<mpsc::UnboundedReceiver<HubNotification>>>,
+    /// Human-readable reason this server is running without a hub connection.
+    disconnected_reason: Option<String>,
 }
 
 impl McpGateway {
@@ -380,6 +385,10 @@ impl McpGateway {
         key: String,
         frame: Frame,
     ) -> Result<Value, ErrorData> {
+        if let Some(reason) = &self.disconnected_reason {
+            return Err(ErrorData::invalid_params(reason.clone(), None));
+        }
+
         let start = Instant::now();
         let (tx, rx) = oneshot::channel();
 
@@ -445,6 +454,25 @@ fn hub_tool_to_mcp(t: &Value) -> Option<Tool> {
         });
 
     Some(Tool::new(name.to_string(), description.to_string(), schema))
+}
+
+fn disconnected_status_tool() -> Tool {
+    Tool::new(
+        DISCONNECTED_STATUS_TOOL.to_string(),
+        "Explain why Botster tools are unavailable in this session.".to_string(),
+        serde_json::Map::from_iter([(
+            "type".to_string(),
+            Value::String("object".to_string()),
+        )]),
+    )
+}
+
+fn disconnected_status_message(reason: &str) -> String {
+    format!(
+        "{reason}. This agent was not launched inside a Botster-managed session, \
+so Botster hub tools, prompts, resources, messaging, and orchestration are unavailable. \
+Start the agent from Botster so BOTSTER_SESSION_UUID is present."
+    )
 }
 
 /// Convert a hub prompt JSON object to an rmcp `Prompt`.
@@ -568,6 +596,12 @@ impl ServerHandler for McpGateway {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
         async move {
+            if self.disconnected_reason.is_some() {
+                return Ok(ListToolsResult::with_all_items(vec![
+                    disconnected_status_tool(),
+                ]));
+            }
+
             let msg = self
                 .hub_request(
                     "tools/list",
@@ -595,6 +629,19 @@ impl ServerHandler for McpGateway {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, ErrorData>> + Send + '_ {
         async move {
+            if let Some(reason) = &self.disconnected_reason {
+                if request.name.as_ref() == DISCONNECTED_STATUS_TOOL {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        disconnected_status_message(reason),
+                    )]));
+                }
+
+                return Err(ErrorData::invalid_params(
+                    disconnected_status_message(reason),
+                    None,
+                ));
+            }
+
             let call_id = self.next_call_id("call").await;
             let tool_name = &request.name;
             let arguments = request
@@ -636,6 +683,10 @@ impl ServerHandler for McpGateway {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListPromptsResult, ErrorData>> + Send + '_ {
         async move {
+            if self.disconnected_reason.is_some() {
+                return Ok(ListPromptsResult::with_all_items(Vec::<Prompt>::new()));
+            }
+
             let msg = self
                 .hub_request(
                     "prompts/list",
@@ -663,6 +714,10 @@ impl ServerHandler for McpGateway {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<GetPromptResult, ErrorData>> + Send + '_ {
         async move {
+            if let Some(reason) = &self.disconnected_reason {
+                return Err(ErrorData::invalid_params(reason.clone(), None));
+            }
+
             let call_id = self.next_call_id("prompt_get").await;
             let prompt_name = &request.name;
             let arguments = request
@@ -718,6 +773,12 @@ impl ServerHandler for McpGateway {
     ) -> impl std::future::Future<Output = Result<ListResourceTemplatesResult, ErrorData>> + Send + '_
     {
         async move {
+            if self.disconnected_reason.is_some() {
+                return Ok(ListResourceTemplatesResult::with_all_items(
+                    Vec::<ResourceTemplate>::new(),
+                ));
+            }
+
             let msg = self
                 .hub_request(
                     "resources/templates/list",
@@ -749,6 +810,10 @@ impl ServerHandler for McpGateway {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ReadResourceResult, ErrorData>> + Send + '_ {
         async move {
+            if let Some(reason) = &self.disconnected_reason {
+                return Err(ErrorData::resource_not_found(reason.clone(), None));
+            }
+
             let call_id = self.next_call_id("resource_read").await;
             let uri = request.uri.as_str();
 
@@ -825,6 +890,17 @@ pub fn run(socket_path: &str) -> Result<()> {
     rt.block_on(run_async(socket_path))
 }
 
+/// Run the MCP gateway without a Botster hub connection.
+///
+/// This mode is used when an agent harness starts the configured Botster MCP
+/// server outside a Botster-managed PTY session. The server starts cleanly and
+/// advertises a diagnostic status tool instead of making the harness report
+/// startup failure.
+pub fn run_disconnected(reason: &str) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_disconnected_async(reason.to_string()))
+}
+
 /// Async entry point: connect to hub, start rmcp server on stdio.
 async fn run_async(socket_path: &str) -> Result<()> {
     // Initial connection — fail immediately if hub is unreachable
@@ -853,9 +929,29 @@ async fn run_async(socket_path: &str) -> Result<()> {
         request_tx,
         call_counter: Mutex::new(0),
         notification_rx: Mutex::new(Some(notification_rx)),
+        disconnected_reason: None,
     };
 
-    // Start the rmcp server on stdio
+    serve_stdio(gateway).await
+}
+
+async fn run_disconnected_async(reason: String) -> Result<()> {
+    log::warn!("[mcp-gateway] starting disconnected: {reason}");
+
+    let (request_tx, _request_rx) = mpsc::unbounded_channel();
+    let (_notification_tx, notification_rx) = mpsc::unbounded_channel();
+
+    let gateway = McpGateway {
+        request_tx,
+        call_counter: Mutex::new(0),
+        notification_rx: Mutex::new(Some(notification_rx)),
+        disconnected_reason: Some(reason),
+    };
+
+    serve_stdio(gateway).await
+}
+
+async fn serve_stdio(gateway: McpGateway) -> Result<()> {
     let service = gateway
         .serve(rmcp::transport::stdio())
         .await

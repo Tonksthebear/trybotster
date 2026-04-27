@@ -112,17 +112,18 @@ describe('createEntityStore', () => {
     expect(store.getState().snapshotSeq).toBe(5)
   })
 
-  it('applies snapshot resyncs even when seq is unchanged or lower', () => {
+  it('applies snapshot resyncs when seq is unchanged and drops stale snapshots', () => {
     const s = store.getState()
     s.applySnapshot([{ session_uuid: 'sess-a', title: 'stale' }], 5)
     s.applySnapshot([{ session_uuid: 'sess-b', title: 'fresh' }], 5)
     s.applySnapshot([{ session_uuid: 'sess-c', title: 'reset' }], 4)
 
     const next = store.getState()
-    expect(next.order).toEqual(['sess-c'])
+    expect(next.order).toEqual(['sess-b'])
     expect(next.byId['sess-a']).toBeUndefined()
-    expect(next.byId['sess-c'].title).toBe('reset')
-    expect(next.snapshotSeq).toBe(4)
+    expect(next.byId['sess-b'].title).toBe('fresh')
+    expect(next.byId['sess-c']).toBeUndefined()
+    expect(next.snapshotSeq).toBe(5)
   })
 
   it('list() returns [id, entity] pairs in insertion order', () => {

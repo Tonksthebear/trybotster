@@ -1,0 +1,33 @@
+{
+  "name": "botster",
+  "version": "0.1.0",
+  "description": "Botster agent integration with MCP server configuration and workflow skills.",
+  "author": {
+    "name": "Botster",
+    "email": "support@botster.dev",
+    "url": "https://botster.dev"
+  },
+  "homepage": "https://botster.dev",
+  "repository": "https://github.com/botster/botster",
+  "license": "MIT",
+  "keywords": ["botster", "mcp", "agents", "pty", "orchestration"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Botster",
+    "shortDescription": "Connect agents to the local Botster hub.",
+    "longDescription": "Installs the Botster MCP server configuration and gives agents focused Botster skills for first-agent setup, TUI customization, hub behavior, Botster plugin customization, and MCP tool authoring.",
+    "developerName": "Botster",
+    "category": "Developer Tools",
+    "capabilities": ["MCP", "Skills"],
+    "websiteURL": "https://botster.dev",
+    "privacyPolicyURL": "https://botster.dev/privacy",
+    "termsOfServiceURL": "https://botster.dev/terms",
+    "defaultPrompt": [
+      "Show my Botster identity.",
+      "List active Botster hubs and agents.",
+      "Coordinate this task through Botster."
+    ],
+    "brandColor": "#2563EB"
+  }
+}
