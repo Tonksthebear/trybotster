@@ -25,9 +25,9 @@ Knowledge-vault background:
 | File | Purpose |
 |---|---|
 | `tokens.rs` | Shared scalar tokens (`UiTone`, `UiAlign`, `UiSpace`, `UiSize`, `UiInteractionDensity`, `UiPresentation`, …). |
-| `viewport.rs` | `UiViewportV1` plus its classes (`UiWidthClass`, `UiHeightClass`, `UiPointer`, `UiOrientation`). |
-| `node.rs` | `UiNodeV1`, `UiChildV1`, `UiActionV1`, `UiCapabilitySetV1`, `UiResponsiveV1<T>`, `UiConditionalV1`, `UiConditionV1`. |
-| `props.rs` | Strongly-typed Props structs for every v1 Lua-public primitive + `DialogPropsV1`. |
+| `viewport.rs` | `UiViewport` plus its classes (`UiWidthClass`, `UiHeightClass`, `UiPointer`, `UiOrientation`). |
+| `node.rs` | `UiNode`, `UiChild`, `UiAction`, `UiCapabilitySet`, `UiResponsive<T>`, `UiConditional`, `UiCondition`. |
+| `props.rs` | Strongly-typed Props structs for every current Lua-public primitive + `DialogProps`. |
 | `lua.rs` | `register(&Lua)` — installs the `ui` table as a Lua global. |
 
 ## Wire format
@@ -42,8 +42,8 @@ All types serialize as JSON matching the TypeScript types in the specs
   "type": "stack",
   "id": "…optional stable id…",
   "props": { "direction": "vertical", "gap": "2" },
-  "children": [ /* UiChildV1 */ ],
-  "slots":    { "title": [ /* UiChildV1 */ ] }
+  "children": [ /* UiChild */ ],
+  "slots":    { "title": [ /* UiChild */ ] }
 }
 ```
 
@@ -67,13 +67,13 @@ The two dimensions are split because `"regular"` is valid in both
 
 `$kind = "when"` renders the inner node only when the condition matches;
 `$kind = "hidden"` renders the inner node only when the condition does **not**
-match. Both are accepted anywhere a `UiNodeV1` is (children arrays, slots).
+match. Both are accepted anywhere a `UiNode` is (children arrays, slots).
 
 ## Lua DSL
 
 `ui_contract::lua::register(&Lua)` installs a `ui` global.
 
-### Primitive constructors (v1, Lua-public)
+### Primitive constructors (current, Lua-public)
 
 All prop shapes align with `cross-client-ui-primitives.md` — web-runtime-only
 extensions (`Panel.padding`, `Panel.radius`, `Stack.padding`,
@@ -105,14 +105,14 @@ ui.status_dot{ state = ..., label = ... }
 ui.empty_state{ title = ..., description = ..., icon = ...,
                 primary_action = ui.action(...) }
 
--- No `disabled` field: disabled travels on `action.disabled` (UiActionV1).
+-- No `disabled` field: disabled travels on `action.disabled` (UiAction).
 -- `icon` is the cross-client canonical name (NOT `leadingIcon`).
 ui.button{ label = ..., action = ..., variant = ..., tone = ..., icon = ... }
 
 -- No `disabled` field: use `action.disabled`.
 ui.icon_button{ icon = ..., label = ..., action = ..., tone = ... }
 
--- No shared props in v1 (web's `density` is renderer-internal).
+-- No shared props in current (web's `density` is renderer-internal).
 ui.tree{ children = {...} }
 
 -- `title` slot is REQUIRED; spec slot keys may be hoisted to top level:
@@ -141,7 +141,7 @@ ui.dialog{ open = ..., title = ..., presentation = "auto" | "inline" | "overlay"
 }
 ```
 
-`Dialog` is deferred from the Lua-public v1 surface per
+`Dialog` is deferred from the Lua-public current surface per
 `docs/specs/web-ui-primitives-runtime.md`. It is registered here so renderers
 can adopt it in Phase B / Phase C. Presentation defaults to `"auto"`. Top-level
 `body` and `footer` keys are automatically hoisted into `slots` per the
@@ -149,13 +149,13 @@ cross-client spec's Dialog shape.
 
 ### `Menu` / `MenuItem`
 
-**Intentionally not exposed.** Both are web-runtime-internal in v1 until the
+**Intentionally not exposed.** Both are web-runtime-internal in current until the
 cross-client menu interaction model stabilizes.
 
 ### `TextInput` / `Checkbox` / `Toggle` / `Select`
 
-**Intentionally not exposed in v1.** These belong to the broader cross-client
-shared vocabulary but are deferred from the v1 Lua-public inventory per
+**Intentionally not exposed in current.** These belong to the broader cross-client
+shared vocabulary but are deferred from the current Lua-public inventory per
 `phase one web ui composites stay internal while Lua public contract stops at primitives.md`.
 
 ### Adaptive helpers
@@ -284,7 +284,7 @@ full integration suite with `./test.sh --integration`.
 
 ## Wire protocol — composite primitives
 
-The wire protocol replaces "rebuild + rebroadcast the entire `UiNodeV1`
+The wire protocol replaces "rebuild + rebroadcast the entire `UiNode`
 tree on every state change" with a delta protocol: structural snapshots
 ship only on connect / structural change, per-entity field deltas ship on
 data change. To keep authored layouts thin, the data-driven UI regions
@@ -304,7 +304,7 @@ they used to inline are now first-class composites:
 These primitives are **data-driven**: they carry no slots and no children
 on the wire. Each renderer (web React, ratatui TUI) reads from its
 client-side entity store and expands the composite into the same flat tree
-the v1 hub-rendered layout used to ship. Both renderers honor the same
+the current hub-rendered layout used to ship. Both renderers honor the same
 density / grouping tokens.
 
 Density follows the `UiSurfaceDensity` token (`sidebar` | `panel`) — see
@@ -361,6 +361,6 @@ the wire shape they consume.)
 
 ## Versioning
 
-This is `ui-contract/v1` with the wire-protocol composite extensions
+This is `ui-contract` with the wire-protocol composite extensions
 listed above. Additive changes are backward-compatible; removing props or
 changing payload semantics requires a major bump.

@@ -251,7 +251,11 @@ fn upsert_falls_back_to_id_when_registered_id_field_is_absent() {
     upsert.call::<()>(("spawn_target", payload)).unwrap();
 
     let captured = frames_as_json(&lua, &frames);
-    assert_eq!(captured.len(), 1, "upsert must emit one frame even without target_id");
+    assert_eq!(
+        captured.len(),
+        1,
+        "upsert must emit one frame even without target_id"
+    );
     let frame = &captured[0];
     assert_eq!(frame["type"], json!("entity_upsert"));
     assert_eq!(frame["entity_type"], json!("spawn_target"));
@@ -352,10 +356,7 @@ fn send_snapshots_to_emits_one_snapshot_per_registered_type() {
 
     assert_eq!(json_frames[1]["entity_type"], json!("workspace"));
     assert_eq!(json_frames[1]["items"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        json_frames[1]["items"][0]["workspace_id"],
-        json!("ws-1")
-    );
+    assert_eq!(json_frames[1]["items"][0]["workspace_id"], json!("ws-1"));
 }
 
 #[test]
@@ -555,7 +556,9 @@ fn hub_upsert_ships_even_when_server_id_is_nil() {
     // hub_id comes from server_hub_id() fallback; state from the transition.
     let upsert: Function = eb.get("upsert").unwrap();
     let payload: Table = lua.create_table().unwrap();
-    payload.set("hub_id", "local-hub-identifier-deadbeef").unwrap();
+    payload
+        .set("hub_id", "local-hub-identifier-deadbeef")
+        .unwrap();
     payload.set("state", "ready").unwrap();
     upsert.call::<()>(("hub", payload)).unwrap();
 

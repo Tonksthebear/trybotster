@@ -281,13 +281,12 @@ mcp.count() -> number
 
 Tools track their source plugin automatically via `_G._loading_plugin_source` (set by `loader.lua`). On plugin hot-reload, `mcp.reset(source)` clears that plugin's tools before re-registering. The hub emits a `tools_list_changed` notification to connected MCP clients so they re-fetch the tool list.
 
-**MCP stdio bridge**: Run `botster mcp-serve` to expose registered tools over JSON-RPC stdio. For Codex, forward `BOTSTER_SESSION_UUID` into the MCP subprocess so the gateway can resolve the correct session manifest:
+**MCP stdio bridge**: Run `botster mcp-serve` to expose registered tools over JSON-RPC stdio. Botster resolves the session through the hub context; session definitions should use `botster context ...` helpers instead of wiring Botster-specific environment variables.
 
 ```toml
 [mcp_servers.botster]
 command = "botster"
 args = ["mcp-serve"]
-env_vars = ["BOTSTER_SESSION_UUID"]
 ```
 
 Editor clients that use `.mcp.json` can still configure the same command directly:

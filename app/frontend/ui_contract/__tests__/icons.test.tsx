@@ -3,13 +3,13 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { cleanup, render } from '@testing-library/react'
 import { UiTreeBody, createRawDispatch } from '..'
 import { IconGlyph, hasIcon } from '../icons'
-import type { UiNodeV1, UiViewportV1 } from '../types'
+import type { UiNode, UiViewport } from '../types'
 
 afterEach(() => {
   cleanup()
 })
 
-const REGULAR_FINE: UiViewportV1 = {
+const REGULAR_FINE: UiViewport = {
   widthClass: 'expanded',
   heightClass: 'regular',
   pointer: 'fine',
@@ -56,7 +56,7 @@ describe('icons registry', () => {
 
 describe('icon primitive renders a visible SVG', () => {
   it('renders SVG child for a registered name', () => {
-    const node: UiNodeV1 = {
+    const node: UiNode = {
       type: 'icon',
       props: { name: 'external-link', size: 'sm' },
     }
@@ -69,7 +69,7 @@ describe('icon primitive renders a visible SVG', () => {
   })
 
   it('icon_button renders an SVG inside the button', () => {
-    const node: UiNodeV1 = {
+    const node: UiNode = {
       type: 'icon_button',
       props: {
         icon: 'close',
@@ -84,7 +84,7 @@ describe('icon primitive renders a visible SVG', () => {
   })
 
   it('button with leading icon renders an SVG', () => {
-    const node: UiNodeV1 = {
+    const node: UiNode = {
       type: 'button',
       props: {
         label: 'Save',
@@ -100,7 +100,7 @@ describe('icon primitive renders a visible SVG', () => {
   })
 
   it('empty_state icon renders an SVG', () => {
-    const node: UiNodeV1 = {
+    const node: UiNode = {
       type: 'empty_state',
       props: { title: 'Empty', icon: 'sparkle' },
     }

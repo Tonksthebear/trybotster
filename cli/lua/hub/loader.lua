@@ -81,24 +81,24 @@ local function plugin_dir(path)
     return path:match("^(.*)/[^/]+$") or "."
 end
 
---- Add a plugin's lua/ directory to package.path (idempotent).
--- Adds both ?.lua and ?/init.lua patterns so sub-modules can be both flat
--- files (github/api.lua) and directories (github/api/init.lua).
--- @param lua_dir string  Full path to the plugin's lua/ directory
-local function add_to_package_path(lua_dir)
-    local entry1 = lua_dir .. "/?.lua"
-    local entry2 = lua_dir .. "/?/init.lua"
+--- Add a plugin directory to package.path (idempotent).
+-- Adds both ?.lua and ?/init.lua patterns so plugin authors can choose their
+-- own organization next to init.lua or inside lua/.
+-- @param dir string  Full path to a plugin-owned directory
+local function add_to_package_path(dir)
+    local entry1 = dir .. "/?.lua"
+    local entry2 = dir .. "/?/init.lua"
     if not package.path:find(entry1, 1, true) then
         package.path = entry1 .. ";" .. entry2 .. ";" .. package.path
     end
 end
 
---- Remove a plugin's lua/ directory from package.path.
+--- Remove a plugin directory from package.path.
 -- Uses split-and-filter to avoid trailing-semicolon edge cases.
--- @param lua_dir string  Full path to the plugin's lua/ directory
-local function remove_from_package_path(lua_dir)
-    local entry1 = lua_dir .. "/?.lua"
-    local entry2 = lua_dir .. "/?/init.lua"
+-- @param dir string  Full path to a plugin-owned directory
+local function remove_from_package_path(dir)
+    local entry1 = dir .. "/?.lua"
+    local entry2 = dir .. "/?/init.lua"
     local parts = {}
     for part in (package.path .. ";"):gmatch("([^;]*);") do
         if part ~= entry1 and part ~= entry2 and part ~= "" then
@@ -117,6 +117,31 @@ local function clear_plugin_namespace(name)
         if k == name or k:sub(1, #prefix) == prefix then
             package.loaded[k] = nil
         end
+    end
+end
+
+local function package_loaded_snapshot()
+    local seen = {}
+    for k in pairs(package.loaded) do
+        seen[k] = true
+    end
+    return seen
+end
+
+local function package_loaded_added_since(before)
+    local out = {}
+    for k in pairs(package.loaded) do
+        if not before[k] then
+            out[#out + 1] = k
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+local function clear_recorded_modules(entry)
+    for _, module_name in ipairs(entry.modules or {}) do
+        package.loaded[module_name] = nil
     end
 end
 
@@ -289,9 +314,13 @@ function M.load_plugin(path, name)
         return false, msg
     end
 
-    -- Add the plugin's lua/ subdir to package.path before executing the chunk
-    -- so require() calls inside the plugin resolve at init time.
-    local lua_dir = plugin_dir(path) .. "/lua"
+    -- Add plugin-owned directories to package.path before executing the chunk
+    -- so require() calls inside init.lua resolve at init time. The plugin root
+    -- is included so authors can keep files like web_layout.lua next to
+    -- init.lua; lua/ remains supported for larger plugin trees.
+    local root_dir = plugin_dir(path)
+    add_to_package_path(root_dir)
+    local lua_dir = root_dir .. "/lua"
     if fs.is_dir(lua_dir) then
         add_to_package_path(lua_dir)
         log.info(string.format("Plugin %s: registered lua/ at %s", name, lua_dir))
@@ -310,6 +339,7 @@ function M.load_plugin(path, name)
     local real_log = _G.log
     _G.log = create_plugin_logger(name, real_log)
 
+    local loaded_before = package_loaded_snapshot()
     local ok, result = pcall(chunk)
 
     -- Restore real logger
@@ -330,6 +360,11 @@ function M.load_plugin(path, name)
     -- Register in package.loaded so reload works
     local module_key = "plugin." .. name
     package.loaded[module_key] = result or true
+    local state = require("hub.state")
+    local registry = state.get("plugin_registry", {})
+    if registry[name] then
+        registry[name].modules = package_loaded_added_since(loaded_before)
+    end
     log.info(string.format("Loaded plugin: %s from %s", name, path))
     return true
 end
@@ -390,8 +425,11 @@ function M.reload_plugin(name)
 
     -- Remove the old package.path entry and sub-module cache so the fresh load
     -- starts clean. load_plugin() re-adds the path after a successful load.
-    local lua_dir = plugin_dir(entry.path) .. "/lua"
+    local root_dir = plugin_dir(entry.path)
+    local lua_dir = root_dir .. "/lua"
+    remove_from_package_path(root_dir)
     remove_from_package_path(lua_dir)
+    clear_recorded_modules(entry)
     clear_plugin_namespace(name)
 
     -- Clear old module
@@ -411,7 +449,10 @@ function M.reload_plugin(name)
         for k, v in pairs(old_namespace) do
             package.loaded[k] = v
         end
-        add_to_package_path(lua_dir)
+        add_to_package_path(root_dir)
+        if fs.is_dir(lua_dir) then
+            add_to_package_path(lua_dir)
+        end
         update_registry_status(name, "errored", "Failed to reload plugin: " .. name)
         return false, "Failed to reload plugin: " .. name
     end
@@ -467,7 +508,10 @@ function M.unload_plugin(name)
 
     -- Remove plugin's lua/ dir from package.path and clear namespace modules
     -- so stale require() cache doesn't survive unload
-    remove_from_package_path(plugin_dir(entry.path) .. "/lua")
+    local root_dir = plugin_dir(entry.path)
+    remove_from_package_path(root_dir)
+    remove_from_package_path(root_dir .. "/lua")
+    clear_recorded_modules(entry)
     clear_plugin_namespace(name)
     package.loaded[module_key] = nil
 

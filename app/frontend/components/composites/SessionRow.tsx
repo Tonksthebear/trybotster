@@ -14,10 +14,10 @@ import {
   titleLine,
 } from '../../store/selectors/session-row'
 import type {
-  SessionRowPropsV1,
-  UiActionV1,
-  UiSurfaceDensityV1,
-  UiValueV1,
+  SessionRowProps as UiSessionRowProps,
+  UiAction,
+  UiSurfaceDensity,
+  UiValue,
 } from '../../ui_contract/types'
 import type { RenderContext } from '../../ui_contract/context'
 import { resolveValue } from '../../ui_contract/viewport'
@@ -39,7 +39,7 @@ type SessionRecord = {
   notification?: boolean
 }
 
-export type SessionRowProps = SessionRowPropsV1 & { ctx: RenderContext }
+export type SessionRowProps = UiSessionRowProps & { ctx: RenderContext }
 
 export function SessionRow({
   sessionUuid,
@@ -50,8 +50,8 @@ export function SessionRow({
     (state) => state.byId[sessionUuid] as SessionRecord | undefined,
   )
   const resolvedDensity =
-    resolveValue<UiSurfaceDensityV1>(
-      density as UiValueV1<UiSurfaceDensityV1> | undefined,
+    resolveValue<UiSurfaceDensity>(
+      density as UiValue<UiSurfaceDensity> | undefined,
       ctx.viewport,
     ) ?? 'panel'
   if (!session) {
@@ -94,7 +94,7 @@ export function SessionRow({
       {
         id: 'botster.session.menu.open',
         payload: { sessionId, sessionUuid },
-      } as UiActionV1,
+      } as UiAction,
       { element: event.currentTarget as Element },
     )
   }

@@ -121,6 +121,7 @@ local function pick_agent_config(resolved, agent_name)
             name = agent_name,
             command = "bash",
             init_script = agent.initialization,
+            definition_dir = agent.dir,
             notifications = true,
             forward_port = false,
         }
@@ -132,6 +133,7 @@ local function pick_agent_config(resolved, agent_name)
             name = name,
             command = "bash",
             init_script = a.initialization,
+            definition_dir = a.dir,
             notifications = true,
             forward_port = false,
         }
@@ -151,6 +153,7 @@ local function pick_accessory_config(resolved, accessory_name)
             name = accessory_name,
             command = "bash",
             init_script = accessory.initialization,
+            definition_dir = accessory.dir,
             notifications = false,
             forward_port = accessory.port_forward,
         }
@@ -228,31 +231,6 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_name, met
 
     -- Pick the agent config
     local session_config = pick_agent_config(resolved, agent_name)
-
-    -- Inject system prompt into worktree before init script runs.
-    -- Uses a marker comment to prevent duplicate injection on re-spawn.
-    local agent_config = resolved.agents[agent_name]
-    if agent_config and agent_config.system_prompt and agent_config.system_prompt ~= "" then
-        local claude_dir = wt_path .. "/.claude"
-        local claude_md = claude_dir .. "/CLAUDE.md"
-        local marker = "<!-- botster:system-prompt -->"
-        local prompt_block = marker .. "\n" .. agent_config.system_prompt
-        if not fs.exists(claude_dir) then
-            fs.mkdir(claude_dir)
-        end
-        if fs.exists(claude_md) then
-            local existing = fs.read(claude_md) or ""
-            if not existing:find(marker, 1, true) then
-                fs.write(claude_md, existing .. "\n\n" .. prompt_block)
-                log.info(string.format("Appended system prompt to %s", claude_md))
-            else
-                log.debug(string.format("System prompt already present in %s, skipping", claude_md))
-            end
-        else
-            fs.write(claude_md, prompt_block)
-            log.info(string.format("Wrote system prompt to %s", claude_md))
-        end
-    end
 
     -- Default dimensions
     local dims = { rows = 24, cols = 80 }

@@ -1,8 +1,8 @@
 #!/bin/bash
 # @template Claude
 # @description Minimal agent session that launches Claude Code in a worktree
-# @category sessions
-# @dest shared/sessions/agent/initialization
+# @category agents
+# @dest agents/claude/initialization
 # @scope device
 # @version 1.1.0
 
@@ -15,14 +15,14 @@
 # mise trust 2>/dev/null
 
 # Change to the worktree directory
-cd "$BOTSTER_WORKTREE_PATH"
+cd "$(botster context worktree_path)"
 
 # ---------------------------------------------------------------------------
 # Claude trust
 # ---------------------------------------------------------------------------
 # Auto-accept the trust dialog for this worktree so Claude doesn't prompt.
 
-botster json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogAccepted" "true"
+botster json-set ~/.claude.json "projects.$(botster context worktree_path).hasTrustDialogAccepted" "true"
 
 # ---------------------------------------------------------------------------
 # Hub MCP tools
@@ -38,6 +38,7 @@ botster json-set ~/.claude.json "projects.$BOTSTER_WORKTREE_PATH.hasTrustDialogA
 # ---------------------------------------------------------------------------
 
 echo "Botster agent initialized for branch: $(botster context branch_name)"
-echo "Worktree: $BOTSTER_WORKTREE_PATH"
+echo "Worktree: $(botster context worktree_path)"
+echo "Agent definition: $(botster context session_dir)"
 
 claude --permission-mode acceptEdits "$(botster context prompt)"

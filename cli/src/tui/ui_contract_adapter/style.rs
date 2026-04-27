@@ -104,10 +104,7 @@ pub fn text_span_style(
     if let Some(t) = tone {
         style.fg = tone_color(t);
     }
-    if matches!(
-        weight,
-        Some(UiTextWeight::Medium | UiTextWeight::Semibold)
-    ) {
+    if matches!(weight, Some(UiTextWeight::Medium | UiTextWeight::Semibold)) {
         style.bold = true;
     }
     if italic {

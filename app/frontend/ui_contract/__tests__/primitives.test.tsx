@@ -2,23 +2,23 @@ import React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, fireEvent } from '@testing-library/react'
 import { UiTreeBody, createRawDispatch } from '..'
-import type { UiActionV1, UiNodeV1, UiViewportV1 } from '../types'
+import type { UiAction, UiNode, UiViewport } from '../types'
 
 afterEach(() => {
   cleanup()
 })
 
-const REGULAR_FINE: UiViewportV1 = {
+const REGULAR_FINE: UiViewport = {
   widthClass: 'expanded',
   heightClass: 'regular',
   pointer: 'fine',
 }
 
 function renderTree(
-  node: UiNodeV1,
+  node: UiNode,
   opts: {
-    viewport?: UiViewportV1
-    onAction?: (action: UiActionV1) => void
+    viewport?: UiViewport
+    onAction?: (action: UiAction) => void
     hubId?: string
   } = {},
 ): ReturnType<typeof render> {

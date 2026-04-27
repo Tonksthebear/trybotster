@@ -10,6 +10,7 @@
   agents/
     claude/                          # Agent definition (AI-driven PTY)
       initialization                 # Startup script
+      notes.md                       # Optional paired file chosen by the author
   accessories/
     rails-server/                    # Accessory definition (plain PTY)
       initialization                 # Startup script
@@ -18,7 +19,9 @@
     dev.json                         # Workspace manifest (auto-spawn group)
   plugins/
     my-plugin/
-      init.lua</code></pre>
+      init.lua                       # Plugin entrypoint
+      web_layout.lua                 # Optional plugin-owned file
+      tui/status.lua                 # TUI file declared by init.lua</code></pre>
 
 <h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Repo level</h2>
 <pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>your-repo/.botster/
@@ -31,10 +34,18 @@
   workspaces/
     full-stack.json                  # Spawn agent + server together
   plugins/
-    github/init.lua
-    worktree-lifecycle/init.lua      # Worktree setup and cleanup (from template)</code></pre>
+    github/
+      init.lua
+      web_layout.lua
+    worktree-lifecycle/
+      init.lua                       # Worktree setup and cleanup (from template)</code></pre>
 
 <p class="text-zinc-400">
   Repo-level config overrides device-level config for the same names. This lets you commit
-  project-specific agent setup while keeping personal defaults at the device level.
+  project-specific agent setup while keeping personal defaults at the device level. Agents,
+  accessories, and plugins are browsed as named directories, so support files can sit next to
+  the entrypoint without filename conventions beyond <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">initialization</code>
+  for sessions and <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">init.lua</code> for plugins.
+  Session scripts can locate their directory with <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">botster context session_dir</code>
+  or read paired files with <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">botster context file &lt;path&gt;</code>.
 </p>

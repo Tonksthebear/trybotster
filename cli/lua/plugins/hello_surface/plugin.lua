@@ -126,7 +126,7 @@ local function details_page(state, ctx)
 end
 
 -- Surfaces with a simple `input_builder` decouple themselves from the
--- workspace payload — they don't need `AgentWorkspaceSurfaceInputV1`.
+-- workspace payload — they don't need `AgentWorkspaceSurfaceInput`.
 local function minimal_input(_client, _sub_id)
     local hub_id = (type(hub) == "table") and hub.server_id and hub.server_id() or nil
     return { hub_id = hub_id }

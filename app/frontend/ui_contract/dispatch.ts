@@ -1,6 +1,6 @@
 import { dispatch as dispatchLocalAction } from '../lib/actions'
 import type { ActionDispatch, ActionDispatchSource } from './context'
-import type { UiActionV1 } from './types'
+import type { UiAction } from './types'
 
 /**
  * Minimal transport surface we need to send `ui_action` frames. Anything
@@ -48,7 +48,7 @@ const LOCAL_ONLY_ACTIONS = new Set<string>([
 ])
 
 function dispatchLocal(
-  action: UiActionV1,
+  action: UiAction,
   mergedPayload: Record<string, unknown>,
 ): void {
   dispatchLocalAction({
@@ -65,7 +65,7 @@ function dispatchLocal(
  * check.
  */
 function navigateToSessionLocally(
-  action: UiActionV1,
+  action: UiAction,
   mergedPayload: Record<string, unknown>,
 ): void {
   if (action.id !== 'botster.session.select') return
@@ -90,13 +90,13 @@ function navigateToSessionLocally(
  * Build an `ActionDispatch` that routes hub-authored actions through the
  * Phase 2b transport. Serialized wire shape:
  *
- *     { type: "ui_action", target_surface, envelope: UiActionV1 }
+ *     { type: "ui_action", target_surface, envelope: UiAction }
  */
 export function createTransportDispatch(
   opts: CreateTransportDispatchOptions,
 ): ActionDispatch {
   const { transport, hubId, targetSurface } = opts
-  return (action: UiActionV1, _source?: ActionDispatchSource) => {
+  return (action: UiAction, _source?: ActionDispatchSource) => {
     if (action.disabled === true) return
     const mergedPayload = {
       hubId,
@@ -115,7 +115,7 @@ export function createTransportDispatch(
       return
     }
 
-    const envelope: UiActionV1 = action.payload
+    const envelope: UiAction = action.payload
       ? { id: action.id, payload: action.payload }
       : { id: action.id }
 
@@ -146,9 +146,9 @@ export function createTransportDispatch(
  * want to pass through the raw payload. Useful in tests.
  */
 export function createRawDispatch(
-  handler: (action: UiActionV1, source?: ActionDispatchSource) => void,
+  handler: (action: UiAction, source?: ActionDispatchSource) => void,
 ): ActionDispatch {
-  return (action: UiActionV1, source?: ActionDispatchSource) => {
+  return (action: UiAction, source?: ActionDispatchSource) => {
     if (action.disabled === true) return
     handler(action, source)
   }

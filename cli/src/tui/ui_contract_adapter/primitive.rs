@@ -1,6 +1,6 @@
 //! Primitive → [`RenderNode`] mapping for the TUI adapter.
 //!
-//! This module is the meat of Phase B: it translates a [`UiNodeV1`] tree
+//! This module is the meat of Phase B: it translates a [`UiNode`] tree
 //! (produced by Phase A's Lua DSL) into the existing TUI render tree so
 //! ratatui can draw it unchanged.
 //!
@@ -52,7 +52,7 @@
 
 #![expect(
     clippy::trivially_copy_pass_by_ref,
-    reason = "UiViewportV1 is Copy but we pass by reference deliberately — it reads as 'the current viewport context this pass is rendering against', and the consistency across 30+ adapter signatures outweighs the trivial copy optimisation"
+    reason = "UiViewport is Copy but we pass by reference deliberately — it reads as 'the current viewport context this pass is rendering against', and the consistency across 30+ adapter signatures outweighs the trivial copy optimisation"
 )]
 
 use anyhow::{anyhow, Result};
@@ -64,15 +64,15 @@ use crate::tui::render_tree::{
     BlockConfig, BorderStyle, ListItemProps, ListProps, ParagraphAlignment, ParagraphProps,
     RenderNode, SpanStyle, StyledContent, StyledSpan, WidgetProps, WidgetType,
 };
-use crate::ui_contract::node::{UiActionV1, UiChildV1, UiNodeV1};
+use crate::ui_contract::node::{UiAction, UiChild, UiNode};
 use crate::ui_contract::props::{
-    BadgePropsV1, ButtonPropsV1, ConnectionCodePropsV1, DialogPropsV1, EmptyStatePropsV1,
-    HubRecoveryStatePropsV1, IconButtonPropsV1, IconPropsV1, NewSessionButtonPropsV1, PanelPropsV1,
-    SessionListPropsV1, SessionRowPropsV1, SpawnTargetListPropsV1, StackPropsV1, StatusDotPropsV1,
-    TextPropsV1, TreeItemPropsV1, WorkspaceListPropsV1, WorktreeListPropsV1,
+    BadgeProps, ButtonProps, ConnectionCodeProps, DialogProps, EmptyStateProps,
+    HubRecoveryStateProps, IconButtonProps, IconProps, NewSessionButtonProps, PanelProps,
+    SessionListProps, SessionRowProps, SpawnTargetListProps, StackProps, StatusDotProps, TextProps,
+    TreeItemProps, WorkspaceListProps, WorktreeListProps,
 };
 use crate::ui_contract::tokens::{UiSessionListGrouping, UiStackDirection, UiSurfaceDensity};
-use crate::ui_contract::viewport::UiViewportV1;
+use crate::ui_contract::viewport::UiViewport;
 
 use super::action::ActionTable;
 use super::responsive::{filter_children, resolve_props};
@@ -81,7 +81,7 @@ use super::style::{
     tone_color, BUTTON_HIGHLIGHT_SYMBOL,
 };
 
-/// Names of every [`UiNodeV1`] primitive the adapter understands.
+/// Names of every [`UiNode`] primitive the adapter understands.
 ///
 /// Used by [`is_ui_node_type`] so callers that hold a Lua table can
 /// decide whether to route it through the adapter or the legacy
@@ -114,7 +114,7 @@ const UI_NODE_TYPE_NAMES: &[&str] = &[
     "tree_item",
     // Internal / experimental — recognised so renderers can consume
     // programmatically-constructed nodes even though the Lua DSL does
-    // not expose them as constructors in v1.
+    // not expose them as constructors in current.
     "dialog",
     "menu",
     "menu_item",
@@ -150,11 +150,11 @@ pub fn is_ui_node_type(type_name: &str) -> bool {
     UI_NODE_TYPE_NAMES.contains(&type_name)
 }
 
-/// Render a single [`UiNodeV1`] into a [`RenderNode`], consuming any
+/// Render a single [`UiNode`] into a [`RenderNode`], consuming any
 /// `$kind = "responsive"` props and populating `actions` with every
-/// [`UiActionV1`] encountered along the way.
+/// [`UiAction`] encountered along the way.
 ///
-/// Backward-compat wrapper around [`render_ui_node_with_stores`] for v1
+/// Backward-compat wrapper around [`render_ui_node_with_stores`] for current
 /// callers that have no [`TuiEntityStores`] context. Wire protocol
 /// composites (`session_list`, `workspace_list`, …) render their empty
 /// state when called this way — pass stores explicitly via
@@ -165,14 +165,14 @@ pub fn is_ui_node_type(type_name: &str) -> bool {
 /// Returns an error if the node has an unknown primitive type, or if its
 /// `props` do not deserialise into the expected Phase A props struct.
 pub fn render_ui_node(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
 ) -> Result<RenderNode> {
     render_ui_node_with_stores(node, viewport, actions, None)
 }
 
-/// Render a single [`UiNodeV1`] into a [`RenderNode`] with optional
+/// Render a single [`UiNode`] into a [`RenderNode`] with optional
 /// access to the entity stores. The wire protocol composites
 /// (`session_list`, `workspace_list`, …) read their data from these
 /// stores; existing primitives ignore them.
@@ -182,8 +182,8 @@ pub fn render_ui_node(
 /// Returns an error if the node has an unknown primitive type, or if its
 /// `props` do not deserialise into the expected Phase A props struct.
 pub fn render_ui_node_with_stores(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
@@ -227,12 +227,12 @@ pub fn render_ui_node_with_stores(
 // =============================================================================
 
 fn render_stack(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
-    let props = decode_props::<StackPropsV1>(&node.props, viewport, "stack")?;
+    let props = decode_props::<StackProps>(&node.props, viewport, "stack")?;
     let children = filter_children(&node.children, viewport);
     let rendered = render_children(&children, viewport, actions, stores)?;
     let constraints = default_min_zero_constraints(rendered.len());
@@ -249,8 +249,8 @@ fn render_stack(
 }
 
 fn render_inline(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
@@ -264,12 +264,12 @@ fn render_inline(
 }
 
 fn render_panel(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
-    let props = decode_props::<PanelPropsV1>(&node.props, viewport, "panel")?;
+    let props = decode_props::<PanelProps>(&node.props, viewport, "panel")?;
     let children = filter_children(&node.children, viewport);
     let block = build_panel_block(&props);
 
@@ -304,7 +304,9 @@ fn render_panel(
                 constraints.push(Constraint::Length(1));
             }
             for child in &children {
-                rendered.push(render_ui_node_with_stores(child, viewport, actions, stores)?);
+                rendered.push(render_ui_node_with_stores(
+                    child, viewport, actions, stores,
+                )?);
                 constraints.push(Constraint::Min(0));
             }
             Ok(RenderNode::VSplit {
@@ -316,8 +318,8 @@ fn render_panel(
 }
 
 fn render_scroll_area(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
@@ -339,8 +341,8 @@ fn render_scroll_area(
 }
 
 fn render_overlay(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
@@ -364,8 +366,8 @@ fn render_overlay(
 // Content primitives
 // =============================================================================
 
-fn render_text(node: &UiNodeV1, viewport: &UiViewportV1) -> Result<RenderNode> {
-    let props = decode_props::<TextPropsV1>(&node.props, viewport, "text")?;
+fn render_text(node: &UiNode, viewport: &UiViewport) -> Result<RenderNode> {
+    let props = decode_props::<TextProps>(&node.props, viewport, "text")?;
     let style = text_span_style(props.tone, props.weight, props.italic.unwrap_or(false));
     let content = single_span(&props.text, style);
     Ok(RenderNode::Widget {
@@ -381,8 +383,8 @@ fn render_text(node: &UiNodeV1, viewport: &UiViewportV1) -> Result<RenderNode> {
     })
 }
 
-fn render_icon(node: &UiNodeV1, viewport: &UiViewportV1) -> Result<RenderNode> {
-    let props = decode_props::<IconPropsV1>(&node.props, viewport, "icon")?;
+fn render_icon(node: &UiNode, viewport: &UiViewport) -> Result<RenderNode> {
+    let props = decode_props::<IconProps>(&node.props, viewport, "icon")?;
     // The TUI has no icon font — render the icon id as a short label so
     // the Lua author's intent still communicates. Tone drives colour.
     let style = SpanStyle {
@@ -404,8 +406,8 @@ fn render_icon(node: &UiNodeV1, viewport: &UiViewportV1) -> Result<RenderNode> {
     })
 }
 
-fn render_badge(node: &UiNodeV1, viewport: &UiViewportV1) -> Result<RenderNode> {
-    let props = decode_props::<BadgePropsV1>(&node.props, viewport, "badge")?;
+fn render_badge(node: &UiNode, viewport: &UiViewport) -> Result<RenderNode> {
+    let props = decode_props::<BadgeProps>(&node.props, viewport, "badge")?;
     let style = SpanStyle {
         fg: props.tone.and_then(badge_tone_color),
         bold: true,
@@ -428,8 +430,8 @@ fn render_badge(node: &UiNodeV1, viewport: &UiViewportV1) -> Result<RenderNode> 
     })
 }
 
-fn render_status_dot(node: &UiNodeV1, viewport: &UiViewportV1) -> Result<RenderNode> {
-    let props = decode_props::<StatusDotPropsV1>(&node.props, viewport, "status_dot")?;
+fn render_status_dot(node: &UiNode, viewport: &UiViewport) -> Result<RenderNode> {
+    let props = decode_props::<StatusDotProps>(&node.props, viewport, "status_dot")?;
     let (glyph, color) = status_dot_color(props.state);
     let style = SpanStyle {
         fg: color,
@@ -450,11 +452,11 @@ fn render_status_dot(node: &UiNodeV1, viewport: &UiViewportV1) -> Result<RenderN
 }
 
 fn render_empty_state(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
 ) -> Result<RenderNode> {
-    let props = decode_props::<EmptyStatePropsV1>(&node.props, viewport, "empty_state")?;
+    let props = decode_props::<EmptyStateProps>(&node.props, viewport, "empty_state")?;
 
     let mut rows: Vec<RenderNode> = Vec::with_capacity(4);
     let mut constraints: Vec<Constraint> = Vec::with_capacity(4);
@@ -514,11 +516,11 @@ fn render_empty_state(
 // =============================================================================
 
 fn render_button(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
 ) -> Result<RenderNode> {
-    let props = decode_props::<ButtonPropsV1>(&node.props, viewport, "button")?;
+    let props = decode_props::<ButtonProps>(&node.props, viewport, "button")?;
     let icon_prefix = props.icon.as_deref();
     let tone = props.tone.and_then(button_tone_color);
     let render = button_widget(&props.label, &props.action, icon_prefix, tone);
@@ -527,11 +529,11 @@ fn render_button(
 }
 
 fn render_icon_button(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
 ) -> Result<RenderNode> {
-    let props = decode_props::<IconButtonPropsV1>(&node.props, viewport, "icon_button")?;
+    let props = decode_props::<IconButtonProps>(&node.props, viewport, "icon_button")?;
     let glyph = icon_glyph_for(&props.icon);
     let label = format!("{glyph} {}", props.label);
     let tone = props.tone.and_then(button_tone_color);
@@ -545,8 +547,8 @@ fn render_icon_button(
 // =============================================================================
 
 fn render_list(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
 ) -> Result<RenderNode> {
     let children = filter_children(&node.children, viewport);
@@ -592,16 +594,16 @@ fn render_list(
 ///
 /// Returns the row plus `true` iff the source node had `selected = true`.
 fn list_item_row(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
 ) -> Result<(ListItemProps, bool)> {
     // list_item props are a strict subset of tree_item's (both share
     // `selected` + `action`; `expanded` / `notification` are tree-only and
-    // simply ignored for a list_item). Reusing `TreeItemPropsV1` keeps the
+    // simply ignored for a list_item). Reusing `TreeItemProps` keeps the
     // slot-handling code the same across list and tree — if Phase A later
-    // adds a dedicated `ListItemPropsV1`, the swap is local.
-    let props = decode_props::<TreeItemPropsV1>(&node.props, viewport, "list_item")?;
+    // adds a dedicated `ListItemProps`, the swap is local.
+    let props = decode_props::<TreeItemProps>(&node.props, viewport, "list_item")?;
     let slots = &node.slots;
 
     let title = slot_first_text(slots, "title", viewport)
@@ -645,10 +647,7 @@ fn list_item_row(
     // string so the existing list-dispatch path treats the row as inert.
     let action = props.action;
     let disabled = action.as_ref().is_some_and(|a| a.disabled.unwrap_or(false));
-    let action_id = action
-        .as_ref()
-        .filter(|_| !disabled)
-        .map(|a| a.id.clone());
+    let action_id = action.as_ref().filter(|_| !disabled).map(|a| a.id.clone());
     if let Some(act) = action {
         actions.insert(node.id.as_deref(), act);
     }
@@ -667,8 +666,8 @@ fn list_item_row(
 }
 
 fn render_standalone_list_item(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
 ) -> Result<RenderNode> {
     // A bare list_item outside a list is unusual but valid — wrap it in a
@@ -692,8 +691,8 @@ fn render_standalone_list_item(
 }
 
 fn render_tree(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
 ) -> Result<RenderNode> {
     let mut rows: Vec<ListItemProps> = Vec::new();
@@ -731,8 +730,8 @@ fn render_tree(
 }
 
 fn render_standalone_tree_item(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
 ) -> Result<RenderNode> {
     let mut rows: Vec<ListItemProps> = Vec::new();
@@ -772,8 +771,8 @@ fn render_standalone_tree_item(
 /// when rendered. This keeps the adapter additive — no new widget type
 /// was introduced for tree rendering.
 fn flatten_tree_item(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     depth: usize,
     rows: &mut Vec<ListItemProps>,
@@ -796,12 +795,11 @@ fn flatten_tree_item(
         }
         return Ok(());
     }
-    let props = decode_props::<TreeItemPropsV1>(&node.props, viewport, "tree_item")?;
+    let props = decode_props::<TreeItemProps>(&node.props, viewport, "tree_item")?;
     let slots = &node.slots;
 
-    let title = slot_first_text(slots, "title", viewport).ok_or_else(|| {
-        anyhow!("ui_contract_adapter: tree_item missing required `title` slot")
-    })?;
+    let title = slot_first_text(slots, "title", viewport)
+        .ok_or_else(|| anyhow!("ui_contract_adapter: tree_item missing required `title` slot"))?;
     let subtitle = slot_first_text(slots, "subtitle", viewport);
     let start = slot_first_text(slots, "start", viewport);
     let end = slot_first_text(slots, "end", viewport);
@@ -870,10 +868,7 @@ fn flatten_tree_item(
     // envelope remains available in the ActionTable.
     let action = props.action.clone();
     let disabled = action.as_ref().is_some_and(|a| a.disabled.unwrap_or(false));
-    let action_id = action
-        .as_ref()
-        .filter(|_| !disabled)
-        .map(|a| a.id.clone());
+    let action_id = action.as_ref().filter(|_| !disabled).map(|a| a.id.clone());
     if let Some(act) = action {
         actions.insert(node.id.as_deref(), act);
     }
@@ -919,12 +914,12 @@ fn flatten_tree_item(
 // =============================================================================
 
 fn render_dialog(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
-    let props = decode_props::<DialogPropsV1>(&node.props, viewport, "dialog")?;
+    let props = decode_props::<DialogProps>(&node.props, viewport, "dialog")?;
 
     let mut rows: Vec<RenderNode> = Vec::with_capacity(3);
     let mut constraints: Vec<Constraint> = Vec::with_capacity(3);
@@ -995,8 +990,8 @@ fn render_dialog(
 }
 
 fn render_menu(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     _stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
@@ -1004,7 +999,7 @@ fn render_menu(
     // matches the cross-client "TUI: overlay/menu panel bound to selection
     // or focus" behavior described by the adaptive spec.
     let items_slot = node.slots.get("items");
-    let items: Vec<UiNodeV1> = items_slot
+    let items: Vec<UiNode> = items_slot
         .map(|children| filter_children(children, viewport))
         .unwrap_or_default();
 
@@ -1048,8 +1043,8 @@ fn render_menu(
 }
 
 fn render_standalone_menu_item(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     _stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
@@ -1064,7 +1059,7 @@ fn render_standalone_menu_item(
 /// the given Phase A props struct.
 fn decode_props<T: serde::de::DeserializeOwned>(
     props: &JsonMap<String, JsonValue>,
-    viewport: &UiViewportV1,
+    viewport: &UiViewport,
     ctx: &'static str,
 ) -> Result<T> {
     let resolved = resolve_props(props, viewport);
@@ -1074,27 +1069,29 @@ fn decode_props<T: serde::de::DeserializeOwned>(
 
 /// Resolve `Stack.direction` — which may be a scalar or a responsive
 /// value — to a concrete [`UiStackDirection`].
-fn resolve_stack_direction(props: &StackPropsV1) -> UiStackDirection {
+fn resolve_stack_direction(props: &StackProps) -> UiStackDirection {
     match props.direction {
-        crate::ui_contract::node::UiValueV1::Scalar(direction) => direction,
+        crate::ui_contract::node::UiValue::Scalar(direction) => direction,
         // A responsive value that reached here means the sentinel was not
         // resolved upstream. This should not happen because [`decode_props`]
         // runs `resolve_props` first — but if it does, default to vertical
         // (the safer terminal default) and let future telemetry surface
         // the mistake. We intentionally do NOT panic.
-        crate::ui_contract::node::UiValueV1::Responsive(_) => UiStackDirection::Vertical,
+        crate::ui_contract::node::UiValue::Responsive(_) => UiStackDirection::Vertical,
     }
 }
 
 fn render_children(
-    children: &[UiNodeV1],
-    viewport: &UiViewportV1,
+    children: &[UiNode],
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<Vec<RenderNode>> {
     let mut out = Vec::with_capacity(children.len());
     for child in children {
-        out.push(render_ui_node_with_stores(child, viewport, actions, stores)?);
+        out.push(render_ui_node_with_stores(
+            child, viewport, actions, stores,
+        )?);
     }
     Ok(out)
 }
@@ -1103,14 +1100,17 @@ fn default_min_zero_constraints(count: usize) -> Vec<Constraint> {
     vec![Constraint::Min(0); count]
 }
 
-fn build_panel_block(props: &PanelPropsV1) -> Option<BlockConfig> {
+fn build_panel_block(props: &PanelProps) -> Option<BlockConfig> {
     let has_border = matches!(props.border, Some(true));
     let has_title = props.title.is_some();
     if !has_border && !has_title {
         return None;
     }
     Some(BlockConfig {
-        title: props.title.as_ref().map(|t| StyledContent::Plain(t.clone())),
+        title: props
+            .title
+            .as_ref()
+            .map(|t| StyledContent::Plain(t.clone())),
         borders: if has_border {
             BorderStyle::All
         } else {
@@ -1168,7 +1168,7 @@ fn apply_id(node: RenderNode, id: Option<String>) -> RenderNode {
     }
 }
 
-fn panel_header_widget(props: &PanelPropsV1, id: Option<&str>) -> RenderNode {
+fn panel_header_widget(props: &PanelProps, id: Option<&str>) -> RenderNode {
     let text = props.title.clone().unwrap_or_default();
     let style = SpanStyle {
         bold: true,
@@ -1209,7 +1209,7 @@ fn paragraph_widget_line(
 
 fn button_widget(
     label: &str,
-    action: &UiActionV1,
+    action: &UiAction,
     icon_prefix: Option<&str>,
     tone: Option<crate::tui::render_tree::SpanColor>,
 ) -> RenderNode {
@@ -1304,10 +1304,10 @@ fn indent_prefix(depth: usize) -> String {
 /// `ui.hidden` wrappers inside a slot drop correctly instead of being
 /// silently skipped (codex F3).
 fn resolved_slot(
-    slots: &std::collections::BTreeMap<String, Vec<UiChildV1>>,
+    slots: &std::collections::BTreeMap<String, Vec<UiChild>>,
     key: &str,
-    viewport: &UiViewportV1,
-) -> Vec<UiNodeV1> {
+    viewport: &UiViewport,
+) -> Vec<UiNode> {
     slots
         .get(key)
         .map(|children| filter_children(children, viewport))
@@ -1319,9 +1319,9 @@ fn resolved_slot(
 /// Walks the slot's children with conditional wrappers already resolved
 /// against `viewport`, so `ui.when` / `ui.hidden` elisions are honored.
 fn slot_first_text(
-    slots: &std::collections::BTreeMap<String, Vec<UiChildV1>>,
+    slots: &std::collections::BTreeMap<String, Vec<UiChild>>,
     key: &str,
-    viewport: &UiViewportV1,
+    viewport: &UiViewport,
 ) -> Option<String> {
     for node in resolved_slot(slots, key, viewport) {
         if let Some(text) = text_node_string(&node) {
@@ -1338,7 +1338,7 @@ fn slot_first_text(
 /// `text` prop. Compound slots typically host one of these so this covers
 /// the common case; richer slot compositions are rendered generically by
 /// the walking code elsewhere.
-fn text_node_string(node: &UiNodeV1) -> Option<String> {
+fn text_node_string(node: &UiNode) -> Option<String> {
     match node.node_type.as_str() {
         "text" | "badge" => node
             .props
@@ -1370,9 +1370,7 @@ fn text_node_string(node: &UiNodeV1) -> Option<String> {
     }
 }
 
-fn slots_have_children(
-    slots: &std::collections::BTreeMap<String, Vec<UiChildV1>>,
-) -> bool {
+fn slots_have_children(slots: &std::collections::BTreeMap<String, Vec<UiChild>>) -> bool {
     slots
         .get("children")
         .is_some_and(|children| !children.is_empty())
@@ -1383,7 +1381,7 @@ fn slots_have_children(
 //
 // These renderers consume zero authored children/slots; they read their data
 // from `stores` (the per-entity-type TUI store aggregate) and expand into
-// the same flat tree the v1 hub-rendered layout used to ship.
+// the same flat tree the current hub-rendered layout used to ship.
 //
 // When `stores` is None (legacy entry point), each composite renders a
 // minimal placeholder paragraph. The cold-turkey switch in commit 7 wires
@@ -1398,11 +1396,11 @@ fn placeholder_widget(label: &str) -> RenderNode {
     paragraph_widget_line(label, SpanStyle::default(), ParagraphAlignment::Left)
 }
 
-/// Build an action with an inline payload object. `UiActionV1::payload` is a
+/// Build an action with an inline payload object. `UiAction::payload` is a
 /// `JsonMap`, so callers that want to attach `{ "key": "value" }` need to
 /// thread through `from_value` to convert. This helper hides that wart.
-fn action_with_payload(id: &str, payload: JsonValue) -> UiActionV1 {
-    let mut act = UiActionV1::new(id);
+fn action_with_payload(id: &str, payload: JsonValue) -> UiAction {
+    let mut act = UiAction::new(id);
     if let JsonValue::Object(map) = payload {
         act.payload = map;
     }
@@ -1410,12 +1408,12 @@ fn action_with_payload(id: &str, payload: JsonValue) -> UiActionV1 {
 }
 
 fn render_session_list(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
-    let props = decode_props::<SessionListPropsV1>(&node.props, viewport, "session_list")?;
+    let props = decode_props::<SessionListProps>(&node.props, viewport, "session_list")?;
     let Some(stores) = stores else {
         return Ok(placeholder_widget("(session_list)"));
     };
@@ -1427,7 +1425,7 @@ fn render_session_list(
     }
 
     let density = match &props.density {
-        Some(crate::ui_contract::node::UiValueV1::Scalar(d)) => *d,
+        Some(crate::ui_contract::node::UiValue::Scalar(d)) => *d,
         _ => UiSurfaceDensity::Panel,
     };
     let grouping = props.grouping.unwrap_or(UiSessionListGrouping::Workspace);
@@ -1495,8 +1493,7 @@ fn render_session_list(
                     action: None,
                 });
                 for (sess_id, session) in session_store.iter() {
-                    let sess_workspace =
-                        session.get("workspace_id").and_then(JsonValue::as_str);
+                    let sess_workspace = session.get("workspace_id").and_then(JsonValue::as_str);
                     if sess_workspace == Some(ws_id.as_str()) {
                         push_session_row(session, &mut rows, actions, 1);
                         seen.insert(sess_id.as_str());
@@ -1532,12 +1529,12 @@ fn render_session_list(
 }
 
 fn render_workspace_list(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     _actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
-    let _ = decode_props::<WorkspaceListPropsV1>(&node.props, viewport, "workspace_list")?;
+    let _ = decode_props::<WorkspaceListProps>(&node.props, viewport, "workspace_list")?;
     let Some(stores) = stores else {
         return Ok(placeholder_widget("(workspace_list)"));
     };
@@ -1576,12 +1573,12 @@ fn render_workspace_list(
 }
 
 fn render_spawn_target_list(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
-    let props = decode_props::<SpawnTargetListPropsV1>(&node.props, viewport, "spawn_target_list")?;
+    let props = decode_props::<SpawnTargetListProps>(&node.props, viewport, "spawn_target_list")?;
     let Some(stores) = stores else {
         return Ok(placeholder_widget("(spawn_target_list)"));
     };
@@ -1602,10 +1599,7 @@ fn render_spawn_target_list(
                 .or_else(|| target.get("target_repo").and_then(JsonValue::as_str))
                 .unwrap_or(id);
             // Per-row action: merge the template with target_id into payload.
-            let act = action_with_payload(
-                &select_action_id,
-                serde_json::json!({ "targetId": id }),
-            );
+            let act = action_with_payload(&select_action_id, serde_json::json!({ "targetId": id }));
             let action_id = act.id.clone();
             actions.insert(Some(id.as_str()), act);
             ListItemProps {
@@ -1639,12 +1633,12 @@ fn render_spawn_target_list(
 }
 
 fn render_worktree_list(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     _actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
-    let props = decode_props::<WorktreeListPropsV1>(&node.props, viewport, "worktree_list")?;
+    let props = decode_props::<WorktreeListProps>(&node.props, viewport, "worktree_list")?;
     let Some(stores) = stores else {
         return Ok(placeholder_widget("(worktree_list)"));
     };
@@ -1693,12 +1687,12 @@ fn render_worktree_list(
 }
 
 fn render_session_row(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     _actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
-    let props = decode_props::<SessionRowPropsV1>(&node.props, viewport, "session_row")?;
+    let props = decode_props::<SessionRowProps>(&node.props, viewport, "session_row")?;
     let Some(stores) = stores else {
         return Ok(placeholder_widget("(session_row)"));
     };
@@ -1724,12 +1718,12 @@ fn render_session_row(
 }
 
 fn render_hub_recovery_state(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     _actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
-    let _ = decode_props::<HubRecoveryStatePropsV1>(&node.props, viewport, "hub_recovery_state")?;
+    let _ = decode_props::<HubRecoveryStateProps>(&node.props, viewport, "hub_recovery_state")?;
     let Some(stores) = stores else {
         return Ok(placeholder_widget("(hub_recovery_state)"));
     };
@@ -1751,12 +1745,12 @@ fn render_hub_recovery_state(
 }
 
 fn render_connection_code(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     _actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
-    let _ = decode_props::<ConnectionCodePropsV1>(&node.props, viewport, "connection_code")?;
+    let _ = decode_props::<ConnectionCodeProps>(&node.props, viewport, "connection_code")?;
     let Some(stores) = stores else {
         return Ok(placeholder_widget("(connection_code)"));
     };
@@ -1777,11 +1771,11 @@ fn render_connection_code(
 }
 
 fn render_new_session_button(
-    node: &UiNodeV1,
-    viewport: &UiViewportV1,
+    node: &UiNode,
+    viewport: &UiViewport,
     actions: &mut ActionTable,
 ) -> Result<RenderNode> {
-    let props = decode_props::<NewSessionButtonPropsV1>(&node.props, viewport, "new_session_button")?;
+    let props = decode_props::<NewSessionButtonProps>(&node.props, viewport, "new_session_button")?;
     let action_id = props.action.id.clone();
     actions.insert(node.id.as_deref(), props.action);
     Ok(RenderNode::Widget {
@@ -1813,8 +1807,8 @@ mod tests {
     use super::*;
     use crate::ui_contract::viewport::{UiHeightClass, UiPointer, UiWidthClass};
 
-    fn regular_viewport() -> UiViewportV1 {
-        UiViewportV1::new(
+    fn regular_viewport() -> UiViewport {
+        UiViewport::new(
             UiWidthClass::Regular,
             UiHeightClass::Regular,
             UiPointer::None,
@@ -1840,7 +1834,7 @@ mod tests {
         // fully-formed surface for each primitive.
         let viewport = regular_viewport();
         for &type_name in UI_NODE_TYPE_NAMES {
-            let node = UiNodeV1::new(type_name);
+            let node = UiNode::new(type_name);
             let mut actions = ActionTable::new();
             let result = render_ui_node(&node, &viewport, &mut actions);
             if let Err(e) = &result {
@@ -1862,7 +1856,7 @@ mod tests {
 
     #[test]
     fn button_widget_records_action_id_on_list_item() {
-        let action = UiActionV1::new("botster.session.select");
+        let action = UiAction::new("botster.session.select");
         let render = button_widget("Select", &action, None, None);
         let RenderNode::Widget { props, .. } = render else {
             panic!("expected widget");
@@ -1879,7 +1873,7 @@ mod tests {
 
     #[test]
     fn render_text_produces_paragraph_widget() {
-        let mut node = UiNodeV1::new("text");
+        let mut node = UiNode::new("text");
         node.props.insert("text".into(), JsonValue::from("Hello"));
         let mut actions = ActionTable::new();
         let rendered = render_ui_node(&node, &regular_viewport(), &mut actions).expect("render");
@@ -1992,7 +1986,7 @@ mod tests {
 
     #[test]
     fn session_list_with_no_stores_renders_placeholder() {
-        let node = UiNodeV1::new("session_list");
+        let node = UiNode::new("session_list");
         let mut actions = ActionTable::new();
         let rendered = render_ui_node_with_stores(&node, &regular_viewport(), &mut actions, None)
             .expect("render");
@@ -2012,16 +2006,12 @@ mod tests {
 
     #[test]
     fn session_list_with_empty_stores_renders_placeholder() {
-        let node = UiNodeV1::new("session_list");
+        let node = UiNode::new("session_list");
         let mut actions = ActionTable::new();
         let stores = TuiEntityStores::new();
-        let rendered = render_ui_node_with_stores(
-            &node,
-            &regular_viewport(),
-            &mut actions,
-            Some(&stores),
-        )
-        .expect("render");
+        let rendered =
+            render_ui_node_with_stores(&node, &regular_viewport(), &mut actions, Some(&stores))
+                .expect("render");
         assert!(matches!(
             rendered,
             RenderNode::Widget {
@@ -2033,16 +2023,12 @@ mod tests {
 
     #[test]
     fn session_list_groups_sessions_under_workspace_headers() {
-        let node = UiNodeV1::new("session_list");
+        let node = UiNode::new("session_list");
         let mut actions = ActionTable::new();
         let stores = populated_stores();
-        let rendered = render_ui_node_with_stores(
-            &node,
-            &regular_viewport(),
-            &mut actions,
-            Some(&stores),
-        )
-        .expect("render");
+        let rendered =
+            render_ui_node_with_stores(&node, &regular_viewport(), &mut actions, Some(&stores))
+                .expect("render");
         let rows = collect_list_rows(&rendered).expect("list rows");
         // Expected ordering:
         //   header(Roadmap) sess-a sess-b header(Triage) sess-c (ungrouped)
@@ -2056,7 +2042,10 @@ mod tests {
             })
             .collect();
         // Workspace headers appear with header=true.
-        assert!(rows.iter().any(|r| r.header), "expected at least one header row");
+        assert!(
+            rows.iter().any(|r| r.header),
+            "expected at least one header row"
+        );
         // The two ws-1 sessions appear after the Roadmap header.
         let roadmap_idx = labels
             .iter()
@@ -2078,7 +2067,7 @@ mod tests {
 
     #[test]
     fn session_list_records_select_action_per_session() {
-        let node = UiNodeV1::new("session_list");
+        let node = UiNode::new("session_list");
         let mut actions = ActionTable::new();
         let stores = populated_stores();
         render_ui_node_with_stores(&node, &regular_viewport(), &mut actions, Some(&stores))
@@ -2087,70 +2076,66 @@ mod tests {
         let entry = actions.get("id:sess-a").expect("sess-a action");
         assert_eq!(entry.action.id, "botster.session.select");
         assert_eq!(
-            entry.action.payload.get("sessionUuid").and_then(|v| v.as_str()),
+            entry
+                .action
+                .payload
+                .get("sessionUuid")
+                .and_then(|v| v.as_str()),
             Some("sess-a")
         );
     }
 
     #[test]
     fn workspace_list_renders_one_row_per_workspace() {
-        let node = UiNodeV1::new("workspace_list");
+        let node = UiNode::new("workspace_list");
         let mut actions = ActionTable::new();
         let stores = populated_stores();
-        let rendered = render_ui_node_with_stores(
-            &node,
-            &regular_viewport(),
-            &mut actions,
-            Some(&stores),
-        )
-        .expect("render");
+        let rendered =
+            render_ui_node_with_stores(&node, &regular_viewport(), &mut actions, Some(&stores))
+                .expect("render");
         let rows = collect_list_rows(&rendered).expect("list rows");
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
     fn spawn_target_list_attaches_target_id_to_action_payload() {
-        let node = UiNodeV1::new("spawn_target_list");
+        let node = UiNode::new("spawn_target_list");
         let mut actions = ActionTable::new();
         let stores = populated_stores();
         render_ui_node_with_stores(&node, &regular_viewport(), &mut actions, Some(&stores))
             .expect("render");
         let entry = actions.get("id:tgt-1").expect("tgt-1 action");
         assert_eq!(
-            entry.action.payload.get("targetId").and_then(|v| v.as_str()),
+            entry
+                .action
+                .payload
+                .get("targetId")
+                .and_then(|v| v.as_str()),
             Some("tgt-1")
         );
     }
 
     #[test]
     fn worktree_list_filters_by_target_id() {
-        let mut node = UiNodeV1::new("worktree_list");
+        let mut node = UiNode::new("worktree_list");
         node.props
             .insert("targetId".into(), JsonValue::from("tgt-1"));
         let mut actions = ActionTable::new();
         let stores = populated_stores();
-        let rendered = render_ui_node_with_stores(
-            &node,
-            &regular_viewport(),
-            &mut actions,
-            Some(&stores),
-        )
-        .expect("render");
+        let rendered =
+            render_ui_node_with_stores(&node, &regular_viewport(), &mut actions, Some(&stores))
+                .expect("render");
         let rows = collect_list_rows(&rendered).expect("list rows");
         assert_eq!(rows.len(), 1);
 
         // A different target_id returns the empty placeholder.
-        let mut other = UiNodeV1::new("worktree_list");
+        let mut other = UiNode::new("worktree_list");
         other
             .props
             .insert("targetId".into(), JsonValue::from("missing"));
-        let rendered = render_ui_node_with_stores(
-            &other,
-            &regular_viewport(),
-            &mut actions,
-            Some(&stores),
-        )
-        .expect("render");
+        let rendered =
+            render_ui_node_with_stores(&other, &regular_viewport(), &mut actions, Some(&stores))
+                .expect("render");
         assert!(matches!(
             rendered,
             RenderNode::Widget {
@@ -2162,18 +2147,14 @@ mod tests {
 
     #[test]
     fn session_row_pulls_title_from_session_store() {
-        let mut node = UiNodeV1::new("session_row");
+        let mut node = UiNode::new("session_row");
         node.props
             .insert("sessionUuid".into(), JsonValue::from("sess-a"));
         let mut actions = ActionTable::new();
         let stores = populated_stores();
-        let rendered = render_ui_node_with_stores(
-            &node,
-            &regular_viewport(),
-            &mut actions,
-            Some(&stores),
-        )
-        .expect("render");
+        let rendered =
+            render_ui_node_with_stores(&node, &regular_viewport(), &mut actions, Some(&stores))
+                .expect("render");
         let RenderNode::Widget {
             widget_type: WidgetType::Paragraph,
             props: Some(WidgetProps::Paragraph(p)),
@@ -2193,16 +2174,12 @@ mod tests {
 
     #[test]
     fn hub_recovery_state_renders_state_field() {
-        let node = UiNodeV1::new("hub_recovery_state");
+        let node = UiNode::new("hub_recovery_state");
         let mut actions = ActionTable::new();
         let stores = populated_stores();
-        let rendered = render_ui_node_with_stores(
-            &node,
-            &regular_viewport(),
-            &mut actions,
-            Some(&stores),
-        )
-        .expect("render");
+        let rendered =
+            render_ui_node_with_stores(&node, &regular_viewport(), &mut actions, Some(&stores))
+                .expect("render");
         let RenderNode::Widget {
             props: Some(WidgetProps::Paragraph(p)),
             ..
@@ -2221,16 +2198,12 @@ mod tests {
 
     #[test]
     fn connection_code_renders_url_field() {
-        let node = UiNodeV1::new("connection_code");
+        let node = UiNode::new("connection_code");
         let mut actions = ActionTable::new();
         let stores = populated_stores();
-        let rendered = render_ui_node_with_stores(
-            &node,
-            &regular_viewport(),
-            &mut actions,
-            Some(&stores),
-        )
-        .expect("render");
+        let rendered =
+            render_ui_node_with_stores(&node, &regular_viewport(), &mut actions, Some(&stores))
+                .expect("render");
         let RenderNode::Widget {
             props: Some(WidgetProps::Paragraph(p)),
             ..
@@ -2249,17 +2222,12 @@ mod tests {
 
     #[test]
     fn new_session_button_records_action_in_table() {
-        let mut node = UiNodeV1::new("new_session_button");
+        let mut node = UiNode::new("new_session_button");
         let action = serde_json::json!({ "id": "botster.session.create.request" });
         node.props.insert("action".into(), action);
         let mut actions = ActionTable::new();
-        let rendered = render_ui_node_with_stores(
-            &node,
-            &regular_viewport(),
-            &mut actions,
-            None,
-        )
-        .expect("render");
+        let rendered = render_ui_node_with_stores(&node, &regular_viewport(), &mut actions, None)
+            .expect("render");
         let rows = collect_list_rows(&rendered).expect("list rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(

@@ -1,7 +1,7 @@
 // Pure-fn tests for app/frontend/store/selectors/session-row.js.
 //
 // These selectors used to live on workspace-store.js (deleted in commit
-// 25b6900d). Tests assert the v1-fidelity contract: same shapes returned
+// 25b6900d). Tests assert the fidelity contract: same shapes returned
 // for the same inputs, just driven off the session entity record.
 
 import { describe, expect, it } from 'vitest'

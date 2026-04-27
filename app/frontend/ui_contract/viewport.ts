@@ -1,13 +1,13 @@
 import { useEffect, useState } from 'react'
 import type {
-  UiConditionV1,
-  UiHeightClassV1,
-  UiOrientationV1,
-  UiPointerV1,
-  UiResponsiveV1,
-  UiValueV1,
-  UiViewportV1,
-  UiWidthClassV1,
+  UiCondition,
+  UiHeightClass,
+  UiOrientation,
+  UiPointer,
+  UiResponsive,
+  UiValue,
+  UiViewport,
+  UiWidthClass,
 } from './types'
 import { isResponsive } from './types'
 
@@ -18,25 +18,25 @@ export const WIDTH_REGULAR_MAX = 1024
 export const HEIGHT_SHORT_MAX = 700
 export const HEIGHT_REGULAR_MAX = 1000
 
-export function widthClassForPx(width: number): UiWidthClassV1 {
+export function widthClassForPx(width: number): UiWidthClass {
   if (width < WIDTH_COMPACT_MAX) return 'compact'
   if (width < WIDTH_REGULAR_MAX) return 'regular'
   return 'expanded'
 }
 
-export function heightClassForPx(height: number): UiHeightClassV1 {
+export function heightClassForPx(height: number): UiHeightClass {
   if (height < HEIGHT_SHORT_MAX) return 'short'
   if (height < HEIGHT_REGULAR_MAX) return 'regular'
   return 'tall'
 }
 
-const SSR_VIEWPORT: UiViewportV1 = {
+const SSR_VIEWPORT: UiViewport = {
   widthClass: 'expanded',
   heightClass: 'regular',
   pointer: 'fine',
 }
 
-function readViewport(): UiViewportV1 {
+function readViewport(): UiViewport {
   if (typeof window === 'undefined') return SSR_VIEWPORT
 
   const visualViewport = window.visualViewport
@@ -45,13 +45,13 @@ function readViewport(): UiViewportV1 {
   const width = visualViewport?.width ?? layoutWidth
   const height = visualViewport?.height ?? layoutHeight
 
-  const pointer: UiPointerV1 = window.matchMedia('(pointer: fine)').matches
+  const pointer: UiPointer = window.matchMedia('(pointer: fine)').matches
     ? 'fine'
     : window.matchMedia('(pointer: coarse)').matches
       ? 'coarse'
       : 'none'
 
-  let orientation: UiOrientationV1 | undefined
+  let orientation: UiOrientation | undefined
   if (window.matchMedia('(orientation: portrait)').matches) {
     orientation = 'portrait'
   } else if (window.matchMedia('(orientation: landscape)').matches) {
@@ -65,7 +65,7 @@ function readViewport(): UiViewportV1 {
       ? layoutHeight - visualViewport.height > 150
       : undefined
 
-  const viewport: UiViewportV1 = {
+  const viewport: UiViewport = {
     widthClass: widthClassForPx(width),
     heightClass: heightClassForPx(height),
     pointer,
@@ -77,8 +77,8 @@ function readViewport(): UiViewportV1 {
 }
 
 /** Reactive viewport hook. Updates on resize / orientation / visualViewport changes. */
-export function useViewport(): UiViewportV1 {
-  const [viewport, setViewport] = useState<UiViewportV1>(readViewport)
+export function useViewport(): UiViewport {
+  const [viewport, setViewport] = useState<UiViewport>(readViewport)
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -118,28 +118,28 @@ export function useViewport(): UiViewportV1 {
 
 // ---------- Responsive resolution ----------
 
-const WIDTH_FALLBACK_ORDER: Record<UiWidthClassV1, UiWidthClassV1[]> = {
+const WIDTH_FALLBACK_ORDER: Record<UiWidthClass, UiWidthClass[]> = {
   compact: ['compact', 'regular', 'expanded'],
   regular: ['regular', 'compact', 'expanded'],
   expanded: ['expanded', 'regular', 'compact'],
 }
 
-const HEIGHT_FALLBACK_ORDER: Record<UiHeightClassV1, UiHeightClassV1[]> = {
+const HEIGHT_FALLBACK_ORDER: Record<UiHeightClass, UiHeightClass[]> = {
   short: ['short', 'regular', 'tall'],
   regular: ['regular', 'short', 'tall'],
   tall: ['tall', 'regular', 'short'],
 }
 
 /**
- * Resolve a `UiValueV1<T>` against the viewport.
+ * Resolve a `UiValue<T>` against the viewport.
  *
  * Fallback order per the adaptive spec: exact match, then next smaller class,
  * then next larger class. When both `width` and `height` are defined on a
  * responsive value, `width` wins (width is primary in the spec's examples).
  */
 export function resolveValue<T>(
-  value: UiValueV1<T> | undefined,
-  viewport: UiViewportV1,
+  value: UiValue<T> | undefined,
+  viewport: UiViewport,
 ): T | undefined {
   if (value === undefined) return undefined
   if (!isResponsive(value)) return value
@@ -149,8 +149,8 @@ export function resolveValue<T>(
 }
 
 function resolveResponsive<T>(
-  value: UiResponsiveV1<T>,
-  viewport: UiViewportV1,
+  value: UiResponsive<T>,
+  viewport: UiViewport,
 ): T | undefined {
   if (value.width !== undefined) {
     const order = WIDTH_FALLBACK_ORDER[viewport.widthClass]
@@ -171,8 +171,8 @@ function resolveResponsive<T>(
 
 /** Evaluate a viewport predicate. Returns true iff every populated field matches. */
 export function matchesCondition(
-  cond: UiConditionV1,
-  viewport: UiViewportV1,
+  cond: UiCondition,
+  viewport: UiViewport,
 ): boolean {
   if (cond.width !== undefined && cond.width !== viewport.widthClass) return false
   if (cond.height !== undefined && cond.height !== viewport.heightClass) return false

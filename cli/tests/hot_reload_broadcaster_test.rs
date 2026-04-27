@@ -55,7 +55,10 @@ fn install_capturing_broadcaster(lua: &Lua, eb: &Table, label: &str) -> Table {
         .create_function(move |_, frame: Table| {
             // Exclude the __label marker from the index count.
             let mut next_idx = 1;
-            while frames_for_closure.raw_get::<Value>(next_idx).is_ok_and(|v| !matches!(v, Value::Nil)) {
+            while frames_for_closure
+                .raw_get::<Value>(next_idx)
+                .is_ok_and(|v| !matches!(v, Value::Nil))
+            {
                 next_idx += 1;
             }
             frames_for_closure.raw_set(next_idx, frame)?;
@@ -112,7 +115,11 @@ fn set_broadcaster_is_atomic_replace_no_nil_window() {
     p2.set("title", "two").unwrap();
     patch.call::<()>(("session", "sess-a", p2)).unwrap();
     // Frame 2 goes to B, not A.
-    assert_eq!(frame_count(&frames_a), 1, "A must not receive frames after replace");
+    assert_eq!(
+        frame_count(&frames_a),
+        1,
+        "A must not receive frames after replace"
+    );
     assert_eq!(frame_count(&frames_b), 1, "B receives the new frame");
 }
 

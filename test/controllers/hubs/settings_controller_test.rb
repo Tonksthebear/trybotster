@@ -38,6 +38,29 @@ class Hubs::SettingsControllerTest < ActionDispatch::IntegrationTest
     assert templates.is_a?(Hash), "Expected templates to be a hash"
   end
 
+  test "settings JSON includes markdown session template files" do
+    get hub_settings_path(@hub), as: :json
+    assert_response :success
+
+    json = JSON.parse(response.body)
+    agent_dests = json.dig("templates", "agents").map { |template| template["dest"] }
+    assert_includes agent_dests, "agents/claude/notes.md"
+    quick_setup_dests = json["agentTemplates"].map { |template| template["dest"] }
+    assert_includes quick_setup_dests, "agents/claude/initialization"
+    refute_includes quick_setup_dests, "agents/claude/notes.md"
+  end
+
+  test "settings JSON includes nested multi-file plugin templates" do
+    get hub_settings_path(@hub), as: :json
+    assert_response :success
+
+    json = JSON.parse(response.body)
+    plugin_dests = json.dig("templates", "plugins").map { |template| template["dest"] }
+    assert_includes plugin_dests, "plugins/demo-surface/init.lua"
+    assert_includes plugin_dests, "plugins/demo-surface/web_layout.lua"
+    assert_includes plugin_dests, "plugins/demo-surface/tui/status.lua"
+  end
+
   test "settings update returns JSON for JSON requests" do
     patch hub_settings_path(@hub), params: { hub: { name: "Updated Hub" } }, as: :json
     assert_response :success

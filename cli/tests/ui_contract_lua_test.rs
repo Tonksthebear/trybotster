@@ -21,11 +21,11 @@
 )]
 
 use botster::ui_contract::lua::register;
-use botster::ui_contract::node::{UiChildV1, UiConditionalV1, UiNodeV1};
+use botster::ui_contract::node::{UiChild, UiConditional, UiNode};
 use botster::ui_contract::{
-    BadgePropsV1, ButtonPropsV1, DialogPropsV1, EmptyStatePropsV1, IconButtonPropsV1, IconPropsV1,
-    InlinePropsV1, PanelPropsV1, ScrollAreaPropsV1, StackPropsV1, StatusDotPropsV1, TextPropsV1,
-    TreeItemPropsV1, UiWidthClass,
+    BadgeProps, ButtonProps, DialogProps, EmptyStateProps, IconButtonProps, IconProps, InlineProps,
+    PanelProps, ScrollAreaProps, StackProps, StatusDotProps, TextProps, TreeItemProps,
+    UiWidthClass,
 };
 use mlua::{Lua, LuaSerdeExt, Value};
 use serde_json::{json, Value as JsonValue};
@@ -38,13 +38,14 @@ fn new_ui_lua() -> Lua {
 
 fn eval_to_json(lua: &Lua, code: &str) -> JsonValue {
     let value: Value = lua.load(code).eval().expect("Lua eval failed");
-    lua.from_value(value).expect("Lua -> JSON conversion failed")
+    lua.from_value(value)
+        .expect("Lua -> JSON conversion failed")
 }
 
-fn eval_to_node(lua: &Lua, code: &str) -> UiNodeV1 {
+fn eval_to_node(lua: &Lua, code: &str) -> UiNode {
     let value: Value = lua.load(code).eval().expect("Lua eval failed");
     lua.from_value(value)
-        .expect("Lua -> UiNodeV1 conversion failed")
+        .expect("Lua -> UiNode conversion failed")
 }
 
 // =============================================================================
@@ -59,9 +60,9 @@ fn stack_wire_shape_and_typed_props_round_trip() {
         r#"return ui.stack{ direction = "vertical", gap = "2" }"#,
     );
     assert_eq!(node.node_type, "stack");
-    let props: StackPropsV1 = serde_json::from_value(serde_json::Value::Object(node.props))
-        .expect("StackPropsV1 deserialize");
-    // Scalar direction + gap round-trips cleanly; padding is NOT in v1 shared contract.
+    let props: StackProps = serde_json::from_value(serde_json::Value::Object(node.props))
+        .expect("StackProps deserialize");
+    // Scalar direction + gap round-trips cleanly; padding is NOT in current shared contract.
     assert_eq!(
         serde_json::to_value(&props).expect("re-serialize"),
         json!({ "direction": "vertical", "gap": "2" })
@@ -85,8 +86,8 @@ fn inline_typed_round_trip() {
         &lua,
         r#"return ui.inline{ gap = "1", wrap = true, justify = "start" }"#,
     );
-    let props: InlinePropsV1 = serde_json::from_value(serde_json::Value::Object(node.props))
-        .expect("InlinePropsV1 deserialize");
+    let props: InlineProps = serde_json::from_value(serde_json::Value::Object(node.props))
+        .expect("InlineProps deserialize");
     assert_eq!(
         serde_json::to_value(&props).expect("re-serialize"),
         json!({ "gap": "1", "wrap": true, "justify": "start" })
@@ -101,8 +102,8 @@ fn panel_typed_round_trip_with_interaction_density() {
         r#"return ui.panel{ title = "Preview", tone = "muted", border = true,
                             interaction_density = "comfortable" }"#,
     );
-    let props: PanelPropsV1 = serde_json::from_value(serde_json::Value::Object(node.props))
-        .expect("PanelPropsV1 deserialize");
+    let props: PanelProps = serde_json::from_value(serde_json::Value::Object(node.props))
+        .expect("PanelProps deserialize");
     let re = serde_json::to_value(&props).expect("re-serialize");
     assert_eq!(
         re,
@@ -188,7 +189,7 @@ fn icon_button_rejects_disabled() {
 fn scroll_area_typed_round_trip() {
     let lua = new_ui_lua();
     let node = eval_to_node(&lua, r#"return ui.scroll_area{ axis = "y" }"#);
-    let props: ScrollAreaPropsV1 =
+    let props: ScrollAreaProps =
         serde_json::from_value(serde_json::Value::Object(node.props)).expect("deserialize");
     assert_eq!(
         serde_json::to_value(&props).expect("re-serialize"),
@@ -208,8 +209,8 @@ fn text_typed_round_trip() {
         r#"return ui.text{ text = "Hello", tone = "accent", size = "sm", weight = "medium",
                            monospace = true, italic = false, truncate = true }"#,
     );
-    let props: TextPropsV1 = serde_json::from_value(serde_json::Value::Object(node.props))
-        .expect("deserialize");
+    let props: TextProps =
+        serde_json::from_value(serde_json::Value::Object(node.props)).expect("deserialize");
     let re = serde_json::to_value(&props).expect("re-serialize");
     assert_eq!(
         re,
@@ -232,8 +233,8 @@ fn icon_typed_round_trip() {
         &lua,
         r#"return ui.icon{ name = "workspace", size = "sm", tone = "muted", label = "Workspaces" }"#,
     );
-    let props: IconPropsV1 = serde_json::from_value(serde_json::Value::Object(node.props))
-        .expect("deserialize");
+    let props: IconProps =
+        serde_json::from_value(serde_json::Value::Object(node.props)).expect("deserialize");
     assert_eq!(props.name, "workspace");
     assert_eq!(props.label.as_deref(), Some("Workspaces"));
 }
@@ -242,8 +243,8 @@ fn icon_typed_round_trip() {
 fn badge_typed_round_trip() {
     let lua = new_ui_lua();
     let node = eval_to_node(&lua, r#"return ui.badge{ text = "3", tone = "warning" }"#);
-    let props: BadgePropsV1 = serde_json::from_value(serde_json::Value::Object(node.props))
-        .expect("deserialize");
+    let props: BadgeProps =
+        serde_json::from_value(serde_json::Value::Object(node.props)).expect("deserialize");
     assert_eq!(props.text, "3");
 }
 
@@ -254,7 +255,7 @@ fn status_dot_typed_round_trip() {
         &lua,
         r#"return ui.status_dot{ state = "active", label = "Running" }"#,
     );
-    let props: StatusDotPropsV1 =
+    let props: StatusDotProps =
         serde_json::from_value(serde_json::Value::Object(node.props)).expect("deserialize");
     assert_eq!(props.label.as_deref(), Some("Running"));
 }
@@ -273,7 +274,7 @@ fn empty_state_typed_round_trip_with_snake_case_primary_action() {
             }
         "#,
     );
-    let props: EmptyStatePropsV1 =
+    let props: EmptyStateProps =
         serde_json::from_value(serde_json::Value::Object(node.props)).expect("deserialize");
     let action = props.primary_action.expect("primary_action present");
     assert_eq!(action.id, "botster.session.create.request");
@@ -298,12 +299,18 @@ fn button_wire_shape_uses_icon_not_leading_icon() {
             }
         "#,
     );
-    let props: ButtonPropsV1 = serde_json::from_value(serde_json::Value::Object(node.props))
-        .expect("ButtonPropsV1 deserialize");
+    let props: ButtonProps = serde_json::from_value(serde_json::Value::Object(node.props))
+        .expect("ButtonProps deserialize");
     assert_eq!(props.icon.as_deref(), Some("check"));
     let re = serde_json::to_value(&props).expect("re-serialize");
-    assert!(re.get("leadingIcon").is_none(), "Button wire must not carry leadingIcon");
-    assert!(re.get("disabled").is_none(), "Button wire must not carry disabled");
+    assert!(
+        re.get("leadingIcon").is_none(),
+        "Button wire must not carry leadingIcon"
+    );
+    assert!(
+        re.get("disabled").is_none(),
+        "Button wire must not carry disabled"
+    );
 }
 
 #[test]
@@ -319,10 +326,13 @@ fn icon_button_typed_round_trip_no_disabled() {
             }
         "#,
     );
-    let props: IconButtonPropsV1 =
+    let props: IconButtonProps =
         serde_json::from_value(serde_json::Value::Object(node.props)).expect("deserialize");
     let re = serde_json::to_value(&props).expect("re-serialize");
-    assert!(re.get("disabled").is_none(), "IconButton wire must not carry disabled");
+    assert!(
+        re.get("disabled").is_none(),
+        "IconButton wire must not carry disabled"
+    );
     assert_eq!(props.label, "Close session");
 }
 
@@ -332,14 +342,18 @@ fn icon_button_typed_round_trip_no_disabled() {
 
 #[test]
 fn tree_has_no_shared_props_and_accepts_children() {
-    // Tree carries NO shared props in v1 — empty `props` map on the wire.
-    // Deliberately no TreePropsV1 struct exists.
+    // Tree carries NO shared props in current — empty `props` map on the wire.
+    // Deliberately no TreeProps struct exists.
     let lua = new_ui_lua();
     let node = eval_to_node(
         &lua,
         r#"return ui.tree{ children = { ui.tree_item{ id="x", title = { ui.text{ text = "X" } } } } }"#,
     );
-    assert!(node.props.is_empty(), "tree must not emit props: {:?}", node.props);
+    assert!(
+        node.props.is_empty(),
+        "tree must not emit props: {:?}",
+        node.props
+    );
     assert_eq!(node.children.len(), 1);
 }
 
@@ -369,10 +383,13 @@ fn tree_item_with_all_optional_slots() {
     assert_eq!(v.get("id").and_then(|v| v.as_str()), Some("ws-1"));
     let slots = v.get("slots").expect("slots present");
     for expected in ["title", "subtitle", "start", "end", "children"] {
-        assert!(slots.get(expected).is_some(), "slot {expected} missing: {slots:?}");
+        assert!(
+            slots.get(expected).is_some(),
+            "slot {expected} missing: {slots:?}"
+        );
     }
-    let props: TreeItemPropsV1 = serde_json::from_value(v.get("props").unwrap().clone())
-        .expect("TreeItemPropsV1 deserialize");
+    let props: TreeItemProps =
+        serde_json::from_value(v.get("props").unwrap().clone()).expect("TreeItemProps deserialize");
     assert_eq!(props.selected, Some(true));
     assert_eq!(props.expanded, Some(true));
 }
@@ -436,8 +453,8 @@ fn dialog_wire_shape_with_hoisted_slots() {
             }
         "#,
     );
-    let props: DialogPropsV1 = serde_json::from_value(v.get("props").unwrap().clone())
-        .expect("DialogPropsV1 deserialize");
+    let props: DialogProps =
+        serde_json::from_value(v.get("props").unwrap().clone()).expect("DialogProps deserialize");
     assert!(props.open);
     assert_eq!(props.title, "Rename Workspace");
     let slots = v.get("slots").expect("slots");
@@ -597,12 +614,12 @@ fn children_roundtrip_through_typed_uinode_with_wrappers() {
             }
         "#,
     );
-    let typed: UiNodeV1 = serde_json::from_value(v).expect("typed deserialize");
+    let typed: UiNode = serde_json::from_value(v).expect("typed deserialize");
     assert_eq!(typed.node_type, "stack");
     assert_eq!(typed.children.len(), 2);
-    assert!(matches!(typed.children[0], UiChildV1::Node(_)));
+    assert!(matches!(typed.children[0], UiChild::Node(_)));
     match &typed.children[1] {
-        UiChildV1::Conditional(UiConditionalV1::When { condition, node }) => {
+        UiChild::Conditional(UiConditional::When { condition, node }) => {
             assert_eq!(condition.width, Some(UiWidthClass::Expanded));
             assert_eq!(node.node_type, "text");
         }
@@ -615,7 +632,7 @@ fn children_roundtrip_through_typed_uinode_with_wrappers() {
 // =============================================================================
 
 #[test]
-fn menu_and_menu_item_not_exposed_in_v1() {
+fn menu_and_menu_item_not_lua_public() {
     let lua = new_ui_lua();
     let menu: Value = lua.load("return ui.menu").eval().expect("eval");
     assert!(matches!(menu, Value::Nil));
@@ -624,17 +641,17 @@ fn menu_and_menu_item_not_exposed_in_v1() {
 }
 
 #[test]
-fn text_input_checkbox_toggle_select_not_exposed_in_v1() {
+fn text_input_checkbox_toggle_select_not_lua_public() {
     // These primitives are in the broader cross-client shared vocabulary but
-    // intentionally deferred from the v1 Lua-public inventory per
+    // intentionally deferred from the current Lua-public inventory per
     // `phase one web ui composites stay internal while Lua public contract stops at primitives.md`.
     let lua = new_ui_lua();
     for name in ["text_input", "checkbox", "toggle", "select"] {
-        let v: Value = lua
-            .load(&format!("return ui.{name}"))
-            .eval()
-            .expect("eval");
-        assert!(matches!(v, Value::Nil), "ui.{name} must not be exposed in v1");
+        let v: Value = lua.load(&format!("return ui.{name}")).eval().expect("eval");
+        assert!(
+            matches!(v, Value::Nil),
+            "ui.{name} must not be exposed in current"
+        );
     }
 }
 

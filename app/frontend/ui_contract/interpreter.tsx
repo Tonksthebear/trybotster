@@ -7,18 +7,18 @@ import {
 } from './context'
 import { PRIMITIVE_REGISTRY, type PrimitiveRenderer } from './registry'
 import type {
-  UiCapabilitySetV1,
-  UiChildV1,
-  UiConditionalV1,
-  UiNodeV1,
-  UiViewportV1,
+  UiCapabilitySet,
+  UiChild,
+  UiConditional,
+  UiNode,
+  UiViewport,
 } from './types'
 import { isConditional } from './types'
 import { matchesCondition, useViewport } from './viewport'
 import { resolveBindings } from './binding'
 
 function renderChild(
-  child: UiChildV1,
+  child: UiChild,
   ctx: RenderContext,
   key: string | number,
 ): ReactNode {
@@ -29,7 +29,7 @@ function renderChild(
 }
 
 function renderConditional(
-  wrapper: UiConditionalV1,
+  wrapper: UiConditional,
   ctx: RenderContext,
   key: string | number,
 ): ReactNode {
@@ -40,7 +40,7 @@ function renderConditional(
 }
 
 function renderInternal(
-  node: UiNodeV1,
+  node: UiNode,
   ctx: RenderContext,
   key: string | number,
 ): ReactNode {
@@ -78,7 +78,7 @@ function renderInternal(
   return <Fragment key={node.id ?? key}>{element}</Fragment>
 }
 
-/** Walk a UiNodeV1 tree into React elements, driven by `ctx`.
+/** Walk a UiNode tree into React elements, driven by `ctx`.
  *
  * Wire protocol: any `$bind` / `$kind = "bind_list"` sentinels in the
  * tree are resolved via the entity stores BEFORE primitive dispatch — see
@@ -92,10 +92,10 @@ function renderInternal(
  * fall back to the unresolved node and let the downstream error boundary
  * catch any render-time failure.
  */
-export function renderNode(node: UiNodeV1, ctx: RenderContext): ReactElement {
-  let resolved: UiNodeV1
+export function renderNode(node: UiNode, ctx: RenderContext): ReactElement {
+  let resolved: UiNode
   try {
-    resolved = resolveBindings(node) as UiNodeV1
+    resolved = resolveBindings(node) as UiNode
   } catch {
     resolved = node
   }
@@ -104,12 +104,12 @@ export function renderNode(node: UiNodeV1, ctx: RenderContext): ReactElement {
 }
 
 export type UiTreeBodyProps = {
-  node: UiNodeV1
+  node: UiNode
   dispatch: ActionDispatch
   /** Override the default web capability set if needed (e.g. tests). */
-  capabilities?: UiCapabilitySetV1
+  capabilities?: UiCapabilitySet
   /** Inject a viewport for tests; defaults to `useViewport()`. */
-  viewport?: UiViewportV1
+  viewport?: UiViewport
   /**
    * Current hub id. Used by web renderers to construct URLs (e.g. session
    * anchor hrefs). Optional so pure-interpreter tests don't have to supply
@@ -119,7 +119,7 @@ export type UiTreeBodyProps = {
 }
 
 /**
- * Pure tree-walker: renders a supplied `UiNodeV1` through the primitive
+ * Pure tree-walker: renders a supplied `UiNode` through the primitive
  * registry. Owns the `RenderContext` and hooks into `useViewport`.
  *
  * The hub-subscribing mount lives in `components/UiTree.jsx` — it owns

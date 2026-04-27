@@ -211,9 +211,9 @@ For one-off hub behavior, use user.init (always at this path, debug and release)
   ~/.botster/lua/user/init.lua       (device-wide)
 
 For reusable, distributable features, create a plugin:
-  ~/.botster/shared/plugins/{name}/init.lua        (device-wide, release)
-  ~/.botster-dev/shared/plugins/{name}/init.lua    (device-wide, debug builds)
-  {repo}/.botster/shared/plugins/{name}/init.lua   (repo-specific)
+  ~/.botster/plugins/{name}/init.lua        (device-wide, release)
+  ~/.botster-dev/plugins/{name}/init.lua    (device-wide, debug builds)
+  {repo}/.botster/plugins/{name}/init.lua   (repo-specific)
 
 Hot-reload: saved files reload automatically. The exception is new plugin directories —
 the watcher only registers directories that exist at hub start. Create the directory
@@ -398,57 +398,52 @@ mcp.prompt("botster-create-plugin", {
     description = "Step-by-step guide to creating a Botster plugin: file location, secrets, HTTP, timers, hooks, MCP tools, and hot-reload",
     arguments = {
         { name = "scope",   description = "Where the plugin lives: 'device' or 'repo'",                required = false },
-        { name = "profile", description = "Profile name to scope to, or omit for all profiles",         required = false },
     },
 }, function(args)
     local scope   = args.scope or "device"
-    local profile = args.profile
     local base    = scope == "repo" and "{repo}/.botster" or "~/.botster"
-    local layer   = (profile and profile ~= "")
-        and (base .. "/profiles/" .. profile .. "/plugins/{name}")
-        or  (base .. "/shared/plugins/{name}")
+    local layer   = base .. "/plugins/{name}"
 
     local prose = string.format([[
 The user wants to create a Botster plugin. Here is everything you need to build and wire it up.
 
-## Step 1: Create the File
+## Step 1: Create the Plugin Directory
 
   %s/init.lua
 
 Device scope: active on every project on this machine.
-  Release: ~/.botster/shared/plugins/{name}/init.lua
-  Debug:   ~/.botster-dev/shared/plugins/{name}/init.lua
+  Release: ~/.botster/plugins/{name}/init.lua
+  Debug:   ~/.botster-dev/plugins/{name}/init.lua
 
 Repo scope: active only when working in that repo.
-  {repo}/.botster/shared/plugins/{name}/init.lua
+  {repo}/.botster/plugins/{name}/init.lua
 
-Shared: active for all profiles. Profile-scoped: only when that profile is selected.
-  Replace "shared" with "profiles/{profile}" for profile-specific plugins.
-
-Botster auto-discovers the file when the hub starts (or hot-reloads if already running).
-The file executes top-to-bottom on load. No registration step — just create and save.
+Botster auto-discovers plugin directories by their init.lua entrypoint when the
+hub starts (or hot-reloads if already running). init.lua executes top-to-bottom
+on load. No registration step — just create the directory and save the files.
 Note: new plugin directories must exist at hub start for hot-reload to work — create the
 directory, restart once, then file changes reload automatically.
 
 ### Multi-File Plugins (Optional)
 
-A single init.lua is fine for simple plugins. For complex ones, split the code
-across multiple files using a lua/ subdir:
+init.lua is the only fixed filename. A single init.lua is fine for simple
+plugins. For complex ones, keep init.lua as the manifest/entrypoint and
+organize sibling files however the plugin wants:
 
   {plugin-dir}/
     init.lua
-    lua/
-      {name}/           <- namespace matches the plugin directory name
-        api.lua
-        config.lua
+    api.lua
+    web_layout.lua
+    tui/
+      status.lua
 
-If lua/ exists, Botster adds it to package.path automatically. On hot-reload and
-unload, the path entry and require() cache are cleaned up.
+Botster adds the plugin root and optional lua/ directory to package.path while
+the plugin loads. On hot-reload and unload, those path entries and modules
+loaded during plugin initialization are cleaned up.
 
-Modules must live under lua/{name}/ so require() calls are namespaced and don't
-collide with other plugins. Example — splitting HTTP helpers into api.lua:
+Example - splitting HTTP helpers into api.lua:
 
-  -- lua/my-plugin/api.lua
+  -- api.lua
   local M = {}
 
   function M.post(url, body, token)
@@ -468,10 +463,15 @@ collide with other plugins. Example — splitting HTTP helpers into api.lua:
   return M
 
   -- init.lua
-  local api = require("my-plugin.api")
+  local api = require("api")
 
   local token, _ = secrets.get("my-plugin", "api_token")
   api.post("https://api.example.com/notify", json.encode({ text = "Agent started" }), token)
+
+TUI files are plugin-owned too. Declare them from init.lua so the TUI can discover
+which files belong to the plugin:
+
+  -- @tui tui/status.lua
 
 ## Step 2: Decide What the Plugin Does
 
@@ -483,7 +483,7 @@ Most plugins combine some of these building blocks:
   Polling          -> timer.every (with hot-reload guard)
   React to agents  -> hooks.on("after_agent_create", ...)
   Expose to Claude -> mcp.tool / mcp.prompt
-  TUI palette      -> commands.register
+  TUI views        -> -- @tui file.lua metadata + ui primitives
 
 ## Step 3: Store Credentials
 
@@ -708,9 +708,9 @@ The user wants to add MCP tools or prompts so Claude can interact with the hub. 
 ## Where the Code Goes
 
 From a plugin (recommended for anything reusable):
-  ~/.botster/shared/plugins/{name}/init.lua        (device-wide, release)
-  ~/.botster-dev/shared/plugins/{name}/init.lua    (device-wide, debug builds)
-  {repo}/.botster/shared/plugins/{name}/init.lua   (repo-specific)
+  ~/.botster/plugins/{name}/init.lua        (device-wide, release)
+  ~/.botster-dev/plugins/{name}/init.lua    (device-wide, debug builds)
+  {repo}/.botster/plugins/{name}/init.lua   (repo-specific)
 
 From user.init (good for quick one-offs — same path in debug and release):
   ~/.botster/lua/user/init.lua

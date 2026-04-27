@@ -2,39 +2,39 @@ import React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render } from '@testing-library/react'
 import { UiTreeBody, createRawDispatch, resolveValue } from '..'
-import type { UiNodeV1, UiResponsiveV1, UiViewportV1 } from '../types'
+import type { UiNode, UiResponsive, UiViewport } from '../types'
 
 afterEach(() => {
   cleanup()
 })
 
-const COMPACT: UiViewportV1 = {
+const COMPACT: UiViewport = {
   widthClass: 'compact',
   heightClass: 'regular',
   pointer: 'coarse',
 }
-const REGULAR: UiViewportV1 = {
+const REGULAR: UiViewport = {
   widthClass: 'regular',
   heightClass: 'regular',
   pointer: 'fine',
 }
-const EXPANDED: UiViewportV1 = {
+const EXPANDED: UiViewport = {
   widthClass: 'expanded',
   heightClass: 'regular',
   pointer: 'fine',
 }
-const SHORT: UiViewportV1 = {
+const SHORT: UiViewport = {
   widthClass: 'regular',
   heightClass: 'short',
   pointer: 'fine',
 }
-const TALL: UiViewportV1 = {
+const TALL: UiViewport = {
   widthClass: 'regular',
   heightClass: 'tall',
   pointer: 'fine',
 }
 
-function renderTree(node: UiNodeV1, viewport: UiViewportV1) {
+function renderTree(node: UiNode, viewport: UiViewport) {
   return render(
     <UiTreeBody
       node={node}
@@ -50,7 +50,7 @@ describe('resolveValue — width dimension', () => {
   })
 
   it('exact width match wins', () => {
-    const value: UiResponsiveV1<string> = {
+    const value: UiResponsive<string> = {
       $kind: 'responsive',
       width: { compact: 'a', regular: 'b', expanded: 'c' },
     }
@@ -62,7 +62,7 @@ describe('resolveValue — width dimension', () => {
   it('falls back to next smaller then next larger', () => {
     // Only regular defined, viewport is compact — next smaller missing, goes
     // to next larger (regular).
-    const onlyRegular: UiResponsiveV1<string> = {
+    const onlyRegular: UiResponsive<string> = {
       $kind: 'responsive',
       width: { regular: 'R' },
     }
@@ -71,7 +71,7 @@ describe('resolveValue — width dimension', () => {
 
     // Expanded viewport, only compact defined — falls through the order
     // [expanded, regular, compact] and picks compact.
-    const onlyCompact: UiResponsiveV1<string> = {
+    const onlyCompact: UiResponsive<string> = {
       $kind: 'responsive',
       width: { compact: 'C' },
     }
@@ -81,7 +81,7 @@ describe('resolveValue — width dimension', () => {
 
 describe('resolveValue — height dimension', () => {
   it('exact height match wins', () => {
-    const v: UiResponsiveV1<string> = {
+    const v: UiResponsive<string> = {
       $kind: 'responsive',
       height: { short: 'S', regular: 'R', tall: 'T' },
     }
@@ -93,7 +93,7 @@ describe('resolveValue — height dimension', () => {
 
 describe('resolveValue — width wins over height when both present', () => {
   it('uses width dimension first if any width breakpoint resolves', () => {
-    const v: UiResponsiveV1<string> = {
+    const v: UiResponsive<string> = {
       $kind: 'responsive',
       width: { regular: 'FROM_W' },
       height: { regular: 'FROM_H' },
@@ -104,7 +104,7 @@ describe('resolveValue — width wins over height when both present', () => {
 
 describe('Stack direction responsive resolution', () => {
   it('resolves compact→vertical and expanded→horizontal at render time', () => {
-    const node: UiNodeV1 = {
+    const node: UiNode = {
       type: 'stack',
       props: {
         direction: {
@@ -130,7 +130,7 @@ describe('Stack direction responsive resolution', () => {
 
 describe('Conditional wrappers', () => {
   it('ui.when renders its node only when condition matches', () => {
-    const node: UiNodeV1 = {
+    const node: UiNode = {
       type: 'stack',
       props: { direction: 'vertical' },
       children: [
@@ -158,7 +158,7 @@ describe('Conditional wrappers', () => {
   })
 
   it('ui.hidden renders its node only when condition does NOT match', () => {
-    const node: UiNodeV1 = {
+    const node: UiNode = {
       type: 'stack',
       props: { direction: 'vertical' },
       children: [
@@ -177,7 +177,7 @@ describe('Conditional wrappers', () => {
   })
 
   it('condition with multiple fields requires all to match', () => {
-    const node: UiNodeV1 = {
+    const node: UiNode = {
       type: 'stack',
       props: { direction: 'vertical' },
       children: [

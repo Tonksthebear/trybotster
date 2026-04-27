@@ -1,6 +1,6 @@
 //! TUI adapter for the cross-client UI DSL (Phase B).
 //!
-//! The adapter translates a [`UiNodeV1`] tree (produced by Phase A's Lua
+//! The adapter translates a [`UiNode`] tree (produced by Phase A's Lua
 //! DSL registered in both the hub VM and the TUI's `LayoutLua`) into the
 //! existing TUI [`RenderNode`] / [`WidgetType`] tree, without altering the
 //! legacy render path. See the knowledge-vault note
@@ -9,11 +9,11 @@
 //!
 //! # Entry points
 //!
-//! - [`render_ui_node`] — walk a `UiNodeV1` tree, producing a `RenderNode`
+//! - [`render_ui_node`] — walk a `UiNode` tree, producing a `RenderNode`
 //!   and an [`ActionTable`] that preserves full action envelopes.
 //! - [`render_lua_ui_node`] — convenience wrapper that pulls a node straight
 //!   out of a Lua `mlua::Table`, used by `LayoutLua::call_render`.
-//! - [`derive_viewport_from_terminal`] — produce a [`UiViewportV1`] from
+//! - [`derive_viewport_from_terminal`] — produce a [`UiViewport`] from
 //!   terminal columns / rows.
 //! - [`is_ui_node_type`] — cheap shape check so callers can decide
 //!   whether a given Lua layout table is in the Phase A shape.
@@ -36,8 +36,8 @@
 //! module consumes.
 //!
 //! [`RenderNode`]: crate::tui::render_tree::RenderNode
-//! [`UiNodeV1`]: crate::ui_contract::node::UiNodeV1
-//! [`UiViewportV1`]: crate::ui_contract::viewport::UiViewportV1
+//! [`UiNode`]: crate::ui_contract::node::UiNode
+//! [`UiViewport`]: crate::ui_contract::viewport::UiViewport
 //! [`WidgetType`]: crate::tui::render_tree::WidgetType
 
 // Rust guideline compliant 2026-04-18
@@ -48,8 +48,8 @@ use serde_json::Value as JsonValue;
 
 use crate::tui::entity_stores::TuiEntityStores;
 use crate::tui::render_tree::RenderNode;
-use crate::ui_contract::node::UiNodeV1;
-use crate::ui_contract::viewport::UiViewportV1;
+use crate::ui_contract::node::UiNode;
+use crate::ui_contract::viewport::UiViewport;
 
 pub mod action;
 pub mod binding;
@@ -61,11 +61,9 @@ pub mod viewport;
 pub use action::ActionTable;
 pub use binding::resolve_bindings;
 pub use primitive::{is_ui_node_type, render_ui_node, render_ui_node_with_stores};
-pub use viewport::{
-    derive_viewport_from_terminal, height_class_for_rows, width_class_for_cols,
-};
+pub use viewport::{derive_viewport_from_terminal, height_class_for_rows, width_class_for_cols};
 
-/// Render a Phase A [`UiNodeV1`] tree from a Lua table directly into a
+/// Render a Phase A [`UiNode`] tree from a Lua table directly into a
 /// [`RenderNode`].
 ///
 /// Convenience entry point for `LayoutLua` — the runner holds a Lua VM
@@ -78,17 +76,17 @@ pub use viewport::{
 /// # Errors
 ///
 /// Returns an error if the table does not deserialise into a
-/// [`UiNodeV1`] (for example, because the top-level `type` does not
+/// [`UiNode`] (for example, because the top-level `type` does not
 /// name a known primitive), or if any primitive renderer fails.
 pub fn render_lua_ui_node(
     lua: &Lua,
     table: &LuaTable,
-    viewport: &UiViewportV1,
+    viewport: &UiViewport,
 ) -> Result<(RenderNode, ActionTable)> {
     render_lua_ui_node_with_stores(lua, table, viewport, None)
 }
 
-/// Render a Lua-built UiNodeV1 tree with optional access to the entity
+/// Render a Lua-built UiNode tree with optional access to the entity
 /// stores for binding resolution + composite data.
 ///
 /// The pipeline is:
@@ -97,7 +95,7 @@ pub fn render_lua_ui_node(
 ///    any `$bind` / `$kind = "bind_list"` sentinels).
 /// 2. [`resolve_bindings`] walks the tree replacing every sentinel with
 ///    the resolved value(s) from `stores`. Skipped when `stores` is None.
-/// 3. JSON → [`UiNodeV1`].
+/// 3. JSON → [`UiNode`].
 /// 4. [`render_ui_node_with_stores`] dispatches to the per-primitive
 ///    renderer with `stores` threaded so composites
 ///    (`session_list`, `workspace_list`, …) can read their data.
@@ -105,11 +103,11 @@ pub fn render_lua_ui_node(
 /// # Errors
 ///
 /// Returns an error if the table does not deserialise into a
-/// [`UiNodeV1`] post-binding-resolution, or if a primitive renderer fails.
+/// [`UiNode`] post-binding-resolution, or if a primitive renderer fails.
 pub fn render_lua_ui_node_with_stores(
     lua: &Lua,
     table: &LuaTable,
-    viewport: &UiViewportV1,
+    viewport: &UiViewport,
     stores: Option<&TuiEntityStores>,
 ) -> Result<(RenderNode, ActionTable)> {
     // Step 1: Lua → JSON (preserves $bind / $kind sentinels verbatim).
@@ -123,8 +121,8 @@ pub fn render_lua_ui_node_with_stores(
     }
 
     // Step 3: JSON → typed node.
-    let node: UiNodeV1 = serde_json::from_value(json)
-        .map_err(|e| anyhow!("ui_contract_adapter: JSON → UiNodeV1 failed: {e}"))?;
+    let node: UiNode = serde_json::from_value(json)
+        .map_err(|e| anyhow!("ui_contract_adapter: JSON → UiNode failed: {e}"))?;
 
     // Step 4: dispatch.
     let mut actions = ActionTable::new();

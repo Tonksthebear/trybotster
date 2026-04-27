@@ -7,38 +7,38 @@ import clsx from 'clsx'
 import type { RenderContext } from './context'
 import { IconGlyph } from './icons'
 import type {
-  BadgePropsV1,
-  ButtonPropsV1,
-  DialogPropsV1,
-  EmptyStatePropsV1,
-  IconButtonPropsV1,
-  IconPropsV1,
-  InlinePropsV1,
-  PanelPropsV1,
-  ScrollAreaPropsV1,
-  StackPropsV1,
-  StatusDotPropsV1,
-  TextPropsV1,
-  TreeItemPropsV1,
-  UiActionV1,
-  UiAlignV1,
-  UiBadgeSizeV1,
-  UiBadgeToneV1,
-  UiButtonToneV1,
-  UiButtonVariantV1,
-  UiInteractionDensityV1,
-  UiJustifyV1,
-  UiNodeV1,
-  UiPanelToneV1,
-  UiPropsV1,
-  UiScrollAxisV1,
-  UiSizeV1,
-  UiSpaceV1,
-  UiStackDirectionV1,
-  UiStatusDotStateV1,
-  UiTextWeightV1,
-  UiToneV1,
-  UiValueV1,
+  BadgeProps,
+  ButtonProps,
+  DialogProps,
+  EmptyStateProps,
+  IconButtonProps,
+  IconProps,
+  InlineProps,
+  PanelProps,
+  ScrollAreaProps,
+  StackProps,
+  StatusDotProps,
+  TextProps,
+  TreeItemProps,
+  UiAction,
+  UiAlign,
+  UiBadgeSize,
+  UiBadgeTone,
+  UiButtonTone,
+  UiButtonVariant,
+  UiInteractionDensity,
+  UiJustify,
+  UiNode,
+  UiPanelTone,
+  UiProps,
+  UiScrollAxis,
+  UiSize,
+  UiSpace,
+  UiStackDirection,
+  UiStatusDotState,
+  UiTextWeight,
+  UiTone,
+  UiValue,
 } from './types'
 import { resolveValue } from './viewport'
 
@@ -54,8 +54,8 @@ import { resolveValue } from './viewport'
  * - `ctx`: viewport, capability set, and action dispatch.
  */
 export type PrimitiveRendererArgs = {
-  node: UiNodeV1
-  props: UiPropsV1
+  node: UiNode
+  props: UiProps
   children: ReactNode[]
   slots: Record<string, ReactNode[]>
   ctx: RenderContext
@@ -65,7 +65,7 @@ export type PrimitiveRenderer = (args: PrimitiveRendererArgs) => ReactElement
 
 // ---------- Tailwind token maps ----------
 
-const SPACE_GAP: Record<UiSpaceV1, string> = {
+const SPACE_GAP: Record<UiSpace, string> = {
   '0': 'gap-0',
   '1': 'gap-1',
   '2': 'gap-2',
@@ -74,21 +74,21 @@ const SPACE_GAP: Record<UiSpaceV1, string> = {
   '6': 'gap-6',
 }
 
-const ALIGN_ITEMS: Record<UiAlignV1, string> = {
+const ALIGN_ITEMS: Record<UiAlign, string> = {
   start: 'items-start',
   center: 'items-center',
   end: 'items-end',
   stretch: 'items-stretch',
 }
 
-const JUSTIFY_CONTENT: Record<UiJustifyV1, string> = {
+const JUSTIFY_CONTENT: Record<UiJustify, string> = {
   start: 'justify-start',
   center: 'justify-center',
   end: 'justify-end',
   between: 'justify-between',
 }
 
-const TEXT_TONE: Record<UiToneV1, string> = {
+const TEXT_TONE: Record<UiTone, string> = {
   default: 'text-zinc-100',
   muted: 'text-zinc-400',
   accent: 'text-sky-400',
@@ -97,24 +97,24 @@ const TEXT_TONE: Record<UiToneV1, string> = {
   danger: 'text-red-400',
 }
 
-const TEXT_SIZE: Record<UiSizeV1, string> = {
+const TEXT_SIZE: Record<UiSize, string> = {
   xs: 'text-xs',
   sm: 'text-sm',
   md: 'text-base',
 }
 
-const TEXT_WEIGHT: Record<UiTextWeightV1, string> = {
+const TEXT_WEIGHT: Record<UiTextWeight, string> = {
   regular: 'font-normal',
   medium: 'font-medium',
   semibold: 'font-semibold',
 }
 
-const PANEL_TONE: Record<UiPanelToneV1, string> = {
+const PANEL_TONE: Record<UiPanelTone, string> = {
   default: 'bg-zinc-900/60',
   muted: 'bg-zinc-800/40',
 }
 
-const BADGE_TONE: Record<UiBadgeToneV1, string> = {
+const BADGE_TONE: Record<UiBadgeTone, string> = {
   default:
     'bg-zinc-600/20 text-zinc-300 dark:bg-white/10 dark:text-zinc-300',
   accent: 'bg-sky-500/15 text-sky-600 dark:bg-sky-500/10 dark:text-sky-400',
@@ -125,12 +125,12 @@ const BADGE_TONE: Record<UiBadgeToneV1, string> = {
   danger: 'bg-red-500/15 text-red-700 dark:bg-red-500/10 dark:text-red-400',
 }
 
-const BADGE_SIZE: Record<UiBadgeSizeV1, string> = {
+const BADGE_SIZE: Record<UiBadgeSize, string> = {
   sm: 'px-1.5 py-0.5 text-[10px]',
   md: 'px-2 py-0.5 text-xs',
 }
 
-const STATUS_DOT_STATE: Record<UiStatusDotStateV1, string> = {
+const STATUS_DOT_STATE: Record<UiStatusDotState, string> = {
   neutral: 'bg-zinc-500',
   idle: 'bg-sky-500',
   active: 'bg-emerald-400',
@@ -139,19 +139,19 @@ const STATUS_DOT_STATE: Record<UiStatusDotStateV1, string> = {
   danger: 'bg-red-500',
 }
 
-const BUTTON_TONE_SOLID: Record<UiButtonToneV1, string> = {
+const BUTTON_TONE_SOLID: Record<UiButtonTone, string> = {
   default: 'bg-zinc-800 text-zinc-100 hover:bg-zinc-700',
   accent: 'bg-sky-600 text-white hover:bg-sky-500',
   danger: 'bg-red-600 text-white hover:bg-red-500',
 }
 
-const BUTTON_TONE_GHOST: Record<UiButtonToneV1, string> = {
+const BUTTON_TONE_GHOST: Record<UiButtonTone, string> = {
   default: 'text-zinc-200 hover:bg-zinc-800/60',
   accent: 'text-sky-400 hover:bg-sky-500/10',
   danger: 'text-red-400 hover:bg-red-500/10',
 }
 
-const ICON_SIZE: Record<UiSizeV1, string> = {
+const ICON_SIZE: Record<UiSize, string> = {
   xs: 'size-3',
   sm: 'size-4',
   md: 'size-5',
@@ -174,7 +174,7 @@ const ACTION_TEST_IDS: Record<string, string> = {
 }
 
 function wrapActionClick(
-  action: UiActionV1,
+  action: UiAction,
   ctx: RenderContext,
 ): (event: MouseEvent) => void {
   return (event: MouseEvent) => {
@@ -191,15 +191,15 @@ function wrapActionClick(
 // ---------- Primitive renderers ----------
 
 const renderStack: PrimitiveRenderer = ({ props, children, ctx }) => {
-  const p = props as Partial<StackPropsV1>
+  const p = props as Partial<StackProps>
   const direction =
-    resolveValue<UiStackDirectionV1>(
-      p.direction as UiValueV1<UiStackDirectionV1> | undefined,
+    resolveValue<UiStackDirection>(
+      p.direction as UiValue<UiStackDirection> | undefined,
       ctx.viewport,
     ) ?? 'vertical'
-  const gap = resolveValue<UiSpaceV1>(p.gap, ctx.viewport)
-  const align = resolveValue<UiAlignV1>(p.align, ctx.viewport)
-  const justify = resolveValue<UiJustifyV1>(p.justify, ctx.viewport)
+  const gap = resolveValue<UiSpace>(p.gap, ctx.viewport)
+  const align = resolveValue<UiAlign>(p.align, ctx.viewport)
+  const justify = resolveValue<UiJustify>(p.justify, ctx.viewport)
   return (
     <div
       className={clsx(
@@ -216,10 +216,10 @@ const renderStack: PrimitiveRenderer = ({ props, children, ctx }) => {
 }
 
 const renderInline: PrimitiveRenderer = ({ props, children, ctx }) => {
-  const p = props as Partial<InlinePropsV1>
-  const gap = resolveValue<UiSpaceV1>(p.gap, ctx.viewport)
-  const align = resolveValue<UiAlignV1>(p.align, ctx.viewport)
-  const justify = resolveValue<UiJustifyV1>(p.justify, ctx.viewport)
+  const p = props as Partial<InlineProps>
+  const gap = resolveValue<UiSpace>(p.gap, ctx.viewport)
+  const align = resolveValue<UiAlign>(p.align, ctx.viewport)
+  const justify = resolveValue<UiJustify>(p.justify, ctx.viewport)
   return (
     <div
       className={clsx(
@@ -236,11 +236,11 @@ const renderInline: PrimitiveRenderer = ({ props, children, ctx }) => {
 }
 
 const renderPanel: PrimitiveRenderer = ({ props, children, ctx }) => {
-  const p = props as Partial<PanelPropsV1>
-  const tone: UiPanelToneV1 = p.tone ?? 'default'
+  const p = props as Partial<PanelProps>
+  const tone: UiPanelTone = p.tone ?? 'default'
   const border = p.border ?? false
   const density =
-    resolveValue<UiInteractionDensityV1>(p.interactionDensity, ctx.viewport) ??
+    resolveValue<UiInteractionDensity>(p.interactionDensity, ctx.viewport) ??
     'comfortable'
   const paddingClass =
     density === 'compact' ? 'p-2' : 'p-4'
@@ -267,22 +267,22 @@ const renderPanel: PrimitiveRenderer = ({ props, children, ctx }) => {
   )
 }
 
-const SCROLL_AXIS: Record<UiScrollAxisV1, string> = {
+const SCROLL_AXIS: Record<UiScrollAxis, string> = {
   y: 'overflow-y-auto',
   x: 'overflow-x-auto',
   both: 'overflow-auto',
 }
 
 const renderScrollArea: PrimitiveRenderer = ({ props, children }) => {
-  const p = props as Partial<ScrollAreaPropsV1>
-  const axis: UiScrollAxisV1 = p.axis ?? 'y'
+  const p = props as Partial<ScrollAreaProps>
+  const axis: UiScrollAxis = p.axis ?? 'y'
   return (
     <div className={clsx('min-h-0 min-w-0', SCROLL_AXIS[axis])}>{children}</div>
   )
 }
 
 const renderText: PrimitiveRenderer = ({ props }) => {
-  const p = props as Partial<TextPropsV1>
+  const p = props as Partial<TextProps>
   const text = p.text ?? ''
   const tone = p.tone ?? 'default'
   const size = p.size ?? 'sm'
@@ -303,7 +303,7 @@ const renderText: PrimitiveRenderer = ({ props }) => {
 }
 
 const renderIcon: PrimitiveRenderer = ({ props }) => {
-  const p = props as Partial<IconPropsV1>
+  const p = props as Partial<IconProps>
   const name = p.name ?? ''
   const size = p.size ?? 'sm'
   const tone = p.tone ?? 'default'
@@ -334,7 +334,7 @@ const renderIcon: PrimitiveRenderer = ({ props }) => {
 }
 
 const renderBadge: PrimitiveRenderer = ({ props }) => {
-  const p = props as Partial<BadgePropsV1>
+  const p = props as Partial<BadgeProps>
   const tone = p.tone ?? 'default'
   const size = p.size ?? 'md'
   return (
@@ -351,7 +351,7 @@ const renderBadge: PrimitiveRenderer = ({ props }) => {
 }
 
 const renderStatusDot: PrimitiveRenderer = ({ props }) => {
-  const p = props as Partial<StatusDotPropsV1>
+  const p = props as Partial<StatusDotProps>
   const state = p.state ?? 'neutral'
   return (
     <span
@@ -363,7 +363,7 @@ const renderStatusDot: PrimitiveRenderer = ({ props }) => {
 }
 
 const renderEmptyState: PrimitiveRenderer = ({ props, ctx }) => {
-  const p = props as Partial<EmptyStatePropsV1>
+  const p = props as Partial<EmptyStateProps>
   const title = p.title ?? ''
   const handlePrimary = p.primaryAction
     ? wrapActionClick(p.primaryAction, ctx)
@@ -384,11 +384,11 @@ const renderEmptyState: PrimitiveRenderer = ({ props, ctx }) => {
         <p className="text-sm text-zinc-500">{p.description}</p>
       )}
       {p.primaryAction && handlePrimary && (
-        // Phase A spec gap: EmptyStatePropsV1.primaryAction has no label
+        // Phase A spec gap: EmptyStateProps.primaryAction has no label
         // field, so we fall back to a generic "Get started" string. Surfaces
         // that need a specific action label should compose Stack+Button
         // directly instead of using the empty_state primitive. spec
-        // candidate: EmptyStatePropsV1.primaryActionLabel.
+        // candidate: EmptyStateProps.primaryActionLabel.
         <button
           type="button"
           onClick={handlePrimary}
@@ -403,11 +403,11 @@ const renderEmptyState: PrimitiveRenderer = ({ props, ctx }) => {
 }
 
 const renderButton: PrimitiveRenderer = ({ props, ctx }) => {
-  const p = props as Partial<ButtonPropsV1>
+  const p = props as Partial<ButtonProps>
   const label = p.label ?? ''
   const action = p.action
-  const variant: UiButtonVariantV1 = p.variant ?? 'solid'
-  const tone: UiButtonToneV1 = p.tone ?? 'default'
+  const variant: UiButtonVariant = p.variant ?? 'solid'
+  const tone: UiButtonTone = p.tone ?? 'default'
   if (!action) {
     return <button type="button" disabled>{label}</button>
   }
@@ -438,11 +438,11 @@ const renderButton: PrimitiveRenderer = ({ props, ctx }) => {
 }
 
 const renderIconButton: PrimitiveRenderer = ({ props, ctx }) => {
-  const p = props as Partial<IconButtonPropsV1>
+  const p = props as Partial<IconButtonProps>
   const icon = p.icon ?? ''
   const label = p.label ?? ''
   const action = p.action
-  const tone: UiButtonToneV1 = p.tone ?? 'default'
+  const tone: UiButtonTone = p.tone ?? 'default'
   if (!action) {
     return <button type="button" aria-label={label} disabled />
   }
@@ -477,7 +477,7 @@ const renderTree: PrimitiveRenderer = ({ children }) => {
 }
 
 const renderTreeItem: PrimitiveRenderer = ({ props, slots, ctx, node }) => {
-  const p = props as Partial<TreeItemPropsV1>
+  const p = props as Partial<TreeItemProps>
   const selected = p.selected ?? false
   const expanded = p.expanded
   const notification = p.notification ?? false
@@ -559,7 +559,7 @@ const renderTreeItem: PrimitiveRenderer = ({ props, slots, ctx, node }) => {
 }
 
 const renderDialog: PrimitiveRenderer = ({ props, slots, ctx }) => {
-  const p = props as Partial<DialogPropsV1>
+  const p = props as Partial<DialogProps>
   const open = p.open ?? false
   const title = p.title ?? ''
   const presentation = p.presentation ?? 'auto'

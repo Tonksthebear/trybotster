@@ -9,25 +9,25 @@ import React from 'react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { cleanup, render } from '@testing-library/react'
 import { UiTreeBody, createRawDispatch } from '..'
-import type { UiNodeV1, UiViewportV1 } from '../types'
+import type { UiNode, UiViewport } from '../types'
 
 afterEach(() => {
   cleanup()
 })
 
-const EXPANDED_FINE: UiViewportV1 = {
+const EXPANDED_FINE: UiViewport = {
   widthClass: 'expanded',
   heightClass: 'regular',
   pointer: 'fine',
 }
 
-const COMPACT_COARSE: UiViewportV1 = {
+const COMPACT_COARSE: UiViewport = {
   widthClass: 'compact',
   heightClass: 'regular',
   pointer: 'coarse',
 }
 
-function renderTree(node: UiNodeV1, viewport = EXPANDED_FINE) {
+function renderTree(node: UiNode, viewport = EXPANDED_FINE) {
   return render(
     <UiTreeBody
       node={node}
@@ -40,7 +40,7 @@ function renderTree(node: UiNodeV1, viewport = EXPANDED_FINE) {
 describe('Phase A wire-format parity', () => {
   // Sourced from stack_wire_shape_and_typed_props_round_trip
   it('stack with scalar direction + gap renders as flex-col', () => {
-    const fixture: UiNodeV1 = {
+    const fixture: UiNode = {
       type: 'stack',
       props: { direction: 'vertical', gap: '2' },
     }
@@ -53,7 +53,7 @@ describe('Phase A wire-format parity', () => {
 
   // Sourced from panel_typed_round_trip_with_interaction_density
   it('panel with interactionDensity=comfortable renders with its label', () => {
-    const fixture: UiNodeV1 = {
+    const fixture: UiNode = {
       type: 'panel',
       props: {
         title: 'Preview',
@@ -68,7 +68,7 @@ describe('Phase A wire-format parity', () => {
 
   // Sourced from responsive_value_embeds_inside_primitive_prop
   it('stack.direction = responsive({compact: vertical, expanded: horizontal}) resolves at render time', () => {
-    const fixture: UiNodeV1 = {
+    const fixture: UiNode = {
       type: 'stack',
       props: {
         direction: {
@@ -92,7 +92,7 @@ describe('Phase A wire-format parity', () => {
 
   // Sourced from when_hidden_wrappers_accepted_in_children_position
   it('stack with $kind=when + $kind=hidden children resolves both', () => {
-    const fixture: UiNodeV1 = {
+    const fixture: UiNode = {
       type: 'stack',
       props: { direction: 'vertical' },
       children: [
@@ -121,7 +121,7 @@ describe('Phase A wire-format parity', () => {
 
   // Sourced from tree_item_with_all_optional_slots
   it('tree_item with all slots including children renders full structure', () => {
-    const fixture: UiNodeV1 = {
+    const fixture: UiNode = {
       type: 'tree_item',
       id: 'ws-1',
       props: {
@@ -162,7 +162,7 @@ describe('Phase A wire-format parity', () => {
 
   // Sourced from dialog_wire_shape_with_hoisted_slots
   it('dialog with hoisted body+footer slots renders both', () => {
-    const fixture: UiNodeV1 = {
+    const fixture: UiNode = {
       type: 'dialog',
       props: {
         open: true,
@@ -192,7 +192,7 @@ describe('Phase A wire-format parity', () => {
 
   // Icon button with payload
   it('icon_button with action.payload round-trips via data-action-id', () => {
-    const fixture: UiNodeV1 = {
+    const fixture: UiNode = {
       type: 'icon_button',
       props: {
         icon: 'close',

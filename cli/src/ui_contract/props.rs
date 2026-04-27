@@ -1,4 +1,4 @@
-//! Strongly-typed Props structs for every v1 Lua-public primitive plus the
+//! Strongly-typed Props structs for every current Lua-public primitive plus the
 //! internal `Dialog`.
 //!
 //! **Cross-client spec is canonical.** Every field here matches
@@ -10,15 +10,15 @@
 //! `cross-client ui should share semantic primitives and actions with renderer-specific adapters.md`.
 //!
 //! When a Props field needs to admit a responsive value, the field type is
-//! [`UiValueV1`], so a renderer sees either a scalar or a `$kind="responsive"`
+//! [`UiValue`], so a renderer sees either a scalar or a `$kind="responsive"`
 //! wrapper.
 //!
 //! Slots (e.g. `TreeItem.title`, `Dialog.body`, `Dialog.footer`) live on
-//! [`crate::ui_contract::node::UiNodeV1::slots`], not in these Props structs.
+//! [`crate::ui_contract::node::UiNode::slots`], not in these Props structs.
 
 use serde::{Deserialize, Serialize};
 
-use crate::ui_contract::node::{UiActionV1, UiValueV1};
+use crate::ui_contract::node::{UiAction, UiValue};
 use crate::ui_contract::tokens::{
     UiAlign, UiBadgeSize, UiBadgeTone, UiButtonTone, UiButtonVariant, UiInteractionDensity,
     UiJustify, UiPanelTone, UiPresentation, UiScrollAxis, UiSessionListGrouping, UiSize, UiSpace,
@@ -32,18 +32,18 @@ use crate::ui_contract::tokens::{
 /// render nodes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StackPropsV1 {
+pub struct StackProps {
     /// Stack direction — required.
-    pub direction: UiValueV1<UiStackDirection>,
+    pub direction: UiValue<UiStackDirection>,
     /// Gap between children.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gap: Option<UiValueV1<UiSpace>>,
+    pub gap: Option<UiValue<UiSpace>>,
     /// Cross-axis alignment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub align: Option<UiValueV1<UiAlign>>,
+    pub align: Option<UiValue<UiAlign>>,
     /// Main-axis distribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub justify: Option<UiValueV1<UiJustify>>,
+    pub justify: Option<UiValue<UiJustify>>,
 }
 
 /// `Inline` props.
@@ -53,16 +53,16 @@ pub struct StackPropsV1 {
 /// web-only extensions (like `padding`) are left out.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct InlinePropsV1 {
+pub struct InlineProps {
     /// Gap between children.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gap: Option<UiValueV1<UiSpace>>,
+    pub gap: Option<UiValue<UiSpace>>,
     /// Cross-axis alignment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub align: Option<UiValueV1<UiAlign>>,
+    pub align: Option<UiValue<UiAlign>>,
     /// Main-axis distribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub justify: Option<UiValueV1<UiJustify>>,
+    pub justify: Option<UiValue<UiJustify>>,
     /// Whether to wrap onto a new line when space runs out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrap: Option<bool>,
@@ -71,7 +71,7 @@ pub struct InlinePropsV1 {
 /// `Panel` props — matches the cross-client spec shape exactly.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PanelPropsV1 {
+pub struct PanelProps {
     /// Optional title text. When present, renderers typically draw a header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -83,7 +83,7 @@ pub struct PanelPropsV1 {
     pub border: Option<bool>,
     /// Interaction density — may be responsive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interaction_density: Option<UiValueV1<UiInteractionDensity>>,
+    pub interaction_density: Option<UiValue<UiInteractionDensity>>,
 }
 
 /// `ScrollArea` props.
@@ -92,7 +92,7 @@ pub struct PanelPropsV1 {
 /// know the scroll axis to render correctly.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ScrollAreaPropsV1 {
+pub struct ScrollAreaProps {
     /// Axis along which to scroll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub axis: Option<UiScrollAxis>,
@@ -101,7 +101,7 @@ pub struct ScrollAreaPropsV1 {
 /// `Text` props — matches the cross-client spec shape exactly.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TextPropsV1 {
+pub struct TextProps {
     /// Required text body.
     pub text: String,
     /// Tone.
@@ -127,7 +127,7 @@ pub struct TextPropsV1 {
 /// `Icon` props.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IconPropsV1 {
+pub struct IconProps {
     /// Icon id.
     pub name: String,
     /// Icon size.
@@ -144,7 +144,7 @@ pub struct IconPropsV1 {
 /// `Badge` props.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BadgePropsV1 {
+pub struct BadgeProps {
     /// Badge text.
     pub text: String,
     /// Badge tone.
@@ -158,7 +158,7 @@ pub struct BadgePropsV1 {
 /// `StatusDot` props.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StatusDotPropsV1 {
+pub struct StatusDotProps {
     /// Dot state.
     pub state: UiStatusDotState,
     /// Accessible label describing the state.
@@ -169,7 +169,7 @@ pub struct StatusDotPropsV1 {
 /// `EmptyState` props.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EmptyStatePropsV1 {
+pub struct EmptyStateProps {
     /// Title text.
     pub title: String,
     /// Optional description.
@@ -180,20 +180,20 @@ pub struct EmptyStatePropsV1 {
     pub icon: Option<String>,
     /// Optional primary action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_action: Option<UiActionV1>,
+    pub primary_action: Option<UiAction>,
 }
 
 /// `Button` props — matches the cross-client spec shape exactly.
 ///
 /// There is no `disabled` field: per cross-client spec, disabled state travels
-/// on the `UiActionV1::disabled` carried by `action`.
+/// on the `UiAction::disabled` carried by `action`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ButtonPropsV1 {
+pub struct ButtonProps {
     /// Button label.
     pub label: String,
     /// Action emitted on press.
-    pub action: UiActionV1,
+    pub action: UiAction,
     /// Visual variant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<UiButtonVariant>,
@@ -211,33 +211,33 @@ pub struct ButtonPropsV1 {
 /// label. There is no `disabled` field; use `action.disabled` instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IconButtonPropsV1 {
+pub struct IconButtonProps {
     /// Icon id.
     pub icon: String,
     /// Accessible label.
     pub label: String,
     /// Action emitted on press.
-    pub action: UiActionV1,
+    pub action: UiAction,
     /// Tone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tone: Option<UiButtonTone>,
 }
 
-// Tree has no shared props in v1 — the web-only `density` surface variant
+// Tree has no shared props in current — the web-only `density` surface variant
 // is a renderer-internal concern and is intentionally excluded from this
-// contract. No `TreePropsV1` struct exists; renderers deserialize Tree
+// contract. No `TreeProps` struct exists; renderers deserialize Tree
 // nodes without a props struct.
 
 /// `TreeItem` props.
 ///
 /// Slots (`title` required, `subtitle` / `start` / `end` / `children`
-/// optional) live on [`crate::ui_contract::node::UiNodeV1::slots`]. The
-/// stable `id` lives on [`crate::ui_contract::node::UiNodeV1::id`] (the
-/// envelope) rather than under props, per the UiNodeV1 shape in
+/// optional) live on [`crate::ui_contract::node::UiNode::slots`]. The
+/// stable `id` lives on [`crate::ui_contract::node::UiNode::id`] (the
+/// envelope) rather than under props, per the UiNode shape in
 /// `docs/specs/cross-client-ui-primitives.md`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TreeItemPropsV1 {
+pub struct TreeItemProps {
     /// Expansion state (controlled if explicit).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expanded: Option<bool>,
@@ -249,7 +249,7 @@ pub struct TreeItemPropsV1 {
     pub notification: Option<bool>,
     /// Primary action emitted on activation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<UiActionV1>,
+    pub action: Option<UiAction>,
 }
 
 // =========================================================================
@@ -257,7 +257,7 @@ pub struct TreeItemPropsV1 {
 //
 // These primitives are data-driven: they carry no children, no slots. Each
 // reads from the client-side entity store (session, workspace, …) and
-// expands into the same flat tree the v1 hub-rendered layout used to ship.
+// expands into the same flat tree the current hub-rendered layout used to ship.
 // Both renderers (web React, ratatui TUI) consume the same wire shape.
 // =========================================================================
 
@@ -267,10 +267,10 @@ pub struct TreeItemPropsV1 {
 /// state, hosted-preview indicators, and the New Session button.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionListPropsV1 {
+pub struct SessionListProps {
     /// Surface density (`sidebar` / `panel`). Defaults to `panel` when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub density: Option<UiValueV1<UiSurfaceDensity>>,
+    pub density: Option<UiValue<UiSurfaceDensity>>,
     /// Grouping mode. Defaults to `workspace` when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grouping: Option<UiSessionListGrouping>,
@@ -286,10 +286,10 @@ pub struct SessionListPropsV1 {
 /// independent of the session tree.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkspaceListPropsV1 {
+pub struct WorkspaceListProps {
     /// Surface density (`sidebar` / `panel`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub density: Option<UiValueV1<UiSurfaceDensity>>,
+    pub density: Option<UiValue<UiSurfaceDensity>>,
 }
 
 /// `SpawnTargetList` props — renders the configured spawn targets.
@@ -300,19 +300,19 @@ pub struct WorkspaceListPropsV1 {
 /// (`botster.spawn_target.select`, `botster.spawn_target.remove`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SpawnTargetListPropsV1 {
+pub struct SpawnTargetListProps {
     /// Action template emitted when a target row is activated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_select: Option<UiActionV1>,
+    pub on_select: Option<UiAction>,
     /// Action template emitted when a target row's remove control fires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_remove: Option<UiActionV1>,
+    pub on_remove: Option<UiAction>,
 }
 
 /// `WorktreeList` props — renders the worktrees for one spawn target.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WorktreeListPropsV1 {
+pub struct WorktreeListProps {
     /// Required: the spawn target whose worktrees should be listed.
     pub target_id: String,
 }
@@ -322,12 +322,12 @@ pub struct WorktreeListPropsV1 {
 /// session-scoped surface).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionRowPropsV1 {
+pub struct SessionRowProps {
     /// Required: the session_uuid the row should bind to.
     pub session_uuid: String,
     /// Surface density. Defaults to `panel`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub density: Option<UiValueV1<UiSurfaceDensity>>,
+    pub density: Option<UiValue<UiSurfaceDensity>>,
 }
 
 /// `HubRecoveryState` props — renders the hub lifecycle banner. Reads the
@@ -335,13 +335,13 @@ pub struct SessionRowPropsV1 {
 /// props in the typical case.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HubRecoveryStatePropsV1 {}
+pub struct HubRecoveryStateProps {}
 
 /// `ConnectionCode` props — renders the QR code + URL for hub pairing. Reads
 /// the `connection_code` singleton entity from the client store.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConnectionCodePropsV1 {}
+pub struct ConnectionCodeProps {}
 
 /// `NewSessionButton` props — the "+" button that opens the new-session
 /// chooser. Lifted into its own composite so both renderers stay parity-free
@@ -349,14 +349,14 @@ pub struct ConnectionCodePropsV1 {}
 /// substitutions can land here without rebroadcasting trees).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NewSessionButtonPropsV1 {
+pub struct NewSessionButtonProps {
     /// Required: the action emitted on press.
-    pub action: UiActionV1,
+    pub action: UiAction,
 }
 
 /// `Dialog` props.
 ///
-/// Deferred from the Lua-public v1 inventory per
+/// Deferred from the Lua-public current inventory per
 /// `docs/specs/web-ui-primitives-runtime.md`, but the primitive is registered
 /// so renderers can adopt it when Phase B / Phase C is ready.
 ///
@@ -365,7 +365,7 @@ pub struct NewSessionButtonPropsV1 {
 /// `auto` when the Lua constructor is used.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DialogPropsV1 {
+pub struct DialogProps {
     /// Whether the dialog is open.
     pub open: bool,
     /// Dialog title text.
@@ -383,24 +383,24 @@ mod tests {
     )]
 
     use super::*;
-    use crate::ui_contract::node::{UiResponsiveV1, UiResponsiveWidthV1};
+    use crate::ui_contract::node::{UiResponsive, UiResponsiveWidth};
     use serde_json::json;
 
     // ---------- Stack ----------
 
     #[test]
     fn stack_requires_direction() {
-        let err = serde_json::from_value::<StackPropsV1>(json!({ "gap": "2" }));
+        let err = serde_json::from_value::<StackProps>(json!({ "gap": "2" }));
         assert!(err.is_err(), "Stack must require `direction`");
     }
 
     #[test]
     fn stack_round_trip_scalar_direction() {
-        let p = StackPropsV1 {
-            direction: UiValueV1::scalar(UiStackDirection::Vertical),
-            gap: Some(UiValueV1::scalar(UiSpace::Two)),
-            align: Some(UiValueV1::scalar(UiAlign::Start)),
-            justify: Some(UiValueV1::scalar(UiJustify::Between)),
+        let p = StackProps {
+            direction: UiValue::scalar(UiStackDirection::Vertical),
+            gap: Some(UiValue::scalar(UiSpace::Two)),
+            align: Some(UiValue::scalar(UiAlign::Start)),
+            justify: Some(UiValue::scalar(UiJustify::Between)),
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(
@@ -412,15 +412,15 @@ mod tests {
                 "justify": "between"
             })
         );
-        let back: StackPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: StackProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
     #[test]
     fn stack_round_trip_responsive_direction() {
-        let p = StackPropsV1 {
-            direction: UiValueV1::Responsive(UiResponsiveV1::Responsive {
-                width: Some(UiResponsiveWidthV1 {
+        let p = StackProps {
+            direction: UiValue::Responsive(UiResponsive::Responsive {
+                width: Some(UiResponsiveWidth {
                     compact: Some(UiStackDirection::Vertical),
                     expanded: Some(UiStackDirection::Horizontal),
                     ..Default::default()
@@ -441,32 +441,35 @@ mod tests {
                 }
             })
         );
-        let back: StackPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: StackProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
     #[test]
     fn stack_padding_is_not_accepted_as_a_field() {
         // Extra keys on the wire are ignored by default; verify padding does
-        // NOT round-trip as a structural field on StackPropsV1.
-        let p = StackPropsV1 {
-            direction: UiValueV1::scalar(UiStackDirection::Vertical),
+        // NOT round-trip as a structural field on StackProps.
+        let p = StackProps {
+            direction: UiValue::scalar(UiStackDirection::Vertical),
             gap: None,
             align: None,
             justify: None,
         };
         let v = serde_json::to_value(&p).expect("serialize");
-        assert!(v.get("padding").is_none(), "StackPropsV1 must not emit `padding`: {v}");
+        assert!(
+            v.get("padding").is_none(),
+            "StackProps must not emit `padding`: {v}"
+        );
     }
 
     // ---------- Inline ----------
 
     #[test]
     fn inline_round_trip() {
-        let p = InlinePropsV1 {
-            gap: Some(UiValueV1::scalar(UiSpace::One)),
-            align: Some(UiValueV1::scalar(UiAlign::Center)),
-            justify: Some(UiValueV1::scalar(UiJustify::Start)),
+        let p = InlineProps {
+            gap: Some(UiValue::scalar(UiSpace::One)),
+            align: Some(UiValue::scalar(UiAlign::Center)),
+            justify: Some(UiValue::scalar(UiJustify::Start)),
             wrap: Some(true),
         };
         let v = serde_json::to_value(&p).expect("serialize");
@@ -474,13 +477,13 @@ mod tests {
             v,
             json!({ "gap": "1", "align": "center", "justify": "start", "wrap": true })
         );
-        let back: InlinePropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: InlineProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
     #[test]
     fn inline_padding_is_not_accepted() {
-        let p = InlinePropsV1::default();
+        let p = InlineProps::default();
         let v = serde_json::to_value(&p).expect("serialize");
         assert!(v.get("padding").is_none());
     }
@@ -489,11 +492,11 @@ mod tests {
 
     #[test]
     fn panel_round_trip_all_fields() {
-        let p = PanelPropsV1 {
+        let p = PanelProps {
             title: Some("Preview error".into()),
             tone: Some(UiPanelTone::Muted),
             border: Some(true),
-            interaction_density: Some(UiValueV1::scalar(UiInteractionDensity::Comfortable)),
+            interaction_density: Some(UiValue::scalar(UiInteractionDensity::Comfortable)),
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(
@@ -505,37 +508,43 @@ mod tests {
                 "interactionDensity": "comfortable"
             })
         );
-        let back: PanelPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: PanelProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
     #[test]
     fn panel_rejects_web_only_fields_on_output() {
-        let p = PanelPropsV1 {
+        let p = PanelProps {
             title: Some("x".into()),
             ..Default::default()
         };
         let v = serde_json::to_value(&p).expect("serialize");
-        assert!(v.get("padding").is_none(), "Panel must not emit web-only `padding`");
-        assert!(v.get("radius").is_none(), "Panel must not emit web-only `radius`");
+        assert!(
+            v.get("padding").is_none(),
+            "Panel must not emit web-only `padding`"
+        );
+        assert!(
+            v.get("radius").is_none(),
+            "Panel must not emit web-only `radius`"
+        );
     }
 
     // ---------- ScrollArea ----------
 
     #[test]
     fn scroll_area_round_trip() {
-        let p = ScrollAreaPropsV1 {
+        let p = ScrollAreaProps {
             axis: Some(UiScrollAxis::Both),
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(v, json!({ "axis": "both" }));
-        let back: ScrollAreaPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: ScrollAreaProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
     #[test]
     fn scroll_area_default_is_empty_object() {
-        let v = serde_json::to_value(ScrollAreaPropsV1::default()).expect("serialize");
+        let v = serde_json::to_value(ScrollAreaProps::default()).expect("serialize");
         assert_eq!(v, json!({}));
     }
 
@@ -543,13 +552,13 @@ mod tests {
 
     #[test]
     fn text_requires_text() {
-        let err = serde_json::from_value::<TextPropsV1>(json!({ "tone": "accent" }));
+        let err = serde_json::from_value::<TextProps>(json!({ "tone": "accent" }));
         assert!(err.is_err());
     }
 
     #[test]
     fn text_round_trip() {
-        let p = TextPropsV1 {
+        let p = TextProps {
             text: "Hello".into(),
             tone: Some(UiTone::Accent),
             size: Some(UiSize::Sm),
@@ -559,7 +568,7 @@ mod tests {
             truncate: Some(false),
         };
         let v = serde_json::to_value(&p).expect("serialize");
-        let back: TextPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: TextProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -567,20 +576,20 @@ mod tests {
 
     #[test]
     fn icon_requires_name() {
-        let err = serde_json::from_value::<IconPropsV1>(json!({}));
+        let err = serde_json::from_value::<IconProps>(json!({}));
         assert!(err.is_err());
     }
 
     #[test]
     fn icon_round_trip() {
-        let p = IconPropsV1 {
+        let p = IconProps {
             name: "workspace".into(),
             size: Some(UiSize::Sm),
             tone: Some(UiTone::Muted),
             label: Some("Workspaces".into()),
         };
         let v = serde_json::to_value(&p).expect("serialize");
-        let back: IconPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: IconProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -588,20 +597,20 @@ mod tests {
 
     #[test]
     fn badge_requires_text() {
-        let err = serde_json::from_value::<BadgePropsV1>(json!({}));
+        let err = serde_json::from_value::<BadgeProps>(json!({}));
         assert!(err.is_err());
     }
 
     #[test]
     fn badge_round_trip() {
-        let p = BadgePropsV1 {
+        let p = BadgeProps {
             text: "3".into(),
             tone: Some(UiBadgeTone::Warning),
             size: Some(UiBadgeSize::Sm),
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(v, json!({ "text": "3", "tone": "warning", "size": "sm" }));
-        let back: BadgePropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: BadgeProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -609,18 +618,18 @@ mod tests {
 
     #[test]
     fn status_dot_requires_state() {
-        let err = serde_json::from_value::<StatusDotPropsV1>(json!({}));
+        let err = serde_json::from_value::<StatusDotProps>(json!({}));
         assert!(err.is_err());
     }
 
     #[test]
     fn status_dot_round_trip() {
-        let p = StatusDotPropsV1 {
+        let p = StatusDotProps {
             state: UiStatusDotState::Active,
             label: Some("Running".into()),
         };
         let v = serde_json::to_value(&p).expect("serialize");
-        let back: StatusDotPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: StatusDotProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -628,17 +637,17 @@ mod tests {
 
     #[test]
     fn empty_state_requires_title() {
-        let err = serde_json::from_value::<EmptyStatePropsV1>(json!({}));
+        let err = serde_json::from_value::<EmptyStateProps>(json!({}));
         assert!(err.is_err());
     }
 
     #[test]
     fn empty_state_round_trip() {
-        let p = EmptyStatePropsV1 {
+        let p = EmptyStateProps {
             title: "No sessions yet".into(),
             description: Some("Spawn an agent to get started.".into()),
             icon: Some("sparkle".into()),
-            primary_action: Some(UiActionV1::new("botster.session.create.request")),
+            primary_action: Some(UiAction::new("botster.session.create.request")),
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(
@@ -650,7 +659,7 @@ mod tests {
                 "primaryAction": { "id": "botster.session.create.request" }
             })
         );
-        let back: EmptyStatePropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: EmptyStateProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -658,17 +667,15 @@ mod tests {
 
     #[test]
     fn button_requires_label_and_action() {
-        assert!(
-            serde_json::from_value::<ButtonPropsV1>(json!({ "action": { "id": "x" } })).is_err()
-        );
-        assert!(serde_json::from_value::<ButtonPropsV1>(json!({ "label": "Go" })).is_err());
+        assert!(serde_json::from_value::<ButtonProps>(json!({ "action": { "id": "x" } })).is_err());
+        assert!(serde_json::from_value::<ButtonProps>(json!({ "label": "Go" })).is_err());
     }
 
     #[test]
     fn button_round_trip() {
-        let p = ButtonPropsV1 {
+        let p = ButtonProps {
             label: "Save".into(),
-            action: UiActionV1::new("botster.workspace.save"),
+            action: UiAction::new("botster.workspace.save"),
             variant: Some(UiButtonVariant::Solid),
             tone: Some(UiButtonTone::Accent),
             icon: Some("check".into()),
@@ -684,22 +691,25 @@ mod tests {
                 "icon": "check"
             })
         );
-        let back: ButtonPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: ButtonProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
     #[test]
     fn button_does_not_emit_disabled_or_leading_icon() {
-        let p = ButtonPropsV1 {
+        let p = ButtonProps {
             label: "x".into(),
-            action: UiActionV1::new("x"),
+            action: UiAction::new("x"),
             variant: None,
             tone: None,
             icon: None,
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert!(v.get("disabled").is_none(), "Button must not emit disabled");
-        assert!(v.get("leadingIcon").is_none(), "Button must not emit leadingIcon");
+        assert!(
+            v.get("leadingIcon").is_none(),
+            "Button must not emit leadingIcon"
+        );
     }
 
     // ---------- IconButton ----------
@@ -712,11 +722,9 @@ mod tests {
                 "label": "Close",
                 "action": { "id": "botster.session.close.request" }
             });
-            obj.as_object_mut()
-                .expect("object")
-                .remove(required);
+            obj.as_object_mut().expect("object").remove(required);
             assert!(
-                serde_json::from_value::<IconButtonPropsV1>(obj).is_err(),
+                serde_json::from_value::<IconButtonProps>(obj).is_err(),
                 "icon_button should require `{required}`"
             );
         }
@@ -724,44 +732,44 @@ mod tests {
 
     #[test]
     fn icon_button_round_trip() {
-        let p = IconButtonPropsV1 {
+        let p = IconButtonProps {
             icon: "close".into(),
             label: "Close session".into(),
-            action: UiActionV1::new("botster.session.close.request"),
+            action: UiAction::new("botster.session.close.request"),
             tone: Some(UiButtonTone::Danger),
         };
         let v = serde_json::to_value(&p).expect("serialize");
-        let back: IconButtonPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: IconButtonProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
     #[test]
     fn icon_button_does_not_emit_disabled() {
-        let p = IconButtonPropsV1 {
+        let p = IconButtonProps {
             icon: "x".into(),
             label: "x".into(),
-            action: UiActionV1::new("x"),
+            action: UiAction::new("x"),
             tone: None,
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert!(v.get("disabled").is_none());
     }
 
-    // ---------- Tree: intentionally no TreePropsV1 struct ----------
+    // ---------- Tree: intentionally no TreeProps struct ----------
 
     // ---------- TreeItem ----------
 
     #[test]
     fn tree_item_props_round_trip() {
-        // id is on UiNodeV1::id, not in TreeItemPropsV1.
-        let p = TreeItemPropsV1 {
+        // id is on UiNode::id, not in TreeItemProps.
+        let p = TreeItemProps {
             expanded: Some(true),
             selected: Some(false),
             notification: Some(true),
-            action: Some(UiActionV1::new("botster.workspace.toggle")),
+            action: Some(UiAction::new("botster.workspace.toggle")),
         };
         let v = serde_json::to_value(&p).expect("serialize");
-        let back: TreeItemPropsV1 = serde_json::from_value(v.clone()).expect("deserialize");
+        let back: TreeItemProps = serde_json::from_value(v.clone()).expect("deserialize");
         assert_eq!(back, p);
         // id is NOT a Props field.
         assert!(v.get("id").is_none());
@@ -771,22 +779,22 @@ mod tests {
 
     #[test]
     fn dialog_requires_open_and_title() {
-        assert!(serde_json::from_value::<DialogPropsV1>(json!({ "open": true })).is_err());
-        assert!(serde_json::from_value::<DialogPropsV1>(json!({ "title": "x" })).is_err());
+        assert!(serde_json::from_value::<DialogProps>(json!({ "open": true })).is_err());
+        assert!(serde_json::from_value::<DialogProps>(json!({ "title": "x" })).is_err());
     }
 
     // ---------- SessionList ----------
 
     #[test]
     fn session_list_default_round_trip_is_empty_object() {
-        let v = serde_json::to_value(SessionListPropsV1::default()).expect("serialize");
+        let v = serde_json::to_value(SessionListProps::default()).expect("serialize");
         assert_eq!(v, json!({}));
     }
 
     #[test]
     fn session_list_round_trip_all_fields() {
-        let p = SessionListPropsV1 {
-            density: Some(UiValueV1::scalar(UiSurfaceDensity::Sidebar)),
+        let p = SessionListProps {
+            density: Some(UiValue::scalar(UiSurfaceDensity::Sidebar)),
             grouping: Some(UiSessionListGrouping::Workspace),
             show_nav_entries: Some(true),
         };
@@ -795,15 +803,15 @@ mod tests {
             v,
             json!({ "density": "sidebar", "grouping": "workspace", "showNavEntries": true })
         );
-        let back: SessionListPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: SessionListProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
     #[test]
     fn session_list_density_supports_responsive() {
-        let p = SessionListPropsV1 {
-            density: Some(UiValueV1::Responsive(UiResponsiveV1::Responsive {
-                width: Some(UiResponsiveWidthV1 {
+        let p = SessionListProps {
+            density: Some(UiValue::Responsive(UiResponsive::Responsive {
+                width: Some(UiResponsiveWidth {
                     compact: Some(UiSurfaceDensity::Sidebar),
                     expanded: Some(UiSurfaceDensity::Panel),
                     ..Default::default()
@@ -813,7 +821,7 @@ mod tests {
             ..Default::default()
         };
         let v = serde_json::to_value(&p).expect("serialize");
-        let back: SessionListPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: SessionListProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -821,12 +829,12 @@ mod tests {
 
     #[test]
     fn workspace_list_round_trip() {
-        let p = WorkspaceListPropsV1 {
-            density: Some(UiValueV1::scalar(UiSurfaceDensity::Panel)),
+        let p = WorkspaceListProps {
+            density: Some(UiValue::scalar(UiSurfaceDensity::Panel)),
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(v, json!({ "density": "panel" }));
-        let back: WorkspaceListPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: WorkspaceListProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -834,15 +842,15 @@ mod tests {
 
     #[test]
     fn spawn_target_list_default_omits_actions() {
-        let v = serde_json::to_value(SpawnTargetListPropsV1::default()).expect("serialize");
+        let v = serde_json::to_value(SpawnTargetListProps::default()).expect("serialize");
         assert_eq!(v, json!({}));
     }
 
     #[test]
     fn spawn_target_list_round_trip_with_action_templates() {
-        let p = SpawnTargetListPropsV1 {
-            on_select: Some(UiActionV1::new("custom.target.select")),
-            on_remove: Some(UiActionV1::new("custom.target.remove")),
+        let p = SpawnTargetListProps {
+            on_select: Some(UiAction::new("custom.target.select")),
+            on_remove: Some(UiAction::new("custom.target.remove")),
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(
@@ -852,7 +860,7 @@ mod tests {
                 "onRemove": { "id": "custom.target.remove" }
             })
         );
-        let back: SpawnTargetListPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: SpawnTargetListProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -860,18 +868,18 @@ mod tests {
 
     #[test]
     fn worktree_list_requires_target_id() {
-        let err = serde_json::from_value::<WorktreeListPropsV1>(json!({}));
+        let err = serde_json::from_value::<WorktreeListProps>(json!({}));
         assert!(err.is_err(), "WorktreeList must require target_id");
     }
 
     #[test]
     fn worktree_list_round_trip() {
-        let p = WorktreeListPropsV1 {
+        let p = WorktreeListProps {
             target_id: "target-abc".into(),
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(v, json!({ "targetId": "target-abc" }));
-        let back: WorktreeListPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: WorktreeListProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -879,22 +887,22 @@ mod tests {
 
     #[test]
     fn session_row_requires_session_uuid() {
-        let err = serde_json::from_value::<SessionRowPropsV1>(json!({}));
+        let err = serde_json::from_value::<SessionRowProps>(json!({}));
         assert!(err.is_err(), "SessionRow must require session_uuid");
     }
 
     #[test]
     fn session_row_round_trip() {
-        let p = SessionRowPropsV1 {
+        let p = SessionRowProps {
             session_uuid: "sess-abc".into(),
-            density: Some(UiValueV1::scalar(UiSurfaceDensity::Sidebar)),
+            density: Some(UiValue::scalar(UiSurfaceDensity::Sidebar)),
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(
             v,
             json!({ "sessionUuid": "sess-abc", "density": "sidebar" })
         );
-        let back: SessionRowPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: SessionRowProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -902,10 +910,10 @@ mod tests {
 
     #[test]
     fn hub_recovery_state_round_trip_is_empty_object() {
-        let p = HubRecoveryStatePropsV1::default();
+        let p = HubRecoveryStateProps::default();
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(v, json!({}));
-        let back: HubRecoveryStatePropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: HubRecoveryStateProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -913,10 +921,10 @@ mod tests {
 
     #[test]
     fn connection_code_round_trip_is_empty_object() {
-        let p = ConnectionCodePropsV1::default();
+        let p = ConnectionCodeProps::default();
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(v, json!({}));
-        let back: ConnectionCodePropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: ConnectionCodeProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -924,21 +932,21 @@ mod tests {
 
     #[test]
     fn new_session_button_requires_action() {
-        let err = serde_json::from_value::<NewSessionButtonPropsV1>(json!({}));
+        let err = serde_json::from_value::<NewSessionButtonProps>(json!({}));
         assert!(err.is_err(), "NewSessionButton must require action");
     }
 
     #[test]
     fn new_session_button_round_trip() {
-        let p = NewSessionButtonPropsV1 {
-            action: UiActionV1::new("botster.session.create.request"),
+        let p = NewSessionButtonProps {
+            action: UiAction::new("botster.session.create.request"),
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(
             v,
             json!({ "action": { "id": "botster.session.create.request" } })
         );
-        let back: NewSessionButtonPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: NewSessionButtonProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
@@ -946,7 +954,7 @@ mod tests {
 
     #[test]
     fn dialog_round_trip_with_presentation() {
-        let p = DialogPropsV1 {
+        let p = DialogProps {
             open: true,
             title: "Rename Workspace".into(),
             presentation: Some(UiPresentation::Auto),
@@ -956,7 +964,7 @@ mod tests {
             v,
             json!({ "open": true, "title": "Rename Workspace", "presentation": "auto" })
         );
-        let back: DialogPropsV1 = serde_json::from_value(v).expect("deserialize");
+        let back: DialogProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 }

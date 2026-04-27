@@ -30,7 +30,7 @@ pub(super) struct LayoutSource {
 pub(super) struct ExtensionSource {
     /// Lua source code.
     pub source: String,
-    /// Human-readable name for error messages (e.g., "plugin:my-plugin/layout").
+    /// Human-readable name for error messages (e.g., "plugin:my-plugin/tui.lua").
     pub name: String,
     /// Filesystem path for hot-reload watching.
     pub fs_path: PathBuf,
@@ -72,17 +72,64 @@ fn load_lua_ui_source(name: &str) -> Option<LayoutSource> {
     None
 }
 
+fn discover_plugin_declared_tui_extensions(
+    plugin_name: &str,
+    plugin_dir: &std::path::Path,
+    init_path: &std::path::Path,
+) -> Vec<ExtensionSource> {
+    let Ok(init_source) = std::fs::read_to_string(init_path) else {
+        return Vec::new();
+    };
+
+    let mut extensions = Vec::new();
+    for line in init_source.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("--") else {
+            if trimmed.is_empty() {
+                continue;
+            }
+            break;
+        };
+        let rest = rest.trim_start();
+        let Some(rel) = rest.strip_prefix("@tui ") else {
+            continue;
+        };
+        let rel = rel.trim();
+        if rel.is_empty() || rel.starts_with('/') || rel.contains("..") {
+            log::warn!("Ignoring invalid @tui path in {plugin_name}/init.lua: {rel}");
+            continue;
+        }
+
+        let path = plugin_dir.join(rel);
+        match std::fs::read_to_string(&path) {
+            Ok(source) => {
+                log::info!("Discovered plugin TUI extension: {plugin_name}/{rel}");
+                extensions.push(ExtensionSource {
+                    source,
+                    name: format!("plugin:{plugin_name}/{rel}"),
+                    fs_path: path,
+                });
+            }
+            Err(e) => log::warn!("Plugin {plugin_name} declares missing TUI extension {rel}: {e}"),
+        }
+    }
+    extensions
+}
+
 /// Discover UI extension files from plugins and user directories.
 ///
 /// Returns extensions in load order:
-/// 1. Plugin `ui/` files (alphabetical by plugin name)
+/// 1. Plugin-declared TUI files from `plugins/<name>/init.lua` metadata:
+///    `-- @tui path/to/file.lua`
 /// 2. User `~/.botster/lua/user/ui/` files (highest priority)
 pub(super) fn discover_ui_extensions(lua_base: &std::path::Path) -> Vec<ExtensionSource> {
     let mut extensions = Vec::new();
     let ui_files = ["layout.lua", "keybindings.lua", "actions.lua", "events.lua"];
 
-    // Plugin UI extensions: ~/.botster/plugins/*/ui/{layout,keybindings,actions}.lua
-    // lua_base is ~/.botster/lua, plugins are at ~/.botster/plugins
+    // Plugin TUI extensions: ~/.botster/plugins/*/init.lua declares files
+    // using `-- @tui relative/path.lua`. This keeps the plugin directory
+    // Neovim-like: init.lua is the only required filename; every other file is
+    // author-owned organization.
     let plugins_dir = lua_base.parent().unwrap_or(lua_base).join("plugins");
 
     if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
@@ -95,18 +142,13 @@ pub(super) fn discover_ui_extensions(lua_base: &std::path::Path) -> Vec<Extensio
                 continue;
             }
             let plugin_name = entry.file_name().to_string_lossy().to_string();
+            let init_path = path.join("init.lua");
 
-            for ui_file in &ui_files {
-                let ui_path = path.join("ui").join(ui_file);
-                if let Ok(source) = std::fs::read_to_string(&ui_path) {
-                    log::info!("Discovered plugin UI extension: {plugin_name}/{ui_file}");
-                    extensions.push(ExtensionSource {
-                        source,
-                        name: format!("plugin:{plugin_name}/{ui_file}"),
-                        fs_path: ui_path,
-                    });
-                }
-            }
+            extensions.extend(discover_plugin_declared_tui_extensions(
+                &plugin_name,
+                &path,
+                &init_path,
+            ));
         }
     }
 
@@ -749,7 +791,6 @@ mod tests {
 
     #[test]
     fn test_is_user_override_lua_rejects_plugin_ui_dir() {
-        // plugin/ui/ ends with "ui" not "user/ui"
         let path = Path::new("/home/user/.botster-dev/plugins/myplugin/ui/layout.lua");
         assert!(!is_user_override_lua(path));
     }
@@ -790,5 +831,48 @@ mod tests {
         ensure_customization_dirs(&lua_base);
 
         assert!(lua_base.join("user/ui").is_dir());
+    }
+
+    #[test]
+    fn discover_ui_extensions_uses_init_declared_tui_files() {
+        let tmp = tempfile::TempDir::new().expect("Should create temp dir");
+        let lua_base = tmp.path().join("lua");
+        let plugin_dir = tmp.path().join("plugins").join("sample");
+        let tui_dir = plugin_dir.join("client");
+        std::fs::create_dir_all(&tui_dir).unwrap();
+        std::fs::create_dir_all(&lua_base).unwrap();
+        std::fs::write(
+            plugin_dir.join("init.lua"),
+            "-- @tui client/status.lua\nreturn {}\n",
+        )
+        .unwrap();
+        std::fs::write(tui_dir.join("status.lua"), "botster.g.sample = true\n").unwrap();
+
+        let extensions = discover_ui_extensions(&lua_base);
+        assert_eq!(extensions.len(), 1);
+        assert_eq!(extensions[0].name, "plugin:sample/client/status.lua");
+        assert!(extensions[0].source.contains("sample"));
+    }
+
+    #[test]
+    fn discover_ui_extensions_ignores_undeclared_plugin_ui_files() {
+        let tmp = tempfile::TempDir::new().expect("Should create temp dir");
+        let lua_base = tmp.path().join("lua");
+        let plugin_ui_dir = tmp.path().join("plugins").join("sample").join("ui");
+        std::fs::create_dir_all(&plugin_ui_dir).unwrap();
+        std::fs::create_dir_all(&lua_base).unwrap();
+        std::fs::write(
+            tmp.path().join("plugins").join("sample").join("init.lua"),
+            "return {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_ui_dir.join("layout.lua"),
+            "botster.g.ignored = true\n",
+        )
+        .unwrap();
+
+        let extensions = discover_ui_extensions(&lua_base);
+        assert!(extensions.is_empty());
     }
 }

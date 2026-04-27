@@ -8,6 +8,7 @@
 --     agents/
 --       claude/
 --         initialization           # startup script
+--         *.md, *.json, ...        # optional paired files
 --       codex/
 --         initialization
 --     accessories/
@@ -93,6 +94,32 @@ local function list_files(path, extension)
     return files
 end
 
+local function list_files_recursive(root, current, out)
+    out = out or {}
+    current = current or root
+    if not fs.exists(current) or not fs.is_dir(current) then
+        return out
+    end
+    local entries, err = fs.listdir(current)
+    if not entries then
+        if err then
+            log.warn(string.format("ConfigResolver: failed to list %s: %s", current, err))
+        end
+        return out
+    end
+    table.sort(entries)
+    for _, name in ipairs(entries) do
+        local path = current .. "/" .. name
+        if fs.is_dir(path) then
+            list_files_recursive(root, path, out)
+        else
+            local rel = path:sub(#root + 2)
+            out[#out + 1] = rel
+        end
+    end
+    return out
+end
+
 -- =============================================================================
 -- Scan Functions (operate on a single .botster/ root)
 -- =============================================================================
@@ -112,18 +139,10 @@ local function read_manifest(path)
     return nil
 end
 
---- Read a system prompt file.
--- @param path string Path to system_prompt.md
--- @return string|nil Contents, or nil if not found
-local function read_system_prompt(path)
-    if not fs.exists(path) then return nil end
-    return fs.read(path)
-end
-
---- Scan agents/ directory: agents/*/initialization + manifest.json + system_prompt.md
+--- Scan agents/ directory: agents/*/initialization plus optional paired files.
 -- @param botster_root string Path to a .botster/ directory
 -- @param source string Source label ("device" or "repo")
--- @return table Map of agent_name -> { name, initialization, manifest, system_prompt, source }
+-- @return table Map of agent_name -> { name, dir, initialization, manifest, source }
 local function read_agents(botster_root, source)
     local agents_dir = botster_root .. "/agents"
     local result = {}
@@ -133,18 +152,11 @@ local function read_agents(botster_root, source)
         local init_path = agent_dir .. "/initialization"
         if fs.exists(init_path) then
             local manifest = read_manifest(agent_dir .. "/manifest.json")
-            -- system_prompt.md wins over manifest.system_prompt
-            local system_prompt = read_system_prompt(agent_dir .. "/system_prompt.md")
-            if not system_prompt and manifest and manifest.system_prompt then
-                system_prompt = manifest.system_prompt
-            end
-            -- Remove system_prompt from manifest to avoid confusion during merge
-            if manifest then manifest.system_prompt = nil end
             result[name] = {
                 name = name,
+                dir = agent_dir,
                 initialization = init_path,
                 manifest = manifest,
-                system_prompt = system_prompt,
                 source = source,
             }
         else
@@ -170,6 +182,7 @@ local function read_accessories(botster_root, source)
         if fs.exists(init_path) then
             result[name] = {
                 name = name,
+                dir = acc_path,
                 initialization = init_path,
                 port_forward = fs.exists(acc_path .. "/port_forward"),
                 source = source,
@@ -224,9 +237,11 @@ local function read_plugins(botster_root, source)
     for _, name in ipairs(names) do
         local init_path = plugins_dir .. "/" .. name .. "/init.lua"
         if fs.exists(init_path) then
+            local plugin_dir = plugins_dir .. "/" .. name
             result[name] = {
                 name = name,
                 init_path = init_path,
+                files = list_files_recursive(plugin_dir),
                 source = source,
             }
         end
@@ -239,9 +254,8 @@ end
 -- =============================================================================
 
 --- Read plugins from a base path's plugins/ directory.
--- Kept for backward compatibility with templates.lua scan_layer calls.
 -- @param base_path string Directory containing plugins/
--- @return table Map of plugin_name -> { init_path }
+-- @return table Map of plugin_name -> { init_path, files }
 function M.read_plugins(base_path)
     local plugins_dir = base_path .. "/plugins"
     local result = {}
@@ -249,7 +263,11 @@ function M.read_plugins(base_path)
     for _, name in ipairs(plugin_names) do
         local init_path = plugins_dir .. "/" .. name .. "/init.lua"
         if fs.exists(init_path) then
-            result[name] = { init_path = init_path }
+            local plugin_dir = plugins_dir .. "/" .. name
+            result[name] = {
+                init_path = init_path,
+                files = list_files_recursive(plugin_dir),
+            }
         end
     end
     return result
@@ -306,10 +324,6 @@ function M.resolve_all(opts)
             elseif existing and existing.manifest and not agent.manifest then
                 -- Repo has no manifest — inherit device manifest
                 agent.manifest = existing.manifest
-            end
-            -- system_prompt: repo wins outright if present, else inherit device
-            if not agent.system_prompt and existing and existing.system_prompt then
-                agent.system_prompt = existing.system_prompt
             end
             acc.agents[name] = agent
         end
@@ -486,139 +500,6 @@ function M.needs_migration(device_root, repo_root)
         end
     end
     return false
-end
-
---- Migrate old profiles/shared structure to new agents/accessories layout.
--- Moves files in-place. Safe to call multiple times (idempotent).
--- @param device_root string|nil Path to ~/.botster
--- @param repo_root string|nil Path to repo root
--- @return boolean ok
--- @return string|nil error
-function M.migrate(device_root, repo_root)
-    local function migrate_root(root)
-        if not root then return end
-
-        -- Migrate shared/sessions/* → agents/* (session named "agent" becomes the agent)
-        local shared_sessions = root .. "/shared/sessions"
-        if fs.exists(shared_sessions) and fs.is_dir(shared_sessions) then
-            local names = list_subdirs(shared_sessions)
-            for _, name in ipairs(names) do
-                local src = shared_sessions .. "/" .. name
-                local dest_dir
-                if name == "agent" then
-                    -- shared/sessions/agent → agents/default
-                    dest_dir = root .. "/agents/default"
-                else
-                    -- shared/sessions/server → accessories/server
-                    dest_dir = root .. "/accessories/" .. name
-                end
-                if not fs.exists(dest_dir) then
-                    fs.mkdir(dest_dir)
-                    -- Copy files from src to dest
-                    local entries = fs.listdir(src) or {}
-                    for _, file in ipairs(entries) do
-                        if not fs.is_dir(src .. "/" .. file) then
-                            local content = fs.read(src .. "/" .. file)
-                            if content then
-                                fs.write(dest_dir .. "/" .. file, content)
-                            end
-                        end
-                    end
-                    log.info(string.format("ConfigResolver: migrated %s → %s", src, dest_dir))
-                end
-            end
-        end
-
-        -- Migrate profiles/*/sessions/agent → agents/*/
-        local profiles_dir = root .. "/profiles"
-        if fs.exists(profiles_dir) and fs.is_dir(profiles_dir) then
-            local profile_names = list_subdirs(profiles_dir)
-            for _, profile_name in ipairs(profile_names) do
-                local profile_sessions = profiles_dir .. "/" .. profile_name .. "/sessions"
-                if fs.exists(profile_sessions) and fs.is_dir(profile_sessions) then
-                    local session_names = list_subdirs(profile_sessions)
-                    for _, sess_name in ipairs(session_names) do
-                        local src = profile_sessions .. "/" .. sess_name
-                        local dest_dir
-                        if sess_name == "agent" then
-                            -- profiles/claude/sessions/agent → agents/claude
-                            dest_dir = root .. "/agents/" .. profile_name
-                        else
-                            -- profiles/claude/sessions/server → accessories/server
-                            dest_dir = root .. "/accessories/" .. sess_name
-                        end
-                        if not fs.exists(dest_dir) then
-                            fs.mkdir(dest_dir)
-                            local entries = fs.listdir(src) or {}
-                            for _, file in ipairs(entries) do
-                                if not fs.is_dir(src .. "/" .. file) then
-                                    local content = fs.read(src .. "/" .. file)
-                                    if content then
-                                        fs.write(dest_dir .. "/" .. file, content)
-                                    end
-                                end
-                            end
-                            log.info(string.format("ConfigResolver: migrated %s → %s", src, dest_dir))
-                        end
-                    end
-                end
-
-                -- Migrate profile-level plugins → top-level plugins
-                local profile_plugins = profiles_dir .. "/" .. profile_name .. "/plugins"
-                if fs.exists(profile_plugins) and fs.is_dir(profile_plugins) then
-                    local plugin_names = list_subdirs(profile_plugins)
-                    for _, plugin_name in ipairs(plugin_names) do
-                        local src = profile_plugins .. "/" .. plugin_name
-                        local dest = root .. "/plugins/" .. plugin_name
-                        if not fs.exists(dest) then
-                            fs.mkdir(dest)
-                            local entries = fs.listdir(src) or {}
-                            for _, file in ipairs(entries) do
-                                if not fs.is_dir(src .. "/" .. file) then
-                                    local content = fs.read(src .. "/" .. file)
-                                    if content then
-                                        fs.write(dest .. "/" .. file, content)
-                                    end
-                                end
-                            end
-                            log.info(string.format("ConfigResolver: migrated plugin %s → %s", src, dest))
-                        end
-                    end
-                end
-            end
-        end
-
-        -- Migrate shared/plugins → plugins (if not already there)
-        local shared_plugins = root .. "/shared/plugins"
-        if fs.exists(shared_plugins) and fs.is_dir(shared_plugins) then
-            local plugin_names = list_subdirs(shared_plugins)
-            for _, plugin_name in ipairs(plugin_names) do
-                local src = shared_plugins .. "/" .. plugin_name
-                local dest = root .. "/plugins/" .. plugin_name
-                if not fs.exists(dest) then
-                    fs.mkdir(dest)
-                    local entries = fs.listdir(src) or {}
-                    for _, file in ipairs(entries) do
-                        if not fs.is_dir(src .. "/" .. file) then
-                            local content = fs.read(src .. "/" .. file)
-                            if content then
-                                fs.write(dest .. "/" .. file, content)
-                            end
-                        end
-                    end
-                    log.info(string.format("ConfigResolver: migrated plugin %s → %s", src, dest))
-                end
-            end
-        end
-
-    end
-
-    migrate_root(device_root)
-    if repo_root then
-        migrate_root(repo_root .. "/" .. repo_config_dirname(device_root))
-    end
-
-    return true
 end
 
 -- =============================================================================

@@ -9,17 +9,20 @@
 //! ```bash
 //! botster context session_uuid     # prints session UUID
 //! botster context hub_id          # prints hub ID
+//! botster context session_dir     # prints the agent/accessory definition dir
+//! botster context file notes.md   # prints a paired file from session_dir
 //! botster context                 # dumps all context as JSON
 //! ```
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
 
 /// Run the context command.
 ///
 /// If `key` is `Some`, prints the value for that key (or empty line if not found).
 /// If `key` is `None`, dumps all available context as JSON.
-pub fn run(key: Option<&str>) -> Result<()> {
+pub fn run(key: Option<&str>, value: Option<&str>) -> Result<()> {
     if std::env::var("BOTSTER_SESSION_UUID")
         .ok()
         .filter(|s| !s.is_empty())
@@ -31,6 +34,11 @@ pub fn run(key: Option<&str>) -> Result<()> {
     let context = build();
 
     match key {
+        Some("file") => {
+            let relative_path = value.context("botster context file requires a relative path")?;
+            let content = read_paired_file(&context, relative_path)?;
+            print!("{content}");
+        }
         Some(k) => {
             if let Some(value) = context.get(k) {
                 println!("{value}");
@@ -41,6 +49,28 @@ pub fn run(key: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Read a file from the selected session definition directory.
+///
+/// The path must be relative and stay inside `session_dir`.
+pub fn read_paired_file(context: &BTreeMap<String, String>, relative_path: &str) -> Result<String> {
+    let session_dir = context
+        .get("session_dir")
+        .filter(|s| !s.is_empty())
+        .context("session_dir is not available in this session context")?;
+    let relative = Path::new(relative_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        anyhow::bail!("paired file path must be relative and stay inside session_dir");
+    }
+
+    let path = PathBuf::from(session_dir).join(relative);
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read paired file {}", path.display()))
 }
 
 /// Build the context map from the session manifest.
@@ -91,6 +121,7 @@ pub fn build() -> BTreeMap<String, String> {
         ("worktree_path", "worktree_path"),
         ("agent_name", "agent_name"),
         ("workspace_id", "workspace_id"),
+        ("session_dir", "session_dir"),
         ("prompt", "prompt"),
     ];
 
@@ -186,7 +217,8 @@ mod tests {
             "branch_name": "feature-x",
             "worktree_path": "/tmp/wt",
             "agent_name": "Claude",
-            "workspace_id": "ws-test-001"
+            "workspace_id": "ws-test-001",
+            "session_dir": "/tmp/botster/agents/claude"
         }"#,
         );
 
@@ -200,6 +232,10 @@ mod tests {
         assert_eq!(
             ctx.get("branch_name").map(String::as_str),
             Some("feature-x")
+        );
+        assert_eq!(
+            ctx.get("session_dir").map(String::as_str),
+            Some("/tmp/botster/agents/claude")
         );
     }
 
@@ -318,5 +354,39 @@ mod tests {
 
         let ctx = build();
         assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn read_paired_file_reads_from_session_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "hello paired file").unwrap();
+        let mut ctx = BTreeMap::new();
+        ctx.insert(
+            "session_dir".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+
+        let content = read_paired_file(&ctx, "notes.md").unwrap();
+
+        assert_eq!(content, "hello paired file");
+    }
+
+    #[test]
+    fn read_paired_file_rejects_path_escape() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut ctx = BTreeMap::new();
+        ctx.insert(
+            "session_dir".to_string(),
+            dir.path().to_string_lossy().to_string(),
+        );
+
+        let err = read_paired_file(&ctx, "../secret").unwrap_err();
+
+        assert!(
+            err.to_string().contains("relative"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -456,7 +456,7 @@ hooks.on("pty_output", "idle_activity_reset", function(ctx, _data)
     end)
 end)
 
--- NOTE: the v1 `broadcast_session_updated` hook (which fanned out
+-- NOTE: the legacy `broadcast_session_updated` hook (which fanned out
 -- agent_list + ui_layout_trees on every Session:update) is GONE. The
 -- entity_patch for changed fields ships from `Session:update` itself via
 -- EB.patch — see lib/session.lua.

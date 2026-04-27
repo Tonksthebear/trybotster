@@ -265,8 +265,7 @@ impl TuiEntityStores {
                 store.apply_snapshot(items, id_field, snapshot_seq);
             }
             "entity_upsert" => {
-                let Some(id) = frame.get("id").and_then(|v| v.as_str()).map(str::to_string)
-                else {
+                let Some(id) = frame.get("id").and_then(|v| v.as_str()).map(str::to_string) else {
                     log::warn!("tui entity_stores: entity_upsert missing id");
                     return true;
                 };
@@ -515,10 +514,10 @@ mod tests {
     }
 
     #[test]
-    fn apply_frame_returns_false_for_v1_envelopes() {
+    fn apply_frame_returns_false_for_legacy_envelopes() {
         let mut stores = TuiEntityStores::new();
-        let v1 = json!({ "type": "agent_list", "agents": [] });
-        assert!(!stores.apply_frame(&v1));
+        let legacy = json!({ "type": "agent_list", "agents": [] });
+        assert!(!stores.apply_frame(&legacy));
     }
 
     #[test]

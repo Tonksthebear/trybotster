@@ -1667,7 +1667,7 @@ where
         // renderers added in commit 4 read straight from these stores.
         //
         // Before this branch landed, this branch did not fire in
-        // production — the hub still ships v1 frames which fall through to
+        // production — the hub still ships legacy frames which fall through to
         // the Lua dispatcher below. Keeping the dispatch here in commit 3
         // gives the cold-turkey switch a single landing point.
         if super::entity_stores::TuiEntityStores::handles_frame(event_type) {
@@ -1677,7 +1677,7 @@ where
             // Keep flowing into Lua. The current TUI layout is still the
             // legacy Lua renderer backed by `_tui_state`, so entity frames
             // must also update Lua state until that layout fully moves to
-            // UiNodeV1 composites backed directly by `TuiEntityStores`.
+            // UiNode composites backed directly by `TuiEntityStores`.
         }
 
         // Handle kitty_changed directly — sets outer terminal keyboard mode.

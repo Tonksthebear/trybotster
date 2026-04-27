@@ -22,9 +22,9 @@ import React, { type ReactNode } from 'react'
 import {
   isBindList,
   isBindSentinel,
-  type UiBindListV1,
-  type UiBindV1,
-  type UiNodeV1,
+  type UiBindList,
+  type UiBind,
+  type UiNode,
 } from './types'
 import { storeFor } from '../store/entities'
 
@@ -77,7 +77,7 @@ function isPlainObject(value: unknown): boolean {
   return proto === Object.prototype || proto === null
 }
 
-function expandBindList(envelope: UiBindListV1, parentItem: ItemContext): unknown[] {
+function expandBindList(envelope: UiBindList, parentItem: ItemContext): unknown[] {
   const entityType = envelope.source.replace(/^\//, '')
   const store = storeFor(entityType).getState()
   const out: unknown[] = []
@@ -233,8 +233,8 @@ export function useBindingValue(path: string, item?: EntityRecord): unknown {
 
 // Convenience: detect bind sentinels in a typed prop bag (used by tests
 // and the interpreter when it decides whether to wrap a prop in BindResolver).
-export function findBindSentinels(props: Record<string, unknown>): UiBindV1[] {
-  const out: UiBindV1[] = []
+export function findBindSentinels(props: Record<string, unknown>): UiBind[] {
+  const out: UiBind[] = []
   for (const value of Object.values(props)) {
     if (isBindSentinel(value)) {
       out.push(value)
@@ -267,4 +267,4 @@ function walk(value: unknown, visit: (v: unknown) => void): void {
 
 // Re-export a non-component named template so plugin tests can import
 // the resolved-tree shape without touching internals.
-export type { UiNodeV1 }
+export type { UiNode }

@@ -33,7 +33,9 @@ fn create_lua_vm(data_dir: &std::path::Path, repo_root: &std::path::Path) -> Lua
           find_available_port = function() return 46000 end,
         }}
         _G.hub = {{
+          last_spawn_config = nil,
           spawn_session = function(_, session_uuid)
+            _G.hub.last_spawn_config = _
             return {{ session_uuid = session_uuid }}
           end,
           register_session = function() return 1 end,
@@ -74,6 +76,55 @@ fn create_lua_vm(data_dir: &std::path::Path, repo_root: &std::path::Path) -> Lua
     .expect("stub globals");
 
     lua
+}
+
+#[test]
+fn session_definition_dir_is_persisted_for_context_lookup() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    let repo_root = dir.path().join("repo");
+    let worktree_path = dir.path().join("feature-b-worktree");
+    let definition_dir = dir.path().join("config/agents/claude");
+
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&repo_root).unwrap();
+    std::fs::create_dir_all(&worktree_path).unwrap();
+    std::fs::create_dir_all(&definition_dir).unwrap();
+    std::fs::write(worktree_path.join(".git"), "gitdir: /tmp/example").unwrap();
+
+    let lua = create_lua_vm(&data_dir, &repo_root);
+
+    let exposed: bool = lua
+        .load(format!(
+            r#"
+            local Agent = require("lib.agent")
+            local first = Agent.new({{
+              repo = "owner/repo",
+              branch_name = "feature-b",
+              worktree_path = "{worktree_path}",
+              session = {{
+                name = "claude",
+                command = "bash",
+                definition_dir = "{definition_dir}",
+              }},
+              target_id = "target-1",
+              target_path = "{repo_root}",
+              target_repo = "owner/repo",
+            }})
+
+            return Agent.get(first.session_uuid):info().session_dir == "{definition_dir}"
+        "#,
+            definition_dir = definition_dir.to_str().unwrap(),
+            repo_root = repo_root.to_str().unwrap(),
+            worktree_path = worktree_path.to_str().unwrap(),
+        ))
+        .eval()
+        .expect("definition dir context should evaluate");
+
+    assert!(
+        exposed,
+        "session context should expose the selected definition directory"
+    );
 }
 
 #[test]

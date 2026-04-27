@@ -14,11 +14,22 @@ your-repo/.botster/plugins/my-plugin/init.lua # Repo-level (this repo only)</cod
 
 <h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Plugin structure</h2>
 <p class="text-zinc-400 mb-4">
-  Each plugin is a directory with an <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">init.lua</code> entry point:
+  Each plugin is a directory with an <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">init.lua</code> entry point.
+  Other filenames are plugin-owned; require them from <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">init.lua</code>.
 </p>
 <pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>plugins/
   my-plugin/
-    init.lua    # Entry point, loaded at startup</code></pre>
+    init.lua       # Entry point, loaded at startup
+    web_layout.lua # Optional web surface module
+    tui/
+      status.lua   # Optional TUI extension module</code></pre>
+
+<p class="text-zinc-400 mb-4">
+  TUI client files are declared in the comment header of <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">init.lua</code>
+  so the TUI can load only client-safe code:
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>-- @tui tui/status.lua
+local web_layout = require("web_layout")</code></pre>
 
 <h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Load order</h2>
 <p class="text-zinc-400">

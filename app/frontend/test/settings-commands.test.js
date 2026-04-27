@@ -138,4 +138,25 @@ describe('settings command helpers', () => {
     expect(hub.loadPlugin).toHaveBeenCalledWith('demo', 'target-1')
     expect(hub.uninstallTemplate).toHaveBeenCalledWith('plugins/demo/init.lua', 'repo', 'target-1')
   })
+
+  it('does not try to load non-plugin templates as plugins', async () => {
+    const hub = mockHub()
+
+    const installed = await installSettingsTemplate({
+      hub,
+      dest: 'agents/claude/notes.md',
+      content: 'Read me with botster context file notes.md.',
+      scope: 'device',
+      targetId: undefined,
+    })
+
+    expect(installed).toBeNull()
+    expect(hub.installTemplate).toHaveBeenCalledWith(
+      'agents/claude/notes.md',
+      'Read me with botster context file notes.md.',
+      'device',
+      undefined,
+    )
+    expect(hub.loadPlugin).not.toHaveBeenCalled()
+  })
 })

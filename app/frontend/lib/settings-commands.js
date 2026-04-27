@@ -135,7 +135,9 @@ export async function initializeBotsterConfig({
 export async function installSettingsTemplate({ hub, dest, content, scope, targetId }) {
   await hub.installTemplate(dest, content, scope, targetId)
   const name = pluginNameFromDest(dest)
-  await hub.loadPlugin(name, targetId).catch(() => {})
+  if (name) {
+    await hub.loadPlugin(name, targetId).catch(() => {})
+  }
   return name
 }
 
@@ -150,5 +152,5 @@ export async function reloadSettingsPlugin({ hub, name, targetId }) {
 
 function pluginNameFromDest(dest) {
   const match = dest?.match(/plugins\/([^/]+)\//)
-  return match ? match[1] : dest
+  return match ? match[1] : null
 }

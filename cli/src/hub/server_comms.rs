@@ -3673,10 +3673,11 @@ impl Hub {
             use flate2::write::GzEncoder;
             use flate2::Compression;
             use std::io::Write;
-            let mut encoder = GzEncoder::new(Vec::with_capacity(uncompressed_len / 4), Compression::fast());
-            encoder
-                .write_all(&plain)
-                .and_then(|()| encoder.finish())
+            let mut encoder = GzEncoder::new(
+                Vec::with_capacity(uncompressed_len / 4),
+                Compression::fast(),
+            );
+            encoder.write_all(&plain).and_then(|()| encoder.finish())
         } {
             Ok(gzipped) => gzipped,
             Err(e) => {

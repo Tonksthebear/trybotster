@@ -130,20 +130,103 @@ function FileEntry({ filePath, label, exists, selected, onSelect }) {
       onClick={() => onSelect(filePath)}
       data-file-path={filePath}
       className={clsx(
-        'w-full text-left px-2.5 py-1.5 rounded border border-zinc-700/50',
-        'hover:border-zinc-700 hover:bg-zinc-800/50 transition-colors',
-        selected && 'bg-zinc-800/50 border-primary-500/30'
+        'w-full text-left px-2.5 py-1.5 rounded-md border',
+        'border-transparent hover:border-zinc-700 hover:bg-zinc-800/50 transition-colors',
+        selected && 'bg-zinc-800/70 border-primary-500/40'
       )}
     >
       <div className="flex items-center justify-between">
         <span className="text-xs font-mono text-zinc-300 truncate">
           {label}
         </span>
-        <Badge color={exists ? 'emerald' : 'zinc'} className="shrink-0 ml-2 text-[10px]">
-          {exists ? 'exists' : 'missing'}
-        </Badge>
+        {!exists && (
+          <Badge color="amber" className="shrink-0 ml-2 text-[10px]">
+            missing
+          </Badge>
+        )}
       </div>
     </button>
+  )
+}
+
+// ─── Configuration Unit ───────────────────────────────────────────
+
+function ConfigUnit({
+  name,
+  kind,
+  basePath,
+  files,
+  requiredFile,
+  requiredExists = true,
+  currentFilePath,
+  onSelect,
+  onRemove,
+  children,
+}) {
+  const existingFiles = files?.length ? files : requiredFile ? [requiredFile] : []
+  const fileEntries = existingFiles.map((file) => ({ name: file, exists: true }))
+  if (
+    requiredFile &&
+    !requiredExists &&
+    !fileEntries.some((file) => file.name === requiredFile)
+  ) {
+    fileEntries.unshift({ name: requiredFile, exists: false })
+  }
+  const existingCount = fileEntries.filter((file) => file.exists).length
+  const displayName = name.charAt(0).toUpperCase() + name.slice(1)
+
+  return (
+    <div className="py-3 border-t border-zinc-800/80 first:border-t-0 group/unit">
+      <div className="flex items-start justify-between gap-3 mb-2">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <h3 className="text-sm font-medium text-zinc-200 truncate">
+              {displayName}
+            </h3>
+            <Badge color="zinc" className="shrink-0 text-[10px]">
+              {kind}
+            </Badge>
+            {requiredFile && !requiredExists && (
+              <Badge color="amber" className="shrink-0 text-[10px]">
+                missing {requiredFile}
+              </Badge>
+            )}
+          </div>
+          <p className="mt-0.5 text-xs text-zinc-500">
+            {existingCount} {existingCount === 1 ? 'file' : 'files'}
+          </p>
+        </div>
+        {onRemove && (
+          <button
+            type="button"
+            onClick={onRemove}
+            className="text-zinc-700 hover:text-red-400 transition-colors opacity-0 group-hover/unit:opacity-100"
+            title={`Remove ${kind}`}
+          >
+            <svg className="size-3.5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" />
+            </svg>
+          </button>
+        )}
+      </div>
+
+      <div className="space-y-1">
+        {fileEntries.map((file) => {
+          const filePath = `${basePath}/${file.name}`
+          return (
+            <FileEntry
+              key={file.name}
+              filePath={filePath}
+              label={file.name}
+              exists={file.exists}
+              selected={currentFilePath === filePath}
+              onSelect={onSelect}
+            />
+          )
+        })}
+        {children}
+      </div>
+    </div>
   )
 }
 
@@ -189,38 +272,26 @@ function NamedSection({ name, type, prefix, tree, currentFilePath, onSelect }) {
   }
 
   return (
-    <div className="mb-3 group/section">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-xs font-medium text-zinc-500 uppercase tracking-wider">
-          {name.charAt(0).toUpperCase() + name.slice(1)}
-        </h3>
-        <button
-          type="button"
-          onClick={() => setConfirmRemove(true)}
-          className="text-zinc-700 hover:text-red-400 transition-colors opacity-0 group-hover/section:opacity-100"
-          title={`Remove ${isAgent ? 'agent' : 'accessory'}`}
-        >
-          <svg className="size-3.5" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
-            <path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" />
-          </svg>
-        </button>
-      </div>
-
-      <div className="space-y-1">
-        <FileEntry
-          filePath={`${itemPath}/initialization`}
-          label="initialization"
-          exists={item.initialization}
-          selected={currentFilePath === `${itemPath}/initialization`}
-          onSelect={onSelect}
-        />
+    <>
+      <ConfigUnit
+        name={name}
+        kind={isAgent ? 'agent' : 'accessory'}
+        basePath={itemPath}
+        files={(item.files?.length ? item.files : ['initialization'])
+          .filter((file) => type !== 'accessories' || file !== 'port_forward')}
+        requiredFile="initialization"
+        requiredExists={item.initialization}
+        currentFilePath={currentFilePath}
+        onSelect={onSelect}
+        onRemove={() => setConfirmRemove(true)}
+      >
         {type === 'accessories' && (
           <PortForwardToggle
             filePath={`${itemPath}/port_forward`}
             enabled={item.port_forward}
           />
         )}
-      </div>
+      </ConfigUnit>
 
       <ConfirmDialog
         open={confirmRemove}
@@ -229,7 +300,7 @@ function NamedSection({ name, type, prefix, tree, currentFilePath, onSelect }) {
         message={`Delete ${isAgent ? 'agent' : 'accessory'} "${name}" and its configuration? This cannot be undone.`}
         onConfirm={handleRemove}
       />
-    </div>
+    </>
   )
 }
 
@@ -324,9 +395,7 @@ function TreeView({ agentTemplates }) {
       {/* Agents */}
       {agentNames.length > 0 && (
         <div className="mt-2">
-          <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">
-            Agents
-          </h2>
+          <SectionHeading title="Agents" count={agentNames.length} />
           {agentNames.map((name) => (
             <NamedSection
               key={name}
@@ -352,9 +421,7 @@ function TreeView({ agentTemplates }) {
       {/* Accessories */}
       {accessoryNames.length > 0 && (
         <div>
-          <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">
-            Accessories
-          </h2>
+          <SectionHeading title="Accessories" count={accessoryNames.length} />
           {accessoryNames.map((name) => (
             <NamedSection
               key={name}
@@ -380,9 +447,7 @@ function TreeView({ agentTemplates }) {
       {/* Workspaces */}
       {workspaceNames.length > 0 && (
         <div>
-          <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">
-            Workspaces
-          </h2>
+          <SectionHeading title="Workspaces" count={workspaceNames.length} />
           <div className="space-y-1">
             {workspaceNames.map((name) => (
               <FileEntry
@@ -400,20 +465,21 @@ function TreeView({ agentTemplates }) {
 
       {/* Plugins */}
       <div>
-        <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wider mb-3">
-          Plugins
-        </h2>
+        <SectionHeading title="Plugins" count={pluginNames.length} />
         {pluginNames.length > 0 ? (
-          <div className="space-y-1">
+          <div>
             {pluginNames.map((name) => (
-              <FileEntry
+              <ConfigUnit
                 key={name}
-                filePath={`${prefix}plugins/${name}/init.lua`}
-                label={`${name}/init.lua`}
-                exists={true}
-                selected={
-                  currentFilePath === `${prefix}plugins/${name}/init.lua`
-                }
+                name={name}
+                kind="plugin"
+                basePath={`${prefix}plugins/${name}`}
+                files={tree.plugins[name]?.files?.length
+                  ? tree.plugins[name].files
+                  : ['init.lua']}
+                requiredFile="init.lua"
+                requiredExists={tree.plugins[name]?.init}
+                currentFilePath={currentFilePath}
                 onSelect={selectFile}
               />
             ))}
@@ -441,6 +507,19 @@ function TreeView({ agentTemplates }) {
         message="Enter a name for the new accessory (lowercase, no spaces):"
         onConfirm={handleAddAccessory}
       />
+    </div>
+  )
+}
+
+function SectionHeading({ title, count }) {
+  return (
+    <div className="flex items-center justify-between mb-1">
+      <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wider">
+        {title}
+      </h2>
+      <span className="text-[10px] text-zinc-600">
+        {count}
+      </span>
     </div>
   )
 }

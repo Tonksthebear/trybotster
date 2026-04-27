@@ -21,7 +21,7 @@ import { IconGlyph } from '../../ui_contract/icons'
 
 // SessionActionsMenu intercepts the placeholder action emitted by Phase 2a's
 // `web/layout.lua:actions_menu_trigger` (`botster.session.menu.open`). Phase
-// 2c keeps the Menu / MenuItem primitives non-Lua-public per the v1 spec
+// 2c keeps the Menu / MenuItem primitives non-Lua-public per the current spec
 // (`docs/specs/web-ui-primitives-runtime.md:179`); instead this Rails-owned
 // composite captures the action + click event and renders a Catalyst Dropdown
 // anchored to the triggering button.

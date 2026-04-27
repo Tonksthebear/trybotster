@@ -1,4 +1,4 @@
-//! Cross-client UI contract (v1) shared by the TUI and web renderers.
+//! Cross-client UI contract (current) shared by the TUI and web renderers.
 //!
 //! This module is the Rust-side source of truth for the Botster UI DSL described
 //! in these specs:
@@ -11,13 +11,13 @@
 //!
 //! 1. [`tokens`] — scalar tokens used across primitives (`UiTone`, `UiAlign`,
 //!    `UiSpace`, `UiSize`, `UiInteractionDensity`, …).
-//! 2. [`viewport`] — the `UiViewportV1` context produced by renderers and the
+//! 2. [`viewport`] — the `UiViewport` context produced by renderers and the
 //!    enums it references (`UiWidthClass`, `UiHeightClass`, `UiPointer`,
 //!    `UiOrientation`).
-//! 3. [`node`] — the core wire types: [`UiNodeV1`], [`UiActionV1`],
-//!    [`UiCapabilitySetV1`], the `UiResponsiveV1<T>` sentinel, and the
-//!    `UiConditionV1` struct used by `ui.when` / `ui.hidden`.
-//! 4. [`props`] — strongly-typed Props structs for every Lua-public v1 primitive
+//! 3. [`node`] — the core wire types: [`UiNode`], [`UiAction`],
+//!    [`UiCapabilitySet`], the `UiResponsive<T>` sentinel, and the
+//!    `UiCondition` struct used by `ui.when` / `ui.hidden`.
+//! 4. [`props`] — strongly-typed Props structs for every Lua-public current primitive
 //!    and for the internal-only `Dialog` primitive.
 //! 5. [`lua`] — Lua DSL registration. Exposes `ui.*` as a global table in both
 //!    the hub `LuaRuntime` and the TUI `LayoutLua`.
@@ -35,19 +35,18 @@ pub mod tokens;
 pub mod viewport;
 
 pub use node::{
-    UiActionV1, UiCapabilitySetV1, UiChildV1, UiConditionV1, UiConditionalV1, UiNodeV1,
-    UiResponsiveHeightV1, UiResponsiveV1, UiResponsiveWidthV1, UiValueV1,
+    UiAction, UiCapabilitySet, UiChild, UiCondition, UiConditional, UiNode, UiResponsive,
+    UiResponsiveHeight, UiResponsiveWidth, UiValue,
 };
 pub use props::{
-    BadgePropsV1, ButtonPropsV1, ConnectionCodePropsV1, DialogPropsV1, EmptyStatePropsV1,
-    HubRecoveryStatePropsV1, IconButtonPropsV1, IconPropsV1, InlinePropsV1, NewSessionButtonPropsV1,
-    PanelPropsV1, ScrollAreaPropsV1, SessionListPropsV1, SessionRowPropsV1, SpawnTargetListPropsV1,
-    StackPropsV1, StatusDotPropsV1, TextPropsV1, TreeItemPropsV1, WorkspaceListPropsV1,
-    WorktreeListPropsV1,
+    BadgeProps, ButtonProps, ConnectionCodeProps, DialogProps, EmptyStateProps,
+    HubRecoveryStateProps, IconButtonProps, IconProps, InlineProps, NewSessionButtonProps,
+    PanelProps, ScrollAreaProps, SessionListProps, SessionRowProps, SpawnTargetListProps,
+    StackProps, StatusDotProps, TextProps, TreeItemProps, WorkspaceListProps, WorktreeListProps,
 };
 pub use tokens::{
     UiAlign, UiBadgeSize, UiBadgeTone, UiButtonTone, UiButtonVariant, UiInteractionDensity,
     UiJustify, UiPanelTone, UiPresentation, UiScrollAxis, UiSessionListGrouping, UiSize, UiSpace,
     UiStackDirection, UiStatusDotState, UiSurfaceDensity, UiTextWeight, UiTone,
 };
-pub use viewport::{UiHeightClass, UiOrientation, UiPointer, UiViewportV1, UiWidthClass};
+pub use viewport::{UiHeightClass, UiOrientation, UiPointer, UiViewport, UiWidthClass};

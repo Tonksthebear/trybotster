@@ -15,7 +15,7 @@
 # mise trust 2>/dev/null
 
 # Change to the worktree directory
-cd "$BOTSTER_WORKTREE_PATH"
+cd "$(botster context worktree_path)"
 
 # ---------------------------------------------------------------------------
 # Hub MCP tools
@@ -31,6 +31,7 @@ claude mcp add botster-hub -- botster mcp-serve
 # ---------------------------------------------------------------------------
 
 echo "Botster agent initialized for branch: $(botster context branch_name)"
-echo "Worktree: $BOTSTER_WORKTREE_PATH"
+echo "Worktree: $(botster context worktree_path)"
+echo "Agent definition: $(botster context session_dir)"
 
 claude --permission-mode acceptEdits "$(botster context prompt)"

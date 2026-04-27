@@ -7,7 +7,10 @@
 import React, { useMemo, type MouseEvent, type ReactElement } from 'react'
 
 import { useSpawnTargetStore } from '../../store/entities'
-import type { SpawnTargetListPropsV1, UiActionV1 } from '../../ui_contract/types'
+import type {
+  SpawnTargetListProps as UiSpawnTargetListProps,
+  UiAction,
+} from '../../ui_contract/types'
 import type { RenderContext } from '../../ui_contract/context'
 import { IconGlyph } from '../../ui_contract/icons'
 
@@ -17,7 +20,7 @@ type SpawnTargetRecord = {
   target_repo?: string
 }
 
-export type SpawnTargetListProps = SpawnTargetListPropsV1 & {
+export type SpawnTargetListProps = UiSpawnTargetListProps & {
   ctx: RenderContext
 }
 
@@ -91,7 +94,7 @@ export function SpawnTargetList({
 }
 
 function makeRowAction(
-  template: UiActionV1 | undefined,
+  template: UiAction | undefined,
   defaultId: string,
   targetId: string,
   ctx: RenderContext,
@@ -99,7 +102,7 @@ function makeRowAction(
   return (event: MouseEvent) => {
     event.preventDefault()
     event.stopPropagation()
-    const action: UiActionV1 = {
+    const action: UiAction = {
       id: template?.id ?? defaultId,
       payload: { ...(template?.payload ?? {}), targetId },
     }

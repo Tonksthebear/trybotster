@@ -1,6 +1,6 @@
 -- Embedded default web layout (wire protocol).
 --
--- Entry point for `web_layout.render(surface, state)`. Produces a `UiNodeV1`
+-- Entry point for `web_layout.render(surface, state)`. Produces a `UiNode`
 -- tree that authors composite primitives (`ui.session_list{}`,
 -- `ui.new_session_button{}`, etc.) and lets each renderer expand them by
 -- reading from its own entity store.

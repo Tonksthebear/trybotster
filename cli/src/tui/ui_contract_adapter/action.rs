@@ -5,7 +5,7 @@
 //! The existing TUI action-dispatch path reads a `Vec<String>` of action
 //! ids via [`crate::tui::render_tree::extract_list_actions`] — selection
 //! index maps to a string. The Phase A contract uses a richer
-//! [`UiActionV1`] envelope with id + payload + disabled.
+//! [`UiAction`] envelope with id + payload + disabled.
 //!
 //! To avoid disturbing existing callers, the adapter keeps both shapes:
 //!
@@ -25,8 +25,8 @@
 //! Each entry has a **unique, walk-order-stable key** — never the action
 //! id. Keys are:
 //!
-//! - `id:<node.id>` when the source [`UiNodeV1`] has an explicit stable
-//!   [`UiNodeV1::id`], or
+//! - `id:<node.id>` when the source [`UiNode`] has an explicit stable
+//!   [`UiNode::id`], or
 //! - `anon:<n>` where `n` is a monotonic counter incremented every time
 //!   the adapter records an anonymous action.
 //!
@@ -37,14 +37,14 @@
 //! The bare action id is still available on each entry for diagnostics
 //! and for dispatchers that want to group by intent.
 //!
-//! [`UiActionV1`]: crate::ui_contract::node::UiActionV1
-//! [`UiNodeV1`]: crate::ui_contract::node::UiNodeV1
-//! [`UiNodeV1::id`]: crate::ui_contract::node::UiNodeV1::id
+//! [`UiAction`]: crate::ui_contract::node::UiAction
+//! [`UiNode`]: crate::ui_contract::node::UiNode
+//! [`UiNode::id`]: crate::ui_contract::node::UiNode::id
 //! [`ListItemProps`]: crate::tui::render_tree::ListItemProps
 
 // Rust guideline compliant 2026-04-18
 
-use crate::ui_contract::node::UiActionV1;
+use crate::ui_contract::node::UiAction;
 
 /// A single recorded action — the envelope plus a unique per-row key and
 /// the source node's stable id, if any.
@@ -54,17 +54,17 @@ pub struct ActionEntry {
     /// explicit id; `anon:<n>` otherwise. Never collides across rows in
     /// the same render pass.
     pub key: String,
-    /// The source node's stable id, mirrored from [`UiNodeV1::id`] when
+    /// The source node's stable id, mirrored from [`UiNode::id`] when
     /// present. Separate from `key` so callers can correlate against
     /// their own node-id selectors without parsing the key string.
     ///
-    /// [`UiNodeV1::id`]: crate::ui_contract::node::UiNodeV1::id
+    /// [`UiNode::id`]: crate::ui_contract::node::UiNode::id
     pub node_id: Option<String>,
-    /// Full [`UiActionV1`] envelope — id, payload, disabled flag.
-    pub action: UiActionV1,
+    /// Full [`UiAction`] envelope — id, payload, disabled flag.
+    pub action: UiAction,
 }
 
-/// Per-render lookup table of every [`UiActionV1`] envelope produced by
+/// Per-render lookup table of every [`UiAction`] envelope produced by
 /// the adapter during a single render pass.
 ///
 /// Entries are recorded in walk order — the order they appear in the
@@ -92,7 +92,7 @@ impl ActionTable {
     ///
     /// Returns the newly inserted entry's key so the caller can correlate
     /// it back to the rendered row if needed.
-    pub fn insert(&mut self, node_id: Option<&str>, action: UiActionV1) -> String {
+    pub fn insert(&mut self, node_id: Option<&str>, action: UiAction) -> String {
         let key = if let Some(id) = node_id {
             format!("id:{id}")
         } else {
@@ -135,7 +135,7 @@ impl ActionTable {
     /// with this id exist"; use [`Self::by_action_id`] when the caller
     /// needs the specific row's payload.
     #[must_use]
-    pub fn first_by_action_id(&self, action_id: &str) -> Option<&UiActionV1> {
+    pub fn first_by_action_id(&self, action_id: &str) -> Option<&UiAction> {
         self.entries
             .iter()
             .find(|entry| entry.action.id == action_id)
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn insert_with_node_id_produces_id_key() {
         let mut table = ActionTable::new();
-        let key = table.insert(Some("row-1"), UiActionV1::new("x"));
+        let key = table.insert(Some("row-1"), UiAction::new("x"));
         assert_eq!(key, "id:row-1");
         assert_eq!(table.get("id:row-1").expect("found").action.id, "x");
     }
@@ -176,8 +176,8 @@ mod tests {
     #[test]
     fn insert_without_node_id_produces_unique_anon_keys() {
         let mut table = ActionTable::new();
-        let k1 = table.insert(None, UiActionV1::new("same"));
-        let k2 = table.insert(None, UiActionV1::new("same"));
+        let k1 = table.insert(None, UiAction::new("same"));
+        let k2 = table.insert(None, UiAction::new("same"));
         assert_ne!(k1, k2);
         assert_eq!(table.len(), 2);
     }
@@ -188,7 +188,7 @@ mod tests {
         // not collapse to the last entry's payload.
         let mut table = ActionTable::new();
         for session in ["sess-a", "sess-b", "sess-c"] {
-            let mut envelope = UiActionV1::new("botster.session.select");
+            let mut envelope = UiAction::new("botster.session.select");
             envelope
                 .payload
                 .insert("sessionUuid".into(), json!(session));
@@ -213,10 +213,10 @@ mod tests {
     #[test]
     fn first_by_action_id_returns_walk_order_head() {
         let mut table = ActionTable::new();
-        let mut first = UiActionV1::new("foo");
+        let mut first = UiAction::new("foo");
         first.payload.insert("k".into(), json!(1));
         table.insert(Some("a"), first);
-        let mut second = UiActionV1::new("foo");
+        let mut second = UiAction::new("foo");
         second.payload.insert("k".into(), json!(2));
         table.insert(Some("b"), second);
         let got = table.first_by_action_id("foo").expect("present");

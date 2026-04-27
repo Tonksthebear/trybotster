@@ -5,7 +5,7 @@
 -- produces the same display strings, activity state, and preview state that
 -- the Phase-1 React composites produce today.
 --
--- Inputs follow the `AgentWorkspaceSurfaceInputV1` shape defined in
+-- Inputs follow the `AgentWorkspaceSurfaceInput` shape defined in
 -- `docs/specs/web-ui-primitives-runtime.md`. Outputs are plain Lua tables
 -- consumed by `web/layout.lua`.
 --
