@@ -1480,6 +1480,9 @@ fn render_session_list(
     if matches!(grouping, UiSessionListGrouping::Workspace) {
         if let Some(ws_store) = workspace_store {
             for (ws_id, workspace) in ws_store.iter() {
+                if !workspace_has_active_agent(stores, ws_id) {
+                    continue;
+                }
                 let header_text = workspace
                     .get("name")
                     .and_then(JsonValue::as_str)
@@ -1546,6 +1549,10 @@ fn render_workspace_list(
     }
     let rows: Vec<ListItemProps> = store
         .iter()
+        .filter(|(id, ws)| {
+            ws.get("status").and_then(JsonValue::as_str) != Some("closed")
+                && workspace_has_active_agent(stores, id)
+        })
         .map(|(id, ws)| {
             let name = ws.get("name").and_then(JsonValue::as_str).unwrap_or(id);
             ListItemProps {
@@ -1558,6 +1565,9 @@ fn render_workspace_list(
             }
         })
         .collect();
+    if rows.is_empty() {
+        return Ok(placeholder_widget("No workspaces"));
+    }
     Ok(RenderNode::Widget {
         widget_type: WidgetType::List,
         id: node.id.clone(),
@@ -1630,6 +1640,22 @@ fn render_spawn_target_list(
             highlight_symbol: Some(BUTTON_HIGHLIGHT_SYMBOL.to_owned()),
         })),
     })
+}
+
+fn workspace_has_active_agent(stores: &TuiEntityStores, workspace_id: &str) -> bool {
+    stores
+        .store("session")
+        .map(|sessions| {
+            sessions.iter().any(|(_, session)| {
+                session.get("workspace_id").and_then(JsonValue::as_str) == Some(workspace_id)
+                    && session.get("status").and_then(JsonValue::as_str) != Some("closed")
+                    && session
+                        .get("session_type")
+                        .and_then(JsonValue::as_str)
+                        .map_or(true, |kind| kind != "accessory")
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn render_worktree_list(
@@ -2031,7 +2057,8 @@ mod tests {
                 .expect("render");
         let rows = collect_list_rows(&rendered).expect("list rows");
         // Expected ordering:
-        //   header(Roadmap) sess-a sess-b header(Triage) sess-c (ungrouped)
+        //   header(Roadmap) sess-a sess-b sess-c (ungrouped)
+        // Empty workspaces do not render headers.
         let labels: Vec<String> = rows
             .iter()
             .map(|r| match &r.content {
@@ -2063,6 +2090,7 @@ mod tests {
         assert!(roadmap_idx < beta_idx);
         // Ungrouped session "gamma" appears too.
         assert!(labels.iter().any(|l| l.contains("gamma")));
+        assert!(!labels.iter().any(|l| l.contains("Triage")));
     }
 
     #[test]
@@ -2086,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_list_renders_one_row_per_workspace() {
+    fn workspace_list_renders_one_row_per_workspace_with_an_active_agent() {
         let node = UiNode::new("workspace_list");
         let mut actions = ActionTable::new();
         let stores = populated_stores();
@@ -2094,7 +2122,11 @@ mod tests {
             render_ui_node_with_stores(&node, &regular_viewport(), &mut actions, Some(&stores))
                 .expect("render");
         let rows = collect_list_rows(&rendered).expect("list rows");
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            &rows[0].content,
+            StyledContent::Plain(label) if label == "Roadmap"
+        ));
     }
 
     #[test]

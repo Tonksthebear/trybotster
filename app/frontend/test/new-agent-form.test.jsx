@@ -18,9 +18,7 @@ const mockHub = {
     load: vi.fn(() => Promise.resolve([])),
   },
   ensureAgentConfig: vi.fn(() => Promise.resolve()),
-  requestSpawnTargets: vi.fn(),
-  requestOpenWorkspaces: vi.fn(),
-  requestWorktrees: vi.fn(),
+  send: vi.fn(() => Promise.resolve(true)),
   on: vi.fn((eventName, callback) => {
     listeners[eventName] = callback
     return () => {
@@ -78,6 +76,7 @@ describe('NewAgentForm', () => {
     Object.keys(listeners).forEach((key) => delete listeners[key])
     vi.clearAllMocks()
     mockHub.ensureAgentConfig.mockResolvedValue({ agents: [], accessories: [], workspaces: [] })
+    mockHub.send.mockResolvedValue(true)
     _resetEntityStoresForTest()
     useSpawnTargetStore.getState().applySnapshot(
       [{ id: 'target-1', name: 'Repo' }],
@@ -145,5 +144,21 @@ describe('NewAgentForm', () => {
 
     expect(await screen.findByText('Claude')).toBeInTheDocument()
     expect(screen.queryByText(/No agent configurations found/)).not.toBeInTheDocument()
+  })
+
+  it('relies on entity broadcasts instead of forced resyncing after create', async () => {
+    const user = userEvent.setup()
+    mockHub.ensureAgentConfig.mockResolvedValue({ agents: ['codex'], accessories: [], workspaces: [] })
+
+    renderNewAgentForm()
+
+    await user.click(screen.getByText('Main branch'))
+    await screen.findByText('Codex')
+    await user.click(screen.getByText('Create Agent'))
+
+    expect(mockHub.send).toHaveBeenCalledWith('create_agent', expect.objectContaining({
+      target_id: 'target-1',
+      agent_name: 'codex',
+    }))
   })
 })

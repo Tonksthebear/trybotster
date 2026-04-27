@@ -18,8 +18,9 @@
  * Usage:
  *   HubTransport is acquired only by HubSession via hub-bridge/hub-store.
  *   React leaves should await waitForHub(hubId) and use the shared session.
- *   transport.on("connected", () => transport.requestAgents());
- *   transport.requestAgents(); // asks the hub to re-ship entity snapshots
+ *   Entity state is live: hub entity frames update the per-type Zustand
+ *   stores directly. Bootstrap-only discovery commands remain below for
+ *   target/worktree/config data that is opened on demand.
  */
 
 import { HubRoute } from "connections/hub_route";
@@ -213,34 +214,6 @@ export class HubTransport extends HubRoute {
   }
 
   /**
-   * Request list of agents from CLI.
-   */
-  requestAgents() {
-    return this.send("list_agents");
-  }
-
-  /**
-   * Request list of worktrees from CLI.
-   */
-  requestWorktrees(targetId) {
-    return this.send("list_worktrees", { target_id: targetId });
-  }
-
-  /**
-   * Request workspace list from CLI.
-   */
-  requestWorkspaces() {
-    return this.send("list_workspaces");
-  }
-
-  /**
-   * Request currently open workspaces from CLI.
-   */
-  requestOpenWorkspaces() {
-    return this.send("list_open_workspaces");
-  }
-
-  /**
    * Select an agent (focus in CLI).
    * @param {string} agentId
    */
@@ -338,13 +311,6 @@ export class HubTransport extends HubRoute {
    */
   requestAgentConfig(targetId) {
     return this.send("list_configs", { target_id: targetId });
-  }
-
-  /**
-   * Request admitted spawn targets from CLI.
-   */
-  requestSpawnTargets() {
-    return this.send("list_spawn_targets");
   }
 
   /**

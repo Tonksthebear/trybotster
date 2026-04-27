@@ -2392,61 +2392,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn entity_snapshot_populates_legacy_tui_state_for_current_layout() {
-        let lua = make_full_lua_with_events();
-        let ctx = ActionContext::default();
-
-        let sessions = serde_json::json!({
-            "type": "entity_snapshot",
-            "entity_type": "session",
-            "items": [{
-                "session_uuid": "sess-modern",
-                "display_name": "agent one",
-                "branch_name": "main",
-                "workspace_id": "ws-modern",
-                "session_type": "agent",
-                "status": "running"
-            }],
-            "snapshot_seq": 1
-        });
-        lua.call_on_hub_event("entity_snapshot", &sessions, &ctx)
-            .unwrap();
-
-        let workspaces = serde_json::json!({
-            "type": "entity_snapshot",
-            "entity_type": "workspace",
-            "items": [{
-                "workspace_id": "ws-modern",
-                "name": "Workspace Modern",
-                "agents": ["sess-modern"],
-                "status": "active"
-            }],
-            "snapshot_seq": 1
-        });
-        lua.call_on_hub_event("entity_snapshot", &workspaces, &ctx)
-            .unwrap();
-
-        let count = lua.eval_usize("return #_tui_state.agents").unwrap();
-        assert_eq!(count, 1);
-        let selected_id = lua
-            .eval_string("return _tui_state.agents[1].id or 'NIL'")
-            .unwrap();
-        assert_eq!(selected_id, "sess-modern");
-
-        let render_ctx = make_test_ctx("list");
-        let tree = lua.call_render(&render_ctx).unwrap();
-        let items = extract_sidebar_items(&tree);
-        assert!(
-            items.iter().any(|item| item.contains("Workspace Modern")),
-            "workspace snapshot should render a workspace header, got {items:?}"
-        );
-        assert!(
-            items.iter().any(|item| item.contains("agent one")),
-            "session snapshot should render an agent row, got {items:?}"
-        );
-    }
-
     /// Full end-to-end: new worktree flow with all lifecycle stages visible.
     #[test]
     fn test_full_visual_flow_create_agent_new_worktree() {
@@ -2821,6 +2766,44 @@ mod tests {
             "Selected agent name should be included in create_agent message"
         );
         assert_eq!(data["prompt"], "test prompt");
+    }
+
+    #[test]
+    fn workspace_picker_only_includes_workspaces_with_active_agents() {
+        let lua = make_full_lua();
+        lua.exec(
+            r#"
+            _tui_state.mode = "new_agent_select_agent"
+            _tui_state.list_selected = 0
+            _tui_state.available_agents = { "claude" }
+            _tui_state.agents = {
+              { id = "agent-live", session_uuid = "agent-live", session_type = "agent", workspace_id = "ws-live" },
+              { id = "accessory-only", session_uuid = "accessory-only", session_type = "accessory", workspace_id = "ws-accessory" },
+              { id = "agent-closed", session_uuid = "agent-closed", session_type = "agent", status = "closed", workspace_id = "ws-closed" },
+            }
+            _tui_state.workspaces = {
+              { id = "ws-live", name = "Live", agents = { "agent-live" }, agent_objects = { _tui_state.agents[1] } },
+              { id = "ws-empty", name = "Empty", agents = {}, agent_objects = {} },
+              { id = "ws-accessory", name = "Accessory", agents = { "accessory-only" }, agent_objects = { _tui_state.agents[2] } },
+              { id = "ws-closed", name = "Closed", agents = { "agent-closed" }, agent_objects = { _tui_state.agents[3] } },
+            }
+            "#,
+        )
+        .unwrap();
+
+        let ctx = ActionContext::default();
+        lua.call_on_action("list_select", &ctx).unwrap().unwrap();
+
+        assert_eq!(
+            lua.eval_usize("return #_tui_state.available_workspaces")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            lua.eval_string("return _tui_state.available_workspaces[1].id")
+                .unwrap(),
+            "ws-live"
+        );
     }
 
     /// Scenario 1: Open agent on main branch.

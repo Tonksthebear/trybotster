@@ -8,9 +8,10 @@
 //
 // Patch merging matches design brief §12.4: top-level fields merge, nested
 // objects (e.g. `hosted_preview`) replace wholesale rather than deep
-// merging. Out-of-order delta frames (snapshot_seq <= last applied) are
-// dropped so a re-ordered network delivery doesn't corrupt the local view.
-// Snapshots always replace local contents and reset the baseline.
+// merging. Out-of-order frames (snapshot_seq < last applied, or <= for
+// deltas) are dropped so a re-ordered network delivery doesn't corrupt the
+// local view. Snapshots replace local contents only when they are at least as
+// fresh as the current baseline.
 
 import { create } from 'zustand'
 
@@ -39,6 +40,12 @@ export function createEntityStore(entityType, { idField = 'id' } = {}) {
      * renderer's iteration matches the hub's intent.
      */
     applySnapshot(items, snapshotSeq) {
+      const seq = normaliseSeq(snapshotSeq)
+      if (seq !== SNAPSHOT_RESET_SEQ && seq < get().snapshotSeq) {
+        // eslint-disable-next-line no-console
+        console.debug(`entity store ${entityType}: dropping stale snapshot (seq=${seq}, last=${get().snapshotSeq})`)
+        return
+      }
       const order = []
       const byId = {}
       for (const item of items || []) {
@@ -51,7 +58,7 @@ export function createEntityStore(entityType, { idField = 'id' } = {}) {
         order.push(id)
         byId[id] = item
       }
-      set({ order, byId, snapshotSeq: normaliseSeq(snapshotSeq) })
+      set({ order, byId, snapshotSeq: seq })
     },
 
     /**

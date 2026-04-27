@@ -28,6 +28,7 @@ import {
   subtext,
   titleLine,
 } from '../../store/selectors/session-row'
+import { activeAgentWorkspaces } from '../../lib/entity-selectors'
 import type { RenderContext } from '../../ui_contract/context'
 import { resolveValue } from '../../ui_contract/viewport'
 import type {
@@ -67,6 +68,7 @@ type SessionRecord = {
 type WorkspaceRecord = {
   workspace_id?: string
   name?: string
+  status?: string
   [key: string]: unknown
 }
 
@@ -99,19 +101,19 @@ export function SessionList({
   )
   const workspaceOrder = useWorkspaceEntityStore((state) => state.order)
   const workspacesById = useWorkspaceEntityStore((state) => state.byId)
-  // Filter out closed workspaces. The hub emits
-  // `entity_patch(workspace, status="closed")` when the last session in a
-  // workspace closes (handlers/connections.lua workspace_closed hook); the
-  // record stays in the store so a future re-open is just an upsert away,
-  // but headers + groups should not render until then.
+  // Filter out closed workspaces and workspaces with no active agent. The hub
+  // emits `entity_patch(workspace, status="closed")` when the last session in
+  // a workspace closes (handlers/connections.lua workspace_closed hook); the
+  // record stays in the store so a future re-open is just an upsert away, but
+  // headers + groups should not render until a live agent session exists.
   const workspaces = useMemo(
-    () =>
-      workspaceOrder
-        .map(
-          (id) => [id, workspacesById[id] as WorkspaceRecord] as const,
-        )
-        .filter(([, ws]) => ws && ws.status !== 'closed'),
-    [workspaceOrder, workspacesById],
+    () => activeAgentWorkspaces({
+      workspaceOrder,
+      workspacesById,
+      sessionOrder,
+      sessionsById,
+    }),
+    [workspaceOrder, workspacesById, sessionOrder, sessionsById],
   )
 
   const selectedSessionId = useUiPresentationStore((s) => s.selectedSessionId)
@@ -158,6 +160,20 @@ export function SessionList({
       {
         id: 'botster.session.menu.open',
         payload: { sessionId, sessionUuid },
+      } as UiAction,
+      { element: event.currentTarget as Element },
+    )
+  }
+
+  const handleWorkspaceRename = (workspaceId: string, title: string) => (
+    event: MouseEvent,
+  ) => {
+    event.preventDefault()
+    event.stopPropagation()
+    ctx.dispatch(
+      {
+        id: 'botster.workspace.rename.request',
+        payload: { workspaceId, title },
       } as UiAction,
       { element: event.currentTarget as Element },
     )
@@ -422,8 +438,8 @@ export function SessionList({
   // grouping = workspace
   const seenSessionIds = new Set<string>()
   const groups: ReactElement[] = []
-  for (const [wsId, workspace] of workspaces) {
-    const id = (wsId as string) || ''
+  for (const workspace of workspaces) {
+    const id = workspace.id || ''
     const ws = workspace as WorkspaceRecord
     const collapsed = collapsedWorkspaceIds.has(id)
     const childRows: ReactElement[] = []
@@ -438,20 +454,32 @@ export function SessionList({
     }
     groups.push(
       <li key={`ws:${id}`} className="flex flex-col gap-0.5">
-        <button
-          type="button"
-          onClick={() => toggleCollapsed(id)}
-          aria-expanded={!collapsed}
+        <div
           className={clsx(
-            'flex items-center gap-1 px-2 py-1 text-xs font-medium uppercase tracking-wider text-zinc-400 hover:text-zinc-300',
+            'group flex items-center gap-1 px-2 py-1 text-xs font-medium uppercase tracking-wider text-zinc-400',
           )}
         >
-          <IconGlyph
-            name={collapsed ? 'chevron-right' : 'chevron-down'}
-            className="size-3.5 shrink-0"
-          />
-          <span className="min-w-0 truncate">{ws.name || id}</span>
-        </button>
+          <button
+            type="button"
+            onClick={() => toggleCollapsed(id)}
+            aria-expanded={!collapsed}
+            className="flex min-w-0 flex-1 items-center gap-1 text-left hover:text-zinc-300"
+          >
+            <IconGlyph
+              name={collapsed ? 'chevron-right' : 'chevron-down'}
+              className="size-3.5 shrink-0"
+            />
+            <span className="min-w-0 truncate">{ws.name || id}</span>
+          </button>
+          <button
+            type="button"
+            aria-label={`Rename workspace ${ws.name || id}`}
+            onClick={handleWorkspaceRename(id, ws.name || id)}
+            className="rounded p-0.5 text-zinc-500 opacity-0 hover:bg-zinc-800 hover:text-zinc-200 focus:opacity-100 focus:outline-none focus:ring-1 focus:ring-zinc-500 group-hover:opacity-100"
+          >
+            <IconGlyph name="pencil" className="size-3.5" />
+          </button>
+        </div>
         {!collapsed && (
           <ul className="flex flex-col gap-0.5">{childRows}</ul>
         )}

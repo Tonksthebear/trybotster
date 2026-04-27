@@ -31,8 +31,8 @@
 //!
 //! Each store keeps the most recent `snapshot_seq` it received. Delta frames
 //! older than the current seq (out-of-order or replayed) are dropped.
-//! Reconnect re-ships an `entity_snapshot` per type; snapshots always replace
-//! local contents and reset the store's baseline.
+//! Reconnect re-ships an `entity_snapshot` per type; snapshots replace local
+//! contents only when they are at least as fresh as the current baseline.
 
 use std::collections::HashMap;
 
@@ -79,6 +79,13 @@ impl EntityStore {
     /// from the items array so the renderer's iteration order matches the
     /// hub's intent.
     pub fn apply_snapshot(&mut self, items: Vec<JsonValue>, id_field: &str, snapshot_seq: u64) {
+        if snapshot_seq != 0 && snapshot_seq < self.snapshot_seq {
+            log::debug!(
+                "tui entity_stores: dropping stale snapshot (seq={snapshot_seq}, last={prev})",
+                prev = self.snapshot_seq
+            );
+            return;
+        }
         self.snapshot_seq = snapshot_seq;
         self.order.clear();
         self.by_id.clear();
@@ -480,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_with_same_or_lower_seq_still_resyncs_store() {
+    fn snapshot_with_same_seq_resyncs_store_and_lower_seq_is_dropped() {
         let mut stores = TuiEntityStores::new();
         stores.apply_frame(&snap_frame(
             vec![json!({ "session_uuid": "sess-a", "title": "stale" })],
@@ -496,10 +503,11 @@ mod tests {
         ));
 
         let store = stores.store("session").expect("store");
-        assert_eq!(store.order, vec!["sess-c"]);
+        assert_eq!(store.order, vec!["sess-b"]);
         assert!(!store.by_id.contains_key("sess-a"));
-        assert_eq!(store.by_id["sess-c"]["title"], json!("reset"));
-        assert_eq!(store.snapshot_seq, 4);
+        assert_eq!(store.by_id["sess-b"]["title"], json!("fresh"));
+        assert!(!store.by_id.contains_key("sess-c"));
+        assert_eq!(store.snapshot_seq, 5);
     }
 
     #[test]

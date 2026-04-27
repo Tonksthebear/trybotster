@@ -30,7 +30,6 @@ export default function NewSessionChooser({ hubId }) {
     function attachToHub(hub) {
       if (cancelled) return
       setHubReady(true)
-      hub.requestSpawnTargets?.()
     }
 
     waitForHub(hubId).then(attachToHub)

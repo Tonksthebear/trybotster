@@ -276,10 +276,6 @@ export class HubSession {
 export const Hub = HubSession;
 
 const TRANSPORT_METHODS = [
-  "requestAgents",
-  "requestWorktrees",
-  "requestWorkspaces",
-  "requestOpenWorkspaces",
   "selectAgent",
   "deleteAgent",
   "clearNotification",
@@ -289,7 +285,6 @@ const TRANSPORT_METHODS = [
   "moveAgentWorkspace",
   "createAccessory",
   "requestAgentConfig",
-  "requestSpawnTargets",
   "addSpawnTarget",
   "removeSpawnTarget",
   "renameSpawnTarget",

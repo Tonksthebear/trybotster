@@ -50,6 +50,48 @@ local function base_mode(context)
   return context.selected_agent and "terminal" or "list"
 end
 
+local function is_active_agent(agent)
+  if type(agent) ~= "table" then return false end
+  if agent.status == "closed" then return false end
+  return (agent.session_type or "agent") ~= "accessory"
+end
+
+local function agent_by_id(agent_id)
+  for _, agent in ipairs(_tui_state.agents or {}) do
+    if agent.id == agent_id or agent.session_uuid == agent_id then
+      return agent
+    end
+  end
+  return nil
+end
+
+local function active_agent_count(ws)
+  local count = 0
+  for _, agent in ipairs(ws.agent_objects or {}) do
+    if is_active_agent(agent) then count = count + 1 end
+  end
+  if count > 0 then return count end
+
+  for _, agent_id in ipairs(ws.agents or {}) do
+    if is_active_agent(agent_by_id(agent_id)) then count = count + 1 end
+  end
+  return count
+end
+
+local function build_available_workspaces(exclude_workspace_id)
+  _tui_state.available_workspaces = {}
+  for _, ws in ipairs(_tui_state.workspaces or {}) do
+    local count = active_agent_count(ws)
+    if count > 0 and ws.id ~= exclude_workspace_id then
+      _tui_state.available_workspaces[#_tui_state.available_workspaces + 1] = {
+        id = ws.id,
+        name = ws.name or ws.id,
+        agent_count = count,
+      }
+    end
+  end
+end
+
 --- Transition from workspace selection to worktree selection.
 --- Sends list_worktrees request and returns ops for the mode change.
 local function transition_to_worktree_selection()
@@ -68,15 +110,7 @@ end
 --- Transition from agent config selection to workspace selection.
 --- Populates available_workspaces from current _tui_state.workspaces.
 local function transition_to_workspace_selection()
-  -- Build the workspace choices from current state
-  _tui_state.available_workspaces = {}
-  for _, ws in ipairs(_tui_state.workspaces or {}) do
-    _tui_state.available_workspaces[#_tui_state.available_workspaces + 1] = {
-      id = ws.id,
-      name = ws.name or ws.id,
-      agent_count = ws.agents and #ws.agents or 0,
-    }
-  end
+  build_available_workspaces()
   return { set_mode_ops("new_agent_select_workspace") }
 end
 
@@ -326,15 +360,7 @@ function M.on_action(action, context)
     local selected = accessories[_tui_state.list_selected + 1]
     if selected then
       _tui_state.pending_fields.accessory_name = selected
-      -- Build workspace choices from current state
-      _tui_state.available_workspaces = {}
-      for _, ws in ipairs(_tui_state.workspaces or {}) do
-        _tui_state.available_workspaces[#_tui_state.available_workspaces + 1] = {
-          id = ws.id,
-          name = ws.name or ws.id,
-          agent_count = ws.agents and #ws.agents or 0,
-        }
-      end
+      build_available_workspaces()
       return { set_mode_ops("new_accessory_select_workspace") }
     end
     return { set_mode_ops(base_mode(context)) }
@@ -517,6 +543,10 @@ function M.on_action(action, context)
             },
           }},
           set_mode_ops("spawn_targets_info"),
+          { op = "send_msg", data = {
+            subscriptionId = "tui_hub",
+            data = { type = "list_spawn_targets" },
+          }},
         }
       end
       return { set_mode_ops("spawn_targets_info") }
@@ -535,10 +565,6 @@ function M.on_action(action, context)
             },
           }},
           set_mode_ops("spawn_targets_info"),
-          { op = "send_msg", data = {
-            subscriptionId = "tui_hub",
-            data = { type = "list_spawn_targets" },
-          }},
         }
       end
       return { set_mode_ops("spawn_targets_info") }
@@ -625,8 +651,11 @@ function M.on_action(action, context)
       if agent_id and target ~= "" then
         local target_workspace_id = nil
         local target_workspace_name = target
+        local current_ws = workspace_for_agent(agent_id)
         for _, ws in ipairs(_tui_state.workspaces or {}) do
-          if ws.id == target or ws.name == target then
+          if active_agent_count(ws) > 0
+              and (not current_ws or ws.id ~= current_ws.id)
+              and (ws.id == target or ws.name == target) then
             target_workspace_id = ws.id
             target_workspace_name = ws.name or target
             break

@@ -24,13 +24,6 @@ export function flattenedTemplates(templates) {
   return Object.values(templates || {}).flat()
 }
 
-export function activeWorkspacesExcept(workspacesById, currentWorkspaceId) {
-  return Object.values(workspacesById || {}).filter((workspace) => {
-    if (!workspace || workspace.status !== 'active') return false
-    return (workspace.workspace_id ?? workspace.id) !== currentWorkspaceId
-  })
-}
-
 function sortedKeys(value) {
   return Object.keys(value || {}).sort()
 }

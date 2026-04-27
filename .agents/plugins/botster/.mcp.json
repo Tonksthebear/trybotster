@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "botster": {
+      "command": "botster",
+      "args": ["mcp-serve"],
+      "env_vars": ["BOTSTER_SESSION_UUID"]
+    }
+  }
+}
