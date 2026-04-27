@@ -16,7 +16,7 @@ import { waitForHub } from '../lib/hub-bridge'
 import { useSurfaceReadinessStore } from '../store/surface-readiness-store'
 
 // ---------------------------------------------------------------------------
-// Wire protocol: pre-dispatch tree decoration is gone. The v1 flow
+// Wire protocol: pre-dispatch tree decoration is gone. The current flow
 // (hub tree → applyCollapseOverrides → applyNavSelectionOverrides →
 // interpreter) turned into (hub tree → interpreter), because:
 //
@@ -194,7 +194,7 @@ function defaultLoadingFallback() {
  * given `targetSurface`. Wire shape:
  *
  *     { type: "ui_tree_snapshot", target_surface: string,
- *       tree: UiNodeV1, tree_version: string, hub_id: string }
+ *       tree: UiNode, tree_version: string, hub_id: string }
  *
  * Mount points: the workspace surface splits into
  *   - `targetSurface="workspace_sidebar"` for the AppShell sidebar

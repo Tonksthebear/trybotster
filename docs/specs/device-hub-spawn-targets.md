@@ -360,7 +360,7 @@ Agent definitions expand from a single initialization script to a directory with
 ~/.botster/agents/orchestrator/
   initialization      # bash script — what gets typed into the PTY
   manifest.json       # structured metadata
-  system_prompt.md    # optional, markdown system prompt
+  notes.md            # optional paired file, interpreted by initialization
 ```
 
 ### Manifest
@@ -373,16 +373,12 @@ Agent definitions expand from a single initialization script to a directory with
 
 - `plugins` — optional whitelist of plugins this agent can access via MCP. Only plugins that are also available at the target level will load (see Plugin Scoping below). If omitted, the agent inherits the full target ceiling. If present, what you declare is what you get. An empty array (`[]`) explicitly opts out of all plugins.
 
-### System Prompt
+### Paired Files
 
-Agent behavioral instructions delivered as context to the spawned AI session.
-
-Two formats, checked in precedence order:
-
-1. `system_prompt.md` file — wins if present. Markdown, any length.
-2. `manifest.json` `"system_prompt"` field — inline string for short instructions.
-
-At spawn time, Botster writes the resolved system prompt into the worktree as `.claude/CLAUDE.md` (or appends to an existing one) before the initialization script runs. The agent never needs to know how it got there.
+Botster does not interpret paired files in an agent or accessory definition.
+The initialization script can call `botster context session_dir` to locate its
+own definition directory, or `botster context file <relative-path>` to read a
+sibling file by whatever name the definition author chooses.
 
 ### Config Layering
 
@@ -391,7 +387,9 @@ Agent manifests follow the same 2-layer merge as other config:
 - device manifest (`~/.botster/agents/{name}/manifest.json`) — base
 - target-local manifest (`{target}/.botster/agents/{name}/manifest.json`) — overrides per target
 
-System prompts follow the same layering. A target-local `system_prompt.md` overrides the device-level one, allowing per-repo behavioral adjustments without changing the device default.
+Paired files are owned by the target-local or device-level definition selected
+by config resolution. Botster does not merge or interpret individual paired
+files by filename.
 
 ## Plugin Scoping
 
@@ -468,8 +466,7 @@ This means:
 ### Phase 4: Agent Manifests and Plugin Scoping
 
 - add `manifest.json` support to agent config directories
-- add `system_prompt.md` / inline `system_prompt` resolution
-- write resolved system prompt into worktree at spawn time
+- expose definition directory to initialization scripts for paired files
 - add `plugins` field to spawn target registry
 - add `plugins` field to agent manifests
 - implement MCP tool resolution: session → target ceiling ∩ agent selection

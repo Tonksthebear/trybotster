@@ -165,7 +165,7 @@ end
 --   target_repo     string   (optional)  live repo identity for the target
 --   session_type    string   (optional)  "agent" (default) or "accessory"
 --   session         table    (required)  single session config:
---                              { name, command, init_script, notifications, forward_port }
+--                              { name, command, init_script, definition_dir, notifications, forward_port }
 --   prompt          string   (optional)  task description
 --   metadata        table    (optional)  plugin key-value store (e.g., issue_number, invocation_url)
 --   workspace       string   (optional)  workspace name (e.g. "owner/repo#42")
@@ -248,6 +248,7 @@ function Session._init(self, config)
     self.is_idle = true       -- idle until first PTY output (managed by pty_output hook)
     self.session = nil        -- single PtySessionHandle
     self._session_config = session_config  -- original session config from creation
+    self.session_dir = session_config.definition_dir
 
     local key = self.session_uuid
 
@@ -261,7 +262,7 @@ function Session._init(self, config)
     local data_dir = _G.config and _G.config.data_dir and _G.config.data_dir() or nil
     self._data_dir = data_dir
 
-    -- Build environment variables
+    -- Build environment variables.
     local env = self:build_env(config.env)
     self.hub_socket = env.BOTSTER_HUB_SOCKET
     self.hub_manifest_path = env.BOTSTER_HUB_MANIFEST_PATH
@@ -1096,6 +1097,7 @@ function Session:info()
         workspace_id = self._workspace_id,
         branch_name = self.branch_name,
         worktree_path = self.worktree_path,
+        session_dir = self.session_dir,
         in_worktree = self._is_worktree or false,
         status = self.status,
         notification = self.notification or false,

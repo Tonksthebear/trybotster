@@ -1,14 +1,14 @@
 //! Lua DSL for the cross-client UI contract.
 //!
 //! Registers a global `ui` table in a Lua VM exposing constructor functions
-//! for every v1 primitive plus the adaptive helpers `ui.responsive`,
+//! for every current primitive plus the adaptive helpers `ui.responsive`,
 //! `ui.when`, `ui.hidden`, and the `ui.action` helper. This module is
 //! deliberately VM-agnostic — both the hub [`crate::lua::LuaRuntime`] and
 //! the TUI `LayoutLua` call [`register`] on their own `mlua::Lua` instance.
 //!
 //! # Wire format
 //!
-//! Constructors return Lua tables that mirror [`UiNodeV1`] JSON exactly.
+//! Constructors return Lua tables that mirror [`UiNode`] JSON exactly.
 //! Authors never hand-build the underlying table shape — they always call
 //! the constructor so the marshalling layer can enforce invariants:
 //!
@@ -20,7 +20,7 @@
 //! See `docs/specs/cross-client-ui-primitives.md` and
 //! `docs/specs/adaptive-ui-viewport-and-presentation.md` for the spec.
 //!
-//! [`UiNodeV1`]: crate::ui_contract::node::UiNodeV1
+//! [`UiNode`]: crate::ui_contract::node::UiNode
 
 use anyhow::{anyhow, Result};
 use mlua::{Lua, Table, Value};
@@ -107,7 +107,7 @@ enum Primitive {
     IconButton,
     Tree,
     TreeItem,
-    /// Flagged internal in v1 — registered so renderers can consume it while
+    /// Flagged internal in current — registered so renderers can consume it while
     /// Phase B / Phase C catch up.
     Dialog,
     /// Wire protocol — workspace-grouped session tree composite.
@@ -180,7 +180,7 @@ impl Primitive {
     /// props raise a Lua error at construction — symmetric with the
     /// slot allowlist.
     ///
-    /// The allowlists here mirror the fields of each `*PropsV1` struct in
+    /// The allowlists here mirror the fields of each `*Props` struct in
     /// `crate::ui_contract::props`, which in turn mirror the cross-client
     /// spec. Web-only extensions (`Panel.padding`, `Button.leadingIcon`, …)
     /// are deliberately absent.
@@ -190,7 +190,15 @@ impl Primitive {
             Self::Inline => &["gap", "align", "justify", "wrap"],
             Self::Panel => &["title", "tone", "border", "interactionDensity"],
             Self::ScrollArea => &["axis"],
-            Self::Text => &["text", "tone", "size", "weight", "monospace", "italic", "truncate"],
+            Self::Text => &[
+                "text",
+                "tone",
+                "size",
+                "weight",
+                "monospace",
+                "italic",
+                "truncate",
+            ],
             Self::Icon => &["name", "size", "tone", "label"],
             Self::Badge => &["text", "tone", "size"],
             Self::StatusDot => &["state", "label"],
@@ -212,7 +220,7 @@ impl Primitive {
     }
 }
 
-/// Prop keys reserved for the UiNodeV1 envelope itself (not passed to props).
+/// Prop keys reserved for the UiNode envelope itself (not passed to props).
 ///
 /// The envelope is identical for every primitive — `id` (optional stable id),
 /// `children` (positional child array), `slots` (named slot map).
@@ -308,7 +316,7 @@ fn register_bind(lua: &Lua, ui: &Table) -> Result<()> {
 /// ```json
 /// { "$kind": "bind_list",
 ///   "source": "/<entity_type>",
-///   "item_template": <UiNodeV1> }
+///   "item_template": <UiNode> }
 /// ```
 ///
 /// The client-side resolver walks the `source` store and clones
@@ -318,9 +326,7 @@ fn register_bind_list(lua: &Lua, ui: &Table) -> Result<()> {
     let constructor = lua
         .create_function(|lua, args: Table| {
             let source: String = args.get("source").map_err(|e| {
-                mlua::Error::RuntimeError(format!(
-                    "ui.bind_list: `source` (string) required: {e}"
-                ))
+                mlua::Error::RuntimeError(format!("ui.bind_list: `source` (string) required: {e}"))
             })?;
             if source.is_empty() {
                 return Err(mlua::Error::RuntimeError(
@@ -500,7 +506,7 @@ fn build_node(lua: &Lua, kind: Primitive, args: Value) -> mlua::Result<Table> {
 fn validate(_lua: &Lua, kind: Primitive, node: &Table) -> mlua::Result<()> {
     match kind {
         Primitive::TreeItem => {
-            // `id` is required for tree_item — matches TreeItemPropsV1.
+            // `id` is required for tree_item — matches TreeItemProps.
             let id = node.get::<Value>("id").unwrap_or(Value::Nil);
             if matches!(id, Value::Nil) {
                 return Err(mlua::Error::RuntimeError(
@@ -575,7 +581,11 @@ fn is_bind_sentinel(value: &Value) -> bool {
     let Value::Table(t) = value else { return false };
     let mut count = 0usize;
     let mut has_bind = false;
-    let Ok(pairs) = t.clone().pairs::<String, Value>().collect::<mlua::Result<Vec<_>>>() else {
+    let Ok(pairs) = t
+        .clone()
+        .pairs::<String, Value>()
+        .collect::<mlua::Result<Vec<_>>>()
+    else {
         return false;
     };
     for (key, val) in pairs {
@@ -638,7 +648,10 @@ fn require_prop_table(node: &Table, key: &str, ctor: &str) -> mlua::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn build_responsive(lua: &Lua, input: &Table) -> mlua::Result<Table> {
-    let has_width = !matches!(input.get::<Value>("width").unwrap_or(Value::Nil), Value::Nil);
+    let has_width = !matches!(
+        input.get::<Value>("width").unwrap_or(Value::Nil),
+        Value::Nil
+    );
     let has_height = !matches!(
         input.get::<Value>("height").unwrap_or(Value::Nil),
         Value::Nil
@@ -726,11 +739,7 @@ fn build_responsive(lua: &Lua, input: &Table) -> mlua::Result<Table> {
     Ok(out)
 }
 
-fn validate_dimension_keys(
-    table: &Table,
-    allowed: &[&str],
-    dim_name: &str,
-) -> mlua::Result<()> {
+fn validate_dimension_keys(table: &Table, allowed: &[&str], dim_name: &str) -> mlua::Result<()> {
     for pair in table.pairs::<String, Value>() {
         let (key, _) = pair?;
         if !allowed.contains(&key.as_str()) {
@@ -765,11 +774,7 @@ fn build_conditional(
     Ok(out)
 }
 
-fn normalize_condition(
-    lua: &Lua,
-    condition: Value,
-    ctor: &'static str,
-) -> mlua::Result<Table> {
+fn normalize_condition(lua: &Lua, condition: Value, ctor: &'static str) -> mlua::Result<Table> {
     match condition {
         Value::String(s) => {
             // Bare-string shorthand = widthClass match.
@@ -842,7 +847,8 @@ mod tests {
 
     fn eval_to_json(lua: &Lua, code: &str) -> serde_json::Value {
         let value: Value = lua.load(code).eval().expect("Lua eval failed");
-        lua.from_value(value).expect("Lua -> JSON conversion failed")
+        lua.from_value(value)
+            .expect("Lua -> JSON conversion failed")
     }
 
     fn new_lua() -> Lua {
@@ -854,13 +860,16 @@ mod tests {
     #[test]
     fn stack_basic_shape() {
         let lua = new_lua();
-        let v = eval_to_json(&lua, r#"
+        let v = eval_to_json(
+            &lua,
+            r#"
             return ui.stack{
                 direction = "vertical",
                 gap = "2",
                 children = { ui.text{ text = "hi" } },
             }
-        "#);
+        "#,
+        );
         assert_eq!(
             v,
             json!({
@@ -884,7 +893,10 @@ mod tests {
     #[test]
     fn text_requires_text_prop() {
         let lua = new_lua();
-        let err = lua.load("return ui.text{ tone = 'accent' }").eval::<Value>().unwrap_err();
+        let err = lua
+            .load("return ui.text{ tone = 'accent' }")
+            .eval::<Value>()
+            .unwrap_err();
         assert!(err.to_string().contains("ui.text"), "got {err}");
     }
 
@@ -946,7 +958,9 @@ mod tests {
     #[test]
     fn slots_end_underscore_rewritten() {
         let lua = new_lua();
-        let v = eval_to_json(&lua, r#"
+        let v = eval_to_json(
+            &lua,
+            r#"
             return ui.tree_item{
                 id = "ws-1",
                 slots = {
@@ -954,22 +968,32 @@ mod tests {
                     end_ = { ui.badge{ text = "3" } },
                 },
             }
-        "#);
+        "#,
+        );
         let slots = v.get("slots").expect("slots present");
-        assert!(slots.get("end").is_some(), "`end_` should be rewritten to `end`: {slots:?}");
-        assert!(slots.get("end_").is_none(), "`end_` should not survive: {slots:?}");
+        assert!(
+            slots.get("end").is_some(),
+            "`end_` should be rewritten to `end`: {slots:?}"
+        );
+        assert!(
+            slots.get("end_").is_none(),
+            "`end_` should not survive: {slots:?}"
+        );
     }
 
     #[test]
     fn tree_item_accepts_slot_keys_at_top_level() {
         let lua = new_lua();
-        let v = eval_to_json(&lua, r#"
+        let v = eval_to_json(
+            &lua,
+            r#"
             return ui.tree_item{
                 id = "ws-1",
                 title = { ui.text{ text = "Workspace" } },
                 end_  = { ui.badge{ text = "3" } },
             }
-        "#);
+        "#,
+        );
         // Spec slot keys at the top level are hoisted into `slots`, not `props`.
         let slots = v.get("slots").expect("slots present");
         assert!(slots.get("title").is_some());
@@ -984,13 +1008,16 @@ mod tests {
     #[test]
     fn button_action_roundtrip() {
         let lua = new_lua();
-        let v = eval_to_json(&lua, r#"
+        let v = eval_to_json(
+            &lua,
+            r#"
             return ui.button{
                 label = "Save",
                 action = ui.action("botster.workspace.save", { workspaceId = "ws-1" }),
                 variant = "solid",
             }
-        "#);
+        "#,
+        );
         assert_eq!(
             v,
             json!({
@@ -1010,9 +1037,12 @@ mod tests {
     #[test]
     fn responsive_width_shorthand() {
         let lua = new_lua();
-        let v = eval_to_json(&lua, r#"
+        let v = eval_to_json(
+            &lua,
+            r#"
             return ui.responsive({ compact = "vertical", expanded = "horizontal" })
-        "#);
+        "#,
+        );
         assert_eq!(
             v,
             json!({
@@ -1025,12 +1055,15 @@ mod tests {
     #[test]
     fn responsive_explicit_form() {
         let lua = new_lua();
-        let v = eval_to_json(&lua, r#"
+        let v = eval_to_json(
+            &lua,
+            r#"
             return ui.responsive({
                 width = { regular = "panel" },
                 height = { tall = "panel", short = "sidebar" },
             })
-        "#);
+        "#,
+        );
         assert_eq!(
             v,
             json!({
@@ -1067,9 +1100,12 @@ mod tests {
     #[test]
     fn when_shorthand_string_is_width_class() {
         let lua = new_lua();
-        let v = eval_to_json(&lua, r#"
+        let v = eval_to_json(
+            &lua,
+            r#"
             return ui.when("compact", ui.text{ text = "mobile-only" })
-        "#);
+        "#,
+        );
         assert_eq!(
             v,
             json!({
@@ -1083,12 +1119,15 @@ mod tests {
     #[test]
     fn hidden_table_condition_with_keyboard_occlusion() {
         let lua = new_lua();
-        let v = eval_to_json(&lua, r#"
+        let v = eval_to_json(
+            &lua,
+            r#"
             return ui.hidden(
                 { pointer = "coarse", keyboard_occluded = true },
                 ui.panel{}
             )
-        "#);
+        "#,
+        );
         assert_eq!(
             v,
             json!({
@@ -1112,30 +1151,51 @@ mod tests {
     #[test]
     fn dialog_defaults_presentation_to_auto() {
         let lua = new_lua();
-        let v = eval_to_json(&lua, r#"
+        let v = eval_to_json(
+            &lua,
+            r#"
             return ui.dialog{ open = true, title = "Rename" }
-        "#);
+        "#,
+        );
         let props = v.get("props").expect("props");
-        assert_eq!(props.get("presentation").and_then(|p| p.as_str()), Some("auto"));
+        assert_eq!(
+            props.get("presentation").and_then(|p| p.as_str()),
+            Some("auto")
+        );
     }
 
     #[test]
     fn dialog_hoists_body_and_footer_into_slots() {
         let lua = new_lua();
-        let v = eval_to_json(&lua, r#"
+        let v = eval_to_json(
+            &lua,
+            r#"
             return ui.dialog{
                 open = true,
                 title = "Rename Workspace",
                 body   = { ui.text{ text = "Enter a name" } },
                 footer = { ui.button{ label = "Save", action = ui.action("botster.workspace.rename.commit") } },
             }
-        "#);
+        "#,
+        );
         let props = v.get("props").expect("props");
-        assert!(props.get("body").is_none(), "`body` must not appear in props: {props:?}");
-        assert!(props.get("footer").is_none(), "`footer` must not appear in props: {props:?}");
+        assert!(
+            props.get("body").is_none(),
+            "`body` must not appear in props: {props:?}"
+        );
+        assert!(
+            props.get("footer").is_none(),
+            "`footer` must not appear in props: {props:?}"
+        );
         let slots = v.get("slots").expect("slots present");
-        assert!(slots.get("body").is_some(), "body should be hoisted into slots: {slots:?}");
-        assert!(slots.get("footer").is_some(), "footer should be hoisted into slots: {slots:?}");
+        assert!(
+            slots.get("body").is_some(),
+            "body should be hoisted into slots: {slots:?}"
+        );
+        assert!(
+            slots.get("footer").is_some(),
+            "footer should be hoisted into slots: {slots:?}"
+        );
     }
 
     #[test]
@@ -1163,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn every_v1_primitive_registered() {
+    fn every_shared_primitive_registered() {
         let lua = new_lua();
         for name in [
             "stack",
@@ -1185,10 +1245,7 @@ mod tests {
             "when",
             "hidden",
         ] {
-            let f: Value = lua
-                .load(&format!("return ui.{name}"))
-                .eval()
-                .expect("eval");
+            let f: Value = lua.load(&format!("return ui.{name}")).eval().expect("eval");
             assert!(matches!(f, Value::Function(_)), "ui.{name} missing");
         }
     }
@@ -1202,8 +1259,14 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unknown prop"), "got {err}");
-        assert!(msg.contains("padding"), "error must name the offending key: {err}");
-        assert!(msg.contains("Allowed props"), "error must list allowed props: {err}");
+        assert!(
+            msg.contains("padding"),
+            "error must name the offending key: {err}"
+        );
+        assert!(
+            msg.contains("Allowed props"),
+            "error must list allowed props: {err}"
+        );
     }
 
     #[test]
@@ -1270,7 +1333,10 @@ mod tests {
         assert_eq!(super::snake_to_camel("leading_icon"), "leadingIcon");
         assert_eq!(super::snake_to_camel("primary_action"), "primaryAction");
         assert_eq!(super::snake_to_camel("title"), "title");
-        assert_eq!(super::snake_to_camel("interaction_density"), "interactionDensity");
+        assert_eq!(
+            super::snake_to_camel("interaction_density"),
+            "interactionDensity"
+        );
     }
 
     #[test]
@@ -1287,7 +1353,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn every_v2_composite_registered() {
+    fn every_composite_registered() {
         let lua = new_lua();
         for name in [
             "session_list",
@@ -1299,10 +1365,7 @@ mod tests {
             "connection_code",
             "new_session_button",
         ] {
-            let f: Value = lua
-                .load(&format!("return ui.{name}"))
-                .eval()
-                .expect("eval");
+            let f: Value = lua.load(&format!("return ui.{name}")).eval().expect("eval");
             assert!(matches!(f, Value::Function(_)), "ui.{name} missing");
         }
     }
@@ -1551,7 +1614,10 @@ mod tests {
     #[test]
     fn bind_rejects_empty_path() {
         let lua = new_lua();
-        let err = lua.load(r#"return ui.bind("")"#).eval::<Value>().unwrap_err();
+        let err = lua
+            .load(r#"return ui.bind("")"#)
+            .eval::<Value>()
+            .unwrap_err();
         assert!(err.to_string().contains("ui.bind"), "got {err}");
     }
 
@@ -1614,69 +1680,68 @@ mod tests {
     }
 
     #[test]
-    fn v2_composites_typed_props_round_trip_via_serde() {
-        // Wire shape ↔ typed PropsV1 round-trip for every composite.
+    fn composites_typed_props_round_trip_via_serde() {
+        // Wire shape ↔ typed Props round-trip for every composite.
         // Catches any drift between the Lua allowlist and the Rust struct.
         use crate::ui_contract::{
-            ConnectionCodePropsV1, HubRecoveryStatePropsV1, NewSessionButtonPropsV1,
-            SessionListPropsV1, SessionRowPropsV1, SpawnTargetListPropsV1, UiActionV1,
-            UiSessionListGrouping, UiSurfaceDensity, UiValueV1, WorkspaceListPropsV1,
-            WorktreeListPropsV1,
+            ConnectionCodeProps, HubRecoveryStateProps, NewSessionButtonProps, SessionListProps,
+            SessionRowProps, SpawnTargetListProps, UiAction, UiSessionListGrouping,
+            UiSurfaceDensity, UiValue, WorkspaceListProps, WorktreeListProps,
         };
 
-        let session_list = SessionListPropsV1 {
-            density: Some(UiValueV1::scalar(UiSurfaceDensity::Sidebar)),
+        let session_list = SessionListProps {
+            density: Some(UiValue::scalar(UiSurfaceDensity::Sidebar)),
             grouping: Some(UiSessionListGrouping::Workspace),
             show_nav_entries: Some(true),
         };
         let v = serde_json::to_value(&session_list).unwrap();
-        let back: SessionListPropsV1 = serde_json::from_value(v).unwrap();
+        let back: SessionListProps = serde_json::from_value(v).unwrap();
         assert_eq!(back, session_list);
 
-        let workspace_list = WorkspaceListPropsV1 {
-            density: Some(UiValueV1::scalar(UiSurfaceDensity::Panel)),
+        let workspace_list = WorkspaceListProps {
+            density: Some(UiValue::scalar(UiSurfaceDensity::Panel)),
         };
-        let back: WorkspaceListPropsV1 =
+        let back: WorkspaceListProps =
             serde_json::from_value(serde_json::to_value(&workspace_list).unwrap()).unwrap();
         assert_eq!(back, workspace_list);
 
-        let spawn = SpawnTargetListPropsV1 {
-            on_select: Some(UiActionV1::new("a")),
-            on_remove: Some(UiActionV1::new("b")),
+        let spawn = SpawnTargetListProps {
+            on_select: Some(UiAction::new("a")),
+            on_remove: Some(UiAction::new("b")),
         };
-        let back: SpawnTargetListPropsV1 =
+        let back: SpawnTargetListProps =
             serde_json::from_value(serde_json::to_value(&spawn).unwrap()).unwrap();
         assert_eq!(back, spawn);
 
-        let worktree = WorktreeListPropsV1 {
+        let worktree = WorktreeListProps {
             target_id: "t".into(),
         };
-        let back: WorktreeListPropsV1 =
+        let back: WorktreeListProps =
             serde_json::from_value(serde_json::to_value(&worktree).unwrap()).unwrap();
         assert_eq!(back, worktree);
 
-        let row = SessionRowPropsV1 {
+        let row = SessionRowProps {
             session_uuid: "s".into(),
             density: None,
         };
-        let back: SessionRowPropsV1 =
+        let back: SessionRowProps =
             serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
         assert_eq!(back, row);
 
-        let hr = HubRecoveryStatePropsV1::default();
-        let back: HubRecoveryStatePropsV1 =
+        let hr = HubRecoveryStateProps::default();
+        let back: HubRecoveryStateProps =
             serde_json::from_value(serde_json::to_value(&hr).unwrap()).unwrap();
         assert_eq!(back, hr);
 
-        let cc = ConnectionCodePropsV1::default();
-        let back: ConnectionCodePropsV1 =
+        let cc = ConnectionCodeProps::default();
+        let back: ConnectionCodeProps =
             serde_json::from_value(serde_json::to_value(&cc).unwrap()).unwrap();
         assert_eq!(back, cc);
 
-        let nsb = NewSessionButtonPropsV1 {
-            action: UiActionV1::new("c"),
+        let nsb = NewSessionButtonProps {
+            action: UiAction::new("c"),
         };
-        let back: NewSessionButtonPropsV1 =
+        let back: NewSessionButtonProps =
             serde_json::from_value(serde_json::to_value(&nsb).unwrap()).unwrap();
         assert_eq!(back, nsb);
     }

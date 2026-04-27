@@ -1,8 +1,8 @@
 #!/bin/bash
 # @template Codex
 # @description Minimal agent session that launches OpenAI Codex in a worktree
-# @category sessions
-# @dest profiles/codex/sessions/agent/initialization
+# @category agents
+# @dest agents/codex/initialization
 # @scope device
 # @version 1.0.0
 
@@ -19,6 +19,7 @@
 # ---------------------------------------------------------------------------
 
 echo "Botster agent initialized for branch: $(botster context branch_name)"
-echo "Worktree: $BOTSTER_WORKTREE_PATH"
+echo "Worktree: $(botster context worktree_path)"
+echo "Agent definition: $(botster context session_dir)"
 
 codex "$(botster context prompt)"

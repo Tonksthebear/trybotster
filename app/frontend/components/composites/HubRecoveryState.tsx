@@ -1,19 +1,19 @@
 // Wire protocol — composite renderer for `ui.hub_recovery_state{}`.
 // Reads the singleton `hub` entity (id = hub_id) and renders the lifecycle
-// banner that v1 used to ship as inline panels in the layout tree.
+// banner that older layouts shipped as inline panels in the layout tree.
 
 import React, { type ReactElement } from 'react'
 
 import { useHubMetaStore } from '../../store/entities'
 import type {
-  HubRecoveryStatePropsV1,
+  HubRecoveryStateProps as UiHubRecoveryStateProps,
 } from '../../ui_contract/types'
 import type { RenderContext } from '../../ui_contract/context'
 import { IconGlyph } from '../../ui_contract/icons'
 
 type HubRecord = { state?: string; reason?: string; [key: string]: unknown }
 
-export type HubRecoveryStateProps = HubRecoveryStatePropsV1 & {
+export type HubRecoveryStateProps = UiHubRecoveryStateProps & {
   ctx: RenderContext
 }
 

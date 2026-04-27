@@ -81,6 +81,23 @@ local function is_nonempty_string(v)
     return type(v) == "string" and v ~= ""
 end
 
+local function normalize_clients(opts)
+    local raw = opts.clients or opts.client or opts.target_clients
+    if raw == nil then return { web = true, tui = true } end
+    if type(raw) == "string" then raw = { raw } end
+    local out = {}
+    if type(raw) == "table" then
+        for _, client in ipairs(raw) do
+            if client == "web" or client == "browser" then out.web = true end
+            if client == "tui" or client == "terminal" then out.tui = true end
+        end
+    end
+    if not out.web and not out.tui then
+        error("surfaces.register: clients must include 'web' and/or 'tui'")
+    end
+    return out
+end
+
 local function notify_changed()
     if type(hooks) == "table" and type(hooks.notify) == "function" then
         pcall(hooks.notify, "surfaces_changed", { registry = M })
@@ -290,7 +307,7 @@ local function compile_routes(name, opts)
 end
 
 -- Build the sub-route 404 fallback tree. Called when a surface's subpath
--- doesn't match any declared route. Uses only v1 primitives so the browser
+-- doesn't match any declared route. Uses only shared primitives so the browser
 -- renders it without Phase-4b client support.
 local function render_sub_404(surface_name, subpath)
     return {
@@ -378,9 +395,11 @@ function M.register(name, opts)
     local compiled_routes = compile_routes(name, opts)
     local base_path = derive_base_path(name, opts)
     local render = make_dispatcher(name, base_path, compiled_routes)
+    local clients = normalize_clients(opts)
 
     local entry = {
         name = name,
+        clients = clients,
         base_path = base_path,
         -- `path` is preserved for consumers that still read the top-level
         -- field (sidebar nav, route registry payload). It equals base_path
@@ -503,6 +522,7 @@ function M.list()
     for name, entry in pairs(registry.by_name) do
         out[#out + 1] = {
             name = name,
+            clients = entry.clients,
             path = entry.path,
             base_path = entry.base_path,
             label = entry.label,
@@ -542,6 +562,9 @@ function M.build_route_registry_payload(hub_id)
     for _, summary in ipairs(M.list()) do
         if summary.path then
             local entry = registry.by_name[summary.name]
+            if entry and entry.clients and not entry.clients.web then
+                goto continue
+            end
             local sub_patterns = {}
             if entry and entry.compiled_routes then
                 for _, compiled in ipairs(entry.compiled_routes) do
@@ -558,6 +581,7 @@ function M.build_route_registry_payload(hub_id)
                 routes = sub_patterns,
             }
         end
+        ::continue::
     end
     return {
         type = "ui_route_registry",
@@ -567,7 +591,7 @@ function M.build_route_registry_payload(hub_id)
 end
 
 --- Rust-facing entry point — called by `web_layout.render(name, state)` when
---- no override-chain layout table supplies `name`. Returns a UiNodeV1 table
+--- no override-chain layout table supplies `name`. Returns a UiNode table
 --- or nil when the surface is not registered.
 ---
 --- Errors raised by `render(state)` propagate up so the Rust fallback
@@ -582,7 +606,7 @@ end
 --- Build per-subscription input state for `surface_name`. Uses the
 --- surface's own `input_builder` when provided; otherwise delegates to the
 --- default `LayoutInput.build_for_subscription`. Callers that want the
---- workspace-shaped `AgentWorkspaceSurfaceInputV1` get it for free; plugin
+--- workspace-shaped `AgentWorkspaceSurfaceInput` get it for free; plugin
 --- surfaces that need less can provide a tiny builder.
 ---
 --- Phase 4b ergonomics: when `route_ctx` is passed, it threads to the

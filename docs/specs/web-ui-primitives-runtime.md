@@ -45,12 +45,12 @@ That last point matters: phase 1 proves the React island using the existing hub 
 
 ## Versioning
 
-This document defines `web-ui-runtime/v1`.
+This document defines `web-ui-runtime`.
 
 Rules:
 
-- `v1` additions must be backward-compatible
-- removing props or changing action payload semantics requires `v2`
+- `current` additions must be backward-compatible
+- removing props or changing action payload semantics requires a new contract
 - phase-1 implementation may keep adapter code internal as long as the contracts below remain stable
 
 ## Phase 1 Boundary
@@ -92,7 +92,7 @@ Rules:
 
 ## Contract Layers
 
-There are three separate contracts in `v1`.
+There are three separate contracts in `current`.
 
 ### 1. Hub transport contract for phase 1
 
@@ -113,14 +113,14 @@ The React island should adapt the current hub payload, not invent a second trans
 ### Hub input shape
 
 ```ts
-type HostedPreviewStateV1 = {
+type HostedPreviewState = {
   status?: "inactive" | "starting" | "running" | "error"
   url?: string | null
   error?: string | null
   install_url?: string | null
 }
 
-type SessionSummaryV1 = {
+type SessionSummary = {
   id: string
   session_uuid: string
   session_type?: "agent" | "accessory" | string | null
@@ -135,20 +135,20 @@ type SessionSummaryV1 = {
   notification?: boolean
   is_idle?: boolean | null
   port?: number | null
-  hosted_preview?: HostedPreviewStateV1 | null
+  hosted_preview?: HostedPreviewState | null
   in_worktree?: boolean | null
 }
 
-type OpenWorkspaceSummaryV1 = {
+type OpenWorkspaceSummary = {
   id: string
   name?: string | null
   agents?: string[]
 }
 
-type AgentWorkspaceSurfaceInputV1 = {
+type AgentWorkspaceSurfaceInput = {
   hub_id: string
-  agents: SessionSummaryV1[]
-  open_workspaces: OpenWorkspaceSummaryV1[]
+  agents: SessionSummary[]
+  open_workspaces: OpenWorkspaceSummary[]
   selected_session_uuid?: string | null
   surface: "sidebar" | "panel"
 }
@@ -159,8 +159,8 @@ type AgentWorkspaceSurfaceInputV1 = {
 The runtime should normalize that input into a store shaped like:
 
 ```ts
-type AgentWorkspaceStoreV1 = {
-  sessionsById: Record<string, SessionSummaryV1>
+type AgentWorkspaceStore = {
+  sessionsById: Record<string, SessionSummary>
   sessionOrder: string[]
   workspacesById: Record<string, {
     id: string
@@ -184,9 +184,9 @@ Rules:
 
 ## Primitive Inventory
 
-`v1` intentionally exposes a small primitive set. Anything not listed here is out of scope for `v1`.
+`current` intentionally exposes a small primitive set. Anything not listed here is out of scope for `current`.
 
-| Category | Component | `v1` status | Lua public in `v1` |
+| Category | Component | `current` status | Lua public in `current` |
 |---|---|---|---|
 | Foundation | `Stack` | supported | yes |
 | Foundation | `Inline` | supported | yes |
@@ -210,7 +210,7 @@ Rules:
 | Botster composite | `HostedPreviewError` | supported | no |
 | Botster composite | `SessionActionsMenu` | supported | no |
 
-Deferred from `v1`:
+Deferred from `current`:
 
 - `Grid`
 - `Separator`
@@ -228,18 +228,18 @@ Deferred from `v1`:
 
 The public registry uses these shared scalar types.
 
-`Density` in this web runtime spec is a phase-1 surface variant for shared workspace and session components. It is intentionally separate from the shared cross-client `UiInteractionDensityV1` token defined in [cross-client-ui-primitives.md](cross-client-ui-primitives.md).
+`Density` in this web runtime spec is a phase-1 surface variant for shared workspace and session components. It is intentionally separate from the shared cross-client `UiInteractionDensity` token defined in [cross-client-ui-primitives.md](cross-client-ui-primitives.md).
 
 ```ts
 type Space = "0" | "1" | "2" | "3" | "4" | "6"
 type Density = "sidebar" | "panel"
 type Tone = "default" | "muted" | "accent" | "success" | "warning" | "danger"
-type NodeV1 = {
+type Node = {
   type: string
   props: Record<string, unknown>
 }
 
-type ActionBindingV1 = {
+type ActionBinding = {
   id:
     | "botster.workspace.toggle"
     | "botster.workspace.rename.request"
@@ -253,62 +253,62 @@ type ActionBindingV1 = {
 }
 ```
 
-`Density` in this web runtime spec is a phase-1 surface variant for shared workspace/session components. It is intentionally separate from the shared cross-client `UiInteractionDensityV1` token defined in [cross-client-ui-primitives.md](cross-client-ui-primitives.md).
+`Density` in this web runtime spec is a phase-1 surface variant for shared workspace/session components. It is intentionally separate from the shared cross-client `UiInteractionDensity` token defined in [cross-client-ui-primitives.md](cross-client-ui-primitives.md).
 
 ## Lua-Public Primitive Props
 
-These are the exact public prop shapes for the `v1` primitive registry.
+These are the exact public prop shapes for the `current` primitive registry.
 
 ### `Stack`
 
 ```ts
-type StackPropsV1 = {
+type StackProps = {
   gap?: Space
   padding?: Space
   align?: "start" | "center" | "end" | "stretch"
   justify?: "start" | "center" | "end" | "between"
-  children: NodeV1[]
+  children: Node[]
 }
 ```
 
 ### `Inline`
 
 ```ts
-type InlinePropsV1 = {
+type InlineProps = {
   gap?: Space
   padding?: Space
   align?: "start" | "center" | "end" | "stretch"
   justify?: "start" | "center" | "end" | "between"
   wrap?: boolean
-  children: NodeV1[]
+  children: Node[]
 }
 ```
 
 ### `Panel`
 
 ```ts
-type PanelPropsV1 = {
+type PanelProps = {
   padding?: Space
   tone?: "default" | "muted"
   border?: boolean
   radius?: "sm" | "md"
-  children: NodeV1[]
+  children: Node[]
 }
 ```
 
 ### `ScrollArea`
 
 ```ts
-type ScrollAreaPropsV1 = {
+type ScrollAreaProps = {
   axis?: "y" | "x" | "both"
-  children: NodeV1[]
+  children: Node[]
 }
 ```
 
 ### `Text`
 
 ```ts
-type TextPropsV1 = {
+type TextProps = {
   text: string
   size?: "xs" | "sm" | "md"
   tone?: Tone
@@ -322,7 +322,7 @@ type TextPropsV1 = {
 ### `Icon`
 
 ```ts
-type IconPropsV1 = {
+type IconProps = {
   name: string
   size?: "xs" | "sm" | "md"
   tone?: Tone
@@ -333,7 +333,7 @@ type IconPropsV1 = {
 ### `Badge`
 
 ```ts
-type BadgePropsV1 = {
+type BadgeProps = {
   text: string
   tone?: "default" | "accent" | "success" | "warning" | "danger"
   size?: "sm" | "md"
@@ -343,7 +343,7 @@ type BadgePropsV1 = {
 ### `StatusDot`
 
 ```ts
-type StatusDotPropsV1 = {
+type StatusDotProps = {
   state: "neutral" | "idle" | "active" | "success" | "warning" | "danger"
   label?: string
 }
@@ -352,20 +352,20 @@ type StatusDotPropsV1 = {
 ### `EmptyState`
 
 ```ts
-type EmptyStatePropsV1 = {
+type EmptyStateProps = {
   title: string
   description?: string
   icon?: string
-  primaryAction?: ActionBindingV1
+  primaryAction?: ActionBinding
 }
 ```
 
 ### `Button`
 
 ```ts
-type ButtonPropsV1 = {
+type ButtonProps = {
   label: string
-  action: ActionBindingV1
+  action: ActionBinding
   variant?: "solid" | "ghost"
   tone?: "default" | "accent" | "danger"
   leadingIcon?: string
@@ -376,10 +376,10 @@ type ButtonPropsV1 = {
 ### `IconButton`
 
 ```ts
-type IconButtonPropsV1 = {
+type IconButtonProps = {
   icon: string
   label: string
-  action: ActionBindingV1
+  action: ActionBinding
   tone?: "default" | "accent" | "danger"
   disabled?: boolean
 }
@@ -388,40 +388,40 @@ type IconButtonPropsV1 = {
 ### `Tree`
 
 ```ts
-type TreePropsV1 = {
+type TreeProps = {
   // Web-only phase-1 surface variant, not the shared interaction-density token.
   density: Density
-  children: NodeV1[]
+  children: Node[]
 }
 ```
 
 ### `TreeItem`
 
 ```ts
-type TreeItemPropsV1 = {
+type TreeItemProps = {
   id: string
   selected?: boolean
   notification?: boolean
-  action?: ActionBindingV1
-  startSlot?: NodeV1[]
-  title: NodeV1[]
-  subtitle?: NodeV1[]
-  endSlot?: NodeV1[]
+  action?: ActionBinding
+  startSlot?: Node[]
+  title: Node[]
+  subtitle?: Node[]
+  endSlot?: Node[]
 }
 ```
 
 ## Internal Phase-1 Composite Contract
 
-These composites are runtime-owned in `v1`. They are stable enough to build the React island, but they are not exposed to Lua until the state-first migration has landed cleanly.
+These composites are runtime-owned in `current`. They are stable enough to build the React island, but they are not exposed to Lua until the state-first migration has landed cleanly.
 
 ### `WorkspaceList`
 
 ```ts
-type WorkspaceListPropsV1 = {
+type WorkspaceListProps = {
   density: Density
-  groups: WorkspaceGroupPropsV1[]
-  ungroupedSessions?: SessionRowPropsV1[]
-  emptyState?: EmptyStatePropsV1
+  groups: WorkspaceGroupProps[]
+  ungroupedSessions?: SessionRowProps[]
+  emptyState?: EmptyStateProps
 }
 ```
 
@@ -430,14 +430,14 @@ Emits: none directly. Child composites emit the actions.
 ### `WorkspaceGroup`
 
 ```ts
-type WorkspaceGroupPropsV1 = {
+type WorkspaceGroupProps = {
   id: string
   title: string
   count: number
   expanded: boolean
   density: Density
   canRename: boolean
-  sessions: SessionRowPropsV1[]
+  sessions: SessionRowProps[]
 }
 ```
 
@@ -449,7 +449,7 @@ Emits:
 ### `SessionRow`
 
 ```ts
-type SessionRowPropsV1 = {
+type SessionRowProps = {
   sessionId: string
   sessionUuid: string
   density: Density
@@ -460,9 +460,9 @@ type SessionRowPropsV1 = {
   notification: boolean
   sessionType: "agent" | "accessory"
   activityState: "hidden" | "idle" | "active"
-  hostedPreview?: HostedPreviewIndicatorPropsV1 | null
-  previewError?: HostedPreviewErrorPropsV1 | null
-  actionsMenu: SessionActionsMenuPropsV1
+  hostedPreview?: HostedPreviewIndicatorProps | null
+  previewError?: HostedPreviewErrorProps | null
+  actionsMenu: SessionActionsMenuProps
   canMoveWorkspace: boolean
   canDelete: boolean
   inWorktree?: boolean | null
@@ -476,7 +476,7 @@ Emits:
 ### `HostedPreviewIndicator`
 
 ```ts
-type HostedPreviewIndicatorPropsV1 = {
+type HostedPreviewIndicatorProps = {
   sessionId: string
   sessionUuid: string
   hasForwardedPort: boolean
@@ -494,7 +494,7 @@ Emits:
 ### `HostedPreviewError`
 
 ```ts
-type HostedPreviewErrorPropsV1 = {
+type HostedPreviewErrorProps = {
   sessionId: string
   sessionUuid: string
   visible: boolean
@@ -511,7 +511,7 @@ Emits:
 ### `SessionActionsMenu`
 
 ```ts
-type SessionActionsMenuPropsV1 = {
+type SessionActionsMenuProps = {
   sessionId: string
   sessionUuid: string
   hasForwardedPort: boolean
@@ -555,12 +555,12 @@ Rules:
 
 The sidebar and main panel must share component logic and differ only by density.
 
-Allowed densities in `v1`:
+Allowed densities in `current`:
 
 - `sidebar` — compact row height, hover-revealed actions, tighter typography
 - `panel` — larger card-like row layout, always-present affordances where appropriate
 
-Any variant beyond those two is out of scope for `v1`.
+Any variant beyond those two is out of scope for `current`.
 
 ## Why Composites Stay Internal In Phase 1
 
@@ -572,7 +572,7 @@ Any variant beyond those two is out of scope for `v1`.
 - hosted preview state mapping
 - action availability rules
 
-That behavior is still moving. Freezing it into the Lua contract before the React island lands would lock Botster into premature APIs. The public `v1` Lua surface should therefore stop at primitives, while phase 1 uses internal composites as the migration bridge.
+That behavior is still moving. Freezing it into the Lua contract before the React island lands would lock Botster into premature APIs. The public `current` Lua surface should therefore stop at primitives, while phase 1 uses internal composites as the migration bridge.
 
 ## Acceptance Criteria For Phase 1
 
@@ -585,8 +585,8 @@ That behavior is still moving. Freezing it into the Lua contract before the Reac
 
 ## Immediate Implementation Sequence
 
-1. Build the React island adapter around `AgentWorkspaceSurfaceInputV1`
-2. Normalize state into `AgentWorkspaceStoreV1`
+1. Build the React island adapter around `AgentWorkspaceSurfaceInput`
+2. Normalize state into `AgentWorkspaceStore`
 3. Implement the internal composites above in `sidebar` and `panel` densities
 4. Map the action ids above onto the existing hub transport methods
 5. Remove template cloning from `agent_list_controller.js`

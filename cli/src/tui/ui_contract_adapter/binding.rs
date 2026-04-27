@@ -12,7 +12,7 @@
 //! ```
 //!
 //! Both sentinels are resolved here BEFORE the node tree is deserialized
-//! into [`UiNodeV1`] and dispatched to a primitive renderer. That keeps the
+//! into [`UiNode`] and dispatched to a primitive renderer. That keeps the
 //! existing primitive renderers ignorant of the sentinel — they only ever
 //! see resolved values + cloned children.
 //!
@@ -72,7 +72,7 @@ fn resolve_bindings_inner(
         JsonValue::Object(map) => {
             // Detect $bind sentinel — an object with exactly one key, "$bind",
             // mapped to a string path. Anything else means the object is a
-            // regular UiNodeV1 / props / payload table; recurse into it.
+            // regular UiNode / props / payload table; recurse into it.
             if let Some(replacement) = try_resolve_bind(map, stores, item_context) {
                 *value = replacement;
                 // After substitution the new value may itself need further
@@ -204,12 +204,7 @@ fn resolve_record(entity_type: &str, id: &str, stores: &TuiEntityStores) -> Json
         .unwrap_or(JsonValue::Null)
 }
 
-fn resolve_scalar(
-    entity_type: &str,
-    id: &str,
-    field: &str,
-    stores: &TuiEntityStores,
-) -> JsonValue {
+fn resolve_scalar(entity_type: &str, id: &str, field: &str, stores: &TuiEntityStores) -> JsonValue {
     stores
         .store(entity_type)
         .map(|store| store.field(id, field))

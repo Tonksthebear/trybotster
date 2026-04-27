@@ -1,4 +1,4 @@
-//! Shared scalar tokens used across v1 primitives.
+//! Shared scalar tokens used across current primitives.
 //!
 //! Every enum in this module serializes to the exact lowercase string the spec
 //! calls for, so `serde_json` output matches the TypeScript types in
@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Shared tone vocabulary (`UiToneV1`).
+/// Shared tone vocabulary (`UiTone`).
 ///
 /// Both renderers agree on what these mean semantically; visual realization is
 /// renderer-specific (Tailwind palette on web, ratatui styles in the TUI).
@@ -28,7 +28,7 @@ pub enum UiTone {
     Danger,
 }
 
-/// Cross-axis alignment (`UiAlignV1`).
+/// Cross-axis alignment (`UiAlign`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UiAlign {
@@ -56,7 +56,7 @@ pub enum UiJustify {
     Between,
 }
 
-/// Shared interaction-density token (`UiInteractionDensityV1`).
+/// Shared interaction-density token (`UiInteractionDensity`).
 ///
 /// Intentionally distinct from `UiDensity`, which is the web-only
 /// phase-1 surface variant (`sidebar` | `panel`).
@@ -252,10 +252,10 @@ pub enum UiSessionListGrouping {
     Flat,
 }
 
-/// Dialog presentation policy (`UiPresentationV1`).
+/// Dialog presentation policy (`UiPresentation`).
 ///
 /// `auto` lets the renderer pick the best native presentation based on the
-/// current `UiViewportV1`.
+/// current `UiViewport`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UiPresentation {
@@ -277,16 +277,27 @@ mod tests {
 
     #[test]
     fn tone_serializes_lowercase() {
-        assert_eq!(serde_json::to_string(&UiTone::Accent).expect("serialize"), "\"accent\"");
-        assert_eq!(serde_json::to_string(&UiTone::Danger).expect("serialize"), "\"danger\"");
+        assert_eq!(
+            serde_json::to_string(&UiTone::Accent).expect("serialize"),
+            "\"accent\""
+        );
+        assert_eq!(
+            serde_json::to_string(&UiTone::Danger).expect("serialize"),
+            "\"danger\""
+        );
     }
 
     #[test]
     fn space_serializes_as_digit_string() {
-        assert_eq!(serde_json::to_string(&UiSpace::Zero).expect("serialize"), "\"0\"");
-        assert_eq!(serde_json::to_string(&UiSpace::Six).expect("serialize"), "\"6\"");
-        let round: UiSpace =
-            serde_json::from_str("\"3\"").expect("round-trip UiSpace from \"3\"");
+        assert_eq!(
+            serde_json::to_string(&UiSpace::Zero).expect("serialize"),
+            "\"0\""
+        );
+        assert_eq!(
+            serde_json::to_string(&UiSpace::Six).expect("serialize"),
+            "\"6\""
+        );
+        let round: UiSpace = serde_json::from_str("\"3\"").expect("round-trip UiSpace from \"3\"");
         assert_eq!(round, UiSpace::Three);
     }
 

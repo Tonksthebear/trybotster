@@ -2,11 +2,11 @@
 //
 // Reads from the session + workspace entity stores and the
 // ui-presentation-store (selection / collapse). Renders the workspace-grouped
-// tree the v1 web/layout.lua used to ship hub-side. Workspaces do NOT carry
+// tree the legacy web/layout.lua used to ship hub-side. Workspaces do NOT carry
 // session lists — membership is derived client-side by filtering sessions
 // where session.workspace_id == workspace.id (design brief §12.5).
 //
-// v1-fidelity restoration: each row carries the activity dot, two-line
+// Fidelity restoration: each row carries the activity dot, two-line
 // content (primary name + titleLine + subtext), inline hosted-preview
 // indicator, and an actions-menu trigger. A `<SessionActionsMenu>` mounted
 // outside the tree (App.jsx / HubShow.jsx) intercepts the
@@ -31,10 +31,10 @@ import {
 import type { RenderContext } from '../../ui_contract/context'
 import { resolveValue } from '../../ui_contract/viewport'
 import type {
-  SessionListPropsV1,
-  UiActionV1,
-  UiSurfaceDensityV1,
-  UiValueV1,
+  SessionListProps as UiSessionListProps,
+  UiAction,
+  UiSurfaceDensity,
+  UiValue,
 } from '../../ui_contract/types'
 import { IconGlyph } from '../../ui_contract/icons'
 import { Badge, BadgeButton } from '../catalyst/badge'
@@ -70,7 +70,7 @@ type WorkspaceRecord = {
   [key: string]: unknown
 }
 
-export type SessionListProps = SessionListPropsV1 & {
+export type SessionListProps = UiSessionListProps & {
   ctx: RenderContext
 }
 
@@ -81,8 +81,8 @@ export function SessionList({
   ctx,
 }: SessionListProps): ReactElement {
   const resolvedDensity =
-    resolveValue<UiSurfaceDensityV1>(
-      density as UiValueV1<UiSurfaceDensityV1> | undefined,
+    resolveValue<UiSurfaceDensity>(
+      density as UiValue<UiSurfaceDensity> | undefined,
       ctx.viewport,
     ) ?? 'panel'
   const groupingMode = grouping ?? 'workspace'
@@ -158,7 +158,7 @@ export function SessionList({
       {
         id: 'botster.session.menu.open',
         payload: { sessionId, sessionUuid },
-      } as UiActionV1,
+      } as UiAction,
       { element: event.currentTarget as Element },
     )
   }
@@ -215,7 +215,7 @@ export function SessionList({
                     sessionUuid,
                     url: preview.url ?? undefined,
                   },
-                } as UiActionV1,
+                } as UiAction,
                 { element: event.currentTarget as Element },
               )
             }}
@@ -355,7 +355,7 @@ export function SessionList({
     )
 
     // Inline error panel: shown directly below the row when the hosted
-    // preview is in error state. Mirrors the v1 web/layout.lua
+    // preview is in error state. Mirrors the legacy web/layout.lua
     // hosted_preview_error_panel composition.
     const errorPanel =
       preview.status === 'error' && preview.error ? (
@@ -384,7 +384,7 @@ export function SessionList({
                       sessionUuid,
                       url: preview.installUrl ?? undefined,
                     },
-                  } as UiActionV1,
+                  } as UiAction,
                   { element: event.currentTarget as Element },
                 )
               }}

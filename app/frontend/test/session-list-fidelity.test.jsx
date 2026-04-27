@@ -1,6 +1,6 @@
 // Wire protocol — fidelity restoration tests for `<SessionList>`.
 //
-// Verifies the v1 row contract: activity dot, two-line content
+// Verifies the current row contract: activity dot, two-line content
 // (primaryName + titleLine + subtext), inline hosted-preview indicator,
 // inline error panel for status==='error', and an actions trigger that
 // dispatches `botster.session.menu.open` for `<SessionActionsMenu>` to
@@ -52,7 +52,7 @@ afterEach(() => {
   cleanup()
 })
 
-describe('<SessionList> v1-fidelity row', () => {
+describe('<SessionList> fidelity row', () => {
   it('left-border color reflects row state with notification > active > idle priority', () => {
     // Active session → emerald border, no notification.
     seedSession({

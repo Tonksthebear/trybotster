@@ -189,7 +189,7 @@ impl LayoutLua {
             .call(state)
             .map_err(|e| anyhow!("Lua render() failed: {e}"))?;
 
-        // If Lua returned a Phase A `UiNodeV1` tree (top-level `type` is
+        // If Lua returned a Phase A `UiNode` tree (top-level `type` is
         // one of the shared primitives), route through the adapter. Any
         // other shape — including the legacy `{ type = "hsplit", ... }`
         // layout tables — falls through to the pre-existing parser.
@@ -239,7 +239,7 @@ impl LayoutLua {
             LuaValue::Nil => Ok(None),
             LuaValue::Table(table) => {
                 // Mirror the opt-in adapter routing used by `call_render`:
-                // Phase A `UiNodeV1` trees flow through the adapter, the
+                // Phase A `UiNode` trees flow through the adapter, the
                 // legacy layout table shape is handled by the existing
                 // parser.
                 if let Ok(type_name) = table.get::<String>("type") {
@@ -709,8 +709,16 @@ fn render_context_to_lua(lua: &Lua, ctx: &RenderContext) -> Result<LuaTable> {
     let viewport_table = lua
         .create_table()
         .map_err(|e| anyhow!("Failed to create viewport table: {e}"))?;
-    set_field(&viewport_table, "width_class", viewport_width_str(&viewport))?;
-    set_field(&viewport_table, "height_class", viewport_height_str(&viewport))?;
+    set_field(
+        &viewport_table,
+        "width_class",
+        viewport_width_str(&viewport),
+    )?;
+    set_field(
+        &viewport_table,
+        "height_class",
+        viewport_height_str(&viewport),
+    )?;
     set_field(&viewport_table, "pointer", viewport_pointer_str(&viewport))?;
     state
         .set("viewport", viewport_table)
@@ -753,7 +761,7 @@ fn set_field<V: mlua::IntoLua>(table: &LuaTable, key: &str, value: V) -> Result<
 }
 
 /// Stringify [`UiWidthClass`] for the `ctx.viewport.width_class` Lua field.
-fn viewport_width_str(viewport: &crate::ui_contract::viewport::UiViewportV1) -> &'static str {
+fn viewport_width_str(viewport: &crate::ui_contract::viewport::UiViewport) -> &'static str {
     use crate::ui_contract::viewport::UiWidthClass;
     match viewport.width_class {
         UiWidthClass::Compact => "compact",
@@ -763,7 +771,7 @@ fn viewport_width_str(viewport: &crate::ui_contract::viewport::UiViewportV1) -> 
 }
 
 /// Stringify [`UiHeightClass`] for the `ctx.viewport.height_class` Lua field.
-fn viewport_height_str(viewport: &crate::ui_contract::viewport::UiViewportV1) -> &'static str {
+fn viewport_height_str(viewport: &crate::ui_contract::viewport::UiViewport) -> &'static str {
     use crate::ui_contract::viewport::UiHeightClass;
     match viewport.height_class {
         UiHeightClass::Short => "short",
@@ -773,7 +781,7 @@ fn viewport_height_str(viewport: &crate::ui_contract::viewport::UiViewportV1) ->
 }
 
 /// Stringify [`UiPointer`] for the `ctx.viewport.pointer` Lua field.
-fn viewport_pointer_str(viewport: &crate::ui_contract::viewport::UiViewportV1) -> &'static str {
+fn viewport_pointer_str(viewport: &crate::ui_contract::viewport::UiViewport) -> &'static str {
     use crate::ui_contract::viewport::UiPointer;
     match viewport.pointer {
         UiPointer::None => "none",
@@ -2393,10 +2401,10 @@ mod tests {
             "type": "entity_snapshot",
             "entity_type": "session",
             "items": [{
-                "session_uuid": "sess-v2",
+                "session_uuid": "sess-modern",
                 "display_name": "agent one",
                 "branch_name": "main",
-                "workspace_id": "ws-v2",
+                "workspace_id": "ws-modern",
                 "session_type": "agent",
                 "status": "running"
             }],
@@ -2409,9 +2417,9 @@ mod tests {
             "type": "entity_snapshot",
             "entity_type": "workspace",
             "items": [{
-                "workspace_id": "ws-v2",
-                "name": "Workspace V2",
-                "agents": ["sess-v2"],
+                "workspace_id": "ws-modern",
+                "name": "Workspace Modern",
+                "agents": ["sess-modern"],
                 "status": "active"
             }],
             "snapshot_seq": 1
@@ -2424,13 +2432,13 @@ mod tests {
         let selected_id = lua
             .eval_string("return _tui_state.agents[1].id or 'NIL'")
             .unwrap();
-        assert_eq!(selected_id, "sess-v2");
+        assert_eq!(selected_id, "sess-modern");
 
         let render_ctx = make_test_ctx("list");
         let tree = lua.call_render(&render_ctx).unwrap();
         let items = extract_sidebar_items(&tree);
         assert!(
-            items.iter().any(|item| item.contains("Workspace V2")),
+            items.iter().any(|item| item.contains("Workspace Modern")),
             "workspace snapshot should render a workspace header, got {items:?}"
         );
         assert!(

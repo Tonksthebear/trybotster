@@ -1,9 +1,9 @@
 //! Resolution helpers for `$kind`-tagged responsive values and conditional
-//! child wrappers in a `UiNodeV1` tree.
+//! child wrappers in a `UiNode` tree.
 //!
 //! Phase A guarantees that `$kind = "responsive"` only appears at
 //! prop-value positions, and `$kind = "when"` / `$kind = "hidden"` only
-//! appear at child / slot positions (`UiChildV1::Conditional`). This module
+//! appear at child / slot positions (`UiChild::Conditional`). This module
 //! matches that split exactly.
 //!
 //! Fallback rules follow `docs/specs/adaptive-ui-viewport-and-presentation.md`:
@@ -14,13 +14,13 @@
 
 #![expect(
     clippy::trivially_copy_pass_by_ref,
-    reason = "UiViewportV1 is Copy but we pass by reference deliberately for consistency with the adapter's many other fns and because the reference reads as 'the current viewport context'"
+    reason = "UiViewport is Copy but we pass by reference deliberately for consistency with the adapter's many other fns and because the reference reads as 'the current viewport context'"
 )]
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::ui_contract::node::{UiChildV1, UiConditionV1, UiConditionalV1, UiNodeV1};
-use crate::ui_contract::viewport::{UiHeightClass, UiViewportV1, UiWidthClass};
+use crate::ui_contract::node::{UiChild, UiCondition, UiConditional, UiNode};
+use crate::ui_contract::viewport::{UiHeightClass, UiViewport, UiWidthClass};
 
 /// The `$kind` discriminator key used by Phase A.
 const KIND_KEY: &str = "$kind";
@@ -38,7 +38,7 @@ const KIND_RESPONSIVE: &str = "responsive";
 #[must_use]
 pub fn resolve_props(
     props: &JsonMap<String, JsonValue>,
-    viewport: &UiViewportV1,
+    viewport: &UiViewport,
 ) -> JsonMap<String, JsonValue> {
     let mut out = JsonMap::with_capacity(props.len());
     for (key, value) in props {
@@ -53,7 +53,7 @@ pub fn resolve_props(
 /// Used by [`resolve_props`] and reused by test helpers that need a
 /// standalone resolution primitive.
 #[must_use]
-pub fn resolve_value(value: &JsonValue, viewport: &UiViewportV1) -> JsonValue {
+pub fn resolve_value(value: &JsonValue, viewport: &UiViewport) -> JsonValue {
     match value {
         JsonValue::Object(map) => {
             if let Some(resolved) = resolve_responsive_sentinel(map, viewport) {
@@ -79,7 +79,7 @@ pub fn resolve_value(value: &JsonValue, viewport: &UiViewportV1) -> JsonValue {
 /// `None` for regular JSON objects so the caller can recurse into them.
 fn resolve_responsive_sentinel(
     map: &JsonMap<String, JsonValue>,
-    viewport: &UiViewportV1,
+    viewport: &UiViewport,
 ) -> Option<JsonValue> {
     let kind = map.get(KIND_KEY)?.as_str()?;
     if kind != KIND_RESPONSIVE {
@@ -108,10 +108,7 @@ fn resolve_responsive_sentinel(
 
 /// Try `target`, then the next smaller width class, then the next larger,
 /// per the adaptive spec's fallback rules.
-fn pick_width(
-    map: &JsonMap<String, JsonValue>,
-    target: UiWidthClass,
-) -> Option<&JsonValue> {
+fn pick_width(map: &JsonMap<String, JsonValue>, target: UiWidthClass) -> Option<&JsonValue> {
     for candidate in width_fallback_order(target) {
         if let Some(value) = map.get(width_key(candidate)) {
             return Some(value);
@@ -122,10 +119,7 @@ fn pick_width(
 
 /// Try `target`, then the next smaller height class, then the next larger,
 /// per the adaptive spec's fallback rules.
-fn pick_height(
-    map: &JsonMap<String, JsonValue>,
-    target: UiHeightClass,
-) -> Option<&JsonValue> {
+fn pick_height(map: &JsonMap<String, JsonValue>, target: UiHeightClass) -> Option<&JsonValue> {
     for candidate in height_fallback_order(target) {
         if let Some(value) = map.get(height_key(candidate)) {
             return Some(value);
@@ -208,7 +202,7 @@ const fn height_fallback_order(target: UiHeightClass) -> [UiHeightClass; 3] {
 /// condition populates them — the condition is more specific than the
 /// viewport can answer for.
 #[must_use]
-pub fn condition_matches(condition: &UiConditionV1, viewport: &UiViewportV1) -> bool {
+pub fn condition_matches(condition: &UiCondition, viewport: &UiViewport) -> bool {
     if let Some(w) = condition.width {
         if w != viewport.width_class {
             return false;
@@ -240,14 +234,14 @@ pub fn condition_matches(condition: &UiConditionV1, viewport: &UiViewportV1) -> 
 /// Filter an array of children, dropping any that fail their conditional
 /// wrapper's test and unwrapping the rest.
 ///
-/// - [`UiChildV1::Node`] passes through as-is.
-/// - [`UiConditionalV1::When`] is kept iff the condition matches.
-/// - [`UiConditionalV1::Hidden`] is kept iff the condition does NOT match.
+/// - [`UiChild::Node`] passes through as-is.
+/// - [`UiConditional::When`] is kept iff the condition matches.
+/// - [`UiConditional::Hidden`] is kept iff the condition does NOT match.
 ///
-/// Returns a fresh `Vec<UiNodeV1>` of the survivors, ready for further
+/// Returns a fresh `Vec<UiNode>` of the survivors, ready for further
 /// adapter work.
 #[must_use]
-pub fn filter_children(children: &[UiChildV1], viewport: &UiViewportV1) -> Vec<UiNodeV1> {
+pub fn filter_children(children: &[UiChild], viewport: &UiViewport) -> Vec<UiNode> {
     children
         .iter()
         .filter_map(|child| resolve_child(child, viewport))
@@ -255,15 +249,15 @@ pub fn filter_children(children: &[UiChildV1], viewport: &UiViewportV1) -> Vec<U
 }
 
 /// Decide whether a single child should render; returns the inner
-/// [`UiNodeV1`] when it should, or `None` when the conditional elides it.
+/// [`UiNode`] when it should, or `None` when the conditional elides it.
 #[must_use]
-pub fn resolve_child(child: &UiChildV1, viewport: &UiViewportV1) -> Option<UiNodeV1> {
+pub fn resolve_child(child: &UiChild, viewport: &UiViewport) -> Option<UiNode> {
     match child {
-        UiChildV1::Node(node) => Some(node.clone()),
-        UiChildV1::Conditional(UiConditionalV1::When { condition, node }) => {
+        UiChild::Node(node) => Some(node.clone()),
+        UiChild::Conditional(UiConditional::When { condition, node }) => {
             condition_matches(condition, viewport).then(|| (**node).clone())
         }
-        UiChildV1::Conditional(UiConditionalV1::Hidden { condition, node }) => {
+        UiChild::Conditional(UiConditional::Hidden { condition, node }) => {
             (!condition_matches(condition, viewport)).then(|| (**node).clone())
         }
     }
@@ -275,8 +269,8 @@ mod tests {
     use crate::ui_contract::viewport::UiPointer;
     use serde_json::json;
 
-    fn viewport(w: UiWidthClass, h: UiHeightClass) -> UiViewportV1 {
-        UiViewportV1::new(w, h, UiPointer::None)
+    fn viewport(w: UiWidthClass, h: UiHeightClass) -> UiViewport {
+        UiViewport::new(w, h, UiPointer::None)
     }
 
     #[test]
@@ -350,7 +344,7 @@ mod tests {
 
     #[test]
     fn condition_conjunctive_match() {
-        let c = UiConditionV1 {
+        let c = UiCondition {
             width: Some(UiWidthClass::Compact),
             pointer: Some(UiPointer::None),
             ..Default::default()
@@ -361,7 +355,7 @@ mod tests {
 
     #[test]
     fn condition_mismatch_on_any_field() {
-        let c = UiConditionV1 {
+        let c = UiCondition {
             width: Some(UiWidthClass::Compact),
             height: Some(UiHeightClass::Tall),
             ..Default::default()

@@ -4,8 +4,8 @@
 //! Each test goes end-to-end:
 //!
 //! 1. Register the Phase A Lua DSL in a fresh `mlua::Lua`.
-//! 2. Evaluate Lua source that returns a `UiNodeV1` tree.
-//! 3. Run the adapter against that tree for a chosen [`UiViewportV1`].
+//! 2. Evaluate Lua source that returns a `UiNode` tree.
+//! 3. Run the adapter against that tree for a chosen [`UiViewport`].
 //! 4. Assert on the resulting [`RenderNode`] shape / content and the
 //!    associated [`ActionTable`].
 //!
@@ -18,7 +18,7 @@
 
 #![expect(
     clippy::trivially_copy_pass_by_ref,
-    reason = "UiViewportV1 is Copy but helpers pass it by reference to match the adapter's signatures — consistency is more valuable here than the trivial copy optimisation"
+    reason = "UiViewport is Copy but helpers pass it by reference to match the adapter's signatures — consistency is more valuable here than the trivial copy optimisation"
 )]
 
 use botster::tui::render_tree::{
@@ -28,8 +28,8 @@ use botster::tui::ui_contract_adapter::{
     derive_viewport_from_terminal, render_lua_ui_node, render_ui_node, ActionTable,
 };
 use botster::ui_contract::lua::register;
-use botster::ui_contract::node::UiNodeV1;
-use botster::ui_contract::viewport::{UiHeightClass, UiPointer, UiViewportV1, UiWidthClass};
+use botster::ui_contract::node::UiNode;
+use botster::ui_contract::viewport::{UiHeightClass, UiPointer, UiViewport, UiWidthClass};
 use mlua::{Lua, LuaSerdeExt, Value};
 
 fn new_ui_lua() -> Lua {
@@ -38,24 +38,24 @@ fn new_ui_lua() -> Lua {
     lua
 }
 
-fn regular_viewport() -> UiViewportV1 {
-    UiViewportV1::new(
+fn regular_viewport() -> UiViewport {
+    UiViewport::new(
         UiWidthClass::Regular,
         UiHeightClass::Regular,
         UiPointer::None,
     )
 }
 
-fn compact_viewport() -> UiViewportV1 {
-    UiViewportV1::new(
+fn compact_viewport() -> UiViewport {
+    UiViewport::new(
         UiWidthClass::Compact,
         UiHeightClass::Regular,
         UiPointer::None,
     )
 }
 
-fn expanded_viewport() -> UiViewportV1 {
-    UiViewportV1::new(
+fn expanded_viewport() -> UiViewport {
+    UiViewport::new(
         UiWidthClass::Expanded,
         UiHeightClass::Regular,
         UiPointer::None,
@@ -63,7 +63,7 @@ fn expanded_viewport() -> UiViewportV1 {
 }
 
 /// Run Lua code and route its result through the adapter.
-fn render_lua(lua: &Lua, code: &str, viewport: &UiViewportV1) -> (RenderNode, ActionTable) {
+fn render_lua(lua: &Lua, code: &str, viewport: &UiViewport) -> (RenderNode, ActionTable) {
     let value: Value = lua.load(code).eval().expect("Lua eval failed");
     let table = match value {
         Value::Table(t) => t,
@@ -72,10 +72,10 @@ fn render_lua(lua: &Lua, code: &str, viewport: &UiViewportV1) -> (RenderNode, Ac
     render_lua_ui_node(lua, &table, viewport).expect("render_lua_ui_node")
 }
 
-/// Convenience: evaluate Lua, deserialize to UiNodeV1, then render.
-fn eval_node(lua: &Lua, code: &str) -> UiNodeV1 {
+/// Convenience: evaluate Lua, deserialize to UiNode, then render.
+fn eval_node(lua: &Lua, code: &str) -> UiNode {
     let value: Value = lua.load(code).eval().expect("Lua eval failed");
-    lua.from_value(value).expect("Lua -> UiNodeV1")
+    lua.from_value(value).expect("Lua -> UiNode")
 }
 
 // =============================================================================
@@ -519,7 +519,10 @@ fn tree_renders_three_depths_with_indentation() {
     );
 
     // Notification row renders the yellow bullet glyph in its content.
-    assert!(sibling.contains('●'), "sibling row missing notification marker: {sibling:?}");
+    assert!(
+        sibling.contains('●'),
+        "sibling row missing notification marker: {sibling:?}"
+    );
 }
 
 #[test]
@@ -809,7 +812,7 @@ fn list_item_disabled_action_drops_legacy_string_but_keeps_envelope() {
 /// flows through the adapter (no fall-through to the legacy parser).
 #[test]
 fn routing_accepts_top_level_list() {
-    // The Lua DSL does not expose a `ui.list` constructor in v1, so we
+    // The Lua DSL does not expose a `ui.list` constructor in current, so we
     // hand-build the node. The point of the test is that the adapter's
     // is_ui_node_type recognises `list` and the call_render path would
     // route to it. We test this directly via render_lua_ui_node, which
@@ -936,7 +939,7 @@ fn tree_item_subtitle_slot_resolves_conditional_wrapper() {
 }
 
 /// Internal menu primitive renders through the adapter even though it
-/// is not Lua-public in v1.
+/// is not Lua-public in current.
 #[test]
 fn internal_menu_renders_as_centered_list() {
     let lua = new_ui_lua();
@@ -958,8 +961,7 @@ fn internal_menu_renders_as_centered_list() {
         )
         .eval()
         .expect("eval");
-    let (render, actions) =
-        render_lua_ui_node(&lua, &table, &regular_viewport()).expect("adapter");
+    let (render, actions) = render_lua_ui_node(&lua, &table, &regular_viewport()).expect("adapter");
     match render {
         RenderNode::Centered { child, .. } => match *child {
             RenderNode::Widget {
@@ -1011,4 +1013,3 @@ fn paragraph_text_contains(node: &RenderNode, needle: &str) -> bool {
         _ => false,
     }
 }
-

@@ -16,6 +16,9 @@ export function defaultSettingsContent(filePath, configMetadata = {}) {
   if (filePath.endsWith('.json')) {
     return '{\n  "agents": [],\n  "accessories": []\n}\n'
   }
+  if (filePath.endsWith('.md')) {
+    return ''
+  }
   return ''
 }
 
@@ -82,6 +85,26 @@ export async function scanSettingsTree({ hub, configScope, selectedTargetId }) {
     }
   }
 
+  const listFilesRecursive = async (path) => {
+    try {
+      const result = await hub.listDir(path, fs, tid)
+      const entries = result.entries || []
+      const files = []
+      for (const entry of entries) {
+        const entryPath = `${path}/${entry.name}`
+        if (entry.type === 'dir') {
+          const nested = await listFilesRecursive(entryPath)
+          files.push(...nested.map((file) => `${entry.name}/${file}`))
+        } else if (entry.type === 'file') {
+          files.push(entry.name)
+        }
+      }
+      return files.sort()
+    } catch {
+      return []
+    }
+  }
+
   const [agentNames, accessoryNames, workspaceEntries, pluginNames] =
     await Promise.all([
       listDirs(`${prefix}agents`),
@@ -92,10 +115,14 @@ export async function scanSettingsTree({ hub, configScope, selectedTargetId }) {
 
   await Promise.all(
     agentNames.map(async (name) => {
+      const path = `${prefix}agents/${name}`
       const initStat = await hub
-        .statFile(`${prefix}agents/${name}/initialization`, fs, tid)
+        .statFile(`${path}/initialization`, fs, tid)
         .catch(() => ({ exists: false }))
-      tree.agents[name] = { initialization: initStat.exists }
+      tree.agents[name] = {
+        initialization: initStat.exists,
+        files: await listFilesRecursive(path),
+      }
     })
   )
 
@@ -109,6 +136,7 @@ export async function scanSettingsTree({ hub, configScope, selectedTargetId }) {
       tree.accessories[name] = {
         initialization: initStat.exists,
         port_forward: portForwardStat.exists,
+        files: await listFilesRecursive(path),
       }
     })
   )
@@ -124,7 +152,13 @@ export async function scanSettingsTree({ hub, configScope, selectedTargetId }) {
       const initStat = await hub
         .statFile(`${prefix}plugins/${name}/init.lua`, fs, tid)
         .catch(() => ({ exists: false }))
-      if (initStat.exists) tree.plugins[name] = { init: true }
+      const files = await listFilesRecursive(`${prefix}plugins/${name}`)
+      if (files.length > 0 || initStat.exists) {
+        tree.plugins[name] = {
+          init: initStat.exists,
+          files,
+        }
+      }
     })
   )
 

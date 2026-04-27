@@ -10,10 +10,7 @@
 //! It deliberately bypasses `LuaRuntime::new()` so the test stays focused on
 //! the vendored library and doesn't drag in every hub primitive.
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "test-code brevity"
-)]
+#![expect(clippy::unwrap_used, reason = "test-code brevity")]
 
 use std::path::PathBuf;
 
@@ -31,7 +28,8 @@ use mlua::{Lua, LuaOptions, StdLib};
 /// VM with safe stdlibs plus FFI, excluding DEBUG. This test mirrors that
 /// configuration exactly so the vendored FFI path is exercised as-in-prod.
 fn new_vendor_lua() -> Lua {
-    let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL_SAFE | StdLib::FFI, LuaOptions::default()) };
+    let lua =
+        unsafe { Lua::unsafe_new_with(StdLib::ALL_SAFE | StdLib::FFI, LuaOptions::default()) };
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let lua_base = manifest_dir.join("lua");

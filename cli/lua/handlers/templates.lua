@@ -71,6 +71,49 @@ local function ensure_parent_dirs(path)
     return true
 end
 
+local function list_files_recursive(root, rel)
+    rel = rel or ""
+    local path = rel == "" and root or (root .. "/" .. rel)
+    local entries = fs.listdir(path) or {}
+    local files = {}
+    for _, entry in ipairs(entries) do
+        local entry_rel = rel == "" and entry or (rel .. "/" .. entry)
+        local entry_path = root .. "/" .. entry_rel
+        if fs.is_dir(entry_path) then
+            local nested = list_files_recursive(root, entry_rel)
+            for _, file in ipairs(nested) do
+                table.insert(files, file)
+            end
+        else
+            table.insert(files, entry_rel)
+        end
+    end
+    table.sort(files)
+    return files
+end
+
+local function scan_definition_dirs(base_path, scope_label, kind, name_key, installed)
+    local base_dir = base_path .. "/" .. kind
+    if not fs.exists(base_dir) or not fs.is_dir(base_dir) then return end
+
+    local names = fs.listdir(base_dir) or {}
+    table.sort(names)
+    for _, name in ipairs(names) do
+        local definition_dir = base_dir .. "/" .. name
+        if fs.is_dir(definition_dir) then
+            for _, file in ipairs(list_files_recursive(definition_dir)) do
+                local entry = {
+                    dest = kind .. "/" .. name .. "/" .. file,
+                    scope = scope_label,
+                    name = name,
+                }
+                entry[name_key] = name
+                table.insert(installed, entry)
+            end
+        end
+    end
+end
+
 -- ============================================================================
 -- Command Handlers
 -- ============================================================================
@@ -142,7 +185,7 @@ commands.register("template:list", function(client, sub_id, command)
     local ConfigResolver = require("lib.config_resolver")
     local installed = {}
 
-    -- Scan device and repo roots for installed plugins and agents
+    -- Scan device and repo roots for installed plugin/session definition files.
     local device_root = config.data_dir and config.data_dir() or nil
     local repo_root = nil
     local target = nil
@@ -159,20 +202,31 @@ commands.register("template:list", function(client, sub_id, command)
     local function scan_plugins(base_path, scope_label, path_prefix)
         local plugins = ConfigResolver.read_plugins(base_path)
         for name, plugin in pairs(plugins) do
-            local dest = path_prefix .. "plugins/" .. name .. "/init.lua"
-            table.insert(installed, { dest = dest, scope = scope_label, name = name })
+            for _, file in ipairs(plugin.files or { "init.lua" }) do
+                local dest = path_prefix .. "plugins/" .. name .. "/" .. file
+                table.insert(installed, {
+                    dest = dest,
+                    scope = scope_label,
+                    name = name,
+                    plugin_name = name,
+                })
+            end
         end
     end
 
     -- Device root
     if device_root and fs.exists(device_root) then
         scan_plugins(device_root, "device", "")
+        scan_definition_dirs(device_root, "device", "agents", "agent_name", installed)
+        scan_definition_dirs(device_root, "device", "accessories", "accessory_name", installed)
     end
 
     -- Repo root
     local repo_config_dir = device_root and tostring(device_root):gsub("/+$", ""):match("([^/]+)$") or ".botster"
     if repo_root and fs.exists(repo_root .. "/" .. repo_config_dir) then
         scan_plugins(repo_root .. "/" .. repo_config_dir, "repo", "")
+        scan_definition_dirs(repo_root .. "/" .. repo_config_dir, "repo", "agents", "agent_name", installed)
+        scan_definition_dirs(repo_root .. "/" .. repo_config_dir, "repo", "accessories", "accessory_name", installed)
     end
 
     respond(client, sub_id, command.request_id, { ok = true, installed = installed })

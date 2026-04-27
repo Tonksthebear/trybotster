@@ -1,6 +1,6 @@
 -- Entity broadcast registry — wire protocol (delta) source of truth.
 --
--- Replaces the v1 "rebuild + broadcast every UiNodeV1 tree on any state
+-- Replaces the current "rebuild + broadcast every UiNode tree on any state
 -- change" pattern with "snapshot once on subscribe, ship per-entity field
 -- deltas thereafter." Each entity type (`session`, `workspace`,
 -- `spawn_target`, `worktree`, `hub`, `connection_code`, plus plugin types

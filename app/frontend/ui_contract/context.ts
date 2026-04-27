@@ -1,5 +1,5 @@
 import { createContext, useContext } from 'react'
-import type { UiActionV1, UiCapabilitySetV1, UiViewportV1 } from './types'
+import type { UiAction, UiCapabilitySet, UiViewport } from './types'
 
 /**
  * Optional metadata a primitive may attach when dispatching an action. Used
@@ -13,19 +13,19 @@ export type ActionDispatchSource = {
 
 /**
  * Called when a primitive's bound action is activated. Implementations route
- * the `UiActionV1` envelope to hub transport (Phase 2b's `ui_action` wire
+ * the `UiAction` envelope to hub transport (Phase 2b's `ui_action` wire
  * message), local store updates, or composite interceptors depending on the
  * action id.
  */
 export type ActionDispatch = (
-  action: UiActionV1,
+  action: UiAction,
   source?: ActionDispatchSource,
 ) => void
 
 /** Context handed to every primitive renderer by the interpreter. */
 export type RenderContext = {
-  viewport: UiViewportV1
-  capabilities: UiCapabilitySetV1
+  viewport: UiViewport
+  capabilities: UiCapabilitySet
   dispatch: ActionDispatch
   /**
    * Current hub id, threaded through by <UiTree>. Web-specific; optional
@@ -37,7 +37,7 @@ export type RenderContext = {
 }
 
 /** Default web capability set. Renderers may override in tests. */
-export const DEFAULT_WEB_CAPABILITIES: UiCapabilitySetV1 = {
+export const DEFAULT_WEB_CAPABILITIES: UiCapabilitySet = {
   hover: true,
   dialog: true,
   tooltip: true,

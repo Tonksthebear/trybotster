@@ -1,6 +1,6 @@
 // Public entry point for the Rails-owned React UI primitive registry.
 //
-// Phase C of the cross-client UI DSL. Consumes the `UiNodeV1` wire format
+// Phase C of the cross-client UI DSL. Consumes the `UiNode` wire format
 // defined by `cli/src/ui_contract/` (Phase A) and renders it with React +
 // Catalyst-aligned components.
 

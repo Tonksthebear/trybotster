@@ -58,7 +58,7 @@ export const useSettingsStore = create((set, get) => ({
   installedRepo: new Set(),
   installedStateLoaded: false,
   previewSlug: null,
-  scopeOverrides: {},
+  templateScope: 'device',
   templateFeedback: '',
   _installStateToken: 0,
 
@@ -71,9 +71,8 @@ export const useSettingsStore = create((set, get) => ({
   setEditorContent: (content) => set({ editorContent: content }),
   setPreviewSlug: (slug) => set({ previewSlug: slug }),
   setTemplateFeedback: (msg) => set({ templateFeedback: msg }),
-
-  setScopeOverride(slug, scope) {
-    set((s) => ({ scopeOverrides: { ...s.scopeOverrides, [slug]: scope } }))
+  setTemplateScope(scope) {
+    set({ templateScope: scope, previewSlug: null })
   },
 
   setConfigMetadata(meta) {
@@ -204,7 +203,10 @@ export const useSettingsStore = create((set, get) => ({
       const result = await scanSettingsTree({ hub, configScope: scope, selectedTargetId })
       if (!isCurrentScan()) return
       if (result.state === 'empty') {
-        set({ treeState: 'empty' })
+        const update = { tree: null, treeState: 'empty' }
+        if (scope === 'device') update.deviceTree = null
+        else update.repoTree = null
+        set(update)
         get()._invalidateAgentConfigQueries()
         return
       }
@@ -538,9 +540,9 @@ export const useSettingsStore = create((set, get) => ({
       const device = new Set()
       const repo = new Set()
       for (const entry of result.installed || []) {
-        if (!entry.name) continue
-        if (entry.scope === 'device') device.add(entry.name)
-        else if (entry.scope === 'repo') repo.add(entry.name)
+        if (!entry.dest) continue
+        if (entry.scope === 'device') device.add(entry.dest)
+        else if (entry.scope === 'repo') repo.add(entry.dest)
       }
 
       set({
@@ -560,11 +562,12 @@ export const useSettingsStore = create((set, get) => ({
     if (!hub) return false
 
     try {
-      const name = await installSettingsTemplate({ hub, dest, content, scope, targetId })
+      await installSettingsTemplate({ hub, dest, content, scope, targetId })
       const key = scope === 'repo' ? 'installedRepo' : 'installedDevice'
       const next = new Set(get()[key])
-      next.add(name)
+      next.add(dest)
       set({ [key]: next })
+      await get().refreshTreeAfterTemplateChange(scope, targetId)
       return true
     } catch {
       return false
@@ -576,15 +579,31 @@ export const useSettingsStore = create((set, get) => ({
     if (!hub) return false
 
     try {
-      const name = await uninstallSettingsTemplate({ hub, dest, scope, targetId })
+      await uninstallSettingsTemplate({ hub, dest, scope, targetId })
       const key = scope === 'repo' ? 'installedRepo' : 'installedDevice'
       const next = new Set(get()[key])
-      next.delete(name)
+      next.delete(dest)
       set({ [key]: next })
+      await get().refreshTreeAfterTemplateChange(scope, targetId)
       return true
     } catch {
       return false
     }
+  },
+
+  async refreshTreeAfterTemplateChange(scope, targetId) {
+    const updates = scope === 'repo' ? { repoTree: null } : { deviceTree: null }
+    const isVisibleScope =
+      get().configScope === scope &&
+      (scope !== 'repo' || get().selectedTargetId === (targetId || null))
+
+    if (!isVisibleScope) {
+      set(updates)
+      return
+    }
+
+    set(updates)
+    await get().scanTree()
   },
 
   async reloadPlugin(name, targetId) {
@@ -623,8 +642,4 @@ export function isDirty(state) {
     state.originalContent !== null &&
     state.editorContent !== state.originalContent
   )
-}
-
-export function getInstallScope(state, slug, defaultScope) {
-  return state.scopeOverrides[slug] || defaultScope || 'device'
 }

@@ -152,7 +152,11 @@ fn connection_code_error_rehydrates_late_subscribers() {
     let frames = snapshot_via("sub-error", &lua, &eb);
     let snapshot = frames.first().expect("snapshot");
     let items = snapshot["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1, "error state must rehydrate a late subscriber");
+    assert_eq!(
+        items.len(),
+        1,
+        "error state must rehydrate a late subscriber"
+    );
     assert_eq!(items[0]["hub_id"], json!("hub-test"));
     assert_eq!(items[0]["error"], json!("tunnel closed"));
     assert!(
@@ -171,10 +175,7 @@ fn never_set_last_connection_code_yields_empty_snapshot() {
 
     let frames = snapshot_via("sub-empty", &lua, &eb);
     let snapshot = frames.first().expect("snapshot");
-    let item_count = snapshot["items"]
-        .as_array()
-        .map(Vec::len)
-        .unwrap_or(0);
+    let item_count = snapshot["items"].as_array().map(Vec::len).unwrap_or(0);
     assert_eq!(
         item_count, 0,
         "no state → empty snapshot, got items={:?}",

@@ -56,7 +56,8 @@ fn cli_manifest_dir() -> PathBuf {
 ///   * `package.path` wired to `cli/lua/` so `require('vendor.sqlite')` and
 ///     `require('lib.plugin_db')` resolve.
 fn new_test_lua() -> Lua {
-    let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL_SAFE | StdLib::FFI, LuaOptions::default()) };
+    let lua =
+        unsafe { Lua::unsafe_new_with(StdLib::ALL_SAFE | StdLib::FFI, LuaOptions::default()) };
 
     botster::lua::primitives::fs::register(&lua).expect("register fs");
     botster::lua::primitives::log::register(&lua).expect("register log");
@@ -773,7 +774,8 @@ fn declaring_lower_version_refuses_load() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("Downgrades are not supported") && msg.contains("version=2")
+        msg.contains("Downgrades are not supported")
+            && msg.contains("version=2")
             && msg.contains("database is at version 3"),
         "downgrade error message missing expected content: {msg}"
     );
@@ -1057,7 +1059,10 @@ fn all_default_pragmas_applied_in_correct_order() {
         .eval()
         .expect("query all four default pragmas");
 
-    assert_eq!(jmode, "wal", "journal_mode should be WAL for file-backed db");
+    assert_eq!(
+        jmode, "wal",
+        "journal_mode should be WAL for file-backed db"
+    );
     assert_eq!(fkeys, 1, "foreign_keys should be ON (= 1)");
     assert_eq!(
         busy_timeout, 5000,
@@ -1432,9 +1437,7 @@ fn adding_required_column_without_default_errors_clearly() {
 
     let msg = err.to_string();
     assert!(
-        msg.contains("cannot add required column")
-            && msg.contains("b")
-            && msg.contains("default"),
+        msg.contains("cannot add required column") && msg.contains("b") && msg.contains("default"),
         "required-without-default message missing expected content: {msg}"
     );
 }

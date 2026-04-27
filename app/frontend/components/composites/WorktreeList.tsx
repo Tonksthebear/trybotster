@@ -4,7 +4,7 @@
 import React, { useMemo, type ReactElement } from 'react'
 
 import { useWorktreeStore } from '../../store/entities'
-import type { WorktreeListPropsV1 } from '../../ui_contract/types'
+import type { WorktreeListProps as UiWorktreeListProps } from '../../ui_contract/types'
 import type { RenderContext } from '../../ui_contract/context'
 
 type WorktreeRecord = {
@@ -14,7 +14,7 @@ type WorktreeRecord = {
   path?: string
 }
 
-export type WorktreeListProps = WorktreeListPropsV1 & { ctx: RenderContext }
+export type WorktreeListProps = UiWorktreeListProps & { ctx: RenderContext }
 
 export function WorktreeList({ targetId }: WorktreeListProps): ReactElement {
   const worktreeOrder = useWorktreeStore((state) => state.order)

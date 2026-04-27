@@ -4,12 +4,12 @@
 import React, { useMemo, type ReactElement } from 'react'
 
 import { useWorkspaceEntityStore } from '../../store/entities'
-import type { WorkspaceListPropsV1 } from '../../ui_contract/types'
+import type { WorkspaceListProps as UiWorkspaceListProps } from '../../ui_contract/types'
 import type { RenderContext } from '../../ui_contract/context'
 
 type WorkspaceRecord = { workspace_id?: string; name?: string; status?: string }
 
-export type WorkspaceListProps = WorkspaceListPropsV1 & { ctx: RenderContext }
+export type WorkspaceListProps = UiWorkspaceListProps & { ctx: RenderContext }
 
 export function WorkspaceList(_props: WorkspaceListProps): ReactElement {
   const workspaceOrder = useWorkspaceEntityStore((state) => state.order)

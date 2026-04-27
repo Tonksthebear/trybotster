@@ -20,7 +20,7 @@ if [ -f Procfile.local ]; then
     printf '\n'
     cat Procfile.local
   } > tmp/Procfile.dev.local
-  exec mise exec -- foreman start -f tmp/Procfile.dev.local "$@"
+  exec mise exec -- foreman start -f tmp/Procfile.dev.local -d . "$@"
 fi
 
 exec mise exec -- foreman start -f Procfile.dev "$@"

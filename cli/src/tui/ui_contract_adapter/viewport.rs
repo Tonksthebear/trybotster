@@ -1,4 +1,4 @@
-//! Terminal → [`UiViewportV1`] derivation for the TUI adapter.
+//! Terminal → [`UiViewport`] derivation for the TUI adapter.
 //!
 //! The cross-client viewport spec intentionally hides raw pixels / columns
 //! behind semantic classes (`compact` / `regular` / `expanded`,
@@ -13,7 +13,7 @@
 
 // Rust guideline compliant 2026-04-18
 
-use crate::ui_contract::viewport::{UiHeightClass, UiPointer, UiViewportV1, UiWidthClass};
+use crate::ui_contract::viewport::{UiHeightClass, UiPointer, UiViewport, UiWidthClass};
 
 /// Column below which the terminal is considered [`UiWidthClass::Compact`].
 ///
@@ -39,7 +39,7 @@ const SHORT_HEIGHT_MAX: u16 = 24;
 /// overlays.
 const TALL_HEIGHT_MIN: u16 = 40;
 
-/// Derive a [`UiViewportV1`] from a terminal's reported dimensions.
+/// Derive a [`UiViewport`] from a terminal's reported dimensions.
 ///
 /// # Arguments
 ///
@@ -54,11 +54,7 @@ const TALL_HEIGHT_MIN: u16 = 40;
 /// `orientation` and `keyboardOccluded` are intentionally omitted — neither
 /// is meaningful for a terminal emulator.
 #[must_use]
-pub fn derive_viewport_from_terminal(
-    cols: u16,
-    rows: u16,
-    supports_mouse: bool,
-) -> UiViewportV1 {
+pub fn derive_viewport_from_terminal(cols: u16, rows: u16, supports_mouse: bool) -> UiViewport {
     let width_class = width_class_for_cols(cols);
     let height_class = height_class_for_rows(rows);
     let pointer = if supports_mouse {
@@ -66,7 +62,7 @@ pub fn derive_viewport_from_terminal(
     } else {
         UiPointer::None
     };
-    UiViewportV1::new(width_class, height_class, pointer)
+    UiViewport::new(width_class, height_class, pointer)
 }
 
 /// Map terminal columns to [`UiWidthClass`].

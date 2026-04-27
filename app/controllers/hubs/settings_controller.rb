@@ -15,7 +15,7 @@ module Hubs
           render json: {
             configMetadata: config_metadata,
             templates: templates,
-            agentTemplates: templates["agents"] || [],
+            agentTemplates: agent_quick_setup_templates(templates),
             hubName: Current.hub.name,
             hubIdentifier: Current.hub.identifier
           }
@@ -73,17 +73,18 @@ module Hubs
       }
     end
 
-    # Parse app/templates/**/*.{lua,sh} into a grouped catalog.
+    # Parse app/templates/**/*.{lua,sh,md} into a grouped catalog.
     # Each template has @tag metadata in comment headers.
-    # Lua uses `-- @tag`, shell uses `# @tag`.
+    # Lua uses `-- @tag`, shell uses `# @tag`, Markdown uses `<!-- @tag -->`.
     def template_catalog
-      Dir.glob(Rails.root.join("app/templates/**/*.{lua,sh}")).filter_map { |path|
+      Dir.glob(Rails.root.join("app/templates/**/*.{lua,sh,md}")).filter_map { |path|
         content = File.read(path)
         meta = extract_template_metadata(content)
         next unless meta[:template] && meta[:category] && meta[:dest]
 
-        ext = File.extname(path)
-        basename = File.basename(path, ext)
+        relative = Pathname.new(path).relative_path_from(Rails.root.join("app/templates")).to_s
+        ext = File.extname(relative)
+        basename = relative.delete_suffix(ext).tr("/", "-")
 
         {
           slug: "#{meta[:category]}-#{basename}",
@@ -96,6 +97,10 @@ module Hubs
           content: content
         }
       }.group_by { |t| t[:category] }
+    end
+
+    def agent_quick_setup_templates(templates)
+      (templates["agents"] || []).select { |template| template[:dest].end_with?("/initialization") }
     end
   end
 end

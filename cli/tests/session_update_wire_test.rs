@@ -76,9 +76,7 @@ fn new_test_lua() -> (Lua, Table) {
     let register: Function = eb.get("register").unwrap();
     let opts: Table = lua.create_table().unwrap();
     opts.set("id_field", "session_uuid").unwrap();
-    let all_fn: Function = lua
-        .create_function(|lua, ()| lua.create_table())
-        .unwrap();
+    let all_fn: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
     opts.set("all", all_fn).unwrap();
     register.call::<()>(("session", opts)).unwrap();
 
@@ -105,9 +103,7 @@ fn frames_as_json(lua: &Lua, frames: &Table) -> Vec<JsonValue> {
     let mut out = Vec::with_capacity(len);
     for i in 1..=len {
         let frame: Table = frames.raw_get(i).unwrap();
-        let json = lua
-            .from_value::<JsonValue>(Value::Table(frame))
-            .unwrap();
+        let json = lua.from_value::<JsonValue>(Value::Table(frame)).unwrap();
         out.push(json);
     }
     out
@@ -276,7 +272,8 @@ fn no_ui_tree_snapshot_emitted_during_session_update_path() {
     for frame in &captured {
         assert_eq!(frame["type"], json!("entity_patch"));
         assert_ne!(
-            frame["type"], json!("ui_tree_snapshot"),
+            frame["type"],
+            json!("ui_tree_snapshot"),
             "Session:update must not trigger ui_tree_snapshot"
         );
     }

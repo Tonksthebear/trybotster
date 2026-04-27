@@ -1,7 +1,7 @@
 //! Web-layout primitive — `web_layout.render(surface, state)`.
 //!
 //! Phase 2a of the cross-client UI DSL migration: the hub Lua VM composes a
-//! `UiNodeV1` tree for browser surfaces and serialises it to JSON. The
+//! `UiNode` tree for browser surfaces and serialises it to JSON. The
 //! primitive is pure (no I/O beyond reading override files on disk, no
 //! broadcast) so browsers stay decoupled from the hub event loop until Phase
 //! 2b wires transport.
@@ -18,7 +18,7 @@
 //! 5. `require("web.layout")`            (embedded default, shipped in cli/lua/web/)
 //!
 //! Each candidate is a Lua chunk that returns a table keyed by surface name;
-//! `table[surface]` is expected to be a function `(state) -> UiNodeV1`.
+//! `table[surface]` is expected to be a function `(state) -> UiNode`.
 //!
 //! In dev mode (`BOTSTER_DEV=1`), `.botster-dev/` is tried before `.botster/`
 //! for each of the repo-scoped and device-scoped paths. Device-scoped paths
@@ -28,7 +28,7 @@
 //! # Error handling
 //!
 //! Any error raised while resolving, calling, or serialising the layout is
-//! wrapped and returned as a fallback `UiNodeV1` tree (an `ui.panel{}` with
+//! wrapped and returned as a fallback `UiNode` tree (an `ui.panel{}` with
 //! the error message). The hub Lua VM never observes a Rust error from this
 //! primitive — this is required so a broken layout file cannot crash a
 //! long-running hub.
@@ -41,7 +41,7 @@ use std::sync::Mutex;
 use anyhow::{anyhow, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
 
-use crate::ui_contract::node::UiNodeV1;
+use crate::ui_contract::node::UiNode;
 
 /// The env var that toggles dev-mode config directories (`.botster-dev/` vs
 /// `.botster/`). Matches the convention used elsewhere in the CLI.
@@ -80,7 +80,7 @@ const LAYOUT_SHARED_FILE: &str = "layout.lua";
 /// })
 /// ```
 ///
-/// The returned string is a JSON-encoded [`UiNodeV1`] tree ready to be shipped
+/// The returned string is a JSON-encoded [`UiNode`] tree ready to be shipped
 /// to browsers by the Phase 2b transport wiring.
 ///
 /// # Errors
@@ -199,12 +199,12 @@ fn render_surface(lua: &Lua, surface_name: &str, state: Value) -> Result<String>
         },
     };
 
-    let node: UiNodeV1 = lua
+    let node: UiNode = lua
         .from_value(returned)
-        .map_err(|e| anyhow!("surface `{surface_name}` did not return a UiNodeV1: {e}"))?;
+        .map_err(|e| anyhow!("surface `{surface_name}` did not return a UiNode: {e}"))?;
 
     serde_json::to_string(&node)
-        .map_err(|e| anyhow!("failed to serialise UiNodeV1 for `{surface_name}`: {e}"))
+        .map_err(|e| anyhow!("failed to serialise UiNode for `{surface_name}`: {e}"))
 }
 
 /// Look up `surface_name` in the resolved layout table and call it with the
@@ -559,9 +559,9 @@ fn load_embedded(lua: &Lua) -> Result<Table> {
 
 /// Produce a minimal fallback tree when layout evaluation fails.
 ///
-/// The shape deliberately uses only v1 primitives so the browser interpreter
+/// The shape deliberately uses only current primitives so the browser interpreter
 /// renders something recognisable instead of erroring. This is the contract
-/// the hub promises to transport: `render` returns valid `UiNodeV1` JSON even
+/// the hub promises to transport: `render` returns valid `UiNode` JSON even
 /// on failure.
 fn error_fallback_json(surface_name: &str, error_msg: &str) -> String {
     let node = serde_json::json!({
@@ -613,9 +613,13 @@ mod tests {
     #[test]
     fn error_fallback_is_valid_uinode_json() {
         let json = error_fallback_json("workspace_surface", "syntax error: unexpected '}'");
-        let node: UiNodeV1 = serde_json::from_str(&json).expect("fallback must deserialise");
+        let node: UiNode = serde_json::from_str(&json).expect("fallback must deserialise");
         assert_eq!(node.node_type, "panel");
-        let title = node.props.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let title = node
+            .props
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         assert!(
             title.contains("workspace_surface"),
             "fallback panel title must mention the surface: {title}"

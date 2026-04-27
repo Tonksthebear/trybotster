@@ -25,9 +25,9 @@ import {
   createTransportDispatch,
   type UiActionTransport,
 } from '..'
-import type { UiNodeV1, UiViewportV1 } from '../types'
+import type { UiNode, UiViewport } from '../types'
 
-const REGULAR_FINE: UiViewportV1 = {
+const REGULAR_FINE: UiViewport = {
   widthClass: 'expanded',
   heightClass: 'regular',
   pointer: 'fine',
@@ -38,7 +38,7 @@ afterEach(() => {
   vi.mocked(localDispatch).mockClear()
 })
 
-function selectButton(label: string): UiNodeV1 {
+function selectButton(label: string): UiNode {
   return {
     type: 'button',
     props: {
@@ -214,7 +214,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
       hubId: 'hub-9',
       targetSurface: 'workspace_surface',
     })
-    const node: UiNodeV1 = {
+    const node: UiNode = {
       type: 'button',
       props: {
         label: 'Toggle preview',
@@ -243,7 +243,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
       hubId: 'hub-x',
       targetSurface: 'workspace_surface',
     })
-    const node: UiNodeV1 = {
+    const node: UiNode = {
       type: 'button',
       props: {
         label: 'Nope',
@@ -263,7 +263,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
       hubId: 'hub-local',
       targetSurface: 'workspace_sidebar',
     })
-    const node: UiNodeV1 = {
+    const node: UiNode = {
       type: 'button',
       props: {
         label: 'New session',
@@ -287,7 +287,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
       hubId: 'hub-mixed',
       targetSurface: 'workspace_panel',
     })
-    const toggleNode: UiNodeV1 = {
+    const toggleNode: UiNode = {
       type: 'button',
       props: {
         label: 'Toggle',

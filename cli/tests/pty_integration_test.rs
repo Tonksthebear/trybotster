@@ -412,9 +412,7 @@ fn test_headless_sigterm_shuts_down_cleanly() {
                 if sent_at.elapsed() > EXIT_TIMEOUT {
                     let _ = child.kill();
                     let _ = child.wait();
-                    panic!(
-                        "headless hub did not exit within {EXIT_TIMEOUT:?} of SIGTERM"
-                    );
+                    panic!("headless hub did not exit within {EXIT_TIMEOUT:?} of SIGTERM");
                 }
                 thread::sleep(Duration::from_millis(50));
             }

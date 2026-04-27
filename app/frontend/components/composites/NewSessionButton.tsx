@@ -6,14 +6,14 @@
 import React, { type MouseEvent, type ReactElement } from 'react'
 
 import type {
-  NewSessionButtonPropsV1,
-  UiActionV1,
+  NewSessionButtonProps as UiNewSessionButtonProps,
+  UiAction,
 } from '../../ui_contract/types'
 import type { RenderContext } from '../../ui_contract/context'
 import { Button } from '../catalyst/button'
 import { IconGlyph } from '../../ui_contract/icons'
 
-export type NewSessionButtonProps = NewSessionButtonPropsV1 & {
+export type NewSessionButtonProps = UiNewSessionButtonProps & {
   ctx: RenderContext
 }
 
@@ -25,7 +25,7 @@ export function NewSessionButton({
     event.preventDefault()
     event.stopPropagation()
     if (action.disabled) return
-    ctx.dispatch(action as UiActionV1, {
+    ctx.dispatch(action as UiAction, {
       element: event.currentTarget as Element,
     })
   }

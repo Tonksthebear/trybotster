@@ -136,4 +136,6 @@ Template Lua files live in `app/templates/` and are installed via the `template:
 |----------|-------------|
 | `initialization/basic.lua` | `user/init.lua` — user's personal init |
 | `sessions/example.lua` | `sessions/example/init.lua` — starter session config |
-| `plugins/github.lua` | `plugins/github/init.lua` — GitHub integration |
+| `plugins/github/init.lua` | `plugins/github/init.lua` - GitHub plugin entrypoint |
+| `plugins/github/web_layout.lua` | `plugins/github/web_layout.lua` - plugin-owned support file |
+| `agents/claude/notes.md` | `agents/claude/notes.md` - paired agent definition file |

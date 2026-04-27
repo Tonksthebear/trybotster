@@ -454,6 +454,8 @@ enum Commands {
     Context {
         /// Context key (e.g., session_uuid, repo, prompt, issue_number)
         key: Option<String>,
+        /// Optional value for context helpers (e.g., `botster context file notes.md`)
+        value: Option<String>,
     },
     /// Run a per-session PTY process (internal — spawned by the hub)
     Session {
@@ -1127,8 +1129,8 @@ fn main() -> Result<()> {
             let socket_path = resolve_mcp_serve_socket()?;
             botster::mcp_gateway::run(&socket_path)?;
         }
-        Commands::Context { key } => {
-            commands::context::run(key.as_deref())?;
+        Commands::Context { key, value } => {
+            commands::context::run(key.as_deref(), value.as_deref())?;
         }
         Commands::Session {
             uuid,

@@ -39,7 +39,7 @@ The renderer computes exact breakpoints. The shared contract only exposes stable
 Every surface renderer should receive:
 
 ```ts
-type UiViewportV1 = {
+type UiViewport = {
   widthClass: "compact" | "regular" | "expanded"
   heightClass: "short" | "regular" | "tall"
   pointer: "none" | "coarse" | "fine"
@@ -52,8 +52,8 @@ Rules:
 
 - web derives this from browser viewport size, input mode, and visible viewport state
 - TUI derives this from terminal cols and rows
-- `pointer` supersedes the older boolean pointer capability; `UiCapabilitySetV1.hover` remains separate
-- `orientation` is optional in `v1` and may be omitted until a surface actually consumes it
+- `pointer` supersedes the older boolean pointer capability; `UiCapabilitySet.hover` remains separate
+- `orientation` is optional in `current` and may be omitted until a surface actually consumes it
 - `keyboardOccluded` is optional and primarily useful for web mobile keyboards
 - surfaces must not depend on raw viewport numbers unless a renderer-specific hint is explicitly needed
 
@@ -63,7 +63,7 @@ These are implementation guidelines, not Lua-visible APIs.
 
 ### Web
 
-Web should derive `UiViewportV1` from:
+Web should derive `UiViewport` from:
 
 - current visible viewport width and height
 - pointer media query or equivalent input heuristics
@@ -77,7 +77,7 @@ Recommended behavior:
 
 ### TUI
 
-TUI should derive `UiViewportV1` from:
+TUI should derive `UiViewport` from:
 
 - terminal columns
 - terminal rows
@@ -232,7 +232,7 @@ When `presentation = "auto"`:
 Interaction density is shared, but the renderer should adapt it through viewport context.
 
 ```ts
-type UiInteractionDensityV1 = "compact" | "comfortable"
+type UiInteractionDensity = "compact" | "comfortable"
 ```
 
 This name intentionally avoids collision with the web runtime phase-1 surface variant `Density = "sidebar" | "panel"`.
@@ -407,6 +407,6 @@ not:
 
 1. Add `ctx.viewport` and `ui.responsive()` to the shared authoring model.
 2. Keep the phase-1 web React island on its existing `sidebar` and `panel` surface variants.
-3. Add `UiViewportV1` consumption to the web runtime as a phase-2 follow-on.
+3. Add `UiViewport` consumption to the web runtime as a phase-2 follow-on.
 4. Add a small TUI adapter that derives the same viewport classes from terminal rows and cols.
 5. Use the workspace/session surface as the first adaptive reference implementation.

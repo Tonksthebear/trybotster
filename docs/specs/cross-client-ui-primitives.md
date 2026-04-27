@@ -100,21 +100,21 @@ Client-specific affordances and side effects:
 ## Core Shared Types
 
 ```ts
-type UiNodeV1 = {
-  type: UiPrimitiveTypeV1
+type UiNode = {
+  type: UiPrimitiveType
   id?: string
   props?: Record<string, unknown>
-  children?: UiNodeV1[]
-  slots?: Record<string, UiNodeV1[]>
+  children?: UiNode[]
+  slots?: Record<string, UiNode[]>
 }
 
-type UiActionV1 = {
+type UiAction = {
   id: string
   payload?: Record<string, unknown>
   disabled?: boolean
 }
 
-type UiCapabilitySetV1 = {
+type UiCapabilitySet = {
   hover: boolean
   dialog: boolean
   tooltip: boolean
@@ -129,7 +129,7 @@ Rules:
 - `props` hold primitive-specific state, not renderer config
 - `slots` are preferred over positional `children` whenever a component has semantic regions like `title`, `subtitle`, `start`, `end`, or `footer`
 - `id` is stable across frames and enables controlled or uncontrolled state in either renderer
-- pointer kind is defined by `UiViewportV1.pointer` in the adaptive viewport spec, not duplicated in `UiCapabilitySetV1`
+- pointer kind is defined by `UiViewport.pointer` in the adaptive viewport spec, not duplicated in `UiCapabilitySet`
 
 ## Shared Primitive Set
 
@@ -187,9 +187,9 @@ The shared props should be small and semantic.
 ### Shared style tokens
 
 ```ts
-type UiInteractionDensityV1 = "compact" | "comfortable"
-type UiToneV1 = "default" | "muted" | "accent" | "success" | "warning" | "danger"
-type UiAlignV1 = "start" | "center" | "end" | "stretch"
+type UiInteractionDensity = "compact" | "comfortable"
+type UiTone = "default" | "muted" | "accent" | "success" | "warning" | "danger"
+type UiAlign = "start" | "center" | "end" | "stretch"
 ```
 
 These tokens should mean the same thing in both clients, even though the concrete rendering differs.
@@ -197,10 +197,10 @@ These tokens should mean the same thing in both clients, even though the concret
 ### `stack`
 
 ```ts
-type StackPropsV1 = {
+type StackProps = {
   direction: "vertical" | "horizontal"
   gap?: "0" | "1" | "2" | "3" | "4" | "6"
-  align?: UiAlignV1
+  align?: UiAlign
   justify?: "start" | "center" | "end" | "between"
 }
 ```
@@ -210,20 +210,20 @@ This deliberately replaces separate `HSplit` and `VSplit` as the shared semantic
 ### `panel`
 
 ```ts
-type PanelPropsV1 = {
+type PanelProps = {
   title?: string
   tone?: "default" | "muted"
   border?: boolean
-  interactionDensity?: UiInteractionDensityV1
+  interactionDensity?: UiInteractionDensity
 }
 ```
 
 ### `text`
 
 ```ts
-type TextPropsV1 = {
+type TextProps = {
   text: string
-  tone?: UiToneV1
+  tone?: UiTone
   size?: "xs" | "sm" | "md"
   weight?: "regular" | "medium" | "semibold"
   monospace?: boolean
@@ -235,10 +235,10 @@ type TextPropsV1 = {
 ### `list_item`
 
 ```ts
-type ListItemPropsV1 = {
+type ListItemProps = {
   selected?: boolean
   disabled?: boolean
-  action?: UiActionV1
+  action?: UiAction
 }
 ```
 
@@ -256,12 +256,12 @@ Optional slots:
 ### `tree_item`
 
 ```ts
-type TreeItemPropsV1 = {
+type TreeItemProps = {
   id: string
   expanded?: boolean
   selected?: boolean
   notification?: boolean
-  action?: UiActionV1
+  action?: UiAction
 }
 ```
 
@@ -279,9 +279,9 @@ Optional slots:
 ### `button`
 
 ```ts
-type ButtonPropsV1 = {
+type ButtonProps = {
   label: string
-  action: UiActionV1
+  action: UiAction
   variant?: "solid" | "ghost"
   tone?: "default" | "accent" | "danger"
   icon?: string
@@ -291,8 +291,8 @@ type ButtonPropsV1 = {
 ### `menu`
 
 ```ts
-type MenuPropsV1 = {
-  trigger: UiNodeV1[]
+type MenuProps = {
+  trigger: UiNode[]
 }
 ```
 
@@ -303,7 +303,7 @@ Required slot:
 ### `dialog`
 
 ```ts
-type DialogPropsV1 = {
+type DialogProps = {
   open: boolean
   title: string
 }
@@ -317,7 +317,7 @@ Optional slots:
 ### `text_input`
 
 ```ts
-type TextInputPropsV1 = {
+type TextInputProps = {
   id: string
   value?: string
   placeholder?: string
@@ -335,7 +335,7 @@ That matches the TUI's current controlled/uncontrolled widget behavior and shoul
 ### `terminal_view`
 
 ```ts
-type TerminalViewPropsV1 = {
+type TerminalViewProps = {
   sessionUuid?: string | null
 }
 ```
@@ -343,7 +343,7 @@ type TerminalViewPropsV1 = {
 ### `connection_code_view`
 
 ```ts
-type ConnectionCodeViewPropsV1 = {
+type ConnectionCodeViewProps = {
   url: string
   qrAscii?: string[]
 }
@@ -414,7 +414,7 @@ The TUI list widget already has implicit regions like title and secondary lines.
 If a client needs rendering hints, keep them in a renderer-specific namespace:
 
 ```ts
-type RendererHintsV1 = {
+type RendererHints = {
   web?: Record<string, unknown>
   tui?: Record<string, unknown>
 }

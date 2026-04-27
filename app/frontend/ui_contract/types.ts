@@ -11,7 +11,7 @@
 
 // ---------- Scalar tokens ----------
 
-export type UiToneV1 =
+export type UiTone =
   | 'default'
   | 'muted'
   | 'accent'
@@ -19,32 +19,32 @@ export type UiToneV1 =
   | 'warning'
   | 'danger'
 
-export type UiAlignV1 = 'start' | 'center' | 'end' | 'stretch'
-export type UiJustifyV1 = 'start' | 'center' | 'end' | 'between'
-export type UiInteractionDensityV1 = 'compact' | 'comfortable'
-export type UiSizeV1 = 'xs' | 'sm' | 'md'
-export type UiSpaceV1 = '0' | '1' | '2' | '3' | '4' | '6'
-export type UiTextWeightV1 = 'regular' | 'medium' | 'semibold'
-export type UiStackDirectionV1 = 'vertical' | 'horizontal'
-export type UiScrollAxisV1 = 'y' | 'x' | 'both'
-export type UiPanelToneV1 = 'default' | 'muted'
-export type UiBadgeToneV1 =
+export type UiAlign = 'start' | 'center' | 'end' | 'stretch'
+export type UiJustify = 'start' | 'center' | 'end' | 'between'
+export type UiInteractionDensity = 'compact' | 'comfortable'
+export type UiSize = 'xs' | 'sm' | 'md'
+export type UiSpace = '0' | '1' | '2' | '3' | '4' | '6'
+export type UiTextWeight = 'regular' | 'medium' | 'semibold'
+export type UiStackDirection = 'vertical' | 'horizontal'
+export type UiScrollAxis = 'y' | 'x' | 'both'
+export type UiPanelTone = 'default' | 'muted'
+export type UiBadgeTone =
   | 'default'
   | 'accent'
   | 'success'
   | 'warning'
   | 'danger'
-export type UiBadgeSizeV1 = 'sm' | 'md'
-export type UiStatusDotStateV1 =
+export type UiBadgeSize = 'sm' | 'md'
+export type UiStatusDotState =
   | 'neutral'
   | 'idle'
   | 'active'
   | 'success'
   | 'warning'
   | 'danger'
-export type UiButtonVariantV1 = 'solid' | 'ghost'
-export type UiButtonToneV1 = 'default' | 'accent' | 'danger'
-export type UiPresentationV1 =
+export type UiButtonVariant = 'solid' | 'ghost'
+export type UiButtonTone = 'default' | 'accent' | 'danger'
+export type UiPresentation =
   | 'auto'
   | 'inline'
   | 'overlay'
@@ -53,77 +53,77 @@ export type UiPresentationV1 =
 
 // ---------- Viewport classes ----------
 
-export type UiWidthClassV1 = 'compact' | 'regular' | 'expanded'
-export type UiHeightClassV1 = 'short' | 'regular' | 'tall'
-export type UiPointerV1 = 'none' | 'coarse' | 'fine'
-export type UiOrientationV1 = 'portrait' | 'landscape'
+export type UiWidthClass = 'compact' | 'regular' | 'expanded'
+export type UiHeightClass = 'short' | 'regular' | 'tall'
+export type UiPointer = 'none' | 'coarse' | 'fine'
+export type UiOrientation = 'portrait' | 'landscape'
 
-export type UiViewportV1 = {
-  widthClass: UiWidthClassV1
-  heightClass: UiHeightClassV1
-  pointer: UiPointerV1
-  orientation?: UiOrientationV1
+export type UiViewport = {
+  widthClass: UiWidthClass
+  heightClass: UiHeightClass
+  pointer: UiPointer
+  orientation?: UiOrientation
   keyboardOccluded?: boolean
 }
 
 // ---------- Responsive + conditional wire sentinels ----------
 
-export type UiResponsiveWidthV1<T> = {
+export type UiResponsiveWidth<T> = {
   compact?: T
   regular?: T
   expanded?: T
 }
 
-export type UiResponsiveHeightV1<T> = {
+export type UiResponsiveHeight<T> = {
   short?: T
   regular?: T
   tall?: T
 }
 
-export type UiResponsiveV1<T> = {
+export type UiResponsive<T> = {
   $kind: 'responsive'
-  width?: UiResponsiveWidthV1<T>
-  height?: UiResponsiveHeightV1<T>
+  width?: UiResponsiveWidth<T>
+  height?: UiResponsiveHeight<T>
 }
 
 /** Either a concrete `T` or a `$kind: "responsive"` sentinel. */
-export type UiValueV1<T> = T | UiResponsiveV1<T>
+export type UiValue<T> = T | UiResponsive<T>
 
-export type UiConditionV1 = {
-  width?: UiWidthClassV1
-  height?: UiHeightClassV1
-  pointer?: UiPointerV1
-  orientation?: UiOrientationV1
+export type UiCondition = {
+  width?: UiWidthClass
+  height?: UiHeightClass
+  pointer?: UiPointer
+  orientation?: UiOrientation
   keyboardOccluded?: boolean
 }
 
-export type UiConditionalV1 =
-  | { $kind: 'when'; condition: UiConditionV1; node: UiNodeV1 }
-  | { $kind: 'hidden'; condition: UiConditionV1; node: UiNodeV1 }
+export type UiConditional =
+  | { $kind: 'when'; condition: UiCondition; node: UiNode }
+  | { $kind: 'hidden'; condition: UiCondition; node: UiNode }
 
 // ---------- Core node + action + capabilities ----------
 
 /** Arbitrary prop bag — primitive-specific Props types narrow this further. */
-export type UiPropsV1 = Record<string, unknown>
+export type UiProps = Record<string, unknown>
 
-export type UiNodeV1 = {
+export type UiNode = {
   type: string
   id?: string
-  props?: UiPropsV1
-  children?: UiChildV1[]
-  slots?: Record<string, UiChildV1[]>
+  props?: UiProps
+  children?: UiChild[]
+  slots?: Record<string, UiChild[]>
 }
 
 /** What may appear in `children` / slots: a node or a conditional wrapper. */
-export type UiChildV1 = UiNodeV1 | UiConditionalV1
+export type UiChild = UiNode | UiConditional
 
-export type UiActionV1 = {
+export type UiAction = {
   id: string
   payload?: Record<string, unknown>
   disabled?: boolean
 }
 
-export type UiCapabilitySetV1 = {
+export type UiCapabilitySet = {
   hover: boolean
   dialog: boolean
   tooltip: boolean
@@ -133,147 +133,147 @@ export type UiCapabilitySetV1 = {
 
 // ---------- Strongly-typed Props per primitive ----------
 //
-// These are the browser-side mirrors of the Rust `*PropsV1` structs. Every
+// These are the browser-side mirrors of the Rust `*Props` structs. Every
 // field matches the cross-client spec exactly.
 
-export type StackPropsV1 = {
-  direction: UiValueV1<UiStackDirectionV1>
-  gap?: UiValueV1<UiSpaceV1>
-  align?: UiValueV1<UiAlignV1>
-  justify?: UiValueV1<UiJustifyV1>
+export type StackProps = {
+  direction: UiValue<UiStackDirection>
+  gap?: UiValue<UiSpace>
+  align?: UiValue<UiAlign>
+  justify?: UiValue<UiJustify>
 }
 
-export type InlinePropsV1 = {
-  gap?: UiValueV1<UiSpaceV1>
-  align?: UiValueV1<UiAlignV1>
-  justify?: UiValueV1<UiJustifyV1>
+export type InlineProps = {
+  gap?: UiValue<UiSpace>
+  align?: UiValue<UiAlign>
+  justify?: UiValue<UiJustify>
   wrap?: boolean
 }
 
-export type PanelPropsV1 = {
+export type PanelProps = {
   title?: string
-  tone?: UiPanelToneV1
+  tone?: UiPanelTone
   border?: boolean
-  interactionDensity?: UiValueV1<UiInteractionDensityV1>
+  interactionDensity?: UiValue<UiInteractionDensity>
 }
 
-export type ScrollAreaPropsV1 = {
-  axis?: UiScrollAxisV1
+export type ScrollAreaProps = {
+  axis?: UiScrollAxis
 }
 
-export type TextPropsV1 = {
+export type TextProps = {
   text: string
-  tone?: UiToneV1
-  size?: UiSizeV1
-  weight?: UiTextWeightV1
+  tone?: UiTone
+  size?: UiSize
+  weight?: UiTextWeight
   monospace?: boolean
   italic?: boolean
   truncate?: boolean
 }
 
-export type IconPropsV1 = {
+export type IconProps = {
   name: string
-  size?: UiSizeV1
-  tone?: UiToneV1
+  size?: UiSize
+  tone?: UiTone
   label?: string
 }
 
-export type BadgePropsV1 = {
+export type BadgeProps = {
   text: string
-  tone?: UiBadgeToneV1
-  size?: UiBadgeSizeV1
+  tone?: UiBadgeTone
+  size?: UiBadgeSize
 }
 
-export type StatusDotPropsV1 = {
-  state: UiStatusDotStateV1
+export type StatusDotProps = {
+  state: UiStatusDotState
   label?: string
 }
 
-export type EmptyStatePropsV1 = {
+export type EmptyStateProps = {
   title: string
   description?: string
   icon?: string
-  primaryAction?: UiActionV1
+  primaryAction?: UiAction
 }
 
-export type ButtonPropsV1 = {
+export type ButtonProps = {
   label: string
-  action: UiActionV1
-  variant?: UiButtonVariantV1
-  tone?: UiButtonToneV1
+  action: UiAction
+  variant?: UiButtonVariant
+  tone?: UiButtonTone
   /** Cross-client canonical name; NOT `leadingIcon`. */
   icon?: string
 }
 
-export type IconButtonPropsV1 = {
+export type IconButtonProps = {
   icon: string
   label: string
-  action: UiActionV1
-  tone?: UiButtonToneV1
+  action: UiAction
+  tone?: UiButtonTone
 }
 
 /**
- * Tree has no shared props in v1 — the web-only `density` surface variant is
+ * Tree has no shared props in current — the web-only `density` surface variant is
  * renderer-internal. Renderers read Tree nodes without a props struct.
  */
-export type TreePropsV1 = Record<string, never>
+export type TreeProps = Record<string, never>
 
-export type TreeItemPropsV1 = {
+export type TreeItemProps = {
   expanded?: boolean
   selected?: boolean
   notification?: boolean
-  action?: UiActionV1
+  action?: UiAction
 }
 
-export type DialogPropsV1 = {
+export type DialogProps = {
   open: boolean
   title: string
   /** Adaptive-spec extension; defaults to `"auto"` in the Lua constructor. */
-  presentation?: UiPresentationV1
+  presentation?: UiPresentation
 }
 
 // ---------- Wire protocol — surface tokens ----------
 
 /**
  * Surface-density token for composites. Distinct from
- * `UiInteractionDensityV1` (compact / comfortable hit targets) — this is the
+ * `UiInteractionDensity` (compact / comfortable hit targets) — this is the
  * public sidebar / panel variant from the Phase-1 web layout.
  */
-export type UiSurfaceDensityV1 = 'sidebar' | 'panel'
+export type UiSurfaceDensity = 'sidebar' | 'panel'
 
 /** Grouping mode for `session_list`. */
-export type UiSessionListGroupingV1 = 'workspace' | 'flat'
+export type UiSessionListGrouping = 'workspace' | 'flat'
 
 // ---------- Wire protocol — composite primitive Props ----------
 
-export type SessionListPropsV1 = {
-  density?: UiValueV1<UiSurfaceDensityV1>
-  grouping?: UiSessionListGroupingV1
+export type SessionListProps = {
+  density?: UiValue<UiSurfaceDensity>
+  grouping?: UiSessionListGrouping
   showNavEntries?: boolean
 }
 
-export type WorkspaceListPropsV1 = {
-  density?: UiValueV1<UiSurfaceDensityV1>
+export type WorkspaceListProps = {
+  density?: UiValue<UiSurfaceDensity>
 }
 
-export type SpawnTargetListPropsV1 = {
-  onSelect?: UiActionV1
-  onRemove?: UiActionV1
+export type SpawnTargetListProps = {
+  onSelect?: UiAction
+  onRemove?: UiAction
 }
 
-export type WorktreeListPropsV1 = {
+export type WorktreeListProps = {
   targetId: string
 }
 
-export type SessionRowPropsV1 = {
+export type SessionRowProps = {
   sessionUuid: string
-  density?: UiValueV1<UiSurfaceDensityV1>
+  density?: UiValue<UiSurfaceDensity>
 }
 
-export type HubRecoveryStatePropsV1 = Record<string, never>
+export type HubRecoveryStateProps = Record<string, never>
 
-export type NewSessionButtonPropsV1 = {
-  action: UiActionV1
+export type NewSessionButtonProps = {
+  action: UiAction
 }
 
 // ---------- Wire protocol — `$bind` sentinel ----------
@@ -283,18 +283,18 @@ export type NewSessionButtonPropsV1 = {
  * Resolved client-side against the per-entity-type stores before primitive
  * dispatch. See `app/frontend/ui_contract/binding.tsx`.
  */
-export type UiBindV1 = { $bind: string }
+export type UiBind = { $bind: string }
 
 /** Wire shape of a `$kind = "bind_list"` envelope. */
-export type UiBindListV1 = {
+export type UiBindList = {
   $kind: 'bind_list'
   source: string
-  item_template: UiNodeV1
+  item_template: UiNode
 }
 
 // ---------- Primitive type-name union ----------
 
-export type UiPrimitiveTypeV1 =
+export type UiPrimitiveType =
   | 'stack'
   | 'inline'
   | 'panel'
@@ -320,31 +320,31 @@ export type UiPrimitiveTypeV1 =
 
 // ---------- Narrow child-kind guards ----------
 
-export function isConditional(child: UiChildV1): child is UiConditionalV1 {
-  return (child as UiConditionalV1).$kind === 'when' ||
-    (child as UiConditionalV1).$kind === 'hidden'
+export function isConditional(child: UiChild): child is UiConditional {
+  return (child as UiConditional).$kind === 'when' ||
+    (child as UiConditional).$kind === 'hidden'
 }
 
 /** Returns true when `value` is a `$bind` sentinel object. */
-export function isBindSentinel(value: unknown): value is UiBindV1 {
+export function isBindSentinel(value: unknown): value is UiBind {
   if (value === null || typeof value !== 'object') return false
   const v = value as Record<string, unknown>
   return Object.keys(v).length === 1 && typeof v.$bind === 'string'
 }
 
 /** Returns true when `value` is a `$kind = "bind_list"` envelope. */
-export function isBindList(value: unknown): value is UiBindListV1 {
+export function isBindList(value: unknown): value is UiBindList {
   if (value === null || typeof value !== 'object') return false
   const v = value as Record<string, unknown>
   return v.$kind === 'bind_list' && typeof v.source === 'string'
 }
 
 export function isResponsive<T>(
-  value: UiValueV1<T> | undefined,
-): value is UiResponsiveV1<T> {
+  value: UiValue<T> | undefined,
+): value is UiResponsive<T> {
   return (
     typeof value === 'object' &&
     value !== null &&
-    (value as UiResponsiveV1<T>).$kind === 'responsive'
+    (value as UiResponsive<T>).$kind === 'responsive'
   )
 }

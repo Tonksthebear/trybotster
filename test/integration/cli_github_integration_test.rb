@@ -111,12 +111,12 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
 
       # Wait for the agent to be FULLY spawned (not just worktree created).
       # Agent.new() registers metadata only after worktree_created fires and
-      # spawn_agent runs. The "Broadcasting agent_created" log confirms the
-      # agent is registered and findable by metadata queries.
+      # spawn_agent runs. The session entity upsert confirms the agent is
+      # registered and findable by metadata queries.
       wait_until(
         timeout: 20,
         message: -> { "Agent not fully spawned.\nCLI logs:\n#{cli.log_contents(lines: 80)}" }
-      ) { cli.log_contents(lines: 100)&.match?(/Broadcasting agent_created/) }
+      ) { cli.log_contents(lines: 100)&.match?(/Broadcasting entity_upsert\(session\)/) }
 
       # Send a follow-up comment on the same issue
       followup_message = create_github_message(
@@ -314,14 +314,14 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     end
   end
 
-  # Install the github.lua plugin into the repo's .botster/ directory.
+  # Install the GitHub plugin into the repo's .botster/ directory.
   # The Lua runtime discovers plugins via ConfigResolver scanning
   # {repo}/.botster/plugins/{name}/init.lua
   def install_github_plugin(repo_path, repo_config_dirname:)
     plugin_dir = File.join(repo_path, repo_config_dirname, "plugins", "github")
     FileUtils.mkdir_p(plugin_dir)
 
-    source = Rails.root.join("app/templates/plugins/github.lua")
+    source = Rails.root.join("app/templates/plugins/github/init.lua")
     dest = File.join(plugin_dir, "init.lua")
 
     # Copy plugin, stripping template metadata comments (@template, @dest, etc.)

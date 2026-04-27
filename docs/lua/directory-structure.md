@@ -51,11 +51,11 @@ In **release builds**, all files are embedded via `build.rs` into `EMBEDDED_LUA_
       layout.lua    # Highest-priority TUI layout override
       keybindings.lua
       actions.lua
-  plugins/*/init.lua         # User plugins (loaded by ConfigResolver)
+  plugins/*/init.lua         # Plugin entrypoints (loaded by ConfigResolver)
   improvements/*.lua         # Agent-written improvements (sandboxed)
 ```
 
-Override search chain for `require()`: `{repo}/.botster/lua/` -> `~/.botster/lua/` -> embedded binary (fallback). The `package.path` includes `?.lua`, `?/init.lua`, `lib/?.lua`, `handlers/?.lua`, `hub/?.lua`, `plugins/?.lua`, `plugins/?/init.lua`.
+Override search chain for `require()`: `{repo}/.botster/lua/` -> `~/.botster/lua/` -> embedded binary (fallback). The `package.path` includes `?.lua`, `?/init.lua`, `lib/?.lua`, `handlers/?.lua`, and `hub/?.lua`. While a plugin loads, Botster also adds that plugin's root directory and optional `lua/` directory so `init.lua` can require sibling files.
 
 ## `.botster/` Config Directory (2-Layer Resolution)
 
@@ -66,19 +66,24 @@ ConfigResolver merges configs across 2 layers (repo wins on name collision):
   agents/
     claude/
       initialization                     # REQUIRED: at least one agent config
+      notes.md                           # Optional paired file owned by this agent
   accessories/
     rails-server/                        # Optional: plain PTY sessions
       initialization
       port_forward                       # Sentinel file: session gets $PORT env var
   workspaces/
     dev.json                             # Workspace manifest (auto-spawn group)
-  plugins/{name}/init.lua                # Device-level plugins
+  plugins/
+    {name}/
+      init.lua                           # Device-level plugin entrypoint
+      web_layout.lua                     # Optional plugin-owned support files
+      tui/status.lua                     # Optional TUI file declared by init.lua
 
 {repo}/.botster/                         # repo_root (Layer 2, highest priority)
   agents/ accessories/ workspaces/ plugins/
 ```
 
-Agents, accessories, and plugins are all merged per-name with repo overriding device.
+Agents, accessories, and plugins are directory units merged per-name with repo overriding device. Only the entrypoint filename is fixed: sessions use `initialization`, plugins use `init.lua`, and any other files in the directory are owned by that definition. Session scripts can use `botster context session_dir` to locate the owning `agents/<name>/` or `accessories/<name>/` directory, or `botster context file <relative-path>` to read a paired file by whatever name the author chooses.
 
 Worktree file copying and cleanup are handled via the **Workspace Include** plugin template (hooks into `worktree_created` and `worktree_deleted`).
 

@@ -4,17 +4,23 @@
   Sessions are the PTY processes managed by Botster. There are two types:
   <strong class="text-zinc-200">agents</strong> (AI-driven, e.g., Claude) and
   <strong class="text-zinc-200">accessories</strong> (plain PTYs, e.g., dev servers).
-  Each session runs a single PTY.
+  Each session definition owns a directory, and each running session starts one PTY from that definition.
 </p>
 
 <h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Agents</h2>
 <p class="text-zinc-400 mb-4">
   Agent definitions live in <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">agents/</code>.
-  At least one agent config is required. The initialization script is the entry point.
+  At least one agent config is required. The <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">initialization</code>
+  script is the entry point; any other files in the directory are owned by that agent definition.
 </p>
 <pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code># .botster/agents/claude/initialization
 #!/bin/bash
-claude --dangerously-skip-permissions</code></pre>
+EXTRA_ARGS=()
+if notes="$(botster context file notes.md 2>/dev/null)"; then
+  EXTRA_ARGS+=(--append-system-prompt "$notes")
+fi
+
+claude "${EXTRA_ARGS[@]}" --dangerously-skip-permissions</code></pre>
 
 <h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Accessories</h2>
 <p class="text-zinc-400 mb-4">

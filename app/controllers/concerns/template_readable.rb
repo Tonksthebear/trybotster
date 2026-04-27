@@ -24,16 +24,19 @@ module TemplateReadable
   end
 
   # Extract @tag metadata from comment headers.
-  # Supports both Lua (`-- @tag value`) and shell (`# @tag value`) comments.
+  # Supports Lua (`-- @tag value`), shell (`# @tag value`), and Markdown
+  # HTML comments (`<!-- @tag value -->`).
   # Stops at the first non-comment line (ignoring shebangs and blank lines).
   def extract_template_metadata(content)
     metadata = {}
     content.each_line do |line|
       next if line.start_with?("#!") # skip shebang
       next if line.strip.empty?
-      break unless line.start_with?("--") || line.start_with?("#")
+      break unless line.start_with?("--") || line.start_with?("#") || line.start_with?("<!--")
 
       if (match = line.match(/^(?:--|#)\s*@(\w+)\s+(.+)/))
+        metadata[match[1].to_sym] = match[2].strip
+      elsif (match = line.match(/^<!--\s*@(\w+)\s+(.+?)\s*-->/))
         metadata[match[1].to_sym] = match[2].strip
       end
     end

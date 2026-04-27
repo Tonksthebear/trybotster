@@ -1,4 +1,4 @@
-//! Core wire types — `UiNodeV1`, `UiActionV1`, `UiCapabilitySetV1`, and the
+//! Core wire types — `UiNode`, `UiAction`, `UiCapabilitySet`, and the
 //! `$kind`-tagged sentinels for responsive values and conditional rendering.
 //!
 //! These are the renderer-agnostic JSON shapes that both the TUI and web
@@ -15,29 +15,29 @@ use crate::ui_contract::viewport::{UiHeightClass, UiOrientation, UiPointer, UiWi
 /// Semantic UI node. `type` names come from the shared primitive inventory
 /// defined in the cross-client spec.
 ///
-/// Children and slots use [`UiChildV1`] so they can hold either a regular
+/// Children and slots use [`UiChild`] so they can hold either a regular
 /// node or a `$kind`-tagged conditional wrapper.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UiNodeV1 {
+pub struct UiNode {
     /// Primitive name (e.g. `"stack"`, `"tree_item"`).
     #[serde(rename = "type")]
     pub node_type: String,
     /// Stable id, used for controlled / uncontrolled state ownership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// Primitive-specific props. May contain [`UiResponsiveV1`] sentinels at
+    /// Primitive-specific props. May contain [`UiResponsive`] sentinels at
     /// any value position.
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub props: JsonMap<String, JsonValue>,
     /// Positional children.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub children: Vec<UiChildV1>,
+    pub children: Vec<UiChild>,
     /// Semantic slots such as `title`, `subtitle`, `start`, `end`, `footer`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub slots: BTreeMap<String, Vec<UiChildV1>>,
+    pub slots: BTreeMap<String, Vec<UiChild>>,
 }
 
-impl UiNodeV1 {
+impl UiNode {
     /// Build a node with the given primitive type and empty everything else.
     #[must_use]
     pub fn new(node_type: impl Into<String>) -> Self {
@@ -65,21 +65,21 @@ impl UiNodeV1 {
 /// first (they carry `$kind`) and falls through to the regular node shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum UiChildV1 {
+pub enum UiChild {
     /// A `$kind`-tagged conditional wrapper (`when` or `hidden`).
-    Conditional(UiConditionalV1),
+    Conditional(UiConditional),
     /// A regular primitive node.
-    Node(UiNodeV1),
+    Node(UiNode),
 }
 
-impl From<UiNodeV1> for UiChildV1 {
-    fn from(value: UiNodeV1) -> Self {
+impl From<UiNode> for UiChild {
+    fn from(value: UiNode) -> Self {
         Self::Node(value)
     }
 }
 
-impl From<UiConditionalV1> for UiChildV1 {
-    fn from(value: UiConditionalV1) -> Self {
+impl From<UiConditional> for UiChild {
+    fn from(value: UiConditional) -> Self {
         Self::Conditional(value)
     }
 }
@@ -96,20 +96,20 @@ impl From<UiConditionalV1> for UiChildV1 {
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "$kind", rename_all = "lowercase")]
-pub enum UiConditionalV1 {
+pub enum UiConditional {
     /// Render the inner node only when `condition` matches the viewport.
     When {
         /// Viewport predicate.
-        condition: UiConditionV1,
+        condition: UiCondition,
         /// Wrapped node.
-        node: Box<UiNodeV1>,
+        node: Box<UiNode>,
     },
     /// Render the inner node only when `condition` does NOT match the viewport.
     Hidden {
         /// Viewport predicate.
-        condition: UiConditionV1,
+        condition: UiCondition,
         /// Wrapped node.
-        node: Box<UiNodeV1>,
+        node: Box<UiNode>,
     },
 }
 
@@ -120,7 +120,7 @@ pub enum UiConditionalV1 {
 /// corresponding field.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UiConditionV1 {
+pub struct UiCondition {
     /// Width-class match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width: Option<UiWidthClass>,
@@ -159,24 +159,24 @@ pub struct UiConditionV1 {
 /// exact match, then next smaller class, then next larger class.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "$kind", rename_all = "lowercase")]
-pub enum UiResponsiveV1<T> {
+pub enum UiResponsive<T> {
     /// Dimension-keyed responsive value.
     Responsive {
         /// Breakpoint values keyed by `UiWidthClass`.
         #[serde(default = "default_none", skip_serializing_if = "Option::is_none")]
-        width: Option<UiResponsiveWidthV1<T>>,
+        width: Option<UiResponsiveWidth<T>>,
         /// Breakpoint values keyed by `UiHeightClass`.
         #[serde(default = "default_none", skip_serializing_if = "Option::is_none")]
-        height: Option<UiResponsiveHeightV1<T>>,
+        height: Option<UiResponsiveHeight<T>>,
     },
 }
 
 /// Width-dimension breakpoint map.
 ///
 /// At least one field should be populated in practice; an all-`None`
-/// [`UiResponsiveWidthV1`] carries no information.
+/// [`UiResponsiveWidth`] carries no information.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UiResponsiveWidthV1<T> {
+pub struct UiResponsiveWidth<T> {
     /// Value for `widthClass = compact`.
     #[serde(default = "default_none", skip_serializing_if = "Option::is_none")]
     pub compact: Option<T>,
@@ -190,13 +190,17 @@ pub struct UiResponsiveWidthV1<T> {
 
 // Hand-rolled Default so T is NOT required to implement Default (Option<T>
 // is None regardless of T).
-impl<T> Default for UiResponsiveWidthV1<T> {
+impl<T> Default for UiResponsiveWidth<T> {
     fn default() -> Self {
-        Self { compact: None, regular: None, expanded: None }
+        Self {
+            compact: None,
+            regular: None,
+            expanded: None,
+        }
     }
 }
 
-impl<T> UiResponsiveWidthV1<T> {
+impl<T> UiResponsiveWidth<T> {
     /// True if every breakpoint is `None`.
     pub const fn is_empty(&self) -> bool {
         self.compact.is_none() && self.regular.is_none() && self.expanded.is_none()
@@ -205,7 +209,7 @@ impl<T> UiResponsiveWidthV1<T> {
 
 /// Height-dimension breakpoint map.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UiResponsiveHeightV1<T> {
+pub struct UiResponsiveHeight<T> {
     /// Value for `heightClass = short`.
     #[serde(default = "default_none", skip_serializing_if = "Option::is_none")]
     pub short: Option<T>,
@@ -217,13 +221,17 @@ pub struct UiResponsiveHeightV1<T> {
     pub tall: Option<T>,
 }
 
-impl<T> Default for UiResponsiveHeightV1<T> {
+impl<T> Default for UiResponsiveHeight<T> {
     fn default() -> Self {
-        Self { short: None, regular: None, tall: None }
+        Self {
+            short: None,
+            regular: None,
+            tall: None,
+        }
     }
 }
 
-impl<T> UiResponsiveHeightV1<T> {
+impl<T> UiResponsiveHeight<T> {
     /// True if every breakpoint is `None`.
     pub const fn is_empty(&self) -> bool {
         self.short.is_none() && self.regular.is_none() && self.tall.is_none()
@@ -234,34 +242,34 @@ const fn default_none<T>() -> Option<T> {
     None
 }
 
-/// Either a concrete value `T` or a `UiResponsiveV1<T>` sentinel.
+/// Either a concrete value `T` or a `UiResponsive<T>` sentinel.
 ///
 /// Useful when typed Props definitions need to express "this field may be
 /// responsive". Serializes as an untagged union — renderers either see the
 /// scalar or the `$kind: "responsive"` object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum UiValueV1<T> {
+pub enum UiValue<T> {
     /// A `$kind`-tagged responsive wrapper.
-    Responsive(UiResponsiveV1<T>),
+    Responsive(UiResponsive<T>),
     /// A concrete value.
     Scalar(T),
 }
 
-impl<T> UiValueV1<T> {
+impl<T> UiValue<T> {
     /// Wrap a scalar value.
     pub fn scalar(value: T) -> Self {
         Self::Scalar(value)
     }
 }
 
-/// Semantic action envelope (`UiActionV1`).
+/// Semantic action envelope (`UiAction`).
 ///
 /// Action ids are namespaced Botster intents (e.g. `botster.session.select`).
 /// Payloads carry stable domain ids (`sessionUuid`, `workspaceId`) rather than
 /// renderer-local identifiers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UiActionV1 {
+pub struct UiAction {
     /// Semantic action id.
     pub id: String,
     /// Action payload.
@@ -272,22 +280,26 @@ pub struct UiActionV1 {
     pub disabled: Option<bool>,
 }
 
-impl UiActionV1 {
+impl UiAction {
     /// Build an action with the given id and no payload.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into(), payload: JsonMap::new(), disabled: None }
+        Self {
+            id: id.into(),
+            payload: JsonMap::new(),
+            disabled: None,
+        }
     }
 }
 
-/// Renderer capability set (`UiCapabilitySetV1`).
+/// Renderer capability set (`UiCapabilitySet`).
 ///
 /// Authors use these booleans to gracefully degrade behavior (e.g. skip a
 /// tooltip when `tooltip == false`). Renderers populate the set based on
 /// their platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UiCapabilitySetV1 {
+pub struct UiCapabilitySet {
     /// Hover is a meaningful interaction on this client.
     pub hover: bool,
     /// Dialogs are supported natively.
@@ -312,28 +324,28 @@ mod tests {
 
     #[test]
     fn uinode_minimal_serializes_type_only() {
-        let node = UiNodeV1::new("stack");
+        let node = UiNode::new("stack");
         let s = serde_json::to_value(&node).expect("serialize");
         assert_eq!(s, json!({ "type": "stack" }));
     }
 
     #[test]
     fn uinode_round_trip() {
-        let mut node = UiNodeV1::new("panel").with_id("preview-error");
+        let mut node = UiNode::new("panel").with_id("preview-error");
         node.props.insert("border".into(), json!(true));
-        node.children.push(UiNodeV1::new("text").into());
+        node.children.push(UiNode::new("text").into());
         node.slots
-            .insert("title".into(), vec![UiNodeV1::new("text").into()]);
+            .insert("title".into(), vec![UiNode::new("text").into()]);
 
         let s = serde_json::to_string(&node).expect("serialize");
-        let back: UiNodeV1 = serde_json::from_str(&s).expect("deserialize");
+        let back: UiNode = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, node);
     }
 
     #[test]
     fn responsive_width_only_wire_shape() {
-        let resp: UiResponsiveV1<String> = UiResponsiveV1::Responsive {
-            width: Some(UiResponsiveWidthV1 {
+        let resp: UiResponsive<String> = UiResponsive::Responsive {
+            width: Some(UiResponsiveWidth {
                 compact: Some("vertical".to_string()),
                 expanded: Some("horizontal".to_string()),
                 ..Default::default()
@@ -348,15 +360,15 @@ mod tests {
                 "width": { "compact": "vertical", "expanded": "horizontal" }
             })
         );
-        let back: UiResponsiveV1<String> = serde_json::from_value(v).expect("deserialize");
+        let back: UiResponsive<String> = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, resp);
     }
 
     #[test]
     fn responsive_height_only_wire_shape() {
-        let resp: UiResponsiveV1<String> = UiResponsiveV1::Responsive {
+        let resp: UiResponsive<String> = UiResponsive::Responsive {
             width: None,
-            height: Some(UiResponsiveHeightV1 {
+            height: Some(UiResponsiveHeight {
                 short: Some("sm".to_string()),
                 tall: Some("md".to_string()),
                 ..Default::default()
@@ -374,29 +386,29 @@ mod tests {
 
     #[test]
     fn responsive_both_dimensions_roundtrip() {
-        let resp: UiResponsiveV1<String> = UiResponsiveV1::Responsive {
-            width: Some(UiResponsiveWidthV1 {
+        let resp: UiResponsive<String> = UiResponsive::Responsive {
+            width: Some(UiResponsiveWidth {
                 regular: Some("w-regular".to_string()),
                 ..Default::default()
             }),
-            height: Some(UiResponsiveHeightV1 {
+            height: Some(UiResponsiveHeight {
                 regular: Some("h-regular".to_string()),
                 ..Default::default()
             }),
         };
         let s = serde_json::to_string(&resp).expect("serialize");
-        let back: UiResponsiveV1<String> = serde_json::from_str(&s).expect("deserialize");
+        let back: UiResponsive<String> = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, resp);
     }
 
     #[test]
     fn when_wrapper_wire_shape() {
-        let wrapper = UiConditionalV1::When {
-            condition: UiConditionV1 {
+        let wrapper = UiConditional::When {
+            condition: UiCondition {
                 width: Some(UiWidthClass::Compact),
                 ..Default::default()
             },
-            node: Box::new(UiNodeV1::new("stack")),
+            node: Box::new(UiNode::new("stack")),
         };
         let v = serde_json::to_value(&wrapper).expect("serialize");
         assert_eq!(
@@ -407,19 +419,19 @@ mod tests {
                 "node": { "type": "stack" }
             })
         );
-        let back: UiConditionalV1 = serde_json::from_value(v).expect("deserialize");
+        let back: UiConditional = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, wrapper);
     }
 
     #[test]
     fn hidden_wrapper_wire_shape() {
-        let wrapper = UiConditionalV1::Hidden {
-            condition: UiConditionV1 {
+        let wrapper = UiConditional::Hidden {
+            condition: UiCondition {
                 pointer: Some(UiPointer::Coarse),
                 keyboard_occluded: Some(true),
                 ..Default::default()
             },
-            node: Box::new(UiNodeV1::new("panel")),
+            node: Box::new(UiNode::new("panel")),
         };
         let v = serde_json::to_value(&wrapper).expect("serialize");
         assert_eq!(
@@ -430,36 +442,36 @@ mod tests {
                 "node": { "type": "panel" }
             })
         );
-        let back: UiConditionalV1 = serde_json::from_value(v).expect("deserialize");
+        let back: UiConditional = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, wrapper);
     }
 
     #[test]
     fn uichild_untagged_union_parses_both() {
         let raw_node = json!({ "type": "text" });
-        let from_node: UiChildV1 = serde_json::from_value(raw_node).expect("deserialize node");
-        assert!(matches!(from_node, UiChildV1::Node(_)));
+        let from_node: UiChild = serde_json::from_value(raw_node).expect("deserialize node");
+        assert!(matches!(from_node, UiChild::Node(_)));
 
         let raw_wrapper = json!({
             "$kind": "when",
             "condition": { "width": "compact" },
             "node": { "type": "stack" }
         });
-        let from_wrapper: UiChildV1 =
+        let from_wrapper: UiChild =
             serde_json::from_value(raw_wrapper).expect("deserialize wrapper");
-        assert!(matches!(from_wrapper, UiChildV1::Conditional(_)));
+        assert!(matches!(from_wrapper, UiChild::Conditional(_)));
     }
 
     #[test]
     fn action_envelope_minimal() {
-        let action = UiActionV1::new("botster.session.select");
+        let action = UiAction::new("botster.session.select");
         let v = serde_json::to_value(&action).expect("serialize");
         assert_eq!(v, json!({ "id": "botster.session.select" }));
     }
 
     #[test]
     fn action_envelope_with_payload() {
-        let mut action = UiActionV1::new("botster.session.select");
+        let mut action = UiAction::new("botster.session.select");
         action
             .payload
             .insert("sessionUuid".into(), json!("sess-123"));
@@ -477,7 +489,7 @@ mod tests {
 
     #[test]
     fn capability_set_serializes_camelcase() {
-        let caps = UiCapabilitySetV1 {
+        let caps = UiCapabilitySet {
             hover: true,
             dialog: true,
             tooltip: false,
@@ -499,15 +511,15 @@ mod tests {
 
     #[test]
     fn uivalue_untagged_parses_scalar_and_responsive() {
-        let scalar: UiValueV1<String> =
+        let scalar: UiValue<String> =
             serde_json::from_value(json!("horizontal")).expect("parse scalar");
-        assert!(matches!(scalar, UiValueV1::Scalar(_)));
+        assert!(matches!(scalar, UiValue::Scalar(_)));
 
-        let resp: UiValueV1<String> = serde_json::from_value(json!({
+        let resp: UiValue<String> = serde_json::from_value(json!({
             "$kind": "responsive",
             "width": { "compact": "vertical" }
         }))
         .expect("parse responsive");
-        assert!(matches!(resp, UiValueV1::Responsive(_)));
+        assert!(matches!(resp, UiValue::Responsive(_)));
     }
 }

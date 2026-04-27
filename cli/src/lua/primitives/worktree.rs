@@ -157,9 +157,7 @@ fn is_detachable_worktree_path(path: &str) -> bool {
     std::path::Path::new(path).join(".git").is_file()
 }
 
-fn filter_detachable_worktrees(
-    worktrees: Vec<serde_json::Value>,
-) -> Vec<serde_json::Value> {
+fn filter_detachable_worktrees(worktrees: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     worktrees
         .into_iter()
         .filter(|entry| {
@@ -255,10 +253,9 @@ pub(crate) fn register(
                 )));
             }
 
-            let worktrees =
-                filter_detachable_worktrees(parse_porcelain_worktrees(&String::from_utf8_lossy(
-                    &output.stdout,
-                )));
+            let worktrees = filter_detachable_worktrees(parse_porcelain_worktrees(
+                &String::from_utf8_lossy(&output.stdout),
+            ));
             super::json::json_to_lua(lua, &serde_json::Value::Array(worktrees))
         })
         .map_err(|e| anyhow!("Failed to create worktree.list_for_root function: {e}"))?;

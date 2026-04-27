@@ -389,7 +389,10 @@ fn surfaces_changed_hook_fires_on_register_and_unregister() {
         .eval()
         .expect("hooks.notify fires");
 
-    assert_eq!(after_register, 1, "register should fire surfaces_changed once");
+    assert_eq!(
+        after_register, 1,
+        "register should fire surfaces_changed once"
+    );
     assert_eq!(
         after_unregister, 2,
         "unregister should fire surfaces_changed once more"
@@ -448,6 +451,10 @@ fn workspace_panel_layout_keeps_pairing_out_of_main_surface() {
     let _lock = lock_env();
     let lua = new_test_lua();
 
+    lua.load(r#"require("hub.builtin_surfaces")"#)
+        .exec()
+        .expect("register built-in hub surfaces");
+
     let json: String = lua
         .load(r#"return web_layout.render("workspace_panel", { surface = "panel" })"#)
         .eval()
@@ -503,7 +510,7 @@ fn layout_broadcast_emits_one_frame_per_registered_surface() {
         .load(
             r#"
             -- Only register lightweight non-workspace surfaces so we don't
-            -- need the full AgentWorkspaceSurfaceInputV1 fixture here. Each
+            -- need the full AgentWorkspaceSurfaceInput fixture here. Each
             -- supplies its own input_builder that returns a trivial state.
             surfaces.register("alpha", {
                 path = "/alpha",
@@ -580,11 +587,11 @@ fn unregister_purges_per_subscription_dedup_baselines() {
         .load(
             r#"
             surfaces.register("alpha", {
-                render = function() return {type="panel", props={title="alpha-v1"}} end,
+                render = function() return {type="panel", props={title="alpha-legacy"}} end,
                 input_builder = function() return { hub_id = "hub-test" } end,
             })
             surfaces.register("beta", {
-                render = function() return {type="panel", props={title="beta-v1"}} end,
+                render = function() return {type="panel", props={title="beta-legacy"}} end,
                 input_builder = function() return { hub_id = "hub-test" } end,
             })
             local LayoutBroadcast = require("lib.layout_broadcast")
@@ -618,7 +625,7 @@ fn unregister_purges_per_subscription_dedup_baselines() {
             -- didn't run, this render's hash would match the stale baseline
             -- and dedup would swallow the frame.
             surfaces.register("alpha", {
-                render = function() return {type="panel", props={title="alpha-v1"}} end,
+                render = function() return {type="panel", props={title="alpha-legacy"}} end,
                 input_builder = function() return { hub_id = "hub-test" } end,
             })
             local f2 = LayoutBroadcast.build_frames(nil, { subscription_key = "sub-A" })
@@ -639,7 +646,10 @@ fn unregister_purges_per_subscription_dedup_baselines() {
         before_removed, 2,
         "alpha's dedup baseline must be cleared from both subscription buckets"
     );
-    assert_eq!(after_removed, 0, "trivially zero (keeps return shape 3-tuple)");
+    assert_eq!(
+        after_removed, 0,
+        "trivially zero (keeps return shape 3-tuple)"
+    );
     assert!(
         !stale_present_after_reregister,
         "re-registering alpha with an identical tree must re-emit; stale baseline was not purged"
@@ -726,9 +736,18 @@ fn route_registry_payload_includes_routable_surfaces_and_excludes_pathless() {
         .expect("build route registry payload");
 
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse JSON");
-    assert_eq!(parsed.get("type").and_then(|v| v.as_str()), Some("ui_route_registry"));
-    assert_eq!(parsed.get("hub_id").and_then(|v| v.as_str()), Some("hub-test"));
-    let routes = parsed.get("routes").and_then(|v| v.as_array()).expect("routes array");
+    assert_eq!(
+        parsed.get("type").and_then(|v| v.as_str()),
+        Some("ui_route_registry")
+    );
+    assert_eq!(
+        parsed.get("hub_id").and_then(|v| v.as_str()),
+        Some("hub-test")
+    );
+    let routes = parsed
+        .get("routes")
+        .and_then(|v| v.as_array())
+        .expect("routes array");
     let paths: Vec<&str> = routes
         .iter()
         .filter_map(|r| r.get("path").and_then(|v| v.as_str()))
@@ -898,7 +917,11 @@ fn route_registry_includes_hide_from_nav_entries_with_flag() {
     let pairs: Vec<(String, bool)> = routes
         .iter()
         .map(|r| {
-            let name = r.get("surface").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = r
+                .get("surface")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let hidden = r
                 .get("hide_from_nav")
                 .and_then(|v| v.as_bool())
@@ -1142,7 +1165,10 @@ fn path_segment_matching_escapes_pattern_metacharacters() {
         .expect("pattern escape");
 
     assert!(literal_hit, "literal dot must match literal dot");
-    assert_eq!(wrong_type, "panel", "wrong should be a panel (sub-404 wrapper)");
+    assert_eq!(
+        wrong_type, "panel",
+        "wrong should be a panel (sub-404 wrapper)"
+    );
     assert_ne!(
         wrong_tag, "literal",
         "literal dot must NOT match arbitrary char (got the literal render instead of sub-404); wrong={wrong_type:?} wrong_tag={wrong_tag:?} text={wrong_text:?}"
@@ -1282,20 +1308,25 @@ fn route_registry_payload_carries_base_path_and_sub_routes() {
         .eval()
         .expect("route registry payload");
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(&payload_json).expect("parse payload");
+    let parsed: serde_json::Value = serde_json::from_str(&payload_json).expect("parse payload");
     let routes = parsed.get("routes").and_then(|v| v.as_array()).unwrap();
     let entry = routes
         .iter()
         .find(|r| r.get("surface").and_then(|v| v.as_str()) == Some("kanban"))
         .expect("kanban entry");
 
-    assert_eq!(entry.get("base_path").and_then(|v| v.as_str()), Some("/kanban"));
+    assert_eq!(
+        entry.get("base_path").and_then(|v| v.as_str()),
+        Some("/kanban")
+    );
     // `path` mirrors `base_path` for routable surfaces so older browsers
     // still see a valid top-level URL.
     assert_eq!(entry.get("path").and_then(|v| v.as_str()), Some("/kanban"));
 
-    let sub_routes = entry.get("routes").and_then(|v| v.as_array()).expect("routes[]");
+    let sub_routes = entry
+        .get("routes")
+        .and_then(|v| v.as_array())
+        .expect("routes[]");
     let sub_paths: Vec<&str> = sub_routes
         .iter()
         .filter_map(|r| r.get("path").and_then(|v| v.as_str()))
@@ -1448,7 +1479,7 @@ fn hello_plugin_default_path_falls_through_to_home() {
 fn hello_plugin_unknown_subpath_renders_sub_404_not_error_fallback() {
     // A known surface with an unknown subpath is NOT the same as an unknown
     // surface: the dispatcher returns the sub-route 404 tree, which is
-    // still a valid UiNodeV1 and must NOT be confused with the
+    // still a valid UiNode and must NOT be confused with the
     // Rust-level "Layout error:" fallback.
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -1789,4 +1820,27 @@ fn surfaces_resolve_route_returns_matched_route_and_params() {
     assert_eq!(matched_id, "13");
     assert!(root_match, "root subpath must match the / route");
     assert!(unknown_match, "unknown subpath must return nil route");
+}
+
+#[test]
+fn web_route_registry_excludes_tui_only_surfaces() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let route_count: usize = lua
+        .load(
+            r#"
+            surfaces.register("tui_status", {
+                clients = { "tui" },
+                routes = {
+                    { path = "/", render = function() return { type = "panel", props = {} } end },
+                },
+            })
+            return #surfaces.build_route_registry_payload("hub-test").routes
+            "#,
+        )
+        .eval()
+        .expect("route registry payload");
+
+    assert_eq!(route_count, 0);
 }
