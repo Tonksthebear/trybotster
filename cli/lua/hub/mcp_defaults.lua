@@ -922,11 +922,11 @@ mcp.tool("list_plugins", {
 end)
 
 mcp.tool("reload_plugin", {
-    description = "Reload a plugin by name. Use after editing plugin code. Returns success/failure with error details.",
+    description = "Reload a plugin by key. Use list_plugins first; repo plugins with the same name have distinct scoped keys.",
     input_schema = {
         type = "object",
         properties = {
-            name = { type = "string", description = "Plugin name (directory name, e.g. 'github')" },
+            name = { type = "string", description = "Plugin key from list_plugins (or unique plugin name)" },
         },
         required = { "name" },
     },
@@ -960,11 +960,11 @@ mcp.tool("reload_layout", {
 end)
 
 mcp.tool("enable_plugin", {
-    description = "Enable a disabled plugin. Loads it immediately.",
+    description = "Enable a disabled plugin by key. Loads it immediately.",
     input_schema = {
         type = "object",
         properties = {
-            name = { type = "string", description = "Plugin name to enable" },
+            name = { type = "string", description = "Plugin key from list_plugins" },
         },
         required = { "name" },
     },
@@ -978,11 +978,11 @@ mcp.tool("enable_plugin", {
 end)
 
 mcp.tool("disable_plugin", {
-    description = "Disable a plugin. Unloads it and prevents it from loading on hub restart. Persists across restarts.",
+    description = "Disable a plugin by key. Unloads it and prevents it from loading on hub restart. Persists across restarts.",
     input_schema = {
         type = "object",
         properties = {
-            name = { type = "string", description = "Plugin name to disable" },
+            name = { type = "string", description = "Plugin key from list_plugins" },
         },
         required = { "name" },
     },

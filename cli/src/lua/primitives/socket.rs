@@ -21,7 +21,7 @@
 //!     end
 //! end)
 //!
-//! socket.send(client_id, { type = "agent_list", agents = {} })
+//! socket.send(client_id, { type = "status_update", count = 0 })
 //! socket.send_binary(client_id, binary_data)
 //! ```
 //!
@@ -265,7 +265,7 @@ mod tests {
 
         lua.load(
             r#"
-            socket.send("socket:abc123", { type = "agent_list", count = 3 })
+            socket.send("socket:abc123", { type = "status_update", count = 3 })
         "#,
         )
         .exec()
@@ -275,7 +275,7 @@ mod tests {
         match event {
             HubEvent::SocketSend(SocketSendRequest::Json { client_id, data }) => {
                 assert_eq!(client_id, "socket:abc123");
-                assert_eq!(data["type"], "agent_list");
+                assert_eq!(data["type"], "status_update");
                 assert_eq!(data["count"], 3);
             }
             _ => panic!("Expected SocketSend Json event"),

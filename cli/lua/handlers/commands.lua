@@ -39,30 +39,6 @@ local function resolve_command_target(command)
     })
 end
 
--- ============================================================================
--- Query Commands
--- ============================================================================
-
--- Wire protocol: list_agents / list_worktrees / list_spawn_targets re-ship
--- the matching entity_snapshot. Clients should not need to call these in
--- normal operation — entity stores are kept live by entity_patch /
--- entity_upsert / entity_remove from the broadcaster — but the handlers
--- remain available for debug / forced-resync flows.
-commands.register("list_agents", function(client, sub_id, _command)
-    local EB = require("lib.entity_broadcast")
-    pcall(EB.send_snapshots_to, client, sub_id)
-end, { description = "Re-send the entity_snapshot batch" })
-
-commands.register("list_worktrees", function(client, sub_id, _command)
-    local EB = require("lib.entity_broadcast")
-    pcall(EB.send_snapshots_to, client, sub_id)
-end, { description = "Re-send the entity_snapshot batch" })
-
-commands.register("list_spawn_targets", function(client, sub_id, _command)
-    local EB = require("lib.entity_broadcast")
-    pcall(EB.send_snapshots_to, client, sub_id)
-end, { description = "Re-send the entity_snapshot batch" })
-
 commands.register("add_spawn_target", function(client, sub_id, command)
     local registry = rawget(_G, "spawn_targets")
     if not registry or type(registry.add) ~= "function" then
@@ -90,16 +66,15 @@ commands.register("add_spawn_target", function(client, sub_id, command)
         "success",
         string.format("Admitted spawn target %s", target.path or target.name or target.id or path)
     )
-    -- Wire protocol: re-snapshot spawn_target so clients see the new entry.
-    -- SpawnTarget records carry `id` not `target_id`; EB.upsert resolves the
-    -- entity id via `payload[id_field] or payload.id`, so no pre-guard needed.
-    local EB = require("lib.entity_broadcast")
-    if EB.is_registered("spawn_target") then
+    -- Wire protocol: publish spawn targets through the shared entity model
+    -- layer so command handlers do not know envelope details.
+    local EntityModel = require("lib.entity_model")
+    if require("lib.entity_broadcast").is_registered("spawn_target") then
         local registry = rawget(_G, "spawn_targets")
         local list_ok, listed = pcall(registry.list)
         if list_ok and type(listed) == "table" then
             for _, t in ipairs(listed) do
-                EB.upsert("spawn_target", t)
+                EntityModel.upsert_spawn_target(t)
             end
         end
     end
@@ -126,11 +101,7 @@ commands.register("remove_spawn_target", function(client, sub_id, command)
     end
 
     send_spawn_target_feedback(client, sub_id, "success", "Removed spawn target.")
-    -- Wire protocol: drop the removed entity, then re-snapshot the rest.
-    local EB = require("lib.entity_broadcast")
-    if EB.is_registered("spawn_target") then
-        EB.remove("spawn_target", target_id)
-    end
+    require("lib.entity_model").remove_spawn_target(target_id)
 end, { description = "Remove an admitted spawn target" })
 
 commands.register("rename_spawn_target", function(client, sub_id, command)
@@ -160,11 +131,7 @@ commands.register("rename_spawn_target", function(client, sub_id, command)
     end
 
     send_spawn_target_feedback(client, sub_id, "success", string.format("Renamed spawn target to %s.", new_name))
-    -- Wire protocol: patch the renamed entity.
-    local EB = require("lib.entity_broadcast")
-    if EB.is_registered("spawn_target") then
-        EB.patch("spawn_target", target_id, { target_name = new_name })
-    end
+    require("lib.entity_model").patch_spawn_target(target_id, { target_name = new_name })
 end, { description = "Rename an admitted spawn target" })
 
 local function route_push_control(client, _sub_id, command)
@@ -184,29 +151,6 @@ commands.register("vapid_key_set", route_push_control, { description = "Install 
 commands.register("push_sub", route_push_control, { description = "Store browser push subscription" })
 commands.register("push_test", route_push_control, { description = "Send a browser push test notification" })
 commands.register("push_disable", route_push_control, { description = "Disable browser push notifications" })
-
-commands.register("list_workspaces", function(client, sub_id, _command)
-    local Hub = require("lib.hub")
-    local ok, workspaces = pcall(function()
-        return Hub.get():list_workspaces()
-    end)
-    if not ok then
-        log.warn(string.format("list_workspaces failed: %s", tostring(workspaces)))
-        workspaces = {}
-    end
-    client:send({
-        subscriptionId = sub_id,
-        type = "workspace_list",
-        workspaces = workspaces,
-    })
-end, { description = "Send workspace list to client" })
-
-commands.register("list_open_workspaces", function(client, sub_id, _command)
-    -- Wire protocol: re-snapshot — clients keep workspace state in their
-    -- entity store and derive open/closed by joining sessions.
-    local EB = require("lib.entity_broadcast")
-    pcall(EB.send_snapshots_to, client, sub_id)
-end, { description = "Re-send the entity_snapshot batch" })
 
 local function send_agent_config(client, sub_id, command)
     local ConfigResolver = require("lib.config_resolver")
@@ -366,15 +310,11 @@ commands.register("rename_workspace", function(client, sub_id, command)
                 session._workspace_name = new_name
                 session:set_meta("workspace", new_name)
                 session:_sync_workspace_manifest()
+                session:publish_entity()
             end
         end
 
-        -- Wire protocol: patch the workspace name. Affected sessions
-        -- emit their own session_updated → entity_patch via Session:update.
-        local EB = require("lib.entity_broadcast")
-        if EB.is_registered("workspace") then
-            EB.patch("workspace", workspace_id, { name = new_name })
-        end
+        require("lib.entity_model").patch_workspace(workspace_id, { name = new_name })
         log.info(string.format("Workspace %s renamed to '%s'", workspace_id, new_name))
     end
 end, { description = "Rename a workspace" })
@@ -410,19 +350,16 @@ commands.register("move_agent_workspace", function(_client, _sub_id, command)
         return
     end
 
-    -- Wire protocol: Session:update inside move_to_workspace already
-    -- emitted the entity_patch for the session. Re-snapshot workspaces so
-    -- the target workspace materialises in clients filtering for non-empty
-    -- workspaces.
-    local EB = require("lib.entity_broadcast")
-    if EB.is_registered("workspace") then
+    -- Wire protocol: move_to_workspace publishes the moved session. Upsert
+    -- workspaces so target/old workspace status and membership summaries
+    -- reach clients filtering for active workspaces.
+    local EntityModel = require("lib.entity_model")
+    if require("lib.entity_broadcast").is_registered("workspace") then
         local Hub = require("lib.hub")
         local ok, workspaces = pcall(function() return Hub.get():list_workspaces() end)
         if ok and type(workspaces) == "table" then
             for _, workspace in ipairs(workspaces) do
-                if workspace.workspace_id then
-                    EB.upsert("workspace", workspace)
-                end
+                EntityModel.upsert_workspace(workspace)
             end
         end
     end
@@ -716,16 +653,16 @@ commands.register("list_plugins", function(client, sub_id, _command)
 end, { description = "List all plugins with status" })
 
 commands.register("reload_plugin", function(client, sub_id, command)
-    local name = command.name or command.plugin_name
-    if not name then
-        if client then client:send({ subscriptionId = sub_id, type = "error", message = "Missing plugin name" }) end
+    local key = command.key or command.plugin_key or command.name or command.plugin_name
+    if not key then
+        if client then client:send({ subscriptionId = sub_id, type = "error", message = "Missing plugin key" }) end
         return
     end
-    local ok, err = loader.reload_plugin(name)
+    local ok, err = loader.reload_plugin(key)
     if client then
-        client:send({ subscriptionId = sub_id, type = "plugin_reloaded", name = name, success = ok, error = not ok and tostring(err) or nil })
+        client:send({ subscriptionId = sub_id, type = "plugin_reloaded", key = key, name = key, success = ok, error = not ok and tostring(err) or nil })
     end
-end, { description = "Reload a plugin by name" })
+end, { description = "Reload a plugin by key" })
 
 -- Explicit invalidation of the web layout cache + proactive rebroadcast to
 -- every subscribed browser. Matches the `reload_plugin` pattern: the hub
@@ -769,28 +706,28 @@ commands.register("reload_layout", function(client, sub_id, _command)
 end, { description = "Reload the web UI layout overrides and rebroadcast to subscribers" })
 
 commands.register("enable_plugin", function(client, sub_id, command)
-    local name = command.name or command.plugin_name
-    if not name then
-        if client then client:send({ subscriptionId = sub_id, type = "error", message = "Missing plugin name" }) end
+    local key = command.key or command.plugin_key or command.name or command.plugin_name
+    if not key then
+        if client then client:send({ subscriptionId = sub_id, type = "error", message = "Missing plugin key" }) end
         return
     end
-    local ok, err = loader.enable_plugin(name)
+    local ok, err = loader.enable_plugin(key)
     if client then
-        client:send({ subscriptionId = sub_id, type = "plugin_enabled", name = name, success = ok, error = not ok and tostring(err) or nil })
+        client:send({ subscriptionId = sub_id, type = "plugin_enabled", key = key, name = key, success = ok, error = not ok and tostring(err) or nil })
     end
-end, { description = "Enable a disabled plugin" })
+end, { description = "Enable a disabled plugin by key" })
 
 commands.register("disable_plugin", function(client, sub_id, command)
-    local name = command.name or command.plugin_name
-    if not name then
-        if client then client:send({ subscriptionId = sub_id, type = "error", message = "Missing plugin name" }) end
+    local key = command.key or command.plugin_key or command.name or command.plugin_name
+    if not key then
+        if client then client:send({ subscriptionId = sub_id, type = "error", message = "Missing plugin key" }) end
         return
     end
-    local ok, err = loader.disable_plugin(name)
+    local ok, err = loader.disable_plugin(key)
     if client then
-        client:send({ subscriptionId = sub_id, type = "plugin_disabled", name = name, success = ok, error = not ok and tostring(err) or nil })
+        client:send({ subscriptionId = sub_id, type = "plugin_disabled", key = key, name = key, success = ok, error = not ok and tostring(err) or nil })
     end
-end, { description = "Disable a plugin" })
+end, { description = "Disable a plugin by key" })
 
 -- Lifecycle hooks for hot-reload
 function M._before_reload()

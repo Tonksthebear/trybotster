@@ -86,16 +86,17 @@ MCP tools re-register automatically on reload, and the hub sends a `tools_list_c
 1. Protected core (`hub.state`, `hub.hooks`, `hub.loader`)
 2. Library modules: `lib.config_resolver`, `lib.agent`, `lib.commands`
 3. Handler modules: all `handlers/*`
-4. `events.on("shutdown", ...)` handler
+4. Shutdown cleanup handlers (`events.on("shutdown", ...)` and `hooks.on("shutdown", ...)`)
 5. `safe_require("user.init")` — user entry point
 6. Plugin discovery via `ConfigResolver.resolve_all()` across 2 layers
-7. Each plugin loaded via `loader.load_plugin(init_path, name)`
+7. Each plugin loaded via `loader.load_plugin(init_path, name, opts)`
 8. Agent improvements from `~/.botster/lua/improvements/*.lua` (sandboxed)
 
 ### `loader.load_plugin()` (User Trust Level)
 
 - Reads file via `fs.read(path)`, compiles with `load()`, executes with full `_ENV`
-- Registered as `plugin.{name}` in `package.loaded`
+- Registered as `plugin.{key}` in `package.loaded`; repo plugins use `repo:{repo_root}:{name}` so same-name plugins in different repos are separate instances.
+- Hook observer/interceptor names registered during plugin load are automatically prefixed with the plugin key, so same-name repo plugin instances can subscribe to the same event without replacing each other.
 - Full access to all Lua primitives — same trust as user code
 
 ### Plugin Directory Structure

@@ -1,6 +1,6 @@
 import React, { useMemo, useState, useEffect } from 'react'
 import { Dialog, DialogTitle, DialogDescription, DialogBody, DialogActions } from '../catalyst/dialog'
-import { Field, Label, Description } from '../catalyst/fieldset'
+import { Field, Label } from '../catalyst/fieldset'
 import { Input } from '../catalyst/input'
 import { Button } from '../catalyst/button'
 import { useDialogStore } from '../../store/dialog-store'
@@ -75,21 +75,21 @@ export default function MoveSessionDialog({ hubId }) {
       <DialogBody>
         {otherWorkspaces.length > 0 && (
           <div className="space-y-2">
-            <Label>Existing workspaces</Label>
+            <div className="text-sm font-medium text-zinc-100">Existing workspaces</div>
             <div className="space-y-2">
               {otherWorkspaces.map((ws) => {
                 const id = ws.workspace_id ?? ws.id
                 return (
-                <button
-                  key={id}
-                  type="button"
-                  onClick={() => moveToExisting(id, ws.name)}
-                  className="w-full text-left px-4 py-3 rounded-lg border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:border-zinc-600 transition-colors"
-                >
-                  <div className="text-sm font-medium text-zinc-100">
-                    {ws.name || id}
-                  </div>
-                </button>
+                  <button
+                    key={id}
+                    type="button"
+                    onClick={() => moveToExisting(id, ws.name)}
+                    className="w-full text-left px-4 py-3 rounded-lg border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:border-zinc-600 transition-colors"
+                  >
+                    <div className="text-sm font-medium text-zinc-100">
+                      {ws.name || id}
+                    </div>
+                  </button>
                 )
               })}
             </div>

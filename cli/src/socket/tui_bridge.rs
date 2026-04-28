@@ -422,7 +422,7 @@ mod tests {
         let (handle, mut channels, server_read, mut server_write, shutdown) =
             setup_bridge(&tmp, "json_h2t.sock").await;
 
-        let msg = Frame::Json(serde_json::json!({"type": "agent_list", "count": 2}));
+        let msg = Frame::Json(serde_json::json!({"type": "status_update", "count": 2}));
         server_write.write_all(&msg.encode()).await.unwrap();
 
         let output =
@@ -433,7 +433,7 @@ mod tests {
 
         match output {
             TuiOutput::Message(value) => {
-                assert_eq!(value["type"], "agent_list");
+                assert_eq!(value["type"], "status_update");
                 assert_eq!(value["count"], 2);
             }
             other => panic!("Expected TuiOutput::Message, got: {other:?}"),

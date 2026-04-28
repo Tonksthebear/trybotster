@@ -44,7 +44,7 @@ Interceptors run in priority order. Each receives the (possibly transformed) out
 | `after_agent_create` | `lib/agent.lua` | After Agent.new() completes |
 | `before_agent_close` | `lib/agent.lua` | Before sessions are killed |
 | `after_agent_close` | `lib/agent.lua` | After agent is removed |
-| `shutdown` | `hub/init.lua` | Hub shutting down |
+| `shutdown` | Rust shutdown bridge | Hub shutting down |
 
 ## Interceptor Events
 
@@ -62,13 +62,14 @@ The `events` primitive provides a separate pub-sub layer from hooks. Rust emits 
 | Event | Source | Payload |
 |-------|--------|---------|
 | `command_message` | `hub_commands.lua` via ActionCable | create_agent / delete_agent commands |
-| `worktree_created` | Rust async worktree create | `{branch, path, issue_number, prompt, session_uuid, profile_name, client_rows, client_cols}` |
+| `worktree_created` | Worktree creation | `{branch, path, metadata, issue_number, prompt, session_uuid, profile_name, client_rows, client_cols}` |
 | `worktree_create_failed` | Rust async worktree create | `{branch, error}` |
 | `connection_code_ready` | Rust connection generation | `{url, qr_ascii}` |
 | `connection_code_error` | Rust connection generation | error string |
 | `agent_status_changed` | Rust/Lua | `{agent_id, status}` |
 | `process_exited` | Rust PTY watcher | `{session_uuid, exit_code}` |
 | `outgoing_signal` | Rust Hub signaling router | Pre-encrypted signal data for `HubCommandChannel.signal` relay |
+| `shutdown` | Rust shutdown bridge | Hub shutting down |
 
 ## Rust -> Lua Bridge Methods
 

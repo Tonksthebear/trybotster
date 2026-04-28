@@ -12,7 +12,7 @@
 --     - `ui_route_registry`  (via Client:send_ui_route_registry)
 --     - `transient_event`   (built inline below for pty notifications)
 --   Hooks like `agent_created` / `agent_deleted` / `session_updated`
---   are local Lua identifiers; their handlers route through EB.
+--   are local Lua identifiers; their handlers publish through lib.entity_model.
 --   Selection lives on the client — both renderers maintain their own.
 --
 -- Each transport handler (webrtc.lua, tui.lua) registers clients here.
@@ -20,7 +20,7 @@
 
 local state = require("hub.state")
 local Agent = require("lib.agent")
-local ClientSessionPayload = require("lib.client_session_payload")
+local EntityModel = require("lib.entity_model")
 local Session = require("lib.session")
 local pty_clients = require("lib.pty_clients")
 local EB = require("lib.entity_broadcast")
@@ -196,20 +196,20 @@ hooks.on("agent_created", "broadcast_agent_created", function(info)
     if Session.is_system_session(info) then
         return
     end
-    local payload = ClientSessionPayload.build(info, Agent.all_info())
-    log.info(string.format("Broadcasting entity_upsert(session): %s",
-        payload.id or payload.session_uuid or "?"))
+    log.info(string.format("Publishing session entity: %s", info.id or info.session_uuid or "?"))
 
-    EB.upsert("session", payload)
+    -- Fresh clients need the workspace record before the session record can be
+    -- grouped. Publish a minimal workspace from the created session first,
+    -- then follow with the authoritative workspace snapshot below.
+    EntityModel.upsert_session_workspace(info)
+    EntityModel.publish_session(info)
     -- Workspaces list may have grown — re-snapshot since workspace patches
     -- are not granular enough to capture "this session now belongs here".
-    -- EB.upsert resolves the entity id via `payload[id_field] or payload.id`
-    -- so no pre-guard needed; workspace_store normalizes id+workspace_id.
     local Hub = require("lib.hub")
     local ok, workspaces = pcall(function() return Hub.get():list_workspaces() end)
     if ok and type(workspaces) == "table" then
         for _, workspace in ipairs(workspaces) do
-            EB.upsert("workspace", workspace)
+            EntityModel.upsert_workspace(workspace)
         end
     end
 end)
@@ -221,9 +221,7 @@ hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
         timer.cancel("idle:" .. agent_id)
     end
 
-    if agent_id then
-        EB.remove("session", agent_id)
-    end
+    EntityModel.remove_session(agent_id)
 
     -- Surviving sessions might leave a workspace empty. Re-snapshot the
     -- workspace list so a fully drained workspace disappears from the
@@ -232,9 +230,7 @@ hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
     local ok, workspaces = pcall(function() return Hub.get():list_workspaces() end)
     if ok and type(workspaces) == "table" then
         for _, workspace in ipairs(workspaces) do
-            if workspace.workspace_id then
-                EB.upsert("workspace", workspace)
-            end
+            EntityModel.upsert_workspace(workspace)
         end
     end
 end)
@@ -465,7 +461,7 @@ hooks.on("agent_lifecycle", "broadcast_lifecycle", function(info)
     log.debug(string.format("Broadcasting agent_lifecycle: %s -> %s",
         info.agent_id or "?", info.status or "?"))
     if info.agent_id and info.status then
-        EB.patch("session", info.agent_id, { status = info.status })
+        EntityModel.patch_session({ session_uuid = info.agent_id }, { status = info.status })
     end
 end)
 
@@ -480,7 +476,7 @@ end)
 hooks.on("workspace_closed", "broadcast_workspace_closed", function(info)
     local ws_id = info and info.workspace_id
     if not ws_id then return end
-    EB.patch("workspace", ws_id, { status = "closed" })
+    EntityModel.patch_workspace(ws_id, { status = "closed" })
 end)
 
 -- ============================================================================
@@ -500,7 +496,7 @@ _event_subs[#_event_subs + 1] = events.on("connection_code_ready", function(data
     }
     last_connection_code = { url = data.url, qr_ascii = data.qr_ascii }
     state.set("connections.last_connection_code", last_connection_code)
-    EB.upsert("connection_code", payload)
+    EntityModel.upsert_connection_code(payload)
 end)
 
 _event_subs[#_event_subs + 1] = events.on("preview_dns_ready", function(data)
@@ -521,7 +517,7 @@ _event_subs[#_event_subs + 1] = events.on("connection_code_error", function(err)
         error = err or "Connection code not available",
     }
     state.set("connections.last_connection_code", last_connection_code)
-    EB.upsert("connection_code", {
+    EntityModel.upsert_connection_code({
         hub_id = hub_id,
         error = last_connection_code.error,
     })
@@ -551,14 +547,14 @@ _event_subs[#_event_subs + 1] = events.on("hub_recovery_state", function(info)
             or (hub.hub_id and hub.hub_id())
             or nil
     end
-    EB.upsert("hub", payload)
+    EntityModel.upsert_hub(payload)
 end)
 
 _event_subs[#_event_subs + 1] = events.on("agent_status_changed", function(info)
     log.debug(string.format("agent_status_changed: %s -> %s",
         info.agent_id or "?", info.status or "?"))
     if info.agent_id and info.status then
-        EB.patch("session", info.agent_id, { status = info.status })
+        EntityModel.patch_session({ session_uuid = info.agent_id }, { status = info.status })
     end
 end)
 

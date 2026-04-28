@@ -134,13 +134,12 @@ fn test_agent_get_pty_handle_returns_valid_handle() {
 
 // === BrowserCommand Serialization Tests ===
 
-/// Test that non-PTY commands (ListAgents, SelectAgent, etc.) are ignored.
+/// Test that non-PTY commands (SelectAgent, CreateAgent, etc.) are ignored.
 #[test]
 fn test_pty_input_receiver_ignores_non_pty_commands() {
     use crate::relay::BrowserCommand;
 
     let non_pty_commands = [
-        serde_json::to_string(&BrowserCommand::ListAgents).unwrap(),
         serde_json::to_string(&BrowserCommand::SelectAgent {
             id: "agent-123".to_string(),
         })

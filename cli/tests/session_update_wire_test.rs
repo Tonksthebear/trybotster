@@ -83,6 +83,24 @@ fn new_test_lua() -> (Lua, Table) {
     (lua, eb)
 }
 
+fn register_workspace(lua: &Lua, eb: &Table) {
+    let register: Function = eb.get("register").unwrap();
+    let opts: Table = lua.create_table().unwrap();
+    opts.set("id_field", "workspace_id").unwrap();
+    let all_fn: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
+    opts.set("all", all_fn).unwrap();
+    register.call::<()>(("workspace", opts)).unwrap();
+}
+
+fn register_entity(lua: &Lua, eb: &Table, entity_type: &str, id_field: &str) {
+    let register: Function = eb.get("register").unwrap();
+    let opts: Table = lua.create_table().unwrap();
+    opts.set("id_field", id_field).unwrap();
+    let all_fn: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
+    opts.set("all", all_fn).unwrap();
+    register.call::<()>((entity_type, opts)).unwrap();
+}
+
 fn install_capturing_broadcaster(lua: &Lua, eb: &Table) -> Table {
     let frames: Table = lua.create_table().unwrap();
     let frames_for_closure = frames.clone();
@@ -230,6 +248,194 @@ fn entity_patch_carries_project_fields_payload_via_eb() {
         frame.get("tree").is_none(),
         "entity_patch must not carry a ui tree: {frame}"
     );
+}
+
+#[test]
+fn entity_model_patch_workspace_emits_workspace_name_frame() {
+    let (lua, eb) = new_test_lua();
+    register_workspace(&lua, &eb);
+    let frames = install_capturing_broadcaster(&lua, &eb);
+
+    let model: Table = lua
+        .load("return require('lib.entity_model')")
+        .eval()
+        .unwrap();
+    let patch_workspace: Function = model.get("patch_workspace").unwrap();
+    let fields: Table = lua.create_table().unwrap();
+    fields.set("name", "Renamed").unwrap();
+    patch_workspace.call::<()>(("ws-a", fields)).unwrap();
+
+    let captured = frames_as_json(&lua, &frames);
+    assert_eq!(captured.len(), 1);
+    let frame = &captured[0];
+    assert_eq!(frame["type"], json!("entity_patch"));
+    assert_eq!(frame["entity_type"], json!("workspace"));
+    assert_eq!(frame["id"], json!("ws-a"));
+    assert_eq!(frame["patch"]["name"], json!("Renamed"));
+}
+
+#[test]
+fn entity_model_publish_session_upserts_current_workspace_fields() {
+    let (lua, eb) = new_test_lua();
+    let frames = install_capturing_broadcaster(&lua, &eb);
+
+    lua.load(
+        r#"
+        package.loaded["lib.session"] = {
+          is_system_session = function(_) return false end,
+        }
+        package.loaded["lib.agent"] = {
+          all_info = function() return {} end,
+        }
+    "#,
+    )
+    .exec()
+    .unwrap();
+
+    let model: Table = lua
+        .load("return require('lib.entity_model')")
+        .eval()
+        .unwrap();
+    let publish_session: Function = model.get("publish_session").unwrap();
+    let session: Table = lua.create_table().unwrap();
+    session.set("session_uuid", "sess-a").unwrap();
+    session.set("workspace_id", "ws-renamed").unwrap();
+    session.set("workspace_name", "Renamed Workspace").unwrap();
+    session
+        .set("metadata", lua.create_table().unwrap())
+        .unwrap();
+    publish_session.call::<()>(session).unwrap();
+
+    let captured = frames_as_json(&lua, &frames);
+    assert_eq!(captured.len(), 1);
+    let frame = &captured[0];
+    assert_eq!(frame["type"], json!("entity_upsert"));
+    assert_eq!(frame["entity_type"], json!("session"));
+    assert_eq!(frame["id"], json!("sess-a"));
+    assert_eq!(frame["entity"]["workspace_id"], json!("ws-renamed"));
+    assert_eq!(
+        frame["entity"]["workspace_name"],
+        json!("Renamed Workspace")
+    );
+}
+
+#[test]
+fn entity_model_upserts_workspace_from_created_session_before_session_publish() {
+    let (lua, eb) = new_test_lua();
+    register_workspace(&lua, &eb);
+    let frames = install_capturing_broadcaster(&lua, &eb);
+
+    let model: Table = lua
+        .load("return require('lib.entity_model')")
+        .eval()
+        .unwrap();
+    let session: Table = lua.create_table().unwrap();
+    session.set("session_uuid", "sess-new").unwrap();
+    session.set("session_type", "agent").unwrap();
+    session.set("workspace_id", "ws-new").unwrap();
+    session.set("workspace_name", "feature/new").unwrap();
+    model
+        .get::<Function>("upsert_session_workspace")
+        .unwrap()
+        .call::<()>(session)
+        .unwrap();
+
+    let captured = frames_as_json(&lua, &frames);
+    assert_eq!(captured.len(), 1);
+    let frame = &captured[0];
+    assert_eq!(frame["type"], json!("entity_upsert"));
+    assert_eq!(frame["entity_type"], json!("workspace"));
+    assert_eq!(frame["id"], json!("ws-new"));
+    assert_eq!(frame["entity"]["workspace_id"], json!("ws-new"));
+    assert_eq!(frame["entity"]["name"], json!("feature/new"));
+    assert_eq!(frame["entity"]["agents"], json!(["sess-new"]));
+    assert_eq!(frame["entity"]["session_counts"]["agent"], json!(1));
+}
+
+#[test]
+fn entity_model_covers_non_session_builtin_entities() {
+    let (lua, eb) = new_test_lua();
+    register_entity(&lua, &eb, "spawn_target", "target_id");
+    register_entity(&lua, &eb, "hub", "hub_id");
+    register_entity(&lua, &eb, "connection_code", "hub_id");
+    register_entity(&lua, &eb, "worktree", "worktree_path");
+    let frames = install_capturing_broadcaster(&lua, &eb);
+
+    let model: Table = lua
+        .load("return require('lib.entity_model')")
+        .eval()
+        .unwrap();
+
+    let target: Table = lua.create_table().unwrap();
+    target.set("target_id", "target-a").unwrap();
+    target.set("path", "/repo/a").unwrap();
+    model
+        .get::<Function>("upsert_spawn_target")
+        .unwrap()
+        .call::<()>(target)
+        .unwrap();
+
+    let target_patch: Table = lua.create_table().unwrap();
+    target_patch.set("target_name", "Repo A").unwrap();
+    model
+        .get::<Function>("patch_spawn_target")
+        .unwrap()
+        .call::<()>(("target-a", target_patch))
+        .unwrap();
+
+    model
+        .get::<Function>("remove_spawn_target")
+        .unwrap()
+        .call::<()>("target-a")
+        .unwrap();
+
+    let hub_payload: Table = lua.create_table().unwrap();
+    hub_payload.set("hub_id", "hub-a").unwrap();
+    hub_payload.set("state", "ready").unwrap();
+    model
+        .get::<Function>("upsert_hub")
+        .unwrap()
+        .call::<()>(hub_payload)
+        .unwrap();
+
+    let code_payload: Table = lua.create_table().unwrap();
+    code_payload.set("hub_id", "hub-a").unwrap();
+    code_payload.set("url", "https://pair").unwrap();
+    model
+        .get::<Function>("upsert_connection_code")
+        .unwrap()
+        .call::<()>(code_payload)
+        .unwrap();
+
+    let worktree_payload: Table = lua.create_table().unwrap();
+    worktree_payload
+        .set("worktree_path", "/repo/.worktrees/a")
+        .unwrap();
+    model
+        .get::<Function>("upsert_worktree")
+        .unwrap()
+        .call::<()>(worktree_payload)
+        .unwrap();
+
+    model
+        .get::<Function>("remove_worktree")
+        .unwrap()
+        .call::<()>("/repo/.worktrees/a")
+        .unwrap();
+
+    let captured = frames_as_json(&lua, &frames);
+    assert_eq!(captured.len(), 7);
+    assert_eq!(captured[0]["type"], json!("entity_upsert"));
+    assert_eq!(captured[0]["entity_type"], json!("spawn_target"));
+    assert_eq!(captured[1]["type"], json!("entity_patch"));
+    assert_eq!(captured[1]["entity_type"], json!("spawn_target"));
+    assert_eq!(captured[2]["type"], json!("entity_remove"));
+    assert_eq!(captured[2]["entity_type"], json!("spawn_target"));
+    assert_eq!(captured[3]["entity_type"], json!("hub"));
+    assert_eq!(captured[4]["entity_type"], json!("connection_code"));
+    assert_eq!(captured[5]["entity_type"], json!("worktree"));
+    assert_eq!(captured[6]["type"], json!("entity_remove"));
+    assert_eq!(captured[6]["entity_type"], json!("worktree"));
 }
 
 #[test]

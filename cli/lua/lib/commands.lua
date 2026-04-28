@@ -17,7 +17,7 @@ local registry = {}
 
 --- Register a hub command handler.
 -- Overwrites any existing handler for the same command type.
--- @param cmd_type string The command type (e.g., "list_agents")
+-- @param cmd_type string The command type (e.g., "create_agent")
 -- @param handler function Called with (client, sub_id, command)
 -- @param opts? table { description = "..." }
 function M.register(cmd_type, handler, opts)

@@ -168,6 +168,45 @@ fn db_open_creates_file_under_data_dir() {
     );
 }
 
+#[test]
+fn db_open_sanitizes_scoped_plugin_key_for_data_dir() {
+    let _lock = lock_env();
+    let tmp = TempDir::new().unwrap();
+    set_config_dir(tmp.path());
+
+    let lua = new_test_lua();
+    set_loading_plugin(
+        &lua,
+        "repo:/Users/jason/Rails/jupiter:rails-worktree-lifecycle",
+    );
+
+    lua.load(
+        r#"
+        local db = plugin.db{
+            version = 1,
+            models = {
+                events = {
+                    id = true,
+                    body = { 'text', default = '' },
+                },
+            },
+        }
+        assert(db ~= nil, "plugin.db returned nil")
+        "#,
+    )
+    .exec()
+    .expect("open scoped plugin db");
+
+    let expected = tmp
+        .path()
+        .join("plugins/repo__Users_jason_Rails_jupiter_rails-worktree-lifecycle/db.sqlite");
+    assert!(
+        expected.exists(),
+        "expected scoped db file at {}",
+        expected.display()
+    );
+}
+
 // ============================================================================
 // 2. test_insert_and_get
 // ============================================================================

@@ -1,7 +1,7 @@
 //! Types for client communication.
 //!
 //! These types define the request/response protocol between clients and Hub.
-//! Note: AgentInfo and WorktreeInfo are re-exported from relay::types.
+//! Note: AgentInfo is re-exported from relay::types.
 
 use std::path::PathBuf;
 

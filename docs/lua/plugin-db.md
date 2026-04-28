@@ -56,11 +56,12 @@ local rows = db:eval('SELECT COUNT(*) AS n FROM messages WHERE author = ?',
 
 ## File layout
 
-`plugin.db` derives `{config.data_dir()}/plugins/<plugin_name>/db.sqlite`
-and creates the parent directory if missing. `<plugin_name>` is whatever
-the hub registered for the loading plugin (matches the plugin's directory
-name). The file is NOT deleted when the plugin is disabled or unloaded —
-only the in-memory handle is.
+`plugin.db` derives `{config.data_dir()}/plugins/<plugin_key>/db.sqlite`
+and creates the parent directory if missing. `<plugin_key>` is the hub
+registry key for the loading plugin; device plugins usually match the plugin
+directory name, and repo plugins include the repo scope. Scoped keys are
+sanitized before they become directory names. The file is NOT deleted when the
+plugin is disabled or unloaded — only the in-memory handle is.
 
 ## Default PRAGMAs
 
@@ -183,7 +184,7 @@ migrations = {
 
 ## Lifecycle
 
-The handle cache is keyed by plugin name, so a hot-reload that calls
+The handle cache is keyed by plugin key, so a hot-reload that calls
 `plugin.db{}` again returns the **same** sqlite connection — data is
 preserved, no fds leak. When the plugin is disabled, unloaded, or the hub
 shuts down, the handle closes. Tests that need an ephemeral database pass

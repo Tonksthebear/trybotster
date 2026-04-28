@@ -455,16 +455,7 @@ function Hub:list_workspaces()
 
         return result
     end
-
-    local result = hub_client.request(self._conn_id, {
-        type = "list_workspaces",
-    }, 5000)
-
-    if result.error then
-        error(string.format("Hub:list_workspaces remote error: %s", result.error))
-    end
-
-    return result.result or {}
+    error("Hub:list_workspaces is local-only; remote clients receive workspace entities")
 end
 
 --- Rename a workspace on this hub.
@@ -491,15 +482,11 @@ function Hub:rename_workspace(workspace_id, new_name)
                 session.metadata.workspace = new_name
                 session:_sync_workspace_manifest()
                 session:_sync_session_manifest()
+                session:publish_entity()
             end
         end
 
-        -- Wire protocol — patch the workspace name and let each affected
-        -- session's Session:update emit its own entity_patch.
-        local EB = require("lib.entity_broadcast")
-        if EB.is_registered("workspace") then
-            EB.patch("workspace", workspace_id, { name = new_name })
-        end
+        require("lib.entity_model").patch_workspace(workspace_id, { name = new_name })
 
         return {
             workspace_id = workspace_id,
@@ -540,20 +527,18 @@ function Hub:move_agent_workspace(agent_id, workspace_id, workspace_name)
             error(string.format("Hub:move_agent_workspace failed: %s", tostring(err)))
         end
 
-        -- Wire protocol — the moved session's workspace_id changed; the
-        -- Session:update inside move_to_workspace already emitted the
-        -- entity_patch. Re-snapshot the workspace registry so a freshly
-        -- non-empty target workspace shows up in clients that filter for
-        -- "workspaces with sessions".
-        local EB = require("lib.entity_broadcast")
-        if EB.is_registered("workspace") then
+        -- Wire protocol — move_to_workspace publishes the moved session.
+        -- Upsert workspaces so target/old workspace status and membership
+        -- summaries reach clients filtering for active workspaces.
+        local EntityModel = require("lib.entity_model")
+        if require("lib.entity_broadcast").is_registered("workspace") then
             local Hub = require("lib.hub")
             local ok, workspaces = pcall(function()
                 return Hub.get():list_workspaces()
             end)
             if ok and type(workspaces) == "table" then
                 for _, workspace in ipairs(workspaces) do
-                    EB.upsert("workspace", workspace)
+                    EntityModel.upsert_workspace(workspace)
                 end
             end
         end
@@ -662,23 +647,13 @@ function Hub:delete_agent(agent_id, delete_worktree)
     return result.result
 end
 
---- List agents on this hub.
--- Local: returns Agent.all_info(). Remote: uses hub_client.request().
+--- List sessions on the local hub.
 -- @return array of agent info tables
 function Hub:agent_list()
     if self._is_local then
         return require("lib.client_session_payload").build_many(Agent.all_info())
     end
-
-    local result = hub_client.request(self._conn_id, {
-        type = "get_agent_list",
-    }, 5000)
-
-    if result.error then
-        error(string.format("Hub:agent_list remote error: %s", result.error))
-    end
-
-    return result.result or {}
+    error("Hub:agent_list is local-only; remote clients receive session entities")
 end
 
 -- =============================================================================

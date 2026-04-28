@@ -296,7 +296,7 @@ mod tests {
 
         // Hub sends a JSON frame to the client
         assert!(conn.send_frame(&Frame::Json(serde_json::json!({
-            "type": "agent_list",
+            "type": "status_update",
             "agents": [{"name": "test-agent", "index": 0}]
         }))));
 
@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(frames.len(), 1);
         match &frames[0] {
             Frame::Json(value) => {
-                assert_eq!(value["type"], "agent_list");
+                assert_eq!(value["type"], "status_update");
                 assert_eq!(value["agents"][0]["name"], "test-agent");
             }
             other => panic!("Expected Json frame, got: {other:?}"),

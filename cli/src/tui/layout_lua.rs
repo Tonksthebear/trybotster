@@ -43,9 +43,9 @@ pub struct KeyContext {
 
 /// Context passed to Lua `actions.on_action()` for workflow dispatch.
 ///
-/// Contains only Rust-owned state that Lua needs. Application state
-/// (mode, input_buffer, list_selected, agents, pending_fields, worktrees)
-/// lives in Lua's `_tui_state` global — the TUI is a client like the browser.
+/// Contains Rust-owned state that Lua needs. Application workflow state lives
+/// in Lua's `_tui_state` global, and entity-backed state is projected from the
+/// TUI entity stores so actions never need legacy hub list requests.
 #[derive(Debug, Clone, Default)]
 pub struct ActionContext {
     /// Action strings from the overlay list (extracted from render tree).
@@ -56,6 +56,8 @@ pub struct ActionContext {
     pub action_char: Option<char>,
     /// Whether the outer terminal window has OS-level focus.
     pub terminal_focused: bool,
+    /// Ordered built-in entity snapshots from the TUI entity stores.
+    pub entities: Option<serde_json::Value>,
 }
 
 /// TUI-owned Lua state for layout rendering and keybinding dispatch.
@@ -179,6 +181,12 @@ impl LayoutLua {
         stores: Option<&crate::tui::entity_stores::TuiEntityStores>,
     ) -> Result<RenderNode> {
         let state = render_context_to_lua(&self.lua, ctx)?;
+        if let Some(stores) = stores {
+            let entities = json_to_lua_value(&self.lua, &stores.action_context_json())?;
+            state
+                .set("entities", entities)
+                .map_err(|e| anyhow!("Failed to set render entities: {e}"))?;
+        }
 
         let globals = self.lua.globals();
         let render_fn: mlua::Function = globals
@@ -224,6 +232,12 @@ impl LayoutLua {
         stores: Option<&crate::tui::entity_stores::TuiEntityStores>,
     ) -> Result<Option<RenderNode>> {
         let state = render_context_to_lua(&self.lua, ctx)?;
+        if let Some(stores) = stores {
+            let entities = json_to_lua_value(&self.lua, &stores.action_context_json())?;
+            state
+                .set("entities", entities)
+                .map_err(|e| anyhow!("Failed to set overlay entities: {e}"))?;
+        }
 
         let globals = self.lua.globals();
         let render_overlay_fn: mlua::Function = match globals.get("render_overlay") {
@@ -673,6 +687,13 @@ impl LayoutLua {
         ctx_table
             .set("terminal_focused", context.terminal_focused)
             .map_err(|e| anyhow!("Failed to set terminal_focused: {e}"))?;
+
+        if let Some(entities) = &context.entities {
+            let value = json_to_lua_value(&self.lua, entities)?;
+            ctx_table
+                .set("entities", value)
+                .map_err(|e| anyhow!("Failed to set entities: {e}"))?;
+        }
 
         Ok(ctx_table)
     }
@@ -1360,6 +1381,11 @@ mod tests {
             include_str!("../../lua/ui/workspace_helpers.lua"),
         )
         .expect("workspace_helpers.lua should preload");
+        lua.preload_module(
+            "ui.entity_state",
+            include_str!("../../lua/ui/entity_state.lua"),
+        )
+        .expect("entity_state.lua should preload");
         lua.load_keybindings(kb_source)
             .expect("keybindings.lua should load");
         lua.load_actions(actions_source)
@@ -1707,6 +1733,11 @@ mod tests {
             .expect("keybindings.lua should load");
         lua.preload_module("ui.workspace_helpers", ws_helpers_source)
             .expect("workspace_helpers preload should succeed");
+        lua.preload_module(
+            "ui.entity_state",
+            include_str!("../../lua/ui/entity_state.lua"),
+        )
+        .expect("entity_state preload should succeed");
         lua.load_actions(actions_source)
             .expect("actions.lua should load");
         lua.load_events(events_source)
@@ -1881,6 +1912,11 @@ mod tests {
             include_str!("../../lua/ui/workspace_helpers.lua"),
         )
         .expect("workspace_helpers.lua should preload");
+        lua.preload_module(
+            "ui.entity_state",
+            include_str!("../../lua/ui/entity_state.lua"),
+        )
+        .expect("entity_state.lua should preload");
         lua.load_keybindings(kb_source)
             .expect("keybindings.lua should load");
         lua.load_actions(actions_source)
@@ -1892,23 +1928,26 @@ mod tests {
         lua
     }
 
-    /// After user submits create_agent, lifecycle events should update
-    /// _tui_state.pending_fields to show creation progress.
+    /// Entity status updates should update pending_fields to show creation progress.
     #[test]
     fn test_lifecycle_creating_worktree_updates_pending_fields() {
         let lua = make_full_lua_with_events();
-        let ctx = ActionContext::default();
-
-        // Simulate the hub broadcasting agent_status_changed: creating_worktree
-        let event = serde_json::json!({
-            "type": "agent_status_changed",
-            "agent_id": "my-repo-feature-auth",
-            "status": "creating_worktree",
-        });
-        let ops = lua
-            .call_on_hub_event("agent_status_changed", &event, &ctx)
+        lua.exec("_tui_state.pending_fields.creating_agent_id = 'my-repo-feature-auth'")
             .unwrap();
-        assert!(ops.is_some(), "agent_status_changed should return ops");
+        let ctx = ActionContext {
+            entities: Some(serde_json::json!({
+                "sessions": [{
+                    "id": "my-repo-feature-auth",
+                    "session_uuid": "my-repo-feature-auth",
+                    "status": "creating_worktree"
+                }],
+                "workspaces": [],
+                "spawn_targets": [],
+                "worktrees": []
+            })),
+            ..Default::default()
+        };
+        lua.call_on_action("refresh_agents", &ctx).unwrap();
 
         // Verify _tui_state was updated for the creating indicator
         let creating_id = lua
@@ -1928,29 +1967,26 @@ mod tests {
         );
     }
 
-    /// spawning_ptys lifecycle event should update stage to spawning_agent.
+    /// spawning_ptys entity status should update stage to spawning_agent.
     #[test]
     fn test_lifecycle_spawning_ptys_updates_stage() {
         let lua = make_full_lua_with_events();
-        let ctx = ActionContext::default();
-
-        // First: creating_worktree
-        let event = serde_json::json!({
-            "type": "agent_status_changed",
-            "agent_id": "my-repo-42",
-            "status": "creating_worktree",
-        });
-        lua.call_on_hub_event("agent_status_changed", &event, &ctx)
+        lua.exec("_tui_state.pending_fields.creating_agent_id = 'my-repo-42'")
             .unwrap();
-
-        // Then: spawning_ptys
-        let event = serde_json::json!({
-            "type": "agent_status_changed",
-            "agent_id": "my-repo-42",
-            "status": "spawning_ptys",
-        });
-        lua.call_on_hub_event("agent_status_changed", &event, &ctx)
-            .unwrap();
+        let ctx = ActionContext {
+            entities: Some(serde_json::json!({
+                "sessions": [{
+                    "id": "my-repo-42",
+                    "session_uuid": "my-repo-42",
+                    "status": "spawning_ptys"
+                }],
+                "workspaces": [],
+                "spawn_targets": [],
+                "worktrees": []
+            })),
+            ..Default::default()
+        };
+        lua.call_on_action("refresh_agents", &ctx).unwrap();
 
         let stage = lua
             .eval_string("return _tui_state.pending_fields.creating_agent_stage or 'NIL'")
@@ -1961,12 +1997,11 @@ mod tests {
         );
     }
 
-    /// agent_created event should add agent to _tui_state.agents and clear
+    /// session entity sync should add agent to _tui_state.agents and clear
     /// pending_fields, making the agent visible in the sidebar.
     #[test]
-    fn test_agent_created_event_adds_agent_to_state() {
+    fn test_session_entity_sync_adds_agent_to_state() {
         let lua = make_full_lua_with_events();
-        let ctx = ActionContext::default();
 
         // Pre-condition: pending creation in progress
         lua.exec(
@@ -1977,11 +2012,11 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate agent_created event from hub
-        let event = serde_json::json!({
-            "type": "agent_created",
-            "agent": {
+        let ctx = ActionContext {
+            entities: Some(serde_json::json!({
+                "sessions": [{
                 "id": "my-repo-feature-auth",
+                "session_uuid": "my-repo-feature-auth",
                 "display_name": "feature-auth",
                 "repo": "my/repo",
                 "branch_name": "feature-auth",
@@ -1990,19 +2025,21 @@ mod tests {
                 "sessions": [
                     { "name": "agent", "port_forward": false },
                 ],
-                "created_at": 1707833400,
-            }
-        });
-        let ops = lua
-            .call_on_hub_event("agent_created", &event, &ctx)
-            .unwrap();
-        assert!(ops.is_some(), "agent_created should return ops");
+                "created_at": 1707833400
+                }],
+                "workspaces": [],
+                "spawn_targets": [],
+                "worktrees": []
+            })),
+            ..Default::default()
+        };
+        lua.call_on_action("refresh_agents", &ctx).unwrap();
 
         // Verify agent was added to _tui_state.agents
         let agent_count = lua.eval_usize("return #_tui_state.agents").unwrap();
         assert_eq!(
             agent_count, 1,
-            "Should have 1 agent after agent_created event"
+            "Should have 1 agent after session entity sync"
         );
 
         let agent_id = lua.eval_string("return _tui_state.agents[1].id").unwrap();
@@ -2019,7 +2056,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             creating_id, "NIL",
-            "creating_agent_id should be cleared after agent_created"
+            "creating_agent_id should be cleared after running status"
         );
 
         let stage = lua
@@ -2027,22 +2064,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             stage, "NIL",
-            "creating_agent_stage should be cleared after agent_created"
+            "creating_agent_stage should be cleared after running status"
         );
-
-        // Verify ops include focus_terminal (auto-select new agent)
-        let ops = ops.unwrap();
-        let focus_op = ops.iter().find(|op| op["op"] == "focus_terminal");
-        assert!(
-            focus_op.is_some(),
-            "agent_created should return focus_terminal op to show the agent"
-        );
-        assert_eq!(focus_op.unwrap()["agent_id"], "my-repo-feature-auth");
-
-        // Verify mode switches to insert
-        let mode_op = ops.iter().find(|op| op["op"] == "set_mode");
-        assert!(mode_op.is_some(), "Should switch to terminal mode");
-        assert_eq!(mode_op.unwrap()["mode"], "terminal");
     }
 
     /// Extract list item plain-text strings from the sidebar (first child of HSplit).
@@ -2324,36 +2347,43 @@ mod tests {
             .unwrap();
         assert_eq!(creating_id, "main");
 
-        // Step 2: Hub sends spawning_ptys lifecycle event
-        let event = serde_json::json!({
-            "type": "agent_status_changed",
-            "agent_id": "main",
-            "status": "spawning_ptys",
-        });
-        lua.call_on_hub_event("agent_status_changed", &event, &ctx)
-            .unwrap();
+        // Step 2: Hub sends a session entity status update.
+        let ctx = ActionContext {
+            entities: Some(serde_json::json!({
+                "sessions": [{ "id": "main", "session_uuid": "main", "status": "spawning_ptys" }],
+                "workspaces": [],
+                "spawn_targets": [],
+                "worktrees": []
+            })),
+            ..Default::default()
+        };
+        lua.call_on_action("refresh_agents", &ctx).unwrap();
         let stage = lua
             .eval_string("return _tui_state.pending_fields.creating_agent_stage or 'NIL'")
             .unwrap();
         assert_eq!(stage, "spawning_agent");
 
-        // Step 3: Hub sends agent_created event
-        let event = serde_json::json!({
-            "type": "agent_created",
-            "agent": {
+        // Step 3: Hub sends the running session entity.
+        let ctx = ActionContext {
+            entities: Some(serde_json::json!({
+                "sessions": [{
                 "id": "my-repo-main",
+                "session_uuid": "my-repo-main",
                 "display_name": "main",
                 "repo": "my/repo",
                 "branch_name": "main",
                 "worktree_path": "/home/user/repo",
                 "status": "running",
                 "sessions": [{ "name": "agent", "port_forward": false }],
-                "created_at": 1707833400,
-            }
-        });
-        let ops = lua
-            .call_on_hub_event("agent_created", &event, &ctx)
-            .unwrap();
+                "created_at": 1707833400
+                }],
+                "workspaces": [],
+                "spawn_targets": [],
+                "worktrees": []
+            })),
+            ..Default::default()
+        };
+        lua.call_on_action("refresh_agents", &ctx).unwrap();
 
         // Verify: agent is in state
         let count = lua.eval_usize("return #_tui_state.agents").unwrap();
@@ -2365,17 +2395,7 @@ mod tests {
             .unwrap();
         assert_eq!(creating, "NIL", "Creating indicator should be cleared");
 
-        // Verify: ops auto-focus the agent
-        let ops = ops.unwrap();
-        assert!(
-            ops.iter().any(|op| op["op"] == "focus_terminal"),
-            "Should auto-focus the new agent"
-        );
-        assert!(
-            ops.iter()
-                .any(|op| op["op"] == "set_mode" && op["mode"] == "terminal"),
-            "Should enter terminal mode"
-        );
+        // Focus is selection state; entity sync only updates model state.
 
         // Verify: layout renders the agent (workspace header + agent row)
         let render_ctx = make_test_ctx("terminal");
@@ -2420,13 +2440,16 @@ mod tests {
         lua.call_on_action("input_submit", &ctx).unwrap(); // → empty prompt OK
 
         // Lifecycle: creating_worktree
-        let event = serde_json::json!({
-            "type": "agent_status_changed",
-            "agent_id": "42",
-            "status": "creating_worktree",
-        });
-        lua.call_on_hub_event("agent_status_changed", &event, &ctx)
-            .unwrap();
+        let ctx = ActionContext {
+            entities: Some(serde_json::json!({
+                "sessions": [{ "id": "42", "session_uuid": "42", "status": "creating_worktree" }],
+                "workspaces": [],
+                "spawn_targets": [],
+                "worktrees": []
+            })),
+            ..Default::default()
+        };
+        lua.call_on_action("refresh_agents", &ctx).unwrap();
 
         // Verify creating indicator renders
         let render_ctx = make_test_ctx("list");
@@ -2445,13 +2468,16 @@ mod tests {
         );
 
         // Lifecycle: spawning_ptys
-        let event = serde_json::json!({
-            "type": "agent_status_changed",
-            "agent_id": "42",
-            "status": "spawning_ptys",
-        });
-        lua.call_on_hub_event("agent_status_changed", &event, &ctx)
-            .unwrap();
+        let ctx = ActionContext {
+            entities: Some(serde_json::json!({
+                "sessions": [{ "id": "42", "session_uuid": "42", "status": "spawning_ptys" }],
+                "workspaces": [],
+                "spawn_targets": [],
+                "worktrees": []
+            })),
+            ..Default::default()
+        };
+        lua.call_on_action("refresh_agents", &ctx).unwrap();
 
         let tree = lua.call_render(&render_ctx).unwrap();
         let items = extract_sidebar_items(&tree);
@@ -2461,11 +2487,12 @@ mod tests {
             items[0]
         );
 
-        // agent_created
-        let event = serde_json::json!({
-            "type": "agent_created",
-            "agent": {
+        // Running session entity
+        let ctx = ActionContext {
+            entities: Some(serde_json::json!({
+                "sessions": [{
                 "id": "my-repo-42",
+                "session_uuid": "my-repo-42",
                 "display_name": "botster-issue-42",
                 "repo": "my/repo",
                 "issue_number": 42,
@@ -2473,11 +2500,15 @@ mod tests {
                 "worktree_path": "/tmp/worktrees/botster-issue-42",
                 "status": "running",
                 "sessions": [{ "name": "agent", "port_forward": false }],
-                "created_at": 1707833400,
-            }
-        });
-        lua.call_on_hub_event("agent_created", &event, &ctx)
-            .unwrap();
+                "created_at": 1707833400
+                }],
+                "workspaces": [],
+                "spawn_targets": [],
+                "worktrees": []
+            })),
+            ..Default::default()
+        };
+        lua.call_on_action("refresh_agents", &ctx).unwrap();
 
         // Creating indicator gone, agent in list (workspace header + agent row)
         let tree = lua.call_render(&render_ctx).unwrap();
@@ -2562,8 +2593,6 @@ mod tests {
     #[test]
     fn test_lifecycle_failed_clears_creating_indicator() {
         let lua = make_full_lua_with_events();
-        let ctx = ActionContext::default();
-
         // Set creating state
         lua.exec(
             r#"
@@ -2573,14 +2602,17 @@ mod tests {
         )
         .unwrap();
 
-        // Hub sends failed
-        let event = serde_json::json!({
-            "type": "agent_status_changed",
-            "agent_id": "my-repo-feature",
-            "status": "failed",
-        });
-        lua.call_on_hub_event("agent_status_changed", &event, &ctx)
-            .unwrap();
+        // Hub sends failed status through the session entity.
+        let ctx = ActionContext {
+            entities: Some(serde_json::json!({
+                "sessions": [{ "id": "my-repo-feature", "session_uuid": "my-repo-feature", "status": "failed" }],
+                "workspaces": [],
+                "spawn_targets": [],
+                "worktrees": []
+            })),
+            ..Default::default()
+        };
+        lua.call_on_action("refresh_agents", &ctx).unwrap();
 
         let creating = lua
             .eval_string("return _tui_state.pending_fields.creating_agent_id and 'SET' or 'NIL'")
@@ -2621,22 +2653,16 @@ mod tests {
         let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
         assert_eq!(ops[0]["op"], "set_mode");
         assert_eq!(ops[0]["mode"], "new_agent_select_target");
-        // Should send list_spawn_targets message
-        assert_eq!(ops[1]["op"], "send_msg");
-        let msg_data = &ops[1]["data"]["data"];
-        assert_eq!(msg_data["type"], "list_spawn_targets");
 
-        // Step 3: Simulate spawn target list and select the first target.
-        let target_event = serde_json::json!({
-            "targets": [
-                { "id": "tgt_trybotster", "name": "trybotster", "path": "/tmp/trybotster", "current_branch": "main" }
-            ]
-        });
-        let event_ops = lua
-            .call_on_hub_event("spawn_target_list", &target_event, &ctx)
-            .unwrap()
-            .unwrap();
-        assert!(event_ops.is_empty());
+        // Step 3: Entity-backed spawn targets are already in client state.
+        lua.exec(
+            r#"
+            _tui_state.available_targets = {
+                { id = "tgt_trybotster", name = "trybotster", path = "/tmp/trybotster", current_branch = "main" }
+            }
+        "#,
+        )
+        .unwrap();
 
         let ctx = ActionContext::default();
         let ops = lua.call_on_action("list_select", &ctx).unwrap().unwrap();
@@ -2667,10 +2693,6 @@ mod tests {
         let ops = lua.call_on_action("input_submit", &ctx).unwrap().unwrap();
         assert_eq!(ops[0]["op"], "set_mode");
         assert_eq!(ops[0]["mode"], "new_agent_select_worktree");
-        assert_eq!(ops[1]["op"], "send_msg");
-        let msg_data = &ops[1]["data"]["data"];
-        assert_eq!(msg_data["type"], "list_worktrees");
-        assert_eq!(msg_data["target_id"], "tgt_trybotster");
 
         ops
     }
@@ -2687,15 +2709,15 @@ mod tests {
         };
         lua.call_on_action("list_select", &ctx).unwrap();
 
-        // Step 3: Spawn target list response, then select the first target.
-        let target_event = serde_json::json!({
-            "targets": [
-                { "id": "tgt_trybotster", "name": "trybotster", "path": "/tmp/trybotster", "current_branch": "main" }
-            ]
-        });
-        lua.call_on_hub_event("spawn_target_list", &target_event, &ctx)
-            .unwrap()
-            .unwrap();
+        // Step 3: Entity-backed spawn targets are already in client state.
+        lua.exec(
+            r#"
+            _tui_state.available_targets = {
+                { id = "tgt_trybotster", name = "trybotster", path = "/tmp/trybotster", current_branch = "main" }
+            }
+        "#,
+        )
+        .unwrap();
 
         let ctx = ActionContext::default();
         lua.call_on_action("list_select", &ctx).unwrap().unwrap();
@@ -2865,11 +2887,11 @@ mod tests {
             .unwrap();
         assert_eq!(creating_id, "main");
 
-        // Verify creating_agent_stage is "spawning" (main skips worktree creation)
+        // Verify creating_agent_stage is "spawning_agent" (main skips worktree creation)
         let stage = lua
             .eval_string("return _tui_state.pending_fields.creating_agent_stage")
             .unwrap();
-        assert_eq!(stage, "spawning");
+        assert_eq!(stage, "spawning_agent");
     }
 
     /// Scenario 1b: Open agent on main with empty prompt (optional prompt).
@@ -3019,7 +3041,7 @@ mod tests {
         let lua = make_full_lua();
         enter_new_agent_flow(&lua);
 
-        // Set up available_worktrees (populated by list_worktrees response)
+        // Set up available_worktrees from entity-backed client state.
         lua.exec(
             r#"
             _tui_state.available_worktrees = {
@@ -3172,13 +3194,14 @@ mod tests {
         };
         lua.call_on_action("list_select", &ctx).unwrap();
 
-        let target_event = serde_json::json!({
-            "targets": [
-                { "id": "tgt_trybotster", "name": "trybotster", "path": "/tmp/trybotster", "current_branch": "main" }
-            ]
-        });
-        lua.call_on_hub_event("spawn_target_list", &target_event, &ctx)
-            .unwrap();
+        lua.exec(
+            r#"
+            _tui_state.available_targets = {
+                { id = "tgt_trybotster", name = "trybotster", path = "/tmp/trybotster", current_branch = "main" }
+            }
+        "#,
+        )
+        .unwrap();
         let ctx = ActionContext::default();
         lua.call_on_action("list_select", &ctx).unwrap();
 

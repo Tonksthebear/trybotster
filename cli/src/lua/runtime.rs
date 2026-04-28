@@ -2035,11 +2035,23 @@ impl LuaRuntime {
     ///
     /// Called by Hub when shutting down.
     pub fn fire_shutdown(&self) -> Result<()> {
-        if !self.has_event_callbacks("shutdown") {
-            return Ok(());
+        if self.has_observers("shutdown") {
+            let result: mlua::Result<()> = (|| {
+                let hooks: mlua::Table = self.lua.globals().get("hooks")?;
+                let notify: mlua::Function = hooks.get("notify")?;
+                notify.call::<mlua::Value>("shutdown")?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                log::warn!("shutdown hook failed: {e}");
+            }
         }
 
-        self.fire_event("shutdown", |_lua| Ok(mlua::Value::Nil))
+        if self.has_event_callbacks("shutdown") {
+            self.fire_event("shutdown", |_lua| Ok(mlua::Value::Nil))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -2847,6 +2859,30 @@ mod tests {
     }
 
     #[test]
+    fn test_fire_shutdown_invokes_hook_observer() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+        load_hooks_module(runtime.lua());
+
+        runtime
+            .lua()
+            .load(
+                r#"
+            shutdown_hook_called = false
+            hooks.on("shutdown", "test.shutdown", function()
+                shutdown_hook_called = true
+            end)
+        "#,
+            )
+            .exec()
+            .unwrap();
+
+        runtime.fire_shutdown().expect("Should fire shutdown hook");
+
+        let called: bool = runtime.lua().globals().get("shutdown_hook_called").unwrap();
+        assert!(called);
+    }
+
+    #[test]
     fn test_hub_events_empty_initially() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         let mut rx = runtime.setup_test_event_channel();
@@ -2978,7 +3014,7 @@ mod tests {
             .lua()
             .load(
                 r#"
-            tui.send({ type = "agent_list" })
+            tui.send({ type = "session_ping" })
             tui.send({ type = "status" })
         "#,
             )
@@ -2991,7 +3027,7 @@ mod tests {
 
         match event1 {
             HubEvent::TuiSend(TuiSendRequest::Json { data }) => {
-                assert_eq!(data["type"], "agent_list");
+                assert_eq!(data["type"], "session_ping");
             }
             _ => panic!("Expected TuiSend Json event"),
         }
@@ -3014,8 +3050,8 @@ mod tests {
             .load(
                 r#"
             tui.on_message(function(msg)
-                if msg.type == "list_agents" then
-                    tui.send({ type = "agent_list", count = 0 })
+                if msg.type == "ping" then
+                    tui.send({ type = "pong", count = 0 })
                 end
             end)
         "#,
@@ -3023,7 +3059,7 @@ mod tests {
             .exec()
             .unwrap();
 
-        let msg = serde_json::json!({ "type": "list_agents" });
+        let msg = serde_json::json!({ "type": "ping" });
         runtime.call_tui_message(msg).expect("Should call callback");
 
         let event = rx.try_recv().expect("Should receive event");
@@ -3031,7 +3067,7 @@ mod tests {
 
         match event {
             HubEvent::TuiSend(TuiSendRequest::Json { data }) => {
-                assert_eq!(data["type"], "agent_list");
+                assert_eq!(data["type"], "pong");
                 assert_eq!(data["count"], 0);
             }
             _ => panic!("Expected TuiSend Json event"),
@@ -3655,7 +3691,11 @@ mod tests {
                 local cleared = false
                 if agent and agent.notification then
                     agent.notification = false
-                    broadcast_hub_event("agent_list", { agents = Agent.all_info() })
+                    broadcast_hub_event("entity_patch", {
+                        entity_type = "session",
+                        id = session_uuid,
+                        patch = { notification = false },
+                    })
                     cleared = true
                 end
                 local any_remaining = false
@@ -3778,9 +3818,9 @@ mod tests {
             .unwrap();
         assert!(!notif, "Notification should be cleared after input");
 
-        // Should have broadcast the updated agent list
+        // Should have broadcast the updated session entity patch.
         let broadcast_count: i64 = runtime.lua().load("return #_broadcasts").eval().unwrap();
-        assert_eq!(broadcast_count, 1, "Should broadcast agent_list update");
+        assert_eq!(broadcast_count, 1, "Should broadcast session entity update");
 
         // Listener should be disarmed (no more notifications pending)
         assert!(
@@ -3977,9 +4017,9 @@ mod tests {
             .unwrap();
         assert!(!notif, "Notification should be cleared");
 
-        // Should have broadcast the update
+        // Should have broadcast the session entity update.
         let broadcast_count: i64 = runtime.lua().load("return #_broadcasts").eval().unwrap();
-        assert_eq!(broadcast_count, 1, "Should broadcast agent_list update");
+        assert_eq!(broadcast_count, 1, "Should broadcast session entity update");
 
         // But should NOT fire the pty_input hook (this wasn't typing)
         let hook_call_count: i64 = runtime

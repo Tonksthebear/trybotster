@@ -298,13 +298,13 @@ safe_require("user.init")
 local ConfigResolver = require("lib.config_resolver")
 local state = require("hub.state")
 local plugin_registry = state.get("plugin_registry", {})
-local loaded_plugin_names = {}
 
 local device_root = config.data_dir and config.data_dir() or nil
 
 -- Store resolver opts so plugin watcher/reload can re-discover plugins
 state.set("plugin_resolver_opts", {
     device_root = device_root,
+    repo_roots = {},
 })
 
 -- Run migration if old structure detected
@@ -330,30 +330,38 @@ if target_registry and type(target_registry.list) == "function" then
     end
 end
 
-local function load_plugins_from_resolved(unified)
+local function load_plugins_from_resolved(unified, repo_root)
     if not unified or not unified.plugins then return end
     for _, plugin in ipairs(unified.plugins) do
-        if not plugin_registry[plugin.name] then
-            plugin_registry[plugin.name] = {
+        local load_opts = {
+            source = plugin.source,
+            repo_root = plugin.source == "repo" and repo_root or nil,
+        }
+        local registry_key = loader.plugin_key(plugin.name, load_opts)
+        if not plugin_registry[registry_key] then
+            plugin_registry[registry_key] = {
+                key = registry_key,
+                name = plugin.name,
                 path = plugin.init_path,
+                source = plugin.source,
+                repo_root = load_opts.repo_root,
                 status = "pending",
                 reload_count = 0,
             }
 
-            if loader.is_disabled(plugin.name) then
-                plugin_registry[plugin.name].status = "disabled"
-                log.info(string.format("Plugin disabled, skipping: %s", plugin.name))
+            if loader.is_disabled(registry_key) or (registry_key ~= plugin.name and loader.is_disabled(plugin.name)) then
+                plugin_registry[registry_key].status = "disabled"
+                log.info(string.format("Plugin disabled, skipping: %s", registry_key))
             else
-                local load_ok, load_err = loader.load_plugin(plugin.init_path, plugin.name)
+                local load_ok, load_err = loader.load_plugin(plugin.init_path, plugin.name, load_opts)
                 if load_ok then
-                    loaded_plugin_names[plugin.name] = true
-                    plugin_registry[plugin.name].status = "loaded"
-                    plugin_registry[plugin.name].loaded_at = os.time()
-                    plugin_registry[plugin.name].reload_count = 1
+                    plugin_registry[registry_key].status = "loaded"
+                    plugin_registry[registry_key].loaded_at = os.time()
+                    plugin_registry[registry_key].reload_count = 1
                 else
-                    plugin_registry[plugin.name].status = "errored"
-                    plugin_registry[plugin.name].error = load_err
-                    plugin_registry[plugin.name].error_at = os.time()
+                    plugin_registry[registry_key].status = "errored"
+                    plugin_registry[registry_key].error = load_err
+                    plugin_registry[registry_key].error_at = os.time()
                 end
             end
         end
@@ -367,24 +375,28 @@ if device_root then
         repo_root = nil,
         require_agent = false,
     })
-    load_plugins_from_resolved(unified)
+    load_plugins_from_resolved(unified, nil)
 end
 
 -- Load repo-level plugins from each spawn target.
 -- Set _loading_plugin_repo_root so hub.detect_repo() can resolve the repo
 -- from the target path (the hub's CWD is $HOME, not a repo directory).
 for repo_root, _ in pairs(target_repo_roots) do
+    local resolver_opts = state.get("plugin_resolver_opts", {})
+    resolver_opts.repo_roots = resolver_opts.repo_roots or {}
+    table.insert(resolver_opts.repo_roots, repo_root)
+
     _G._loading_plugin_repo_root = repo_root
     local unified = ConfigResolver.resolve_all({
-        device_root = nil,
+        device_root = device_root,
         repo_root = repo_root,
         require_agent = false,
     })
-    load_plugins_from_resolved(unified)
+    load_plugins_from_resolved(unified, repo_root)
 end
 _G._loading_plugin_repo_root = nil
 
-if not next(loaded_plugin_names) then
+if not next(plugin_registry) then
     log.debug("No plugins found")
 end
 

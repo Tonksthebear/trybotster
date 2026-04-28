@@ -22,14 +22,14 @@ default: &default
 development:
   primary:
     <<: *default
-    database: trybotster_development
+    database: <%= "#{ENV.fetch("RAILS_WORKTREE_DATABASE_PREFIX", "trybotster")}_development" %>
   queue:
     <<: *default
-    database: trybotster_development_queue
+    database: <%= "#{ENV.fetch("RAILS_WORKTREE_DATABASE_PREFIX", "trybotster")}_development_queue" %>
     migrations_paths: db/queue_migrate
   cable:
     <<: *default
-    database: trybotster_development_cable
+    database: <%= "#{ENV.fetch("RAILS_WORKTREE_DATABASE_PREFIX", "trybotster")}_development_cable" %>
     migrations_paths: db/cable_migrate
 
 # Warning: The database defined as "test" will be erased and
@@ -38,17 +38,17 @@ development:
 test:
   primary: &primary_test
     <<: *default
-    database: trybotster_test
+    database: <%= "#{ENV.fetch("RAILS_WORKTREE_DATABASE_PREFIX", "trybotster")}_test" %>
     host: <%= ENV.fetch("DB_HOST", nil) %>
     username: <%= ENV.fetch("DB_USERNAME", nil) %>
     password: <%= ENV.fetch("DB_PASSWORD", "") %>
   queue:
     <<: *primary_test
-    database: trybotster_test_queue
+    database: <%= "#{ENV.fetch("RAILS_WORKTREE_DATABASE_PREFIX", "trybotster")}_test_queue" %>
     migrations_paths: db/queue_migrate
   cable:
     <<: *primary_test
-    database: trybotster_test_cable
+    database: <%= "#{ENV.fetch("RAILS_WORKTREE_DATABASE_PREFIX", "trybotster")}_test_cable" %>
     migrations_paths: db/cable_migrate
 
 # As with config/credentials.yml, you never want to store sensitive information,
