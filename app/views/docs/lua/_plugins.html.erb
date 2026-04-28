@@ -31,6 +31,35 @@ your-repo/.botster/plugins/my-plugin/init.lua # Repo-level (this repo only)</cod
 <pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>-- @tui tui/status.lua
 local web_layout = require("web_layout")</code></pre>
 
+<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Plugin surfaces</h2>
+<p class="text-zinc-400 mb-4">
+  Plugins can register browser surfaces and ask core to place them in navigation. Icon names come from the vendored Heroicons mini set under
+  <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">app/assets/svg/icons/heroicons/mini</code>, so use the Heroicon filename without
+  <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">.svg</code>.
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>surfaces.register("vault", {
+  label = "Vault",
+  icon = "book-open",
+  nav = { section = "workspace", order = 25 },
+  routes = {
+    { path = "/", render = vault_home },
+    { path = "/sessions/:session_uuid", render = vault_session },
+  },
+})</code></pre>
+<p class="text-zinc-400 mb-4">
+  Plugin-owned sessions can stay out of the normal workspace sidebar while remaining visible inside the plugin surface:
+</p>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>ui.session_list{
+  visibility = "plugin",
+  owner_plugin = "vault",
+  surface = "vault",
+}
+
+ui.session_terminal{
+  session_uuid = state.params.session_uuid,
+  back = ctx.path("/"),
+}</code></pre>
+
 <h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Load order</h2>
 <p class="text-zinc-400">
   Plugins are loaded in alphabetical order. Device-level plugins load first, then repo-level.

@@ -20,6 +20,10 @@ import {
   useSessionStore,
   useWorkspaceEntityStore,
 } from '../../store/entities'
+import {
+  selectRoutesForHub,
+  useRouteRegistryStore,
+} from '../../store/route-registry-store'
 import { useUiPresentationStore } from '../../store/ui-presentation-store'
 import {
   activityState,
@@ -48,6 +52,9 @@ type SessionRecord = {
   label?: string
   workspace_id?: string
   session_type?: string
+  owner_plugin?: string
+  visibility?: string
+  surface?: string
   is_idle?: boolean
   notification?: boolean
   port?: number
@@ -72,6 +79,23 @@ type WorkspaceRecord = {
   [key: string]: unknown
 }
 
+type RouteNav = {
+  section?: string
+  order?: number
+  label?: string
+  icon?: string
+}
+
+type RouteRegistryEntry = {
+  path?: string
+  base_path?: string
+  surface?: string
+  label?: string
+  icon?: string
+  hide_from_nav?: boolean
+  nav?: RouteNav | false
+}
+
 export type SessionListProps = UiSessionListProps & {
   ctx: RenderContext
 }
@@ -79,7 +103,9 @@ export type SessionListProps = UiSessionListProps & {
 export function SessionList({
   density,
   grouping,
-  showNavEntries,
+  ownerPlugin,
+  visibility,
+  surface,
   ctx,
 }: SessionListProps): ReactElement {
   const resolvedDensity =
@@ -91,16 +117,31 @@ export function SessionList({
 
   const sessionOrder = useSessionStore((state) => state.order)
   const sessionsById = useSessionStore((state) => state.byId)
+  const requestedVisibility = visibility ?? 'workspace'
   const sessions = useMemo(
     () =>
-      sessionOrder.map((id) => [
-        id,
-        sessionsById[id] as SessionRecord,
-      ] as const),
-    [sessionOrder, sessionsById],
+      sessionOrder
+        .map((id) => [
+          id,
+          sessionsById[id] as SessionRecord,
+        ] as const)
+        .filter(([, session]) => {
+          if (!session) return false
+          const sessionVisibility = session.visibility || 'workspace'
+          if (requestedVisibility !== 'all' && sessionVisibility !== requestedVisibility) {
+            return false
+          }
+          if (ownerPlugin && session.owner_plugin !== ownerPlugin) return false
+          if (surface && session.surface !== surface) return false
+          return true
+        }),
+    [ownerPlugin, requestedVisibility, sessionOrder, sessionsById, surface],
   )
   const workspaceOrder = useWorkspaceEntityStore((state) => state.order)
   const workspacesById = useWorkspaceEntityStore((state) => state.byId)
+  const routeEntries = useRouteRegistryStore((state) =>
+    selectRoutesForHub(state, ctx.hubId),
+  ) as RouteRegistryEntry[]
   // Filter out closed workspaces and workspaces with no active agent. The hub
   // emits `entity_patch(workspace, status="closed")` when the last session in
   // a workspace closes (handlers/connections.lua workspace_closed hook); the
@@ -112,8 +153,21 @@ export function SessionList({
       workspacesById,
       sessionOrder,
       sessionsById,
+      sessionFilter: {
+        ownerPlugin,
+        visibility: requestedVisibility,
+        surface,
+      },
     }),
-    [workspaceOrder, workspacesById, sessionOrder, sessionsById],
+    [
+      ownerPlugin,
+      requestedVisibility,
+      surface,
+      workspaceOrder,
+      workspacesById,
+      sessionOrder,
+      sessionsById,
+    ],
   )
 
   const selectedSessionId = useUiPresentationStore((s) => s.selectedSessionId)
@@ -138,7 +192,24 @@ export function SessionList({
     )
   }
 
-  const handleSelect = (sessionUuid: string | undefined, sessionId: string | undefined) => (
+  const sessionHrefFor = (session: SessionRecord, sessionUuid: string): string | undefined => {
+    if (!ctx.hubId || !sessionUuid) return undefined
+    const surfaceName = session.surface || session.owner_plugin
+    if (surfaceName && session.visibility === 'plugin') {
+      const entry = routeEntries.find((candidate) => candidate.surface === surfaceName)
+      const basePath = entry?.base_path || entry?.path
+      if (basePath && basePath !== '/') {
+        return `/hubs/${ctx.hubId}${basePath}/sessions/${sessionUuid}`
+      }
+    }
+    return `/hubs/${ctx.hubId}/sessions/${sessionUuid}`
+  }
+
+  const handleSelect = (
+    sessionUuid: string | undefined,
+    sessionId: string | undefined,
+    url: string | undefined,
+  ) => (
     event: MouseEvent,
   ) => {
     if (!sessionUuid) return
@@ -147,7 +218,7 @@ export function SessionList({
     ctx.dispatch(
       {
         id: 'botster.session.select',
-        payload: { sessionUuid, sessionId: sessionId || sessionUuid },
+        payload: { sessionUuid, sessionId: sessionId || sessionUuid, url },
       },
       { element: event.currentTarget as Element },
     )
@@ -192,10 +263,7 @@ export function SessionList({
     const activity = activityState(session)
     const preview = previewState(session)
     const selected = selectedSessionId === sessionUuid
-    const sessionHref =
-      ctx.hubId && sessionUuid
-        ? `/hubs/${ctx.hubId}/sessions/${sessionUuid}`
-        : undefined
+    const sessionHref = sessionHrefFor(session, sessionUuid)
 
     // Row state → left-border color. Priority: notification beats active
     // beats idle so an alert always wins surface attention. One color at
@@ -347,7 +415,7 @@ export function SessionList({
     const rowBody = sessionHref ? (
       <a
         href={sessionHref}
-        onClick={handleSelect(sessionUuid, sessionId)}
+        onClick={handleSelect(sessionUuid, sessionId, sessionHref)}
         className={containerClass}
         data-session-id={sessionId}
       >
@@ -357,10 +425,10 @@ export function SessionList({
       <div
         role="button"
         tabIndex={0}
-        onClick={handleSelect(sessionUuid, sessionId)}
+        onClick={handleSelect(sessionUuid, sessionId, sessionHref)}
         onKeyDown={(event) => {
           if (event.key === 'Enter' || event.key === ' ') {
-            handleSelect(sessionUuid, sessionId)(event as unknown as MouseEvent)
+            handleSelect(sessionUuid, sessionId, sessionHref)(event as unknown as MouseEvent)
           }
         }}
         className={containerClass}
@@ -503,8 +571,6 @@ export function SessionList({
       </li>,
     )
   }
-
-  void showNavEntries // sidebar nav entries: future iteration
 
   return <ul className="flex flex-col gap-1">{groups}</ul>
 }

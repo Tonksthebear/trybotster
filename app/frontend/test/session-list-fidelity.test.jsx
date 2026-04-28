@@ -13,6 +13,7 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import { SessionList } from '../components/composites/SessionList'
 import { WorkspaceList } from '../components/composites/WorkspaceList'
 import { useSessionStore, useWorkspaceEntityStore } from '../store/entities'
+import { useRouteRegistryStore } from '../store/route-registry-store'
 import { useUiPresentationStore } from '../store/ui-presentation-store'
 
 function fakeCtx(overrides = {}) {
@@ -46,6 +47,10 @@ function seedSession(session) {
 beforeEach(() => {
   useSessionStore.getState()._reset()
   useWorkspaceEntityStore.getState()._reset()
+  useRouteRegistryStore.setState({
+    routesByHubId: {},
+    snapshotReceivedAtByHubId: {},
+  })
   useUiPresentationStore.getState()._reset()
 })
 
@@ -354,6 +359,83 @@ describe('<SessionList> fidelity row', () => {
     expect(screen.getByText('live-ws')).toBeInTheDocument()
     expect(screen.queryByText('empty-ws')).toBeNull()
     expect(screen.queryByText('accessory-ws')).toBeNull()
+  })
+
+  it('filters plugin-scoped sessions out of the default workspace list', () => {
+    useSessionStore.setState({
+      byId: {
+        regular: {
+          id: 'regular',
+          session_uuid: 'regular',
+          session_type: 'agent',
+          label: 'regular',
+          visibility: 'workspace',
+        },
+        vault: {
+          id: 'vault',
+          session_uuid: 'vault',
+          session_type: 'agent',
+          label: 'vault worker',
+          owner_plugin: 'vault',
+          visibility: 'plugin',
+          surface: 'vault',
+        },
+      },
+      order: ['regular', 'vault'],
+      snapshotSeq: 1,
+    })
+
+    render(<SessionList density="panel" grouping="flat" ctx={fakeCtx()} />)
+    expect(screen.getByText('regular')).toBeInTheDocument()
+    expect(screen.queryByText('vault worker')).toBeNull()
+
+    cleanup()
+
+    render(
+      <SessionList
+        density="panel"
+        grouping="flat"
+        visibility="plugin"
+        ownerPlugin="vault"
+        ctx={fakeCtx()}
+      />,
+    )
+    expect(screen.queryByText('regular')).toBeNull()
+    expect(screen.getByText('vault worker')).toBeInTheDocument()
+  })
+
+  it('routes plugin-owned sessions through the owning surface', () => {
+    useRouteRegistryStore.getState().setRoutes('hub-1', [
+      {
+        path: '/vault',
+        base_path: '/vault',
+        surface: 'vault',
+        label: 'Vault',
+        icon: 'book-open',
+        nav: { section: 'workspace', order: 25 },
+      },
+    ])
+    seedSession({
+      id: 'sess-vault',
+      session_uuid: 'uuid-vault',
+      session_type: 'agent',
+      label: 'vault worker',
+      owner_plugin: 'vault',
+      visibility: 'plugin',
+      surface: 'vault',
+    })
+
+    render(
+      <SessionList
+        density="sidebar"
+        grouping="flat"
+        visibility="plugin"
+        ctx={fakeCtx()}
+      />,
+    )
+
+    expect(screen.getByText('vault worker').closest('a'))
+      .toHaveAttribute('href', '/hubs/hub-1/vault/sessions/uuid-vault')
   })
 })
 

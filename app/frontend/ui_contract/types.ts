@@ -250,6 +250,19 @@ export type SessionListProps = {
   density?: UiValue<UiSurfaceDensity>
   grouping?: UiSessionListGrouping
   showNavEntries?: boolean
+  ownerPlugin?: string
+  visibility?: 'workspace' | 'plugin' | 'hidden' | 'all'
+  surface?: string
+}
+
+export type SessionTerminalProps = {
+  sessionUuid: string
+  back?: string
+}
+
+export type SurfaceNavProps = {
+  section?: string
+  density?: UiValue<UiSurfaceDensity>
 }
 
 export type WorkspaceListProps = {
@@ -315,6 +328,8 @@ export type UiPrimitiveType =
   | 'spawn_target_list'
   | 'worktree_list'
   | 'session_row'
+  | 'session_terminal'
+  | 'surface_nav'
   | 'hub_recovery_state'
   | 'new_session_button'
 

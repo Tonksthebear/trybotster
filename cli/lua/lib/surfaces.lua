@@ -9,6 +9,7 @@
 --   surfaces.register("kanban", {
 --       label = "Kanban",
 --       icon  = "squares-2x2",
+--       nav   = { section = "workspace", order = 25 },
 --       -- base path = "/kanban" (derived from name). URL =
 --       -- /hubs/<hub_id>/kanban. Each route's `path` is relative to that base.
 --       routes = {
@@ -61,7 +62,7 @@ local M = {}
 
 -- Storage shape:
 --   registry.by_name[name] = {
---       name, base_path, label, icon,
+--       name, base_path, label, icon, nav,
 --       render,                -- auto-generated dispatcher (or passthrough)
 --       compiled_routes,       -- array of { pattern, param_names, regex, render }
 --       input_builder,
@@ -96,6 +97,41 @@ local function normalize_clients(opts)
         error("surfaces.register: clients must include 'web' and/or 'tui'")
     end
     return out
+end
+
+local function normalize_nav(opts)
+    local raw = opts.nav
+    if raw == false then return false end
+    if raw == nil then return nil end
+    assert(type(raw) == "table", "surfaces.register: nav must be a table or false")
+
+    local section = raw.section
+    if section == nil or section == "" then section = "workspace" end
+    assert(type(section) == "string",
+        "surfaces.register: nav.section must be a string when provided")
+
+    local order = raw.order
+    if order == nil then order = opts.order end
+    if order ~= nil and type(order) ~= "number" then
+        error("surfaces.register: nav.order must be a number when provided")
+    end
+
+    local label = raw.label
+    if label ~= nil and not is_nonempty_string(label) then
+        error("surfaces.register: nav.label must be a non-empty string when provided")
+    end
+
+    local icon = raw.icon
+    if icon ~= nil and not is_nonempty_string(icon) then
+        error("surfaces.register: nav.icon must be a non-empty string when provided")
+    end
+
+    return {
+        section = section,
+        order = order,
+        label = label,
+        icon = icon,
+    }
 end
 
 local function notify_changed()
@@ -396,6 +432,7 @@ function M.register(name, opts)
     local base_path = derive_base_path(name, opts)
     local render = make_dispatcher(name, base_path, compiled_routes)
     local clients = normalize_clients(opts)
+    local nav = normalize_nav(opts)
 
     local entry = {
         name = name,
@@ -411,6 +448,7 @@ function M.register(name, opts)
         path = base_path,
         label = is_nonempty_string(opts.label) and opts.label or name,
         icon = is_nonempty_string(opts.icon) and opts.icon or nil,
+        nav = nav,
         render = render,
         compiled_routes = compiled_routes,
         input_builder = type(opts.input_builder) == "function" and opts.input_builder or nil,
@@ -527,6 +565,7 @@ function M.list()
             base_path = entry.base_path,
             label = entry.label,
             icon = entry.icon,
+            nav = entry.nav,
             hide_from_nav = entry.hide_from_nav,
             order = entry.order,
             seq = entry.seq,
@@ -577,6 +616,7 @@ function M.build_route_registry_payload(hub_id)
                 surface = summary.name,
                 label = summary.label,
                 icon = summary.icon,
+                nav = summary.nav,
                 hide_from_nav = summary.hide_from_nav or nil,
                 routes = sub_patterns,
             }

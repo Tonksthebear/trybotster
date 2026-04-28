@@ -292,11 +292,13 @@ they used to inline are now first-class composites:
 
 | Constructor | Wire `type` | Required props |
 |---|---|---|
-| `ui.session_list{ density?, grouping?, show_nav_entries? }` | `session_list` | none |
+| `ui.session_list{ density?, grouping?, owner_plugin?, visibility?, surface? }` | `session_list` | none |
 | `ui.workspace_list{ density? }` | `workspace_list` | none |
 | `ui.spawn_target_list{ on_select?, on_remove? }` | `spawn_target_list` | none |
 | `ui.worktree_list{ target_id }` | `worktree_list` | `target_id` |
 | `ui.session_row{ session_uuid, density? }` | `session_row` | `session_uuid` |
+| `ui.session_terminal{ session_uuid, back? }` | `session_terminal` | `session_uuid` |
+| `ui.surface_nav{ section?, density? }` | `surface_nav` | none |
 | `ui.hub_recovery_state{}` | `hub_recovery_state` | none |
 | `ui.connection_code{}` | `connection_code` | none |
 | `ui.new_session_button{ action }` | `new_session_button` | `action` |
@@ -305,7 +307,11 @@ These primitives are **data-driven**: they carry no slots and no children
 on the wire. Each renderer (web React, ratatui TUI) reads from its
 client-side entity store and expands the composite into the same flat tree
 the current hub-rendered layout used to ship. Both renderers honor the same
-density / grouping tokens.
+density / grouping tokens. `surface_nav` renders `surfaces.register(..., nav={...})`
+entries in core-owned navigation. `session_terminal` is the surface-local way
+for plugin routes such as `/vault/sessions/:session_uuid` to mount Botster's
+core terminal viewer without routing through the global `/sessions/:session_uuid`
+page.
 
 Density follows the `UiSurfaceDensity` token (`sidebar` | `panel`) — see
 `tokens::UiSurfaceDensity`. This is distinct from `UiInteractionDensity`

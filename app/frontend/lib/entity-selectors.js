@@ -32,9 +32,21 @@ export function normalizedWorkspace(workspace) {
   }
 }
 
-export function isActiveAgentInWorkspace(session, workspaceId) {
+function sessionMatchesFilter(session, filter = {}) {
+  if (!session) return false
+  const visibility = session.visibility || 'workspace'
+  if (filter.visibility && filter.visibility !== 'all' && visibility !== filter.visibility) {
+    return false
+  }
+  if (filter.ownerPlugin && session.owner_plugin !== filter.ownerPlugin) return false
+  if (filter.surface && session.surface !== filter.surface) return false
+  return true
+}
+
+export function isActiveAgentInWorkspace(session, workspaceId, filter = {}) {
   if (!session || session.workspace_id !== workspaceId) return false
   if (session.status === 'closed') return false
+  if (!sessionMatchesFilter(session, filter)) return false
   return (session.session_type ?? 'agent') !== 'accessory'
 }
 
@@ -44,6 +56,7 @@ export function activeAgentWorkspaces({
   sessionOrder = [],
   sessionsById = {},
   excludeWorkspaceId = null,
+  sessionFilter = {},
 } = {}) {
   return workspaceOrder
     .map((id) => normalizedWorkspace(workspacesById[id]))
@@ -51,7 +64,7 @@ export function activeAgentWorkspaces({
       if (!workspace || workspace.status === 'closed') return false
       if (excludeWorkspaceId && workspace.id === excludeWorkspaceId) return false
       return sessionOrder.some((sessionId) =>
-        isActiveAgentInWorkspace(sessionsById[sessionId], workspace.id),
+        isActiveAgentInWorkspace(sessionsById[sessionId], workspace.id, sessionFilter),
       )
     })
 }

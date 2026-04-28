@@ -41,8 +41,9 @@ pub use node::{
 pub use props::{
     BadgeProps, ButtonProps, ConnectionCodeProps, DialogProps, EmptyStateProps,
     HubRecoveryStateProps, IconButtonProps, IconProps, InlineProps, NewSessionButtonProps,
-    PanelProps, ScrollAreaProps, SessionListProps, SessionRowProps, SpawnTargetListProps,
-    StackProps, StatusDotProps, TextProps, TreeItemProps, WorkspaceListProps, WorktreeListProps,
+    PanelProps, ScrollAreaProps, SessionListProps, SessionRowProps, SessionTerminalProps,
+    SpawnTargetListProps, StackProps, StatusDotProps, SurfaceNavProps, TextProps, TreeItemProps,
+    WorkspaceListProps, WorktreeListProps,
 };
 pub use tokens::{
     UiAlign, UiBadgeSize, UiBadgeTone, UiButtonTone, UiButtonVariant, UiInteractionDensity,

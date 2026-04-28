@@ -18,7 +18,8 @@
 --
 -- ENV GATE (important): this file is only loaded by `hub/init.lua` when
 -- `BOTSTER_DEV=1` OR `BOTSTER_ENV=test`. Production hubs skip it so real
--- users don't see the demo in their sidebar. If you're writing a real
+-- users don't see the demo route. The registration also uses `nav = false`
+-- so it never appears in core-rendered plugin navigation. If you're writing a real
 -- plugin, do NOT copy this gating pattern — user plugins live under the
 -- device root or a spawn target's repo and are picked up by the
 -- ConfigResolver plugin loader. This file ships as part of the CLI so
@@ -136,6 +137,7 @@ local entry = surfaces.register("hello", {
     label = "Hello",
     icon = "sparkle",
     order = 1000,
+    nav = false,
     source = "plugin:hello_surface",
     routes = {
         { path = "/",              render = home_page },

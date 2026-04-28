@@ -80,7 +80,10 @@ function navigateToSessionLocally(
     return
   }
   if (typeof window === 'undefined' || !window.history?.pushState) return
-  const url = `/hubs/${hubId}/sessions/${sessionUuid}`
+  const payloadUrl = mergedPayload['url']
+  const url = typeof payloadUrl === 'string' && payloadUrl.length > 0
+    ? payloadUrl
+    : `/hubs/${hubId}/sessions/${sessionUuid}`
   if (window.location.pathname === url) return
   window.history.pushState({}, '', url)
   window.dispatchEvent(new PopStateEvent('popstate'))

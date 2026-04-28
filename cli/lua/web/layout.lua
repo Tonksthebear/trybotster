@@ -28,18 +28,43 @@ function M.workspace_surface(state)
     local is_sidebar = density == "sidebar"
 
     local children = {}
+    if is_sidebar then
+        children[#children + 1] = ui.inline{
+            gap = "2",
+            align = "center",
+            justify = "between",
+            children = {
+                ui.text{
+                    text = "Workspace",
+                    size = "xs",
+                    weight = "semibold",
+                    tone = "muted",
+                },
+                ui.new_session_button{
+                    action = ui.action("botster.session.create.request"),
+                },
+            },
+        }
+    end
     children[#children + 1] = ui.session_list{
         density = density,
         grouping = "workspace",
-        show_nav_entries = is_sidebar,
     }
-    children[#children + 1] = ui.new_session_button{
-        action = ui.action("botster.session.create.request"),
-    }
+    if is_sidebar then
+        children[#children + 1] = ui.surface_nav{
+            section = "workspace",
+            density = density,
+        }
+    end
+    if not is_sidebar then
+        children[#children + 1] = ui.new_session_button{
+            action = ui.action("botster.session.create.request"),
+        }
+    end
 
     return ui.stack{
         direction = "vertical",
-        gap = is_sidebar and "0" or "2",
+        gap = is_sidebar and "1" or "2",
         children = children,
     }
 end

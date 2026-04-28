@@ -128,6 +128,67 @@ over prose strings when other tools or agents may consume the result.
 Register prompts only for instructions that are genuinely reusable. Agent-side
 skills should carry static workflow guidance when possible.
 
+## Web Surfaces
+
+Use `lib.surfaces` when a plugin needs a routable browser interface. Core owns
+sidebar placement, so plugins should declare navigation metadata instead of
+patching workspace layouts.
+
+```lua
+local surfaces = require("lib.surfaces")
+
+surfaces.register("vault", {
+  label = "Vault",
+  icon = "book-open", -- Heroicons mini filename without .svg
+  nav = { section = "workspace", order = 25 },
+  routes = {
+    { path = "/", render = vault_home },
+    { path = "/sessions/:session_uuid", render = vault_session },
+  },
+})
+```
+
+Set `nav = false` for routable utility/debug surfaces that should not appear
+in the core Plugins section. Icon names are Heroicons mini filenames from
+`app/assets/svg/icons/heroicons/mini`, without the `.svg` suffix.
+
+### Plugin-Owned Sessions
+
+When a plugin owns sessions that should not appear as normal workspace sessions,
+spawn them with ownership metadata:
+
+```lua
+metadata = {
+  owner_plugin = "vault",
+  visibility = "plugin",
+  surface = "vault",
+}
+```
+
+Then render them inside the plugin surface:
+
+```lua
+ui.session_list{
+  visibility = "plugin",
+  owner_plugin = "vault",
+  surface = "vault",
+}
+```
+
+For terminal views inside a plugin route, use `ui.session_terminal` rather than
+linking to the global `/sessions/:session_uuid` route:
+
+```lua
+ui.session_terminal{
+  session_uuid = state.params.session_uuid,
+  back = ctx.path("/"),
+}
+```
+
+Notification URLs for plugin-owned sessions route through
+`/hubs/<hub>/<surface>/sessions/<session_uuid>` when the session has
+`visibility = "plugin"` and a matching `surface`/`owner_plugin`.
+
 ## References
 
 - `docs/lua/primitives.md` — primitive APIs and execution model.

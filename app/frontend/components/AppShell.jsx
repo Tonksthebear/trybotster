@@ -316,7 +316,7 @@ function HubShell() {
     return () => disconnectHub()
   }, [disconnectHub])
 
-  const isSessionRoute = /\/sessions\//.test(location.pathname)
+  const isSessionRoute = /^\/hubs\/[^/]+\/sessions\//.test(location.pathname)
   const isSettingsRoute = /\/settings/.test(location.pathname)
   const isPairingRoute = /\/pairing/.test(location.pathname)
 

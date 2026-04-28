@@ -71,6 +71,8 @@ pub fn register(lua: &Lua) -> Result<()> {
     register_primitive(lua, &ui, "spawn_target_list", Primitive::SpawnTargetList)?;
     register_primitive(lua, &ui, "worktree_list", Primitive::WorktreeList)?;
     register_primitive(lua, &ui, "session_row", Primitive::SessionRow)?;
+    register_primitive(lua, &ui, "session_terminal", Primitive::SessionTerminal)?;
+    register_primitive(lua, &ui, "surface_nav", Primitive::SurfaceNav)?;
     register_primitive(lua, &ui, "hub_recovery_state", Primitive::HubRecoveryState)?;
     register_primitive(lua, &ui, "connection_code", Primitive::ConnectionCode)?;
     register_primitive(lua, &ui, "new_session_button", Primitive::NewSessionButton)?;
@@ -120,6 +122,10 @@ enum Primitive {
     WorktreeList,
     /// Wire protocol — single-session row composite (binds to a uuid).
     SessionRow,
+    /// Wire protocol — surface-local terminal viewer composite.
+    SessionTerminal,
+    /// Wire protocol — plugin surface navigation composite.
+    SurfaceNav,
     /// Wire protocol — hub lifecycle banner composite (singleton entity).
     HubRecoveryState,
     /// Wire protocol — pairing QR + URL composite (singleton entity).
@@ -150,6 +156,8 @@ impl Primitive {
             Self::SpawnTargetList => "spawn_target_list",
             Self::WorktreeList => "worktree_list",
             Self::SessionRow => "session_row",
+            Self::SessionTerminal => "session_terminal",
+            Self::SurfaceNav => "surface_nav",
             Self::HubRecoveryState => "hub_recovery_state",
             Self::ConnectionCode => "connection_code",
             Self::NewSessionButton => "new_session_button",
@@ -208,11 +216,20 @@ impl Primitive {
             Self::Tree => &[],
             Self::TreeItem => &["expanded", "selected", "notification", "action"],
             Self::Dialog => &["open", "title", "presentation"],
-            Self::SessionList => &["density", "grouping", "showNavEntries"],
+            Self::SessionList => &[
+                "density",
+                "grouping",
+                "showNavEntries",
+                "ownerPlugin",
+                "visibility",
+                "surface",
+            ],
             Self::WorkspaceList => &["density"],
             Self::SpawnTargetList => &["onSelect", "onRemove"],
             Self::WorktreeList => &["targetId"],
             Self::SessionRow => &["sessionUuid", "density"],
+            Self::SessionTerminal => &["sessionUuid", "back"],
+            Self::SurfaceNav => &["section", "density"],
             Self::HubRecoveryState => &[],
             Self::ConnectionCode => &[],
             Self::NewSessionButton => &["action"],
@@ -555,6 +572,9 @@ fn validate(_lua: &Lua, kind: Primitive, node: &Table) -> mlua::Result<()> {
         }
         Primitive::WorktreeList => require_prop_string(node, "targetId", "ui.worktree_list")?,
         Primitive::SessionRow => require_prop_string(node, "sessionUuid", "ui.session_row")?,
+        Primitive::SessionTerminal => {
+            require_prop_string(node, "sessionUuid", "ui.session_terminal")?;
+        }
         Primitive::NewSessionButton => {
             require_prop_table(node, "action", "ui.new_session_button")?;
         }
@@ -565,6 +585,7 @@ fn validate(_lua: &Lua, kind: Primitive, node: &Table) -> mlua::Result<()> {
         | Primitive::Panel
         | Primitive::ScrollArea
         | Primitive::SessionList
+        | Primitive::SurfaceNav
         | Primitive::WorkspaceList
         | Primitive::SpawnTargetList
         | Primitive::HubRecoveryState
@@ -1361,6 +1382,8 @@ mod tests {
             "spawn_target_list",
             "worktree_list",
             "session_row",
+            "session_terminal",
+            "surface_nav",
             "hub_recovery_state",
             "connection_code",
             "new_session_button",
@@ -1386,6 +1409,9 @@ mod tests {
                 density = "sidebar",
                 grouping = "workspace",
                 show_nav_entries = true,
+                owner_plugin = "vault",
+                visibility = "plugin",
+                surface = "vault",
             }"#,
         );
         assert_eq!(
@@ -1395,7 +1421,10 @@ mod tests {
                 "props": {
                     "density": "sidebar",
                     "grouping": "workspace",
-                    "showNavEntries": true
+                    "showNavEntries": true,
+                    "ownerPlugin": "vault",
+                    "visibility": "plugin",
+                    "surface": "vault"
                 }
             })
         );
@@ -1449,6 +1478,50 @@ mod tests {
         // well-formed and that children DID NOT escape into props.
         assert_eq!(v.get("type").and_then(|v| v.as_str()), Some("session_list"));
         assert!(v.get("props").map_or(true, |p| p.get("children").is_none()));
+    }
+
+    #[test]
+    fn session_terminal_props_round_trip() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.session_terminal{
+                session_uuid = "sess-abc",
+                back = "/hubs/h1/vault",
+            }"#,
+        );
+        assert_eq!(
+            v,
+            json!({
+                "type": "session_terminal",
+                "props": {
+                    "sessionUuid": "sess-abc",
+                    "back": "/hubs/h1/vault"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn surface_nav_props_round_trip() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.surface_nav{
+                section = "workspace",
+                density = "sidebar",
+            }"#,
+        );
+        assert_eq!(
+            v,
+            json!({
+                "type": "surface_nav",
+                "props": {
+                    "section": "workspace",
+                    "density": "sidebar"
+                }
+            })
+        );
     }
 
     #[test]
@@ -1685,14 +1758,16 @@ mod tests {
         // Catches any drift between the Lua allowlist and the Rust struct.
         use crate::ui_contract::{
             ConnectionCodeProps, HubRecoveryStateProps, NewSessionButtonProps, SessionListProps,
-            SessionRowProps, SpawnTargetListProps, UiAction, UiSessionListGrouping,
-            UiSurfaceDensity, UiValue, WorkspaceListProps, WorktreeListProps,
+            SessionRowProps, SessionTerminalProps, SpawnTargetListProps, UiAction,
+            UiSessionListGrouping, UiSurfaceDensity, UiValue, WorkspaceListProps,
+            WorktreeListProps,
         };
 
         let session_list = SessionListProps {
             density: Some(UiValue::scalar(UiSurfaceDensity::Sidebar)),
             grouping: Some(UiSessionListGrouping::Workspace),
             show_nav_entries: Some(true),
+            ..Default::default()
         };
         let v = serde_json::to_value(&session_list).unwrap();
         let back: SessionListProps = serde_json::from_value(v).unwrap();
@@ -1727,6 +1802,14 @@ mod tests {
         let back: SessionRowProps =
             serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
         assert_eq!(back, row);
+
+        let terminal = SessionTerminalProps {
+            session_uuid: "s".into(),
+            back: Some("/hubs/h1/vault".into()),
+        };
+        let back: SessionTerminalProps =
+            serde_json::from_value(serde_json::to_value(&terminal).unwrap()).unwrap();
+        assert_eq!(back, terminal);
 
         let hr = HubRecoveryStateProps::default();
         let back: HubRecoveryStateProps =
