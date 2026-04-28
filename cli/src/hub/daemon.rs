@@ -17,8 +17,10 @@
 //! and `~/Library/Application Support/...` exceeds that.
 
 use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -34,6 +36,107 @@ pub struct HubLock {
     _file: File,
     /// Path stored for diagnostics only.
     pub path: PathBuf,
+}
+
+/// Read-only snapshot of a hub's runtime artifacts.
+///
+/// This is intentionally diagnostic: it does not remove or repair files.
+/// Cleanup and repair paths must opt into mutation explicitly.
+#[derive(Debug, Clone)]
+pub struct HubArtifactInspection {
+    /// Stable local hub hash ID.
+    pub hub_id: String,
+    /// PID file path.
+    pub pid_file_path: PathBuf,
+    /// PID read from the PID file, if present and parseable.
+    pub pid: Option<u32>,
+    /// Whether the PID currently appears live.
+    pub pid_alive: bool,
+    /// Runtime manifest path.
+    pub manifest_path: PathBuf,
+    /// Parsed runtime manifest, if present and valid.
+    pub manifest: Option<HubManifest>,
+    /// Socket path advertised by the manifest, or the expected local path.
+    pub socket_path: PathBuf,
+    /// Whether the socket pathname exists in the filesystem.
+    pub socket_path_exists: bool,
+    /// Whether a new UnixStream can connect to the socket path.
+    pub socket_connectable: bool,
+    /// Whether the socket answered Botster's protocol hello.
+    pub socket_protocol_responds: bool,
+    /// Diagnostic details from the protocol probe.
+    pub socket_probe_error: Option<String>,
+    /// Singleton lock path.
+    pub lock_file_path: PathBuf,
+}
+
+impl HubArtifactInspection {
+    /// Return true when the hub process appears alive.
+    #[must_use]
+    pub fn process_alive(&self) -> bool {
+        self.pid_alive
+            || self
+                .manifest
+                .as_ref()
+                .is_some_and(|manifest| pid_is_live(manifest.pid))
+    }
+
+    /// Return true when new clients can connect through the advertised socket.
+    #[must_use]
+    pub fn accepts_new_clients(&self) -> bool {
+        self.socket_protocol_responds
+    }
+}
+
+/// Runtime artifact owner for a single hub.
+///
+/// Centralizes PID, manifest, lock, and socket path operations so discovery,
+/// cleanup, repair, and status do not each invent their own liveness rules.
+#[derive(Debug, Clone)]
+pub struct HubRuntimeArtifacts {
+    hub_id: String,
+}
+
+impl HubRuntimeArtifacts {
+    /// Build an artifact owner for a local hub ID.
+    #[must_use]
+    pub fn new(hub_id: impl Into<String>) -> Self {
+        Self {
+            hub_id: hub_id.into(),
+        }
+    }
+
+    /// Hub ID these artifacts belong to.
+    #[must_use]
+    pub fn hub_id(&self) -> &str {
+        &self.hub_id
+    }
+
+    /// Socket path for this hub.
+    pub fn socket_path(&self) -> Result<PathBuf> {
+        socket_path(&self.hub_id)
+    }
+
+    /// Write PID and manifest for the current process.
+    pub fn publish_current_process(&self, server_id: Option<&str>) -> Result<()> {
+        write_pid_file(&self.hub_id)?;
+        write_manifest(&self.hub_id, server_id)
+    }
+
+    /// Inspect runtime artifacts without mutating them.
+    pub fn inspect(&self) -> Result<HubArtifactInspection> {
+        inspect_hub_artifacts(&self.hub_id)
+    }
+
+    /// Remove stale files for this hub when no live process/socket owns them.
+    pub fn cleanup_stale_files(&self) {
+        cleanup_stale_files(&self.hub_id);
+    }
+
+    /// Remove runtime files during owner shutdown.
+    pub fn cleanup_on_shutdown(&self) {
+        cleanup_on_shutdown(&self.hub_id);
+    }
 }
 
 /// Path to the lock file for a hub.
@@ -69,7 +172,6 @@ pub fn try_lock_hub(hub_id: &str) -> Result<HubLock> {
     }
 
     // Write our PID into the lock file for diagnostics.
-    use std::io::Write;
     let mut f = &file;
     let _ = f.write_all(format!("{}", std::process::id()).as_bytes());
 
@@ -191,6 +293,137 @@ pub fn read_manifest(hub_id: &str) -> Option<HubManifest> {
     serde_json::from_str(&content).ok()
 }
 
+/// Inspect all daemon runtime artifacts for a hub without cleanup or repair.
+pub fn inspect_hub_artifacts(hub_id: &str) -> Result<HubArtifactInspection> {
+    let pid_file = pid_file_path(hub_id)?;
+    let pid = fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|contents| contents.trim().parse().ok());
+    let pid_alive = pid.is_some_and(pid_is_live);
+
+    let manifest_file = manifest_path(hub_id)?;
+    let manifest = fs::read_to_string(&manifest_file)
+        .ok()
+        .and_then(|content| serde_json::from_str::<HubManifest>(&content).ok());
+
+    let socket = manifest
+        .as_ref()
+        .map(|m| PathBuf::from(&m.socket_path))
+        .unwrap_or(socket_path(hub_id)?);
+    let socket_path_exists = socket.exists();
+    let socket_probe = if socket_path_exists {
+        probe_hub_socket(&socket)
+    } else {
+        HubSocketProbe::not_connected("socket path is missing")
+    };
+
+    Ok(HubArtifactInspection {
+        hub_id: hub_id.to_string(),
+        pid_file_path: pid_file,
+        pid,
+        pid_alive,
+        manifest_path: manifest_file,
+        manifest,
+        socket_path: socket,
+        socket_path_exists,
+        socket_connectable: socket_probe.connected,
+        socket_protocol_responds: socket_probe.responded,
+        socket_probe_error: socket_probe.error,
+        lock_file_path: lock_file_path(hub_id)?,
+    })
+}
+
+/// Result of probing a connectable socket for Botster protocol identity.
+#[derive(Debug, Clone)]
+struct HubSocketProbe {
+    connected: bool,
+    responded: bool,
+    error: Option<String>,
+}
+
+impl HubSocketProbe {
+    fn ok() -> Self {
+        Self {
+            connected: true,
+            responded: true,
+            error: None,
+        }
+    }
+
+    fn connected_without_ack(error: impl Into<String>) -> Self {
+        Self {
+            connected: true,
+            responded: false,
+            error: Some(error.into()),
+        }
+    }
+
+    fn not_connected(error: impl Into<String>) -> Self {
+        Self {
+            connected: false,
+            responded: false,
+            error: Some(error.into()),
+        }
+    }
+}
+
+/// Connect and perform a minimal Botster socket protocol handshake.
+///
+/// This proves more than filesystem existence or connectability: the peer must
+/// decode a `hello` frame and return `hello_ack`.
+fn probe_hub_socket(path: &Path) -> HubSocketProbe {
+    let mut stream = match std::os::unix::net::UnixStream::connect(path) {
+        Ok(stream) => stream,
+        Err(e) => return HubSocketProbe::not_connected(format!("connect failed: {e}")),
+    };
+
+    let timeout = Duration::from_millis(500);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let hello = crate::socket::framing::Frame::Json(serde_json::json!({
+        "type": "hello",
+        "protocol_version": 2,
+        "min_supported_version": 1,
+        "client": "daemon_probe",
+    }));
+
+    if let Err(e) = stream.write_all(&hello.encode()) {
+        return HubSocketProbe::connected_without_ack(format!("hello write failed: {e}"));
+    }
+
+    let mut decoder = crate::socket::framing::FrameDecoder::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                return HubSocketProbe::connected_without_ack("socket closed before hello_ack")
+            }
+            Ok(n) => match decoder.feed(&buf[..n]) {
+                Ok(frames) => {
+                    for frame in frames {
+                        if matches!(
+                            frame,
+                            crate::socket::framing::Frame::Json(ref value)
+                                if value.get("type").and_then(|v| v.as_str()) == Some("hello_ack")
+                        ) {
+                            return HubSocketProbe::ok();
+                        }
+                    }
+                }
+                Err(e) => {
+                    return HubSocketProbe::connected_without_ack(format!("decode failed: {e}"));
+                }
+            },
+            Err(e) => {
+                return HubSocketProbe::connected_without_ack(format!(
+                    "hello_ack read failed: {e}"
+                ));
+            }
+        }
+    }
+}
+
 /// Update the workspaces list in the hub manifest.
 ///
 /// Reads the current manifest, replaces `workspaces`, and writes back.
@@ -210,11 +443,13 @@ pub fn update_manifest_workspaces(hub_id: &str, workspaces: Vec<String>) -> Resu
     Ok(())
 }
 
-/// Return true if a manifest appears live (PID alive + socket exists).
+/// Return true if a manifest appears live enough for path resolution.
 fn manifest_is_live(manifest: &HubManifest) -> bool {
     let pid_alive = pid_is_live(manifest.pid);
-    let socket_alive = PathBuf::from(&manifest.socket_path).exists();
-    pid_alive && socket_alive
+    let socket_path = PathBuf::from(&manifest.socket_path);
+    let socket_alive = socket_path.exists();
+    let socket_protocol_responds = socket_alive && probe_hub_socket(&socket_path).responded;
+    pid_alive && socket_protocol_responds
 }
 
 /// Interpret `kill(pid, 0)` probe results.
@@ -256,7 +491,6 @@ pub fn resolve_socket_for_server_id(server_id: &str) -> Option<PathBuf> {
         };
         if manifest.server_id.as_deref() == Some(server_id) {
             if !manifest_is_live(&manifest) {
-                cleanup_stale_files(&manifest.hub_id);
                 continue;
             }
             return Some(PathBuf::from(manifest.socket_path));
@@ -271,7 +505,6 @@ pub fn resolve_socket_for_server_id(server_id: &str) -> Option<PathBuf> {
 pub fn resolve_socket_for_hub_id(hub_id: &str) -> Option<PathBuf> {
     let manifest = read_manifest(hub_id)?;
     if !manifest_is_live(&manifest) {
-        cleanup_stale_files(&manifest.hub_id);
         return None;
     }
     Some(PathBuf::from(manifest.socket_path))
@@ -314,6 +547,11 @@ pub fn cleanup_stale_files(hub_id: &str) {
         return;
     }
 
+    let socket_is_live = socket_path(hub_id)
+        .ok()
+        .filter(|path| path.exists())
+        .is_some_and(|path| std::os::unix::net::UnixStream::connect(&path).is_ok());
+
     if let Ok(path) = pid_file_path(hub_id) {
         if path.exists() {
             let _ = fs::remove_file(&path);
@@ -321,6 +559,13 @@ pub fn cleanup_stale_files(hub_id: &str) {
         }
     }
     if let Ok(path) = socket_path(hub_id) {
+        if socket_is_live {
+            log::warn!(
+                "Preserving live hub socket despite stale PID metadata: {}",
+                path.display()
+            );
+            return;
+        }
         if path.exists() {
             let _ = fs::remove_file(&path);
             log::debug!("Removed stale socket file: {}", path.display());
@@ -463,9 +708,6 @@ pub fn discover_running_hubs() -> Vec<(String, u32)> {
         if let Some(pid) = read_pid_file(&hub_id) {
             if pid_is_live(pid) {
                 running.push((hub_id, pid));
-            } else {
-                // Process dead, clean up stale files
-                cleanup_stale_files(&hub_id);
             }
         }
     }
@@ -476,6 +718,42 @@ pub fn discover_running_hubs() -> Vec<(String, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::socket::framing::{Frame, FrameDecoder};
+
+    fn spawn_hello_ack_socket(path: &Path) -> std::thread::JoinHandle<()> {
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+
+            let mut decoder = FrameDecoder::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    return;
+                }
+                let frames = decoder.feed(&buf[..n]).unwrap();
+                for frame in frames {
+                    if matches!(
+                        frame,
+                        Frame::Json(ref value)
+                            if value.get("type").and_then(|v| v.as_str()) == Some("hello")
+                    ) {
+                        let ack = Frame::Json(serde_json::json!({
+                            "type": "hello_ack",
+                            "protocol_version": 2,
+                            "min_supported_version": 1,
+                        }));
+                        stream.write_all(&ack.encode()).unwrap();
+                        return;
+                    }
+                }
+            }
+        })
+    }
 
     #[test]
     fn test_socket_path_format() {
@@ -592,6 +870,137 @@ mod tests {
     }
 
     #[test]
+    fn test_cleanup_stale_files_preserves_connectable_socket_with_stale_pid() {
+        let test_id = format!("_test_live_socket_stale_pid_{}", std::process::id());
+        let pid_path = pid_file_path(&test_id).unwrap();
+        let socket_path = socket_path(&test_id).unwrap();
+
+        fs::write(&pid_path, "999999").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+
+        cleanup_stale_files(&test_id);
+
+        assert!(
+            socket_path.exists(),
+            "cleanup must not unlink a connectable live socket"
+        );
+        assert!(
+            !pid_path.exists(),
+            "stale PID metadata should still be removed"
+        );
+
+        drop(listener);
+        let _ = fs::remove_file(&socket_path);
+        if let Ok(path) = manifest_path(&test_id) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn test_inspect_hub_artifacts_reports_missing_runtime_files() {
+        let test_id = format!("_test_inspect_missing_{}", std::process::id());
+
+        let inspection = inspect_hub_artifacts(&test_id).unwrap();
+
+        assert_eq!(inspection.hub_id, test_id);
+        assert!(inspection.pid.is_none());
+        assert!(!inspection.pid_alive);
+        assert!(inspection.manifest.is_none());
+        assert!(!inspection.socket_path_exists);
+        assert!(!inspection.socket_connectable);
+        assert!(!inspection.socket_protocol_responds);
+        assert!(inspection.socket_probe_error.is_some());
+        assert!(!inspection.process_alive());
+        assert!(!inspection.accepts_new_clients());
+    }
+
+    #[test]
+    fn test_inspect_hub_artifacts_verifies_socket_protocol() {
+        let test_id = format!("_test_inspect_protocol_{}", std::process::id());
+        write_pid_file(&test_id).unwrap();
+        write_manifest(&test_id, None).unwrap();
+        let socket_path = socket_path(&test_id).unwrap();
+        let handle = spawn_hello_ack_socket(&socket_path);
+
+        let inspection = inspect_hub_artifacts(&test_id).unwrap();
+
+        assert!(inspection.socket_path_exists);
+        assert!(inspection.socket_connectable);
+        assert!(inspection.socket_protocol_responds);
+        assert!(inspection.socket_probe_error.is_none());
+        assert!(inspection.accepts_new_clients());
+
+        handle.join().unwrap();
+        cleanup_on_shutdown(&test_id);
+    }
+
+    #[test]
+    fn test_inspect_hub_artifacts_rejects_non_botster_socket() {
+        let test_id = format!("_test_inspect_non_botster_{}", std::process::id());
+        write_pid_file(&test_id).unwrap();
+        write_manifest(&test_id, None).unwrap();
+        let socket_path = socket_path(&test_id).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.write_all(b"not a framed botster response");
+        });
+
+        let inspection = inspect_hub_artifacts(&test_id).unwrap();
+
+        assert!(inspection.socket_path_exists);
+        assert!(inspection.socket_connectable);
+        assert!(!inspection.socket_protocol_responds);
+        assert!(inspection.socket_probe_error.is_some());
+        assert!(!inspection.accepts_new_clients());
+
+        handle.join().unwrap();
+        cleanup_on_shutdown(&test_id);
+    }
+
+    #[test]
+    fn test_resolve_socket_for_hub_id_does_not_cleanup_stale_artifacts() {
+        let test_id = format!("_test_resolve_read_only_{}", std::process::id());
+        let pid_path = pid_file_path(&test_id).unwrap();
+        let socket_path = socket_path(&test_id).unwrap();
+        let manifest_path = manifest_path(&test_id).unwrap();
+        let manifest = HubManifest {
+            hub_id: test_id.clone(),
+            server_id: None,
+            socket_path: socket_path.to_string_lossy().into_owned(),
+            pid: 999999,
+            updated_at: 1,
+            workspaces: Vec::new(),
+        };
+
+        fs::write(&pid_path, "999999").unwrap();
+        fs::write(&socket_path, b"").unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert!(resolve_socket_for_hub_id(&test_id).is_none());
+        assert!(
+            pid_path.exists(),
+            "read-only resolve must not remove stale pid files"
+        );
+        assert!(
+            socket_path.exists(),
+            "read-only resolve must not remove stale socket files"
+        );
+        assert!(
+            manifest_path.exists(),
+            "read-only resolve must not remove stale manifests"
+        );
+
+        let _ = fs::remove_file(pid_path);
+        let _ = fs::remove_file(socket_path);
+        let _ = fs::remove_file(manifest_path);
+    }
+
+    #[test]
     fn test_manifest_round_trip() {
         let test_id = format!("_test_manifest_{}", std::process::id());
         write_manifest(&test_id, Some("123")).unwrap();
@@ -607,14 +1016,14 @@ mod tests {
     fn test_resolve_socket_for_server_id() {
         let test_id = format!("_test_server_lookup_{}", std::process::id());
         write_manifest(&test_id, Some("hub-server-id-xyz")).unwrap();
-        // Make the socket path exist so liveness check passes.
         let socket = socket_path(&test_id).unwrap();
-        fs::write(&socket, b"").unwrap();
+        let handle = spawn_hello_ack_socket(&socket);
         let socket =
             resolve_socket_for_server_id("hub-server-id-xyz").expect("socket should resolve");
         assert!(socket
             .to_string_lossy()
             .ends_with(&format!("/{test_id}.sock")));
+        handle.join().unwrap();
         cleanup_on_shutdown(&test_id);
     }
 
@@ -622,13 +1031,13 @@ mod tests {
     fn test_resolve_socket_for_hub_id() {
         let test_id = format!("_test_local_lookup_{}", std::process::id());
         write_manifest(&test_id, Some("ignored-server-id")).unwrap();
-        // Make the socket path exist so liveness check passes.
         let socket = socket_path(&test_id).unwrap();
-        fs::write(&socket, b"").unwrap();
+        let handle = spawn_hello_ack_socket(&socket);
         let resolved = resolve_socket_for_hub_id(&test_id).expect("socket should resolve");
         assert!(resolved
             .to_string_lossy()
             .ends_with(&format!("/{test_id}.sock")));
+        handle.join().unwrap();
         cleanup_on_shutdown(&test_id);
     }
 

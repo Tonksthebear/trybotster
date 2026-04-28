@@ -745,6 +745,7 @@ impl Hub {
             }
             // LuaFileChange removed — hot-reload now handled by Lua's module_watcher
             HubEvent::CleanupTick => {
+                self.repair_missing_socket_path();
                 self.cleanup_disconnected_webrtc_channels();
                 self.poll_stream_frames_outgoing();
                 self.send_backpressure_recovery_snapshots();
