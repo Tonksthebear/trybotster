@@ -1,7 +1,7 @@
 {
-  "name": "botster-local",
+  "name": "botster",
   "interface": {
-    "displayName": "Botster Local"
+    "displayName": "Botster"
   },
   "plugins": [
     {

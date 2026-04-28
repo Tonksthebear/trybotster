@@ -48,5 +48,5 @@ Claude Code:
 
 ```text
 /plugin marketplace add Tonksthebear/trybotster
-/plugin install botster@botster-local
+/plugin install botster@botster
 ```
