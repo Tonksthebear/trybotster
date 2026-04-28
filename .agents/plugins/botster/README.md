@@ -11,6 +11,7 @@ hub, session, messaging, and orchestration tools correctly.
 ## Included
 
 - `.codex-plugin/plugin.json` — plugin manifest.
+- `.claude-plugin/plugin.json` — Claude Code plugin manifest.
 - `.mcp.json` — single MCP server named `botster`.
 - `skills/botster-install/SKILL.md` — first-agent setup and MCP checks.
 - `skills/botster-customize-tui/SKILL.md` — TUI layout/keybinding guidance.
@@ -33,4 +34,19 @@ calling session:
     }
   }
 }
+```
+
+## Install From GitHub
+
+Codex CLI:
+
+```bash
+codex plugin marketplace add Tonksthebear/trybotster --ref main --sparse .agents
+```
+
+Claude Code:
+
+```text
+/plugin marketplace add Tonksthebear/trybotster
+/plugin install botster@botster-local
 ```

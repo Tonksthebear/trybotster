@@ -1,0 +1,16 @@
+{
+  "name": "botster",
+  "version": "0.1.0",
+  "description": "Botster agent integration with MCP server configuration and workflow skills.",
+  "author": {
+    "name": "Botster",
+    "email": "support@botster.dev",
+    "url": "https://botster.dev"
+  },
+  "homepage": "https://botster.dev",
+  "repository": "https://github.com/Tonksthebear/trybotster",
+  "license": "MIT",
+  "keywords": ["botster", "mcp", "agents", "pty", "orchestration"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}
