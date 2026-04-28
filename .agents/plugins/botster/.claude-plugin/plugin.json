@@ -1,6 +1,6 @@
 {
   "name": "botster",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Botster agent integration with MCP server configuration and workflow skills.",
   "author": {
     "name": "Botster",
