@@ -12,6 +12,7 @@ fn create_lua_vm(data_dir: &std::path::Path, repo_root: &std::path::Path) -> Lua
     botster::lua::primitives::fs::register(&lua).expect("fs register");
     botster::lua::primitives::json::register(&lua).expect("json register");
     botster::lua::primitives::log::register(&lua).expect("log register");
+    botster::lua::primitives::hook_timeout::register(&lua).expect("hook timeout register");
 
     let lua_dir = std::env::current_dir()
         .unwrap()
@@ -28,6 +29,10 @@ fn create_lua_vm(data_dir: &std::path::Path, repo_root: &std::path::Path) -> Lua
     lua.load(format!(
         r#"
         _G.hooks = require("hub.hooks")
+        _G.events = {{
+          on = function() return "test-subscription" end,
+          off = function() return true end,
+        }}
         _G.config = {{
           data_dir = function() return "{data_dir}" end,
           find_available_port = function() return 46000 end,
@@ -49,6 +54,8 @@ fn create_lua_vm(data_dir: &std::path::Path, repo_root: &std::path::Path) -> Lua
           manifest_path = function() return "{data_dir}/hub-manifest.json" end,
         }}
         _G.worktree = {{
+          find = function() return nil end,
+          find_for_root = function() return nil end,
           list = function() return {{}} end,
         }}
         _G.spawn_targets = {{
@@ -76,6 +83,76 @@ fn create_lua_vm(data_dir: &std::path::Path, repo_root: &std::path::Path) -> Lua
     .expect("stub globals");
 
     lua
+}
+
+#[test]
+fn workspace_accessories_inherit_agent_resolved_default_workspace() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join(".botster-dev");
+    let repo_root = dir.path().join("repo");
+    let worktree_path = dir.path().join("feature-accessory-worktree");
+
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&repo_root).unwrap();
+    std::fs::create_dir_all(&worktree_path).unwrap();
+    std::fs::write(worktree_path.join(".git"), "gitdir: /tmp/example").unwrap();
+
+    let agent_dir = repo_root.join(".botster-dev/agents/claude");
+    let accessory_dir = repo_root.join(".botster-dev/accessories/rails-server");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::create_dir_all(&accessory_dir).unwrap();
+    std::fs::write(agent_dir.join("initialization"), "echo agent").unwrap();
+    std::fs::write(accessory_dir.join("initialization"), "echo accessory").unwrap();
+
+    let lua = create_lua_vm(&data_dir, &repo_root);
+
+    let inherited: bool = lua
+        .load(format!(
+            r#"
+            worktree.find_for_root = function(_, _) return "{worktree_path}" end
+
+            local handlers = require("handlers.agents")
+            handlers.handle_create_agent(
+              "feature-accessory",
+              nil,
+              nil,
+              nil,
+              "claude",
+              {{ workspace_config = {{ accessories = {{ "rails-server" }} }} }},
+              {{
+                target_id = "target-1",
+                target_path = "{repo_root}",
+                target_repo = "owner/repo",
+              }}
+            )
+
+            local Agent = require("lib.agent")
+            local sessions = Agent.list()
+            local primary, accessory
+            for _, session in ipairs(sessions) do
+              if session.session_type == "agent" then primary = session end
+              if session.session_type == "accessory" then accessory = session end
+            end
+
+            return primary ~= nil
+              and accessory ~= nil
+              and primary._workspace_id ~= nil
+              and primary._workspace_id ~= ""
+              and accessory._workspace_id == primary._workspace_id
+              and accessory._workspace_name == primary._workspace_name
+              and not fs.exists("{data_dir}/workspaces/nil")
+        "#,
+            data_dir = data_dir.to_str().unwrap(),
+            repo_root = repo_root.to_str().unwrap(),
+            worktree_path = worktree_path.to_str().unwrap(),
+        ))
+        .eval()
+        .expect("workspace accessory inheritance should evaluate");
+
+    assert!(
+        inherited,
+        "workspace accessories should use the workspace resolved by the primary agent"
+    );
 }
 
 #[test]
@@ -124,6 +201,63 @@ fn session_definition_dir_is_persisted_for_context_lookup() {
     assert!(
         exposed,
         "session context should expose the selected definition directory"
+    );
+}
+
+#[test]
+fn before_pty_spawn_applies_returned_spawn_config_changes() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    let repo_root = dir.path().join("repo");
+    let worktree_path = dir.path().join("feature-c-worktree");
+
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&repo_root).unwrap();
+    std::fs::create_dir_all(&worktree_path).unwrap();
+    std::fs::write(worktree_path.join(".git"), "gitdir: /tmp/example").unwrap();
+
+    let lua = create_lua_vm(&data_dir, &repo_root);
+
+    let applied: bool = lua
+        .load(format!(
+            r#"
+            hooks.intercept("before_pty_spawn", "test.mutate-spawn", function(ctx)
+              ctx.command = "zsh"
+              ctx.args = {{ "-lc", "echo changed" }}
+              ctx.cwd = "{repo_root}"
+              ctx.env.TEST_BEFORE_PTY_SPAWN = "applied"
+              ctx.init_commands = {{ "echo init changed" }}
+              return ctx
+            end)
+
+            local Agent = require("lib.agent")
+            Agent.new({{
+              repo = "owner/repo",
+              branch_name = "feature-c",
+              worktree_path = "{worktree_path}",
+              session = {{ name = "claude", command = "bash" }},
+              target_id = "target-1",
+              target_path = "{repo_root}",
+              target_repo = "owner/repo",
+            }})
+
+            local cfg = hub.last_spawn_config
+            return cfg.command == "zsh"
+              and cfg.args[1] == "-lc"
+              and cfg.args[2] == "echo changed"
+              and cfg.cwd == "{repo_root}"
+              and cfg.env.TEST_BEFORE_PTY_SPAWN == "applied"
+              and cfg.init_commands[1] == "echo init changed"
+        "#,
+            repo_root = repo_root.to_str().unwrap(),
+            worktree_path = worktree_path.to_str().unwrap(),
+        ))
+        .eval()
+        .expect("before_pty_spawn mutation should evaluate");
+
+    assert!(
+        applied,
+        "before_pty_spawn should apply returned spawn configuration changes"
     );
 }
 

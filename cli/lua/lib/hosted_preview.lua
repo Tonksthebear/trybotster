@@ -21,6 +21,7 @@ local CLOUDFLARED_INSTALL_URL =
     "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
 local MISSING_BINARY_ERROR =
     "Hosted preview requires cloudflared to be installed on this machine."
+local QUICK_TUNNEL_CONFIG_BASENAME = "botster-cloudflared-quick.yml"
 
 local function metadata_flag(value)
     return value == true or value == "true"
@@ -67,6 +68,30 @@ local function resolve_cloudflared_binary()
     end
 
     return hub.resolve_command_path("cloudflared")
+end
+
+local function quick_tunnel_config_path()
+    local override = os.getenv("BOTSTER_CLOUDFLARED_QUICK_CONFIG")
+    if type(override) == "string" and override:match("%S") then
+        return override
+    end
+
+    local tmpdir = os.getenv("TMPDIR")
+    if type(tmpdir) ~= "string" or not tmpdir:match("%S") then
+        tmpdir = "/tmp"
+    end
+    return tmpdir:gsub("/+$", "") .. "/" .. QUICK_TUNNEL_CONFIG_BASENAME
+end
+
+local function ensure_quick_tunnel_config()
+    local path = quick_tunnel_config_path()
+    local file, err = io.open(path, "w")
+    if not file then
+        return nil, err
+    end
+    file:write("{}\n")
+    file:close()
+    return path
 end
 
 function M.is_system_session(subject)
@@ -149,6 +174,21 @@ function M.enable(parent)
         return nil, MISSING_BINARY_ERROR
     end
 
+    local quick_config_path, quick_config_err = ensure_quick_tunnel_config()
+    if not quick_config_path then
+        local error_message = "Failed to prepare cloudflared quick tunnel config: " .. tostring(quick_config_err)
+        parent:update({
+            hosted_preview = preview_state_for(parent, {
+                status = "error",
+                error = error_message,
+                install_url = nil,
+                url = nil,
+                connector_session_uuid = nil,
+            }),
+        })
+        return nil, error_message
+    end
+
     local existing = M.find_connector(parent.session_uuid)
     if existing then
         M.disable_by_parent_uuid(parent.session_uuid, { clear_parent = false })
@@ -172,6 +212,8 @@ function M.enable(parent)
             command = cloudflared_bin,
             args = {
                 "tunnel",
+                "--config",
+                quick_config_path,
                 "--url",
                 "http://127.0.0.1:" .. tostring(parent._port),
                 "--no-autoupdate",

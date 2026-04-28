@@ -62,7 +62,7 @@ pub mod ui_contract;
 pub use agent::Agent;
 pub use config::Config;
 pub use git::WorktreeManager;
-pub use relay::{AgentInfo, TerminalMessage, WorktreeInfo};
+pub use relay::{AgentInfo, TerminalMessage};
 pub use spawn_targets::{SpawnTarget, SpawnTargetInspection, SpawnTargetRegistry};
 pub use terminal_widget::TerminalWidget;
 

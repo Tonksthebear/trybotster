@@ -239,16 +239,16 @@ end, { description = "List installed templates" })
 local loader = require("hub.loader")
 
 commands.register("plugin:reload", function(client, sub_id, command)
-    local name = command.plugin_name
-    if not name then
-        respond(client, sub_id, command.request_id, { ok = false, error = "Missing plugin_name" })
+    local key = command.plugin_key or command.key or command.plugin_name
+    if not key then
+        respond(client, sub_id, command.request_id, { ok = false, error = "Missing plugin_key" })
         return
     end
 
-    log.info(string.format("Plugin reload requested: %s", name))
-    local ok, err = loader.reload_plugin(name)
-    respond(client, sub_id, command.request_id, { ok = ok, error = err, plugin_name = name })
-end, { description = "Reload a plugin by name" })
+    log.info(string.format("Plugin reload requested: %s", key))
+    local ok, err = loader.reload_plugin(key)
+    respond(client, sub_id, command.request_id, { ok = ok, error = err, plugin_key = key, plugin_name = key })
+end, { description = "Reload a plugin by key" })
 
 commands.register("plugin:load", function(client, sub_id, command)
     local name = command.plugin_name
@@ -261,9 +261,10 @@ commands.register("plugin:load", function(client, sub_id, command)
     local registry = state.get("plugin_registry", {})
 
     -- Already loaded? Reload instead
-    if registry[name] then
-        local ok, err = loader.reload_plugin(name)
-        respond(client, sub_id, command.request_id, { ok = ok, error = err, plugin_name = name })
+    local existing_key = command.plugin_key or command.key or name
+    if registry[existing_key] then
+        local ok, err = loader.reload_plugin(existing_key)
+        respond(client, sub_id, command.request_id, { ok = ok, error = err, plugin_key = existing_key, plugin_name = name })
         return
     end
 
@@ -300,11 +301,21 @@ commands.register("plugin:load", function(client, sub_id, command)
         return
     end
 
-    local ok = loader.load_plugin(found.init_path, name)
+    local load_opts = {
+        source = found.source,
+        repo_root = found.source == "repo" and repo_root or nil,
+    }
+    local key = loader.plugin_key(name, load_opts)
+    local ok = loader.load_plugin(found.init_path, name, load_opts)
     if ok then
-        registry[name] = { path = found.init_path }
+        registry[key] = registry[key] or { path = found.init_path }
+        registry[key].key = key
+        registry[key].name = name
+        registry[key].path = found.init_path
+        registry[key].source = found.source
+        registry[key].repo_root = load_opts.repo_root
     end
-    respond(client, sub_id, command.request_id, { ok = ok, plugin_name = name })
+    respond(client, sub_id, command.request_id, { ok = ok, plugin_key = key, plugin_name = name })
 end, { description = "Load a newly installed plugin" })
 
 -- ============================================================================

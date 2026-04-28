@@ -21,7 +21,7 @@
 --   quit             { op }                         - Request application quit
 --
 -- Context fields (Rust-owned):
---   overlay_actions, selected_agent
+--   overlay_actions, selected_agent, entities
 --
 -- Client-side state (_tui_state):
 --   mode, input_buffer, list_selected, agents, pending_fields, available_worktrees,
@@ -32,7 +32,11 @@
 -- Note: _tui_state.list_selected is 0-based. Lua tables are 1-based,
 -- so add 1 when indexing into Lua arrays (e.g., overlay_actions[list_selected + 1]).
 
-local ws_helpers = require("ui.workspace_helpers")
+local entity_state = require("ui.entity_state")
+
+_tui_sync_entities = function(entities)
+  entity_state.sync(entities)
+end
 
 local M = {}
 
@@ -92,19 +96,20 @@ local function build_available_workspaces(exclude_workspace_id)
   end
 end
 
+local function available_worktrees_for_target()
+  local target_id = _tui_state.pending_fields and _tui_state.pending_fields.target_id or nil
+  local out = {}
+  for _, wt in ipairs(_tui_state.available_worktrees or {}) do
+    if not target_id or not wt.target_id or wt.target_id == target_id then
+      out[#out + 1] = wt
+    end
+  end
+  return out
+end
+
 --- Transition from workspace selection to worktree selection.
---- Sends list_worktrees request and returns ops for the mode change.
 local function transition_to_worktree_selection()
-  return {
-    set_mode_ops("new_agent_select_worktree"),
-    { op = "send_msg", data = {
-      subscriptionId = "tui_hub",
-      data = {
-        type = "list_worktrees",
-        target_id = _tui_state.pending_fields.target_id,
-      },
-    }},
-  }
+  return { set_mode_ops("new_agent_select_worktree") }
 end
 
 --- Transition from agent config selection to workspace selection.
@@ -126,10 +131,6 @@ end
 -- =============================================================================
 -- Workspace flat_list helpers (Phase 3)
 -- =============================================================================
-
-local function rebuild_flat_list()
-  ws_helpers.rebuild_nav_flat_list(_tui_state)
-end
 
 --- Get the flat_list item at the current cursor position.
 local function current_cursor_item()
@@ -206,6 +207,7 @@ end
 -- @param context table Action context with all TUI state
 -- @return table|nil List of op tables, or nil for generic Rust handling
 function M.on_action(action, context)
+  entity_state.sync(context and context.entities)
 
   -- Note: Widget-intrinsic actions (list_up, list_down, input_char, input_backspace,
   -- cursor movement) are handled by Rust's WidgetStateStore and synced back to
@@ -222,33 +224,15 @@ function M.on_action(action, context)
       _tui_state.pending_fields.target_id = nil
       _tui_state.pending_fields.target_path = nil
       _tui_state.pending_fields.target_repo = nil
-      return {
-        set_mode_ops("new_agent_select_target"),
-        { op = "send_msg", data = {
-          subscriptionId = "tui_hub",
-          data = { type = "list_spawn_targets" },
-        }},
-      }
+      return { set_mode_ops("new_agent_select_target") }
     elseif selected == "new_accessory" then
       _tui_state.pending_fields.accessory_name = nil
       _tui_state.pending_fields.target_id = nil
       _tui_state.pending_fields.target_path = nil
       _tui_state.pending_fields.target_repo = nil
-      return {
-        set_mode_ops("new_accessory_select_target"),
-        { op = "send_msg", data = {
-          subscriptionId = "tui_hub",
-          data = { type = "list_spawn_targets" },
-        }},
-      }
+      return { set_mode_ops("new_accessory_select_target") }
     elseif selected == "spawn_targets_info" then
-      return {
-        set_mode_ops("spawn_targets_info"),
-        { op = "send_msg", data = {
-          subscriptionId = "tui_hub",
-          data = { type = "list_spawn_targets" },
-        }},
-      }
+      return { set_mode_ops("spawn_targets_info") }
     elseif selected == "close_agent" then
       if context.selected_agent then
         return { set_mode_ops("close_agent_confirm") }
@@ -450,7 +434,7 @@ function M.on_action(action, context)
     else
       -- Existing worktree. Index 2+ maps to available_worktrees[1+] (Lua 1-based).
       local wt_idx = ls - 1
-      local worktrees = _tui_state.available_worktrees or {}
+      local worktrees = available_worktrees_for_target()
       local wt = worktrees[wt_idx]
       if wt then
         _tui_state.pending_fields.creating_agent_id = wt.branch
@@ -491,12 +475,7 @@ function M.on_action(action, context)
   end
 
   if action == "refresh_spawn_targets" and _tui_state.mode == "spawn_targets_info" then
-    return {
-      { op = "send_msg", data = {
-        subscriptionId = "tui_hub",
-        data = { type = "list_spawn_targets" },
-      }},
-    }
+    return {}
   end
 
   if action == "spawn_target_rename" and _tui_state.mode == "spawn_targets_info" then
@@ -543,10 +522,6 @@ function M.on_action(action, context)
             },
           }},
           set_mode_ops("spawn_targets_info"),
-          { op = "send_msg", data = {
-            subscriptionId = "tui_hub",
-            data = { type = "list_spawn_targets" },
-          }},
         }
       end
       return { set_mode_ops("spawn_targets_info") }
@@ -596,7 +571,7 @@ function M.on_action(action, context)
         local workspace_id = pf.workspace_id
         local workspace_name = pf.workspace_name
         _tui_state.pending_fields.creating_agent_id = issue or "main"
-        _tui_state.pending_fields.creating_agent_stage = use_main and "spawning" or "creating_worktree"
+        _tui_state.pending_fields.creating_agent_stage = use_main and "spawning_agent" or "creating_worktree"
         _tui_state.pending_fields.pending_issue_or_branch = nil
         _tui_state.pending_fields.use_main_branch = nil
         _tui_state.pending_fields.agent_name = nil
@@ -892,16 +867,8 @@ function M.on_action(action, context)
 
   -- === Refresh agent list ===
   if action == "refresh_agents" then
-    return {
-      { op = "send_msg", data = {
-        subscriptionId = "tui_hub",
-        data = { type = "list_agents" },
-      }},
-      { op = "send_msg", data = {
-        subscriptionId = "tui_hub",
-        data = { type = "list_workspaces" },
-      }},
-    }
+    entity_state.sync(context and context.entities)
+    return {}
   end
 
   -- === Application control ===

@@ -323,13 +323,19 @@ local function build_worktree_items()
     { text = "[Create New Worktree]" },
   }
   for _, wt in ipairs(_tui_state and _tui_state.available_worktrees or {}) do
+    local target_id = _tui_state.pending_fields and _tui_state.pending_fields.target_id or nil
+    if not target_id or not wt.target_id or wt.target_id == target_id then
     table.insert(items, { text = string.format("%s (%s)", wt.branch, wt.path) })
+    end
   end
   return items
 end
 
 --- Main layout: workspace/agent list + terminal panel.
 function render(state)
+  if _tui_sync_entities then
+    _tui_sync_entities(state and state.entities)
+  end
   local agents = _tui_state and _tui_state.agents or {}
   local agent_count = #agents
   local creating = get_creating_agent()

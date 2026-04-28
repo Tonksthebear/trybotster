@@ -325,7 +325,7 @@ M.hooks = {
         { name = "before_command",          data = "{type, args, peer_id}",                        returns = "modified command or nil to block" },
         { name = "before_hub_command",      data = "command table",                                returns = "modified or nil to block" },
         { name = "before_client_subscribe", data = "{client, sub_id, ...}",                        returns = "modified context or nil to block" },
-        { name = "before_pty_spawn",        data = "{session, cmd, env, metadata}",                returns = "modified spawn context or nil to block" },
+        { name = "before_pty_spawn",        data = "{command, args, cwd, env, init_commands, metadata, ...}", returns = "modified spawn context or nil to block" },
         { name = "filter_agent_env",        data = "(env_table, agent)",                           returns = "modified env table" },
     },
 }

@@ -298,6 +298,26 @@ impl TuiEntityStores {
         }
         true
     }
+
+    /// Snapshot the built-in entity stores into ordered arrays for Lua
+    /// workflow state. Composite renderers read the stores directly; Lua
+    /// actions use this lightweight projection for selection flows that need
+    /// to inspect targets, worktrees, sessions, or workspaces before sending a
+    /// hub command.
+    pub fn action_context_json(&self) -> JsonValue {
+        serde_json::json!({
+            "sessions": self.ordered_entities("session"),
+            "workspaces": self.ordered_entities("workspace"),
+            "spawn_targets": self.ordered_entities("spawn_target"),
+            "worktrees": self.ordered_entities("worktree"),
+        })
+    }
+
+    fn ordered_entities(&self, entity_type: &str) -> Vec<JsonValue> {
+        self.store(entity_type)
+            .map(|store| store.iter().map(|(_, entity)| entity.clone()).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Default `id_field` for a built-in entity type. Plugin types fall back to

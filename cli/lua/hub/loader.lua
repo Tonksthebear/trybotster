@@ -153,6 +153,18 @@ end
 -- @param name string Plugin name
 -- @param status string "loaded" | "errored" | "disabled" | "unloaded"
 -- @param error_msg string|nil Error message (for "errored" status)
+local function plugin_key(name, opts)
+    opts = opts or {}
+    if opts.source == "repo" and opts.repo_root and opts.repo_root ~= "" then
+        return "repo:" .. tostring(opts.repo_root) .. ":" .. name
+    end
+    return name
+end
+
+function M.plugin_key(name, opts)
+    return plugin_key(name, opts)
+end
+
 local function update_registry_status(name, status, error_msg)
     local state = require("hub.state")
     local registry = state.get("plugin_registry", {})
@@ -173,6 +185,105 @@ local function update_registry_status(name, status, error_msg)
     end
 
     hooks.notify("plugin_status_changed", { name = name, status = status, error = error_msg })
+end
+
+local function upsert_registry_entry(name, path, fields)
+    local state = require("hub.state")
+    local registry = state.get("plugin_registry", {})
+    local entry = registry[name] or {
+        reload_count = 0,
+    }
+    entry.key = name
+    entry.path = path
+    entry.status = entry.status or "pending"
+    if fields then
+        for k, v in pairs(fields) do
+            entry[k] = v
+        end
+    end
+    registry[name] = entry
+    return entry
+end
+
+local function repo_roots_from_spawn_targets()
+    local roots = {}
+    local registry = rawget(_G, "spawn_targets")
+    if not registry or type(registry.list) ~= "function" then
+        return roots
+    end
+
+    local ok, targets = pcall(registry.list)
+    if not ok or type(targets) ~= "table" then
+        return roots
+    end
+
+    for _, target in ipairs(targets) do
+        if type(target) == "table" and target.enabled ~= false and target.path then
+            roots[#roots + 1] = target.path
+        end
+    end
+    return roots
+end
+
+local function append_unique(list, seen, value)
+    if value and not seen[value] then
+        seen[value] = true
+        list[#list + 1] = value
+    end
+end
+
+local function find_plugin_on_disk(name, opts)
+    opts = opts or {}
+    local ConfigResolver = require("lib.config_resolver")
+    local state = require("hub.state")
+    local resolver_opts = state.get("plugin_resolver_opts", {})
+    local device_root = opts.device_root or resolver_opts.device_root or (config.data_dir and config.data_dir()) or nil
+
+    local repo_roots = {}
+    local seen = {}
+    append_unique(repo_roots, seen, opts.repo_root)
+    for _, repo_root in ipairs(resolver_opts.repo_roots or {}) do
+        append_unique(repo_roots, seen, repo_root)
+    end
+    if opts.include_spawn_targets ~= false then
+        for _, repo_root in ipairs(repo_roots_from_spawn_targets()) do
+            append_unique(repo_roots, seen, repo_root)
+        end
+    end
+
+    if device_root then
+        local unified = ConfigResolver.resolve_all({
+            device_root = device_root,
+            repo_root = nil,
+            require_agent = false,
+        })
+        if unified and unified.plugins then
+            for _, plugin in ipairs(unified.plugins) do
+                if plugin.name == name then
+                    plugin.repo_root = nil
+                    return plugin
+                end
+            end
+        end
+    end
+
+    for _, repo_root in ipairs(repo_roots) do
+        local unified = ConfigResolver.resolve_all({
+            device_root = device_root,
+            repo_root = repo_root,
+            require_agent = false,
+        })
+        if unified and unified.plugins then
+            for _, plugin in ipairs(unified.plugins) do
+                if plugin.name == name then
+                    plugin.repo_root = plugin.source == "repo" and repo_root or nil
+                    return plugin
+                end
+            end
+        end
+    end
+
+    return nil
 end
 
 --- Capture a log entry into a plugin's ring buffer.
@@ -225,6 +336,54 @@ local function create_plugin_logger(name, real_log)
             real_log.debug(string.format("[%s] %s", name, msg))
         end,
     }
+end
+
+local function scoped_hook_name(key, name)
+    if type(name) ~= "string" then return name end
+    local prefix = key .. "::"
+    if name:sub(1, #prefix) == prefix then
+        return name
+    end
+    return prefix .. name
+end
+
+local function create_scoped_hooks(key, real_hooks)
+    if type(real_hooks) ~= "table" then return real_hooks end
+    local scoped = {}
+    setmetatable(scoped, { __index = real_hooks })
+
+    if type(real_hooks.on) == "function" then
+        scoped.on = function(event, name, callback, opts)
+            return real_hooks.on(event, scoped_hook_name(key, name), callback, opts)
+        end
+    end
+    if type(real_hooks.off) == "function" then
+        scoped.off = function(event, name)
+            return real_hooks.off(event, scoped_hook_name(key, name))
+        end
+    end
+    if type(real_hooks.intercept) == "function" then
+        scoped.intercept = function(event, name, callback, opts)
+            return real_hooks.intercept(event, scoped_hook_name(key, name), callback, opts)
+        end
+    end
+    if type(real_hooks.unintercept) == "function" then
+        scoped.unintercept = function(event, name)
+            return real_hooks.unintercept(event, scoped_hook_name(key, name))
+        end
+    end
+    if type(real_hooks.enable) == "function" then
+        scoped.enable = function(event, name)
+            return real_hooks.enable(event, scoped_hook_name(key, name))
+        end
+    end
+    if type(real_hooks.disable) == "function" then
+        scoped.disable = function(event, name)
+            return real_hooks.disable(event, scoped_hook_name(key, name))
+        end
+    end
+
+    return scoped
 end
 
 --- Persist the disabled set to disk.
@@ -284,17 +443,26 @@ end
 -- so the plugin can require() its own modules (e.g. require("telegram.api")).
 -- @param path string Absolute path to the plugin's init.lua
 -- @param name string Plugin name (used for registration and logging)
+-- @param opts table|nil { source = "device"|"repo", repo_root = string }
 -- @return boolean success
 -- @return string|nil error message on failure
-function M.load_plugin(path, name)
+function M.load_plugin(path, name, opts)
+    opts = opts or {}
+    local key = plugin_key(name, opts)
+    upsert_registry_entry(key, path, {
+        name = name,
+        source = opts.source,
+        repo_root = opts.repo_root,
+    })
+
     -- Skip disabled plugins
-    if M.is_disabled(name) then
-        log.info(string.format("Skipping disabled plugin: %s", name))
-        return false, "Plugin is disabled: " .. name
+    if M.is_disabled(key) or (key ~= name and M.is_disabled(name)) then
+        log.info(string.format("Skipping disabled plugin: %s", key))
+        return false, "Plugin is disabled: " .. key
     end
 
     if not fs.exists(path) then
-        local msg = string.format("load_plugin: %s not found at %s", name, path)
+        local msg = string.format("load_plugin: %s not found at %s", key, path)
         log.warn(msg)
         return false, msg
     end
@@ -309,7 +477,7 @@ function M.load_plugin(path, name)
     local chunk, err = load(source, "@" .. path)
     if not chunk then
         local msg = string.format("load_plugin: syntax error in %s: %s", path, tostring(err))
-        capture_plugin_log(name, "error", msg)
+        capture_plugin_log(key, "error", msg)
         log.error(msg)
         return false, msg
     end
@@ -333,43 +501,60 @@ function M.load_plugin(path, name)
 
     -- Set source context so mcp.tool() can track which plugin registered each tool
     _G._loading_plugin_source = "@" .. path
-    _G._loading_plugin_name = name
+    _G._loading_plugin_name = key
+    _G._loading_plugin_display_name = name
+    _G._loading_plugin_key = key
+    _G._loading_plugin_repo_root = opts.repo_root or _G._loading_plugin_repo_root
 
     -- Install per-plugin logger during load
     local real_log = _G.log
-    _G.log = create_plugin_logger(name, real_log)
+    local real_hooks = _G.hooks
+    local real_hooks_module = package.loaded["hub.hooks"]
+    local scoped_hooks = create_scoped_hooks(key, real_hooks)
+    _G.log = create_plugin_logger(key, real_log)
+    _G.hooks = scoped_hooks
+    if real_hooks_module then
+        package.loaded["hub.hooks"] = scoped_hooks
+    end
 
     local loaded_before = package_loaded_snapshot()
     local ok, result = pcall(chunk)
 
-    -- Restore real logger
+    -- Restore real globals
     _G.log = real_log
+    _G.hooks = real_hooks
+    package.loaded["hub.hooks"] = real_hooks_module
     _G._loading_plugin_source = nil
     _G._loading_plugin_name = nil
+    _G._loading_plugin_display_name = nil
+    _G._loading_plugin_key = nil
+    if opts.repo_root then
+        _G._loading_plugin_repo_root = nil
+    end
 
     if mcp then mcp.end_batch() end
 
     if not ok then
         local msg = string.format("load_plugin: runtime error in %s: %s", path, tostring(result))
         -- Capture error in plugin's log ring even though logger is restored
-        capture_plugin_log(name, "error", msg)
+        capture_plugin_log(key, "error", msg)
         log.error(msg)
         return false, msg
     end
 
     -- Register in package.loaded so reload works
-    local module_key = "plugin." .. name
+    local module_key = "plugin." .. key
     package.loaded[module_key] = result or true
     local state = require("hub.state")
     local registry = state.get("plugin_registry", {})
-    if registry[name] then
-        registry[name].modules = package_loaded_added_since(loaded_before)
+    if registry[key] then
+        registry[key].modules = package_loaded_added_since(loaded_before)
     end
-    log.info(string.format("Loaded plugin: %s from %s", name, path))
+    log.info(string.format("Loaded plugin: %s from %s", key, path))
     return true
 end
 
---- Reload a plugin by name using the runtime registry.
+--- Reload a plugin by key using the runtime registry.
 -- Plugins are loaded from absolute paths (not package.path), so the standard
 -- reload() won't work. This looks up the path from hub.state, runs lifecycle
 -- hooks, and re-executes the plugin file.
@@ -381,14 +566,40 @@ function M.reload_plugin(name)
     local registry = state.get("plugin_registry", {})
     local entry = registry[name]
     if not entry then
-        return false, "Plugin not found in registry: " .. name
+        local discovered = find_plugin_on_disk(name)
+        if not discovered then
+            return false, "Plugin not found in registry or on disk: " .. name
+        end
+
+        local discovered_key = plugin_key(discovered.name or name, {
+            source = discovered.source,
+            repo_root = discovered.repo_root,
+        })
+        entry = upsert_registry_entry(discovered_key, discovered.init_path, {
+            name = discovered.name or name,
+            status = "pending",
+            source = discovered.source,
+            repo_root = discovered.repo_root,
+        })
+
+        local ok, err = M.load_plugin(entry.path, entry.name or name, {
+            source = entry.source,
+            repo_root = entry.repo_root,
+        })
+        if ok then
+            update_registry_status(discovered_key, "loaded", nil)
+        else
+            update_registry_status(discovered_key, "errored", err)
+        end
+        return ok, err
     end
 
     if M.is_disabled(name) then
         return false, "Plugin is disabled: " .. name .. " (enable it first)"
     end
 
-    local module_key = "plugin." .. name
+    local plugin_name = entry.name or name
+    local module_key = "plugin." .. (entry.key or name)
     local old = package.loaded[module_key]
 
     -- Snapshot sub-module cache so we can fully restore it on failure.
@@ -397,9 +608,9 @@ function M.reload_plugin(name)
     -- module would subsequently require() those new (possibly incompatible)
     -- versions rather than its own originals.
     local old_namespace = {}
-    local ns_prefix = name .. "."
+    local ns_prefix = plugin_name .. "."
     for k, v in pairs(package.loaded) do
-        if k == name or k:sub(1, #ns_prefix) == ns_prefix then
+        if k == plugin_name or k:sub(1, #ns_prefix) == ns_prefix then
             old_namespace[k] = v
         end
     end
@@ -430,13 +641,16 @@ function M.reload_plugin(name)
     remove_from_package_path(root_dir)
     remove_from_package_path(lua_dir)
     clear_recorded_modules(entry)
-    clear_plugin_namespace(name)
+    clear_plugin_namespace(plugin_name)
 
     -- Clear old module
     package.loaded[module_key] = nil
 
     -- Re-load from disk (errors caught internally — load_plugin never throws)
-    local ok = M.load_plugin(entry.path, name)
+    local ok = M.load_plugin(entry.path, plugin_name, {
+        source = entry.source,
+        repo_root = entry.repo_root,
+    })
 
     -- Single notification for the entire reload cycle
     if mcp then mcp.end_batch() end
@@ -482,13 +696,14 @@ function M.unload_plugin(name)
         return false, "Plugin not found in registry: " .. name
     end
 
-    local module_key = "plugin." .. name
+    local plugin_name = entry.name or name
+    local module_key = "plugin." .. (entry.key or name)
     local mod = package.loaded[module_key]
 
     -- Notify subscribers (e.g. lib.plugin_db) that the plugin is about to be
     -- torn down so they can release resources keyed by plugin name. Fires
     -- BEFORE the plugin's own `_before_unload` so shared infra runs first.
-    hooks.notify("plugin_unloading", { name = name })
+    hooks.notify("plugin_unloading", { name = name, plugin_name = plugin_name, key = entry.key or name })
 
     -- Lifecycle: let the plugin clean up before being removed
     if mod and type(mod) == "table" and mod._before_unload then
@@ -512,7 +727,7 @@ function M.unload_plugin(name)
     remove_from_package_path(root_dir)
     remove_from_package_path(root_dir .. "/lua")
     clear_recorded_modules(entry)
-    clear_plugin_namespace(name)
+    clear_plugin_namespace(plugin_name)
     package.loaded[module_key] = nil
 
     -- Remove from registry
@@ -574,7 +789,10 @@ function M.enable_plugin(name)
 
     -- Load the plugin
     local entry = registry[name]
-    local ok, err = M.load_plugin(entry.path, name)
+    local ok, err = M.load_plugin(entry.path, entry.name or name, {
+        source = entry.source,
+        repo_root = entry.repo_root,
+    })
     if ok then
         update_registry_status(name, "loaded", nil)
     else
@@ -591,8 +809,11 @@ function M.list_plugins()
     local result = {}
     for name, entry in pairs(registry) do
         table.insert(result, {
-            name = name,
+            key = entry.key or name,
+            name = entry.name or name,
             path = entry.path,
+            source = entry.source,
+            repo_root = entry.repo_root,
             status = entry.status or "unknown",
             error = entry.error,
             loaded_at = entry.loaded_at,
@@ -600,7 +821,7 @@ function M.list_plugins()
             reload_count = entry.reload_count or 0,
         })
     end
-    table.sort(result, function(a, b) return a.name < b.name end)
+    table.sort(result, function(a, b) return (a.key or a.name) < (b.key or b.name) end)
     return result
 end
 

@@ -182,6 +182,19 @@ local function notify_lifecycle(agent_id, status, extra)
     hooks.notify("agent_lifecycle", payload)
 end
 
+local function notify_worktree_created(path, branch, metadata)
+    local target = TargetContext.resolve({
+        metadata = metadata or {},
+    })
+
+    hooks.notify("worktree_created", {
+        path = path,
+        branch = branch,
+        repo = target and target.target_repo or nil,
+        metadata = metadata or {},
+    })
+end
+
 -- ============================================================================
 -- Agent Spawning (internal)
 -- ============================================================================
@@ -277,6 +290,9 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_name, met
         notify_lifecycle(branch_name, "failed", { error = tostring(agent) })
         return nil, msg
     end
+
+    workspace_id = agent._workspace_id or workspace_id
+    workspace_name = agent._workspace_name or workspace_name
 
     -- Notify via hooks (connections.lua observes and broadcasts to clients)
     hooks.notify("agent_created", agent:info())
@@ -527,6 +543,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
             return nil, tostring(created_or_err)
         end
         wt_path = created_or_err
+        notify_worktree_created(wt_path, branch_name, metadata)
     else
         log.info(string.format("Worktree found for %s at %s", branch_name, wt_path))
     end
@@ -806,13 +823,7 @@ _event_subs[#_event_subs + 1] = events.on("worktree_created", function(info)
     local target = TargetContext.resolve({
         metadata = info.metadata or {},
     })
-
-    hooks.notify("worktree_created", {
-        path = info.path,
-        branch = info.branch,
-        repo = target and target.target_repo or nil,
-        metadata = info.metadata or {},
-    })
+    notify_worktree_created(info.path, info.branch, info.metadata)
 
     local client = { rows = info.client_rows, cols = info.client_cols }
 

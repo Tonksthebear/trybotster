@@ -5,7 +5,7 @@
 //!
 //! # Message Types
 //!
-//! - [`TerminalMessage`] - CLI → Browser messages (output, agent lists, etc.)
+//! - [`TerminalMessage`] - CLI → Browser messages (output, control responses, etc.)
 //! - [`BrowserCommand`] - Browser → CLI commands (input, actions)
 //!
 //! # Transport
@@ -33,30 +33,10 @@ pub enum TerminalMessage {
         /// List of available agents.
         agents: Vec<AgentInfo>,
     },
-    /// Worktree list response.
-    #[serde(rename = "worktrees")]
-    Worktrees {
-        /// List of available worktrees.
-        worktrees: Vec<WorktreeInfo>,
-        /// Repository name.
-        repo: Option<String>,
-    },
     /// Agent selected confirmation.
     #[serde(rename = "agent_selected")]
     AgentSelected {
         /// Selected agent's session key.
-        id: String,
-    },
-    /// Agent created confirmation.
-    #[serde(rename = "agent_created")]
-    AgentCreated {
-        /// Created agent's session key.
-        id: String,
-    },
-    /// Agent deleted confirmation.
-    #[serde(rename = "agent_deleted")]
-    AgentDeleted {
-        /// Deleted agent's session key.
         id: String,
     },
     /// Error message.
@@ -146,17 +126,6 @@ pub struct AgentInfo {
     pub hub_identifier: Option<String>,
 }
 
-/// Worktree info for list response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorktreeInfo {
-    /// Filesystem path to the worktree.
-    pub path: String,
-    /// Git branch name.
-    pub branch: String,
-    /// Associated issue number, if any.
-    pub issue_number: Option<u64>,
-}
-
 /// Browser command types (browser -> CLI).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -191,12 +160,6 @@ pub enum BrowserCommand {
         /// Display mode ("tui" or "gui").
         mode: String,
     },
-    /// List all agents.
-    #[serde(rename = "list_agents")]
-    ListAgents,
-    /// List available worktrees.
-    #[serde(rename = "list_worktrees")]
-    ListWorktrees,
     /// Select an agent.
     #[serde(rename = "select_agent")]
     SelectAgent {
@@ -312,21 +275,6 @@ mod tests {
     }
 
     #[test]
-    fn test_terminal_message_worktrees_serialization() {
-        let msg = TerminalMessage::Worktrees {
-            worktrees: vec![WorktreeInfo {
-                path: "/path/to/worktree".to_string(),
-                branch: "feature-branch".to_string(),
-                issue_number: None,
-            }],
-            repo: Some("owner/repo".to_string()),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains(r#""type":"worktrees""#));
-        assert!(json.contains(r#""path":"/path/to/worktree""#));
-    }
-
-    #[test]
     fn test_terminal_message_agent_selected_serialization() {
         let msg = TerminalMessage::AgentSelected {
             id: "agent-123".to_string(),
@@ -400,13 +348,6 @@ mod tests {
             BrowserCommand::SetMode { mode } => assert_eq!(mode, "gui"),
             _ => panic!("Wrong variant"),
         }
-    }
-
-    #[test]
-    fn test_browser_command_list_agents_parsing() {
-        let json = r#"{"type":"list_agents"}"#;
-        let cmd: BrowserCommand = serde_json::from_str(json).unwrap();
-        assert!(matches!(cmd, BrowserCommand::ListAgents));
     }
 
     #[test]

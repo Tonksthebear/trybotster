@@ -300,12 +300,10 @@ function Client:handle_subscribe(msg)
     end
 end
 
--- Wire protocol: send_spawn_target_list, send_agent_list,
--- send_workspace_list, send_open_workspace_list, send_worktree_list, and
--- send_hub_recovery_state are GONE. Subscribe-time priming now goes through
--- `EB.send_snapshots_to(self, sub_id)` (see handle_subscribe), which ships
--- one entity_snapshot per registered type. Subsequent updates flow as
--- entity_patch / entity_upsert / entity_remove from EB.
+-- Wire protocol: model priming goes through `EB.send_snapshots_to(self,
+-- sub_id)` (see handle_subscribe), which ships one entity_snapshot per
+-- registered type. Subsequent updates flow as entity_patch / entity_upsert /
+-- entity_remove from lib.entity_model.
 
 --- Set up terminal subscription with PTY forwarder.
 -- Creates a transport-agnostic forwarder that streams PTY output to the client.
@@ -425,12 +423,9 @@ function Client:send_ui_route_registry(sub_id)
     self:send(payload)
 end
 
--- Wire protocol: send_workspace_list, send_open_workspace_list,
--- send_worktree_list, and send_hub_recovery_state are GONE. The hub now
--- ships those as `entity_snapshot(workspace)` / `entity_snapshot(worktree)`
--- / `entity_snapshot(hub)` at subscribe time and `entity_patch` /
--- `entity_upsert` / `entity_remove` thereafter — see lib.entity_broadcast
--- and the registrations in cli/lua/hub/init.lua.
+-- Wire protocol: workspace, worktree, hub, and connection-code state ships as
+-- entity_snapshot at subscribe time and entity_patch / entity_upsert /
+-- entity_remove thereafter.
 
 --- Handle unsubscribe message - remove virtual subscription.
 -- @param msg The unsubscribe message
@@ -553,7 +548,7 @@ function Client:handle_terminal_data(sub_id, sub, command)
     end
 end
 
---- Handle hub control data (list_agents, create_agent, etc.).
+--- Handle hub control data (create_agent, move_agent_workspace, etc.).
 -- @param sub_id The subscription ID for responses
 -- @param command The hub command
 function Client:handle_hub_data(sub_id, command)

@@ -563,7 +563,8 @@ local function resolve_uri(plugin_name, memory)
             plugin_name
         ), 0)
     end
-    local plugin_dir = data_dir .. "/plugins/" .. plugin_name
+    local plugin_dirname = plugin_name:gsub("[^%w%._-]", "_")
+    local plugin_dir = data_dir .. "/plugins/" .. plugin_dirname
     local ok, err = fs.mkdir(plugin_dir)
     if not ok then
         error(string.format(

@@ -220,6 +220,48 @@ fn test_ensure_workspace_finds_existing() {
 }
 
 #[test]
+fn test_ensure_workspace_reopens_closed_same_name_workspace() {
+    let dir = TempDir::new().unwrap();
+    let lua = create_lua_vm(dir.path());
+    load_workspace_store(&lua);
+
+    let (same_id, not_created, active): (bool, bool, bool) = lua
+        .load(format!(
+            r#"
+            local dd = "{dd}"
+            ws.init_dir(dd)
+            local id1 = ws.generate_workspace_id()
+            ws.write_workspace(dd, id1, {{
+                id = id1,
+                name = "main",
+                status = "closed",
+                target_id = "target-1",
+                target_path = "/repo",
+                target_repo = "owner/repo",
+            }})
+            local id2, manifest, created2 = ws.ensure_workspace(dd, {{
+                name = "main",
+                target_id = "target-1",
+                target_path = "/repo",
+                target_repo = "owner/repo",
+            }})
+            local entries = fs.list_dir(dd .. "/workspaces") or {{}}
+            return id1 == id2 and #entries == 1, not created2, manifest.status == "active"
+            "#,
+            dd = dir.path().to_str().unwrap()
+        ))
+        .eval()
+        .expect("ensure_workspace reopens closed same-name workspace");
+
+    assert!(
+        same_id,
+        "Default workspace creation should merge with same-name closed workspace"
+    );
+    assert!(not_created, "Should not create a duplicate workspace");
+    assert!(active, "Reused workspace should be marked active");
+}
+
+#[test]
 fn test_ensure_workspace_missing_name() {
     let dir = TempDir::new().unwrap();
     let lua = create_lua_vm(dir.path());

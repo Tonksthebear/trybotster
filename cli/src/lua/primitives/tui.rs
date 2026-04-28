@@ -22,8 +22,8 @@
 //! -- Register callback for messages from TUI
 //! tui.on_message(function(message)
 //!     log.debug("TUI message: type=" .. tostring(message.type))
-//!     if message.type == "list_agents" then
-//!         tui.send({ type = "agent_list", agents = Agent.all_info() })
+//!     if message.type == "ping" then
+//!         tui.send({ type = "pong" })
 //!     end
 //! end)
 //! ```
@@ -281,7 +281,7 @@ mod tests {
 
         lua.load(
             r#"
-            tui.send({ type = "agent_list", count = 3 })
+            tui.send({ type = "status_update", count = 3 })
         "#,
         )
         .exec()
@@ -290,7 +290,7 @@ mod tests {
         let event = rx.try_recv().expect("Should have received event");
         match event {
             HubEvent::TuiSend(TuiSendRequest::Json { data }) => {
-                assert_eq!(data["type"], "agent_list");
+                assert_eq!(data["type"], "status_update");
                 assert_eq!(data["count"], 3);
             }
             _ => panic!("Expected TuiSend Json event"),

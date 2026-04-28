@@ -187,7 +187,7 @@ end
 -- -------------------------------------------------------------------------
 
 --- Emit `entity_upsert`. Called when a new entity arrives or when the entity
---- record is being replaced wholesale (e.g. agent_created hook handler).
+--- record is being replaced wholesale.
 --- The payload itself is shipped as `entity` so clients can apply it without
 --- re-fetching.
 function M.upsert(entity_type, payload)

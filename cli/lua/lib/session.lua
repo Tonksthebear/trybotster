@@ -425,8 +425,16 @@ function Session._init(self, config)
     local spawn_ctx = {
         worktree_path = config.worktree_path,
         branch = config.branch_name,
-        session_uuid = key,
         session_uuid = session_uuid,
+        cwd = spawn_config.cwd,
+        command = spawn_config.command,
+        args = spawn_config.args,
+        env = spawn_config.env,
+        init_commands = spawn_config.init_commands,
+        detect_notifications = spawn_config.detect_notifications,
+        rows = spawn_config.rows,
+        cols = spawn_config.cols,
+        port = spawn_config.port,
         session_type = session_type,
         session_name = session_name,
         repo = config.repo,
@@ -444,6 +452,19 @@ function Session._init(self, config)
         end
         error(string.format("PTY spawn blocked by interceptor for %s", key))
     end
+    spawn_config.worktree_path = spawn_result.worktree_path or spawn_config.worktree_path
+    spawn_config.cwd = spawn_result.cwd or spawn_config.cwd
+    spawn_config.command = spawn_result.command or spawn_config.command
+    spawn_config.args = spawn_result.args or spawn_config.args
+    spawn_config.env = spawn_result.env or spawn_config.env
+    spawn_config.init_commands = spawn_result.init_commands or spawn_config.init_commands
+    spawn_config.detect_notifications = spawn_result.detect_notifications
+    if spawn_config.detect_notifications == nil then
+        spawn_config.detect_notifications = session_config.notifications or false
+    end
+    spawn_config.rows = spawn_result.rows or spawn_config.rows
+    spawn_config.cols = spawn_result.cols or spawn_config.cols
+    spawn_config.port = spawn_result.port or spawn_config.port
 
     local ok, handle = pcall(hub.spawn_session, spawn_config, session_uuid)
     if not ok or not handle then
@@ -635,15 +656,18 @@ function Session:update(fields)
         -- re-derived ones (display_name when title/agent_name/branch_name
         -- moved). System sessions stay off the wire — the EB filter on
         -- the `session` registration drops them.
-        local EB = require("lib.entity_broadcast")
-        local ClientSessionPayload = require("lib.client_session_payload")
-        if EB.is_registered("session") and not Session.is_system_session(self) then
-            local patch = ClientSessionPayload.project_fields(changed_fields, self)
-            if next(patch) ~= nil then
-                EB.patch("session", self.session_uuid, patch)
-            end
-        end
+        require("lib.entity_model").patch_session(self, changed_fields)
     end
+end
+
+--- Publish the current client-facing session entity.
+--
+-- Workspace rename/move changes live on the private `_workspace_*` fields,
+-- so they cannot safely flow through Session:update without creating shadow
+-- public fields. Use a full upsert after those identity changes so every
+-- client sees the same payload it would receive on subscribe/reconnect.
+function Session:publish_entity()
+    require("lib.entity_model").publish_session(self)
 end
 
 --- Set a metadata value and sync session manifest.
@@ -878,6 +902,8 @@ function Session:move_to_workspace(opts)
         pcall(ws.refresh_workspace_status, self._data_dir, old_workspace_id)
     end
     pcall(ws.refresh_workspace_status, self._data_dir, workspace_id)
+
+    self:publish_entity()
 
     return {
         workspace_id = workspace_id,

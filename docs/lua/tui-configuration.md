@@ -118,7 +118,11 @@ Called via `on_hub_event(event_type, event_data, context)`. Returns ops like act
 
 ### Hub Event Types Handled
 
-`agent_created`, `agent_deleted`, `agent_status_changed`, `agent_list`, `pty_notification`, `worktree_list`, `profiles`, `connection_code`, `connection_code_error`
+Durable model state is consumed through `entity_snapshot`, `entity_upsert`,
+`entity_patch`, and `entity_remove` by the Rust entity stores. Lua handles
+transient workflow events: `pty_notification`, `spawn_target_feedback`,
+`agent_config`, `connection_code`, `connection_code_error`,
+`bridge_reconnected`, `hub_recovery_state`, and `hub_ready`.
 
 ## `ui/botster.lua` — Extension API
 

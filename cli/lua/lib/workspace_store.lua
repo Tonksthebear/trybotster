@@ -423,6 +423,28 @@ function M.ensure_workspace(data_dir, opts)
         return existing_id, existing_manifest, false, nil
     end
 
+    -- Generated/default workspaces should be stable by name. If a same-name
+    -- workspace exists but currently computes as closed, reopen and reuse it
+    -- instead of creating a duplicate "main"/branch workspace.
+    existing_id, existing_manifest = M.find_workspace(data_dir, name, opts)
+    if existing_id then
+        if expect_new then
+            return nil, nil, false, string.format("Workspace '%s' already exists", name)
+        end
+
+        existing_manifest.status = "active"
+        existing_manifest.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+        existing_manifest.target_id = existing_manifest.target_id or opts.target_id
+        existing_manifest.target_path = existing_manifest.target_path or opts.target_path
+        existing_manifest.target_repo = existing_manifest.target_repo or opts.target_repo
+        existing_manifest.metadata = existing_manifest.metadata or {}
+        for k, v in pairs(opts.metadata or {}) do
+            existing_manifest.metadata[k] = v
+        end
+        M.write_workspace(data_dir, existing_id, existing_manifest)
+        return existing_id, existing_manifest, false, nil
+    end
+
     local workspace_id = M.generate_workspace_id()
     local now = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
     local manifest = {
@@ -620,7 +642,7 @@ function M.refresh_workspace_status(data_dir, workspace_id)
     return manifest.status
 end
 
---- Build grouped workspace payload for agent_list broadcasts.
+--- Build grouped workspace payload for workspace entity snapshots.
 -- @param data_dir string
 -- @param agents array Agent.info()-style tables
 -- @return array workspaces

@@ -107,28 +107,6 @@ Initial terminal handshake with dimensions.
 }
 ```
 
-### list_agents (Hub)
-
-Request current agent list.
-
-```json
-{
-  "subscriptionId": "sub_1_1234567890",
-  "type": "list_agents"
-}
-```
-
-### list_worktrees (Hub)
-
-Request available worktrees.
-
-```json
-{
-  "subscriptionId": "sub_1_1234567890",
-  "type": "list_worktrees"
-}
-```
-
 ### create_agent (Hub)
 
 Create a new agent.
@@ -180,25 +158,19 @@ Confirmation that subscription is active.
 }
 ```
 
-### agent_list
+### entity_snapshot / entity_upsert / entity_patch / entity_remove
 
-List of all agents. Sent on HubChannel subscription and on request.
+Hub model state is sent through entity frames. Subscribing to the hub channel
+sends one `entity_snapshot` per registered entity type; subsequent changes use
+`entity_upsert`, `entity_patch`, or `entity_remove`.
 
 ```json
 {
-  "type": "agent_list",
+  "type": "entity_snapshot",
   "subscriptionId": "sub_1_1234567890",
-  "workspaces": [
-    {
-      "id": "ws-1730000000000-abcdef",
-      "title": "owner/repo — issue #42",
-      "repo": "owner/repo",
-      "issue_number": 42,
-      "status": "active",
-      "agents": ["owner-repo-botster-issue-42"]
-    }
-  ],
-  "agents": [
+  "entity_type": "session",
+  "snapshot_seq": 42,
+  "items": [
     {
       "id": "session-key-here",
       "session_uuid": "sess-abc123",
@@ -218,10 +190,14 @@ List of all agents. Sent on HubChannel subscription and on request.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `workspaces` | array | Grouped workspace metadata (may be empty `[]`) |
-| `agents` | array | List of agent objects (empty array `[]` if none) |
+| `entity_type` | string | `session`, `workspace`, `spawn_target`, `worktree`, `hub`, or `connection_code` |
+| `snapshot_seq` | integer | Monotonic sequence used to reject stale frames |
+| `items` | array | Full records for `entity_snapshot` |
+| `id` | string | Entity id for upsert, patch, and remove frames |
+| `entity` | object | Full record for `entity_upsert` |
+| `patch` | object | Sparse top-level field changes for `entity_patch` |
 
-**Agent object fields:**
+**Session fields:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -236,76 +212,6 @@ List of all agents. Sent on HubChannel subscription and on request.
 | `server_running` | boolean | No | Whether dev server is running |
 | `has_server_pty` | boolean | No | Whether server PTY exists |
 | `pty_count` | integer | Yes | Number of PTY sessions |
-
-### worktree_list
-
-List of available worktrees. Sent on HubChannel subscription and on request.
-
-```json
-{
-  "type": "worktree_list",
-  "subscriptionId": "sub_1_1234567890",
-  "worktrees": [
-    {
-      "path": "/Users/user/botster-sessions/repo-branch",
-      "branch": "feature-branch"
-    }
-  ]
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `worktrees` | array | List of worktree objects (empty array `[]` if none) |
-
-**Worktree object fields:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `path` | string | Yes | Absolute path to worktree |
-| `branch` | string | Yes | Git branch name |
-
-### agent_created
-
-Broadcast when a new agent is created.
-
-```json
-{
-  "type": "agent_created",
-  "subscriptionId": "sub_1_1234567890",
-  "agent": {
-    "id": "session-key-here",
-    "repo": "owner/repo",
-    "issue_number": 42,
-    "branch_name": "botster-issue-42"
-  }
-}
-```
-
-### agent_deleted
-
-Broadcast when an agent is deleted.
-
-```json
-{
-  "type": "agent_deleted",
-  "subscriptionId": "sub_1_1234567890",
-  "agent_id": "session-key-here"
-}
-```
-
-### agent_status_changed
-
-Broadcast when an agent's status changes.
-
-```json
-{
-  "type": "agent_status_changed",
-  "subscriptionId": "sub_1_1234567890",
-  "agent_id": "session-key-here",
-  "status": "Running"
-}
-```
 
 ### error
 
@@ -354,6 +260,6 @@ The raw bytes are the terminal output including ANSI escape sequences. No JSON e
 
 | Channel | Purpose |
 |---------|---------|
-| `HubChannel` | Agent lifecycle, worktrees, control plane |
+| `HubChannel` | Entity model state and control plane |
 | `TerminalRelayChannel` | PTY input/output for a specific session |
 | `PreviewChannel` | Development server preview (future) |

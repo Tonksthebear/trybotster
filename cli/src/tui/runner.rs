@@ -414,6 +414,7 @@ where
             selected_agent: self.panel_pool.selected_agent.clone(),
             action_char: None,
             terminal_focused: self.terminal_modes.terminal_focused(),
+            entities: Some(self.entity_stores.action_context_json()),
         }
     }
 
@@ -2843,6 +2844,11 @@ mod tests {
             include_str!("../../lua/ui/workspace_helpers.lua"),
         )
         .expect("workspace_helpers.lua should preload");
+        lua.preload_module(
+            "ui.entity_state",
+            include_str!("../../lua/ui/entity_state.lua"),
+        )
+        .expect("entity_state.lua should preload");
         lua.load_keybindings(kb_source)
             .expect("test keybindings should load");
         lua.load_actions(actions_source)
@@ -3370,7 +3376,7 @@ mod tests {
         // Wait for responder to process
         thread::sleep(Duration::from_millis(10));
 
-        // Verify create_agent JSON message (skip list_worktrees request)
+        // Verify create_agent JSON message.
         let mut found_create = false;
         while let Ok(req) = request_rx.try_recv() {
             let msg = unwrap_lua_msg(req);
@@ -3388,12 +3394,12 @@ mod tests {
         }
         assert!(found_create, "create_agent JSON message should be sent");
 
-        // Modal closes after submit — stays in list mode until agent_created
-        // event arrives and selects the agent (which sets terminal mode).
+        // Modal closes after submit and stays in list mode until explicit
+        // selection/focus state changes.
         assert_eq!(
             runner.mode(),
             "list",
-            "Should be list mode until agent_created event selects the agent"
+            "Should be list mode until selection state changes"
         );
 
         // Cleanup
@@ -3415,15 +3421,15 @@ mod tests {
             create_test_runner_with_mock_client();
         let lua = make_test_layout_with_keybindings();
 
-        // Pre-populate worktrees in _tui_state (normally delivered via worktree_list event)
-        lua.load_extension(
-            r#"_tui_state.available_worktrees = {
-                { path = "/path/worktree-1", branch = "feature-branch" },
-                { path = "/path/worktree-2", branch = "bugfix-branch" },
-            }"#,
-            "test_worktrees",
-        )
-        .unwrap();
+        runner.entity_stores.apply_frame(&serde_json::json!({
+            "type": "entity_snapshot",
+            "entity_type": "worktree",
+            "snapshot_seq": 1,
+            "items": [
+                { "worktree_path": "/path/worktree-1", "path": "/path/worktree-1", "branch": "feature-branch", "target_id": "tgt_trybotster" },
+                { "worktree_path": "/path/worktree-2", "path": "/path/worktree-2", "branch": "bugfix-branch", "target_id": "tgt_trybotster" }
+            ]
+        }));
 
         // Open menu and navigate to New Agent using cached overlay actions
         process_key_with_lua(&mut runner, make_key_ctrl('p'), &lua);
@@ -3439,19 +3445,18 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
         assert_eq!(runner.mode(), "new_agent_select_target");
 
-        {
-            let target_event = serde_json::json!({
-                "targets": [
-                    { "id": "tgt_trybotster", "name": "trybotster", "path": "/tmp/trybotster", "current_branch": "main" }
-                ]
-            });
-            let ctx = crate::tui::layout_lua::ActionContext::default();
-            let ops = lua
-                .call_on_hub_event("spawn_target_list", &target_event, &ctx)
-                .unwrap()
-                .unwrap();
-            runner.execute_lua_ops(ops);
-        }
+        runner.entity_stores.apply_frame(&serde_json::json!({
+            "type": "entity_snapshot",
+            "entity_type": "spawn_target",
+            "snapshot_seq": 1,
+            "items": [{
+                "target_id": "tgt_trybotster",
+                "id": "tgt_trybotster",
+                "name": "trybotster",
+                "path": "/tmp/trybotster",
+                "current_branch": "main"
+            }]
+        }));
         runner.focused_list_id = Some("spawn_target_list".to_string());
         runner
             .widget_states
@@ -3507,11 +3512,12 @@ mod tests {
 
         thread::sleep(Duration::from_millis(10));
 
-        // Modal closes after selection — stays in list mode until agent_created event
+        // Modal closes after selection and stays in list mode until explicit
+        // selection/focus state changes.
         assert_eq!(
             runner.mode(),
             "list",
-            "Should be list mode until agent_created event selects the agent"
+            "Should be list mode until selection state changes"
         );
 
         // Verify reopen_worktree JSON message with path
@@ -4787,6 +4793,11 @@ mod tests {
             include_str!("../../lua/ui/workspace_helpers.lua"),
         )
         .expect("workspace_helpers.lua should preload");
+        lua.preload_module(
+            "ui.entity_state",
+            include_str!("../../lua/ui/entity_state.lua"),
+        )
+        .expect("entity_state.lua should preload");
         lua.load_keybindings(kb_source)
             .expect("keybindings.lua should load");
         lua.load_actions(actions_source)
@@ -5033,22 +5044,21 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
         assert_eq!(runner.mode(), "new_agent_select_target");
 
-        {
-            let target_event = serde_json::json!({
-                "targets": [
-                    { "id": "tgt_trybotster", "name": "trybotster", "path": "/tmp/trybotster", "current_branch": "main" }
-                ]
-            });
-            let ctx = crate::tui::layout_lua::ActionContext::default();
-            let ops = lua
-                .call_on_hub_event("spawn_target_list", &target_event, &ctx)
-                .unwrap()
-                .unwrap();
-            runner.execute_lua_ops(ops);
-        }
+        runner.entity_stores.apply_frame(&serde_json::json!({
+            "type": "entity_snapshot",
+            "entity_type": "spawn_target",
+            "snapshot_seq": 1,
+            "items": [{
+                "target_id": "tgt_trybotster",
+                "id": "tgt_trybotster",
+                "name": "trybotster",
+                "path": "/tmp/trybotster",
+                "current_branch": "main"
+            }]
+        }));
         runner
             .render(Some(&lua), None)
-            .expect("render after spawn target list");
+            .expect("render after spawn target state");
         runner.focused_list_id = Some("spawn_target_list".to_string());
         runner
             .widget_states
