@@ -159,6 +159,9 @@ fn test_status_command() {
 
     // Status should always work (even if no agents running)
     assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Hub status"));
+    assert!(stdout.contains("socket:"));
 }
 
 /// Test list-worktrees command

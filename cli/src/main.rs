@@ -608,9 +608,7 @@ fn resolve_mcp_serve_socket() -> Result<Option<String>> {
         .ok()
         .filter(|s| !s.is_empty())
     else {
-        log::warn!(
-            "BOTSTER_SESSION_UUID is not set; starting mcp-serve without Botster hub tools"
-        );
+        log::warn!("BOTSTER_SESSION_UUID is not set; starting mcp-serve without Botster hub tools");
         return Ok(None);
     };
 
@@ -806,6 +804,81 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
     }
 
     // pipe fds closed automatically by WakePipe drop
+
+    Ok(())
+}
+
+/// Print local hub runtime artifact status.
+fn run_status() -> Result<()> {
+    let hub_id = botster::hub::local_device_hub_id()?;
+    let artifacts = botster::hub::daemon::HubRuntimeArtifacts::new(hub_id.clone());
+    let inspection = artifacts.inspect()?;
+
+    println!("Hub status");
+    println!("  hub_id: {}", inspection.hub_id);
+    println!(
+        "  process: {}",
+        if inspection.process_alive() {
+            "alive"
+        } else {
+            "not running"
+        }
+    );
+    match inspection.pid {
+        Some(pid) => println!(
+            "  pid_file: {} (pid={}, alive={})",
+            inspection.pid_file_path.display(),
+            pid,
+            inspection.pid_alive
+        ),
+        None => println!(
+            "  pid_file: {} (missing or invalid)",
+            inspection.pid_file_path.display()
+        ),
+    }
+    println!(
+        "  manifest: {} ({})",
+        inspection.manifest_path.display(),
+        if inspection.manifest.is_some() {
+            "present"
+        } else {
+            "missing or invalid"
+        }
+    );
+    if let Some(manifest) = &inspection.manifest {
+        println!("  manifest_pid: {}", manifest.pid);
+        if let Some(server_id) = &manifest.server_id {
+            println!("  server_id: {server_id}");
+        }
+        println!("  updated_at: {}", manifest.updated_at);
+        println!("  workspaces: {}", manifest.workspaces.len());
+    }
+    println!("  lock_file: {}", inspection.lock_file_path.display());
+    println!(
+        "  socket: {} (path_exists={}, connectable={}, protocol={})",
+        inspection.socket_path.display(),
+        inspection.socket_path_exists,
+        inspection.socket_connectable,
+        inspection.socket_protocol_responds
+    );
+    if let Some(error) = &inspection.socket_probe_error {
+        println!("  socket_probe: {error}");
+    }
+
+    if inspection.process_alive() && !inspection.socket_path_exists {
+        println!("  diagnosis: hub process is alive but socket pathname is missing");
+        println!("  repair: a patched running hub should recreate it on the next cleanup tick");
+    } else if inspection.socket_path_exists && !inspection.socket_connectable {
+        println!("  diagnosis: socket pathname exists but does not accept connections");
+        println!("  repair: restart the hub or run explicit cleanup before starting a new hub");
+    } else if inspection.socket_connectable && !inspection.socket_protocol_responds {
+        println!("  diagnosis: socket accepts connections but did not answer Botster hello");
+        println!("  repair: verify the socket owner before attaching agents");
+    } else if inspection.accepts_new_clients() {
+        println!("  diagnosis: hub accepts new local IPC clients");
+    } else {
+        println!("  diagnosis: no connectable local hub found");
+    }
 
     Ok(())
 }
@@ -1077,7 +1150,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::Status => {
-            println!("Status command not yet implemented");
+            run_status()?;
         }
         Commands::Config { key, value } => {
             let config = Config::load()?;
@@ -1131,14 +1204,12 @@ fn main() -> Result<()> {
         Commands::Attach { hub: hub_arg } => {
             run_attach(hub_arg)?;
         }
-        Commands::McpServe => {
-            match resolve_mcp_serve_socket()? {
-                Some(socket_path) => botster::mcp_gateway::run(&socket_path)?,
-                None => botster::mcp_gateway::run_disconnected(
-                    "Botster MCP is available only inside a Botster-managed session",
-                )?,
-            }
-        }
+        Commands::McpServe => match resolve_mcp_serve_socket()? {
+            Some(socket_path) => botster::mcp_gateway::run(&socket_path)?,
+            None => botster::mcp_gateway::run_disconnected(
+                "Botster MCP is available only inside a Botster-managed session",
+            )?,
+        },
         Commands::Context { key, value } => {
             commands::context::run(key.as_deref(), value.as_deref())?;
         }

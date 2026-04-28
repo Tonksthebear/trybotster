@@ -1008,14 +1008,16 @@ impl Hub {
         let lock = daemon::try_lock_hub(&self.hub_identifier)?;
         self.singleton_lock = Some(lock);
 
+        let artifacts = daemon::HubRuntimeArtifacts::new(self.hub_identifier.clone());
+
         // Clean up stale files from previous runs
-        daemon::cleanup_stale_files(&self.hub_identifier);
+        artifacts.cleanup_stale_files();
 
         // Sweep orphaned sockets left by crashed/killed processes
         daemon::cleanup_orphaned_sockets();
         crate::session::cleanup_orphaned_session_files();
 
-        let path = daemon::socket_path(&self.hub_identifier)?;
+        let path = artifacts.socket_path()?;
         let socket_path = path.display().to_string();
         let server = crate::socket::server::SocketServer::start(path, self.hub_event_tx.clone())?;
         log::info!(
@@ -1026,11 +1028,8 @@ impl Hub {
 
         // Persist ownership metadata after a successful bind so failed startup
         // attempts never steal pid/manifest ownership from a live hub.
-        if let Err(e) = daemon::write_pid_file(&self.hub_identifier) {
-            log::warn!("Failed to write PID file: {e}");
-        }
-        if let Err(e) = daemon::write_manifest(&self.hub_identifier, self.botster_id.as_deref()) {
-            log::warn!("Failed to write hub manifest: {e}");
+        if let Err(e) = artifacts.publish_current_process(self.botster_id.as_deref()) {
+            log::warn!("Failed to publish hub runtime artifacts: {e}");
         }
 
         self.fire_hub_recovery_state(
@@ -1055,6 +1054,61 @@ impl Hub {
 
         self.fire_hub_recovery_state("ready", serde_json::json!({}));
         Ok(())
+    }
+
+    /// Rebind the public hub socket if its pathname was unlinked while the
+    /// hub is still running.
+    ///
+    /// Existing socket clients keep their connected streams. This only
+    /// replaces the listener used by new clients such as `botster mcp-serve`.
+    pub(crate) fn repair_missing_socket_path(&mut self) {
+        let _guard = self.tokio_runtime.enter();
+
+        if self.socket_server.is_none() {
+            return;
+        }
+
+        let artifacts = daemon::HubRuntimeArtifacts::new(self.hub_identifier.clone());
+        let path = match artifacts.socket_path() {
+            Ok(path) => path,
+            Err(e) => {
+                log::error!("[Socket] Failed to resolve hub socket path for repair: {e}");
+                return;
+            }
+        };
+
+        if path.exists() {
+            return;
+        }
+
+        log::error!(
+            "[Socket] Hub socket path disappeared while hub is running; rebinding {}",
+            path.display()
+        );
+
+        if let Some(server) = self.socket_server.take() {
+            server.shutdown();
+        }
+
+        let socket_path = path.display().to_string();
+        match crate::socket::server::SocketServer::start(path, self.hub_event_tx.clone()) {
+            Ok(server) => {
+                self.socket_server = Some(server);
+                if let Err(e) = artifacts.publish_current_process(self.botster_id.as_deref()) {
+                    log::warn!("[Socket] Failed to refresh runtime artifacts after repair: {e}");
+                }
+                self.fire_hub_recovery_state(
+                    "socket_repaired",
+                    serde_json::json!({ "socket_path": socket_path }),
+                );
+            }
+            Err(e) => {
+                log::error!(
+                    "[Socket] Failed to rebind missing hub socket at {}: {e}",
+                    socket_path
+                );
+            }
+        }
     }
 
     /// Eagerly generate the connection URL.
@@ -1177,7 +1231,7 @@ impl Hub {
             log::info!("Released singleton lock: {}", lock.path.display());
         }
         // Clean up daemon files (PID, socket)
-        daemon::cleanup_on_shutdown(&self.hub_identifier);
+        daemon::HubRuntimeArtifacts::new(self.hub_identifier.clone()).cleanup_on_shutdown();
 
         // Notify Lua that TUI is disconnecting
         if let Err(e) = self.lua.call_tui_disconnected() {
@@ -1609,6 +1663,39 @@ mod tests {
         hub_c.shutdown();
         drop(hub_c);
         let _ = std::fs::remove_file(lock_path);
+        let _ = std::fs::remove_dir(daemon::hub_dir(&test_hub_id).unwrap());
+    }
+
+    #[test]
+    fn test_hub_repairs_missing_socket_path_without_shutdown() {
+        let test_hub_id = format!("_test_socket_repair_{}", std::process::id());
+
+        let mut hub = Hub::with_runtime(test_config(), shared_test_runtime()).unwrap();
+        hub.hub_identifier = test_hub_id.clone();
+        hub.start_socket_server()
+            .expect("hub should start socket server");
+
+        let sock_path = daemon::socket_path(&test_hub_id).unwrap();
+        assert!(sock_path.exists(), "socket should exist after startup");
+
+        std::fs::remove_file(&sock_path).expect("test should unlink socket path");
+        assert!(
+            !sock_path.exists(),
+            "test precondition: socket path missing"
+        );
+
+        hub.repair_missing_socket_path();
+
+        assert!(
+            sock_path.exists(),
+            "repair should recreate the socket pathname"
+        );
+        std::os::unix::net::UnixStream::connect(&sock_path)
+            .expect("repaired socket should accept new clients");
+
+        hub.shutdown();
+        drop(hub);
+        let _ = std::fs::remove_file(daemon::lock_file_path(&test_hub_id).unwrap());
         let _ = std::fs::remove_dir(daemon::hub_dir(&test_hub_id).unwrap());
     }
 

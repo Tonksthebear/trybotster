@@ -8,6 +8,10 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -22,14 +26,8 @@ use crate::socket::framing::{Frame, FrameDecoder};
 /// Subscription ID used for the MCP channel on the hub socket.
 const SUB_ID: &str = "mcp_bridge";
 
-/// How many times to retry connecting to the hub socket on startup.
-const CONNECT_RETRIES: u32 = 5;
-
 /// Base delay between socket connect retries, in milliseconds.
 const CONNECT_RETRY_BASE_MS: u64 = 300;
-
-/// How many times to retry reconnecting after a mid-session disconnect.
-const RECONNECT_RETRIES: u32 = 10;
 
 /// Fixed delay between reconnect attempts in milliseconds.
 const RECONNECT_RETRY_MS: u64 = 1_000;
@@ -63,46 +61,72 @@ struct BridgeRequest {
     response_tx: oneshot::Sender<Result<Value, String>>,
 }
 
+#[derive(Debug)]
+struct BridgeConnectionState {
+    socket_path: String,
+    connected: AtomicBool,
+    last_error: Mutex<Option<String>>,
+}
+
+impl BridgeConnectionState {
+    fn pending(socket_path: String) -> Arc<Self> {
+        Arc::new(Self {
+            socket_path,
+            connected: AtomicBool::new(false),
+            last_error: Mutex::new(None),
+        })
+    }
+
+    fn permanent_disconnected(reason: String) -> Arc<Self> {
+        Arc::new(Self {
+            socket_path: String::new(),
+            connected: AtomicBool::new(false),
+            last_error: Mutex::new(Some(reason)),
+        })
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    async fn set_connected(&self) -> bool {
+        let was_connected = self.connected.swap(true, Ordering::AcqRel);
+        *self.last_error.lock().await = None;
+        !was_connected
+    }
+
+    async fn set_disconnected(&self, reason: String) -> bool {
+        let was_connected = self.connected.swap(false, Ordering::AcqRel);
+        *self.last_error.lock().await = Some(reason);
+        was_connected
+    }
+
+    async fn unavailable_message(&self) -> String {
+        let reason = self
+            .last_error
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| "hub connection is not ready yet".to_string());
+
+        if self.socket_path.is_empty() {
+            return reason;
+        }
+
+        format!(
+            "Botster hub tools are temporarily unavailable: {reason}. \
+The MCP bridge is still running and retrying hub socket {}.",
+            self.socket_path
+        )
+    }
+}
+
 /// Why a hub session ended.
 enum SessionExit {
     /// The gateway dropped its request channel — process is shutting down.
     RequestChannelClosed,
     /// Hub socket disconnected — should reconnect.
     HubDisconnected,
-}
-
-/// Connect to the hub socket, retrying on failure.
-async fn connect_to_hub(
-    socket_path: &str,
-    retries: u32,
-    delay_ms: u64,
-    linear_backoff: bool,
-) -> Result<tokio::net::UnixStream> {
-    let mut last_err: Option<std::io::Error> = None;
-    for attempt in 0..retries {
-        if attempt > 0 {
-            let delay = if linear_backoff {
-                Duration::from_millis(u64::from(attempt) * delay_ms)
-            } else {
-                Duration::from_millis(delay_ms)
-            };
-            tokio::time::sleep(delay).await;
-        }
-        match tokio::net::UnixStream::connect(socket_path).await {
-            Ok(s) => return Ok(s),
-            Err(e) => {
-                log::warn!(
-                    "[mcp-gateway] connect attempt {}/{retries} failed: {e}",
-                    attempt + 1,
-                );
-                last_err = Some(e);
-            }
-        }
-    }
-    Err(anyhow::anyhow!(
-        "Failed to connect to hub socket after {retries} attempts: {socket_path}: {}",
-        last_err.map_or_else(|| "unknown".to_owned(), |e| e.to_string())
-    ))
 }
 
 /// Route a hub JSON message to the appropriate pending request or notification channel.
@@ -293,58 +317,51 @@ async fn run_hub_session(
     exit
 }
 
+fn notify_capability_lists_changed(notification_tx: &mpsc::UnboundedSender<HubNotification>) {
+    let _ = notification_tx.send(HubNotification::ToolsListChanged);
+    let _ = notification_tx.send(HubNotification::PromptsListChanged);
+    let _ = notification_tx.send(HubNotification::ResourcesListChanged);
+}
+
 /// Connection manager: runs the connect → session → reconnect loop.
 ///
 /// Lives for the lifetime of the MCP process. Exits when the gateway
-/// drops its request channel (process shutting down) or reconnection
-/// is exhausted.
+/// drops its request channel (process shutting down). The loop does not
+/// exhaust retries because MCP stdio must remain available while the hub
+/// repairs or recreates its socket path.
 async fn connection_manager(
     socket_path: String,
-    initial_stream: tokio::net::UnixStream,
     mut request_rx: mpsc::UnboundedReceiver<BridgeRequest>,
     notification_tx: mpsc::UnboundedSender<HubNotification>,
     caller_context: BTreeMap<String, String>,
+    connection_state: Arc<BridgeConnectionState>,
 ) {
-    // Run first session with the pre-connected stream
-    let exit = run_hub_session(
-        initial_stream,
-        &mut request_rx,
-        &notification_tx,
-        &caller_context,
-    )
-    .await;
-
-    if matches!(exit, SessionExit::RequestChannelClosed) {
-        return;
-    }
-
-    // Reconnect loop
+    let mut attempts: u32 = 0;
     loop {
-        log::warn!("[mcp-gateway] Hub disconnected, reconnecting...");
+        if request_rx.is_closed() {
+            return;
+        }
 
-        let stream = match connect_to_hub(
-            &socket_path,
-            RECONNECT_RETRIES,
-            RECONNECT_RETRY_MS,
-            false,
-        )
-        .await
-        {
+        let stream = match tokio::net::UnixStream::connect(&socket_path).await {
             Ok(s) => {
-                log::info!("[mcp-gateway] Reconnected to hub");
+                attempts = 0;
+                log::info!("[mcp-gateway] Connected to hub at {socket_path}");
+                if connection_state.set_connected().await {
+                    notify_capability_lists_changed(&notification_tx);
+                }
                 s
             }
             Err(e) => {
-                log::error!(
-                    "[mcp-gateway] Failed to reconnect after {RECONNECT_RETRIES} attempts: {e}"
-                );
-                // Drain and fail remaining requests
-                while let Ok(req) = request_rx.try_recv() {
-                    let _ = req
-                        .response_tx
-                        .send(Err("hub reconnection failed".to_string()));
+                attempts = attempts.saturating_add(1);
+                let reason = format!("hub socket {socket_path} is not reachable: {e}");
+                connection_state.set_disconnected(reason).await;
+                if attempts == 1 || attempts % 30 == 0 {
+                    log::warn!(
+                        "[mcp-gateway] hub connect attempt {attempts} failed; retrying: {e}"
+                    );
                 }
-                return;
+                tokio::time::sleep(Duration::from_millis(CONNECT_RETRY_BASE_MS)).await;
+                continue;
             }
         };
 
@@ -353,6 +370,21 @@ async fn connection_manager(
 
         if matches!(exit, SessionExit::RequestChannelClosed) {
             return;
+        }
+
+        if connection_state
+            .set_disconnected(format!("hub socket {socket_path} disconnected"))
+            .await
+        {
+            notify_capability_lists_changed(&notification_tx);
+        }
+
+        tokio::time::sleep(Duration::from_millis(RECONNECT_RETRY_MS)).await;
+
+        while let Ok(req) = request_rx.try_recv() {
+            let _ = req.response_tx.send(Err(
+                "hub disconnected before the request could be sent; retrying".to_string(),
+            ));
         }
     }
 }
@@ -373,6 +405,8 @@ pub struct McpGateway {
     call_counter: Mutex<u64>,
     /// Notification receiver — taken once in `on_initialized`.
     notification_rx: Mutex<Option<mpsc::UnboundedReceiver<HubNotification>>>,
+    /// Shared hub connection state used to fail requests quickly while retrying.
+    connection_state: Arc<BridgeConnectionState>,
     /// Human-readable reason this server is running without a hub connection.
     disconnected_reason: Option<String>,
 }
@@ -387,6 +421,13 @@ impl McpGateway {
     ) -> Result<Value, ErrorData> {
         if let Some(reason) = &self.disconnected_reason {
             return Err(ErrorData::invalid_params(reason.clone(), None));
+        }
+
+        if !self.connection_state.is_connected() {
+            return Err(ErrorData::internal_error(
+                self.connection_state.unavailable_message().await,
+                None,
+            ));
         }
 
         let start = Instant::now();
@@ -460,10 +501,7 @@ fn disconnected_status_tool() -> Tool {
     Tool::new(
         DISCONNECTED_STATUS_TOOL.to_string(),
         "Explain why Botster tools are unavailable in this session.".to_string(),
-        serde_json::Map::from_iter([(
-            "type".to_string(),
-            Value::String("object".to_string()),
-        )]),
+        serde_json::Map::from_iter([("type".to_string(), Value::String("object".to_string()))]),
     )
 }
 
@@ -472,6 +510,13 @@ fn disconnected_status_message(reason: &str) -> String {
         "{reason}. This agent was not launched inside a Botster-managed session, \
 so Botster hub tools, prompts, resources, messaging, and orchestration are unavailable. \
 Start the agent from Botster so BOTSTER_SESSION_UUID is present."
+    )
+}
+
+fn reconnecting_status_message(reason: &str) -> String {
+    format!(
+        "{reason} Tool, prompt, resource, messaging, and orchestration capabilities \
+will appear automatically after the bridge reconnects."
     )
 }
 
@@ -601,6 +646,11 @@ impl ServerHandler for McpGateway {
                     disconnected_status_tool(),
                 ]));
             }
+            if !self.connection_state.is_connected() {
+                return Ok(ListToolsResult::with_all_items(vec![
+                    disconnected_status_tool(),
+                ]));
+            }
 
             let msg = self
                 .hub_request(
@@ -640,6 +690,15 @@ impl ServerHandler for McpGateway {
                     disconnected_status_message(reason),
                     None,
                 ));
+            }
+            if !self.connection_state.is_connected() {
+                let message =
+                    reconnecting_status_message(&self.connection_state.unavailable_message().await);
+                if request.name.as_ref() == DISCONNECTED_STATUS_TOOL {
+                    return Ok(CallToolResult::success(vec![Content::text(message)]));
+                }
+
+                return Err(ErrorData::internal_error(message, None));
             }
 
             let call_id = self.next_call_id("call").await;
@@ -686,6 +745,9 @@ impl ServerHandler for McpGateway {
             if self.disconnected_reason.is_some() {
                 return Ok(ListPromptsResult::with_all_items(Vec::<Prompt>::new()));
             }
+            if !self.connection_state.is_connected() {
+                return Ok(ListPromptsResult::with_all_items(Vec::<Prompt>::new()));
+            }
 
             let msg = self
                 .hub_request(
@@ -716,6 +778,12 @@ impl ServerHandler for McpGateway {
         async move {
             if let Some(reason) = &self.disconnected_reason {
                 return Err(ErrorData::invalid_params(reason.clone(), None));
+            }
+            if !self.connection_state.is_connected() {
+                return Err(ErrorData::internal_error(
+                    reconnecting_status_message(&self.connection_state.unavailable_message().await),
+                    None,
+                ));
             }
 
             let call_id = self.next_call_id("prompt_get").await;
@@ -774,9 +842,10 @@ impl ServerHandler for McpGateway {
     {
         async move {
             if self.disconnected_reason.is_some() {
-                return Ok(ListResourceTemplatesResult::with_all_items(
-                    Vec::<ResourceTemplate>::new(),
-                ));
+                return Ok(ListResourceTemplatesResult::with_all_items(Vec::new()));
+            }
+            if !self.connection_state.is_connected() {
+                return Ok(ListResourceTemplatesResult::with_all_items(Vec::new()));
             }
 
             let msg = self
@@ -812,6 +881,12 @@ impl ServerHandler for McpGateway {
         async move {
             if let Some(reason) = &self.disconnected_reason {
                 return Err(ErrorData::resource_not_found(reason.clone(), None));
+            }
+            if !self.connection_state.is_connected() {
+                return Err(ErrorData::resource_not_found(
+                    reconnecting_status_message(&self.connection_state.unavailable_message().await),
+                    None,
+                ));
             }
 
             let call_id = self.next_call_id("resource_read").await;
@@ -903,24 +978,23 @@ pub fn run_disconnected(reason: &str) -> Result<()> {
 
 /// Async entry point: connect to hub, start rmcp server on stdio.
 async fn run_async(socket_path: &str) -> Result<()> {
-    // Initial connection — fail immediately if hub is unreachable
-    let stream = connect_to_hub(socket_path, CONNECT_RETRIES, CONNECT_RETRY_BASE_MS, true).await?;
-
     let (request_tx, request_rx) = mpsc::unbounded_channel();
     let (notification_tx, notification_rx) = mpsc::unbounded_channel();
 
     let caller_context = crate::commands::context::build();
+    let connection_state = BridgeConnectionState::pending(socket_path.to_owned());
 
     // Spawn the connection manager (owns the hub socket lifecycle)
     let socket_path_owned = socket_path.to_owned();
     let context_clone = caller_context.clone();
+    let state_clone = Arc::clone(&connection_state);
     tokio::spawn(async move {
         connection_manager(
             socket_path_owned,
-            stream,
             request_rx,
             notification_tx,
             context_clone,
+            state_clone,
         )
         .await;
     });
@@ -929,6 +1003,7 @@ async fn run_async(socket_path: &str) -> Result<()> {
         request_tx,
         call_counter: Mutex::new(0),
         notification_rx: Mutex::new(Some(notification_rx)),
+        connection_state,
         disconnected_reason: None,
     };
 
@@ -940,11 +1015,13 @@ async fn run_disconnected_async(reason: String) -> Result<()> {
 
     let (request_tx, _request_rx) = mpsc::unbounded_channel();
     let (_notification_tx, notification_rx) = mpsc::unbounded_channel();
+    let connection_state = BridgeConnectionState::permanent_disconnected(reason.clone());
 
     let gateway = McpGateway {
         request_tx,
         call_counter: Mutex::new(0),
         notification_rx: Mutex::new(Some(notification_rx)),
+        connection_state,
         disconnected_reason: Some(reason),
     };
 
@@ -974,6 +1051,19 @@ mod tests {
     /// Create a connected Unix socket pair.
     fn socket_pair() -> (tokio::net::UnixStream, tokio::net::UnixStream) {
         tokio::net::UnixStream::pair().expect("UnixStream::pair")
+    }
+
+    fn test_gateway(connection_state: Arc<BridgeConnectionState>) -> McpGateway {
+        let (request_tx, _request_rx) = mpsc::unbounded_channel();
+        let (_notification_tx, notification_rx) = mpsc::unbounded_channel();
+
+        McpGateway {
+            request_tx,
+            call_counter: Mutex::new(0),
+            notification_rx: Mutex::new(Some(notification_rx)),
+            connection_state,
+            disconnected_reason: None,
+        }
     }
 
     /// When the hub closes its socket, the session must return `HubDisconnected`.
@@ -1146,5 +1236,114 @@ mod tests {
         drop(req_tx);
         let _ = session_handle.await;
         hub_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_hub_request_fails_fast_while_pending() {
+        let connection_state = BridgeConnectionState::pending("/tmp/botster-missing.sock".into());
+        connection_state
+            .set_disconnected("hub socket is missing".to_string())
+            .await;
+        let gateway = test_gateway(Arc::clone(&connection_state));
+
+        let err = gateway
+            .hub_request(
+                "tools/list",
+                "tools_list".to_string(),
+                Frame::Json(json!({ "type": "tools_list" })),
+            )
+            .await
+            .expect_err("pending gateway must reject immediately");
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("temporarily unavailable"),
+            "error should explain transient unavailability: {rendered}"
+        );
+        assert!(
+            rendered.contains("retrying"),
+            "error should say the bridge is still retrying: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connection_manager_keeps_retrying_until_socket_appears() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let socket_path = temp_dir.path().join("hub.sock");
+        let socket_path_string = socket_path.to_string_lossy().to_string();
+        let connection_state = BridgeConnectionState::pending(socket_path_string.clone());
+        let (_request_tx, request_rx) = mpsc::unbounded_channel::<BridgeRequest>();
+        let (notification_tx, mut notification_rx) = mpsc::unbounded_channel::<HubNotification>();
+
+        let manager_state = Arc::clone(&connection_state);
+        let manager_path = socket_path_string.clone();
+        let manager = tokio::spawn(async move {
+            connection_manager(
+                manager_path,
+                request_rx,
+                notification_tx,
+                BTreeMap::new(),
+                manager_state,
+            )
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(CONNECT_RETRY_BASE_MS * 2)).await;
+        assert!(
+            !connection_state.is_connected(),
+            "manager should remain pending before the socket exists"
+        );
+
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
+        let accept_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept bridge");
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut decoder = FrameDecoder::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = reader.read(&mut buf).await.expect("read subscribe");
+                if n == 0 {
+                    break;
+                }
+                if decoder
+                    .feed(&buf[..n])
+                    .expect("decode")
+                    .into_iter()
+                    .any(|frame| {
+                        matches!(
+                            frame,
+                            Frame::Json(ref v)
+                                if v.get("type").and_then(|t| t.as_str()) == Some("subscribe")
+                        )
+                    })
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let connected = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if connection_state.is_connected() {
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("manager should connect after socket appears");
+        assert!(connected);
+
+        let first_notification = notification_rx
+            .recv()
+            .await
+            .expect("connection should notify MCP client to refresh");
+        assert!(matches!(
+            first_notification,
+            HubNotification::ToolsListChanged
+        ));
+
+        manager.abort();
+        accept_task.abort();
     }
 }
