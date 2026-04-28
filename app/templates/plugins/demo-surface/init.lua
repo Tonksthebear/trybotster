@@ -12,6 +12,7 @@ local web_layout = require("web_layout")
 surfaces.register("demo_surface", {
     label = "Demo Surface",
     icon = "sparkles",
+    nav = { section = "workspace", order = 100 },
     clients = { "web" },
     routes = {
         { path = "/", render = web_layout.home },

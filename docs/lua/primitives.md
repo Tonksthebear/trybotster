@@ -61,6 +61,58 @@ secrets.set(key, val)
 secrets.delete(key)
 ```
 
+## Plugin Web Surfaces
+
+Plugins register browser surfaces through `lib.surfaces`. A registered surface
+is routable at `/hubs/<hub_id>/<surface_name>` unless it explicitly opts out of
+navigation.
+
+```lua
+local surfaces = require("lib.surfaces")
+
+surfaces.register("vault", {
+  label = "Vault",
+  icon = "book-open", -- Heroicons mini filename without .svg
+  nav = { section = "workspace", order = 25 },
+  routes = {
+    { path = "/", render = vault_home },
+    { path = "/sessions/:session_uuid", render = vault_session },
+  },
+})
+```
+
+Set `nav = false` for routable surfaces that should stay out of the sidebar.
+Icon names are Heroicons mini filenames vendored under
+`app/assets/svg/icons/heroicons/mini`.
+
+Plugin-scoped sessions should carry explicit ownership metadata so core can
+hide them from the default workspace list while the owning plugin can render
+them:
+
+```lua
+metadata = {
+  owner_plugin = "vault",
+  visibility = "plugin",
+  surface = "vault",
+}
+```
+
+Surface UI can render those sessions and mount the core terminal viewer without
+leaving the plugin route:
+
+```lua
+ui.session_list{
+  visibility = "plugin",
+  owner_plugin = "vault",
+  surface = "vault",
+}
+
+ui.session_terminal{
+  session_uuid = state.params.session_uuid,
+  back = ctx.path("/"),
+}
+```
+
 ## Event-Driven Primitives
 
 ### `webrtc`

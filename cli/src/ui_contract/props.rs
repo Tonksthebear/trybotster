@@ -279,6 +279,15 @@ pub struct SessionListProps {
     /// behaviour (`true` only for sidebar).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_nav_entries: Option<bool>,
+    /// Optional owner-plugin filter for plugin-scoped lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_plugin: Option<String>,
+    /// Visibility filter. Defaults to `workspace`; use `all` for diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// Optional owning surface filter for surface-scoped lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
 }
 
 /// `WorkspaceList` props — renders the bare list of workspaces (without the
@@ -326,6 +335,32 @@ pub struct SessionRowProps {
     /// Required: the session_uuid the row should bind to.
     pub session_uuid: String,
     /// Surface density. Defaults to `panel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub density: Option<UiValue<UiSurfaceDensity>>,
+}
+
+/// `SessionTerminal` props — surface-local terminal view. The browser renders
+/// the core terminal implementation for the given session while the plugin
+/// keeps ownership of the surrounding route.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTerminalProps {
+    /// Required: the session_uuid whose terminal should be mounted.
+    pub session_uuid: String,
+    /// Optional back URL for renderer chrome around the terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub back: Option<String>,
+}
+
+/// `SurfaceNav` props — renders route-registry entries registered by plugins.
+/// Core owns placement; plugins only declare `surfaces.register(..., nav={...})`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfaceNavProps {
+    /// Navigation section. Defaults to `workspace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    /// Surface density (`sidebar` / `panel`). Defaults to `sidebar`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub density: Option<UiValue<UiSurfaceDensity>>,
 }
@@ -797,11 +832,21 @@ mod tests {
             density: Some(UiValue::scalar(UiSurfaceDensity::Sidebar)),
             grouping: Some(UiSessionListGrouping::Workspace),
             show_nav_entries: Some(true),
+            owner_plugin: Some("vault".to_owned()),
+            visibility: Some("plugin".to_owned()),
+            surface: Some("vault".to_owned()),
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(
             v,
-            json!({ "density": "sidebar", "grouping": "workspace", "showNavEntries": true })
+            json!({
+                "density": "sidebar",
+                "grouping": "workspace",
+                "showNavEntries": true,
+                "ownerPlugin": "vault",
+                "visibility": "plugin",
+                "surface": "vault"
+            })
         );
         let back: SessionListProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
@@ -903,6 +948,43 @@ mod tests {
             json!({ "sessionUuid": "sess-abc", "density": "sidebar" })
         );
         let back: SessionRowProps = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    // ---------- SessionTerminal ----------
+
+    #[test]
+    fn session_terminal_requires_session_uuid() {
+        let err = serde_json::from_value::<SessionTerminalProps>(json!({}));
+        assert!(err.is_err(), "SessionTerminal must require session_uuid");
+    }
+
+    #[test]
+    fn session_terminal_round_trip() {
+        let p = SessionTerminalProps {
+            session_uuid: "sess-abc".into(),
+            back: Some("/hubs/h1/vault".into()),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(
+            v,
+            json!({ "sessionUuid": "sess-abc", "back": "/hubs/h1/vault" })
+        );
+        let back: SessionTerminalProps = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    // ---------- SurfaceNav ----------
+
+    #[test]
+    fn surface_nav_round_trip() {
+        let p = SurfaceNavProps {
+            section: Some("workspace".into()),
+            density: Some(UiValue::scalar(UiSurfaceDensity::Sidebar)),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(v, json!({ "section": "workspace", "density": "sidebar" }));
+        let back: SurfaceNavProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 

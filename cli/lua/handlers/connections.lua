@@ -24,6 +24,7 @@ local EntityModel = require("lib.entity_model")
 local Session = require("lib.session")
 local pty_clients = require("lib.pty_clients")
 local EB = require("lib.entity_broadcast")
+local surfaces = require("lib.surfaces")
 
 -- Shared client registry - all transports register here
 local clients = state.get("connections.clients", {})
@@ -281,7 +282,15 @@ hooks.on("pty_notification", "push_notification", function(info)
 
     local url = nil
     if hub_id and agent and agent.session_uuid then
-        url = string.format("/hubs/%s/sessions/%s", hub_id, agent.session_uuid)
+        local surface_name = agent.surface or agent.owner_plugin
+        if agent.visibility == "plugin" and surface_name then
+            url = surfaces.path(surface_name, "/sessions/:session_uuid", {
+                session_uuid = agent.session_uuid,
+            })
+        end
+        if not url then
+            url = string.format("/hubs/%s/sessions/%s", hub_id, agent.session_uuid)
+        end
     elseif hub_id then
         url = string.format("/hubs/%s", hub_id)
     end

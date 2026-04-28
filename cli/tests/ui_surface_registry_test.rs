@@ -933,6 +933,47 @@ fn route_registry_includes_hide_from_nav_entries_with_flag() {
     assert!(pairs.contains(&("hidden".to_string(), true)));
 }
 
+#[test]
+fn route_registry_includes_surface_nav_metadata() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let payload_json: String = lua
+        .load(
+            r#"
+            surfaces.register("vault", {
+                path = "/vault",
+                label = "Vault",
+                icon = "book-open",
+                order = 25,
+                nav = {
+                    section = "workspace",
+                    order = 20,
+                },
+                render = function() return {type="panel", props={}} end,
+            })
+            return json.encode(surfaces.build_route_registry_payload("hub-test"))
+            "#,
+        )
+        .eval()
+        .expect("route registry with nav metadata");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload_json).expect("parse registry JSON");
+    let route = parsed
+        .get("routes")
+        .and_then(|v| v.as_array())
+        .and_then(|routes| routes.first())
+        .expect("first route");
+    assert_eq!(route.get("surface").and_then(|v| v.as_str()), Some("vault"));
+    let nav = route.get("nav").expect("nav metadata");
+    assert_eq!(
+        nav.get("section").and_then(|v| v.as_str()),
+        Some("workspace")
+    );
+    assert_eq!(nav.get("order").and_then(|v| v.as_i64()), Some(20));
+}
+
 // -------------------------------------------------------------------------
 // Phase 4b — sub-routes, params, ctx, subpath re-render
 // -------------------------------------------------------------------------

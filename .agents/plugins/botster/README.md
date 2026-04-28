@@ -8,6 +8,11 @@ Botster Lua plugins still own the runtime tool surface. This package only
 connects the agent to `botster mcp-serve` and teaches the agent how to use the
 hub, session, messaging, and orchestration tools correctly.
 
+The same `skills/` directory is shared by the Codex and Claude plugin manifests
+in this package. Update those skill files once and both agent runtimes receive
+the same Botster authoring guidance when the plugin is installed from this
+source.
+
 ## Included
 
 - `.codex-plugin/plugin.json` — plugin manifest.
@@ -17,6 +22,8 @@ hub, session, messaging, and orchestration tools correctly.
 - `skills/botster-customize-tui/SKILL.md` — TUI layout/keybinding guidance.
 - `skills/botster-customize-hub/SKILL.md` — hub hooks and lifecycle guidance.
 - `skills/botster-customize-plugin/SKILL.md` — Botster Lua plugin authoring.
+  Includes browser surface registration, core plugin navigation, Heroicons icon
+  names, plugin-owned session metadata, and surface-local terminal routing.
 - `skills/botster-customize-mcp/SKILL.md` — MCP tools/prompts from plugins.
 
 ## MCP Server

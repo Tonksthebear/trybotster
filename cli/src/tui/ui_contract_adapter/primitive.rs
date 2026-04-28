@@ -68,8 +68,9 @@ use crate::ui_contract::node::{UiAction, UiChild, UiNode};
 use crate::ui_contract::props::{
     BadgeProps, ButtonProps, ConnectionCodeProps, DialogProps, EmptyStateProps,
     HubRecoveryStateProps, IconButtonProps, IconProps, NewSessionButtonProps, PanelProps,
-    SessionListProps, SessionRowProps, SpawnTargetListProps, StackProps, StatusDotProps, TextProps,
-    TreeItemProps, WorkspaceListProps, WorktreeListProps,
+    SessionListProps, SessionRowProps, SessionTerminalProps, SpawnTargetListProps, StackProps,
+    StatusDotProps, SurfaceNavProps, TextProps, TreeItemProps, WorkspaceListProps,
+    WorktreeListProps,
 };
 use crate::ui_contract::tokens::{UiSessionListGrouping, UiStackDirection, UiSurfaceDensity};
 use crate::ui_contract::viewport::UiViewport;
@@ -124,6 +125,8 @@ const UI_NODE_TYPE_NAMES: &[&str] = &[
     "spawn_target_list",
     "worktree_list",
     "session_row",
+    "session_terminal",
+    "surface_nav",
     "hub_recovery_state",
     "connection_code",
     "new_session_button",
@@ -215,6 +218,8 @@ pub fn render_ui_node_with_stores(
         "spawn_target_list" => render_spawn_target_list(node, viewport, actions, stores),
         "worktree_list" => render_worktree_list(node, viewport, actions, stores),
         "session_row" => render_session_row(node, viewport, actions, stores),
+        "session_terminal" => render_session_terminal(node, viewport),
+        "surface_nav" => render_surface_nav(node, viewport),
         "hub_recovery_state" => render_hub_recovery_state(node, viewport, actions, stores),
         "connection_code" => render_connection_code(node, viewport, actions, stores),
         "new_session_button" => render_new_session_button(node, viewport, actions),
@@ -1429,6 +1434,7 @@ fn render_session_list(
         _ => UiSurfaceDensity::Panel,
     };
     let grouping = props.grouping.unwrap_or(UiSessionListGrouping::Workspace);
+    let visibility = props.visibility.as_deref().unwrap_or("workspace");
 
     let workspace_store = stores.store("workspace");
     let mut rows: Vec<ListItemProps> = Vec::with_capacity(session_store.order.len() * 2);
@@ -1480,7 +1486,13 @@ fn render_session_list(
     if matches!(grouping, UiSessionListGrouping::Workspace) {
         if let Some(ws_store) = workspace_store {
             for (ws_id, workspace) in ws_store.iter() {
-                if !workspace_has_active_agent(stores, ws_id) {
+                if !workspace_has_active_agent(
+                    stores,
+                    ws_id,
+                    visibility,
+                    props.owner_plugin.as_deref(),
+                    props.surface.as_deref(),
+                ) {
                     continue;
                 }
                 let header_text = workspace
@@ -1497,7 +1509,14 @@ fn render_session_list(
                 });
                 for (sess_id, session) in session_store.iter() {
                     let sess_workspace = session.get("workspace_id").and_then(JsonValue::as_str);
-                    if sess_workspace == Some(ws_id.as_str()) {
+                    if sess_workspace == Some(ws_id.as_str())
+                        && session_matches_list_filter(
+                            session,
+                            visibility,
+                            props.owner_plugin.as_deref(),
+                            props.surface.as_deref(),
+                        )
+                    {
                         push_session_row(session, &mut rows, actions, 1);
                         seen.insert(sess_id.as_str());
                     }
@@ -1509,7 +1528,14 @@ fn render_session_list(
     // Ungrouped bucket — every session not already attached to a workspace
     // group, or every session if grouping = flat.
     for (sess_id, session) in session_store.iter() {
-        if !seen.contains(sess_id.as_str()) {
+        if !seen.contains(sess_id.as_str())
+            && session_matches_list_filter(
+                session,
+                visibility,
+                props.owner_plugin.as_deref(),
+                props.surface.as_deref(),
+            )
+        {
             push_session_row(session, &mut rows, actions, 0);
         }
     }
@@ -1551,7 +1577,7 @@ fn render_workspace_list(
         .iter()
         .filter(|(id, ws)| {
             ws.get("status").and_then(JsonValue::as_str) != Some("closed")
-                && workspace_has_active_agent(stores, id)
+                && workspace_has_active_agent(stores, id, "workspace", None, None)
         })
         .map(|(id, ws)| {
             let name = ws.get("name").and_then(JsonValue::as_str).unwrap_or(id);
@@ -1642,13 +1668,46 @@ fn render_spawn_target_list(
     })
 }
 
-fn workspace_has_active_agent(stores: &TuiEntityStores, workspace_id: &str) -> bool {
+fn session_matches_list_filter(
+    session: &JsonValue,
+    visibility: &str,
+    owner_plugin: Option<&str>,
+    surface: Option<&str>,
+) -> bool {
+    let session_visibility = session
+        .get("visibility")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("workspace");
+    if visibility != "all" && session_visibility != visibility {
+        return false;
+    }
+    if let Some(owner_plugin) = owner_plugin {
+        if session.get("owner_plugin").and_then(JsonValue::as_str) != Some(owner_plugin) {
+            return false;
+        }
+    }
+    if let Some(surface) = surface {
+        if session.get("surface").and_then(JsonValue::as_str) != Some(surface) {
+            return false;
+        }
+    }
+    true
+}
+
+fn workspace_has_active_agent(
+    stores: &TuiEntityStores,
+    workspace_id: &str,
+    visibility: &str,
+    owner_plugin: Option<&str>,
+    surface: Option<&str>,
+) -> bool {
     stores
         .store("session")
         .map(|sessions| {
             sessions.iter().any(|(_, session)| {
                 session.get("workspace_id").and_then(JsonValue::as_str) == Some(workspace_id)
                     && session.get("status").and_then(JsonValue::as_str) != Some("closed")
+                    && session_matches_list_filter(session, visibility, owner_plugin, surface)
                     && session
                         .get("session_type")
                         .and_then(JsonValue::as_str)
@@ -1741,6 +1800,19 @@ fn render_session_row(
         SpanStyle::default(),
         ParagraphAlignment::Left,
     ))
+}
+
+fn render_session_terminal(node: &UiNode, viewport: &UiViewport) -> Result<RenderNode> {
+    let props = decode_props::<SessionTerminalProps>(&node.props, viewport, "session_terminal")?;
+    Ok(placeholder_widget(&format!(
+        "Terminal: {}",
+        props.session_uuid
+    )))
+}
+
+fn render_surface_nav(node: &UiNode, viewport: &UiViewport) -> Result<RenderNode> {
+    let _ = decode_props::<SurfaceNavProps>(&node.props, viewport, "surface_nav")?;
+    Ok(placeholder_widget("(plugins)"))
 }
 
 fn render_hub_recovery_state(

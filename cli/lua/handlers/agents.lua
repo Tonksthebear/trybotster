@@ -281,6 +281,9 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_name, met
         session = session_config,
         dims = dims,
         agent_name = agent_name,
+        owner_plugin = session_metadata and session_metadata.owner_plugin,
+        visibility = session_metadata and session_metadata.visibility,
+        surface = session_metadata and session_metadata.surface,
     })
 
     if not ok then
@@ -388,6 +391,9 @@ spawn_accessory = function(branch_name, wt_path, accessory_name, agent_name, met
         workspace_expect_new = workspace_expect_new,
         dims = { rows = 24, cols = 80 },
         agent_name = agent_name,
+        owner_plugin = session_metadata and session_metadata.owner_plugin,
+        visibility = session_metadata and session_metadata.visibility,
+        surface = session_metadata and session_metadata.surface,
     })
 
     if not ok then
