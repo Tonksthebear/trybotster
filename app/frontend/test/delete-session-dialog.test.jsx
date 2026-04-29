@@ -61,8 +61,8 @@ describe('DeleteSessionDialog', () => {
     setSession({
       id: 'sess-1',
       session_uuid: 'sess-1',
-      label: 'Claude Code',
-      display_name: 'Claude Code',
+      label: 'Codex',
+      display_name: 'Codex',
       in_worktree: true,
       close_actions: {
         can_close: true,
@@ -85,8 +85,8 @@ describe('DeleteSessionDialog', () => {
     setSession({
       id: 'sess-1',
       session_uuid: 'sess-1',
-      label: 'Claude Code',
-      display_name: 'Claude Code',
+      label: 'Codex',
+      display_name: 'Codex',
       in_worktree: true,
       close_actions: {
         can_close: true,
@@ -115,8 +115,8 @@ describe('DeleteSessionDialog', () => {
     setSession({
       id: 'sess-1',
       session_uuid: 'sess-1',
-      label: 'Claude Code',
-      display_name: 'Claude Code',
+      label: 'Codex',
+      display_name: 'Codex',
       in_worktree: false,
       close_actions: {
         can_close: true,
@@ -147,8 +147,8 @@ describe('DeleteSessionDialog', () => {
     setSession({
       id: 'sess-1',
       session_uuid: 'sess-1',
-      label: 'Claude Code',
-      display_name: 'Claude Code',
+      label: 'Codex',
+      display_name: 'Codex',
       in_worktree: true,
       close_actions: {
         can_close: true,

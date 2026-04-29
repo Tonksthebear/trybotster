@@ -174,7 +174,7 @@ end
 --   workspace_metadata table (optional)  plugin data stored on workspace manifest
 --   env             table    (optional)  base environment variables
 --   dims            table    (optional)  { rows = 24, cols = 80 }
---   agent_name      string   (optional)  config agent name (e.g., "claude")
+--   agent_name      string   (optional)  config agent name (e.g., "codex")
 --   owner_plugin    string   (optional)  plugin that owns this session
 --   visibility      string   (optional)  "workspace" (default), "plugin", or "hidden"
 --   surface         string   (optional)  owning surface for plugin-scoped navigation

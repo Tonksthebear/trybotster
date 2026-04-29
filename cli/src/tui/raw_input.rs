@@ -46,7 +46,7 @@ pub enum InputEvent {
     /// Terminals wrap drag/drop file paths and clipboard paste in these markers.
     /// The full sequence (start marker + content + end marker) is preserved so
     /// the PTY receives it atomically in a single write — required for apps like
-    /// Claude Code to detect paste-as-file-attachment vs typed input.
+    /// agent CLIs to detect paste-as-file-attachment vs typed input.
     Paste {
         /// Complete paste bytes including `ESC[200~` prefix and `ESC[201~` suffix.
         raw_bytes: Vec<u8>,

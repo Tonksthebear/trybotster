@@ -27,13 +27,13 @@
 //! local pretty, err = json.encode_pretty({ name = "bot" })
 //!
 //! -- Read a value from a JSON file (dot-notation path, ~ expansion)
-//! local val, err = json.file_get("~/.claude.json", "projects.mypath.hasTrust")
+//! local val, err = json.file_get("~/.config/example/settings.json", "projects.mypath.hasTrust")
 //!
 //! -- Set a value in a JSON file (creates intermediate objects)
-//! local ok, err = json.file_set("~/.claude.json", "projects.mypath.hasTrust", true)
+//! local ok, err = json.file_set("~/.config/example/settings.json", "projects.mypath.hasTrust", true)
 //!
 //! -- Delete a key from a JSON file (idempotent)
-//! local ok, err = json.file_delete("~/.claude.json", "projects.mypath")
+//! local ok, err = json.file_delete("~/.config/example/settings.json", "projects.mypath")
 //! ```
 //!
 //! # Error Handling

@@ -6,7 +6,7 @@
 -- Directory structure:
 --   .botster/
 --     agents/
---       claude/
+--       agent/
 --         initialization           # startup script
 --         *.md, *.json, ...        # optional paired files
 --       codex/
@@ -16,7 +16,7 @@
 --         initialization
 --         port_forward             # sentinel = gets $PORT
 --     workspaces/
---       dev.json                   # { "agents": ["claude"], "accessories": ["rails-server"] }
+--       dev.json                   # { "agents": ["agent"], "accessories": ["rails-server"] }
 --     plugins/
 --       github/
 --         init.lua

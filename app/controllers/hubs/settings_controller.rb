@@ -2,8 +2,6 @@
 
 module Hubs
   class SettingsController < ApplicationController
-    include TemplateReadable
-
     before_action :authenticate_user!
     before_action :set_hub
 
@@ -11,11 +9,8 @@ module Hubs
       respond_to do |format|
         format.html { render "spa/show", layout: "spa" }
         format.json do
-          templates = template_catalog
           render json: {
             configMetadata: config_metadata,
-            templates: templates,
-            agentTemplates: agent_quick_setup_templates(templates),
             hubName: Current.hub.name,
             hubIdentifier: Current.hub.identifier
           }
@@ -71,10 +66,6 @@ module Hubs
             default: "#!/bin/bash\n# Session initialization\n# Commands run when this session starts\n" }
         }
       }
-    end
-
-    def agent_quick_setup_templates(templates)
-      (templates["agents"] || []).select { |template| template[:dest].end_with?("/initialization") }
     end
   end
 end

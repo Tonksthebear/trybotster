@@ -139,10 +139,10 @@ describe('NewAgentForm', () => {
     expect(screen.queryByText(/No agent configurations found/)).not.toBeInTheDocument()
 
     await act(async () => {
-      resolveConfig({ agents: ['claude'], accessories: [], workspaces: [] })
+      resolveConfig({ agents: ['codex'], accessories: [], workspaces: [] })
     })
 
-    expect(await screen.findByText('Claude')).toBeInTheDocument()
+    expect(await screen.findByText('Codex')).toBeInTheDocument()
     expect(screen.queryByText(/No agent configurations found/)).not.toBeInTheDocument()
   })
 

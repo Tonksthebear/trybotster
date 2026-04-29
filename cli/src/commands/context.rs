@@ -216,9 +216,9 @@ mod tests {
             "repo": "owner/repo",
             "branch_name": "feature-x",
             "worktree_path": "/tmp/wt",
-            "agent_name": "Claude",
+            "agent_name": "codex",
             "workspace_id": "ws-test-001",
-            "session_dir": "/tmp/botster/agents/claude"
+            "session_dir": "/tmp/botster/agents/codex"
         }"#,
         );
 
@@ -235,7 +235,7 @@ mod tests {
         );
         assert_eq!(
             ctx.get("session_dir").map(String::as_str),
-            Some("/tmp/botster/agents/claude")
+            Some("/tmp/botster/agents/codex")
         );
     }
 

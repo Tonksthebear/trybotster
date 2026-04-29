@@ -659,7 +659,7 @@ where
                 InputEvent::Paste { ref raw_bytes } => {
                     self.dirty = true;
                     // Forward the complete bracketed paste atomically to the PTY.
-                    // Apps like Claude Code rely on receiving the full paste
+                    // Agent CLIs can rely on receiving the full paste
                     // (start marker + content + end marker) in one read to detect
                     // file drag/drop vs typed input.
                     if self.mode == "terminal" && !self.has_overlay {
@@ -3301,7 +3301,7 @@ mod tests {
 
         // Simulate single agent config response (auto-skips to workspace selection)
         {
-            let agent_config_event = serde_json::json!({ "agents": ["claude"] });
+            let agent_config_event = serde_json::json!({ "agents": ["codex"] });
             let ctx = crate::tui::layout_lua::ActionContext::default();
             let ops = lua
                 .call_on_hub_event("agent_config", &agent_config_event, &ctx)
@@ -3467,7 +3467,7 @@ mod tests {
 
         // Simulate single agent config response (auto-skips to workspace selection)
         {
-            let agent_config_event = serde_json::json!({ "agents": ["claude"] });
+            let agent_config_event = serde_json::json!({ "agents": ["codex"] });
             let ctx = crate::tui::layout_lua::ActionContext::default();
             let ops = lua
                 .call_on_hub_event("agent_config", &agent_config_event, &ctx)
@@ -4891,7 +4891,7 @@ mod tests {
 
         // Simulate single agent config response (auto-skips to workspace selection)
         {
-            let agent_config_event = serde_json::json!({ "agents": ["claude"] });
+            let agent_config_event = serde_json::json!({ "agents": ["codex"] });
             let ctx = crate::tui::layout_lua::ActionContext::default();
             let ops = lua
                 .call_on_hub_event("agent_config", &agent_config_event, &ctx)
@@ -5069,7 +5069,7 @@ mod tests {
 
         // Simulate single agent config response (auto-skips to workspace selection)
         {
-            let agent_config_event = serde_json::json!({ "agents": ["claude"] });
+            let agent_config_event = serde_json::json!({ "agents": ["codex"] });
             let ctx = crate::tui::layout_lua::ActionContext::default();
             let ops = lua
                 .call_on_hub_event("agent_config", &agent_config_event, &ctx)

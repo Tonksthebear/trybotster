@@ -8,6 +8,10 @@ import {
   templateInstallState,
 } from '../components/settings/TemplateCatalog'
 import TemplateCatalog from '../components/settings/TemplateCatalog'
+import {
+  agentQuickSetupTemplates,
+  groupedTemplatesByCategory,
+} from '../store/selectors/settings-selectors'
 import { useSettingsStore } from '../store/settings-store'
 
 beforeEach(() => {
@@ -19,6 +23,35 @@ afterEach(() => {
 })
 
 describe('displayTemplatesFor', () => {
+  it('groups hub-authored template entities by category for settings consumers', () => {
+    const templates = groupedTemplatesByCategory([
+      {
+        id: 'plugins-demo',
+        category: 'plugins',
+        dest: 'plugins/demo/init.lua',
+      },
+      {
+        id: 'agents-claude-notes',
+        category: 'agents',
+        dest: 'agents/claude/notes.md',
+      },
+      {
+        id: 'agents-claude-init',
+        category: 'agents',
+        dest: 'agents/claude/initialization',
+      },
+    ])
+
+    expect(Object.keys(templates)).toEqual(['plugins', 'agents'])
+    expect(templates.agents.map((template) => template.dest)).toEqual([
+      'agents/claude/initialization',
+      'agents/claude/notes.md',
+    ])
+    expect(agentQuickSetupTemplates(templates).map((template) => template.dest)).toEqual([
+      'agents/claude/initialization',
+    ])
+  })
+
   it('groups multi-file plugins by plugin name', () => {
     const grouped = displayTemplatesFor([
       {

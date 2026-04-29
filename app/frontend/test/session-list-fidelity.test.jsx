@@ -111,7 +111,7 @@ describe('<SessionList> fidelity row', () => {
       task: 'Trim dead routes',
       target_name: 'backend',
       branch_name: 'feature/api',
-      agent_name: 'claude',
+      agent_name: 'codex',
     })
     render(<SessionList density="panel" grouping="flat" ctx={fakeCtx()} />)
 
@@ -125,7 +125,7 @@ describe('<SessionList> fidelity row', () => {
     const sub = screen.getByTestId('session-row-subtext')
     expect(sub).toHaveTextContent('backend')
     expect(sub).toHaveTextContent('feature/api')
-    expect(sub).toHaveTextContent('claude')
+    expect(sub).toHaveTextContent('codex')
   })
 
   it('renders the hosted-preview "Running" button when status === "running" with url', () => {

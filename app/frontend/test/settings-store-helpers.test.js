@@ -11,12 +11,12 @@ function mockHub(entriesByPath) {
 describe('settings store helpers', () => {
   it('recursively scans plugin and session definition files', async () => {
     const hub = mockHub({
-      agents: [{ name: 'claude', type: 'dir' }],
-      'agents/claude': [
+      agents: [{ name: 'codex', type: 'dir' }],
+      'agents/codex': [
         { name: 'initialization', type: 'file' },
         { name: 'notes.md', type: 'file' },
       ],
-      'agents/claude/initialization': [],
+      'agents/codex/initialization': [],
       accessories: [],
       plugins: [{ name: 'demo', type: 'dir' }],
       'plugins/demo': [
@@ -36,7 +36,7 @@ describe('settings store helpers', () => {
     })
 
     expect(result.state).toBe('tree')
-    expect(result.tree.agents.claude.files).toEqual(['initialization', 'notes.md'])
+    expect(result.tree.agents.codex.files).toEqual(['initialization', 'notes.md'])
     expect(result.tree.plugins.demo.files).toEqual(['init.lua', 'tui/status.lua', 'web_layout.lua'])
   })
 

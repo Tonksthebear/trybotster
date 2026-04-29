@@ -20,7 +20,7 @@ describe('ConfigEditor installed configuration browser', () => {
       treeState: 'tree',
       tree: {
         agents: {
-          claude: {
+          codex: {
             initialization: true,
             files: ['initialization', 'notes.md'],
           },
@@ -39,15 +39,15 @@ describe('ConfigEditor installed configuration browser', () => {
     render(<ConfigEditor agentTemplates={[]} />)
 
     expect(screen.getByText('Agents')).toBeInTheDocument()
-    expect(screen.getByText('Claude')).toBeInTheDocument()
+    expect(screen.getByText('Codex')).toBeInTheDocument()
     expect(screen.getByText('agent')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /initialization/ })).toHaveAttribute(
       'data-file-path',
-      'agents/claude/initialization',
+      'agents/codex/initialization',
     )
     expect(screen.getByRole('button', { name: /notes\.md/ })).toHaveAttribute(
       'data-file-path',
-      'agents/claude/notes.md',
+      'agents/codex/notes.md',
     )
 
     expect(screen.getByText('Plugins')).toBeInTheDocument()

@@ -67,10 +67,6 @@ local function normalize_session_manifest(manifest, workspace_id, session_uuid)
     manifest.uuid = manifest.uuid or session_uuid
     manifest.session_uuid = manifest.session_uuid or manifest.uuid or session_uuid
     manifest.workspace_id = manifest.workspace_id or workspace_id
-    -- Persisted migration boundary: older manifests may have only
-    -- `profile_name`; read it once, then keep the normalized shape canonical.
-    manifest.agent_name = manifest.agent_name or manifest.profile_name
-    manifest.profile_name = nil
     local target = extract_target_identity(manifest)
     manifest.target_id = manifest.target_id or target.target_id
     manifest.target_path = manifest.target_path or target.target_path
@@ -894,7 +890,7 @@ function M.migrate(data_dir)
             repo          = ctx.repo,
             branch        = ctx.branch_name,
             worktree_path = ctx.worktree_path or worktree_path,
-            agent_name    = ctx.agent_name or ctx.profile_name,
+            agent_name    = ctx.agent_name,
             status        = "active",
             created_at    = ctx.created_at or now,
             updated_at    = now,

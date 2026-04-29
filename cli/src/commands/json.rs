@@ -2,7 +2,7 @@
 //!
 //! Provides CLI utilities for reading, modifying, and deleting values in JSON
 //! files using dot-notation paths. Useful for managing configuration files
-//! like Claude's `projects.json`.
+//! like tool settings or plugin state files.
 //!
 //! # Path Notation
 //!
@@ -12,13 +12,13 @@
 //!
 //! ```bash
 //! # Get a value
-//! botster json-get ~/.config/claude/projects.json "projects.myproject.hasTrust"
+//! botster json-get ~/.config/example/settings.json "projects.myproject.hasTrust"
 //!
 //! # Set a value (creates intermediate objects if needed)
-//! botster json-set ~/.config/claude/projects.json "projects.myproject.hasTrust" "true"
+//! botster json-set ~/.config/example/settings.json "projects.myproject.hasTrust" "true"
 //!
 //! # Delete a key
-//! botster json-delete ~/.config/claude/projects.json "projects.myproject.hasTrust"
+//! botster json-delete ~/.config/example/settings.json "projects.myproject.hasTrust"
 //! ```
 
 use anyhow::{Context, Result};
@@ -41,7 +41,7 @@ use std::path::Path;
 ///
 /// ```ignore
 /// // Read "projects.myproject.hasTrust" from a JSON file
-/// json::get("~/.config/claude/projects.json", "projects.myproject.hasTrust")?;
+/// json::get("~/.config/example/settings.json", "projects.myproject.hasTrust")?;
 /// ```
 pub fn get(file_path: &str, key_path: &str) -> Result<()> {
     let path = shellexpand::tilde(file_path);

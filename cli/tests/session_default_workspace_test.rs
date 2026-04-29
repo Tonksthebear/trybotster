@@ -97,7 +97,7 @@ fn workspace_accessories_inherit_agent_resolved_default_workspace() {
     std::fs::create_dir_all(&worktree_path).unwrap();
     std::fs::write(worktree_path.join(".git"), "gitdir: /tmp/example").unwrap();
 
-    let agent_dir = repo_root.join(".botster-dev/agents/claude");
+    let agent_dir = repo_root.join(".botster-dev/agents/codex");
     let accessory_dir = repo_root.join(".botster-dev/accessories/rails-server");
     std::fs::create_dir_all(&agent_dir).unwrap();
     std::fs::create_dir_all(&accessory_dir).unwrap();
@@ -117,7 +117,7 @@ fn workspace_accessories_inherit_agent_resolved_default_workspace() {
               nil,
               nil,
               nil,
-              "claude",
+              "codex",
               {{ workspace_config = {{ accessories = {{ "rails-server" }} }} }},
               {{
                 target_id = "target-1",
@@ -161,7 +161,7 @@ fn session_definition_dir_is_persisted_for_context_lookup() {
     let data_dir = dir.path().join("data");
     let repo_root = dir.path().join("repo");
     let worktree_path = dir.path().join("feature-b-worktree");
-    let definition_dir = dir.path().join("config/agents/claude");
+    let definition_dir = dir.path().join("config/agents/codex");
 
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::create_dir_all(&repo_root).unwrap();
@@ -180,7 +180,7 @@ fn session_definition_dir_is_persisted_for_context_lookup() {
               branch_name = "feature-b",
               worktree_path = "{worktree_path}",
               session = {{
-                name = "claude",
+                name = "codex",
                 command = "bash",
                 definition_dir = "{definition_dir}",
               }},
@@ -235,7 +235,7 @@ fn before_pty_spawn_applies_returned_spawn_config_changes() {
               repo = "owner/repo",
               branch_name = "feature-c",
               worktree_path = "{worktree_path}",
-              session = {{ name = "claude", command = "bash" }},
+              session = {{ name = "codex", command = "bash" }},
               target_id = "target-1",
               target_path = "{repo_root}",
               target_repo = "owner/repo",
@@ -285,7 +285,7 @@ fn default_workspace_reuses_active_workspace_for_same_branch_and_target() {
               repo = "owner/repo",
               branch_name = "feature-a",
               worktree_path = "{worktree_path}",
-              session = {{ name = "claude", command = "bash" }},
+              session = {{ name = "codex", command = "bash" }},
               target_id = "target-1",
               target_path = "{repo_root}",
               target_repo = "owner/repo",
@@ -295,7 +295,7 @@ fn default_workspace_reuses_active_workspace_for_same_branch_and_target() {
               repo = "owner/repo",
               branch_name = "feature-a",
               worktree_path = "{worktree_path}",
-              session = {{ name = "claude", command = "bash" }},
+              session = {{ name = "codex", command = "bash" }},
               target_id = "target-1",
               target_path = "{repo_root}",
               target_repo = "owner/repo",

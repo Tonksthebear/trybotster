@@ -47,7 +47,7 @@ use crate::agent::pty::{PtyEvent, SharedPtyState};
 /// Session type distinguishing agents (AI-driven) from accessories (plain PTY).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SessionType {
-    /// AI-driven agent session (Claude, Codex, etc.)
+    /// AI-driven agent session.
     #[default]
     Agent,
     /// Accessory session (Rails server, REPL, shell, log tail).

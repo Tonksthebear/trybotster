@@ -46,9 +46,9 @@ describe('subtext', () => {
       subtext({
         target_name: 'backend',
         branch_name: 'feature/api',
-        agent_name: 'claude',
+        agent_name: 'codex',
       }),
-    ).toBe('backend · feature/api · claude')
+    ).toBe('backend · feature/api · codex')
   })
   it('omits config name when agent_name is absent', () => {
     expect(subtext({ branch_name: 'feature/api' })).toBe('feature/api')
@@ -162,7 +162,7 @@ describe('selectSessionRowProps', () => {
     title: 'Refactor request path',
     target_name: 'backend',
     branch_name: 'feature/api',
-    agent_name: 'claude',
+    agent_name: 'codex',
     is_idle: false,
     notification: true,
     session_type: 'agent',
@@ -183,7 +183,7 @@ describe('selectSessionRowProps', () => {
       density: 'sidebar',
       primaryName: 'api',
       titleLine: 'Refactor request path',
-      subtext: 'backend · feature/api · claude',
+      subtext: 'backend · feature/api · codex',
       selected: true,
       notification: true,
       sessionType: 'agent',

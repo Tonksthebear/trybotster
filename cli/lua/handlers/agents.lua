@@ -208,7 +208,7 @@ local spawn_accessory
 -- @param wt_path string        Worktree filesystem path
 -- @param prompt string          Task description
 -- @param client table|nil       Requesting client (for dimensions)
--- @param agent_name string      Agent name from config (e.g., "claude")
+-- @param agent_name string      Agent name from config (e.g., "codex")
 -- @param metadata table|nil     Plugin metadata
 -- @param workspace_manifest table|nil  Workspace manifest { agents[], accessories[] }
 -- @param target table           Explicit target context
@@ -414,7 +414,7 @@ end
 -- @param prompt string|nil           Optional task prompt
 -- @param from_worktree string|nil    Optional existing worktree path
 -- @param client table|nil            Requesting client
--- @param agent_name string|nil       Agent name (e.g., "claude")
+-- @param agent_name string|nil       Agent name (e.g., "codex")
 -- @param metadata table|nil          Plugin metadata
 -- @param target table|nil            Explicit target context
 -- @return Agent|nil

@@ -4,7 +4,7 @@
 //! dispatch, and id correlation. Routes tool/prompt requests through the
 //! hub socket `mcp` channel to Lua.
 //!
-//! Launched by Claude Code as: `botster mcp-serve`
+//! Launched by an MCP client as: `botster mcp-serve`
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -1034,7 +1034,7 @@ async fn serve_stdio(gateway: McpGateway) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {e}"))?;
 
-    // Block until the client (Claude Code) disconnects
+    // Block until the MCP client disconnects.
     service
         .waiting()
         .await

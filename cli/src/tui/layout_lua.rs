@@ -2276,7 +2276,7 @@ mod tests {
                     title = "Agent runtime title",
                     branch_name = "feature-auth",
                     target_name = "trybotster",
-                    agent_name = "claude",
+                    agent_name = "codex",
                     session_type = "agent",
                     is_idle = false,
                     status = "running",
@@ -2310,7 +2310,7 @@ mod tests {
         assert!(
             tertiary_text.contains("trybotster")
                 && tertiary_text.contains("feature-auth")
-                && tertiary_text.contains("claude"),
+                && tertiary_text.contains("codex"),
             "Tertiary should contain spawn info (target · branch · config), got: {}",
             tertiary_text
         );
@@ -2331,7 +2331,7 @@ mod tests {
         };
         lua.call_on_action("list_select", &menu_ctx).unwrap(); // → agent config select
                                                                // Simulate single agent config response (auto-skips to workspace)
-        let agent_config_event = serde_json::json!({ "agents": ["claude"] });
+        let agent_config_event = serde_json::json!({ "agents": ["codex"] });
         lua.call_on_hub_event("agent_config", &agent_config_event, &ctx)
             .unwrap();
         lua.call_on_action("list_select", &ctx).unwrap(); // → Create New Workspace → name input
@@ -2426,7 +2426,7 @@ mod tests {
         };
         lua.call_on_action("list_select", &menu_ctx).unwrap(); // → agent config select
                                                                // Simulate single agent config response (auto-skips to workspace)
-        let agent_config_event = serde_json::json!({ "agents": ["claude"] });
+        let agent_config_event = serde_json::json!({ "agents": ["codex"] });
         lua.call_on_hub_event("agent_config", &agent_config_event, &ctx)
             .unwrap();
         lua.call_on_action("list_select", &ctx).unwrap(); // → Create New Workspace → name input
@@ -2674,7 +2674,7 @@ mod tests {
         assert_eq!(msg_data["target_id"], "tgt_trybotster");
 
         // Step 4: Simulate agent_config event with single agent (auto-skips to workspace selection)
-        let event_data = serde_json::json!({ "agents": ["claude"] });
+        let event_data = serde_json::json!({ "agents": ["codex"] });
         let event_ops = lua
             .call_on_hub_event("agent_config", &event_data, &ctx)
             .unwrap()
@@ -2723,7 +2723,7 @@ mod tests {
         lua.call_on_action("list_select", &ctx).unwrap().unwrap();
 
         // Step 4: Multi-agent response — stays in agent config selection
-        let event_data = serde_json::json!({ "agents": ["claude", "web"] });
+        let event_data = serde_json::json!({ "agents": ["codex", "web"] });
         let event_ops = lua
             .call_on_hub_event("agent_config", &event_data, &ctx)
             .unwrap()
@@ -2797,7 +2797,7 @@ mod tests {
             r#"
             _tui_state.mode = "new_agent_select_agent"
             _tui_state.list_selected = 0
-            _tui_state.available_agents = { "claude" }
+            _tui_state.available_agents = { "codex" }
             _tui_state.agents = {
               { id = "agent-live", session_uuid = "agent-live", session_type = "agent", workspace_id = "ws-live" },
               { id = "accessory-only", session_uuid = "accessory-only", session_type = "accessory", workspace_id = "ws-accessory" },
@@ -3206,7 +3206,7 @@ mod tests {
         lua.call_on_action("list_select", &ctx).unwrap();
 
         // Simulate single agent config response (auto-skips to workspace selection)
-        let agent_config_event = serde_json::json!({ "agents": ["claude"] });
+        let agent_config_event = serde_json::json!({ "agents": ["codex"] });
         lua.call_on_hub_event("agent_config", &agent_config_event, &ctx)
             .unwrap();
 

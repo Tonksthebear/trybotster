@@ -17,6 +17,7 @@ import { useWorkspaceEntityStore } from './workspace-store'
 import { useSpawnTargetStore } from './spawn-target-store'
 import { useWorktreeStore } from './worktree-store'
 import { useHubMetaStore, useConnectionCodeStore } from './hub-meta-store'
+import { useTemplateStore } from './template-store'
 
 /** Built-in stores keyed by wire entity_type. */
 export const ENTITY_STORES = {
@@ -26,6 +27,7 @@ export const ENTITY_STORES = {
   worktree: useWorktreeStore,
   hub: useHubMetaStore,
   connection_code: useConnectionCodeStore,
+  template: useTemplateStore,
 }
 
 /** Plugin entity types are created on demand. Wire id field defaults to "id". */
@@ -39,6 +41,7 @@ const ID_FIELDS = {
   worktree: 'worktree_path',
   hub: 'hub_id',
   connection_code: 'hub_id',
+  template: 'id',
 }
 
 /**
@@ -150,4 +153,5 @@ export {
   useWorktreeStore,
   useHubMetaStore,
   useConnectionCodeStore,
+  useTemplateStore,
 }

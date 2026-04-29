@@ -109,7 +109,7 @@ export default function NewSessionChooser({ hubId }) {
             </span>
             <div className="text-center">
               <div className="text-sm font-medium text-zinc-100">Agent</div>
-              <div className="text-xs text-zinc-500 mt-1">AI-powered session with Claude</div>
+              <div className="text-xs text-zinc-500 mt-1">AI-powered session</div>
             </div>
           </button>
 

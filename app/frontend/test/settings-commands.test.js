@@ -37,12 +37,12 @@ describe('settings command helpers', () => {
       hub,
       configScope: 'repo',
       selectedTargetId: 'target-1',
-      filePath: '.botster/agents/claude/initialization',
+      filePath: '.botster/agents/codex/initialization',
     })
 
     expect(result).toEqual({ exists: true, content: 'hello' })
-    expect(hub.statFile).toHaveBeenCalledWith('.botster/agents/claude/initialization', 'repo', 'target-1')
-    expect(hub.readFile).toHaveBeenCalledWith('.botster/agents/claude/initialization', 'repo', 'target-1')
+    expect(hub.statFile).toHaveBeenCalledWith('.botster/agents/codex/initialization', 'repo', 'target-1')
+    expect(hub.readFile).toHaveBeenCalledWith('.botster/agents/codex/initialization', 'repo', 'target-1')
   })
 
   it('creates a missing settings file with default content', async () => {
@@ -53,13 +53,13 @@ describe('settings command helpers', () => {
       configMetadata: { session_files: { initialization: { default: '#!/bin/custom\n' } } },
       configScope: 'device',
       selectedTargetId: null,
-      filePath: 'agents/claude/initialization',
+      filePath: 'agents/codex/initialization',
       content: '',
     })
 
     expect(content).toBe('#!/bin/custom\n')
-    expect(hub.mkDir).toHaveBeenCalledWith('agents/claude', 'device', undefined)
-    expect(hub.writeFile).toHaveBeenCalledWith('agents/claude/initialization', '#!/bin/custom\n', 'device', undefined)
+    expect(hub.mkDir).toHaveBeenCalledWith('agents/codex', 'device', undefined)
+    expect(hub.writeFile).toHaveBeenCalledWith('agents/codex/initialization', '#!/bin/custom\n', 'device', undefined)
   })
 
   it('delegates basic file mutations to the hub', async () => {
@@ -86,24 +86,24 @@ describe('settings command helpers', () => {
       configScope: 'repo',
       selectedTargetId: 'target-1',
       type: 'agents',
-      name: 'claude',
+      name: 'codex',
     })
     await removeSessionConfig({
       hub,
       configScope: 'repo',
       selectedTargetId: 'target-1',
       type: 'agents',
-      name: 'claude',
+      name: 'codex',
     })
 
-    expect(hub.mkDir).toHaveBeenCalledWith('.botster/agents/claude', 'repo', 'target-1')
+    expect(hub.mkDir).toHaveBeenCalledWith('.botster/agents/codex', 'repo', 'target-1')
     expect(hub.writeFile).toHaveBeenCalledWith(
-      '.botster/agents/claude/initialization',
+      '.botster/agents/codex/initialization',
       '#!/bin/bash\n',
       'repo',
       'target-1',
     )
-    expect(hub.rmDir).toHaveBeenCalledWith('.botster/agents/claude', 'repo', 'target-1')
+    expect(hub.rmDir).toHaveBeenCalledWith('.botster/agents/codex', 'repo', 'target-1')
   })
 
   it('applies quick setup and template commands', async () => {
@@ -144,7 +144,7 @@ describe('settings command helpers', () => {
 
     const installed = await installSettingsTemplate({
       hub,
-      dest: 'agents/claude/notes.md',
+      dest: 'agents/codex/notes.md',
       content: 'Read me with botster context file notes.md.',
       scope: 'device',
       targetId: undefined,
@@ -152,7 +152,7 @@ describe('settings command helpers', () => {
 
     expect(installed).toBeNull()
     expect(hub.installTemplate).toHaveBeenCalledWith(
-      'agents/claude/notes.md',
+      'agents/codex/notes.md',
       'Read me with botster context file notes.md.',
       'device',
       undefined,

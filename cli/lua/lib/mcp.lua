@@ -76,7 +76,7 @@ local _batch_resources_dirty = false
 
 -- Debounce state for mcp_tools_changed notifications.
 -- Multiple rapid reloads (e.g. several agents editing plugin files simultaneously)
--- each call end_batch(), which would fire N notifications and cause N Claude
+-- each call end_batch(), which would fire N notifications and cause N MCP client
 -- reconnect cycles. Instead, each call cancels the previous pending timer and
 -- schedules a new one — only the final settle fires the notification.
 local _debounce_timer = nil
@@ -162,6 +162,31 @@ local function build_headers(token, session_id)
         h["Mcp-Session-Id"] = session_id
     end
     return h
+end
+
+local function build_botster_meta(context)
+    if type(context) ~= "table" then return nil end
+
+    local meta = {}
+    local keys = {
+        "session_uuid",
+        "agent_name",
+        "session_name",
+        "branch_name",
+        "repo",
+        "workspace_id",
+        "worktree_path",
+    }
+
+    for _, key in ipairs(keys) do
+        local value = context[key]
+        if type(value) == "string" and value ~= "" then
+            meta[key] = value
+        end
+    end
+
+    if next(meta) == nil then return nil end
+    return meta
 end
 
 --- Parse an SSE (Server-Sent Events) response body and return the first data payload.
@@ -466,11 +491,15 @@ function M.call_tool(name, params, context, callback)
             return nil, err
         end
 
+        local params = { name = name, arguments = params or {} }
+        local botster_meta = build_botster_meta(context)
+        if botster_meta then params._meta = { botster = botster_meta } end
+
         local body = json.encode({
             jsonrpc = "2.0",
             id      = 1,
             method  = "tools/call",
-            params  = { name = name, arguments = params or {} },
+            params  = params,
         })
 
         http.request({

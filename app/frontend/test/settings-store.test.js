@@ -22,7 +22,7 @@ describe('settings store template install state', () => {
         installed: [
           { dest: 'plugins/demo/init.lua', scope: 'device', name: 'demo' },
           { dest: 'plugins/demo/web_layout.lua', scope: 'device', name: 'demo' },
-          { dest: 'agents/claude/notes.md', scope: 'repo', name: 'claude' },
+          { dest: 'agents/codex/notes.md', scope: 'repo', name: 'codex' },
         ],
       })),
     })
@@ -34,7 +34,7 @@ describe('settings store template install state', () => {
       new Set(['plugins/demo/init.lua', 'plugins/demo/web_layout.lua']),
     )
     expect(useSettingsStore.getState().installedRepo).toEqual(
-      new Set(['agents/claude/notes.md']),
+      new Set(['agents/codex/notes.md']),
     )
   })
 
@@ -44,10 +44,10 @@ describe('settings store template install state', () => {
 
     await useSettingsStore
       .getState()
-      .installTemplate('agents/claude/notes.md', 'Read me', 'device')
+      .installTemplate('agents/codex/notes.md', 'Read me', 'device')
 
     expect(useSettingsStore.getState().installedDevice).toEqual(
-      new Set(['agents/claude/notes.md']),
+      new Set(['agents/codex/notes.md']),
     )
     expect(hub.loadPlugin).not.toHaveBeenCalled()
   })
