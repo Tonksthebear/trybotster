@@ -74,6 +74,7 @@ surfaces.register("vault", {
   label = "Vault",
   icon = "book-open", -- Heroicons mini filename without .svg
   nav = { section = "workspace", order = 25 },
+  sidebar = { surface = "vault_sidebar" },
   routes = {
     { path = "/", render = vault_home },
     { path = "/sessions/:session_uuid", render = vault_session },
@@ -84,6 +85,26 @@ surfaces.register("vault", {
 Set `nav = false` for routable surfaces that should stay out of the sidebar.
 Icon names are Heroicons mini filenames vendored under
 `app/assets/svg/icons/heroicons/mini`.
+
+Set `sidebar = { surface = "vault_sidebar" }` when the plugin should own the
+left sidebar while the user is inside that surface. Botster renders the plugin
+name and a back button at the top, then mounts the named sidebar surface. The
+sidebar surface can render plugin-local session/workspace navigation without
+nested nav inside the main page:
+
+```lua
+surfaces.register("vault_sidebar", {
+  render = function()
+    return ui.stack{
+      ui.session_list{
+        visibility = "plugin",
+        owner_plugin = "vault",
+        surface = "vault",
+      },
+    }
+  end,
+})
+```
 
 Plugin-scoped sessions should carry explicit ownership metadata so core can
 hide them from the default workspace list while the owning plugin can render

@@ -23,7 +23,8 @@ source.
 - `skills/botster-customize-hub/SKILL.md` — hub hooks and lifecycle guidance.
 - `skills/botster-customize-plugin/SKILL.md` — Botster Lua plugin authoring.
   Includes browser surface registration, core plugin navigation, Heroicons icon
-  names, plugin-owned session metadata, and surface-local terminal routing.
+  names, route-scoped plugin sidebars, plugin-owned session metadata, and
+  surface-local terminal routing.
 - `skills/botster-customize-mcp/SKILL.md` — MCP tools/prompts from plugins.
 
 ## MCP Server

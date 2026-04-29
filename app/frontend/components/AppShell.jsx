@@ -33,13 +33,16 @@ import { setHubId } from '../lib/modal-bridge'
 import { subscribeHubListUpdates, useHubStore } from '../store/hub-store'
 import {
   useRouteRegistryStore,
+  selectRoutesForHub,
   selectHasRouteRegistrySnapshot,
+  matchSurfaceForPath,
 } from '../store/route-registry-store'
 import {
   useSurfaceReadinessStore,
   selectHasAnySurfaceForHub,
 } from '../store/surface-readiness-store'
 import { useDialogStore } from '../store/dialog-store'
+import { IconGlyph } from '../ui_contract/icons'
 
 // Lazy-loaded route components
 const Home = React.lazy(() => import('./pages/Home'))
@@ -183,6 +186,41 @@ function PlusIcon({ className = 'size-4' }) {
   )
 }
 
+function PluginSidebarSection({ hubId, activeSidebar, onBack }) {
+  if (!hubId || !activeSidebar) return null
+
+  return (
+    <SidebarSection>
+      <div className="mb-2 flex items-center gap-2 px-1">
+        <button
+          type="button"
+          onClick={onBack}
+          className="inline-flex size-7 shrink-0 items-center justify-center rounded-md text-zinc-500 hover:bg-zinc-800/70 hover:text-zinc-100"
+          aria-label="Back to workspaces"
+          data-testid="plugin-sidebar-back"
+        >
+          <IconGlyph name="arrow-left" className="size-4" />
+        </button>
+        <div className="min-w-0 flex-1">
+          <div
+            className="truncate px-1 text-sm font-semibold text-zinc-100"
+            data-testid="plugin-sidebar-title"
+          >
+            {activeSidebar.label}
+          </div>
+        </div>
+      </div>
+      <UiTree
+        hubId={hubId}
+        targetSurface={activeSidebar.surface}
+        subpath={activeSidebar.subpath || '/'}
+      >
+        <SessionActionsMenu />
+      </UiTree>
+    </SidebarSection>
+  )
+}
+
 /**
  * Syncs route :hubId param into the hub store.
  * Renders inside /hubs/:hubId routes.
@@ -213,6 +251,9 @@ function HubShell() {
   const pendingFingerprint = searchParams.get('pending_fingerprint')
   const initialHubIdsRef = useRef(null)
   const selectedHubId = useHubStore((s) => s.selectedHubId)
+  const routeEntries = useRouteRegistryStore((s) =>
+    selectRoutesForHub(s, selectedHubId),
+  )
   const connectionState = useHubStore((s) => s.connectionState)
   const hubListLoading = useHubStore((s) => s.hubListLoading)
   const fetchHubList = useHubStore((s) => s.fetchHubList)
@@ -326,14 +367,33 @@ function HubShell() {
     return () => disconnectHub()
   }, [disconnectHub])
 
-  const isSessionRoute = /^\/hubs\/[^/]+\/sessions\//.test(location.pathname)
+  const isGlobalSessionRoute = /^\/hubs\/[^/]+\/sessions\//.test(location.pathname)
+  const isPluginSessionRoute = /^\/hubs\/[^/]+\/[^/]+\/sessions\//.test(location.pathname)
+  const shouldFlushContent = isGlobalSessionRoute || isPluginSessionRoute
   const isSettingsRoute = /\/settings/.test(location.pathname)
   const isPairingRoute = /\/pairing/.test(location.pathname)
+  const hubPathPrefix = selectedHubId ? `/hubs/${selectedHubId}` : ''
+  const hubRelativePath = hubPathPrefix && location.pathname.startsWith(hubPathPrefix)
+    ? location.pathname.slice(hubPathPrefix.length) || '/'
+    : '/'
+  const activeSurfaceMatch = matchSurfaceForPath(routeEntries, hubRelativePath)
+  const activeSidebarConfig = activeSurfaceMatch?.entry?.sidebar
+  const activePluginSidebar = activeSidebarConfig?.surface
+    ? {
+        surface: activeSidebarConfig.surface,
+        subpath: activeSidebarConfig.subpath || '/',
+        label:
+          activeSidebarConfig.label ||
+          activeSurfaceMatch.entry.label ||
+          activeSurfaceMatch.entry.surface ||
+          'Plugin',
+      }
+    : null
 
   return (
     <>
       <SidebarLayout
-        flush={isSessionRoute}
+        flush={shouldFlushContent}
         navbar={
           <Navbar>
             <NavbarItem href={selectedHubId ? `/hubs/${selectedHubId}` : '/hubs'}>
@@ -350,26 +410,34 @@ function HubShell() {
             </SidebarHeader>
             <SidebarBody>
               <SidebarConnectionStatus />
-              <SidebarSection>
-                <div className="mb-1 flex items-center justify-between gap-2">
-                  <SidebarHeading className="mb-0">Workspaces</SidebarHeading>
-                  <button
-                    type="button"
-                    onClick={openNewSession}
-                    className="inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-xs font-medium text-zinc-500 hover:bg-zinc-800/60 hover:text-zinc-200"
-                    data-testid="new-session-button"
-                  >
-                    <PlusIcon className="size-3.5" />
-                    <span>New</span>
-                  </button>
-                </div>
-                <UiTree
+              {activePluginSidebar ? (
+                <PluginSidebarSection
                   hubId={selectedHubId}
-                  targetSurface="workspace_sidebar"
-                >
-                  <SessionActionsMenu />
-                </UiTree>
-              </SidebarSection>
+                  activeSidebar={activePluginSidebar}
+                  onBack={() => navigate(selectedHubId ? `/hubs/${selectedHubId}` : '/hubs')}
+                />
+              ) : (
+                <SidebarSection>
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <SidebarHeading className="mb-0">Workspaces</SidebarHeading>
+                    <button
+                      type="button"
+                      onClick={openNewSession}
+                      className="inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-xs font-medium text-zinc-500 hover:bg-zinc-800/60 hover:text-zinc-200"
+                      data-testid="new-session-button"
+                    >
+                      <PlusIcon className="size-3.5" />
+                      <span>New</span>
+                    </button>
+                  </div>
+                  <UiTree
+                    hubId={selectedHubId}
+                    targetSurface="workspace_sidebar"
+                  >
+                    <SessionActionsMenu />
+                  </UiTree>
+                </SidebarSection>
+              )}
               <SidebarSpacer />
             </SidebarBody>
             <SidebarFooter>
@@ -406,7 +474,7 @@ function HubShell() {
           </Sidebar>
         }
       >
-        {isSessionRoute ? (
+        {isGlobalSessionRoute ? (
           <TerminalCache hubId={selectedHubId} />
         ) : (
           <Outlet />

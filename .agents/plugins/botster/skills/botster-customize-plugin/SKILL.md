@@ -141,6 +141,7 @@ surfaces.register("vault", {
   label = "Vault",
   icon = "book-open", -- Heroicons mini filename without .svg
   nav = { section = "workspace", order = 25 },
+  sidebar = { surface = "vault_sidebar" },
   routes = {
     { path = "/", render = vault_home },
     { path = "/sessions/:session_uuid", render = vault_session },
@@ -151,6 +152,25 @@ surfaces.register("vault", {
 Set `nav = false` for routable utility/debug surfaces that should not appear
 in the core Plugins section. Icon names are Heroicons mini filenames from
 `app/assets/svg/icons/heroicons/mini`, without the `.svg` suffix.
+
+When a plugin has its own session/workspace structure, declare a route-scoped
+sidebar instead of nesting navigation in the main page. Botster renders the
+plugin name with a back button, then mounts the named sidebar surface while the
+user is inside the plugin route:
+
+```lua
+surfaces.register("vault_sidebar", {
+  render = function()
+    return ui.stack{
+      ui.session_list{
+        visibility = "plugin",
+        owner_plugin = "vault",
+        surface = "vault",
+      },
+    }
+  end,
+})
+```
 
 ### Plugin-Owned Sessions
 

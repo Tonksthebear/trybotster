@@ -93,8 +93,14 @@ export default function DynamicSurfaceRoute() {
     )
   }
 
+  const terminalSubroute = match.subpath.startsWith('/sessions/')
+
   return (
-    <div className="h-full overflow-y-auto p-4 lg:p-6">
+    <div className={
+      terminalSubroute
+        ? 'h-full min-h-0 overflow-hidden'
+        : 'h-full overflow-y-auto p-4 lg:p-6'
+    }>
       <UiTree
         hubId={hubId}
         targetSurface={match.entry.surface}

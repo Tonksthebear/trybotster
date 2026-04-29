@@ -974,6 +974,45 @@ fn route_registry_includes_surface_nav_metadata() {
     assert_eq!(nav.get("order").and_then(|v| v.as_i64()), Some(20));
 }
 
+#[test]
+fn route_registry_includes_surface_sidebar_metadata() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let payload_json: String = lua
+        .load(
+            r#"
+            surfaces.register("vault", {
+                path = "/vault",
+                label = "Vault",
+                icon = "book-open",
+                sidebar = {
+                    surface = "vault_sidebar",
+                    subpath = "/",
+                },
+                render = function() return {type="panel", props={}} end,
+            })
+            return json.encode(surfaces.build_route_registry_payload("hub-test"))
+            "#,
+        )
+        .eval()
+        .expect("route registry with sidebar metadata");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload_json).expect("parse registry JSON");
+    let route = parsed
+        .get("routes")
+        .and_then(|v| v.as_array())
+        .and_then(|routes| routes.first())
+        .expect("first route");
+    let sidebar = route.get("sidebar").expect("sidebar metadata");
+    assert_eq!(
+        sidebar.get("surface").and_then(|v| v.as_str()),
+        Some("vault_sidebar")
+    );
+    assert_eq!(sidebar.get("subpath").and_then(|v| v.as_str()), Some("/"));
+}
+
 // -------------------------------------------------------------------------
 // Phase 4b — sub-routes, params, ctx, subpath re-render
 // -------------------------------------------------------------------------
