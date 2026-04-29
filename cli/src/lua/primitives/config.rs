@@ -81,18 +81,16 @@ fn data_dir_path() -> Option<PathBuf> {
     dirs::home_dir().map(|d| d.join(data_dir_name()))
 }
 
-/// Built-in template catalog root.
+/// Explicit local template catalog root.
 ///
-/// `BOTSTER_TEMPLATE_CATALOG_PATH` lets packaged/dev launches point the hub at
-/// a synced or bundled catalog without involving Rails. In source builds, fall
-/// back to the repository's `catalog/templates` directory.
+/// The hub normally fetches the template catalog from its remote provider/cache.
+/// `BOTSTER_TEMPLATE_CATALOG_PATH` is a development/offline override only; there
+/// is no implicit source-tree fallback.
 fn template_catalog_path() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("BOTSTER_TEMPLATE_CATALOG_PATH") {
         return Some(PathBuf::from(custom));
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(|p| p.join("catalog/templates"))
+    None
 }
 
 /// Read the config file, returning an empty object if it doesn't exist.
@@ -302,16 +300,13 @@ pub fn register(lua: &Lua) -> Result<()> {
         .set("data_dir", data_dir_fn)
         .map_err(|e| anyhow!("Failed to set config.data_dir: {e}"))?;
 
-    // config.template_catalog_path() -> string
+    // config.template_catalog_path() -> string|nil
     //
-    // Returns the hub-owned built-in template catalog source root. Rails does
-    // not participate in catalog discovery.
+    // Returns an explicit local template catalog source root when configured.
+    // Rails does not participate in catalog discovery.
     let template_catalog_path_fn = lua
         .create_function(|_, ()| {
-            let path = template_catalog_path()
-                .map(|d| d.to_string_lossy().to_string())
-                .unwrap_or_else(|| "catalog/templates".to_string());
-            Ok(path)
+            Ok(template_catalog_path().map(|d| d.to_string_lossy().to_string()))
         })
         .map_err(|e| anyhow!("Failed to create config.template_catalog_path function: {e}"))?;
 
@@ -493,19 +488,21 @@ mod tests {
     }
 
     #[test]
-    fn test_template_catalog_path_returns_source_catalog() {
+    fn test_template_catalog_path_is_optional_local_override() {
         let lua = Lua::new();
         register(&lua).expect("Should register config primitives");
 
-        let result: String = lua
+        let result: Option<String> = lua
             .load(r#"return config.template_catalog_path()"#)
             .eval()
             .expect("config.template_catalog_path should be callable");
 
-        assert!(
-            result.ends_with("catalog/templates"),
-            "template catalog path should point at catalog/templates, got: {result}"
-        );
+        if let Some(path) = result {
+            assert!(
+                !path.is_empty(),
+                "configured catalog path should not be empty"
+            );
+        }
     }
 
     #[test]

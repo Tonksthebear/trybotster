@@ -25,9 +25,9 @@ class GithubGetIssueCommentsTool < ApplicationMCPTool
 
     client = ::Github::App.installation_client(installation_id)
 
-    # Detect client for user feedback
-    client_info = detect_client_type
-    render(text: "Fetching comments for #{repo}##{issue_number} (via #{client_info})...")
+    # Identify the Botster session for user feedback
+    agent_info = botster_session_attribution
+    render(text: "Fetching comments for #{repo}##{issue_number} (via #{agent_info})...")
 
     comments = client.issue_comments(repo, issue_number.to_i)
 

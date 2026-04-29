@@ -9,9 +9,9 @@ class GithubListReposTool < ApplicationMCPTool
   property :direction, type: "string", description: "Sort direction: asc or desc (default: desc)", required: false
 
   def perform
-    # Detect client for user feedback
-    client_info = detect_client_type
-    render(text: "Fetching accessible GitHub repositories (via #{client_info})...")
+    # Identify the Botster session for user feedback
+    agent_info = botster_session_attribution
+    render(text: "Fetching accessible GitHub repositories (via #{agent_info})...")
 
     repos = ::Github::App.list_installation_repos
 

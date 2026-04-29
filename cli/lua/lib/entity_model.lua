@@ -132,4 +132,11 @@ function M.upsert_connection_code(payload)
     end
 end
 
+function M.upsert_template(template)
+    local EB = require("lib.entity_broadcast")
+    if type(template) == "table" and template.id and EB.is_registered("template") then
+        EB.upsert("template", template)
+    end
+end
+
 return M

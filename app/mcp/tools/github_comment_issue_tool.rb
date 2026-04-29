@@ -28,9 +28,9 @@ class GithubCommentIssueTool < ApplicationMCPTool
 
     client = ::Github::App.installation_client(installation_id)
 
-    # Detect client for user feedback
-    client_info = detect_client_type
-    render(text: "Adding comment to #{repo}##{issue_number} as [bot] (#{client_info})...")
+    # Identify the Botster session for user feedback
+    agent_info = botster_session_attribution
+    render(text: "Adding comment to #{repo}##{issue_number} as [bot] (#{agent_info})...")
 
     # Add attribution footer to comment body
     enhanced_body = body + attribution_footer

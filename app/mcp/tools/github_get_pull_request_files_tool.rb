@@ -29,8 +29,8 @@ class GithubGetPullRequestFilesTool < ApplicationMCPTool
 
     client = ::Github::App.installation_client(installation_id)
 
-    client_info = detect_client_type
-    render(text: "Fetching changed files for #{repo}##{pr_number} (via #{client_info})...")
+    agent_info = botster_session_attribution
+    render(text: "Fetching changed files for #{repo}##{pr_number} (via #{agent_info})...")
 
     files = client.pull_request_files(repo, pr_number.to_i)
 

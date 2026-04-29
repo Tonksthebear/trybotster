@@ -6,7 +6,7 @@ require_relative "cli_integration_test_case"
 # Tests the GitHub plugin integration: message → ActionCable → Lua plugin → agent spawn.
 #
 # GitHub is a PLUGIN integration, not core. These tests verify the full flow
-# through the github.lua plugin loaded from .botster/plugins/github/.
+# through the GitHub plugin loaded from .botster/plugins/github/.
 #
 # The test sets up:
 # 1. A git repo with .botster/ directory structure (sessions + github plugin)
@@ -176,7 +176,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
   end
 
   # Start CLI with a git repo and .botster/ config directory set up.
-  # Installs the github.lua plugin and agent session config so the
+  # Installs the GitHub plugin and agent session config so the
   # full GitHub integration flow works.
   def start_cli_in_git_repo(hub, **options)
     build_cli unless skip_build?
@@ -321,13 +321,15 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
     plugin_dir = File.join(repo_path, repo_config_dirname, "plugins", "github")
     FileUtils.mkdir_p(plugin_dir)
 
-    source = Rails.root.join("catalog/templates/plugins/github/init.lua")
-    dest = File.join(plugin_dir, "init.lua")
+    source_dir = Rails.root.join("catalog/templates/plugins/github")
 
-    # Copy plugin, stripping template metadata comments (@template, @dest, etc.)
-    content = File.read(source)
-    cleaned = content.lines.reject { |l| l.match?(/^-- @(template|description|category|dest|scope|version)\b/) }.join
-    File.write(dest, cleaned)
+    # Copy plugin files, stripping template metadata comments (@template, @dest, etc.)
+    Dir.glob(source_dir.join("*.lua")).each do |source|
+      dest = File.join(plugin_dir, File.basename(source))
+      content = File.read(source)
+      cleaned = content.lines.reject { |l| l.match?(/^-- @(template|description|category|dest|scope|version)\b/) }.join
+      File.write(dest, cleaned)
+    end
 
     # Commit the plugin so worktrees inherit it
     Dir.chdir(repo_path) do
@@ -335,7 +337,7 @@ class CliGithubIntegrationTest < CliIntegrationTestCase
       system("git commit -m 'Add github plugin'", out: File::NULL, err: File::NULL)
     end
 
-    Rails.logger.info "[CliGithubTest] Installed github plugin at #{dest}"
+    Rails.logger.info "[CliGithubTest] Installed github plugin at #{plugin_dir}"
   end
 
   # Install a minimal agent config so ConfigResolver.resolve_all()

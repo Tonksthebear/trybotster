@@ -29,8 +29,9 @@ external notification services, or opinionated template catalogs.
 
 Rails owns settings bootstrap, authentication, and the browser shell. It must
 not discover, fetch, or parse template catalogs. Browsers consume the hub's
-`template` entity snapshot, and future remote sources such as GitHub belong
-behind a hub catalog provider/cache rather than a Rails controller.
+`template` entity snapshot. Remote sources such as the default GitHub-backed
+trybotster catalog belong behind the hub catalog provider/cache rather than a
+Rails controller.
 
 ## Rule of Thumb
 

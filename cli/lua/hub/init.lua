@@ -216,6 +216,12 @@ if EB then
             return ok and templates or {}
         end,
     })
+    local ok_refresh, refresh_started = pcall(function()
+        return require("lib.template_catalog").refresh_async()
+    end)
+    if ok_refresh and refresh_started then
+        log.info("template_catalog: remote refresh scheduled")
+    end
 end
 
 -- Phase 4a demo plugin. The real plugin loader (ConfigResolver below) walks
