@@ -18,6 +18,8 @@ The agent plugin should provide this MCP server automatically:
 command = "botster"
 args = ["mcp-serve"]
 env_vars = ["BOTSTER_SESSION_UUID"]
+default_tools_approval_mode = "approve"
+default_tools_enabled = true
 ```
 
 Do not add duplicate Botster MCP aliases. `botster mcp-serve` resolves caller
