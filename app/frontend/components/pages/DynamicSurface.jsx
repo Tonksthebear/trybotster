@@ -93,11 +93,12 @@ export default function DynamicSurfaceRoute() {
     )
   }
 
-  const terminalSubroute = match.subpath.startsWith('/sessions/')
+  const fullscreenRoute =
+    match.subpath.startsWith('/sessions/') || match.route?.layout === 'fullscreen'
 
   return (
     <div className={
-      terminalSubroute
+      fullscreenRoute
         ? 'h-full min-h-0 overflow-hidden'
         : 'h-full overflow-y-auto p-4 lg:p-6'
     }>

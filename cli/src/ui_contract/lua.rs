@@ -73,6 +73,7 @@ pub fn register(lua: &Lua) -> Result<()> {
     register_primitive(lua, &ui, "session_row", Primitive::SessionRow)?;
     register_primitive(lua, &ui, "session_terminal", Primitive::SessionTerminal)?;
     register_primitive(lua, &ui, "surface_nav", Primitive::SurfaceNav)?;
+    register_primitive(lua, &ui, "iframe", Primitive::Iframe)?;
     register_primitive(lua, &ui, "hub_recovery_state", Primitive::HubRecoveryState)?;
     register_primitive(lua, &ui, "connection_code", Primitive::ConnectionCode)?;
     register_primitive(lua, &ui, "new_session_button", Primitive::NewSessionButton)?;
@@ -126,6 +127,8 @@ enum Primitive {
     SessionTerminal,
     /// Wire protocol — plugin surface navigation composite.
     SurfaceNav,
+    /// Wire protocol — sandboxed iframe for plugin assets or safe URLs.
+    Iframe,
     /// Wire protocol — hub lifecycle banner composite (singleton entity).
     HubRecoveryState,
     /// Wire protocol — pairing QR + URL composite (singleton entity).
@@ -158,6 +161,7 @@ impl Primitive {
             Self::SessionRow => "session_row",
             Self::SessionTerminal => "session_terminal",
             Self::SurfaceNav => "surface_nav",
+            Self::Iframe => "iframe",
             Self::HubRecoveryState => "hub_recovery_state",
             Self::ConnectionCode => "connection_code",
             Self::NewSessionButton => "new_session_button",
@@ -230,6 +234,7 @@ impl Primitive {
             Self::SessionRow => &["sessionUuid", "density"],
             Self::SessionTerminal => &["sessionUuid", "back"],
             Self::SurfaceNav => &["section", "density"],
+            Self::Iframe => &["src", "title", "sandbox", "bridge"],
             Self::HubRecoveryState => &[],
             Self::ConnectionCode => &[],
             Self::NewSessionButton => &["action"],
@@ -574,6 +579,9 @@ fn validate(_lua: &Lua, kind: Primitive, node: &Table) -> mlua::Result<()> {
         Primitive::SessionRow => require_prop_string(node, "sessionUuid", "ui.session_row")?,
         Primitive::SessionTerminal => {
             require_prop_string(node, "sessionUuid", "ui.session_terminal")?;
+        }
+        Primitive::Iframe => {
+            require_prop_string(node, "src", "ui.iframe")?;
         }
         Primitive::NewSessionButton => {
             require_prop_table(node, "action", "ui.new_session_button")?;
@@ -1525,6 +1533,32 @@ mod tests {
     }
 
     #[test]
+    fn iframe_props_round_trip() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.iframe{
+                src = "botster-plugin-asset://vault:graph?v=1",
+                title = "Graph",
+                sandbox = "allow-scripts",
+                bridge = { actions = { "card.move" } },
+            }"#,
+        );
+        assert_eq!(
+            v,
+            json!({
+                "type": "iframe",
+                "props": {
+                    "src": "botster-plugin-asset://vault:graph?v=1",
+                    "title": "Graph",
+                    "sandbox": "allow-scripts",
+                    "bridge": { "actions": ["card.move"] }
+                }
+            })
+        );
+    }
+
+    #[test]
     fn workspace_list_minimal_round_trip() {
         let lua = new_lua();
         let v = eval_to_json(&lua, "return ui.workspace_list{}");
@@ -1757,9 +1791,9 @@ mod tests {
         // Wire shape ↔ typed Props round-trip for every composite.
         // Catches any drift between the Lua allowlist and the Rust struct.
         use crate::ui_contract::{
-            ConnectionCodeProps, HubRecoveryStateProps, NewSessionButtonProps, SessionListProps,
-            SessionRowProps, SessionTerminalProps, SpawnTargetListProps, UiAction,
-            UiSessionListGrouping, UiSurfaceDensity, UiValue, WorkspaceListProps,
+            ConnectionCodeProps, HubRecoveryStateProps, IframeProps, NewSessionButtonProps,
+            SessionListProps, SessionRowProps, SessionTerminalProps, SpawnTargetListProps,
+            UiAction, UiSessionListGrouping, UiSurfaceDensity, UiValue, WorkspaceListProps,
             WorktreeListProps,
         };
 
@@ -1810,6 +1844,16 @@ mod tests {
         let back: SessionTerminalProps =
             serde_json::from_value(serde_json::to_value(&terminal).unwrap()).unwrap();
         assert_eq!(back, terminal);
+
+        let iframe = IframeProps {
+            src: "botster-plugin-asset://vault:graph?v=1".into(),
+            title: Some("Graph".into()),
+            sandbox: Some("allow-scripts".into()),
+            bridge: None,
+        };
+        let back: IframeProps =
+            serde_json::from_value(serde_json::to_value(&iframe).unwrap()).unwrap();
+        assert_eq!(back, iframe);
 
         let hr = HubRecoveryStateProps::default();
         let back: HubRecoveryStateProps =

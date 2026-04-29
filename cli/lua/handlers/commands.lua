@@ -516,6 +516,40 @@ commands.register("ui_action", function(client, sub_id, command)
     })
 end, { description = "Dispatch a semantic UI action envelope to hub handlers" })
 
+do
+    local plugin_assets = require("lib.plugin_assets")
+    plugin_assets._install_action_handler()
+
+    commands.register("plugin_asset:read", function(client, sub_id, command)
+        local request_id = command.request_id
+        local asset_id = command.asset_id or command.assetId
+        local result, err = plugin_assets.read(asset_id)
+        local response
+        if result then
+            response = {
+                type = "plugin_asset:response",
+                request_id = request_id,
+                subscriptionId = sub_id,
+                ok = true,
+                asset_id = result.asset_id,
+                content = result.content,
+                content_type = result.content_type,
+                version = result.version,
+            }
+        else
+            response = {
+                type = "plugin_asset:response",
+                request_id = request_id,
+                subscriptionId = sub_id,
+                ok = false,
+                asset_id = asset_id,
+                error = err or "Unable to read plugin asset",
+            }
+        end
+        client:send(response)
+    end, { description = "Read a plugin-exposed static asset" })
+end
+
 -- Phase 4b: surface subpath notifier. The browser fires this whenever its
 -- URL changes within a registered surface so the hub updates per-client
 -- `surface_subpaths[surface_name]` and re-renders just that surface for

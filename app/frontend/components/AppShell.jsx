@@ -369,7 +369,6 @@ function HubShell() {
 
   const isGlobalSessionRoute = /^\/hubs\/[^/]+\/sessions\//.test(location.pathname)
   const isPluginSessionRoute = /^\/hubs\/[^/]+\/[^/]+\/sessions\//.test(location.pathname)
-  const shouldFlushContent = isGlobalSessionRoute || isPluginSessionRoute
   const isSettingsRoute = /\/settings/.test(location.pathname)
   const isPairingRoute = /\/pairing/.test(location.pathname)
   const hubPathPrefix = selectedHubId ? `/hubs/${selectedHubId}` : ''
@@ -377,6 +376,9 @@ function HubShell() {
     ? location.pathname.slice(hubPathPrefix.length) || '/'
     : '/'
   const activeSurfaceMatch = matchSurfaceForPath(routeEntries, hubRelativePath)
+  const isFullscreenSurfaceRoute = activeSurfaceMatch?.route?.layout === 'fullscreen'
+  const shouldFlushContent =
+    isGlobalSessionRoute || isPluginSessionRoute || isFullscreenSurfaceRoute
   const activeSidebarConfig = activeSurfaceMatch?.entry?.sidebar
   const activePluginSidebar = activeSidebarConfig?.surface
     ? {

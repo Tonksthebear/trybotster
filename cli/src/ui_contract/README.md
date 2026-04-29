@@ -299,6 +299,7 @@ they used to inline are now first-class composites:
 | `ui.session_row{ session_uuid, density? }` | `session_row` | `session_uuid` |
 | `ui.session_terminal{ session_uuid, back? }` | `session_terminal` | `session_uuid` |
 | `ui.surface_nav{ section?, density? }` | `surface_nav` | none |
+| `ui.iframe{ src, title?, sandbox?, bridge? }` | `iframe` | `src` |
 | `ui.hub_recovery_state{}` | `hub_recovery_state` | none |
 | `ui.connection_code{}` | `connection_code` | none |
 | `ui.new_session_button{ action }` | `new_session_button` | `action` |
@@ -312,6 +313,9 @@ entries in core-owned navigation. `session_terminal` is the surface-local way
 for plugin routes such as `/vault/sessions/:session_uuid` to mount Botster's
 core terminal viewer without routing through the global `/sessions/:session_uuid`
 page.
+`iframe` is web-first: browser clients resolve `botster-plugin-asset://` URLs
+over the paired hub transport and mount the result in a sandboxed iframe, while
+TUI clients render a placeholder.
 
 Density follows the `UiSurfaceDensity` token (`sidebar` | `panel`) — see
 `tokens::UiSurfaceDensity`. This is distinct from `UiInteractionDensity`

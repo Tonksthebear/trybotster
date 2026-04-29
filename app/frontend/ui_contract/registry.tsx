@@ -638,6 +638,7 @@ import { WorktreeList } from '../components/composites/WorktreeList'
 import { SessionRow } from '../components/composites/SessionRow'
 import { SessionTerminal } from '../components/composites/SessionTerminal'
 import { SurfaceNav } from '../components/composites/SurfaceNav'
+import { PluginIframe } from '../components/composites/PluginIframe'
 import { HubRecoveryState } from '../components/composites/HubRecoveryState'
 import { NewSessionButton } from '../components/composites/NewSessionButton'
 
@@ -661,6 +662,9 @@ const renderSessionTerminal: PrimitiveRenderer = ({ props, ctx }) => (
 )
 const renderSurfaceNav: PrimitiveRenderer = ({ props, ctx }) => (
   <SurfaceNav {...(props as any)} ctx={ctx} />
+)
+const renderIframe: PrimitiveRenderer = ({ props, ctx }) => (
+  <PluginIframe {...(props as any)} ctx={ctx} />
 )
 const renderHubRecoveryState: PrimitiveRenderer = ({ props, ctx }) => (
   <HubRecoveryState {...(props as any)} ctx={ctx} />
@@ -694,6 +698,7 @@ export const PRIMITIVE_REGISTRY: Record<string, PrimitiveRenderer> = {
   session_row: renderSessionRow,
   session_terminal: renderSessionTerminal,
   surface_nav: renderSurfaceNav,
+  iframe: renderIframe,
   hub_recovery_state: renderHubRecoveryState,
   new_session_button: renderNewSessionButton,
 }

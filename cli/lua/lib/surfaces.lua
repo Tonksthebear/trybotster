@@ -204,9 +204,19 @@ end
 --   * Named params like "/board/:id" — `:id` captures one segment (no slashes)
 --     and is exposed as `params.id`.
 --
+local function normalize_route_layout(layout)
+    if layout == nil then return nil end
+    assert(type(layout) == "string",
+        "surfaces.register: route.layout must be a string when provided")
+    if layout ~= "fullscreen" and layout ~= "document" then
+        error("surfaces.register: route.layout must be 'fullscreen' or 'document'")
+    end
+    return layout
+end
+
 -- Returns a table:
---   { pattern, lua_pattern, param_names, render }
-local function compile_route(path_pattern, render)
+--   { pattern, lua_pattern, param_names, render, layout }
+local function compile_route(path_pattern, render, layout)
     assert(type(render) == "function",
         "surfaces.register: each route must declare `render = function(state, ctx) ... end`")
     local normalised = ensure_leading_slash(path_pattern)
@@ -220,6 +230,7 @@ local function compile_route(path_pattern, render)
             lua_pattern = "^/?$",
             param_names = param_names,
             render = render,
+            layout = normalize_route_layout(layout),
         }
     end
 
@@ -243,6 +254,7 @@ local function compile_route(path_pattern, render)
         lua_pattern = table.concat(parts),
         param_names = param_names,
         render = render,
+        layout = normalize_route_layout(layout),
     }
 end
 
@@ -366,13 +378,13 @@ local function compile_routes(name, opts)
         for i, route in ipairs(opts.routes) do
             assert(type(route) == "table",
                 "surfaces.register(" .. name .. "): routes[" .. i .. "] must be a table")
-            compiled[#compiled + 1] = compile_route(route.path or "/", route.render)
+            compiled[#compiled + 1] = compile_route(route.path or "/", route.render, route.layout)
         end
         return compiled
     end
     assert(type(opts.render) == "function",
         "surfaces.register(" .. name .. "): must provide `routes` or a top-level `render`")
-    return { compile_route("/", opts.render) }
+    return { compile_route("/", opts.render, opts.layout) }
 end
 
 -- Build the sub-route 404 fallback tree. Called when a surface's subpath
@@ -643,7 +655,10 @@ function M.build_route_registry_payload(hub_id)
             local sub_patterns = {}
             if entry and entry.compiled_routes then
                 for _, compiled in ipairs(entry.compiled_routes) do
-                    sub_patterns[#sub_patterns + 1] = { path = compiled.pattern }
+                    sub_patterns[#sub_patterns + 1] = {
+                        path = compiled.pattern,
+                        layout = compiled.layout,
+                    }
                 end
             end
             routes[#routes + 1] = {

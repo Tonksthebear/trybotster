@@ -123,6 +123,10 @@ export type UiAction = {
   disabled?: boolean
 }
 
+export type IframeBridgeProps = {
+  actions?: string[]
+}
+
 export type UiCapabilitySet = {
   hover: boolean
   dialog: boolean
@@ -330,6 +334,7 @@ export type UiPrimitiveType =
   | 'session_row'
   | 'session_terminal'
   | 'surface_nav'
+  | 'iframe'
   | 'hub_recovery_state'
   | 'new_session_button'
 

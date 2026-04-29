@@ -9,6 +9,7 @@ import type { UiAction } from './types'
  */
 export type UiActionTransport = {
   send: (type: string, data: Record<string, unknown>) => Promise<boolean>
+  on?: (event: string, handler: (message: unknown) => void) => () => void
 }
 
 export type CreateTransportDispatchOptions = {

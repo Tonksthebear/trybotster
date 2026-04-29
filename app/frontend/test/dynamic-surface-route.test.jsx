@@ -249,4 +249,24 @@ describe('DynamicSurfaceRoute', () => {
     expect(wrapper).not.toHaveClass('p-4')
     expect(screen.getByTestId('ui-tree')).toHaveTextContent('subpath=/sessions/sess-1')
   })
+
+  it('uses a full-height overflow-hidden wrapper for fullscreen plugin routes', () => {
+    useRouteRegistryStore.getState().setRoutes('h1', [
+      {
+        path: '/vault',
+        base_path: '/vault',
+        surface: 'vault',
+        label: 'Vault',
+        routes: [{ path: '/' }, { path: '/graph', layout: 'fullscreen' }],
+      },
+    ])
+    renderDynamic('/hubs/h1/vault/graph')
+
+    const wrapper = screen.getByTestId('ui-tree').parentElement
+    expect(wrapper).toHaveClass('h-full')
+    expect(wrapper).toHaveClass('min-h-0')
+    expect(wrapper).toHaveClass('overflow-hidden')
+    expect(wrapper).not.toHaveClass('overflow-y-auto')
+    expect(screen.getByTestId('ui-tree')).toHaveTextContent('subpath=/graph')
+  })
 })

@@ -78,6 +78,7 @@ surfaces.register("vault", {
   routes = {
     { path = "/", render = vault_home },
     { path = "/sessions/:session_uuid", render = vault_session },
+    { path = "/graph", layout = "fullscreen", render = vault_graph },
   },
 })
 ```
@@ -133,6 +134,39 @@ ui.session_terminal{
   back = ctx.path("/"),
 }
 ```
+
+Plugins can also expose generated static HTML through a sandboxed iframe. The
+browser fetches `botster-plugin-asset://...` sources over the existing hub
+connection and mounts them as blob URLs, so remote/tunneled browsers do not
+need access to the user's `localhost` or `file://` paths:
+
+```lua
+local plugin_assets = require("lib.plugin_assets")
+
+local graph_url = plugin_assets.expose_file("knowledge_graph", "/Users/me/knowledge/ops/graph.html", {
+  content_type = "text/html",
+})
+
+plugin_assets.on_message("card.move", function(payload, ctx)
+  -- Validate payload and update plugin state.
+end)
+
+ui.iframe{
+  src = graph_url,
+  title = "Knowledge graph",
+  sandbox = "allow-scripts",
+  bridge = { actions = { "card.move" } },
+}
+```
+
+Use `layout = "fullscreen"` on a route that needs full-bleed space, such as an
+iframe, canvas, dashboard, editor, or embedded terminal-like tool. Fullscreen
+routes use the same padded-shell bypass as session terminal routes.
+
+Iframe content can call `window.parent.postMessage({ type =
+"botster.plugin_action", action = "card.move", payload = {...} }, "*")`.
+Only actions declared in the iframe `bridge.actions` list are forwarded to the
+hub, and Lua receives them through `plugin_assets.on_message`.
 
 ## Event-Driven Primitives
 

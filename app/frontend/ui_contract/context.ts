@@ -1,5 +1,6 @@
 import { createContext, useContext } from 'react'
 import type { UiAction, UiCapabilitySet, UiViewport } from './types'
+import type { UiActionTransport } from './dispatch'
 
 /**
  * Optional metadata a primitive may attach when dispatching an action. Used
@@ -34,6 +35,8 @@ export type RenderContext = {
    * middle-click browser navigation works.
    */
   hubId?: string
+  /** Hub transport, when a web-only composite needs request/response frames. */
+  transport?: UiActionTransport | null
 }
 
 /** Default web capability set. Renderers may override in tests. */

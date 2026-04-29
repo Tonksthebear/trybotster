@@ -5,6 +5,7 @@ import {
   type ActionDispatch,
   type RenderContext,
 } from './context'
+import type { UiActionTransport } from './dispatch'
 import { PRIMITIVE_REGISTRY, type PrimitiveRenderer } from './registry'
 import type {
   UiCapabilitySet,
@@ -116,6 +117,7 @@ export type UiTreeBodyProps = {
    * one.
    */
   hubId?: string
+  transport?: UiActionTransport | null
 }
 
 /**
@@ -133,6 +135,7 @@ export function UiTreeBody({
   capabilities,
   viewport,
   hubId,
+  transport,
 }: UiTreeBodyProps): ReactElement {
   const liveViewport = useViewport()
   const effectiveViewport = viewport ?? liveViewport
@@ -141,6 +144,7 @@ export function UiTreeBody({
     capabilities: capabilities ?? DEFAULT_WEB_CAPABILITIES,
     dispatch,
     hubId,
+    transport,
   }
   return (
     <RenderContextProvider value={ctx}>

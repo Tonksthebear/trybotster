@@ -67,9 +67,9 @@ use crate::tui::render_tree::{
 use crate::ui_contract::node::{UiAction, UiChild, UiNode};
 use crate::ui_contract::props::{
     BadgeProps, ButtonProps, ConnectionCodeProps, DialogProps, EmptyStateProps,
-    HubRecoveryStateProps, IconButtonProps, IconProps, NewSessionButtonProps, PanelProps,
-    SessionListProps, SessionRowProps, SessionTerminalProps, SpawnTargetListProps, StackProps,
-    StatusDotProps, SurfaceNavProps, TextProps, TreeItemProps, WorkspaceListProps,
+    HubRecoveryStateProps, IconButtonProps, IconProps, IframeProps, NewSessionButtonProps,
+    PanelProps, SessionListProps, SessionRowProps, SessionTerminalProps, SpawnTargetListProps,
+    StackProps, StatusDotProps, SurfaceNavProps, TextProps, TreeItemProps, WorkspaceListProps,
     WorktreeListProps,
 };
 use crate::ui_contract::tokens::{UiSessionListGrouping, UiStackDirection, UiSurfaceDensity};
@@ -127,6 +127,7 @@ const UI_NODE_TYPE_NAMES: &[&str] = &[
     "session_row",
     "session_terminal",
     "surface_nav",
+    "iframe",
     "hub_recovery_state",
     "connection_code",
     "new_session_button",
@@ -220,6 +221,7 @@ pub fn render_ui_node_with_stores(
         "session_row" => render_session_row(node, viewport, actions, stores),
         "session_terminal" => render_session_terminal(node, viewport),
         "surface_nav" => render_surface_nav(node, viewport),
+        "iframe" => render_iframe(node, viewport),
         "hub_recovery_state" => render_hub_recovery_state(node, viewport, actions, stores),
         "connection_code" => render_connection_code(node, viewport, actions, stores),
         "new_session_button" => render_new_session_button(node, viewport, actions),
@@ -1813,6 +1815,11 @@ fn render_session_terminal(node: &UiNode, viewport: &UiViewport) -> Result<Rende
 fn render_surface_nav(node: &UiNode, viewport: &UiViewport) -> Result<RenderNode> {
     let _ = decode_props::<SurfaceNavProps>(&node.props, viewport, "surface_nav")?;
     Ok(placeholder_widget("(plugins)"))
+}
+
+fn render_iframe(node: &UiNode, viewport: &UiViewport) -> Result<RenderNode> {
+    let props = decode_props::<IframeProps>(&node.props, viewport, "iframe")?;
+    Ok(placeholder_widget(&format!("Web view: {}", props.src)))
 }
 
 fn render_hub_recovery_state(
