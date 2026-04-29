@@ -145,6 +145,7 @@ surfaces.register("vault", {
   routes = {
     { path = "/", render = vault_home },
     { path = "/sessions/:session_uuid", render = vault_session },
+    { path = "/graph", layout = "fullscreen", render = vault_graph },
   },
 })
 ```
@@ -231,6 +232,15 @@ ui.iframe{
   title = "Board",
   sandbox = "allow-scripts",
   bridge = { actions = { "card.move" } },
+}
+```
+
+Register iframe/canvas/editor routes with `layout = "fullscreen"` so Botster
+uses the same full-height, no-padding shell as terminal routes:
+
+```lua
+routes = {
+  { path = "/board", layout = "fullscreen", render = render_board },
 }
 ```
 

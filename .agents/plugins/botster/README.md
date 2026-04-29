@@ -25,7 +25,7 @@ source.
   Includes browser surface registration, core plugin navigation, Heroicons icon
   names, route-scoped plugin sidebars, plugin-owned session metadata, and
   surface-local terminal routing, plus sandboxed custom HTML views through
-  plugin assets and iframes.
+  plugin assets, iframes, and fullscreen plugin route layouts.
 - `skills/botster-customize-mcp/SKILL.md` — MCP tools/prompts from plugins.
 
 ## MCP Server
