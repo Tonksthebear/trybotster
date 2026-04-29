@@ -482,7 +482,7 @@ Most plugins combine some of these building blocks:
   Persistent conn  -> action_cable.subscribe or websocket.connect
   Polling          -> timer.every (with hot-reload guard)
   React to agents  -> hooks.on("after_agent_create", ...)
-  Expose to Claude -> mcp.tool / mcp.prompt
+  Expose to MCP clients -> mcp.tool / mcp.prompt
   TUI views        -> -- @tui file.lua metadata + ui primitives
 
 ## Step 3: Store Credentials
@@ -556,7 +556,7 @@ Use the state guard pattern:
     log.info("my-plugin: agent closed: " .. agent.session_uuid)
   end)
 
-## Step 7: Expose Tools to Claude
+## Step 7: Expose Tools to MCP Clients
 
   mcp.tool("send_message", {
     description = "Send a message to the external service",
@@ -582,7 +582,7 @@ Use the state guard pattern:
 
 The user can invoke this with Ctrl+P -> "my-plugin-action".
 
-## Step 9: Expose a Prompt to Claude
+## Step 9: Expose a Prompt to MCP Clients
 
   mcp.prompt("my-plugin-context", {
     description = "Inject current plugin state into the conversation",
@@ -639,7 +639,7 @@ The user can invoke this with Ctrl+P -> "my-plugin-action".
     send("Agent closed: " .. agent.session_uuid)
   end)
 
-  -- MCP tool so Claude can send messages directly
+  -- MCP tool so connected agents can send messages directly
   mcp.tool("telegram_send", {
     description = "Send a Telegram message to the configured chat",
     input_schema = {
@@ -699,11 +699,11 @@ end)
 -- =============================================================================
 
 mcp.prompt("botster-customize-mcp", {
-    description = "How to expose MCP tools and prompts to Claude from Botster plugins",
+    description = "How to expose MCP tools and prompts from Botster plugins",
     arguments = {},
 }, function(_args)
     local prose = [[
-The user wants to add MCP tools or prompts so Claude can interact with the hub. Here is everything you need to implement it.
+The user wants to add MCP tools or prompts so connected agents can interact with the hub. Here is everything you need to implement it.
 
 ## Where the Code Goes
 
@@ -715,14 +715,14 @@ From a plugin (recommended for anything reusable):
 From user.init (good for quick one-offs — same path in debug and release):
   ~/.botster/lua/user/init.lua
 
-All registrations appear together in Claude's tool/prompt list. Last write for a given name wins.
+All registrations appear together in the connected MCP client's tool/prompt list. Last write for a given name wins.
 
 ## Registering a Tool
 
-A tool lets Claude call into the hub and get a result.
+A tool lets a connected agent call into the hub and get a result.
 
   mcp.tool("tool_name", {
-    description = "One-line description shown in Claude",
+    description = "One-line description shown in the MCP client",
     input_schema = {
       type = "object",
       properties = {
@@ -733,13 +733,13 @@ A tool lets Claude call into the hub and get a result.
       required = { "file" },
     },
   }, function(params, context)
-    -- params.file, params.limit, params.verbose — values from Claude
-    -- context.session_uuid — session UUID of the agent Claude is running in
+    -- params.file, params.limit, params.verbose — values from the MCP client
+    -- context.session_uuid — session UUID of the calling agent
     -- context.hub_id      — hub UUID
     -- context.caller_cwd  — working directory of the calling process
 
     -- Return a string, a plain table (auto JSON-encoded), or an MCP content array:
-    return { result = "data", count = 3 }   -- becomes JSON text in Claude
+    return { result = "data", count = 3 }   -- becomes JSON text in the MCP client
   end)
 
 ### Using Hub Data in a Tool
@@ -778,16 +778,16 @@ Anything available in Lua is available in the handler:
 
 ### Signaling Errors
 
-Return a descriptive string on soft errors. For hard errors that Claude should see as isError=true, use error():
+Return a descriptive string on soft errors. For hard errors that the MCP client should see as isError=true, use error():
 
   if not ok then error("Failed to read file: " .. path) end
 
 ## Registering a Prompt
 
-A prompt is a template Claude can select to inject context into the conversation.
+A prompt is a template an MCP client can select to inject context into the conversation.
 
   mcp.prompt("prompt-name", {
-    description = "One-line description shown in Claude",
+    description = "One-line description shown in the MCP client",
     arguments = {
       { name = "focus", description = "What area to focus on", required = false },
     },

@@ -50,8 +50,8 @@ describe('subtext', () => {
       }),
     ).toBe('backend · feature/api · claude')
   })
-  it('falls back to profile_name when agent_name is absent', () => {
-    expect(subtext({ profile_name: 'engineer' })).toBe('engineer')
+  it('omits config name when agent_name is absent', () => {
+    expect(subtext({ branch_name: 'feature/api' })).toBe('feature/api')
   })
   it('returns "accessory" subtext when accessory has no parts', () => {
     expect(subtext({ session_type: 'accessory' })).toBe('accessory')

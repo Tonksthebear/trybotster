@@ -265,4 +265,4 @@ supporting assets deliberately.
 - `docs/lua/plugin-db.md` — `plugin.db{}` schema, migrations, constraints.
 - `docs/lua/directory-structure.md` — plugin paths and override order.
 - `docs/lua/hot-reload.md` — plugin reload behavior.
-- `app/templates/plugins/` — working plugin templates.
+- `catalog/templates/plugins/` — working plugin templates.

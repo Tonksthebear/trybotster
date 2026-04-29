@@ -131,7 +131,6 @@ type SessionSummary = {
   target_name?: string | null
   branch_name?: string | null
   agent_name?: string | null
-  profile_name?: string | null
   notification?: boolean
   is_idle?: boolean | null
   port?: number | null

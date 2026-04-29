@@ -428,7 +428,6 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         prompt = prompt,
         from_worktree = from_worktree,
         agent_name = agent_name,
-        profile_name = agent_name,  -- backward compat for hook consumers
         metadata = metadata,
         target = target,
     })
@@ -440,7 +439,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     issue_or_branch = params.issue_or_branch
     prompt = params.prompt
     from_worktree = params.from_worktree
-    agent_name = params.agent_name or params.profile_name  -- accept either from hooks
+    agent_name = params.agent_name
     metadata = params.metadata
     target = params.target
 
@@ -536,7 +535,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
                 branch = branch_name,
                 prompt = prompt,
                 metadata = async_metadata,
-                profile_name = agent_name,  -- Rust reads profile_name from this table
+                agent_name = agent_name,
                 client_rows = 24,
                 client_cols = 80,
             })
@@ -836,7 +835,7 @@ _event_subs[#_event_subs + 1] = events.on("worktree_created", function(info)
     -- Extract stashed fields from metadata (Rust doesn't carry these directly)
     local metadata = info.metadata or {}
     local workspace_manifest = metadata._workspace_manifest
-    local agent_name = metadata._agent_name or info.profile_name
+    local agent_name = metadata._agent_name or info.agent_name
     metadata._workspace_manifest = nil
     metadata._agent_name = nil
 

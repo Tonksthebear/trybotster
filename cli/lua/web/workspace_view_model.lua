@@ -43,7 +43,7 @@ function M.display_name(session)
   return session.id or ""
 end
 
---- Build the subtext line: target · branch · agent/profile. For accessories
+--- Build the subtext line: target · branch · agent. For accessories
 --- with no configured metadata, falls back to the literal "accessory" so the
 --- row reads as something rather than being empty.
 function M.subtext(session)
@@ -55,7 +55,7 @@ function M.subtext(session)
   if session.branch_name and session.branch_name ~= "" then
     parts[#parts + 1] = session.branch_name
   end
-  local config_name = session.agent_name or session.profile_name
+  local config_name = session.agent_name
   if config_name and config_name ~= "" then
     parts[#parts + 1] = config_name
   end

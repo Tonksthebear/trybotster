@@ -131,11 +131,14 @@ Agent-written Lua in `~/.botster/lua/improvements/*.lua` runs in a restricted sa
 
 ## Rails-Side Templates
 
+See [`core-product-boundaries.md`](core-product-boundaries.md) for the division
+between core Lua framework behavior and product-specific plugin/template policy.
+
 Rails serves a template catalog from a simple repository directory. The current
-source root is `app/templates/`; Rails reads matching `*.lua`, `*.sh`, and `*.md`
-files, extracts manifest-like `@tag` metadata from the comment header, and
-returns file content as-is. Rails should stay a generic catalog reader here, not
-the owner of product policy for which templates exist.
+source root is `catalog/templates/`; Rails reads matching `*.lua`, `*.sh`, and
+`*.md` files, extracts manifest-like `@tag` metadata from the comment header,
+and returns file content as-is. Rails should stay a generic catalog reader here,
+not the owner of product policy for which templates exist.
 
 Required metadata:
 

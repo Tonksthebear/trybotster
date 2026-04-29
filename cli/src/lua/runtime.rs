@@ -3433,7 +3433,7 @@ mod tests {
     /// Verifies `call_tui_message` converts JSON null to Lua nil, not userdata.
     ///
     /// Same root cause as `fire_json_event` — both use `lua.to_value()`.
-    /// TUI messages with null fields (e.g., optional `profile_name`) must
+    /// TUI messages with null fields (e.g., optional `agent_name`) must
     /// arrive as nil in Lua, not as truthy userdata.
     #[test]
     fn test_call_tui_message_null_is_nil_not_userdata() {
