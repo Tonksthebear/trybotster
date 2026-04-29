@@ -204,9 +204,9 @@ mcp.tool("create_agent", {
                 type = "string",
                 description = "Task prompt for the agent.",
             },
-            profile = {
+            agent_name = {
                 type = "string",
-                description = "Config profile name. Omit to auto-select.",
+                description = "Agent config name. Omit to auto-select.",
             },
             workspace_id = {
                 type = "string",
@@ -269,7 +269,7 @@ mcp.tool("create_agent", {
         local result = h:create_agent(
             params.issue_or_branch,
             params.prompt,
-            params.profile,
+            params.agent_name,
             params.workspace_id,
             params.workspace_name,
             target
@@ -548,7 +548,7 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
             return local_hub:create_agent(
                 message.issue_or_branch,
                 message.prompt,
-                message.profile,
+                message.agent_name,
                 message.workspace_id,
                 message.workspace_name,
                 target

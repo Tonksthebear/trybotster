@@ -354,12 +354,12 @@ end
 -- Local: calls handlers.agents directly. Remote: uses hub_client.request().
 -- @param issue_or_branch string Issue number or branch name
 -- @param prompt string|nil Task prompt
--- @param profile string|nil Config profile name
+-- @param agent_name string|nil Agent config name
 -- @param workspace_id string|nil Workspace ID
 -- @param workspace_name string|nil Workspace display name
 -- @param target table|nil Optional target context { target_id, target_path, target_repo }
 -- @return table Result payload
-function Hub:create_agent(issue_or_branch, prompt, profile, workspace_id, workspace_name, target)
+function Hub:create_agent(issue_or_branch, prompt, agent_name, workspace_id, workspace_name, target)
     if self._is_local then
         local agents_handler = require("handlers.agents")
         local ClientSessionPayload = require("lib.client_session_payload")
@@ -370,7 +370,7 @@ function Hub:create_agent(issue_or_branch, prompt, profile, workspace_id, worksp
             metadata.workspace = workspace_name
         end
         local agent, err = agents_handler.handle_create_agent(
-            issue_or_branch, prompt, nil, nil, profile, metadata, target
+            issue_or_branch, prompt, nil, nil, agent_name, metadata, target
         )
         if agent then
             return ClientSessionPayload.build(agent, Agent.all_info())
@@ -388,7 +388,7 @@ function Hub:create_agent(issue_or_branch, prompt, profile, workspace_id, worksp
         type = "create_agent",
         issue_or_branch = issue_or_branch,
         prompt = prompt,
-        profile = profile,
+        agent_name = agent_name,
         workspace_id = workspace_id,
         workspace_name = workspace_name,
         target_id = target and target.target_id or nil,

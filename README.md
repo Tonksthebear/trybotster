@@ -119,7 +119,7 @@ Web client / TUI
   Monitor via E2E encrypted WebRTC
 ```
 
-**Rails server** ([trybotster.com](https://trybotster.com)) — User auth, hub management, template catalog, plugin event channels. Relays E2E encrypted data it cannot decrypt.
+**Rails server** ([trybotster.com](https://trybotster.com)) — User auth, hub management, browser shell, and plugin event channels. Relays E2E encrypted data it cannot decrypt.
 
 **Rust daemon** (botster) — Interactive TUI with ratatui, event-driven Lua runtime for agent lifecycle, creates isolated git worktrees, spawns sessions in PTYs, streams terminal state over encrypted WebRTC to connected clients.
 

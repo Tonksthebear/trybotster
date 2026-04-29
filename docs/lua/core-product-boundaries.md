@@ -14,9 +14,8 @@ external notification services, or opinionated template catalogs.
   template install/list/uninstall commands, and MCP prompt/tool registration.
 - Built-in framework surfaces required for Botster itself, such as workspace
   sidebar/panel surfaces.
-- Compatibility migrations for old hub data, even when the historical data used
-  product-specific prefixes. Those branches are legacy readers, not precedent
-  for new product behavior in core.
+- Current data migrations required for live hub data. Historical layout readers
+  should not stay in core once the project chooses a cold turkey switch.
 
 ## Plugins and Templates Own
 

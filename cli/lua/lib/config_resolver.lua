@@ -474,29 +474,6 @@ function M.list_workspaces(device_root, repo_root)
 end
 
 -- =============================================================================
--- Backward Compatibility: Migration Detection & Helpers
--- =============================================================================
-
---- Check if the old shared/sessions/ structure exists.
--- @param device_root string|nil Path to ~/.botster
--- @param repo_root string|nil Path to repo root
--- @return boolean true if legacy structure is detected
-function M.needs_migration(device_root, repo_root)
-    if device_root then
-        if fs.exists(device_root .. "/shared/sessions") and fs.is_dir(device_root .. "/shared/sessions") then
-            return true
-        end
-    end
-    if repo_root then
-        local rr = repo_root .. "/" .. repo_config_dirname(device_root)
-        if fs.exists(rr .. "/shared/sessions") and fs.is_dir(rr .. "/shared/sessions") then
-            return true
-        end
-    end
-    return false
-end
-
--- =============================================================================
 -- Lifecycle Hooks for Hot-Reload
 -- =============================================================================
 
