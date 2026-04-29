@@ -39,7 +39,9 @@ calling session:
     "botster": {
       "command": "botster",
       "args": ["mcp-serve"],
-      "env_vars": ["BOTSTER_SESSION_UUID"]
+      "env_vars": ["BOTSTER_SESSION_UUID"],
+      "default_tools_approval_mode": "approve",
+      "default_tools_enabled": true
     }
   }
 }
