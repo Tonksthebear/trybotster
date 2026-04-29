@@ -1013,6 +1013,80 @@ fn route_registry_includes_surface_sidebar_metadata() {
     assert_eq!(sidebar.get("subpath").and_then(|v| v.as_str()), Some("/"));
 }
 
+#[test]
+fn route_registry_includes_subroute_layout_metadata() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let payload_json: String = lua
+        .load(
+            r#"
+            surfaces.register("vault", {
+                label = "Vault",
+                routes = {
+                    { path = "/", render = function() return {type="panel", props={}} end },
+                    {
+                        path = "/graph",
+                        layout = "fullscreen",
+                        render = function() return {type="panel", props={}} end,
+                    },
+                },
+            })
+            return json.encode(surfaces.build_route_registry_payload("hub-test"))
+            "#,
+        )
+        .eval()
+        .expect("route registry with layout metadata");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload_json).expect("parse registry JSON");
+    let subroutes = parsed
+        .get("routes")
+        .and_then(|v| v.as_array())
+        .and_then(|routes| routes.first())
+        .and_then(|route| route.get("routes"))
+        .and_then(|v| v.as_array())
+        .expect("subroutes");
+    let graph = subroutes
+        .iter()
+        .find(|route| route.get("path").and_then(|v| v.as_str()) == Some("/graph"))
+        .expect("graph route");
+    assert_eq!(
+        graph.get("layout").and_then(|v| v.as_str()),
+        Some("fullscreen")
+    );
+}
+
+#[test]
+fn plugin_assets_expose_file_returns_cache_busted_asset_url_and_reads_content() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let (url, content, content_type): (String, String, String) = lua
+        .load(
+            r#"
+            _G._loading_plugin_name = "vault"
+            _G.fs = {
+                stat = function(_path) return { modified = 123, size = 17 } end,
+                read = function(_path) return "<html>graph</html>" end,
+            }
+            local assets = require("lib.plugin_assets")
+            assets._reset_for_tests()
+            local url = assets.expose_file("knowledge_graph", "/tmp/graph.html", {
+                content_type = "text/html",
+            })
+            local result = assets.read("vault:knowledge_graph")
+            return url, result.content, result.content_type
+            "#,
+        )
+        .eval()
+        .expect("plugin asset expose/read");
+
+    assert_eq!(url, "botster-plugin-asset://vault:knowledge_graph?v=123-17");
+    assert_eq!(content, "<html>graph</html>");
+    assert_eq!(content_type, "text/html");
+}
+
 // -------------------------------------------------------------------------
 // Phase 4b — sub-routes, params, ctx, subpath re-render
 // -------------------------------------------------------------------------

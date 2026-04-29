@@ -268,6 +268,28 @@ describe('AppRoutes', () => {
     expect(screen.getByTestId('ui-tree-vault')).toHaveTextContent('UiTree:hub-1:vault:/sessions/sess-1')
   })
 
+  it('renders fullscreen plugin routes in the flush shell', async () => {
+    useHubStore.setState({
+      selectedHubId: 'hub-1',
+      fetchHubList: vi.fn(() => Promise.resolve([{ id: 'hub-1', name: 'Hub', identifier: 'hub-1', active: true }])),
+    })
+    useRouteRegistryStore.getState().setRoutes('hub-1', [
+      {
+        path: '/vault',
+        base_path: '/vault',
+        surface: 'vault',
+        label: 'Vault',
+        routes: [{ path: '/' }, { path: '/graph', layout: 'fullscreen' }],
+      },
+    ])
+
+    renderRoutes('/hubs/hub-1/vault/graph')
+
+    expect(await screen.findByTestId('sidebar-layout')).toHaveAttribute('data-flush', 'true')
+    expect(screen.queryByText('TerminalCache:hub-1')).toBeNull()
+    expect(screen.getByTestId('ui-tree-vault')).toHaveTextContent('UiTree:hub-1:vault:/graph')
+  })
+
   it('swaps to a plugin sidebar with a back button when the active surface declares one', async () => {
     useHubStore.setState({
       selectedHubId: 'hub-1',

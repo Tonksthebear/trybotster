@@ -578,9 +578,14 @@ _event_subs[#_event_subs + 1] = events.on("process_exited", function(data)
         return
     end
 
-    local agent = (session_uuid and Agent.get(session_uuid))
-    if agent then
-        agent:update({ status = "exited" })
+    local session = (session_uuid and Session.get(session_uuid))
+    if session then
+        local auto_close = session:get_meta("auto_close_on_exit")
+        if auto_close == true or auto_close == "true" then
+            session:close(false)
+        else
+            session:update({ status = "exited" })
+        end
     end
 end)
 

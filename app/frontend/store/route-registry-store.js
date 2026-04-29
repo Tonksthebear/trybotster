@@ -17,7 +17,7 @@ import { create } from 'zustand'
 //       icon,
 //       sidebar?,          // optional route-scoped sidebar surface descriptor
 //       hide_from_nav?,
-//       routes?,           // sub-patterns: [{ path }]
+//       routes?,           // sub-patterns: [{ path, layout? }]
 //     }>,
 //   }
 //   snapshotReceivedAtByHubId: { [hubId]: number }
@@ -129,11 +129,40 @@ export function matchSurfaceForPath(entries, pathname) {
     }
 
     if (subpath !== null && base.length > bestLen) {
-      best = { entry, subpath }
+      best = { entry, subpath, route: matchRouteForSubpath(entry.routes, subpath) }
       bestLen = base.length
     }
   }
   return best
+}
+
+function normaliseRoutePath(pathname) {
+  if (typeof pathname !== 'string' || pathname === '') return '/'
+  const withoutQuery = pathname.replace(/[?#].*$/, '')
+  if (withoutQuery === '') return '/'
+  const withSlash = withoutQuery.startsWith('/') ? withoutQuery : `/${withoutQuery}`
+  return withSlash === '/' ? '/' : withSlash.replace(/\/+$/, '')
+}
+
+function routePatternMatches(pattern, subpath) {
+  if (typeof pattern !== 'string' || pattern === '') return false
+  const route = normaliseRoutePath(pattern)
+  const requested = normaliseRoutePath(subpath)
+  if (route === '/') return requested === '/'
+  const routeParts = route.split('/').filter(Boolean)
+  const requestedParts = requested.split('/').filter(Boolean)
+  if (routeParts.length !== requestedParts.length) return false
+  return routeParts.every((part, index) =>
+    part.startsWith(':') || part === requestedParts[index],
+  )
+}
+
+export function matchRouteForSubpath(routes, subpath) {
+  if (!Array.isArray(routes)) return null
+  for (const route of routes) {
+    if (routePatternMatches(route?.path, subpath)) return route
+  }
+  return null
 }
 
 /** Selector: return the routes for a given hub id, or an empty array. */

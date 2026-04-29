@@ -365,6 +365,34 @@ pub struct SurfaceNavProps {
     pub density: Option<UiValue<UiSurfaceDensity>>,
 }
 
+/// Message bridge allowlist for a sandboxed iframe.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IframeBridgeProps {
+    /// Action names the iframe may post back to the owning plugin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<String>,
+}
+
+/// `Iframe` props — sandboxed custom plugin UI. `botster-plugin-asset://`
+/// sources are resolved by the browser over the paired hub transport.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IframeProps {
+    /// Required iframe source. `botster-plugin-asset://...` is resolved over
+    /// the paired hub transport; http/https URLs are passed through.
+    pub src: String,
+    /// Accessible iframe title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Browser sandbox attribute. Renderers default to `allow-scripts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    /// Optional postMessage bridge allowlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<IframeBridgeProps>,
+}
+
 /// `HubRecoveryState` props — renders the hub lifecycle banner. Reads the
 /// `hub` singleton entity (id = hub_id) from the client store; carries no
 /// props in the typical case.
@@ -985,6 +1013,38 @@ mod tests {
         let v = serde_json::to_value(&p).expect("serialize");
         assert_eq!(v, json!({ "section": "workspace", "density": "sidebar" }));
         let back: SurfaceNavProps = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    // ---------- Iframe ----------
+
+    #[test]
+    fn iframe_requires_src() {
+        let err = serde_json::from_value::<IframeProps>(json!({}));
+        assert!(err.is_err(), "Iframe must require src");
+    }
+
+    #[test]
+    fn iframe_round_trip() {
+        let p = IframeProps {
+            src: "botster-plugin-asset://vault:graph?v=1".into(),
+            title: Some("Graph".into()),
+            sandbox: Some("allow-scripts".into()),
+            bridge: Some(IframeBridgeProps {
+                actions: vec!["card.move".into()],
+            }),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(
+            v,
+            json!({
+                "src": "botster-plugin-asset://vault:graph?v=1",
+                "title": "Graph",
+                "sandbox": "allow-scripts",
+                "bridge": { "actions": ["card.move"] }
+            })
+        );
+        let back: IframeProps = serde_json::from_value(v).expect("deserialize");
         assert_eq!(back, p);
     }
 
