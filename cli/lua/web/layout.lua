@@ -28,17 +28,6 @@ function M.workspace_surface(state)
     local is_sidebar = density == "sidebar"
 
     local children = {}
-    if is_sidebar then
-        children[#children + 1] = ui.inline{
-            align = "center",
-            justify = "end",
-            children = {
-                ui.new_session_button{
-                    action = ui.action("botster.session.create.request"),
-                },
-            },
-        }
-    end
     children[#children + 1] = ui.session_list{
         density = density,
         grouping = "workspace",
