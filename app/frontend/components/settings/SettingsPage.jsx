@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import clsx from 'clsx'
 import { useSettingsStore } from '../../store/settings-store'
@@ -27,7 +27,12 @@ export default function SettingsPage({
 }) {
   const activeTab = useSettingsStore((s) => s.activeTab)
   const setActiveTab = useSettingsStore((s) => s.setActiveTab)
-  const templateEntities = useTemplateStore((state) => orderedEntities(state))
+  const templateOrder = useTemplateStore((state) => state.order)
+  const templatesById = useTemplateStore((state) => state.byId)
+  const templateEntities = useMemo(
+    () => orderedEntities({ order: templateOrder, byId: templatesById }),
+    [templateOrder, templatesById]
+  )
   const templates = groupedTemplatesByCategory(templateEntities)
   const agentTemplates = agentQuickSetupTemplates(templates)
 

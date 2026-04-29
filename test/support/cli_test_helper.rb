@@ -265,6 +265,7 @@ module CliTestHelper
     env = {
       "BOTSTER_ENV" => "system_test",
       "BOTSTER_CONFIG_DIR" => temp_dir,
+      "BOTSTER_TEMPLATE_CATALOG_PATH" => Rails.root.join("catalog/templates").to_s,
       "BOTSTER_SERVER_URL" => server_url,
       "BOTSTER_REPO" => "test/repo",  # Optional — used for GitHub event subscription
       "RUST_LOG" => options[:log_level] || "info,botster=debug"

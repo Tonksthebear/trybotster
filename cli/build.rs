@@ -17,6 +17,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
+mod build_support;
+use build_support::{
+    resolve_zig_command as choose_zig_command, zig_candidates, zig_global_cache_dir, ZigCommand,
+};
+
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("embedded_lua.rs");
@@ -252,10 +257,10 @@ fn collect_terminfo_files(base: &Path, dir: &Path, files: &mut Vec<(String, Stri
 
 /// Build libghostty-vt from the vendored Ghostty source using Zig.
 ///
-/// Runs `mise exec -- zig build -Demit-lib-vt` in `vendor/ghostty/` and tells
-/// Cargo to link the resulting static library. Uses DEVELOPER_DIR to point at
-/// the Command Line Tools SDK to work around a zig 0.15 + Xcode 26.4 TBD
-/// architecture mismatch bug (Codeberg #31658).
+/// Runs Zig in `vendor/ghostty/` and tells Cargo to link the resulting static
+/// library. Uses DEVELOPER_DIR to point at the Command Line Tools SDK to work
+/// around a zig 0.15 + Xcode 26.4 TBD architecture mismatch bug (Codeberg
+/// #31658).
 fn build_ghostty_vt() {
     let ghostty_dir = Path::new("vendor/ghostty");
     let out_dir = env::var("OUT_DIR").unwrap();
@@ -270,19 +275,19 @@ fn build_ghostty_vt() {
         "-Dcpu=baseline",
     ];
 
-    // Try mise first (local dev), fall back to bare zig (CI).
-    let status = Command::new("mise")
-        .args(["exec", "--", "zig"])
-        .args(&zig_args)
+    let zig = resolve_zig_command(ghostty_dir);
+    println!("cargo:warning=building libghostty-vt with {}", zig.label);
+
+    let zig_global_cache_dir =
+        zig_global_cache_dir(&out_dir, env::var("ZIG_GLOBAL_CACHE_DIR").ok());
+
+    let status = Command::new(&zig.program)
+        .args(&zig.prefix_args)
+        .args(zig_args)
         .current_dir(ghostty_dir)
         .env("DEVELOPER_DIR", "/Library/Developer/CommandLineTools")
+        .env("ZIG_GLOBAL_CACHE_DIR", zig_global_cache_dir)
         .status()
-        .or_else(|_| {
-            Command::new("zig")
-                .args(&zig_args)
-                .current_dir(ghostty_dir)
-                .status()
-        })
         .expect("failed to run zig build — is zig or mise installed?");
 
     assert!(
@@ -355,10 +360,46 @@ fn build_ghostty_vt() {
     }
 
     // Rerun if ghostty source changes.
+    println!("cargo:rerun-if-changed=build_support.rs");
+    println!("cargo:rerun-if-env-changed=BOTSTER_ZIG");
+    println!("cargo:rerun-if-env-changed=ZIG");
+    println!("cargo:rerun-if-env-changed=ZIG_GLOBAL_CACHE_DIR");
     println!("cargo:rerun-if-changed=vendor/ghostty/build.zig");
     println!("cargo:rerun-if-changed=vendor/ghostty/build.zig.zon");
     println!("cargo:rerun-if-changed=vendor/ghostty/src");
     println!("cargo:rerun-if-changed=vendor/ghostty/include");
+}
+
+fn resolve_zig_command(ghostty_dir: &Path) -> ZigCommand {
+    let candidates = zig_candidates(
+        env::var("BOTSTER_ZIG").ok(),
+        env::var("ZIG").ok(),
+        env::var("HOME").ok(),
+        |path| path.exists(),
+    );
+
+    choose_zig_command(&candidates, |candidate| zig_version(candidate, ghostty_dir))
+        .unwrap_or_else(|err| panic!("{err}"))
+}
+
+fn zig_version(candidate: &ZigCommand, ghostty_dir: &Path) -> Result<String, String> {
+    let output = Command::new(&candidate.program)
+        .args(&candidate.prefix_args)
+        .arg("version")
+        .current_dir(ghostty_dir)
+        .output()
+        .map_err(|err| err.to_string())?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("version command exited with {:?}", output.status.code())
+        } else {
+            stderr
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Recursively collect all .lua files from a directory.
