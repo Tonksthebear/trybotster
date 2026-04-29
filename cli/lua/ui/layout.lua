@@ -82,7 +82,7 @@ local function session_spawn_parts(agent)
   local parts = {}
   if agent.target_name then parts[#parts + 1] = agent.target_name end
   if agent.branch_name then parts[#parts + 1] = agent.branch_name end
-  local config_name = agent.agent_name or agent.profile_name
+  local config_name = agent.agent_name
   if config_name then parts[#parts + 1] = config_name end
   return parts
 end

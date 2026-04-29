@@ -313,7 +313,7 @@ function M.resolve_session_plugins(session_uuid)
     local target_id, agent_name, target_path
     if session then
         target_id = session.target_id
-        agent_name = session.agent_name or session.profile_name
+        agent_name = session.agent_name
         target_path = session.target_path
     else
         -- Session not in memory — read manifest from workspace store
@@ -326,7 +326,7 @@ function M.resolve_session_plugins(session_uuid)
                     local m = WorkspaceStore.read_session(data_dir, ws_id, session_uuid)
                     if m then
                         target_id = m.target_id
-                        agent_name = m.agent_name or m.profile_name
+                        agent_name = m.agent_name
                         target_path = m.target_path
                         break
                     end

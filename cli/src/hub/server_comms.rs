@@ -1314,7 +1314,7 @@ impl Hub {
                         branch,
                         metadata,
                         prompt,
-                        profile_name,
+                        agent_name,
                         client_rows,
                         client_cols,
                     } => {
@@ -1348,7 +1348,7 @@ impl Hub {
                                     result: outcome,
                                     metadata,
                                     prompt,
-                                    profile_name,
+                                    agent_name,
                                     client_rows,
                                     client_cols,
                                 })
@@ -2096,7 +2096,7 @@ impl Hub {
                     "path": path_str,
                     "metadata": result.metadata,
                     "prompt": result.prompt,
-                    "profile_name": result.profile_name,
+                    "agent_name": result.agent_name,
                     "client_rows": result.client_rows,
                     "client_cols": result.client_cols,
                 });
@@ -3170,7 +3170,7 @@ impl Hub {
                         "path": path_str,
                         "metadata": result.metadata,
                         "prompt": result.prompt,
-                        "profile_name": result.profile_name,
+                        "agent_name": result.agent_name,
                         "client_rows": result.client_rows,
                         "client_cols": result.client_cols,
                     });

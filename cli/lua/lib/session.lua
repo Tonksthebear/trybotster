@@ -175,7 +175,6 @@ end
 --   env             table    (optional)  base environment variables
 --   dims            table    (optional)  { rows = 24, cols = 80 }
 --   agent_name      string   (optional)  config agent name (e.g., "claude")
---   profile_name    string   (optional)  DEPRECATED alias for agent_name
 --   owner_plugin    string   (optional)  plugin that owns this session
 --   visibility      string   (optional)  "workspace" (default), "plugin", or "hidden"
 --   surface         string   (optional)  owning surface for plugin-scoped navigation
@@ -241,8 +240,7 @@ function Session._init(self, config)
     self.metadata = metadata
     self._workspace_name = workspace_name
     self._workspace_metadata = config.workspace_metadata or {}
-    self.agent_name = config.agent_name or config.profile_name
-    self.profile_name = config.agent_name or config.profile_name  -- backward compat alias
+    self.agent_name = config.agent_name
     self.owner_plugin = config.owner_plugin or metadata.owner_plugin
     self.visibility = config.visibility or metadata.visibility or "workspace"
     self.surface = config.surface or metadata.surface
@@ -552,7 +550,6 @@ function Session._init_recovered(self, config)
     self.worktree_path   = config.worktree_path
     self.prompt          = config.prompt
     self.agent_name      = config.agent_name
-    self.profile_name    = config.profile_name or config.agent_name
     self.owner_plugin    = config.owner_plugin or (config.metadata and config.metadata.owner_plugin)
     self.visibility      = config.visibility or (config.metadata and config.metadata.visibility) or "workspace"
     self.surface         = config.surface or (config.metadata and config.metadata.surface)
@@ -1124,7 +1121,6 @@ function Session:info()
         title = self.title,
         cwd = self.cwd,
         agent_name = self.agent_name,
-        profile_name = self.profile_name,  -- backward compat
         repo = self.repo,
         target_id = self.target_id,
         target_name = self:_resolve_target_name(),

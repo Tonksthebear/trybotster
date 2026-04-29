@@ -62,7 +62,6 @@ type SessionRecord = {
   target_name?: string
   branch_name?: string
   agent_name?: string
-  profile_name?: string
   hosted_preview?: {
     status?: string
     url?: string | null

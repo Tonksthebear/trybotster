@@ -187,7 +187,8 @@ The existing `context.json` (in worktrees and `data_dir/agents/`) maps to this a
 | `metadata.broker_pty_rows_N` | session manifest `pty_dimensions` |
 | `metadata.issue_number` | workspace manifest `issue_number` |
 | `metadata.invocation_url` | workspace manifest `issue_url` |
-| `profile_name` | session manifest `agent_name` or compatibility metadata during migration |
+| `profile_name` | session manifest `agent_name` during one-time persisted migration |
+| `agent_name` | session manifest `agent_name` |
 | `created_at` | session manifest `created_at` |
 
 Migration path: on first startup after deploy, if old `context.json` found, migrate to new layout and delete old file.

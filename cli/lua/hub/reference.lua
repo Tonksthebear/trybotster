@@ -320,7 +320,7 @@ M.hooks = {
     },
 
     interceptors = {
-        { name = "before_agent_create",     data = "{issue_or_branch, prompt, profile_name, ...}", returns = "modified params or nil to block" },
+        { name = "before_agent_create",     data = "{issue_or_branch, prompt, agent_name, ...}", returns = "modified params or nil to block" },
         { name = "before_agent_delete",     data = "{session_uuid, delete_worktree}",              returns = "modified config or nil to block" },
         { name = "before_command",          data = "{type, args, peer_id}",                        returns = "modified command or nil to block" },
         { name = "before_hub_command",      data = "command table",                                returns = "modified or nil to block" },

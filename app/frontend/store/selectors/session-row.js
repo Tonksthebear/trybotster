@@ -22,7 +22,6 @@
  * @property {string} [target_name]        spawn target friendly name
  * @property {string} [branch_name]
  * @property {string} [agent_name]
- * @property {string} [profile_name]       alternate profile label
  * @property {string} [session_type]       'agent' | 'accessory'
  * @property {boolean} [is_idle]
  * @property {boolean} [notification]
@@ -61,7 +60,7 @@ export function subtext(session) {
   const parts = []
   if (session.target_name) parts.push(session.target_name)
   if (session.branch_name) parts.push(session.branch_name)
-  const configName = session.agent_name || session.profile_name
+  const configName = session.agent_name
   if (configName) parts.push(configName)
   if (session.session_type === 'accessory' && parts.length === 0) {
     parts.push('accessory')

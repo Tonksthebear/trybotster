@@ -33,7 +33,6 @@ type SessionRecord = {
   target_name?: string
   branch_name?: string
   agent_name?: string
-  profile_name?: string
   session_type?: string
   is_idle?: boolean
   notification?: boolean

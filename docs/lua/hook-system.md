@@ -62,7 +62,7 @@ The `events` primitive provides a separate pub-sub layer from hooks. Rust emits 
 | Event | Source | Payload |
 |-------|--------|---------|
 | `command_message` | `hub_commands.lua` via ActionCable | create_agent / delete_agent commands |
-| `worktree_created` | Worktree creation | `{branch, path, metadata, issue_number, prompt, session_uuid, agent_name/profile_name compatibility field, client_rows, client_cols}` |
+| `worktree_created` | Worktree creation | `{branch, path, metadata, issue_number, prompt, session_uuid, agent_name, client_rows, client_cols}` |
 | `worktree_create_failed` | Rust async worktree create | `{branch, error}` |
 | `connection_code_ready` | Rust connection generation | `{url, qr_ascii}` |
 | `connection_code_error` | Rust connection generation | error string |

@@ -3,28 +3,10 @@
 module TemplateReadable
   extend ActiveSupport::Concern
 
-  TEMPLATE_SOURCE_ROOT = Rails.root.join("app/templates")
+  TEMPLATE_SOURCE_ROOT = Rails.root.join("catalog/templates")
   TEMPLATE_SOURCE_PATTERN = "**/*.{lua,sh,md}"
 
   private
-
-  # Read a template file and extract its metadata from the template source root.
-  # Returns { name:, description:, dest:, scope:, version:, content: } or nil.
-  def read_template(relative_path)
-    path = template_source_root.join(relative_path)
-    return nil unless File.exist?(path)
-
-    content = File.read(path)
-    meta = extract_template_metadata(content)
-    {
-      name: meta[:template],
-      description: meta[:description],
-      dest: meta[:dest],
-      scope: meta[:scope],
-      version: meta[:version] || "1.0.0",
-      content: content
-    }
-  end
 
   # Parse the template source root into a grouped catalog.
   # Rails treats templates as filesystem data: metadata comes from comment

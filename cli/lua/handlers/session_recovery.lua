@@ -89,7 +89,6 @@ local function recover_session(record, socket_info, recovered, seen_keys)
         branch_name       = sess.branch_name,
         worktree_path     = sess.worktree_path,
         agent_name        = sess.agent_name,
-        profile_name      = sess.profile_name,
         metadata          = sess.metadata,
         workspace_id      = sess.workspace_id,
         workspace_name    = ws_name,

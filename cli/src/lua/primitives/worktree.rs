@@ -77,8 +77,8 @@ pub enum WorktreeRequest {
         metadata: serde_json::Value,
         /// Task prompt for the agent.
         prompt: String,
-        /// Profile name for config resolution.
-        profile_name: Option<String>,
+        /// Agent name for config resolution.
+        agent_name: Option<String>,
         /// Terminal rows from the requesting client.
         client_rows: u16,
         /// Terminal cols from the requesting client.
@@ -109,8 +109,8 @@ pub struct WorktreeCreateResult {
     pub metadata: serde_json::Value,
     /// Task prompt (carried forward from request).
     pub prompt: String,
-    /// Profile name (carried forward from request).
-    pub profile_name: Option<String>,
+    /// Agent name (carried forward from request).
+    pub agent_name: Option<String>,
     /// Terminal rows (carried forward from request).
     pub client_rows: u16,
     /// Terminal cols (carried forward from request).
@@ -381,7 +381,7 @@ pub(crate) fn register(
     // `worktree_create_failed` Lua events on completion.
     //
     // params is a table with: label, branch, metadata, prompt,
-    // profile_name, client_rows, client_cols
+    // agent_name, client_rows, client_cols
     let tx = hub_event_tx.clone();
     let create_async_fn = lua
         .create_function(move |lua_inner, params: LuaTable| {
@@ -399,7 +399,7 @@ pub(crate) fn register(
             let metadata_json = lua_inner
                 .from_value::<serde_json::Value>(metadata_lua)
                 .unwrap_or(serde_json::Value::Null);
-            let profile_name: Option<String> = params.get("profile_name").unwrap_or(None);
+            let agent_name: Option<String> = params.get("agent_name").unwrap_or(None);
             let client_rows: u16 = params.get("client_rows").unwrap_or(24);
             let client_cols: u16 = params.get("client_cols").unwrap_or(80);
 
@@ -410,7 +410,7 @@ pub(crate) fn register(
                     branch,
                     metadata: metadata_json,
                     prompt,
-                    profile_name,
+                    agent_name,
                     client_rows,
                     client_cols,
                 }));
@@ -801,7 +801,7 @@ mod tests {
                 branch = "feature-branch",
                 metadata = { issue_number = 42, invocation_url = "https://github.com/test/repo/issues/42" },
                 prompt = "Fix the bug",
-                profile_name = "default",
+                agent_name = "default",
                 client_rows = 30,
                 client_cols = 120,
             })"#,
@@ -816,7 +816,7 @@ mod tests {
                 branch,
                 metadata,
                 prompt,
-                profile_name,
+                agent_name,
                 client_rows,
                 client_cols,
             }) => {
@@ -828,7 +828,7 @@ mod tests {
                     "https://github.com/test/repo/issues/42"
                 );
                 assert_eq!(prompt, "Fix the bug");
-                assert_eq!(profile_name.as_deref(), Some("default"));
+                assert_eq!(agent_name.as_deref(), Some("default"));
                 assert_eq!(client_rows, 30);
                 assert_eq!(client_cols, 120);
             }
