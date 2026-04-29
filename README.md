@@ -285,13 +285,13 @@ The output should show `env_vars: BOTSTER_SESSION_UUID`.
 
 ## Templates
 
-The Settings > Templates tab in the web client provides a catalog of installable templates:
+The Settings > Templates tab in the web client provides a catalog of installable templates served by the hub:
 
 - **Sessions** — Pre-configured session initialization scripts (e.g., coding-agent sessions)
 - **Plugins** — Lua plugins (e.g., GitHub integration)
 - **Initialization** — User init.lua for custom hooks and commands
 
-Templates can be installed to either device scope (`~/.botster/`) or project scope (`{project}/.botster/`) and are transferred over E2E encrypted connections.
+Templates can be installed to either device scope (`~/.botster/`) or project scope (`{project}/.botster/`) and are transferred over E2E encrypted connections. The hub fetches the default catalog from the trybotster GitHub repository on `main`, caches it locally, and publishes template entities to clients. Override the remote source with `BOTSTER_TEMPLATE_CATALOG_URL` / `BOTSTER_TEMPLATE_CATALOG_REF` or use `BOTSTER_TEMPLATE_CATALOG_PATH` for a local catalog root.
 
 ## Testing
 

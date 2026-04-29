@@ -25,9 +25,9 @@ class GithubCreatePullRequestTool < ApplicationMCPTool
 
     client = ::Github::App.installation_client(installation_id)
 
-    # Detect client for user feedback
-    client_info = detect_client_type
-    render(text: "Creating pull request in #{repo} as [bot] (#{client_info})...")
+    # Identify the Botster session for user feedback
+    agent_info = botster_session_attribution
+    render(text: "Creating pull request in #{repo} as [bot] (#{agent_info})...")
 
     # Add attribution footer to PR body
     enhanced_body = body.to_s + attribution_footer

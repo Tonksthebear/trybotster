@@ -19,9 +19,9 @@ class GithubListIssuesTool < ApplicationMCPTool
     client = ::Github::App.installation_client(installation_id)
     state_param = state || "open"
 
-    # Detect client for user feedback
-    client_info = detect_client_type
-    render(text: "Fetching #{state_param} issues for #{repo} (via #{client_info})...")
+    # Identify the Botster session for user feedback
+    agent_info = botster_session_attribution
+    render(text: "Fetching #{state_param} issues for #{repo} (via #{agent_info})...")
 
     issues = client.list_issues(repo, state: state_param)
 

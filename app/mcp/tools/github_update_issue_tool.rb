@@ -25,9 +25,9 @@ class GithubUpdateIssueTool < ApplicationMCPTool
 
     client = ::Github::App.installation_client(installation_id)
 
-    # Detect client for user feedback
-    client_info = detect_client_type
-    render(text: "Updating #{repo}##{issue_number} as [bot] (#{client_info})...")
+    # Identify the Botster session for user feedback
+    agent_info = botster_session_attribution
+    render(text: "Updating #{repo}##{issue_number} as [bot] (#{agent_info})...")
 
     # Build update options
     update_options = {}

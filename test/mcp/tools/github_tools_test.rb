@@ -59,7 +59,7 @@ module MCPToolTestHelper
   def setup_tool_mocks(tool)
     tool.define_singleton_method(:render) { |**args| @rendered = args }
     tool.define_singleton_method(:report_error) { |msg| @error = msg }
-    tool.define_singleton_method(:detect_client_type) { "Test Client" }
+    tool.define_singleton_method(:botster_session_attribution) { "Botster test-session" }
     tool.define_singleton_method(:attribution_footer) { "\n\n_via test_" }
     tool
   end

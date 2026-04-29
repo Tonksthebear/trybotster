@@ -23,9 +23,9 @@ class GithubSearchReposTool < ApplicationMCPTool
 
     client = ::Github::App.installation_client(installation_id)
 
-    # Detect client for user feedback
-    client_info = detect_client_type
-    render(text: "Searching repositories for: '#{query}' (via #{client_info})...")
+    # Identify the Botster session for user feedback
+    agent_info = botster_session_attribution
+    render(text: "Searching repositories for: '#{query}' (via #{agent_info})...")
 
     # Set options
     options = {}

@@ -134,13 +134,24 @@ Agent-written Lua in `~/.botster/lua/improvements/*.lua` runs in a restricted sa
 See [`core-product-boundaries.md`](core-product-boundaries.md) for the division
 between core Lua framework behavior and product-specific plugin/template policy.
 
-The hub serves the template catalog from a simple source root. The bundled
-source root is `catalog/templates/`, exposed to Lua as
-`config.template_catalog_path()` and overridable with
-`BOTSTER_TEMPLATE_CATALOG_PATH`. The hub reads matching `*.lua`, `*.sh`, and
-`*.md` files, extracts manifest-like `@tag` metadata from the comment header,
-and publishes the results as `template` entity frames. Rails and browser clients
-consume those hub-authored frames; Rails must not fetch or discover templates.
+The hub serves the template catalog through a provider/cache. By default it
+fetches the GitHub-backed trybotster catalog from
+`Tonksthebear/trybotster:main` under `catalog/templates/`, writes the parsed
+entities to `{config.data_dir()}/cache/template_catalog.json`, and publishes the
+results as `template` entity frames. Rails and browser clients consume those
+hub-authored frames; Rails must not fetch or discover templates.
+
+Remote source overrides:
+
+| Setting | Purpose |
+|---------|---------|
+| `BOTSTER_TEMPLATE_CATALOG_URL` or `config.set("template_catalog_url", ...)` | GitHub Contents API URL for the catalog root |
+| `BOTSTER_TEMPLATE_CATALOG_REF` or `config.set("template_catalog_ref", ...)` | Git ref used by the default trybotster URL |
+| `BOTSTER_TEMPLATE_CATALOG_PATH` | Local source root for development or offline packaged launches |
+
+The hub reads matching `*.lua`, `*.sh`, and `*.md` files, extracts
+manifest-like `@tag` metadata from the comment header, and keeps the entity
+model hub-owned.
 
 Required metadata:
 
@@ -153,9 +164,9 @@ Required metadata:
 | `@scope` | Default install scope |
 | `@version` | Template version, defaults to `1.0.0` when omitted |
 
-The source root is intentionally isolated behind the hub catalog provider so a
-future change can point it at a static directory, cache, or synced GitHub source
-without making Rails a catalog owner.
+The provider/cache boundary keeps catalog source policy out of Rails and out of
+clients. Clients receive the same `template` entities whether they came from
+GitHub, cache, or an explicit local source root.
 
 Catalog entries are installed via the `template:install` command:
 

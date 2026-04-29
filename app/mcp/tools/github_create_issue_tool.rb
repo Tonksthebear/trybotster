@@ -21,9 +21,9 @@ class GithubCreateIssueTool < ApplicationMCPTool
 
     client = ::Github::App.installation_client(installation_id)
 
-    # Detect client for user feedback
-    client_info = detect_client_type
-    render(text: "Creating issue in #{repo} as [bot] (#{client_info})...")
+    # Identify the Botster session for user feedback
+    agent_info = botster_session_attribution
+    render(text: "Creating issue in #{repo} as [bot] (#{agent_info})...")
 
     # Parse labels if provided
     label_array = labels.present? ? labels.split(",").map(&:strip) : []

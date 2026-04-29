@@ -3,13 +3,13 @@
 class ApplicationMCPTool < ActionMCP::Tool
   abstract!
 
-  # Extract idempotency key from request metadata
-  # Clients can send this via _meta.idempotencyKey in the request
+  # Extract idempotency key from request metadata.
+  # MCP callers can send this via _meta.idempotencyKey in the request.
   def idempotency_key_from_request
     meta = request_metadata
     return nil unless meta.is_a?(Hash)
 
-    meta["idempotencyKey"] || meta["idempotency_key"] || meta[:idempotencyKey] || meta[:idempotency_key]
+    hash_value(meta, "idempotencyKey") || hash_value(meta, "idempotency_key")
   end
 
   # Check if we have a cached response for this idempotency key
@@ -61,7 +61,9 @@ class ApplicationMCPTool < ActionMCP::Tool
   # Helper method to access request metadata from ActionMCP execution context
   def request_metadata
     if respond_to?(:execution_context) && execution_context.is_a?(Hash)
-      meta = execution_context.dig(:request, :params, :_meta)
+      request = hash_value(execution_context, "request")
+      params = hash_value(request, "params") if request.is_a?(Hash)
+      meta = hash_value(params, "_meta") if params.is_a?(Hash)
       return meta if meta.present?
     end
 
@@ -72,18 +74,17 @@ class ApplicationMCPTool < ActionMCP::Tool
   end
 
   # Helper to identify the Botster agent/session invoking the tool.
-  def detect_client_type
+  def botster_session_attribution
     botster_agent_attribution || "Botster MCP session"
   end
 
   def botster_agent_attribution
-    meta = request_metadata
-    botster = meta["botster"] || meta[:botster] if meta.is_a?(Hash)
+    botster = botster_agent_metadata
     return nil unless botster.is_a?(Hash)
 
-    agent_name = botster["agent_name"] || botster[:agent_name] || botster["session_name"] || botster[:session_name]
-    branch_name = botster["branch_name"] || botster[:branch_name]
-    session_uuid = botster["session_uuid"] || botster[:session_uuid]
+    agent_name = hash_value(botster, "agent_name") || hash_value(botster, "session_name")
+    branch_name = hash_value(botster, "branch_name")
+    session_uuid = hash_value(botster, "session_uuid")
 
     label = agent_name.presence || "agent"
     details = []
@@ -97,6 +98,11 @@ class ApplicationMCPTool < ActionMCP::Tool
     end
   end
 
+  def botster_agent_metadata
+    meta = request_metadata
+    hash_value(meta, "botster") if meta.is_a?(Hash)
+  end
+
   # Helper to get user attribution string
   def user_attribution
     current_user&.email || current_user&.username || "MCP User"
@@ -104,8 +110,16 @@ class ApplicationMCPTool < ActionMCP::Tool
 
   # Helper to generate attribution footer for GitHub content
   def attribution_footer
-    agent_info = detect_client_type
+    agent_info = botster_session_attribution
     user_info = user_attribution
     "\n\n---\n_Created by #{agent_info} for #{user_info} using trybotster MCP tools_"
+  end
+
+  private
+
+  def hash_value(hash, key)
+    return nil unless hash.is_a?(Hash)
+
+    hash[key] || hash[key.to_sym]
   end
 end

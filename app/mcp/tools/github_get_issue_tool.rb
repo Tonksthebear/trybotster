@@ -19,9 +19,9 @@ class GithubGetIssueTool < ApplicationMCPTool
 
     client = ::Github::App.installation_client(installation_id)
 
-    # Detect client for user feedback
-    client_info = detect_client_type
-    render(text: "Fetching details for #{repo}##{issue_number} (via #{client_info})...")
+    # Identify the Botster session for user feedback
+    agent_info = botster_session_attribution
+    render(text: "Fetching details for #{repo}##{issue_number} (via #{agent_info})...")
 
     issue = client.issue(repo, issue_number.to_i)
 

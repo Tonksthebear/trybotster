@@ -52,7 +52,7 @@ config.set(key, val)
 config.env(name) -> string       -- environment variable access
 config.lua_path() -> string      -- Lua script base path
 config.data_dir() -> string      -- config directory
-config.template_catalog_path() -> string -- bundled template catalog root
+config.template_catalog_path() -> string|nil -- explicit local template catalog root
 ```
 
 ### `secrets`
