@@ -30,16 +30,9 @@ function M.workspace_surface(state)
     local children = {}
     if is_sidebar then
         children[#children + 1] = ui.inline{
-            gap = "2",
             align = "center",
-            justify = "between",
+            justify = "end",
             children = {
-                ui.text{
-                    text = "Workspace",
-                    size = "xs",
-                    weight = "semibold",
-                    tone = "muted",
-                },
                 ui.new_session_button{
                     action = ui.action("botster.session.create.request"),
                 },
