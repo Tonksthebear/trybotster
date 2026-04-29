@@ -13,7 +13,7 @@ Called per keypress via `handle_key(key, mode, context)`. Returns an action stri
 | `normal` | No agent selected | Shared modifier bindings only |
 | `insert` | Agent selected, PTY active | Shared bindings + unbound keys forward to PTY |
 | `menu` | Ctrl+P pressed | Escape/q=close, arrows/j/k=navigate, Enter/Space=select, 1-9=shortcut |
-| `new_agent_select_profile` | New agent, multiple agent configs (legacy mode name) | List navigation |
+| `new_agent_select_agent` | New agent, multiple agent configs | List navigation |
 | `new_agent_select_worktree` | Agent config selected | List navigation |
 | `new_agent_create_worktree` | Create worktree selected | Text input mode |
 | `new_agent_prompt` | Worktree selected | Text input mode |

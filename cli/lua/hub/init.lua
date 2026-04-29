@@ -316,15 +316,6 @@ state.set("plugin_resolver_opts", {
     repo_roots = {},
 })
 
--- Run migration if old structure detected
-if ConfigResolver.needs_migration(device_root, nil) then
-    log.info("Legacy config structure detected, running migration...")
-    local mig_ok, mig_err = pcall(ConfigResolver.migrate, device_root, nil)
-    if not mig_ok then
-        log.warn(string.format("Config migration error: %s", tostring(mig_err)))
-    end
-end
-
 -- Collect repo roots from admitted spawn targets
 local target_repo_roots = {}
 local target_registry = rawget(_G, "spawn_targets")

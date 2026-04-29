@@ -12,6 +12,13 @@ class DocsControllerTest < ActionDispatch::IntegrationTest
     assert_select "#app", false
   end
 
+  test "show renders agents and accessories docs at the current path" do
+    get doc_path(path: "configuration/agents-accessories")
+
+    assert_response :success
+    assert_select "h1", text: "Agents & Accessories"
+  end
+
   test "show redirects invalid docs paths to the first page" do
     get doc_path(path: "not/a-real-page")
 

@@ -147,7 +147,7 @@ fn test_pty_input_receiver_ignores_non_pty_commands() {
         serde_json::to_string(&BrowserCommand::CreateAgent {
             issue_or_branch: Some("42".to_string()),
             prompt: None,
-            profile: None,
+            agent_name: None,
         })
         .unwrap(),
         serde_json::to_string(&BrowserCommand::DeleteAgent {

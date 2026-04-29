@@ -35,7 +35,7 @@ use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
 ///     command: "bash".to_string(),
 ///     args: vec![],
 ///     env: HashMap::new(),
-///     init_commands: vec!["source .botster/shared/sessions/agent/initialization".to_string()],
+///     init_commands: vec!["source .botster/agents/codex/initialization".to_string()],
 ///     detect_notifications: true,
 ///     port: None,
 ///     context: String::new(),

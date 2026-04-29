@@ -789,8 +789,7 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
             if issue_number and not meta.issue_number then
                 meta.issue_number = issue_number
             end
-            -- Accept both "profile" (legacy) and "agent_name" (new)
-            local agent_name = message.agent_name or message.profile
+            local agent_name = message.agent_name
             handle_create_agent(issue_or_branch, message.prompt, message.from_worktree, nil, agent_name, meta, command_target)
         else
             log.warn("command_message create_agent missing issue_or_branch")
@@ -800,7 +799,7 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
         local accessory_name = message.accessory_name or message.session_name or message.name
         local workspace_id = message.workspace_id
         local workspace_name = message.workspace_name
-        local agent_name = message.agent_name or message.profile
+        local agent_name = message.agent_name
         handle_create_accessory(workspace_id, workspace_name, accessory_name, agent_name, message.metadata, {
             target_id = message.target_id,
             target_path = message.target_path,

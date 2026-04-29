@@ -173,9 +173,9 @@ pub enum BrowserCommand {
         issue_or_branch: Option<String>,
         /// Initial prompt for the agent.
         prompt: Option<String>,
-        /// Config profile name (auto-selected if only one exists).
+        /// Agent config name (auto-selected if only one exists).
         #[serde(default)]
-        profile: Option<String>,
+        agent_name: Option<String>,
     },
     /// Reopen an existing worktree.
     #[serde(rename = "reopen_worktree")]
@@ -368,11 +368,11 @@ mod tests {
             BrowserCommand::CreateAgent {
                 issue_or_branch,
                 prompt,
-                profile,
+                agent_name,
             } => {
                 assert_eq!(issue_or_branch, Some("42".to_string()));
                 assert_eq!(prompt, Some("Fix the bug".to_string()));
-                assert_eq!(profile, None);
+                assert_eq!(agent_name, None);
             }
             _ => panic!("Wrong variant"),
         }

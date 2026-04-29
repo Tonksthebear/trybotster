@@ -151,7 +151,7 @@ Read agent and UI state from the _tui_state global inside render():
   normal                    no agent selected, unbound keys swallowed
   insert                    agent selected, unbound keys forwarded to PTY
   menu                      command palette (Ctrl+P)
-  new_agent_select_profile  new_agent_select_worktree  new_agent_create_worktree
+  new_agent_select_agent    new_agent_select_worktree  new_agent_create_worktree
   new_agent_prompt          close_agent_confirm         connection_code
   error
 

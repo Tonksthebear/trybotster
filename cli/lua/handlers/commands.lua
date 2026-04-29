@@ -193,8 +193,7 @@ commands.register("create_agent", function(client, sub_id, command)
     local issue_or_branch = command.issue_or_branch or command.branch
     local prompt = command.prompt
     local from_worktree = command.from_worktree
-    -- Accept both "agent_name" (new) and "profile" (legacy)
-    local agent_name = command.agent_name or command.profile
+    local agent_name = command.agent_name
     local workspace_id = command.workspace_id
     local workspace_name = command.workspace_name
 
@@ -243,7 +242,7 @@ commands.register("create_accessory", function(client, sub_id, command)
     local accessory_name = command.accessory_name or command.session_name or command.name
     local workspace_id = command.workspace_id
     local workspace_name = command.workspace_name
-    local agent_name = command.agent_name or command.profile
+    local agent_name = command.agent_name
     local target, target_err = resolve_command_target(command)
     if not target then
         send_command_error(client, sub_id, "error", target_err)
@@ -387,7 +386,7 @@ commands.register("reopen_worktree", function(client, _sub_id, command)
             log.warn(string.format("reopen_worktree failed: %s", tostring(target_err)))
             return
         end
-        local agent_name = command.agent_name or command.profile
+        local agent_name = command.agent_name
         local metadata = TargetContext.with_metadata(nil, target)
         if command.workspace_id or command.workspace_name then
             metadata.workspace_id = command.workspace_id
