@@ -65,7 +65,6 @@ Called each frame via `render(state)` and `render_overlay(state)`. Returns a tre
 | `list_selected` | 0-based list cursor |
 | `pending_fields` | Wizard state (creating_agent_id, creating_agent_stage, selected agent config, etc.) |
 | `available_worktrees` | Worktree list for modal |
-| `available_profiles` | Agent config list for modal (legacy field name) |
 
 ### Render Node Types
 

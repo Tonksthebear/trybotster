@@ -185,29 +185,6 @@ commands.register("list_agent_config", function(client, sub_id, command)
     send_agent_config(client, sub_id, command)
 end, { description = "List available agent config (alias for list_configs)" })
 
--- Backward compat: list_profiles → list_configs
-commands.register("list_profiles", function(client, sub_id, command)
-    local ConfigResolver = require("lib.config_resolver")
-    local target, target_err = resolve_command_target(command)
-    if not target then
-        send_command_error(client, sub_id, "profiles_error", target_err)
-        log.warn(string.format("list_profiles failed: %s", tostring(target_err)))
-        return
-    end
-    local device_root = config.data_dir and config.data_dir() or nil
-    local repo_root = target.target_path
-    local agents = ConfigResolver.list_agents(device_root, repo_root)
-    client:send({
-        subscriptionId = sub_id,
-        type = "profiles",
-        profiles = agents,
-        shared_agent = #agents > 0,
-        target_id = target.target_id,
-        target_path = target.target_path,
-        target_repo = target.target_repo,
-    })
-end, { description = "List available config profiles (deprecated, use list_configs)" })
-
 -- ============================================================================
 -- Agent Lifecycle Commands
 -- ============================================================================
