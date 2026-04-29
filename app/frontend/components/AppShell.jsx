@@ -39,6 +39,7 @@ import {
   useSurfaceReadinessStore,
   selectHasAnySurfaceForHub,
 } from '../store/surface-readiness-store'
+import { useDialogStore } from '../store/dialog-store'
 
 // Lazy-loaded route components
 const Home = React.lazy(() => import('./pages/Home'))
@@ -174,6 +175,14 @@ function CommandLineIcon() {
   )
 }
 
+function PlusIcon({ className = 'size-4' }) {
+  return (
+    <svg className={className} aria-hidden="true" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v14m7-7H5" />
+    </svg>
+  )
+}
+
 /**
  * Syncs route :hubId param into the hub store.
  * Renders inside /hubs/:hubId routes.
@@ -210,6 +219,7 @@ function HubShell() {
   const selectHub = useHubStore((s) => s.selectHub)
   const disconnectHub = useHubStore((s) => s.disconnectHub)
   const getLastHubId = useHubStore((s) => s.getLastHubId)
+  const openNewSession = useDialogStore((s) => s.openNewSession)
 
   // Fetch hub list on mount
   useEffect(() => {
@@ -341,7 +351,18 @@ function HubShell() {
             <SidebarBody>
               <SidebarConnectionStatus />
               <SidebarSection>
-                <SidebarHeading>Workspaces</SidebarHeading>
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <SidebarHeading className="mb-0">Workspaces</SidebarHeading>
+                  <button
+                    type="button"
+                    onClick={openNewSession}
+                    className="inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 text-xs font-medium text-zinc-500 hover:bg-zinc-800/60 hover:text-zinc-200"
+                    data-testid="new-session-button"
+                  >
+                    <PlusIcon className="size-3.5" />
+                    <span>New</span>
+                  </button>
+                </div>
                 <UiTree
                   hubId={selectedHubId}
                   targetSurface="workspace_sidebar"
