@@ -328,7 +328,7 @@ async fn attempt_delivery(
                 };
 
                 // Phase 1: Erase probe characters one at a time.
-                // Claude Code processes one key event per frame, so each
+                // Some agent CLIs process one key event per frame, so each
                 // backspace needs its own write + delay.
                 for _ in 0..PROBE.len() {
                     if !write_to_pty(shared_state, bs) {

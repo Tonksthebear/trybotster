@@ -128,7 +128,7 @@ export async function initializeBotsterConfig({
     configScope,
     selectedTargetId,
     type: 'agents',
-    name: 'claude',
+    name: 'codex',
   })
 }
 

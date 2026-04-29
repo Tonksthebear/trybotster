@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test init script for integration tests
-# This simulates a session initialization script without requiring claude
+# This simulates a session initialization script without requiring an agent CLI
 
 echo "=== Test Botster Init ==="
 echo "BOTSTER_WORKTREE_PATH: $BOTSTER_WORKTREE_PATH"

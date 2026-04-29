@@ -12,15 +12,15 @@
   <code class="text-zinc-300 bg-zinc-800 px-1.5 py-0.5 rounded text-sm">accessories/</code>
   directories at either the device or repo level:
 </p>
-<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>~/.botster/agents/claude/             # Device-level agent
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>~/.botster/agents/codex/              # Device-level agent
 ~/.botster/accessories/rails-server/  # Device-level accessory
-your-repo/.botster/agents/claude/     # Repo-level agent (overrides device)</code></pre>
+your-repo/.botster/agents/codex/      # Repo-level agent (overrides device)</code></pre>
 
 <h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Agent selection</h2>
 <p class="text-zinc-400 mb-4">
   If only one agent config exists, it's selected automatically. With multiple agent configs, you choose one when creating an agent:
 </p>
-<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>create_agent(agent_name: "claude")</code></pre>
+<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>create_agent(agent_name: "codex")</code></pre>
 
 <h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Config resolution</h2>
 <p class="text-zinc-400 mb-4">

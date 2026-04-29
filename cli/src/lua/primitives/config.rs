@@ -81,6 +81,20 @@ fn data_dir_path() -> Option<PathBuf> {
     dirs::home_dir().map(|d| d.join(data_dir_name()))
 }
 
+/// Built-in template catalog root.
+///
+/// `BOTSTER_TEMPLATE_CATALOG_PATH` lets packaged/dev launches point the hub at
+/// a synced or bundled catalog without involving Rails. In source builds, fall
+/// back to the repository's `catalog/templates` directory.
+fn template_catalog_path() -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var("BOTSTER_TEMPLATE_CATALOG_PATH") {
+        return Some(PathBuf::from(custom));
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.join("catalog/templates"))
+}
+
 /// Read the config file, returning an empty object if it doesn't exist.
 fn read_config() -> std::io::Result<serde_json::Value> {
     let Some(path) = config_path() else {
@@ -288,6 +302,23 @@ pub fn register(lua: &Lua) -> Result<()> {
         .set("data_dir", data_dir_fn)
         .map_err(|e| anyhow!("Failed to set config.data_dir: {e}"))?;
 
+    // config.template_catalog_path() -> string
+    //
+    // Returns the hub-owned built-in template catalog source root. Rails does
+    // not participate in catalog discovery.
+    let template_catalog_path_fn = lua
+        .create_function(|_, ()| {
+            let path = template_catalog_path()
+                .map(|d| d.to_string_lossy().to_string())
+                .unwrap_or_else(|| "catalog/templates".to_string());
+            Ok(path)
+        })
+        .map_err(|e| anyhow!("Failed to create config.template_catalog_path function: {e}"))?;
+
+    config_table
+        .set("template_catalog_path", template_catalog_path_fn)
+        .map_err(|e| anyhow!("Failed to set config.template_catalog_path: {e}"))?;
+
     // config.terminfo() -> { term = string, terminfo_dir = string|nil }
     //
     // Returns the terminal type and optional TERMINFO directory for spawned
@@ -395,6 +426,9 @@ mod tests {
         let _: Function = config_table
             .get("data_dir")
             .expect("config.data_dir should exist");
+        let _: Function = config_table
+            .get("template_catalog_path")
+            .expect("config.template_catalog_path should exist");
         let _: Function = config_table.get("env").expect("config.env should exist");
         let _: Function = config_table
             .get("find_available_port")
@@ -456,6 +490,22 @@ mod tests {
             .expect("config.lua_path should be callable");
 
         assert!(!result.is_empty(), "lua_path should not be empty");
+    }
+
+    #[test]
+    fn test_template_catalog_path_returns_source_catalog() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register config primitives");
+
+        let result: String = lua
+            .load(r#"return config.template_catalog_path()"#)
+            .eval()
+            .expect("config.template_catalog_path should be callable");
+
+        assert!(
+            result.ends_with("catalog/templates"),
+            "template catalog path should point at catalog/templates, got: {result}"
+        );
     }
 
     #[test]

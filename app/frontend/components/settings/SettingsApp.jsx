@@ -10,8 +10,6 @@ import SettingsPage from './SettingsPage'
 export default function SettingsApp({
   hubId,
   configMetadata,
-  templates,
-  agentTemplates,
   hubName,
   hubIdentifier,
   hubSettingsPath,
@@ -42,8 +40,6 @@ export default function SettingsApp({
   return (
     <SettingsPage
       hubId={hubId}
-      templates={templates}
-      agentTemplates={agentTemplates}
       hubName={hubName}
       hubIdentifier={hubIdentifier}
       hubSettingsPath={hubSettingsPath}

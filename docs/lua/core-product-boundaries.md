@@ -10,8 +10,8 @@ external notification services, or opinionated template catalogs.
 - Stable primitives exposed by Rust, such as `fs`, `http`, `pty`, `secrets`,
   `worktree`, `mcp`, `watch`, and transport primitives.
 - Generic registries and protocols, such as hooks, commands, surfaces, plugin
-  loading, entity broadcasts, template install/list/uninstall commands, and MCP
-  prompt/tool registration.
+  loading, entity broadcasts, template catalog providers,
+  template install/list/uninstall commands, and MCP prompt/tool registration.
 - Built-in framework surfaces required for Botster itself, such as workspace
   sidebar/panel surfaces.
 - Compatibility migrations for old hub data, even when the historical data used
@@ -28,10 +28,10 @@ external notification services, or opinionated template catalogs.
 
 ## Rails Owns
 
-Rails may serve a generic template catalog reader and return template files with
-metadata and content intact. It should not decide which integrations belong in
-the product. Template entries can move to a static directory or synced source
-without changing hub core semantics.
+Rails owns settings bootstrap, authentication, and the browser shell. It must
+not discover, fetch, or parse template catalogs. Browsers consume the hub's
+`template` entity snapshot, and future remote sources such as GitHub belong
+behind a hub catalog provider/cache rather than a Rails controller.
 
 ## Rule of Thumb
 

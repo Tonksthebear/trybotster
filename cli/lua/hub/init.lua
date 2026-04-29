@@ -47,6 +47,7 @@ safe_require("lib.config_resolver")
 safe_require("lib.session")
 safe_require("lib.agent")
 safe_require("lib.accessory")
+safe_require("lib.template_catalog")
 safe_require("lib.commands")
 _G.mcp = safe_require("lib.mcp")
 
@@ -205,6 +206,14 @@ if EB then
             local payload = { hub_id = hub_id }
             for k, v in pairs(code) do payload[k] = v end
             return { payload }
+        end,
+    })
+    EB.register("template", {
+        id_field = "id",
+        all = function()
+            local Catalog = require("lib.template_catalog")
+            local ok, templates = pcall(Catalog.list)
+            return ok and templates or {}
         end,
     })
 end

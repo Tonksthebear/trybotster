@@ -21,8 +21,6 @@ export default function SettingsRoute() {
     <SettingsApp
       hubId={hubId}
       configMetadata={settingsData.configMetadata || {}}
-      templates={settingsData.templates || {}}
-      agentTemplates={settingsData.agentTemplates || []}
       hubName={settingsData.hubName || ''}
       hubIdentifier={settingsData.hubIdentifier || ''}
       hubSettingsPath={`/hubs/${hubId}/settings`}

@@ -66,7 +66,7 @@ Trigger conditions: `Create`, `Modify`, `Rename` file events on `.lua` files onl
 
 Core modules (`lib/`, `handlers/`) are watched by the Rust `LuaFileWatcher` (FSEvents/inotify). Plugins in `.botster/` directories use a separate Lua-based watcher (`handlers/plugin_watcher.lua`) that uses `watch.directory()` with `poll = true`.
 
-**Why PollWatcher?** macOS FSEvents misses in-place file writes (the kind agent tools like Claude Code's Edit produce). PollWatcher checks mtimes every 2 seconds, reliably detecting all changes.
+**Why PollWatcher?** macOS FSEvents misses in-place file writes from some agent editing tools. PollWatcher checks mtimes every 2 seconds, reliably detecting all changes.
 
 The plugin watcher watches the same 2 layers that `ConfigResolver` scans:
 1. `~/.botster/plugins/`
@@ -129,16 +129,18 @@ Agent-written Lua in `~/.botster/lua/improvements/*.lua` runs in a restricted sa
 - Bytecode loading (text-only `load()` mode)
 - Path traversal (confined to improvements directory)
 
-## Rails-Side Templates
+## Hub-Owned Templates
 
 See [`core-product-boundaries.md`](core-product-boundaries.md) for the division
 between core Lua framework behavior and product-specific plugin/template policy.
 
-Rails serves a template catalog from a simple repository directory. The current
-source root is `catalog/templates/`; Rails reads matching `*.lua`, `*.sh`, and
+The hub serves the template catalog from a simple source root. The bundled
+source root is `catalog/templates/`, exposed to Lua as
+`config.template_catalog_path()` and overridable with
+`BOTSTER_TEMPLATE_CATALOG_PATH`. The hub reads matching `*.lua`, `*.sh`, and
 `*.md` files, extracts manifest-like `@tag` metadata from the comment header,
-and returns file content as-is. Rails should stay a generic catalog reader here,
-not the owner of product policy for which templates exist.
+and publishes the results as `template` entity frames. Rails and browser clients
+consume those hub-authored frames; Rails must not fetch or discover templates.
 
 Required metadata:
 
@@ -151,9 +153,9 @@ Required metadata:
 | `@scope` | Default install scope |
 | `@version` | Template version, defaults to `1.0.0` when omitted |
 
-The source root is intentionally isolated behind the catalog reader so a future
-change can point it at a static directory or synced GitHub source without making
-Rails a template policy layer.
+The source root is intentionally isolated behind the hub catalog provider so a
+future change can point it at a static directory, cache, or synced GitHub source
+without making Rails a catalog owner.
 
 Catalog entries are installed via the `template:install` command:
 

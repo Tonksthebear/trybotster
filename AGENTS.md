@@ -6,7 +6,7 @@ Bootstrap every agent session in Botster with the knowledge vault so work follow
 
 ## Required Session Start
 
-Run this first in every session (Claude or Codex):
+Run this first in every agent CLI session:
 
 ```bash
 bash ~/knowledge/ops/scripts/codex-hooks.sh session-start "$PWD"

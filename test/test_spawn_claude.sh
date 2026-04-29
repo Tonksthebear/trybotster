@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Test script for spawning Claude Code sessions without webhooks
+# Test script for spawning agent sessions without webhooks
 # This simulates the full flow: create bot message → daemon processes → spawn terminal
 #
 

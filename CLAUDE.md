@@ -20,7 +20,7 @@ Client / plugin command → Rust daemon
 
 **Lua plugin system** (Neovim-inspired): Hot-reloadable plugins, ~20 Rust primitives exposed to Lua.
 
-GitHub and Claude support lives in plugins/templates, not the core product boundary.
+Provider-specific agent support lives in plugins/templates, not the core product boundary.
 
 ## Running Tests
 

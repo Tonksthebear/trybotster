@@ -19,10 +19,6 @@ local function on_worktree_created(ctx)
     local repo_root = ctx.repo or worktree.repo_root()
     if not repo_root then return end
 
-    -- Example: auto-trust worktree in Claude Code so it doesn't prompt
-    -- json.file_set("~/.claude.json",
-    --     "projects." .. ctx.path .. ".hasTrustDialogAccepted", true)
-
     -- Example: copy .env from main repo into the worktree
     -- local src = repo_root .. "/.env"
     -- local dst = ctx.path .. "/.env"
@@ -45,9 +41,6 @@ end
 --- Called when a worktree is about to be deleted.
 -- ctx fields: path, branch, session_uuid
 local function on_worktree_deleted(ctx)
-    -- Example: remove worktree from Claude's trusted projects
-    -- json.file_delete("~/.claude.json", "projects." .. ctx.path)
-
     -- Example: clean up temp files
     -- local tmp = ctx.path .. "/tmp/botster"
     -- if fs.exists(tmp) then

@@ -1,4 +1,4 @@
-//! Botster Hub CLI - manages autonomous Claude agents for GitHub issues.
+//! Botster Hub CLI - manages autonomous agent sessions.
 //!
 //! This is the main binary entry point. See the `botster` library
 //! for the core functionality.

@@ -5,6 +5,12 @@ import { useSettingsStore } from '../../store/settings-store'
 import ConfigEditor from './ConfigEditor'
 import TemplateCatalog from './TemplateCatalog'
 import HubInfoPanel from './HubInfoPanel'
+import { useTemplateStore } from '../../store/entities'
+import { orderedEntities } from '../../lib/entity-selectors'
+import {
+  agentQuickSetupTemplates,
+  groupedTemplatesByCategory,
+} from '../../store/selectors/settings-selectors'
 
 const TABS = [
   { id: 'config', label: 'Config' },
@@ -14,8 +20,6 @@ const TABS = [
 
 export default function SettingsPage({
   hubId,
-  templates,
-  agentTemplates,
   hubName,
   hubIdentifier,
   hubSettingsPath,
@@ -23,6 +27,9 @@ export default function SettingsPage({
 }) {
   const activeTab = useSettingsStore((s) => s.activeTab)
   const setActiveTab = useSettingsStore((s) => s.setActiveTab)
+  const templateEntities = useTemplateStore((state) => orderedEntities(state))
+  const templates = groupedTemplatesByCategory(templateEntities)
+  const agentTemplates = agentQuickSetupTemplates(templates)
 
   return (
     <div className="flex flex-col h-full overflow-hidden">

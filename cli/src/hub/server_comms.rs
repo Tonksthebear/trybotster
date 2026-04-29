@@ -1797,7 +1797,7 @@ impl Hub {
     /// Handle a file transfer from browser (image paste/drop via WebRTC).
     ///
     /// Writes the file to a temp path and injects the path as text into the
-    /// target PTY, so CLI tools (e.g., Claude Code) see a local file path.
+    /// target PTY, so agent CLIs see a local file path.
     pub fn handle_file_input(&mut self, file: crate::channel::webrtc::FileInputIncoming) {
         use std::io::Write;
 

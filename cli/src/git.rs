@@ -316,20 +316,6 @@ impl WorktreeManager {
             anyhow::bail!("Failed to create worktree: {}", stderr);
         }
 
-        // Mark as trusted for Claude
-        let claude_dir = worktree_path.join(".claude");
-        fs::create_dir_all(&claude_dir)?;
-
-        // Create settings.local.json to pre-authorize the directory
-        let settings = serde_json::json!({
-            "allowedDirectories": [worktree_path.to_str().expect("path is valid UTF-8")],
-            "permissionMode": "acceptEdits"
-        });
-        fs::write(
-            claude_dir.join("settings.local.json"),
-            serde_json::to_string_pretty(&settings)?,
-        )?;
-
         Ok(worktree_path)
     }
 
@@ -500,16 +486,6 @@ impl WorktreeManager {
                 branch_name
             );
             // Don't bail - just warn, as this might be intentional
-        }
-
-        // DEFENSE-IN-DEPTH CHECK 3: Check for Claude settings marker file
-        let marker_file = worktree_path.join(".claude/settings.local.json");
-        if !marker_file.exists() {
-            log::warn!(
-                "Missing botster marker file at {} - this may not be a managed worktree",
-                marker_file.display()
-            );
-            // Don't bail - just warn
         }
 
         log::debug!("worktree_path = {}", worktree_path.display());

@@ -65,8 +65,8 @@ fn test_worktree_manager_handles_existing_branch() {
     let worktree_path = result.unwrap();
     assert!(worktree_path.exists(), "Worktree should be created");
     assert!(
-        worktree_path.join(".claude/settings.local.json").exists(),
-        "Should have Claude settings file"
+        worktree_path.join("README.md").exists(),
+        "Worktree should contain repository files"
     );
 }
 

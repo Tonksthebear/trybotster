@@ -43,7 +43,7 @@ function seedMoveDialogState() {
       },
       {
         session_uuid: 'sess-target',
-        label: 'Claude',
+        label: 'Agent',
         workspace_id: 'ws-target',
         status: 'active',
       },

@@ -28,15 +28,3 @@ hooks.on("worktree_created", "my-copy", function(ctx)
         fs.copy(src, ctx.path .. "/.env")
     end
 end)</code></pre>
-
-<h2 class="text-lg font-semibold text-zinc-200 mt-8 mb-3">Example: manage Claude trust</h2>
-<pre class="bg-zinc-900 border border-zinc-800 rounded-lg p-4 text-sm text-zinc-300 font-mono overflow-x-auto mb-6"><code>-- Auto-trust worktree on create
-hooks.on("worktree_created", "claude-trust", function(ctx)
-    json.file_set("~/.claude.json",
-        "projects." .. ctx.path .. ".hasTrustDialogAccepted", true)
-end)
-
--- Clean up trust entry on delete
-hooks.on("worktree_deleted", "claude-cleanup", function(ctx)
-    json.file_delete("~/.claude.json", "projects." .. ctx.path)
-end)</code></pre>

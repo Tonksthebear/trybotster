@@ -703,7 +703,7 @@ fn run_session(
     shutdown.store(true, Ordering::Release);
     let _ = writer_tx.send(PtyWriteCommand::Shutdown);
 
-    // Kill child process group so descendants (e.g. codex, claude) don't orphan
+    // Kill child process group so descendants don't orphan.
     if child_pid > 0 {
         let pgid = child_pid as i32;
         log::info!("[session] sending SIGTERM to process group {pgid}");
