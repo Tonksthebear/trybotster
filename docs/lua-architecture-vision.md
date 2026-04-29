@@ -95,7 +95,7 @@ The Rust binary is like Node.js or the JVM—infrastructure that rarely changes.
 
 Rails continues to handle:
 - **P2P negotiation** — WebRTC signaling
-- **GitHub event forwarding** — Webhook ingestion, routing to hubs
+- **Plugin event forwarding** — Optional integration webhooks, routing to hubs
 - **Auth & billing** — User accounts, subscriptions
 - **Hub registry** — Which hubs exist, their status
 - **Fundamental web pages** — Landing, settings, hub overview
@@ -288,7 +288,7 @@ Hub feeds a Rails-hosted React/Catalyst web UI with structured Lua layout/state 
 ### Architecture
 
 ```
-Browser
+Web client
 ├── React runtime
 ├── Catalyst/Tailwind components
 ├── Shared hub connection
@@ -332,7 +332,7 @@ end)
 
 ### React Renderer
 
-The browser renders trusted primitives. Plugins provide data and primitive composition, not arbitrary JavaScript:
+The web client renders trusted primitives. Plugins provide data and primitive composition, not arbitrary JavaScript:
 
 ```tsx
 registry.register("session_table", SessionTable)
@@ -365,7 +365,7 @@ end)
 1. Web UI renders from React/Catalyst primitives
 2. Real-time updates flow through hub collections/events
 3. User/plugin Lua can override surfaces and hooks
-4. Browser actions dispatch structured commands back to the hub
+4. Client actions dispatch structured commands back to the hub
 
 ---
 

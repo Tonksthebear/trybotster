@@ -1,22 +1,26 @@
 # Botster
 
-GitHub mention → autonomous Claude agent in isolated worktree.
+Local-first PTY workspace platform for agents, accessories, Lua automation, and encrypted clients.
 
 ## Architecture
 
 ```
-GitHub webhook → Rails server → Message queue → Rust daemon polls
-                                                      ↓
-                                              Lua plugin handles message
-                                                      ↓
-                                              Creates worktree, spawns Claude in PTY
+Client / plugin command → Rust daemon
+                              ↓
+                      Lua runtime handles lifecycle
+                              ↓
+              Creates workspace/worktree, spawns session PTYs
+                              ↓
+              Streams terminal state to connected clients
 ```
 
-**Rails server** (trybotster.com): Webhooks, hub registration, MCP tools, user auth via GitHub OAuth.
+**Rails server** (trybotster.com): Hub registration, user auth, template catalog, plugin event channels, and encrypted relay/signaling it cannot decrypt.
 
-**Rust daemon** (botster): TUI, browser client via WebRTC (E2E encrypted), Lua plugin system, PTY infrastructure, worktree management.
+**Rust daemon** (botster): TUI, web client transport via WebRTC (E2E encrypted), Lua plugin system, PTY infrastructure, worktree/workspace management.
 
 **Lua plugin system** (Neovim-inspired): Hot-reloadable plugins, ~20 Rust primitives exposed to Lua.
+
+GitHub and Claude support lives in plugins/templates, not the core product boundary.
 
 ## Running Tests
 
@@ -35,6 +39,6 @@ This ensures `BOTSTER_ENV=test` is set, preventing macOS keyring prompts.
 
 ## Patterns
 
-See `.claude/skills/rails-backend-guidelines/` - fat models, no service objects, POROs.
+Rails follows the repo conventions: fat models, concerns/callbacks where useful, POROs over service-object sprawl, and minimal gems.
 
 **NEVER PRECOMPILE ASSETS IN RAILS**

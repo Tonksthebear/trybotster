@@ -13,7 +13,7 @@ Session persistence in Botster is fragile:
 ## Design Goals
 
 1. **Universal** — same persistence model for main branch, worktrees, and future agent types; no special-casing
-2. **Rails-free** — works fully offline/private; Rails only enters when GitHub integration is needed
+2. **Rails-free** — works fully offline/private; Rails only enters for hosted coordination or optional integrations
 3. **Deterministic resurrection** — restart should always produce the same result given the same on-disk state
 4. **Meaningful recovery** — resurrection includes terminal history, not just blank screens
 5. **Cross-device ready** — designed so workspace sync can layer on via hub mesh (VPN/WebRTC), not retrofitted later
@@ -28,7 +28,7 @@ An agent is exactly one PTY process with autonomy and intent — it receives pro
 
 Any other PTY session in a workspace — a Rails server, REPL, log tail, debugger, one-shot script, whatever. An accessory has no AI autonomy; it's a tool you run alongside agents. The distinction is conceptual, not technical: both are PTY sessions under the hood.
 
-If a workspace needs a web server alongside a Claude agent, the Claude session is an agent and the web server is an accessory. Each has its own session directory, its own PTY log, its own lifecycle.
+If a workspace needs a web server alongside an AI coding agent, the coding session is an agent and the web server is an accessory. Each has its own session directory, its own PTY log, its own lifecycle.
 
 ### Session = Persistent Record of One Agent Run
 
@@ -42,11 +42,11 @@ A session captures everything about one agent's execution:
 ### Workspace = Unit of Work
 
 A workspace groups sessions working toward a shared goal. It is:
-- **A template** — declares what agents are needed (e.g., "1 Claude + 1 Rails server")
+- **A template** — declares what sessions are needed (e.g., "1 coding agent + 1 Rails server")
 - **A runtime** — sessions are spawned from the template, can be added/removed dynamically
 - **A history** — sessions persist even after the workspace is "done"
 
-A workspace may be backed by a GitHub issue (natural cross-device anchor) or be ad-hoc.
+A workspace may be backed by an external integration record, such as a GitHub issue, or be ad-hoc.
 
 ## Directory Layout
 
@@ -96,7 +96,7 @@ For dev: `~/.botster-dev/workspaces/` (follows existing `data_dir` config).
   "repo": "owner/repo",
   "branch": "botster-issue-42",
   "worktree_path": "/Users/user/.botster/worktrees/owner-repo-botster-issue-42",
-  "profile_name": "github",
+  "agent_name": "developer",
   "status": "active",
   "broker_sessions": {
     "0": 7
@@ -187,7 +187,7 @@ The existing `context.json` (in worktrees and `data_dir/agents/`) maps to this a
 | `metadata.broker_pty_rows_N` | session manifest `pty_dimensions` |
 | `metadata.issue_number` | workspace manifest `issue_number` |
 | `metadata.invocation_url` | workspace manifest `issue_url` |
-| `profile_name` | session manifest `profile_name` |
+| `profile_name` | session manifest `agent_name` or compatibility metadata during migration |
 | `created_at` | session manifest `created_at` |
 
 Migration path: on first startup after deploy, if old `context.json` found, migrate to new layout and delete old file.
@@ -249,8 +249,8 @@ Migration path: on first startup after deploy, if old `context.json` found, migr
 Workspace manifests sync via hub mesh (VPN/WebRTC) — no Rails.
 
 - Workspace ID is stable across devices
-- When GitHub issue is the anchor, issue number is the natural dedup key
+- When an integration issue is the anchor, the external issue id is the natural dedup key
 - Session manifests stay local; workspace roster (which sessions exist) syncs
 - PTY logs stay local (too large to sync); remote hubs see session list but not output
 
-Rails only enters for GitHub webhook delivery, same as today.
+Rails only enters for hosted coordination or optional integration webhook delivery.

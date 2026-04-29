@@ -64,20 +64,46 @@ Botster should use four layers.
 
 ### 1. Domain state
 
-Authoritative app state from hub/Lua:
+Authoritative app state from hub/Lua, shipped to clients as durable entity
+frames:
 
 - sessions
 - workspaces
+- spawn targets
+- worktrees
+- hub metadata
+- plugin-defined entities
+
+The durable shared state contract is:
+
+- `entity_snapshot`
+- `entity_upsert`
+- `entity_patch`
+- `entity_remove`
+
+Both the browser and TUI are equal consumers of this entity-frame stream. They
+may store it in different local structures, but the entity envelopes are the
+only shared durable model-state path.
+
+Presentation and control state is separate:
+
 - selection
 - notifications
 - preview lifecycle
 - modal state
+- route registry
+- rendered UI tree snapshots
+
+Those may influence rendering, navigation, or local workflow, but they must not
+compete with entity frames as durable domain state.
 
 ### 2. Shared UI contract
 
 Renderer-agnostic node tree plus action envelopes.
 
 This is the layer that should be shared between web and TUI.
+It may contain `$bind` references into entity stores and derived display props,
+but it should not duplicate full entity records as a second state store.
 
 ### 3. Renderer implementation
 
@@ -399,6 +425,11 @@ Prefer:
 
 That reduces payload size and keeps selectors shared.
 
+`ui_tree_snapshot` is therefore a presentation snapshot for one rendered
+surface. It is not a competing durable state stream. If a row needs live session
+or workspace data, reference the entity store by id or binding path and let both
+clients resolve it from the same `entity_*` frames.
+
 ### 2. Share action ids across clients
 
 The TUI and web should not invent separate command names for the same user intent.
@@ -451,6 +482,12 @@ The web runtime should use the same rule. This avoids two different state-owners
 
 The TUI does not need a flag day rewrite.
 
+The TUI should continue applying `entity_snapshot`, `entity_upsert`,
+`entity_patch`, and `entity_remove` into Rust entity stores, then adapt shared
+UI nodes against those stores. Route registries, UI tree snapshots, transient
+events, and request-scoped replies are presentation or control inputs around
+the entity store, not replacement model stores.
+
 The shared primitives can map onto the current Rust render tree like this:
 
 | Shared primitive | Current TUI concept |
@@ -470,6 +507,8 @@ That means the near-term work is primarily an adapter, not a full renderer rewri
 ## Mapping To Web Runtime
 
 The web runtime should map the same shared primitives onto React components.
+Like the TUI, it should consume durable model data from `entity_*` frames and
+treat `ui_route_registry` and `ui_tree_snapshot` as presentation/control inputs.
 
 Examples:
 

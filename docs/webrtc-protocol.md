@@ -1,6 +1,37 @@
 # WebRTC Message Protocol
 
-This document defines the message protocol between the browser and CLI over WebRTC DataChannel.
+This document defines the message protocol between the browser and CLI over
+WebRTC DataChannel. The durable model-state frames in this protocol are also
+the shared client state contract used by other clients, including the TUI over
+its hub bridge. Browser and TUI clients are equal consumers of the entity frame
+stream; WebRTC is only one transport.
+
+## Client State Paths
+
+Botster uses one durable shared state path for client-visible model data:
+
+- `entity_snapshot`
+- `entity_upsert`
+- `entity_patch`
+- `entity_remove`
+
+Every client that maintains Botster model state should apply those four entity
+frames into normalized per-entity stores. They are not browser-specific, and no
+browser-only frame should compete with them as a second durable state channel.
+
+Other frame families are intentionally non-durable:
+
+- request-scoped responses such as `agent_config`, `session_types`, `fs:*`, and
+  `template:response` answer one in-flight command and are not shared state
+- transient events such as `transient_event`, `spawn_target_feedback`,
+  `bridge_reconnected`, `hub_recovery_state`, and `hub_ready` drive immediate
+  workflow or connection effects
+- `ui_route_registry` is a presentation/control snapshot for routable surfaces,
+  not model state
+- `ui_tree_snapshot` is a presentation snapshot for one surface render, not a
+  durable entity store
+- terminal binary frames are PTY stream data for a terminal subscription, not
+  hub model state
 
 ## Framing
 
@@ -145,7 +176,12 @@ Delete an agent.
 | `agent_id` | string | Yes | Agent session key |
 | `delete_worktree` | boolean | No | Also delete the git worktree (default: false) |
 
-## CLI → Browser Messages
+## CLI → Client Messages
+
+The frames in this section are shown on the WebRTC transport, but durable entity
+frames are client-wide. Browser and TUI consumers should apply the same
+`entity_*` semantics when they receive those envelopes over their respective
+hub transports.
 
 ### subscribed
 
@@ -163,6 +199,11 @@ Confirmation that subscription is active.
 Hub model state is sent through entity frames. Subscribing to the hub channel
 sends one `entity_snapshot` per registered entity type; subsequent changes use
 `entity_upsert`, `entity_patch`, or `entity_remove`.
+
+These frames are the only durable shared state path. The browser applies them
+to frontend entity stores; the TUI applies the same envelopes to Rust entity
+stores. Presentation snapshots, route registries, request responses, and
+transient events must not be treated as alternate model-state channels.
 
 ```json
 {
@@ -215,7 +256,8 @@ sends one `entity_snapshot` per registered entity type; subsequent changes use
 
 ### error
 
-Error response.
+Error response. Request-scoped errors explain a failed command or subscription;
+they do not mutate durable model state.
 
 ```json
 {
@@ -227,7 +269,8 @@ Error response.
 
 ### ack
 
-Acknowledgment (used in handshake).
+Acknowledgment (used in handshake). This is connection control, not durable
+model state.
 
 ```json
 {
@@ -260,6 +303,6 @@ The raw bytes are the terminal output including ANSI escape sequences. No JSON e
 
 | Channel | Purpose |
 |---------|---------|
-| `HubChannel` | Entity model state and control plane |
+| `HubChannel` | Durable entity model state plus non-durable control/presentation frames |
 | `TerminalRelayChannel` | PTY input/output for a specific session |
 | `PreviewChannel` | Development server preview (future) |

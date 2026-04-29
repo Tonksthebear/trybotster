@@ -10,7 +10,7 @@ Primitives expose different calling patterns to control blocking semantics:
 - **Sync (positional shortcuts):** `http.get(url)`, `http.post(url, body)` — BLOCKING the event loop. Only safe at plugin load time (before hub starts). Using in callbacks breaks WebRTC health checks.
 - **Dedicated threads:** `websocket`, `action_cable` — spawn dedicated OS/async threads for I/O, keeping the hub event loop responsive.
 
-**Critical invariant:** The hub event loop runs inside tokio's `block_on()`. Any blocking operation (sync HTTP, file I/O) stalls the entire hub, preventing `dc_pong` responses from reaching the browser within 30 seconds. Browser times out and closes WebRTC connection. Always use async forms in callbacks and runtime code.
+**Critical invariant:** The hub event loop runs inside tokio's `block_on()`. Any blocking operation (sync HTTP, file I/O) stalls the entire hub, preventing `dc_pong` responses from reaching connected web clients within 30 seconds. The client times out and closes the WebRTC connection. Always use async forms in callbacks and runtime code.
 
 ## Core Primitives (no HubEventSender needed)
 
@@ -63,7 +63,7 @@ secrets.delete(key)
 
 ## Plugin Web Surfaces
 
-Plugins register browser surfaces through `lib.surfaces`. A registered surface
+Plugins register web client surfaces through `lib.surfaces`. A registered surface
 is routable at `/hubs/<hub_id>/<surface_name>` unless it explicitly opts out of
 navigation.
 
@@ -136,8 +136,8 @@ ui.session_terminal{
 ```
 
 Plugins can also expose generated static HTML through a sandboxed iframe. The
-browser fetches `botster-plugin-asset://...` sources over the existing hub
-connection and mounts them as blob URLs, so remote/tunneled browsers do not
+web client fetches `botster-plugin-asset://...` sources over the existing hub
+connection and mounts them as blob URLs, so remote/tunneled clients do not
 need access to the user's `localhost` or `file://` paths:
 
 ```lua
@@ -285,7 +285,7 @@ http.request({method="POST", url="...", headers={}, body/json=...}, function(res
 - **Table-first** (`http.request({...}, callback)`) — async, non-blocking. Callback runs asynchronously when request completes. Safe everywhere, especially in event handlers and plugin callbacks.
 - **Positional** (`http.get(url)`, etc.) — sync, BLOCKING the event loop. Only safe at plugin load time (before the hub event loop starts). Using these in callbacks will stall the hub and break WebRTC health checks.
 
-**Critical gotcha:** Calling `http.get()` inside a callback blocks the entire hub event loop, preventing `dc_pong` responses from reaching the browser within the 30-second health check window. This triggers a WebRTC disconnect. See [[HTTP blocking calls break WebRTC health checks]] in the knowledge vault.
+**Critical gotcha:** Calling `http.get()` inside a callback blocks the entire hub event loop, preventing `dc_pong` responses from reaching connected web clients within the 30-second health check window. This triggers a WebRTC disconnect. See [[HTTP blocking calls break WebRTC health checks]] in the knowledge vault.
 
 ### `timer`
 ```lua
