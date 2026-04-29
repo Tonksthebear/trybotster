@@ -338,7 +338,6 @@ impl LuaBootstrap {
                     agents = {},\
                     pending_fields = {},\
                     available_worktrees = {},\
-                    available_profiles = {},\
                     available_session_types = {},\
                     mode = 'normal',\
                     input_buffer = '',\

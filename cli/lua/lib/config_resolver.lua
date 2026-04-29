@@ -477,24 +477,18 @@ end
 -- Backward Compatibility: Migration Detection & Helpers
 -- =============================================================================
 
---- Check if the old profiles/ or shared/sessions/ structure exists.
+--- Check if the old shared/sessions/ structure exists.
 -- @param device_root string|nil Path to ~/.botster
 -- @param repo_root string|nil Path to repo root
 -- @return boolean true if legacy structure is detected
 function M.needs_migration(device_root, repo_root)
     if device_root then
-        if fs.exists(device_root .. "/profiles") and fs.is_dir(device_root .. "/profiles") then
-            return true
-        end
         if fs.exists(device_root .. "/shared/sessions") and fs.is_dir(device_root .. "/shared/sessions") then
             return true
         end
     end
     if repo_root then
         local rr = repo_root .. "/" .. repo_config_dirname(device_root)
-        if fs.exists(rr .. "/profiles") and fs.is_dir(rr .. "/profiles") then
-            return true
-        end
         if fs.exists(rr .. "/shared/sessions") and fs.is_dir(rr .. "/shared/sessions") then
             return true
         end
