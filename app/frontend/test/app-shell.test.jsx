@@ -4,6 +4,7 @@ import { render, screen, waitFor, act, cleanup } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import { AppRoutes } from '../components/AppShell'
 import { resetHubListSubscriptionForTest, useHubStore } from '../store/hub-store'
+import { useRouteRegistryStore } from '../store/route-registry-store'
 import { setHubId } from '../lib/modal-bridge'
 
 vi.mock('../lib/transport/hub_signaling_client', () => ({
@@ -35,8 +36,8 @@ vi.mock('../components/pages/PairingRoute', () => ({
 }))
 
 vi.mock('../components/catalyst/sidebar-layout', () => ({
-  SidebarLayout: ({ navbar, sidebar, children }) => (
-    <div>
+  SidebarLayout: ({ navbar, sidebar, children, flush }) => (
+    <div data-testid="sidebar-layout" data-flush={flush ? 'true' : 'false'}>
       <div>{navbar}</div>
       <div>{sidebar}</div>
       <div>{children}</div>
@@ -72,9 +73,9 @@ vi.mock('../components/catalyst/navbar', () => ({
 }))
 
 vi.mock('../components/UiTree', () => ({
-  default: ({ hubId, targetSurface, children }) => (
-    <div>
-      <div>{`UiTree:${hubId}:${targetSurface}`}</div>
+  default: ({ hubId, targetSurface, subpath, children }) => (
+    <div data-testid={`ui-tree-${targetSurface}`}>
+      <div>{`UiTree:${hubId}:${targetSurface}:${subpath || '/'}`}</div>
       {children}
     </div>
   ),
@@ -142,11 +143,19 @@ describe('AppRoutes', () => {
       disconnectHub: vi.fn(),
       getLastHubId: vi.fn(() => null),
     })
+    useRouteRegistryStore.setState({
+      routesByHubId: {},
+      snapshotReceivedAtByHubId: {},
+    })
   })
 
   afterEach(() => {
     cleanup()
     resetHubListSubscriptionForTest()
+    useRouteRegistryStore.setState({
+      routesByHubId: {},
+      snapshotReceivedAtByHubId: {},
+    })
     vi.useRealTimers()
   })
 
@@ -235,5 +244,51 @@ describe('AppRoutes', () => {
       expect(setHubId).toHaveBeenCalledWith('42')
       expect(screen.getByText('DialogHost:42')).toBeInTheDocument()
     })
+  })
+
+  it('renders plugin-owned session routes in the flush shell without TerminalCache', async () => {
+    useHubStore.setState({
+      selectedHubId: 'hub-1',
+      fetchHubList: vi.fn(() => Promise.resolve([{ id: 'hub-1', name: 'Hub', identifier: 'hub-1', active: true }])),
+    })
+    useRouteRegistryStore.getState().setRoutes('hub-1', [
+      {
+        path: '/vault',
+        base_path: '/vault',
+        surface: 'vault',
+        label: 'Vault',
+        routes: [{ path: '/' }, { path: '/sessions/:session_uuid' }],
+      },
+    ])
+
+    renderRoutes('/hubs/hub-1/vault/sessions/sess-1')
+
+    expect(await screen.findByTestId('sidebar-layout')).toHaveAttribute('data-flush', 'true')
+    expect(screen.queryByText('TerminalCache:hub-1')).toBeNull()
+    expect(screen.getByTestId('ui-tree-vault')).toHaveTextContent('UiTree:hub-1:vault:/sessions/sess-1')
+  })
+
+  it('swaps to a plugin sidebar with a back button when the active surface declares one', async () => {
+    useHubStore.setState({
+      selectedHubId: 'hub-1',
+      fetchHubList: vi.fn(() => Promise.resolve([{ id: 'hub-1', name: 'Hub', identifier: 'hub-1', active: true }])),
+    })
+    useRouteRegistryStore.getState().setRoutes('hub-1', [
+      {
+        path: '/vault',
+        base_path: '/vault',
+        surface: 'vault',
+        label: 'Vault',
+        sidebar: { surface: 'vault_sidebar' },
+        routes: [{ path: '/' }],
+      },
+    ])
+
+    renderRoutes('/hubs/hub-1/vault')
+
+    expect(await screen.findByTestId('plugin-sidebar-title')).toHaveTextContent('Vault')
+    expect(screen.getByTestId('ui-tree-vault_sidebar')).toHaveTextContent('UiTree:hub-1:vault_sidebar:/')
+    expect(screen.queryByTestId('ui-tree-workspace_sidebar')).toBeNull()
+    expect(screen.getByTestId('plugin-sidebar-back')).toBeInTheDocument()
   })
 })

@@ -15,6 +15,7 @@ import { create } from 'zustand'
 //       surface,           // wire target_surface identifier
 //       label,
 //       icon,
+//       sidebar?,          // optional route-scoped sidebar surface descriptor
 //       hide_from_nav?,
 //       routes?,           // sub-patterns: [{ path }]
 //     }>,

@@ -134,6 +134,39 @@ local function normalize_nav(opts)
     }
 end
 
+local function normalize_sidebar(opts)
+    local raw = opts.sidebar
+    if raw == nil or raw == false then return nil end
+
+    if type(raw) == "string" then
+        raw = { surface = raw }
+    end
+    assert(type(raw) == "table",
+        "surfaces.register: sidebar must be a table, string, or false")
+
+    local surface = raw.surface or raw.target_surface
+    assert(is_nonempty_string(surface),
+        "surfaces.register: sidebar.surface must be a non-empty string")
+
+    local subpath = raw.subpath or raw.path
+    if subpath ~= nil then
+        assert(type(subpath) == "string" and subpath ~= "",
+            "surfaces.register: sidebar.subpath must be a non-empty string when provided")
+        if subpath:sub(1, 1) ~= "/" then subpath = "/" .. subpath end
+    end
+
+    local label = raw.label
+    if label ~= nil and not is_nonempty_string(label) then
+        error("surfaces.register: sidebar.label must be a non-empty string when provided")
+    end
+
+    return {
+        surface = surface,
+        subpath = subpath,
+        label = label,
+    }
+end
+
 local function notify_changed()
     if type(hooks) == "table" and type(hooks.notify) == "function" then
         pcall(hooks.notify, "surfaces_changed", { registry = M })
@@ -433,6 +466,7 @@ function M.register(name, opts)
     local render = make_dispatcher(name, base_path, compiled_routes)
     local clients = normalize_clients(opts)
     local nav = normalize_nav(opts)
+    local sidebar = normalize_sidebar(opts)
 
     local entry = {
         name = name,
@@ -449,6 +483,7 @@ function M.register(name, opts)
         label = is_nonempty_string(opts.label) and opts.label or name,
         icon = is_nonempty_string(opts.icon) and opts.icon or nil,
         nav = nav,
+        sidebar = sidebar,
         render = render,
         compiled_routes = compiled_routes,
         input_builder = type(opts.input_builder) == "function" and opts.input_builder or nil,
@@ -566,6 +601,7 @@ function M.list()
             label = entry.label,
             icon = entry.icon,
             nav = entry.nav,
+            sidebar = entry.sidebar,
             hide_from_nav = entry.hide_from_nav,
             order = entry.order,
             seq = entry.seq,
@@ -617,6 +653,7 @@ function M.build_route_registry_payload(hub_id)
                 label = summary.label,
                 icon = summary.icon,
                 nav = summary.nav,
+                sidebar = summary.sidebar,
                 hide_from_nav = summary.hide_from_nav or nil,
                 routes = sub_patterns,
             }

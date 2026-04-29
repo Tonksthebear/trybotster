@@ -16,7 +16,7 @@ export function SessionTerminal({
   ctx,
 }: SessionTerminalProps): ReactElement {
   return (
-    <div className="h-full min-h-[70vh] overflow-hidden rounded-md border border-zinc-800 bg-zinc-950">
+    <div className="h-full min-h-0 overflow-hidden bg-zinc-950">
       <TerminalView hubId={ctx.hubId} sessionUuid={sessionUuid} />
     </div>
   )

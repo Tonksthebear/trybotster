@@ -20,5 +20,10 @@ describe('<SessionTerminal>', () => {
     )
 
     expect(screen.getByTestId('terminal-view')).toHaveTextContent('hub-1:sess-1')
+    const wrapper = screen.getByTestId('terminal-view').parentElement
+    expect(wrapper).toHaveClass('h-full')
+    expect(wrapper).toHaveClass('min-h-0')
+    expect(wrapper).toHaveClass('overflow-hidden')
+    expect(wrapper).not.toHaveClass('min-h-[70vh]')
   })
 })
