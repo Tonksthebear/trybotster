@@ -209,6 +209,45 @@ Notification URLs for plugin-owned sessions route through
 `/hubs/<hub>/<surface>/sessions/<session_uuid>` when the session has
 `visibility = "plugin"` and a matching `surface`/`owner_plugin`.
 
+### Custom HTML Views
+
+Use `lib.plugin_assets` plus `ui.iframe` when a plugin needs a fully custom
+HTML/CSS/JS interface, such as a generated graph or drag-and-drop board. Do not
+inject raw HTML into the parent Botster app.
+
+```lua
+local plugin_assets = require("lib.plugin_assets")
+
+local board_url = plugin_assets.expose_file("kanban_board", "/path/to/board.html", {
+  content_type = "text/html",
+})
+
+plugin_assets.on_message("card.move", function(payload, ctx)
+  -- Validate payload and update plugin-owned state.
+end)
+
+ui.iframe{
+  src = board_url,
+  title = "Board",
+  sandbox = "allow-scripts",
+  bridge = { actions = { "card.move" } },
+}
+```
+
+Iframe JavaScript can post:
+
+```js
+window.parent.postMessage({
+  type: "botster.plugin_action",
+  action: "card.move",
+  payload: { card_id: "c1", to_column: "done", position: 2 },
+}, "*")
+```
+
+Only actions declared in `bridge.actions` are forwarded to the hub. Keep the
+iframe sandboxed by default and use self-contained HTML unless you also expose
+supporting assets deliberately.
+
 ## References
 
 - `docs/lua/primitives.md` — primitive APIs and execution model.
