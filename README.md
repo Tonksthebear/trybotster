@@ -1,16 +1,16 @@
 # Botster
 
-**Your agents. Your machine. From anywhere.**
+**Your PTY workspaces. Your machine. From anywhere.**
 
-Run autonomous AI agents on your machine. Monitor them from any device through P2P encrypted connections the server can never read.
+Run local agents and supporting PTY sessions on your machine. Control workspaces from multiple clients through P2P encrypted connections the server can never read.
 
 ## Features
 
 - **Zero-Knowledge Architecture** — Keys exchanged offline via QR code. The server relays encrypted blobs it can never read.
-- **Multi-Agent Management** — Run 20+ agents simultaneously, each in isolated git worktrees. Manage from the TUI or your browser.
-- **Plugin System** — Extensible Lua plugin architecture with a template catalog for one-click install from the browser.
+- **Workspace Management** — Run 20+ agent and accessory sessions simultaneously, each in an isolated git worktree or admitted local target. Manage them from the TUI or web client.
+- **Plugin System** — Extensible Lua plugin architecture with a template catalog for one-click install from the web client.
 - **Local-First Execution** — Agents run on your hardware. Keys live in your OS keychain. No cloud execution, no vendor lock-in.
-- **Agents & Accessories** — Define AI agents and plain PTY accessories at device or repo level. Workspace manifests auto-spawn groups of sessions with optional port forwarding over encrypted WebRTC.
+- **Agents & Accessories** — Define AI agents and plain PTY accessories at device or target level. Workspace manifests auto-spawn groups of sessions with optional port forwarding over encrypted WebRTC.
 
 ## Privacy Model
 
@@ -87,24 +87,24 @@ On first run, the CLI will prompt you to name your hub (defaults to the repo nam
   Press Enter to open browser (or visit the URL above)...
 ```
 
-Visit the URL, sign in with GitHub, and approve. Token is saved securely in your OS keychain.
+Visit the URL, sign in, and approve. Token is saved securely in your OS keychain.
 
-### 2. Configure your repository
+### 2. Configure your project
 
-Set up a `.botster/` directory in your repo (see [Repository Setup](#repository-setup)) or use the browser Settings page to configure sessions and install templates.
+Set up a `.botster/` directory in your project (see [Project Setup](#project-setup)) or use the web client's Settings page to configure sessions and install templates.
 
-### 3. Connect your browser
+### 3. Connect a client
 
 Open [trybotster.com/hubs](https://trybotster.com/hubs) and scan the QR code displayed in the TUI. This establishes the E2E encrypted P2P connection — the server never sees your data.
 
 ### 4. Create agents
 
-Create agents from the browser or from the TUI menu (`Ctrl+P`). Terminal output streams in real-time over the encrypted connection.
+Create agents from the web client or from the TUI menu (`Ctrl+P`). Terminal output streams in real-time over the encrypted connection.
 
 ## Architecture
 
 ```
-Browser / TUI
+Web client / TUI
       |
   Create agent (manual or plugin-triggered)
       |
@@ -121,7 +121,7 @@ Browser / TUI
 
 **Rails server** ([trybotster.com](https://trybotster.com)) — User auth, hub management, template catalog, plugin event channels. Relays E2E encrypted data it cannot decrypt.
 
-**Rust daemon** (botster) — Interactive TUI with ratatui, event-driven Lua runtime for agent lifecycle, creates isolated git worktrees, spawns sessions in PTYs, streams terminal over encrypted WebRTC.
+**Rust daemon** (botster) — Interactive TUI with ratatui, event-driven Lua runtime for agent lifecycle, creates isolated git worktrees, spawns sessions in PTYs, streams terminal state over encrypted WebRTC to connected clients.
 
 **Lua runtime** — Hot-reloadable event-driven plugin system. Core handlers manage agent lifecycle, WebRTC signaling, hub commands, and TUI keybindings. User-extensible via plugins in `.botster/`.
 
@@ -154,16 +154,16 @@ Shift+End       - Scroll to bottom
 Ctrl+Q          - Quit daemon
 ```
 
-## Repository Setup
+## Project Setup
 
-Each repository that uses Botster needs a `.botster/` configuration directory. You can set this up manually or use the browser Settings page (Settings > Config tab) to create and edit files over E2E encrypted connections. Session and plugin templates are available for one-click install from the Settings > Templates tab.
+Each project that uses Botster can have a `.botster/` configuration directory. You can set this up manually or use the web client's Settings page (Settings > Config tab) to create and edit files over E2E encrypted connections. Session and plugin templates are available for one-click install from the Settings > Templates tab.
 
 ### Directory structure
 
 ```
 .botster/
   agents/
-    claude/                        # Agent definition (AI-driven PTY)
+    developer/                     # Agent definition (AI-driven PTY)
       initialization               # startup script (required: at least one agent)
   accessories/
     rails-server/                  # Accessory definition (plain PTY, no AI)
@@ -177,12 +177,12 @@ Each repository that uses Botster needs a `.botster/` configuration directory. Y
 
 ### Config resolution
 
-Configuration is resolved across 2 layers (repo wins on collision):
+Configuration is resolved across 2 layers (project wins on collision):
 
 1. **Device** (`~/.botster/`) — Personal defaults for all repos
-2. **Repo** (`{repo}/.botster/`) — Project-specific config (highest priority)
+2. **Project** (`{project}/.botster/`) — Project-specific config (highest priority)
 
-At least one agent config is required. Agents, accessories, and plugins are all merged per-name with repo overriding device.
+At least one agent config is required. Agents, accessories, and plugins are all merged per-name with project overriding device.
 
 ### Example: accessory with dev server
 
@@ -193,21 +193,21 @@ An accessory that runs a dev server with port forwarding:
 .botster/accessories/server/port_forward      # empty sentinel file
 ```
 
-The `port_forward` sentinel file tells Botster to assign a `$PORT` and tunnel it over encrypted WebRTC for browser preview.
+The `port_forward` sentinel file tells Botster to assign a `$PORT` and tunnel it over encrypted WebRTC for client previews.
 
 ## Plugins
 
-Plugins are Lua scripts that extend Botster's behavior. They live in `.botster/plugins/{name}/init.lua` at either the device or repo level, with repo overriding device.
+Plugins are Lua scripts that extend Botster's behavior. They live in `.botster/plugins/{name}/init.lua` at either the device or project level, with project config overriding device defaults.
 
 ### Installing plugins
 
-The easiest way to install plugins is from the browser: go to your hub's **Settings > Templates** tab, which shows a catalog of available plugins. One click installs to either device or repo scope.
+The easiest way to install plugins is from the web client: go to your hub's **Settings > Templates** tab, which shows a catalog of available plugins. One click installs to either device or project scope.
 
 You can also create plugins manually by adding an `init.lua` to the appropriate plugins directory.
 
 ### GitHub plugin
 
-The GitHub plugin subscribes to webhook events for your repository and automatically creates agents when `@botster` is mentioned in issues or PRs. Install it from the Templates catalog.
+GitHub is an optional plugin, not the core Botster workflow. The GitHub plugin subscribes to webhook events for your repository and can create agents when `@botster` is mentioned in issues or PRs. Install it from the Templates catalog.
 
 Once installed, mentioning `@botster` in a GitHub issue or PR will:
 
@@ -285,13 +285,13 @@ The output should show `env_vars: BOTSTER_SESSION_UUID`.
 
 ## Templates
 
-The Settings > Templates tab in the browser provides a catalog of installable templates:
+The Settings > Templates tab in the web client provides a catalog of installable templates:
 
-- **Sessions** — Pre-configured session initialization scripts (e.g., Claude agent session)
+- **Sessions** — Pre-configured session initialization scripts (e.g., coding-agent sessions)
 - **Plugins** — Lua plugins (e.g., GitHub integration)
 - **Initialization** — User init.lua for custom hooks and commands
 
-Templates can be installed to either device scope (`~/.botster/`) or repo scope (`{repo}/.botster/`) and are transferred over E2E encrypted connections.
+Templates can be installed to either device scope (`~/.botster/`) or project scope (`{project}/.botster/`) and are transferred over E2E encrypted connections.
 
 ## Testing
 

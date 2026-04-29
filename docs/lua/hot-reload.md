@@ -131,12 +131,32 @@ Agent-written Lua in `~/.botster/lua/improvements/*.lua` runs in a restricted sa
 
 ## Rails-Side Templates
 
-Template Lua files live in `app/templates/` and are installed via the `template:install` command:
+Rails serves a template catalog from a simple repository directory. The current
+source root is `app/templates/`; Rails reads matching `*.lua`, `*.sh`, and `*.md`
+files, extracts manifest-like `@tag` metadata from the comment header, and
+returns file content as-is. Rails should stay a generic catalog reader here, not
+the owner of product policy for which templates exist.
+
+Required metadata:
+
+| Tag | Purpose |
+|-----|---------|
+| `@template` | Display name |
+| `@description` | Catalog summary |
+| `@category` | Catalog group, such as `agents` or `plugins` |
+| `@dest` | Install destination under the Botster config root |
+| `@scope` | Default install scope |
+| `@version` | Template version, defaults to `1.0.0` when omitted |
+
+The source root is intentionally isolated behind the catalog reader so a future
+change can point it at a static directory or synced GitHub source without making
+Rails a template policy layer.
+
+Catalog entries are installed via the `template:install` command:
 
 | Template | Installs to |
 |----------|-------------|
 | `initialization/basic.lua` | `user/init.lua` — user's personal init |
-| `sessions/example.lua` | `sessions/example/init.lua` — starter session config |
 | `plugins/github/init.lua` | `plugins/github/init.lua` - GitHub plugin entrypoint |
 | `plugins/github/web_layout.lua` | `plugins/github/web_layout.lua` - plugin-owned support file |
-| `agents/claude/notes.md` | `agents/claude/notes.md` - paired agent definition file |
+| `agents/{name}/notes.md` | `agents/{name}/notes.md` - paired agent definition file |

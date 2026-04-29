@@ -8,7 +8,7 @@ The device hub owns:
 
 - one local runtime and socket
 - one Olm/WebRTC identity
-- one browser peer connection per browser identity/tab
+- one peer connection per web client identity/tab
 - many explicitly admitted spawn targets
 - many workspaces and sessions across those targets
 
@@ -21,7 +21,7 @@ This preserves the current `.botster` override behavior while removing the ambie
 3. Deny by default: no process may spawn in an arbitrary directory unless that path was explicitly admitted as a spawn target.
 4. Support both git-backed and plain-directory targets.
 5. Treat git capabilities as dynamic properties of a target path, not immutable target type.
-6. Keep one WebRTC connection per browser identity/tab and reuse it across all target/workspace/session activity.
+6. Keep one WebRTC connection per web client identity/tab and reuse it across all target/workspace/session activity.
 
 ## Non-Goals
 
@@ -39,7 +39,7 @@ It is device-scoped, not repo-scoped:
 
 - starts from the user's home directory
 - owns the device-local Unix socket and lock
-- owns the device-local crypto identity for browser communication
+- owns the device-local crypto identity for web client communication
 - manages all admitted spawn targets
 
 The hub process must never derive trust or repo identity from its own `cwd`.
@@ -118,7 +118,7 @@ Allowed:
 
 ### Enforcement Layer
 
-Security must be enforced in Rust, not only in TUI/browser code.
+Security must be enforced in Rust, not only in client code.
 
 The UI may prevent bad inputs, but runtime enforcement is authoritative.
 
@@ -178,7 +178,7 @@ Git-dependent commands must check capabilities fresh at execution time.
 
 ## Workspaces and Sessions
 
-Workspaces and sessions must carry target identity explicitly so reconnect, browser UI, MCP, and restoration never depend on process `cwd`.
+Workspaces and sessions must carry target identity explicitly so reconnect, client UI, MCP, and restoration never depend on process `cwd`.
 
 ### Workspace Manifest
 
@@ -235,7 +235,7 @@ The new architecture should use:
 
 - one Olm identity per device hub
 - one `CryptoService` for that hub
-- one WebRTC peer connection per browser identity/tab
+- one WebRTC peer connection per web client identity/tab
 
 All activity for all targets, workspaces, and sessions should flow over that shared peer connection.
 
@@ -247,9 +247,9 @@ Reasons:
 
 This change is allowed to break existing repo-scoped relay identity continuity. No migration is required.
 
-## GitHub Integration
+## Optional GitHub Integration
 
-Current GitHub delivery is already repo-scoped.
+GitHub delivery is an optional plugin/integration and is already repo-scoped.
 
 The device hub must subscribe to GitHub events per admitted git-backed target repo, not per launch directory.
 
@@ -305,7 +305,7 @@ Both clients need:
 - add/remove/enable/disable targets
 - select target before spawning
 
-The browser does not need to be a general file manager.
+The client does not need to be a general file manager.
 
 ## Backend API Shape
 

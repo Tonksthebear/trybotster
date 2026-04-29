@@ -24,7 +24,7 @@ cli/lua/
     tui.lua          # TUI transport handler
     socket.lua       # Unix socket IPC transport handler
     hub_commands.lua # ActionCable HubCommandChannel plugin
-    filesystem.lua   # fs:* browser commands
+    filesystem.lua   # fs:* client commands
     templates.lua    # template:* commands
     plugin_watcher.lua # Hot-reload via PollWatcher for plugin directories
   ui/                # Separate mlua instance (TUI-side)
@@ -59,12 +59,12 @@ Override search chain for `require()`: `{repo}/.botster/lua/` -> `~/.botster/lua
 
 ## `.botster/` Config Directory (2-Layer Resolution)
 
-ConfigResolver merges configs across 2 layers (repo wins on name collision):
+ConfigResolver merges configs across 2 layers (target-local wins on name collision):
 
 ```
 ~/.botster/                              # device_root (Layer 1)
   agents/
-    claude/
+    developer/
       initialization                     # REQUIRED: at least one agent config
       notes.md                           # Optional paired file owned by this agent
   accessories/
@@ -79,11 +79,11 @@ ConfigResolver merges configs across 2 layers (repo wins on name collision):
       web_layout.lua                     # Optional plugin-owned support files
       tui/status.lua                     # Optional TUI file declared by init.lua
 
-{repo}/.botster/                         # repo_root (Layer 2, highest priority)
+{target}/.botster/                       # target_root (Layer 2, highest priority)
   agents/ accessories/ workspaces/ plugins/
 ```
 
-Agents, accessories, and plugins are directory units merged per-name with repo overriding device. Only the entrypoint filename is fixed: sessions use `initialization`, plugins use `init.lua`, and any other files in the directory are owned by that definition. Session scripts can use `botster context session_dir` to locate the owning `agents/<name>/` or `accessories/<name>/` directory, or `botster context file <relative-path>` to read a paired file by whatever name the author chooses.
+Agents, accessories, and plugins are directory units merged per-name with target-local definitions overriding device defaults. Only the entrypoint filename is fixed: sessions use `initialization`, plugins use `init.lua`, and any other files in the directory are owned by that definition. Session scripts can use `botster context session_dir` to locate the owning `agents/<name>/` or `accessories/<name>/` directory, or `botster context file <relative-path>` to read a paired file by whatever name the author chooses.
 
 Worktree file copying and cleanup are handled via the **Workspace Include** plugin template (hooks into `worktree_created` and `worktree_deleted`).
 

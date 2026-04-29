@@ -2,7 +2,7 @@
 
 ## Goal
 
-Replace the old browser-side "template cloning plus Stimulus reconciliation" approach for live operator surfaces with a Rails-owned React/Catalyst runtime that renders trusted Botster primitives from structured data.
+Replace the old web-client-side "template cloning plus Stimulus reconciliation" approach for live operator surfaces with a Rails-owned React/Catalyst runtime that renders trusted Botster primitives from structured data.
 
 This spec is the web renderer application of the shared contract in [cross-client-ui-primitives.md](cross-client-ui-primitives.md). The cross-client spec owns primitive names, shared action semantics, and renderer-neutral state ownership rules. This document only defines the web-specific rollout and the phase-1 adapter boundary.
 
@@ -12,7 +12,7 @@ This is the web equivalent of the TUI model:
 
 - Rails owns the trusted runtime, primitive registry, styling, and accessibility behavior
 - hub/Lua owns authoritative state and declarative composition
-- the browser renders locally and emits structured actions
+- the web client renders locally and emits structured actions
 
 Botster's operator frontend is a React/Catalyst application hosted by Rails. Rails still owns authentication, persistence, and HTTP endpoints, but live hub surfaces, settings workflows, and plugin-defined UI should use the React runtime and the hub collection/event contract instead of Turbo, Stimulus, or server-rendered HTML fragments.
 
@@ -32,9 +32,9 @@ That is the wrong shape for Stimulus. The next runtime must render from normaliz
 
 ## Decision Summary
 
-- React is the browser runtime for live operator surfaces
-- Catalyst/Tailwind components are the browser component system
-- React Query owns browser request caches and loading/error states
+- React is the web client runtime for live operator surfaces
+- Catalyst/Tailwind components are the web component system
+- React Query owns client request caches and loading/error states
 - Zustand owns local UI state plus hub-pushed entity collections
 - Rails owns the primitive/component registry
 - hub/Lua does not send HTML, CSS, or JavaScript
@@ -67,16 +67,16 @@ Later phases move the remaining frontend surfaces onto the same runtime. The Rea
 
 - Turbo/Stimulus compatibility paths for hub-owned UI
 - server-rendered HTML fragments for live hub surfaces
-- duplicate browser renderers for the same hub-owned surface
+- duplicate client renderers for the same hub-owned surface
 - connection-code cards in plugin/layout surfaces; pairing URLs are requested and shown only by the React `Share` modal
 - request caches implemented in Zustand
-- arbitrary user-authored browser composition
+- arbitrary user-authored web client composition
 
 Settings/forms remain Rails-authenticated React/Catalyst surfaces until a shared Lua form contract exists.
 
-## Browser State Ownership
+## Client State Ownership
 
-The browser has three state classes:
+The web client has three state classes:
 
 - Hub-pushed collections and events: normalized into Zustand entity stores from the shared hub connection.
 - Request/response data: loaded through React Query. This includes `/hubs.json`, `/hubs/:id/settings.json`, and target-scoped agent/accessory config discovery.
@@ -100,7 +100,7 @@ The hub continues to send the existing state-oriented payloads. The React island
 
 ### 2. Rails-owned primitive registry
 
-Rails defines the stable browser primitive inventory and prop schemas. This is the future Lua-facing surface area.
+Rails defines the stable web primitive inventory and prop schemas. This is the future Lua-facing surface area.
 
 ### 3. Internal phase-1 composites
 
@@ -154,7 +154,7 @@ type AgentWorkspaceSurfaceInput = {
 }
 ```
 
-### Normalized browser store
+### Normalized client store
 
 The runtime should normalize that input into a store shaped like:
 
@@ -178,7 +178,7 @@ type AgentWorkspaceStore = {
 Rules:
 
 - hub data remains the single remote source of truth
-- `collapsedWorkspaceIds` is browser-local UI state
+- `collapsedWorkspaceIds` is client-local UI state
 - selection is derived from route plus hub state, then stored as `selectedSessionId`
 - runtime selectors derive display names, title lines, preview affordances, and row density
 
@@ -506,7 +506,7 @@ type HostedPreviewErrorProps = {
 Emits:
 
 - no hub action
-- optional browser navigation to `installUrl`
+- optional web client navigation to `installUrl`
 
 ### `SessionActionsMenu`
 
@@ -541,7 +541,7 @@ These action ids are the only user-intent events the phase-1 composites may emit
 | `botster.workspace.rename.request` | `{ workspaceId, currentName }` | open rename UI, then call `hub.renameWorkspace` |
 | `botster.session.select` | `{ sessionId, sessionUuid }` | navigate/select, then call `hub.selectAgent` |
 | `botster.session.preview.toggle` | `{ sessionId, sessionUuid }` | call `hub.toggleHostedPreview(sessionUuid)` |
-| `botster.session.preview.open` | `{ sessionId, sessionUuid, url }` | browser navigation only |
+| `botster.session.preview.open` | `{ sessionId, sessionUuid, url }` | web client navigation only |
 | `botster.session.move.request` | `{ sessionId, sessionUuid }` | open move UI, then call `hub.moveAgentWorkspace` |
 | `botster.session.delete.request` | `{ sessionId, sessionUuid, inWorktree }` | open delete UI, then call `hub.deleteAgent` |
 

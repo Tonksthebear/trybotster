@@ -13,8 +13,8 @@ Called per keypress via `handle_key(key, mode, context)`. Returns an action stri
 | `normal` | No agent selected | Shared modifier bindings only |
 | `insert` | Agent selected, PTY active | Shared bindings + unbound keys forward to PTY |
 | `menu` | Ctrl+P pressed | Escape/q=close, arrows/j/k=navigate, Enter/Space=select, 1-9=shortcut |
-| `new_agent_select_profile` | New agent, multiple profiles | List navigation |
-| `new_agent_select_worktree` | Profile selected | List navigation |
+| `new_agent_select_profile` | New agent, multiple agent configs (legacy mode name) | List navigation |
+| `new_agent_select_worktree` | Agent config selected | List navigation |
 | `new_agent_create_worktree` | Create worktree selected | Text input mode |
 | `new_agent_prompt` | Worktree selected | Text input mode |
 | `close_agent_confirm` | Close menu item | y=close, d=close+delete, n/Esc=cancel |
@@ -63,9 +63,9 @@ Called each frame via `render(state)` and `render_overlay(state)`. Returns a tre
 | `mode` | Current UI mode string |
 | `input_buffer` | Current text input |
 | `list_selected` | 0-based list cursor |
-| `pending_fields` | Wizard state (creating_agent_id, creating_agent_stage, profile, etc.) |
+| `pending_fields` | Wizard state (creating_agent_id, creating_agent_stage, selected agent config, etc.) |
 | `available_worktrees` | Worktree list for modal |
-| `available_profiles` | Profile list for modal |
+| `available_profiles` | Agent config list for modal (legacy field name) |
 
 ### Render Node Types
 
@@ -119,10 +119,21 @@ Called via `on_hub_event(event_type, event_data, context)`. Returns ops like act
 ### Hub Event Types Handled
 
 Durable model state is consumed through `entity_snapshot`, `entity_upsert`,
-`entity_patch`, and `entity_remove` by the Rust entity stores. Lua handles
-transient workflow events: `pty_notification`, `spawn_target_feedback`,
-`agent_config`, `connection_code`, `connection_code_error`,
-`bridge_reconnected`, `hub_recovery_state`, and `hub_ready`.
+`entity_patch`, and `entity_remove` by the Rust entity stores. This is the same
+client-wide entity frame contract consumed by the browser; the TUI is not a
+secondary state path. Shared UI nodes and `$bind` lookups should read from these
+stores for model data.
+
+Lua handles non-durable events and command responses:
+
+- transient workflow and connection events: `pty_notification`,
+  `spawn_target_feedback`, `bridge_reconnected`, `hub_recovery_state`, and
+  `hub_ready`
+- request-scoped or workflow responses: `agent_config`, `connection_code`, and
+  `connection_code_error`
+- presentation/control frames, when relevant to a client: route registry and UI
+  tree snapshots describe navigation and rendered surfaces, not durable model
+  state
 
 ## `ui/botster.lua` — Extension API
 

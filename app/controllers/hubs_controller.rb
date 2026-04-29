@@ -2,7 +2,6 @@
 
 class HubsController < ApplicationController
   include ApiKeyAuthenticatable
-  include TemplateReadable
 
   before_action :authenticate_user!, only: [ :index, :show ]
   before_action :authenticate_hub_request!, only: [ :create, :update, :destroy ]
