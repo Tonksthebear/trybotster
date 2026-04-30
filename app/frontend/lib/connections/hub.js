@@ -307,6 +307,7 @@ const TRANSPORT_METHODS = [
   "installTemplate",
   "uninstallTemplate",
   "listInstalledTemplates",
+  "refreshTemplates",
   "reloadPlugin",
   "loadPlugin",
   "send",
