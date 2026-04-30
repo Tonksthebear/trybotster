@@ -487,6 +487,10 @@ export class HubTransport extends HubRoute {
     return this.templateRequest("template:list", { target_id: targetId, scope: targetId ? "repo" : undefined });
   }
 
+  refreshTemplates() {
+    return this.templateRequest("template:refresh");
+  }
+
   reloadPlugin(pluginName, targetId) {
     return this.templateRequest("plugin:reload", { plugin_name: pluginName, target_id: targetId });
   }

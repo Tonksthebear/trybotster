@@ -6,6 +6,7 @@ function mockHub(overrides = {}) {
     listInstalledTemplates: vi.fn(() => Promise.resolve({ installed: [] })),
     installTemplate: vi.fn(() => Promise.resolve()),
     uninstallTemplate: vi.fn(() => Promise.resolve()),
+    refreshTemplates: vi.fn(() => Promise.resolve()),
     loadPlugin: vi.fn(() => Promise.resolve()),
     ...overrides,
   }
@@ -116,5 +117,15 @@ describe('settings store template install state', () => {
       'init.lua',
       'web_layout.lua',
     ])
+  })
+
+  it('requests a fresh template catalog from the hub', async () => {
+    const hub = mockHub()
+    useSettingsStore.setState({ hub })
+
+    await useSettingsStore.getState().refreshTemplates()
+
+    expect(hub.refreshTemplates).toHaveBeenCalled()
+    expect(useSettingsStore.getState().templateFeedback).toBe('Template refresh started.')
   })
 })

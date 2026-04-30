@@ -286,7 +286,8 @@ safe_require("handlers.commands")
 -- Must load after commands registry.
 safe_require("handlers.filesystem")
 
--- Load template command handlers (template:install, template:uninstall, template:list)
+-- Load template command handlers (template:install, template:uninstall,
+-- template:list, template:refresh)
 -- Must load after commands registry.
 safe_require("handlers.templates")
 
