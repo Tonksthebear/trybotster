@@ -18,7 +18,7 @@ const mockHub = {
     load: vi.fn(() => Promise.resolve([])),
   },
   ensureAgentConfig: vi.fn(() => Promise.resolve()),
-  send: vi.fn(() => Promise.resolve(true)),
+  sendCommand: vi.fn(() => Promise.resolve(true)),
   on: vi.fn((eventName, callback) => {
     listeners[eventName] = callback
     return () => {
@@ -76,7 +76,7 @@ describe('NewAgentForm', () => {
     Object.keys(listeners).forEach((key) => delete listeners[key])
     vi.clearAllMocks()
     mockHub.ensureAgentConfig.mockResolvedValue({ agents: [], accessories: [], workspaces: [] })
-    mockHub.send.mockResolvedValue(true)
+    mockHub.sendCommand.mockResolvedValue(true)
     _resetEntityStoresForTest()
     useSpawnTargetStore.getState().applySnapshot(
       [{ id: 'target-1', name: 'Repo' }],
@@ -156,7 +156,7 @@ describe('NewAgentForm', () => {
     await screen.findByText('Codex')
     await user.click(screen.getByText('Create Agent'))
 
-    expect(mockHub.send).toHaveBeenCalledWith('create_agent', expect.objectContaining({
+    expect(mockHub.sendCommand).toHaveBeenCalledWith('create_agent', expect.objectContaining({
       target_id: 'target-1',
       agent_name: 'codex',
     }))

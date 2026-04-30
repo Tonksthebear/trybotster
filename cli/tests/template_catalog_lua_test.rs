@@ -53,7 +53,10 @@ fn repository_catalog_includes_cloudflare_hosted_preview_template() {
         .eval()
         .expect("repository catalog should be parseable");
 
-    assert!(ok, "catalog should expose Cloudflare hosted preview as a template");
+    assert!(
+        ok,
+        "catalog should expose Cloudflare hosted preview as a template"
+    );
 }
 
 #[test]

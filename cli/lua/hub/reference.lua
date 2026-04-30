@@ -346,7 +346,6 @@ M.events = {
     { name = "sessions_discovered",    data = "{sockets=[{uuid,name},...]}",   desc = "Live sessions found on hub restart" },
     { name = "worktree_created",       data = "{branch, path, ...}",           desc = "Async worktree creation succeeded" },
     { name = "worktree_create_failed", data = "{branch, error}",              desc = "Async worktree creation failed" },
-    { name = "command_message",        data = "{type, issue_or_branch, ...}",  desc = "Command channel message (create/delete agent)" },
     { name = "outgoing_signal",        data = "{browser_identity, envelope}",  desc = "Encrypted signaling message to relay" },
     { name = "mcp_tools_changed",      data = "nil",                           desc = "MCP tool registry changed" },
     { name = "mcp_prompts_changed",    data = "nil",                           desc = "MCP prompt registry changed" },

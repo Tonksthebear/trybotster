@@ -29,7 +29,8 @@ import SessionActionsMenu from '../components/workspace/SessionActionsMenu'
 class FakeTransport {
   constructor() {
     this._listeners = new Map()
-    this.send = vi.fn(async () => true)
+    this.sendCommand = vi.fn(async () => true)
+    this.send = this.sendCommand
   }
   on(event, callback) {
     if (!this._listeners.has(event)) this._listeners.set(event, new Set())
@@ -134,13 +135,13 @@ describe('<SessionActionsMenu> interceptor', () => {
     // Drop the initial surface.subpath send — this test only cares that
     // the clicked menu-open action is CONSUMED by the interceptor and
     // never forwarded to transport.
-    fakeTransport.send.mockClear()
+    fakeTransport.sendCommand.mockClear()
     fireEvent.click(trigger)
     await Promise.resolve()
     await Promise.resolve()
 
     // Interceptor consumed the action — nothing should be sent over transport.
-    expect(fakeTransport.send).not.toHaveBeenCalled()
+    expect(fakeTransport.sendCommand).not.toHaveBeenCalled()
 
     // The interceptor stages the dropdown by mounting an invisible
     // MenuButton anchored to the trigger and programmatically clicking it.
@@ -159,14 +160,21 @@ describe('<SessionActionsMenu> interceptor', () => {
     })
     expect(actionItem).toBeInTheDocument()
     fireEvent.click(actionItem)
-    expect(localDispatch).toHaveBeenCalledWith({
-      action: 'botster.session.action.execute',
-      payload: expect.objectContaining({
-        hubId: 'hub-1',
-        sessionUuid: 'u-1',
-        actionId: 'cloudflare.preview.toggle',
-      }),
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(fakeTransport.sendCommand).toHaveBeenCalledWith('ui_action', {
+      target_surface: 'workspace_panel',
+      envelope: {
+        id: 'botster.session.action.execute',
+        payload: {
+          sessionUuid: 'u-1',
+          actionId: 'cloudflare.preview.toggle',
+        },
+      },
     })
+    expect(localDispatch).not.toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'botster.session.action.execute' }),
+    )
   })
 
   it('does nothing without an anchor element (returns false from interceptor)', async () => {
@@ -193,6 +201,6 @@ describe('<SessionActionsMenu> interceptor', () => {
     })
     await Promise.resolve()
     await Promise.resolve()
-    expect(fakeTransport.send).toHaveBeenCalled()
+    expect(fakeTransport.sendCommand).toHaveBeenCalled()
   })
 })

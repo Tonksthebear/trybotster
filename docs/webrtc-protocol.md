@@ -140,7 +140,9 @@ Initial terminal handshake with dimensions.
 
 ### create_agent (Hub)
 
-Create a new agent.
+Create an agent for a target/workspace/issue identity. This command is
+idempotent: if a matching agent already exists, the hub returns that session and
+delivers the prompt to it instead of spawning a duplicate.
 
 ```json
 {

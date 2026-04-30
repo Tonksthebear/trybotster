@@ -53,9 +53,11 @@ function selectButton(label: string): UiNode {
 
 describe('createTransportDispatch — Phase 2c default', () => {
   function makeTransport(sendImpl?: (type: string, data: unknown) => Promise<boolean>) {
-    const send = vi.fn(sendImpl ?? (async () => true))
-    const transport: UiActionTransport = { send: send as UiActionTransport['send'] }
-    return { transport, send }
+    const sendCommand = vi.fn(sendImpl ?? (async () => true))
+    const transport: UiActionTransport = {
+      sendCommand: sendCommand as UiActionTransport['sendCommand'],
+    }
+    return { transport, send: sendCommand }
   }
 
   it('sends ui_action frame on the configured target_surface and skips local dispatch', async () => {
@@ -110,7 +112,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Select' }))
 
     expect(send).toHaveBeenCalledOnce()
-    // Synchronous side-effect — runs before the async transport.send resolves.
+    // Synchronous side-effect — runs before the async transport command resolves.
     expect(window.location.pathname).toBe('/hubs/hub-7/sessions/uuid-1')
     expect(popstateSpy).toHaveBeenCalledOnce()
     window.removeEventListener('popstate', popstateSpy)

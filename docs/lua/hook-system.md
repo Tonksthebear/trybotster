@@ -26,6 +26,21 @@ hooks.has_interceptors(event)   -- fast-path check
 
 Interceptors run in priority order. Each receives the (possibly transformed) output of the previous. Returning nil blocks the action entirely.
 
+## Command Ingress
+
+All client and application commands enter through `cli/lua/lib/client.lua`.
+Browser, TUI, socket, Rails/GitHub adapters, MCP tools, and hub-to-hub RPC all
+normalize their intent into command envelopes and dispatch through either a real
+transport client or `lib.internal_client`. This keeps `before_hub_command`,
+`before_command`, command handlers, and `after_hub_command` consistent for every
+caller. Raw PTY bytes, file transfer bytes, focus state, and terminal color
+profile updates are transport data-plane/telemetry primitives, not hub commands.
+
+`create_agent` is idempotent in the canonical command handler. When a matching
+agent already exists for the target/workspace/issue identity, the hub returns and
+notifies that session rather than spawning a duplicate. This rule applies to all
+clients and internal producers.
+
 ## Observer Events
 
 | Event | Registered in | Fires when |
@@ -41,6 +56,7 @@ Interceptors run in priority order. Each receives the (possibly transformed) out
 | `pty_input` | `connections.lua` | Notification cleared by user typing |
 | `client_connected` | (user hook point) | Client joined the registry |
 | `client_disconnected` | (user hook point) | Client left the registry |
+| `after_hub_command` | `lib/commands.lua` | After a hub command executed; includes success/error |
 | `after_agent_create` | `lib/agent.lua` | After Agent.new() completes |
 | `before_agent_close` | `lib/agent.lua` | Before sessions are killed |
 | `after_agent_close` | `lib/agent.lua` | After agent is removed |
@@ -50,6 +66,8 @@ Interceptors run in priority order. Each receives the (possibly transformed) out
 
 | Event | Called by | Can do |
 |-------|-----------|--------|
+| `before_hub_command` | `lib/client.lua` | Transform or block the raw command envelope before registry dispatch |
+| `before_command` | `lib/commands.lua` | Transform or block the registered command context |
 | `before_agent_create` | `handlers/agents.lua` | Transform params or return nil to block creation |
 | `before_agent_delete` | `handlers/agents.lua` | Transform params or return nil to block deletion |
 | `before_client_subscribe` | `lib/client.lua` | Transform or block subscription requests |
@@ -61,7 +79,6 @@ The `events` primitive provides a separate pub-sub layer from hooks. Rust emits 
 
 | Event | Source | Payload |
 |-------|--------|---------|
-| `command_message` | `hub_commands.lua` via ActionCable | create_agent / delete_agent commands |
 | `worktree_created` | Worktree creation | `{branch, path, metadata, issue_number, prompt, session_uuid, agent_name, client_rows, client_cols}` |
 | `worktree_create_failed` | Rust async worktree create | `{branch, error}` |
 | `connection_code_ready` | Rust connection generation | `{url, qr_ascii}` |

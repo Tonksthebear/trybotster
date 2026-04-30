@@ -89,7 +89,7 @@ export function PluginIframe({
       setResolvedSrc(objectUrl)
     })
 
-    void ctx.transport.send('plugin_asset:read', {
+    void ctx.transport.sendCommand('plugin_asset:read', {
       request_id: requestId,
       asset_id: assetId,
     }).catch((err: unknown) => {

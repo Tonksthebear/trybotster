@@ -16,6 +16,7 @@
 
 local state = require("hub.state")
 local Agent = require("lib.agent")
+local InternalClient = require("lib.internal_client")
 local TargetContext = require("lib.target_context")
 
 local function resolve_webhook_target(payload)
@@ -86,7 +87,7 @@ handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
                 if cmd_repo and issue_num then
                     ws_name = cmd_repo .. "#" .. tostring(issue_num)
                 end
-                events.emit("command_message", {
+                InternalClient.dispatch("hub_commands", {
                     type = "create_agent",
                     issue_or_branch = issue_num and tostring(issue_num),
                     prompt = payload.prompt or payload.context or payload.comment_body,
@@ -123,7 +124,7 @@ handles.channel = action_cable.subscribe(handles.conn, "HubCommandChannel",
                         end
                     end
                     for _, agent in ipairs(matches) do
-                        events.emit("command_message", {
+                        InternalClient.dispatch("hub_commands", {
                             type = "delete_agent",
                             session_uuid = agent.session_uuid,
                             delete_worktree = false,

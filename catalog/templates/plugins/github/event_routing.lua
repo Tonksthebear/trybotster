@@ -8,6 +8,7 @@
 local M = {}
 
 local Agent = require("lib.agent")
+local InternalClient = require("lib.internal_client")
 local state = require("hub.state")
 local routing_state = state.get("github.event_routing", {})
 
@@ -65,7 +66,7 @@ local function handle_message(default_repo, message, channel_id)
             local ws_name = github_workspace_name(event_repo, payload.issue_number)
             local matches = Agent.find_by_workspace(ws_name)
             for _, agent in ipairs(matches) do
-                events.emit("command_message", {
+                InternalClient.dispatch("github", {
                     type = "delete_agent",
                     agent_id = agent.session_uuid,
                     delete_worktree = false,
@@ -79,7 +80,7 @@ local function handle_message(default_repo, message, channel_id)
         else
             local issue_num = payload.issue_number
             local ws_name = github_workspace_name(event_repo, issue_num)
-            events.emit("command_message", {
+            InternalClient.dispatch("github", {
                 type = "create_agent",
                 issue_or_branch = issue_num and tostring(issue_num),
                 prompt = payload.prompt or payload.context or payload.comment_body,

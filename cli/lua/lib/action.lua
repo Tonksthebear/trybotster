@@ -62,6 +62,15 @@ local function fallback_command(envelope)
         }
     end
 
+    if id == "botster.session.action.execute" then
+        return {
+            type = "execute_session_action",
+            session_uuid = payload.sessionUuid,
+            action_id = payload.actionId,
+            params = payload.params,
+        }
+    end
+
     -- Everything else: local UI concern (toggle/rename.request/move.request/
     -- delete.request/preview.open/menu.open/create.request). Browser handles
     -- locally; hub follow-up commands arrive as their own legacy commands.

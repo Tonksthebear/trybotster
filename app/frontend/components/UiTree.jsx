@@ -349,7 +349,7 @@ export default function UiTree({
     const normalisedSubpath =
       typeof subpath === 'string' && subpath !== '' ? subpath : '/'
 
-    // transport.send returns a Promise that REJECTS when the DataChannel
+    // transport.sendCommand returns a Promise that REJECTS when the DataChannel
     // isn't open yet (e.g. cold mount during WebRTC handshake). If we
     // don't attach a .catch handler, the rejection surfaces as an
     // "Uncaught Error: DataChannel closed" in the browser console —
@@ -358,7 +358,7 @@ export default function UiTree({
     // tests assert on an empty console.
     let sendPromise
     try {
-      sendPromise = transport.send('ui_action', {
+      sendPromise = transport.sendCommand('ui_action', {
         target_surface: targetSurface,
         envelope: {
           id: 'botster.surface.subpath',

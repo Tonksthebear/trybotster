@@ -37,7 +37,8 @@ import {
 class FakeTransport {
   constructor() {
     this._listeners = new Map()
-    this.send = vi.fn(async () => true)
+    this.sendCommand = vi.fn(async () => true)
+    this.send = this.sendCommand
   }
   on(event, callback) {
     if (!this._listeners.has(event)) this._listeners.set(event, new Set())
@@ -128,7 +129,7 @@ describe('<UiTree>', () => {
     expect(await screen.findByText('hello world')).toBeInTheDocument()
 
     first.unmount()
-    fakeTransport.send.mockClear()
+    fakeTransport.sendCommand.mockClear()
 
     render(<UiTree hubId="hub-1" targetSurface="workspace_panel" subpath="/" />)
     expect(screen.getByText('hello world')).toBeInTheDocument()
@@ -230,16 +231,16 @@ describe('<UiTree>', () => {
     // Clear pre-switch sends (transportA got its initial surface.subpath
     // send on mount; that is expected and unrelated to the cross-transport
     // routing we are asserting).
-    transportA.send.mockClear()
-    transportB.send.mockClear()
+    transportA.sendCommand.mockClear()
+    transportB.sendCommand.mockClear()
     captured?.({
       id: 'botster.session.select',
       payload: { sessionId: 's-x' },
     })
     await Promise.resolve()
     await Promise.resolve()
-    expect(transportA.send).not.toHaveBeenCalled()
-    expect(transportB.send).toHaveBeenCalledWith('ui_action', {
+    expect(transportA.sendCommand).not.toHaveBeenCalled()
+    expect(transportB.sendCommand).toHaveBeenCalledWith('ui_action', {
       target_surface: 'workspace_panel',
       envelope: {
         id: 'botster.session.select',
@@ -322,7 +323,7 @@ describe('<UiTree>', () => {
     await Promise.resolve()
     await Promise.resolve()
 
-    expect(fakeTransport.send).toHaveBeenCalledWith('ui_action', {
+    expect(fakeTransport.sendCommand).toHaveBeenCalledWith('ui_action', {
       target_surface: 'workspace_panel',
       envelope: {
         id: 'botster.session.select',
@@ -348,7 +349,7 @@ describe('<UiTree>', () => {
     await act(async () => {
       await new Promise((r) => setTimeout(r, 0))
     })
-    fakeTransport.send.mockResolvedValueOnce(false)
+    fakeTransport.sendCommand.mockResolvedValueOnce(false)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Select' }))
     await Promise.resolve()
@@ -478,12 +479,12 @@ describe('<UiTree> interceptor context', () => {
     // Clear the initial surface.subpath send (unrelated to this test's
     // intercept semantics — we only care that the clicked action is
     // consumed, not forwarded).
-    fakeTransport.send.mockClear()
+    fakeTransport.sendCommand.mockClear()
     fireEvent.click(await screen.findByRole('button', { name: 'Select' }))
     await Promise.resolve()
     expect(intercept).toHaveBeenCalledOnce()
     // Consumed — no transport send, no legacy dispatch.
-    expect(fakeTransport.send).not.toHaveBeenCalled()
+    expect(fakeTransport.sendCommand).not.toHaveBeenCalled()
     expect(legacyDispatch).not.toHaveBeenCalled()
   })
 
@@ -505,7 +506,7 @@ describe('<UiTree> interceptor context', () => {
     await Promise.resolve()
     await Promise.resolve()
     expect(intercept).toHaveBeenCalledOnce()
-    expect(fakeTransport.send).toHaveBeenCalled()
+    expect(fakeTransport.sendCommand).toHaveBeenCalled()
   })
 
   it('exposes the dispatch function via useUiTreeDispatch', async () => {
@@ -522,7 +523,7 @@ describe('<UiTree> interceptor context', () => {
     })
     await Promise.resolve()
     await Promise.resolve()
-    expect(fakeTransport.send).toHaveBeenCalledWith('ui_action', {
+    expect(fakeTransport.sendCommand).toHaveBeenCalledWith('ui_action', {
       target_surface: 'workspace_panel',
       envelope: {
         id: 'botster.session.select',
@@ -547,7 +548,7 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     await act(async () => {
       await new Promise((r) => setTimeout(r, 120))
     })
-    const subpathCalls = fakeTransport.send.mock.calls.filter(
+    const subpathCalls = fakeTransport.sendCommand.mock.calls.filter(
       ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
     )
     expect(subpathCalls).toHaveLength(1)
@@ -562,17 +563,17 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
 
   // Regression (2026-04-22): system-test caught "Uncaught Error: DataChannel
   // closed" in the browser console during WebRTC handshake because
-  // transport.send returns a rejecting Promise when the DataChannel isn't
-  // open yet. `void transport.send(...)` swallows the return value but the
+  // transport.sendCommand returns a rejecting Promise when the DataChannel isn't
+  // open yet. `void transport.sendCommand(...)` swallows the return value but the
   // rejection still fires as an unhandled rejection. UiTree must attach a
   // .catch handler so the rejection is consumed — the subscribe envelope
   // already primed the hub and the next nav will re-fire.
-  it('handles a rejecting transport.send without raising unhandled rejection', async () => {
+  it('handles a rejecting transport command without raising unhandled rejection', async () => {
     const rejected = Promise.reject(new Error('DataChannel closed'))
     // Keep the rejection plumbing: attach a noop catch to the PROMISE WE
     // RETURN from send so Node's test runner sees a handled rejection too.
     rejected.catch(() => {})
-    fakeTransport.send.mockReturnValueOnce(rejected)
+    fakeTransport.sendCommand.mockReturnValueOnce(rejected)
 
     const unhandledSpy = vi.fn()
     const onUnhandled = (event) => {
@@ -606,7 +607,7 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     })
     // Clear the initial mount send so the assertion below only counts the
     // subpath-change send we're testing.
-    fakeTransport.send.mockClear()
+    fakeTransport.sendCommand.mockClear()
 
     // Push a home-render tree so the panel is visible.
     await act(async () => {
@@ -632,7 +633,7 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     expect(screen.queryByText('home')).toBeNull()
 
     // Exactly one surface.subpath action fired for the new subpath.
-    const calls = fakeTransport.send.mock.calls.filter(
+    const calls = fakeTransport.sendCommand.mock.calls.filter(
       ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
     )
     expect(calls).toHaveLength(1)
@@ -706,7 +707,7 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
       await Promise.resolve()
     })
 
-    const calls = fakeTransport.send.mock.calls.filter(
+    const calls = fakeTransport.sendCommand.mock.calls.filter(
       ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
     )
     // Expect sends for BOTH the initial mount and the kanban transition.
@@ -745,14 +746,14 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
       await new Promise((r) => setTimeout(r, 120))
     })
     first.unmount()
-    fakeTransport.send.mockClear()
+    fakeTransport.sendCommand.mockClear()
 
     render(<UiTree hubId="hub-1" targetSurface="hello" subpath="/" />)
     await act(async () => {
       await new Promise((r) => setTimeout(r, 120))
     })
 
-    const calls = fakeTransport.send.mock.calls.filter(
+    const calls = fakeTransport.sendCommand.mock.calls.filter(
       ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
     )
     expect(calls).toHaveLength(1)

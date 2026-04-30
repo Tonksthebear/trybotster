@@ -270,7 +270,7 @@ safe_require("handlers.connections")
 safe_require("handlers.agents")
 
 -- Load ActionCable handlers (hub commands)
--- Must load after agents (emits command_message events)
+-- Must load after agents (routes application commands through lib.client)
 safe_require("handlers.hub_commands")
 
 -- Load transport handlers (register peer/message callbacks)

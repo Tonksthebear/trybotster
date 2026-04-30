@@ -1861,15 +1861,6 @@ impl LuaRuntime {
         })
     }
 
-    /// Fire the "command_message" event with the full message payload.
-    ///
-    /// Called by Hub when a command channel message should be handled by Lua.
-    /// Lua handlers (e.g., `handlers/agents.lua`) listen for this event and
-    /// route `create_agent`, `delete_agent`, etc. to their respective handlers.
-    pub fn fire_command_message(&self, message: &serde_json::Value) -> Result<()> {
-        self.fire_json_event("command_message", message)
-    }
-
     /// Notify observers of a PTY notification event.
     ///
     /// Fires the `_pty_notification_raw` hook with a table containing:

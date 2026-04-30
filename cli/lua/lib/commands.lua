@@ -15,6 +15,17 @@ local M = {}
 -- Command registry: cmd_type -> { handler, description }
 local registry = {}
 
+local function send_failure_response(client, sub_id, command, err)
+    if not client or not command or not command.request_id then return end
+    client:send({
+        subscriptionId = sub_id,
+        type = "command_response",
+        request_id = command.request_id,
+        ok = false,
+        error = tostring(err),
+    })
+end
+
 --- Register a hub command handler.
 -- Overwrites any existing handler for the same command type.
 -- @param cmd_type string The command type (e.g., "create_agent")
@@ -71,6 +82,7 @@ function M.dispatch(client, sub_id, command)
         local ok, err = pcall(entry.handler, client, sub_id, command)
         if not ok then
             log.error(string.format("Command '%s' error: %s", cmd_type, tostring(err)))
+            send_failure_response(client, sub_id, command, err)
         end
         hooks.notify("after_hub_command", {
             command = cmd_type,

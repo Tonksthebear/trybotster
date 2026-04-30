@@ -11,6 +11,15 @@
 local commands = require("lib.commands")
 local TargetContext = require("lib.target_context")
 
+local function send_command_response(client, sub_id, command, data)
+    if not client or not command.request_id then return end
+    data = data or {}
+    data.subscriptionId = sub_id
+    data.type = "command_response"
+    data.request_id = command.request_id
+    client:send(data)
+end
+
 local function send_command_error(client, sub_id, error_type, message)
     if not client then return end
     client:send({
@@ -31,12 +40,78 @@ local function send_spawn_target_feedback(client, sub_id, tone, message)
 end
 
 local function resolve_command_target(command)
-    return TargetContext.resolve({
+    local target, err = TargetContext.resolve({
         command = command,
         metadata = command and command.metadata or nil,
         require_target_id = true,
         require_target_path = true,
     })
+    if target then return target end
+    if command and command.repo then
+        return TargetContext.find_by_repo(command.repo)
+    end
+    return nil, err
+end
+
+local function format_notification(command)
+    local prompt = command.prompt
+    if prompt then
+        return string.format(
+            "=== NEW MENTION (automated notification) ===\n\n%s\n\n==================",
+            prompt
+        )
+    end
+    return "=== NEW MENTION (automated notification) ===\nNew mention\n=================="
+end
+
+local function notify_existing_agent(agent, command)
+    if agent.session_type and agent.session_type ~= "agent" then
+        return false
+    end
+    if agent.session then
+        agent.session:send_message(format_notification(command))
+        log.info("Sent notification to existing agent: " .. agent.session_uuid)
+        return true
+    end
+    log.warn("Cannot notify agent (no session): " .. agent.session_uuid)
+    return false
+end
+
+local function existing_agents_for_command(command, metadata, target)
+    local Agent = require("lib.agent")
+    local existing = {}
+
+    if metadata.workspace_id then
+        for _, session in ipairs(Agent.list()) do
+            if session._workspace_id == metadata.workspace_id
+                    and (not session.session_type or session.session_type == "agent") then
+                existing[#existing + 1] = session
+            end
+        end
+        return existing
+    end
+
+    if metadata.workspace then
+        for _, agent in ipairs(Agent.find_by_workspace(metadata.workspace, target)) do
+            if not agent.session_type or agent.session_type == "agent" then
+                existing[#existing + 1] = agent
+            end
+        end
+        return existing
+    end
+
+    local issue_or_branch = command.issue_or_branch or command.branch
+    local issue_number = tonumber(issue_or_branch) or metadata.issue_number
+    if issue_number then
+        for _, agent in ipairs(Agent.find_by_meta("issue_number", issue_number)) do
+            if TargetContext.matches(agent, target)
+                    and (not agent.session_type or agent.session_type == "agent") then
+                existing[#existing + 1] = agent
+            end
+        end
+    end
+
+    return existing
 end
 
 commands.register("add_spawn_target", function(client, sub_id, command)
@@ -200,14 +275,36 @@ commands.register("create_agent", function(client, sub_id, command)
     local target, target_err = resolve_command_target(command)
     if not target then
         send_command_error(client, sub_id, "error", target_err)
+        send_command_response(client, sub_id, command, { ok = false, error = target_err })
         log.warn(string.format("create_agent failed: %s", tostring(target_err)))
         return
     end
 
-    local metadata = TargetContext.with_metadata(nil, target)
+    local metadata = TargetContext.with_metadata(command.metadata, target)
     if workspace_id or workspace_name then
-        metadata.workspace_id = workspace_id
-        metadata.workspace = workspace_name
+        metadata.workspace_id = workspace_id or metadata.workspace_id
+        metadata.workspace = workspace_name or metadata.workspace
+    end
+    if command.invocation_url and not metadata.invocation_url then
+        metadata.invocation_url = command.invocation_url
+    end
+
+    local existing = existing_agents_for_command(command, metadata, target)
+    if #existing > 0 then
+        local notified = 0
+        for _, agent in ipairs(existing) do
+            if notify_existing_agent(agent, command) then
+                notified = notified + 1
+            end
+        end
+        send_command_response(client, sub_id, command, {
+            ok = true,
+            status = "notified_existing",
+            notified = notified,
+            session_uuid = existing[1] and existing[1].session_uuid or nil,
+            id = existing[1] and existing[1].session_uuid or nil,
+        })
+        return
     end
 
     -- Optional workspace template for auto-spawning accessory bundles.
@@ -228,9 +325,25 @@ commands.register("create_agent", function(client, sub_id, command)
         end
     end
 
-    require("handlers.agents").handle_create_agent(
+    local agent, err = require("handlers.agents").handle_create_agent(
         issue_or_branch, prompt, from_worktree, client, agent_name, metadata, target
     )
+    if err then
+        send_command_response(client, sub_id, command, { ok = false, error = err })
+        return
+    end
+    if agent then
+        send_command_response(client, sub_id, command, {
+            ok = true,
+            session_uuid = agent.session_uuid,
+            id = agent.session_uuid,
+        })
+    else
+        send_command_response(client, sub_id, command, {
+            ok = true,
+            status = "pending",
+        })
+    end
     log.info(string.format("Create agent request: %s (agent: %s, workspace: %s, target: %s)",
         tostring(issue_or_branch or "main"), tostring(agent_name or "auto"),
         tostring(workspace_id or workspace_name or "none"),
@@ -245,6 +358,7 @@ commands.register("create_accessory", function(client, sub_id, command)
     local target, target_err = resolve_command_target(command)
     if not target then
         send_command_error(client, sub_id, "error", target_err)
+        send_command_response(client, sub_id, command, { ok = false, error = target_err })
         log.warn(string.format("create_accessory failed: %s", tostring(target_err)))
         return
     end
@@ -252,12 +366,22 @@ commands.register("create_accessory", function(client, sub_id, command)
 
     if not accessory_name then
         log.warn("create_accessory missing accessory_name")
+        send_command_response(client, sub_id, command, { ok = false, error = "accessory_name is required" })
         return
     end
 
-    require("handlers.agents").handle_create_accessory(
+    local accessory, err = require("handlers.agents").handle_create_accessory(
         workspace_id, workspace_name, accessory_name, agent_name, metadata, target
     )
+    if err then
+        send_command_response(client, sub_id, command, { ok = false, error = err })
+        return
+    end
+    send_command_response(client, sub_id, command, {
+        ok = accessory ~= nil,
+        session_uuid = accessory and accessory.session_uuid or nil,
+        id = accessory and accessory.session_uuid or nil,
+    })
     log.info(string.format("Create accessory request: %s (workspace: %s, target: %s)",
         accessory_name, tostring(workspace_id or workspace_name or "none"), tostring(target.target_id)))
 end, { description = "Create an accessory session (no AI autonomy)" })
@@ -267,12 +391,14 @@ commands.register("rename_workspace", function(client, sub_id, command)
     local new_name = command.new_name or command.name
     if not workspace_id or not new_name then
         log.warn("rename_workspace missing workspace_id or new_name")
+        send_command_response(client, sub_id, command, { ok = false, error = "workspace_id and new_name are required" })
         return
     end
 
     local data_dir = config.data_dir and config.data_dir() or nil
     if not data_dir then
         log.warn("rename_workspace: no data_dir configured")
+        send_command_response(client, sub_id, command, { ok = false, error = "no data_dir configured" })
         return
     end
 
@@ -291,20 +417,25 @@ commands.register("rename_workspace", function(client, sub_id, command)
 
         require("lib.entity_model").patch_workspace(workspace_id, { name = new_name })
         log.info(string.format("Workspace %s renamed to '%s'", workspace_id, new_name))
+        send_command_response(client, sub_id, command, { ok = true, workspace_id = workspace_id, name = new_name })
+    else
+        send_command_response(client, sub_id, command, { ok = false, error = "failed to rename workspace" })
     end
 end, { description = "Rename a workspace" })
 
-commands.register("move_agent_workspace", function(_client, _sub_id, command)
-    local session_id = command.session_uuid
+commands.register("move_agent_workspace", function(client, sub_id, command)
+    local session_id = command.session_uuid or command.agent_id
     local workspace_id = command.workspace_id
     local workspace_name = command.workspace_name
 
     if not session_id then
         log.warn("move_agent_workspace missing session identifier")
+        send_command_response(client, sub_id, command, { ok = false, error = "session identifier is required" })
         return
     end
     if not workspace_id and not workspace_name then
         log.warn("move_agent_workspace missing workspace_id/workspace_name")
+        send_command_response(client, sub_id, command, { ok = false, error = "workspace_id or workspace_name is required" })
         return
     end
 
@@ -312,6 +443,7 @@ commands.register("move_agent_workspace", function(_client, _sub_id, command)
     local session = Agent.get(session_id)
     if not session then
         log.warn(string.format("move_agent_workspace: session '%s' not found", tostring(session_id)))
+        send_command_response(client, sub_id, command, { ok = false, error = "session not found" })
         return
     end
 
@@ -322,6 +454,7 @@ commands.register("move_agent_workspace", function(_client, _sub_id, command)
     if not moved then
         log.warn(string.format("move_agent_workspace failed for %s: %s",
             tostring(session_id), tostring(err)))
+        send_command_response(client, sub_id, command, { ok = false, error = err or "move failed" })
         return
     end
 
@@ -341,12 +474,22 @@ commands.register("move_agent_workspace", function(_client, _sub_id, command)
 
     log.info(string.format("Moved session %s to workspace %s (%s)",
         session.session_uuid, moved.workspace_id, moved.workspace_name or "unnamed"))
+    send_command_response(client, sub_id, command, {
+        ok = true,
+        agent_id = session.session_uuid,
+        session_uuid = session.session_uuid,
+        workspace_id = moved.workspace_id,
+        workspace_name = moved.workspace_name,
+        previous_workspace_id = moved.previous_workspace_id,
+        previous_workspace_name = moved.previous_workspace_name,
+    })
 end, { description = "Move a live session to another workspace" })
 
-commands.register("update_session", function(_client, _sub_id, command)
-    local session_id = command.session_uuid
+commands.register("update_session", function(client, sub_id, command)
+    local session_id = command.session_uuid or command.agent_id
     if not session_id then
         log.warn("update_session missing session identifier")
+        send_command_response(client, sub_id, command, { ok = false, error = "session identifier is required" })
         return
     end
 
@@ -354,6 +497,7 @@ commands.register("update_session", function(_client, _sub_id, command)
     local session = Agent.get(session_id)
     if not session then
         log.warn(string.format("update_session: session '%s' not found", tostring(session_id)))
+        send_command_response(client, sub_id, command, { ok = false, error = "session not found" })
         return
     end
 
@@ -362,15 +506,20 @@ commands.register("update_session", function(_client, _sub_id, command)
     if command.label ~= nil then fields.label = command.label end
     if command.task ~= nil then fields.task = command.task end
 
-    if next(fields) then
-        session:update(fields)
-        log.info(string.format("Session %s updated: %s", session.session_uuid,
-            table.concat((function()
-                local parts = {}
-                for k, v in pairs(fields) do parts[#parts + 1] = k .. "=" .. tostring(v) end
-                return parts
-            end)(), ", ")))
+    if not next(fields) then
+        log.warn("update_session missing updatable fields")
+        send_command_response(client, sub_id, command, { ok = false, error = "label or task is required" })
+        return
     end
+
+    session:update(fields)
+    log.info(string.format("Session %s updated: %s", session.session_uuid,
+        table.concat((function()
+            local parts = {}
+            for k, v in pairs(fields) do parts[#parts + 1] = k .. "=" .. tostring(v) end
+            return parts
+        end)(), ", ")))
+    send_command_response(client, sub_id, command, { ok = true, session_uuid = session.session_uuid })
 end, { description = "Update session label or task" })
 
 commands.register("reopen_worktree", function(client, _sub_id, command)
@@ -400,15 +549,21 @@ commands.register("reopen_worktree", function(client, _sub_id, command)
     end
 end, { description = "Reopen an existing worktree as an agent" })
 
-commands.register("delete_agent", function(_client, _sub_id, command)
-    local session_id = command.session_uuid
+commands.register("delete_agent", function(client, sub_id, command)
+    local session_id = command.session_uuid or command.agent_id
     local delete_worktree = command.delete_worktree or false
 
     if session_id then
-        require("handlers.agents").handle_delete_session(session_id, delete_worktree)
+        local ok = require("handlers.agents").handle_delete_session(session_id, delete_worktree)
         log.info(string.format("Delete session request: %s", session_id))
+        send_command_response(client, sub_id, command, {
+            ok = ok == true,
+            session_uuid = session_id,
+            error = ok == true and nil or "session not found",
+        })
     else
         log.warn("delete_agent missing session identifier")
+        send_command_response(client, sub_id, command, { ok = false, error = "session identifier is required" })
     end
 end, { description = "Delete a session (agent or accessory, optionally with worktree)" })
 
