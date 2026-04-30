@@ -30,6 +30,7 @@ export const useSettingsStore = create((set, get) => ({
   hub: null,
   connected: true,
   _unsubscribers: [],
+  _connectionToken: 0,
 
   // --- Spawn targets ---
   spawnTargets: [],
@@ -83,7 +84,16 @@ export const useSettingsStore = create((set, get) => ({
   // --- Hub lifecycle ---
 
   async connectHub(hubId) {
-    const hub = await waitForHub(hubId)
+    // Settings is a route-owned hub consumer: it should wait for the URL hub
+    // connection instead of treating a slow route acquisition as optional.
+    const token = get()._connectionToken + 1
+    set({ _connectionToken: token })
+    const isCurrentConnection = () => get()._connectionToken === token
+
+    const hub = await waitForHub(hubId, null)
+    // Ignore late durable wait resolution after SettingsApp has unmounted.
+    if (!isCurrentConnection()) return null
+
     if (!hub) {
       set({
         connected: false,
@@ -138,7 +148,11 @@ export const useSettingsStore = create((set, get) => ({
   disconnectHub() {
     const { _unsubscribers } = get()
     _unsubscribers.forEach((fn) => fn())
-    set({ _unsubscribers: [], hub: null })
+    set({
+      _unsubscribers: [],
+      _connectionToken: get()._connectionToken + 1,
+      hub: null,
+    })
   },
 
   // --- Config scope + target ---

@@ -186,6 +186,55 @@ describe('AppRoutes', () => {
     })
   })
 
+  it('selects the URL hub when cold-rendering a hub route without lastHub', async () => {
+    const selectHub = vi.fn(() => Promise.resolve())
+    const getLastHubId = vi.fn(() => '99')
+
+    useHubStore.setState({
+      selectedHubId: null,
+      fetchHubList: vi.fn(() => Promise.resolve([])),
+      selectHub,
+      getLastHubId,
+    })
+
+    renderRoutes('/hubs/42/settings')
+
+    expect(await screen.findByText('Hub Settings Route')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(selectHub).toHaveBeenCalledWith('42')
+    })
+    expect(getLastHubId).not.toHaveBeenCalled()
+  })
+
+  it('re-selects the URL hub if hub state is cleared while the hub route remains mounted', async () => {
+    const selectHub = vi.fn((hubId) => {
+      useHubStore.setState({ selectedHubId: String(hubId) })
+      return Promise.resolve()
+    })
+
+    useHubStore.setState({
+      selectedHubId: null,
+      fetchHubList: vi.fn(() => Promise.resolve([])),
+      selectHub,
+    })
+
+    renderRoutes('/hubs/42')
+
+    expect(await screen.findByText('Hub Show')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(selectHub).toHaveBeenCalledTimes(1)
+    })
+
+    act(() => {
+      useHubStore.setState({ selectedHubId: null })
+    })
+
+    await waitFor(() => {
+      expect(selectHub).toHaveBeenCalledTimes(2)
+    })
+    expect(selectHub).toHaveBeenLastCalledWith('42')
+  })
+
   it('suppresses normal auto-navigation while the booting handoff is active', async () => {
     const selectHub = vi.fn(() => Promise.resolve())
     const hubs = [{ id: 7, name: 'Fresh Hub', identifier: 'hub-7', active: true }]
