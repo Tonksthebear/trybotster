@@ -357,31 +357,49 @@ function TemplateTargetSelector() {
 function TemplateScopeSelector() {
   const templateScope = useSettingsStore((s) => s.templateScope)
   const setTemplateScope = useSettingsStore((s) => s.setTemplateScope)
+  const refreshTemplates = useSettingsStore((s) => s.refreshTemplates)
+  const [refreshing, setRefreshing] = useState(false)
+
+  async function handleRefresh() {
+    setRefreshing(true)
+    await refreshTemplates()
+    setRefreshing(false)
+  }
 
   return (
     <div className="mb-4">
       <label className="block text-[11px] font-medium uppercase tracking-wider text-zinc-500 mb-2">
         Browse Scope
       </label>
-      <div className="inline-flex rounded-lg bg-zinc-900/70 border border-zinc-800 p-1">
-        {[
-          ['device', 'Device'],
-          ['repo', 'Repository'],
-        ].map(([scope, label]) => (
-          <button
-            key={scope}
-            type="button"
-            onClick={() => setTemplateScope(scope)}
-            className={clsx(
-              'px-3 py-1.5 text-sm font-medium rounded-md transition-colors',
-              templateScope === scope
-                ? 'bg-zinc-700 text-zinc-100'
-                : 'text-zinc-500 hover:text-zinc-300'
-            )}
-          >
-            {label}
-          </button>
-        ))}
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="inline-flex rounded-lg bg-zinc-900/70 border border-zinc-800 p-1">
+          {[
+            ['device', 'Device'],
+            ['repo', 'Repository'],
+          ].map(([scope, label]) => (
+            <button
+              key={scope}
+              type="button"
+              onClick={() => setTemplateScope(scope)}
+              className={clsx(
+                'px-3 py-1.5 text-sm font-medium rounded-md transition-colors',
+                templateScope === scope
+                  ? 'bg-zinc-700 text-zinc-100'
+                  : 'text-zinc-500 hover:text-zinc-300'
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <Button
+          plain
+          onClick={handleRefresh}
+          disabled={refreshing}
+          className="!text-xs !px-3 !py-1.5"
+        >
+          {refreshing ? 'Refreshing...' : 'Refresh'}
+        </Button>
       </div>
     </div>
   )

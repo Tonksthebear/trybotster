@@ -232,6 +232,18 @@ commands.register("template:list", function(client, sub_id, command)
     respond(client, sub_id, command.request_id, { ok = true, installed = installed })
 end, { description = "List installed templates" })
 
+commands.register("template:refresh", function(client, sub_id, command)
+    local Catalog = require("lib.template_catalog")
+    local started, err = Catalog.refresh_async()
+    if started then
+        respond(client, sub_id, command.request_id, { ok = true, status = "started" })
+    elseif err == "refresh already in flight" then
+        respond(client, sub_id, command.request_id, { ok = true, status = "already_in_flight" })
+    else
+        respond(client, sub_id, command.request_id, { ok = false, error = err or "Template refresh did not start" })
+    end
+end, { description = "Fetch the latest remote template catalog" })
+
 -- ============================================================================
 -- Plugin Reload Commands
 -- ============================================================================

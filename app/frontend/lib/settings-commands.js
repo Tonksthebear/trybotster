@@ -150,6 +150,10 @@ export async function reloadSettingsPlugin({ hub, name, targetId }) {
   await hub.reloadPlugin(name, targetId)
 }
 
+export async function refreshSettingsTemplates({ hub }) {
+  await hub.refreshTemplates()
+}
+
 function pluginNameFromDest(dest) {
   const match = dest?.match(/plugins\/([^/]+)\//)
   return match ? match[1] : null

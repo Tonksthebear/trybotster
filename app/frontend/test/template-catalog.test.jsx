@@ -1,6 +1,6 @@
 import React from 'react'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   displayTemplatesFor,
@@ -183,10 +183,12 @@ describe('displayTemplatesFor', () => {
   })
 
   it('browses templates within one selected scope before showing repo targets', () => {
+    const refreshTemplates = vi.fn()
     useSettingsStore.setState({
       installedDevice: new Set(['plugins/demo/init.lua']),
       installedRepo: new Set(),
       spawnTargets: [{ id: 'target-1', name: 'Repo One', path: '/repo' }],
+      refreshTemplates,
     })
 
     render(
@@ -215,10 +217,39 @@ describe('displayTemplatesFor', () => {
     expect(screen.getByText('Installed in Device')).toBeInTheDocument()
     expect(screen.getByText('Available for Device')).toBeInTheDocument()
     expect(screen.queryByText('Repo Target')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Repository' }))
 
     expect(screen.getByText('Available for Repository')).toBeInTheDocument()
     expect(screen.getByText('Repo Target')).toBeInTheDocument()
+  })
+
+  it('refreshes the template catalog on demand', async () => {
+    const refreshTemplates = vi.fn(() => Promise.resolve(true))
+    useSettingsStore.setState({ refreshTemplates })
+
+    render(
+      <TemplateCatalog
+        templates={{
+          plugins: [
+            {
+              slug: 'plugins-demo-init',
+              name: 'Demo Surface',
+              description: 'Demo',
+              dest: 'plugins/demo/init.lua',
+              content: 'return {}',
+            },
+          ],
+        }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+
+    await waitFor(() => expect(refreshTemplates).toHaveBeenCalled())
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Refresh' })).toBeInTheDocument(),
+    )
   })
 })

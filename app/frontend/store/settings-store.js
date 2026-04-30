@@ -9,6 +9,7 @@ import {
   installSettingsTemplate,
   readSettingsFile,
   reloadSettingsPlugin,
+  refreshSettingsTemplates,
   removeSessionConfig,
   renameSettingsFile,
   setPortForward,
@@ -609,6 +610,26 @@ export const useSettingsStore = create((set, get) => ({
     const { hub } = get()
     if (!hub) throw new Error('Hub not connected')
     await reloadSettingsPlugin({ hub, name, targetId })
+  },
+
+  async refreshTemplates() {
+    const { hub } = get()
+    if (!hub) return false
+
+    set({ templateFeedback: 'Fetching latest templates...' })
+    try {
+      await refreshSettingsTemplates({ hub })
+      set({ templateFeedback: 'Template refresh started.' })
+      setTimeout(() => {
+        if (get().templateFeedback === 'Template refresh started.') {
+          set({ templateFeedback: '' })
+        }
+      }, 2000)
+      return true
+    } catch (error) {
+      set({ templateFeedback: `Template refresh failed: ${error.message}` })
+      return false
+    }
   },
 
   restartHub() {

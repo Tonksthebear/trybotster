@@ -6,6 +6,7 @@ import {
   deleteSettingsFile,
   installSettingsTemplate,
   readSettingsFile,
+  refreshSettingsTemplates,
   removeSessionConfig,
   renameSettingsFile,
   setPortForward,
@@ -24,6 +25,7 @@ function mockHub(overrides = {}) {
     rmDir: vi.fn(() => Promise.resolve()),
     installTemplate: vi.fn(() => Promise.resolve()),
     uninstallTemplate: vi.fn(() => Promise.resolve()),
+    refreshTemplates: vi.fn(() => Promise.resolve()),
     loadPlugin: vi.fn(() => Promise.resolve()),
     ...overrides,
   }
@@ -158,5 +160,13 @@ describe('settings command helpers', () => {
       undefined,
     )
     expect(hub.loadPlugin).not.toHaveBeenCalled()
+  })
+
+  it('delegates template catalog refresh to the hub', async () => {
+    const hub = mockHub()
+
+    await refreshSettingsTemplates({ hub })
+
+    expect(hub.refreshTemplates).toHaveBeenCalled()
   })
 })
