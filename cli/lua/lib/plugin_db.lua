@@ -3,7 +3,7 @@
 -- plugin.db() — public persistence API for Lua plugins.
 --
 -- Plugin authors call `plugin.db{...}` once during plugin load. The module:
---   1. Resolves the db path: {config.data_dir()}/plugins/<plugin_name>/db.sqlite
+--   1. Resolves the db path: {config.data_dir()}/plugin-data/<plugin_name>/db.sqlite
 --      (or ":memory:" if `memory = true` was declared).
 --   2. Opens a sqlite connection via vendored `sqlite.lua` and applies default
 --      PRAGMAs (WAL, synchronous=NORMAL, foreign_keys=ON, busy_timeout=5000).
@@ -544,7 +544,7 @@ end
 
 --- Resolve the database URI for a plugin.
 -- memory = true   -> ":memory:"
--- else            -> "{config.data_dir()}/plugins/<plugin_name>/db.sqlite"
+-- else            -> "{config.data_dir()}/plugin-data/<plugin_name>/db.sqlite"
 -- The parent directory is created with fs.mkdir (mkdir -p semantics).
 local function resolve_uri(plugin_name, memory)
     if memory then
@@ -564,7 +564,7 @@ local function resolve_uri(plugin_name, memory)
         ), 0)
     end
     local plugin_dirname = plugin_name:gsub("[^%w%._-]", "_")
-    local plugin_dir = data_dir .. "/plugins/" .. plugin_dirname
+    local plugin_dir = data_dir .. "/plugin-data/" .. plugin_dirname
     local ok, err = fs.mkdir(plugin_dir)
     if not ok then
         error(string.format(

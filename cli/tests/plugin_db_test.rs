@@ -2,7 +2,7 @@
 //! persistence API for Lua plugins.
 //!
 //! The wrapper layers onto the vendored `sqlite.lua` (PR B.1) and provides:
-//!   * path derivation under `{data_dir}/plugins/<name>/db.sqlite`
+//!   * path derivation under `{data_dir}/plugin-data/<name>/db.sqlite`
 //!   * default PRAGMAs (WAL + NORMAL sync + foreign_keys + busy_timeout)
 //!   * declarative schema reconciliation (additive adds vs strict mismatches)
 //!   * a migration runner driven by `PRAGMA user_version`
@@ -160,7 +160,7 @@ fn db_open_creates_file_under_data_dir() {
     .exec()
     .expect("open fresh db");
 
-    let expected = tmp.path().join("plugins/messaging/db.sqlite");
+    let expected = tmp.path().join("plugin-data/messaging/db.sqlite");
     assert!(
         expected.exists(),
         "expected db file at {}",
@@ -199,7 +199,7 @@ fn db_open_sanitizes_scoped_plugin_key_for_data_dir() {
 
     let expected = tmp
         .path()
-        .join("plugins/repo__Users_jason_Rails_jupiter_rails-worktree-lifecycle/db.sqlite");
+        .join("plugin-data/repo__Users_jason_Rails_jupiter_rails-worktree-lifecycle/db.sqlite");
     assert!(
         expected.exists(),
         "expected scoped db file at {}",
@@ -967,7 +967,7 @@ fn plugin_unload_evicts_cache_but_leaves_file() {
     .exec()
     .expect("initial load + insert");
 
-    let expected = tmp.path().join("plugins/disabletest/db.sqlite");
+    let expected = tmp.path().join("plugin-data/disabletest/db.sqlite");
     assert!(expected.exists(), "db file must be created on first load");
 
     // Simulate hub/loader firing plugin_unloading — our stub's `hooks.notify`
