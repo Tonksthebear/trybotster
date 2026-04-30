@@ -30,6 +30,7 @@ export const useSettingsStore = create((set, get) => ({
   hub: null,
   connected: true,
   _unsubscribers: [],
+  _connectionToken: 0,
 
   // --- Spawn targets ---
   spawnTargets: [],
@@ -83,7 +84,12 @@ export const useSettingsStore = create((set, get) => ({
   // --- Hub lifecycle ---
 
   async connectHub(hubId) {
+    const connectionToken = get()._connectionToken + 1
+    set({ _connectionToken: connectionToken })
+
     const hub = await waitForHub(hubId, null)
+    if (get()._connectionToken !== connectionToken) return null
+
     if (!hub) {
       set({
         connected: false,
@@ -97,9 +103,13 @@ export const useSettingsStore = create((set, get) => ({
     const selectedTargetId = targets.length === 1 ? targets[0].id || targets[0].target_id : null
 
     const unsubs = []
+    let recoverOnConnect = false
+    const isCurrentConnection = () =>
+      get().hub === hub && get()._connectionToken === connectionToken
 
     unsubs.push(
       useSpawnTargetStore.subscribe((state) => {
+        if (!isCurrentConnection()) return
         const arr = orderedEntities(state)
         const { selectedTargetId: currentId } = get()
         const valid = arr.some((t) => (t.id || t.target_id) === currentId)
@@ -116,11 +126,36 @@ export const useSettingsStore = create((set, get) => ({
 
     unsubs.push(
       hub.onDisconnected(() => {
+        if (!isCurrentConnection()) return
+        recoverOnConnect = true
         set({
           connected: false,
           treeState: 'disconnected',
           treeFeedback: 'Hub disconnected. Reconnecting...',
         })
+      })
+    )
+
+    unsubs.push(
+      hub.onConnected(() => {
+        if (!isCurrentConnection() || !recoverOnConnect) return
+        recoverOnConnect = false
+        const targets = orderedEntities(useSpawnTargetStore.getState())
+        const currentId = get().selectedTargetId
+        const valid = targets.some((t) => (t.id || t.target_id) === currentId)
+        set({
+          connected: true,
+          spawnTargets: targets,
+          selectedTargetId: valid
+            ? currentId
+            : targets.length === 1
+              ? targets[0].id || targets[0].target_id
+              : null,
+          treeState: get().tree ? 'tree' : 'loading',
+          treeFeedback: 'Loading configuration...',
+        })
+        get().scanTree()
+        get().checkInstalled()
       })
     )
 
@@ -138,7 +173,11 @@ export const useSettingsStore = create((set, get) => ({
   disconnectHub() {
     const { _unsubscribers } = get()
     _unsubscribers.forEach((fn) => fn())
-    set({ _unsubscribers: [], hub: null })
+    set({
+      _unsubscribers: [],
+      hub: null,
+      _connectionToken: get()._connectionToken + 1,
+    })
   },
 
   // --- Config scope + target ---
@@ -535,7 +574,7 @@ export const useSettingsStore = create((set, get) => ({
 
     try {
       const result = await hub.listInstalledTemplates(selectedTargetId)
-      if (!get().hub || token !== get()._installStateToken) return
+      if (get().hub !== hub || token !== get()._installStateToken) return
 
       const device = new Set()
       const repo = new Set()
@@ -552,7 +591,7 @@ export const useSettingsStore = create((set, get) => ({
         templateFeedback: '',
       })
     } catch {
-      if (token !== get()._installStateToken) return
+      if (get().hub !== hub || token !== get()._installStateToken) return
       set({ installedStateLoaded: true, templateFeedback: '' })
     }
   },

@@ -8,13 +8,35 @@ vi.mock('../lib/hub-bridge', () => ({
 }))
 
 function mockHub(overrides = {}) {
+  const disconnectedCallbacks = []
+  const connectedCallbacks = []
+  const unsubscribeDisconnected = vi.fn()
+  const unsubscribeConnected = vi.fn()
+
   return {
-    onDisconnected: vi.fn(() => vi.fn()),
+    onDisconnected: vi.fn((callback) => {
+      disconnectedCallbacks.push(callback)
+      return unsubscribeDisconnected
+    }),
+    onConnected: vi.fn((callback) => {
+      connectedCallbacks.push(callback)
+      return unsubscribeConnected
+    }),
     listInstalledTemplates: vi.fn(() => Promise.resolve({ installed: [] })),
     installTemplate: vi.fn(() => Promise.resolve()),
     uninstallTemplate: vi.fn(() => Promise.resolve()),
     refreshTemplates: vi.fn(() => Promise.resolve()),
     loadPlugin: vi.fn(() => Promise.resolve()),
+    statFile: vi.fn(() => Promise.resolve({ exists: false })),
+    listDir: vi.fn(() => Promise.resolve({ entries: [] })),
+    emitDisconnected() {
+      disconnectedCallbacks.forEach((callback) => callback())
+    },
+    emitConnected() {
+      connectedCallbacks.forEach((callback) => callback())
+    },
+    unsubscribeDisconnected,
+    unsubscribeConnected,
     ...overrides,
   }
 }
@@ -34,6 +56,91 @@ describe('settings store template install state', () => {
     expect(mockWaitForHub).toHaveBeenCalledWith('hub-1', null)
     expect(useSettingsStore.getState().hub).toBe(hub)
     expect(useSettingsStore.getState().connected).toBe(true)
+  })
+
+  it('marks settings disconnected when the hub disconnects', async () => {
+    const hub = mockHub()
+    mockWaitForHub.mockResolvedValueOnce(hub)
+
+    await useSettingsStore.getState().connectHub('hub-1')
+    hub.emitDisconnected()
+
+    expect(useSettingsStore.getState().connected).toBe(false)
+    expect(useSettingsStore.getState().treeState).toBe('disconnected')
+    expect(useSettingsStore.getState().treeFeedback).toBe(
+      'Hub disconnected. Reconnecting...',
+    )
+  })
+
+  it('recovers settings state and refreshes data when the hub reconnects', async () => {
+    const hub = mockHub({
+      statFile: vi.fn((path) =>
+        Promise.resolve({
+          exists: ['agents', 'accessories', 'plugins', 'workspaces'].includes(path),
+        }),
+      ),
+    })
+    mockWaitForHub.mockResolvedValueOnce(hub)
+    useSettingsStore.setState({ configScope: 'device' })
+
+    await useSettingsStore.getState().connectHub('hub-1')
+    hub.emitDisconnected()
+    hub.emitConnected()
+
+    expect(useSettingsStore.getState().connected).toBe(true)
+    await vi.waitFor(() => {
+      expect(hub.statFile).toHaveBeenCalledWith('agents', 'device', undefined)
+      expect(hub.listInstalledTemplates).toHaveBeenCalledTimes(1)
+      expect(useSettingsStore.getState().treeState).toBe('tree')
+      expect(useSettingsStore.getState().installedStateLoaded).toBe(true)
+    })
+  })
+
+  it('does not run duplicate recovery scans on initial hub connect', async () => {
+    const hub = mockHub()
+    mockWaitForHub.mockResolvedValueOnce(hub)
+    useSettingsStore.setState({ configScope: 'device' })
+
+    await useSettingsStore.getState().connectHub('hub-1')
+    hub.emitConnected()
+
+    expect(hub.statFile).not.toHaveBeenCalled()
+    expect(hub.listInstalledTemplates).not.toHaveBeenCalled()
+  })
+
+  it('does not let an old hub reconnect mutate state after disconnect', async () => {
+    const hub = mockHub()
+    mockWaitForHub.mockResolvedValueOnce(hub)
+    useSettingsStore.setState({ configScope: 'device' })
+
+    await useSettingsStore.getState().connectHub('hub-1')
+    hub.emitDisconnected()
+    useSettingsStore.getState().disconnectHub()
+    hub.emitConnected()
+
+    expect(hub.unsubscribeDisconnected).toHaveBeenCalledTimes(1)
+    expect(hub.unsubscribeConnected).toHaveBeenCalledTimes(1)
+    expect(useSettingsStore.getState().hub).toBe(null)
+    expect(useSettingsStore.getState().connected).toBe(false)
+    expect(hub.statFile).not.toHaveBeenCalled()
+    expect(hub.listInstalledTemplates).not.toHaveBeenCalled()
+  })
+
+  it('does not let an old hub reconnect mutate state after a newer connect', async () => {
+    const oldHub = mockHub()
+    const newHub = mockHub()
+    mockWaitForHub.mockResolvedValueOnce(oldHub).mockResolvedValueOnce(newHub)
+    useSettingsStore.setState({ configScope: 'device' })
+
+    await useSettingsStore.getState().connectHub('hub-1')
+    oldHub.emitDisconnected()
+    await useSettingsStore.getState().connectHub('hub-1')
+    oldHub.emitConnected()
+
+    expect(useSettingsStore.getState().hub).toBe(newHub)
+    expect(useSettingsStore.getState().connected).toBe(true)
+    expect(oldHub.statFile).not.toHaveBeenCalled()
+    expect(oldHub.listInstalledTemplates).not.toHaveBeenCalled()
   })
 
   it('tracks installed templates by destination file', async () => {

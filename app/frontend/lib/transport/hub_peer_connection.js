@@ -12,7 +12,7 @@ import bridge from "workers/bridge"
 import { parseBinaryBundle } from "matrix/bundle"
 import { HubSignalingClient } from "transport/hub_signaling_client"
 import { HubChannelProtocol } from "transport/hub_channel_protocol"
-import { HubPeerLifecycle } from "transport/hub_peer_lifecycle"
+import { HubPeerLifecycle, PEER_LOST_REASONS } from "transport/hub_peer_lifecycle"
 
 let instance = null
 
@@ -105,6 +105,7 @@ class HubPeerConnection {
         getIceConfig: (hubId, conn) => this.#getIceConfig(hubId, conn),
         encryptSignal: (hubId, payload) => this.#encryptSignal(hubId, payload),
         setupDataChannel: (hubId, dataChannel) => this.#setupDataChannel(hubId, dataChannel),
+        peerLost: (hubId, reason) => this.#handlePeerLost(hubId, reason),
       },
       constants: {
         ConnectionMode,
@@ -225,7 +226,7 @@ class HubPeerConnection {
   }
 
   async connectPeer(hubId) {
-    const conn = this.#connections.get(hubId)
+    let conn = this.#connections.get(hubId)
     if (!conn) throw new Error(`No signaling connection for hub ${hubId}`)
 
     if (conn.pc) {
@@ -236,8 +237,8 @@ class HubPeerConnection {
         (pcState === "connected" && !dcAlive)
 
       if (dead) {
-        this.#peerLifecycle.teardownPeer(conn)
-        this.#emit("connection:state", { hubId, state: "disconnected" })
+        this.#handlePeerLost(hubId, PEER_LOST_REASONS.STALE_PEER_ON_CONNECT)
+        conn = this.#connections.get(hubId)
       } else {
         return { state: conn.state }
       }
@@ -614,10 +615,22 @@ class HubPeerConnection {
     if (!conn) return
 
     console.debug(`[WebRTCTransport] Closing connection for hub ${hubId}`)
-    this.#peerLifecycle.teardownPeer(conn)
+    this.#handlePeerLost(hubId, PEER_LOST_REASONS.GRACE_EXPIRED)
     this.#signalingClient.disconnect(hubId)
     this.#connections.delete(hubId)
-    this.#emit("connection:state", { hubId, state: "disconnected" })
+  }
+
+  #handlePeerLost(hubId, reason) {
+    const conn = this.#connections.get(hubId)
+    if (!conn?.pc) {
+      console.debug(`[WebRTCTransport] Ignoring duplicate peer lost for hub ${hubId} (${reason})`)
+      return
+    }
+
+    this.#peerLifecycle.teardownPeer(conn)
+    this.#peerConnectPromises.delete(hubId)
+    this.#dataMessageChains.delete(hubId)
+    this.#emit("connection:state", { hubId, state: "disconnected", reason })
   }
 
   #setupDataChannel(hubId, dataChannel) {
@@ -642,11 +655,12 @@ class HubPeerConnection {
 
     dataChannel.onclose = () => {
       console.debug(`[WebRTCTransport] DataChannel closed for hub ${hubId}`)
-      this.#emit("connection:state", { hubId, state: "disconnected" })
+      this.#handlePeerLost(hubId, PEER_LOST_REASONS.DATACHANNEL_CLOSE)
     }
 
     dataChannel.onerror = (error) => {
       console.error("[WebRTCTransport] DataChannel error:", error)
+      this.#handlePeerLost(hubId, PEER_LOST_REASONS.DATACHANNEL_ERROR)
     }
 
     dataChannel.onmessage = (event) => {

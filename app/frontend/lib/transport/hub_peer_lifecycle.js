@@ -1,3 +1,16 @@
+export const PEER_LOST_REASONS = Object.freeze({
+  DATACHANNEL_CLOSE: "datachannel_close",
+  DATACHANNEL_ERROR: "datachannel_error",
+  STALE_PEER_ON_CONNECT: "stale_peer_on_connect",
+  GRACE_EXPIRED: "grace_expired",
+  ICE_DISCONNECT_STUCK: "ice_disconnect_stuck",
+  PC_CLOSED: "pc_closed",
+  PC_FAILED_MAX_RESTARTS: "pc_failed_max_restarts",
+  PEER_SETUP_TIMEOUT: "peer_setup_timeout",
+  PROBE_DEAD: "probe_dead",
+  EXPLICIT_DISCONNECT: "explicit_disconnect",
+})
+
 export class HubPeerLifecycle {
   #callbacks
   #constants
@@ -88,7 +101,7 @@ export class HubPeerLifecycle {
             if (pc.iceConnectionState === "disconnected") {
               this.#recordDirectDisconnect(hubId, conn)
               console.debug("[WebRTCTransport] ICE stuck disconnected for 5s, cleaning up peer")
-              this.cleanupPeer(hubId, conn)
+              this.cleanupPeer(hubId, conn, PEER_LOST_REASONS.ICE_DISCONNECT_STUCK)
             }
           }, 5_000)
         }
@@ -107,13 +120,13 @@ export class HubPeerLifecycle {
           this.#callbacks.emit("connection:mode", { hubId, mode })
         }).catch(() => {})
       } else if (state === "closed") {
-        this.cleanupPeer(hubId, conn)
+        this.cleanupPeer(hubId, conn, PEER_LOST_REASONS.PC_CLOSED)
       } else if (state === "failed") {
         if (conn.iceRestartAttempts >= ICE_RESTART_MAX_ATTEMPTS) {
           console.debug(
             `[WebRTCTransport] Connection failed after ${conn.iceRestartAttempts} ICE restarts, cleaning up peer`,
           )
-          this.cleanupPeer(hubId, conn)
+          this.cleanupPeer(hubId, conn, PEER_LOST_REASONS.PC_FAILED_MAX_RESTARTS)
         }
       }
     }
@@ -153,7 +166,7 @@ export class HubPeerLifecycle {
     if (dead) {
       console.debug(`[WebRTCTransport] Probe: peer dead for hub ${hubId} (pc=${pcState}, dc=${dcState}), cleaning up`)
       conn.iceRestartAttempts = 0
-      this.cleanupPeer(hubId, conn)
+      this.cleanupPeer(hubId, conn, PEER_LOST_REASONS.PROBE_DEAD)
     }
 
     return { alive: !dead, pcState, dcState }
@@ -164,8 +177,7 @@ export class HubPeerLifecycle {
     if (!conn?.pc) return
 
     console.debug(`[WebRTCTransport] Disconnecting peer for hub ${hubId} (keeping signaling)`)
-    this.teardownPeer(conn)
-    this.#callbacks.emit("connection:state", { hubId, state: "disconnected" })
+    this.#callbacks.peerLost(hubId, PEER_LOST_REASONS.EXPLICIT_DISCONNECT)
   }
 
   async handleAnswer(hubId, sdp) {
@@ -245,9 +257,8 @@ export class HubPeerLifecycle {
     conn.offerSentAt = 0
   }
 
-  cleanupPeer(hubId, conn) {
-    this.teardownPeer(conn)
-    this.#callbacks.emit("connection:state", { hubId, state: "disconnected" })
+  cleanupPeer(hubId, _conn, reason) {
+    this.#callbacks.peerLost(hubId, reason)
   }
 
   async detectConnectionMode(hubId, conn) {
@@ -382,7 +393,7 @@ export class HubPeerLifecycle {
       console.warn(
         `[WebRTCTransport] Peer setup timed out for hub ${hubId} after ${elapsed}ms; cleaning up for retry`,
       )
-      this.cleanupPeer(hubId, current)
+      this.cleanupPeer(hubId, current, PEER_LOST_REASONS.PEER_SETUP_TIMEOUT)
     }, PEER_SETUP_TIMEOUT_MS)
   }
 
