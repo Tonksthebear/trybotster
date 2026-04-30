@@ -92,13 +92,12 @@ fn internal_dispatch_enters_client_command_hooks() {
 }
 
 #[test]
-fn create_agent_is_idempotent_for_matching_existing_agent() {
+fn create_agent_creates_even_when_matching_agent_exists() {
     let lua = new_lua();
 
     let result: String = lua
         .load(
             r#"
-            local notifications = {}
             local spawned = 0
 
             config = { data_dir = function() return "/tmp/botster-test" end }
@@ -118,7 +117,7 @@ fn create_agent_is_idempotent_for_matching_existing_agent() {
               metadata = { issue_number = 42 },
               session = {
                 send_message = function(_, text)
-                  notifications[#notifications + 1] = text
+                  error("create_agent should not notify existing sessions: " .. tostring(text))
                 end,
               },
             }
@@ -151,18 +150,104 @@ fn create_agent_is_idempotent_for_matching_existing_agent() {
               },
             })
 
-            assert(spawned == 0)
-            assert(#notifications == 1)
-            assert(notifications[1]:match("Please look at this"))
+            assert(spawned == 1)
             assert(result.frames[1].type == "command_response")
             assert(result.frames[1].ok == true)
-            assert(result.frames[1].status == "notified_existing")
-            assert(result.frames[1].session_uuid == "sess-existing")
+            assert(result.frames[1].session_uuid == "sess-new")
             return "ok"
             "#,
         )
         .eval()
-        .expect("dedupe should notify existing agent");
+        .expect("create_agent should create a new session");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn hub_command_channel_create_agent_webhook_dispatches_spawn_command() {
+    let lua = new_lua();
+
+    let result: String = lua
+        .load(
+            r#"
+            local callback = nil
+            local dispatched = {}
+
+            config = { env = function() return "development" end }
+            hub = {
+              is_offline = function() return false end,
+              server_id = function() return "hub-1" end,
+              handle_signaling_message = function() error("unexpected signal") end,
+            }
+            timer = {
+              every = function() return "timer-1" end,
+              cancel = function() end,
+            }
+            events = {
+              on = function() return "event-1" end,
+              off = function() end,
+            }
+            action_cable = {
+              connect = function() return "conn-1" end,
+              subscribe = function(_, _, _, cb)
+                callback = cb
+                return "channel-1"
+              end,
+              unsubscribe = function() end,
+              perform = function() end,
+            }
+            spawn_targets = {
+              get = function(id)
+                if id == "target-1" then
+                  return { id = "target-1", path = "/repo", enabled = true }
+                end
+              end,
+              inspect = function(_)
+                return { repo_name = "owner/repo", is_git_repo = true, repo_root = "/repo" }
+              end,
+            }
+
+            package.loaded["hub.state"] = {
+              get = function() return {} end,
+            }
+            package.loaded["lib.agent"] = {
+              find_by_workspace = function()
+                error("HubCommandChannel create_agent ingress should not dedupe by existing session")
+              end,
+            }
+            package.loaded["lib.internal_client"] = {
+              dispatch = function(source, command)
+                dispatched[#dispatched + 1] = { source = source, command = command }
+              end,
+            }
+
+            require("handlers.hub_commands")
+            assert(type(callback) == "function")
+            callback({
+              type = "message",
+              event_type = "create_agent",
+              payload = {
+                target_id = "target-1",
+                target_path = "/repo",
+                target_repo = "owner/repo",
+                issue_number = 42,
+                prompt = "Please inspect this",
+                issue_url = "https://github.com/owner/repo/issues/42",
+              },
+            }, "channel-1")
+
+            assert(#dispatched == 1)
+            assert(dispatched[1].source == "hub_commands")
+            assert(dispatched[1].command.type == "create_agent")
+            assert(dispatched[1].command.issue_or_branch == "42")
+            assert(dispatched[1].command.prompt == "Please inspect this")
+            assert(dispatched[1].command.target_id == "target-1")
+            assert(dispatched[1].command.metadata.workspace == "owner/repo#42")
+            return "ok"
+            "#,
+        )
+        .eval()
+        .expect("HubCommandChannel create_agent webhook should dispatch explicit spawn command");
 
     assert_eq!(result, "ok");
 }

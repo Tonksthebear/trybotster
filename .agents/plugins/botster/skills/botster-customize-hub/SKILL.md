@@ -88,8 +88,8 @@ Use `events.on(event, fn(data))` for Rust-emitted events:
 All commands enter through `cli/lua/lib/client.lua`. Browser, TUI, socket, MCP,
 hub-to-hub, GitHub, and Rails-originated commands should dispatch through a real
 client transport or `lib.internal_client`; do not add side-channel command
-events. `create_agent` is idempotent for a matching target/workspace/issue:
-existing sessions are returned/notified instead of spawning duplicates.
+events. `create_agent` is an explicit spawn operation: do not infer reuse from
+matching workspace, target, issue, or branch metadata.
 
 Register hub commands for command palette and tool-driven workflows:
 

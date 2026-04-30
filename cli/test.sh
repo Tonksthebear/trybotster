@@ -81,6 +81,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# If the caller supplied only cargo test filters/args, keep the documented
+# default behavior and run the full suite with those args.
+if [ "$RUN_UNIT" = false ] && [ "$RUN_INTEGRATION" = false ] && [ "$RUN_BUILD_CHECK" = false ]; then
+    RUN_UNIT=true
+    RUN_INTEGRATION=true
+fi
+
 echo "BOTSTER_ENV=$BOTSTER_ENV (keyring access disabled)"
 echo ""
 
