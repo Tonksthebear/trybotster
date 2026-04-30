@@ -140,9 +140,11 @@ Initial terminal handshake with dimensions.
 
 ### create_agent (Hub)
 
-Create an agent for a target/workspace/issue identity. This command is
-idempotent: if a matching agent already exists, the hub returns that session and
-delivers the prompt to it instead of spawning a duplicate.
+Create an agent for a target/workspace/issue identity. This is an intentional
+spawn command: each accepted request creates a new agent session. Clients that
+want to focus an existing session should use `select_agent`; producers that want
+to notify an existing session should use the hub/MCP message APIs such as
+`post_message` instead of relying on `create_agent` to infer reuse.
 
 ```json
 {

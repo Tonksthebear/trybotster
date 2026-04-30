@@ -16,7 +16,7 @@ source.
 ## Included
 
 - Version `0.1.9` — command-routing guidance reflects the canonical
-  `client.lua` ingress and idempotent `create_agent` behavior.
+  `client.lua` ingress and explicit `create_agent` spawn behavior.
 - `.codex-plugin/plugin.json` — plugin manifest.
 - `.claude-plugin/plugin.json` — Claude Code plugin manifest.
 - `.mcp.json` — single MCP server named `botster`.

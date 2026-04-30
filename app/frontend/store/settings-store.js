@@ -83,7 +83,7 @@ export const useSettingsStore = create((set, get) => ({
   // --- Hub lifecycle ---
 
   async connectHub(hubId) {
-    const hub = await waitForHub(hubId)
+    const hub = await waitForHub(hubId, null)
     if (!hub) {
       set({
         connected: false,

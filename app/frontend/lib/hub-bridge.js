@@ -125,7 +125,7 @@ function doDisconnect(hubId, callerId) {
 }
 
 function currentHub(hubId) {
-  return hubState.get(hubId)?.hub || null
+  return hubState.get(String(hubId))?.hub || null
 }
 
 export function waitForHub(hubId, timeoutMs = 10000) {
@@ -151,7 +151,9 @@ export function waitForHub(hubId, timeoutMs = 10000) {
     if (!hubWaiters.has(key)) hubWaiters.set(key, new Set())
     hubWaiters.get(key).add(finish)
 
-    timer = window.setTimeout(() => finish(currentHub(key)), timeoutMs)
+    if (timeoutMs != null) {
+      timer = window.setTimeout(() => finish(currentHub(key)), timeoutMs)
+    }
   })
 }
 

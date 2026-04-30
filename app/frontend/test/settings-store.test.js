@@ -1,8 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useSettingsStore } from '../store/settings-store'
 
+const mockWaitForHub = vi.hoisted(() => vi.fn())
+
+vi.mock('../lib/hub-bridge', () => ({
+  waitForHub: (...args) => mockWaitForHub(...args),
+}))
+
 function mockHub(overrides = {}) {
   return {
+    onDisconnected: vi.fn(() => vi.fn()),
     listInstalledTemplates: vi.fn(() => Promise.resolve({ installed: [] })),
     installTemplate: vi.fn(() => Promise.resolve()),
     uninstallTemplate: vi.fn(() => Promise.resolve()),
@@ -14,7 +21,19 @@ function mockHub(overrides = {}) {
 
 describe('settings store template install state', () => {
   beforeEach(() => {
+    mockWaitForHub.mockReset()
     useSettingsStore.setState(useSettingsStore.getInitialState(), true)
+  })
+
+  it('waits durably for the route-owned hub connection', async () => {
+    const hub = mockHub()
+    mockWaitForHub.mockResolvedValueOnce(hub)
+
+    await useSettingsStore.getState().connectHub('hub-1')
+
+    expect(mockWaitForHub).toHaveBeenCalledWith('hub-1', null)
+    expect(useSettingsStore.getState().hub).toBe(hub)
+    expect(useSettingsStore.getState().connected).toBe(true)
   })
 
   it('tracks installed templates by destination file', async () => {

@@ -85,3 +85,82 @@ fn github_event_routing_template_uses_internal_client_ingress() {
         "GitHub template must not use the legacy command_message bypass"
     );
 }
+
+#[test]
+fn github_event_routing_template_notifies_matching_agent_before_create() {
+    let template_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github/event_routing.lua");
+    let template_path = template_path.to_str().unwrap();
+
+    let lua = create_lua_vm();
+
+    let result: String = lua
+        .load(format!(
+            r#"
+            local notifications = {{}}
+            local dispatches = 0
+            local acked = false
+            local callback = nil
+
+            package.loaded["lib.agent"] = {{
+              find_by_workspace = function(name)
+                if name == "owner/repo#42" then
+                  return {{
+                    {{
+                      session_uuid = "sess-existing",
+                      session = {{
+                        send_message = function(_, text)
+                          notifications[#notifications + 1] = text
+                        end,
+                      }},
+                    }},
+                  }}
+                end
+                return {{}}
+              end,
+            }}
+            package.loaded["lib.internal_client"] = {{
+              dispatch = function()
+                dispatches = dispatches + 1
+              end,
+            }}
+            package.loaded["hub.state"] = {{
+              get = function() return {{}} end,
+            }}
+            action_cable = {{
+              connect = function() return "conn-1" end,
+              subscribe = function(_, _, _, cb)
+                callback = cb
+                return "chan-1"
+              end,
+              perform = function(_, action, data)
+                if action == "ack" and data.id == 7 then acked = true end
+              end,
+              close = function() end,
+            }}
+
+            local routing = dofile("{template_path}")
+            routing.start("owner/repo")
+            callback({{
+              id = 7,
+              event_type = "issue_comment",
+              payload = {{
+                issue_number = 42,
+                prompt = "Please inspect this",
+              }},
+            }}, "chan-1")
+
+            assert(#notifications == 1)
+            assert(notifications[1]:match("Please inspect this"))
+            assert(dispatches == 0)
+            assert(acked == true)
+            return "ok"
+            "#
+        ))
+        .eval()
+        .expect("GitHub template should notify matching agents instead of spawning");
+
+    assert_eq!(result, "ok");
+}

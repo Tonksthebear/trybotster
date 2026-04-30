@@ -53,67 +53,6 @@ local function resolve_command_target(command)
     return nil, err
 end
 
-local function format_notification(command)
-    local prompt = command.prompt
-    if prompt then
-        return string.format(
-            "=== NEW MENTION (automated notification) ===\n\n%s\n\n==================",
-            prompt
-        )
-    end
-    return "=== NEW MENTION (automated notification) ===\nNew mention\n=================="
-end
-
-local function notify_existing_agent(agent, command)
-    if agent.session_type and agent.session_type ~= "agent" then
-        return false
-    end
-    if agent.session then
-        agent.session:send_message(format_notification(command))
-        log.info("Sent notification to existing agent: " .. agent.session_uuid)
-        return true
-    end
-    log.warn("Cannot notify agent (no session): " .. agent.session_uuid)
-    return false
-end
-
-local function existing_agents_for_command(command, metadata, target)
-    local Agent = require("lib.agent")
-    local existing = {}
-
-    if metadata.workspace_id then
-        for _, session in ipairs(Agent.list()) do
-            if session._workspace_id == metadata.workspace_id
-                    and (not session.session_type or session.session_type == "agent") then
-                existing[#existing + 1] = session
-            end
-        end
-        return existing
-    end
-
-    if metadata.workspace then
-        for _, agent in ipairs(Agent.find_by_workspace(metadata.workspace, target)) do
-            if not agent.session_type or agent.session_type == "agent" then
-                existing[#existing + 1] = agent
-            end
-        end
-        return existing
-    end
-
-    local issue_or_branch = command.issue_or_branch or command.branch
-    local issue_number = tonumber(issue_or_branch) or metadata.issue_number
-    if issue_number then
-        for _, agent in ipairs(Agent.find_by_meta("issue_number", issue_number)) do
-            if TargetContext.matches(agent, target)
-                    and (not agent.session_type or agent.session_type == "agent") then
-                existing[#existing + 1] = agent
-            end
-        end
-    end
-
-    return existing
-end
-
 commands.register("add_spawn_target", function(client, sub_id, command)
     local registry = rawget(_G, "spawn_targets")
     if not registry or type(registry.add) ~= "function" then
@@ -287,24 +226,6 @@ commands.register("create_agent", function(client, sub_id, command)
     end
     if command.invocation_url and not metadata.invocation_url then
         metadata.invocation_url = command.invocation_url
-    end
-
-    local existing = existing_agents_for_command(command, metadata, target)
-    if #existing > 0 then
-        local notified = 0
-        for _, agent in ipairs(existing) do
-            if notify_existing_agent(agent, command) then
-                notified = notified + 1
-            end
-        end
-        send_command_response(client, sub_id, command, {
-            ok = true,
-            status = "notified_existing",
-            notified = notified,
-            session_uuid = existing[1] and existing[1].session_uuid or nil,
-            id = existing[1] and existing[1].session_uuid or nil,
-        })
-        return
     end
 
     -- Optional workspace template for auto-spawning accessory bundles.

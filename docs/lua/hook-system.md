@@ -36,10 +36,10 @@ transport client or `lib.internal_client`. This keeps `before_hub_command`,
 caller. Raw PTY bytes, file transfer bytes, focus state, and terminal color
 profile updates are transport data-plane/telemetry primitives, not hub commands.
 
-`create_agent` is idempotent in the canonical command handler. When a matching
-agent already exists for the target/workspace/issue identity, the hub returns and
-notifies that session rather than spawning a duplicate. This rule applies to all
-clients and internal producers.
+`create_agent` is an explicit spawn command. When a client asks for a new
+session, the hub must create one; matching workspace, target, issue, or branch
+metadata must not be treated as an implicit request to reuse or notify an
+existing session.
 
 ## Observer Events
 

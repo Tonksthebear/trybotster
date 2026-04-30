@@ -126,27 +126,6 @@ impl ParsedMessage {
         self.event_type == "webrtc_offer"
     }
 
-    /// Get a notification string for pinging an existing agent.
-    ///
-    /// Used when an agent already exists for this issue and we need
-    /// to notify it of a new mention.
-    #[must_use]
-    pub fn format_notification(&self) -> String {
-        if let Some(prompt) = &self.prompt {
-            format!(
-                "=== NEW MENTION (automated notification) ===\n\n{}\n\n==================",
-                prompt
-            )
-        } else {
-            let author = self.comment_author.as_deref().unwrap_or("unknown");
-            let body = self.comment_body.as_deref().unwrap_or("New mention");
-            format!(
-                "=== NEW MENTION (automated notification) ===\n{} mentioned you: {}\n==================",
-                author, body
-            )
-        }
-    }
-
     /// Get the task description for spawning a new agent.
     #[must_use]
     pub fn task_description(&self) -> String {
@@ -245,42 +224,6 @@ mod tests {
 
         assert!(!parsed.is_cleanup());
         assert!(parsed.is_webrtc_offer());
-    }
-
-    #[test]
-    fn test_format_notification_with_prompt() {
-        let data = make_message(
-            1,
-            "issue_comment",
-            serde_json::json!({
-                "prompt": "Please review this PR"
-            }),
-        );
-
-        let parsed = ParsedMessage::from_message_data(&data);
-        let notification = parsed.format_notification();
-
-        assert!(notification.contains("NEW MENTION"));
-        assert!(notification.contains("Please review this PR"));
-    }
-
-    #[test]
-    fn test_format_notification_without_prompt() {
-        let data = make_message(
-            1,
-            "issue_comment",
-            serde_json::json!({
-                "comment_author": "alice",
-                "comment_body": "Hey bot, help!"
-            }),
-        );
-
-        let parsed = ParsedMessage::from_message_data(&data);
-        let notification = parsed.format_notification();
-
-        assert!(notification.contains("NEW MENTION"));
-        assert!(notification.contains("alice"));
-        assert!(notification.contains("Hey bot, help!"));
     }
 
     #[test]
