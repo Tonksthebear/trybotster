@@ -61,4 +61,39 @@ describe('settings store helpers', () => {
       files: ['web_layout.lua'],
     })
   })
+
+  it('ignores legacy plugin database directories without init.lua', async () => {
+    const hub = mockHub({
+      agents: [],
+      accessories: [],
+      plugins: [
+        { name: 'repo__Users_jason_Rails_trybotster_rails-worktree-lifecycle', type: 'dir' },
+        { name: 'demo', type: 'dir' },
+      ],
+      'plugins/repo__Users_jason_Rails_trybotster_rails-worktree-lifecycle': [
+        { name: 'db.sqlite', type: 'file' },
+        { name: 'db.sqlite-shm', type: 'file' },
+        { name: 'db.sqlite-wal', type: 'file' },
+      ],
+      'plugins/demo': [
+        { name: 'init.lua', type: 'file' },
+      ],
+      'plugins/demo/init.lua': [],
+      workspaces: [],
+    })
+
+    const result = await scanSettingsTree({
+      hub,
+      configScope: 'device',
+      selectedTargetId: null,
+    })
+
+    expect(result.state).toBe('tree')
+    expect(result.tree.plugins).toEqual({
+      demo: {
+        init: true,
+        files: ['init.lua'],
+      },
+    })
+  })
 })

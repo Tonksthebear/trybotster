@@ -105,6 +105,14 @@ export async function scanSettingsTree({ hub, configScope, selectedTargetId }) {
     }
   }
 
+  const isLegacyPluginDataDir = (files) => {
+    if (!files?.length) return false
+
+    return files.every((file) =>
+      ['db.sqlite', 'db.sqlite-shm', 'db.sqlite-wal'].includes(file)
+    )
+  }
+
   const [agentNames, accessoryNames, workspaceEntries, pluginNames] =
     await Promise.all([
       listDirs(`${prefix}agents`),
@@ -153,6 +161,7 @@ export async function scanSettingsTree({ hub, configScope, selectedTargetId }) {
         .statFile(`${prefix}plugins/${name}/init.lua`, fs, tid)
         .catch(() => ({ exists: false }))
       const files = await listFilesRecursive(`${prefix}plugins/${name}`)
+      if (!initStat.exists && isLegacyPluginDataDir(files)) return
       if (files.length > 0 || initStat.exists) {
         tree.plugins[name] = {
           init: initStat.exists,
