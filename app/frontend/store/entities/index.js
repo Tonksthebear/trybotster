@@ -18,6 +18,7 @@ import { useSpawnTargetStore } from './spawn-target-store'
 import { useWorktreeStore } from './worktree-store'
 import { useHubMetaStore, useConnectionCodeStore } from './hub-meta-store'
 import { useTemplateStore } from './template-store'
+import { useSessionActionStore } from './session-action-store'
 
 /** Built-in stores keyed by wire entity_type. */
 export const ENTITY_STORES = {
@@ -28,6 +29,7 @@ export const ENTITY_STORES = {
   hub: useHubMetaStore,
   connection_code: useConnectionCodeStore,
   template: useTemplateStore,
+  session_action: useSessionActionStore,
 }
 
 /** Plugin entity types are created on demand. Wire id field defaults to "id". */
@@ -42,6 +44,7 @@ const ID_FIELDS = {
   hub: 'hub_id',
   connection_code: 'hub_id',
   template: 'id',
+  session_action: 'id',
 }
 
 /**
@@ -154,4 +157,5 @@ export {
   useHubMetaStore,
   useConnectionCodeStore,
   useTemplateStore,
+  useSessionActionStore,
 }

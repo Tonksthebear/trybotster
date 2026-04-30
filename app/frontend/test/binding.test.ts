@@ -28,7 +28,7 @@ describe('resolveBindings', () => {
           session_uuid: 'sess-a',
           title: 'alpha',
           is_idle: false,
-          hosted_preview: { status: 'running', url: 'https://x' },
+          plugin_state: { example_provider: { status: 'running', url: 'https://x' } },
         },
         {
           session_uuid: 'sess-b',

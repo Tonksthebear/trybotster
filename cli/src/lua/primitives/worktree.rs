@@ -7,10 +7,10 @@
 //!
 //! - **Queries** (`list`, `exists`, `find`, `repo_root`) read directly from
 //!   `HandleCache` - non-blocking, thread-safe snapshots
-//! - **Create** (`create`) runs synchronously (legacy, blocks Hub event loop)
 //! - **Create async** (`create_async`) sends `HubEvent::LuaWorktreeRequest` for
 //!   Hub to process on a blocking threadpool. Hub fires `worktree_created` or
-//!   `worktree_create_failed` Lua events when done.
+//!   `worktree_create_failed` Lua events when done. Pass `repo_root` to target
+//!   a repository other than the current runtime checkout.
 //! - **Delete** (`delete`) sends `HubEvent::LuaWorktreeRequest` for Hub to
 //!   process asynchronously
 //!
@@ -34,9 +34,6 @@
 //!     log.info("Found at: " .. path)
 //! end
 //!
-//! -- Create worktree synchronously (returns path or errors)
-//! local path = worktree.create("feature-branch")
-//!
 //! -- Create worktree asynchronously (returns immediately, fires event on completion)
 //! worktree.create_async({ label = "key", branch = "feature-branch", prompt = "..." })
 //!
@@ -45,7 +42,6 @@
 //! ```
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -73,6 +69,9 @@ pub enum WorktreeRequest {
         label: String,
         /// Git branch name for the worktree.
         branch: String,
+        /// Optional explicit repository root. When absent, the current runtime
+        /// repository is used.
+        repo_root: Option<String>,
         /// Opaque plugin metadata (carried through for Lua agent spawning).
         metadata: serde_json::Value,
         /// Task prompt for the agent.
@@ -103,6 +102,8 @@ pub struct WorktreeCreateResult {
     pub label: String,
     /// Git branch name.
     pub branch: String,
+    /// Explicit repository root used for creation, if any.
+    pub repo_root: Option<String>,
     /// `Ok(path)` on success, `Err(message)` on failure.
     pub result: Result<std::path::PathBuf, String>,
     /// Opaque plugin metadata (carried forward from request).
@@ -123,40 +124,25 @@ pub type WorktreeResultReceiver = tokio::sync::mpsc::Receiver<WorktreeCreateResu
 /// Channel type for sending async worktree creation results.
 pub type WorktreeResultSender = tokio::sync::mpsc::Sender<WorktreeCreateResult>;
 
-fn parse_porcelain_worktrees(output: &str) -> Vec<serde_json::Value> {
-    let mut worktrees = Vec::new();
-    let mut current_path: Option<String> = None;
-    let mut current_branch: Option<String> = None;
-
-    for line in output.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            current_path = Some(path.to_string());
-        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
-            current_branch = Some(branch.to_string());
-        } else if line.is_empty() {
-            if let Some(path) = current_path.take() {
-                worktrees.push(serde_json::json!({
-                    "path": path,
-                    "branch": current_branch.take().unwrap_or_default(),
-                }));
-            }
-        }
-    }
-
-    if let Some(path) = current_path {
-        worktrees.push(serde_json::json!({
-            "path": path,
-            "branch": current_branch.unwrap_or_default(),
-        }));
-    }
-
-    worktrees
+pub(crate) fn branch_is_repo_head(repo_root: &std::path::Path, branch: &str) -> bool {
+    let head_path = repo_root.join(".git").join("HEAD");
+    std::fs::read_to_string(head_path)
+        .ok()
+        .and_then(|head| {
+            head.trim()
+                .strip_prefix("ref: refs/heads/")
+                .map(std::string::ToString::to_string)
+        })
+        .as_deref()
+        == Some(branch)
 }
 
+#[cfg(test)]
 fn is_detachable_worktree_path(path: &str) -> bool {
     std::path::Path::new(path).join(".git").is_file()
 }
 
+#[cfg(test)]
 fn filter_detachable_worktrees(worktrees: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     worktrees
         .into_iter()
@@ -176,12 +162,8 @@ fn filter_detachable_worktrees(worktrees: Vec<serde_json::Value>) -> Vec<serde_j
 /// - `worktree.list()` - Get all worktrees as a table of {branch, path}
 /// - `worktree.exists(branch)` - Check if worktree exists for branch
 /// - `worktree.find(branch)` - Find worktree path for branch (nil if not found)
-/// - `worktree.create(branch)` - Synchronously create worktree, returns path
 /// - `worktree.delete(path, branch)` - Request worktree deletion (async)
 /// - `worktree.repo_root()` - Get the main repository root path (nil if not in repo)
-/// - `worktree.list_for_root(path)` - List git worktrees for an explicit repo root
-/// - `worktree.find_for_root(path, branch)` - Find a worktree path for an explicit repo root
-/// - `worktree.create_for_root(path, branch)` - Create a worktree for an explicit repo root
 ///
 /// # Arguments
 ///
@@ -197,7 +179,7 @@ pub(crate) fn register(
     lua: &Lua,
     hub_event_tx: HubEventSender,
     handle_cache: Arc<HandleCache>,
-    worktree_base: PathBuf,
+    _worktree_base: PathBuf,
 ) -> Result<()> {
     let worktree = lua
         .create_table()
@@ -231,58 +213,6 @@ pub(crate) fn register(
     worktree
         .set("list", list_fn)
         .map_err(|e| anyhow!("Failed to set worktree.list: {e}"))?;
-
-    let list_for_root_fn = lua
-        .create_function(move |lua, repo_root: String| {
-            let output = Command::new("git")
-                .args(["worktree", "list", "--porcelain"])
-                .current_dir(&repo_root)
-                .output()
-                .map_err(|e| {
-                    mlua::Error::runtime(format!(
-                        "Failed to list worktrees for {}: {}",
-                        repo_root, e
-                    ))
-                })?;
-
-            if !output.status.success() {
-                return Err(mlua::Error::runtime(format!(
-                    "Failed to list worktrees for {}: {}",
-                    repo_root,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
-            }
-
-            let worktrees = filter_detachable_worktrees(parse_porcelain_worktrees(
-                &String::from_utf8_lossy(&output.stdout),
-            ));
-            super::json::json_to_lua(lua, &serde_json::Value::Array(worktrees))
-        })
-        .map_err(|e| anyhow!("Failed to create worktree.list_for_root function: {e}"))?;
-
-    worktree
-        .set("list_for_root", list_for_root_fn)
-        .map_err(|e| anyhow!("Failed to set worktree.list_for_root: {e}"))?;
-
-    let find_for_root_base = worktree_base.clone();
-    let find_for_root_fn = lua
-        .create_function(move |_, (repo_root, branch): (String, String)| {
-            let manager = WorktreeManager::new(find_for_root_base.clone());
-            let found = manager
-                .find_worktree_for_branch(std::path::Path::new(&repo_root), &branch)
-                .map_err(|e| {
-                    mlua::Error::runtime(format!(
-                        "Failed to find worktree for {} in {}: {}",
-                        branch, repo_root, e
-                    ))
-                })?;
-            Ok(found.map(|path| path.to_string_lossy().to_string()))
-        })
-        .map_err(|e| anyhow!("Failed to create worktree.find_for_root function: {e}"))?;
-
-    worktree
-        .set("find_for_root", find_for_root_fn)
-        .map_err(|e| anyhow!("Failed to set worktree.find_for_root: {e}"))?;
 
     // worktree.exists(branch) -> boolean
     //
@@ -320,77 +250,25 @@ pub(crate) fn register(
         .set("find", find_fn)
         .map_err(|e| anyhow!("Failed to set worktree.find: {e}"))?;
 
-    // worktree.create(branch) -> path string or error
-    //
-    // Synchronously creates a worktree for the given branch name.
-    // Returns the filesystem path on success, raises Lua error on failure.
-    // Also updates HandleCache so worktree.find() sees it immediately.
-    let create_base = worktree_base.clone();
-    let create_cache = Arc::clone(&handle_cache);
-    let create_fn = lua
-        .create_function(move |_, branch: String| {
-            let manager = WorktreeManager::new(create_base.clone());
-            match manager.create_worktree_with_branch(&branch) {
-                Ok(path) => {
-                    let path_str = path.to_string_lossy().to_string();
-                    log::info!("Created worktree for branch '{}' at {}", branch, path_str);
-
-                    // Update HandleCache so worktree.find() sees it immediately
-                    let mut worktrees = create_cache.get_worktrees();
-                    worktrees.push((path_str.clone(), branch));
-                    create_cache.set_worktrees(worktrees);
-
-                    Ok(path_str)
-                }
-                Err(e) => Err(mlua::Error::runtime(format!(
-                    "Failed to create worktree for branch '{}': {}",
-                    branch, e
-                ))),
-            }
-        })
-        .map_err(|e| anyhow!("Failed to create worktree.create function: {e}"))?;
-
-    worktree
-        .set("create", create_fn)
-        .map_err(|e| anyhow!("Failed to set worktree.create: {e}"))?;
-
-    let create_for_root_base = worktree_base.clone();
-    let create_for_root_fn = lua
-        .create_function(move |_, (repo_root, branch): (String, String)| {
-            let manager = WorktreeManager::new(create_for_root_base.clone());
-            let path = manager
-                .create_worktree_for_repo_root(std::path::Path::new(&repo_root), &branch)
-                .map_err(|e| {
-                    mlua::Error::runtime(format!(
-                        "Failed to create worktree for {} in {}: {}",
-                        branch, repo_root, e
-                    ))
-                })?;
-            Ok(path.to_string_lossy().to_string())
-        })
-        .map_err(|e| anyhow!("Failed to create worktree.create_for_root function: {e}"))?;
-
-    worktree
-        .set("create_for_root", create_for_root_fn)
-        .map_err(|e| anyhow!("Failed to set worktree.create_for_root: {e}"))?;
-
     // worktree.create_async(params) - Queue async worktree creation
     //
     // Queues a worktree creation request for Hub to process on a blocking
     // threadpool. Returns immediately. Hub fires `worktree_created` or
     // `worktree_create_failed` Lua events on completion.
     //
-    // params is a table with: label, branch, metadata, prompt,
+    // params is a table with: label, branch, repo_root, metadata, prompt,
     // agent_name, client_rows, client_cols
     let tx = hub_event_tx.clone();
     let create_async_fn = lua
         .create_function(move |lua_inner, params: LuaTable| {
-            let label: String = params
-                .get("label")
-                .map_err(|e| mlua::Error::runtime(format!("create_async: missing label: {e}")))?;
             let branch: String = params
                 .get("branch")
                 .map_err(|e| mlua::Error::runtime(format!("create_async: missing branch: {e}")))?;
+            let label: String = params
+                .get::<Option<String>>("label")
+                .unwrap_or(None)
+                .unwrap_or_else(|| branch.clone());
+            let repo_root: Option<String> = params.get("repo_root").unwrap_or(None);
             let prompt: String = params
                 .get::<Option<String>>("prompt")
                 .unwrap_or(None)
@@ -408,6 +286,7 @@ pub(crate) fn register(
                 let _ = sender.send(HubEvent::LuaWorktreeRequest(WorktreeRequest::Create {
                     label,
                     branch,
+                    repo_root,
                     metadata: metadata_json,
                     prompt,
                     agent_name,
@@ -572,11 +451,14 @@ mod tests {
         assert!(wt.contains_key("list").unwrap());
         assert!(wt.contains_key("exists").unwrap());
         assert!(wt.contains_key("find").unwrap());
-        assert!(wt.contains_key("create").unwrap());
         assert!(wt.contains_key("create_async").unwrap());
         assert!(wt.contains_key("copy_from_patterns").unwrap());
         assert!(wt.contains_key("delete").unwrap());
         assert!(wt.contains_key("repo_root").unwrap());
+        assert!(!wt.contains_key("create").unwrap());
+        assert!(!wt.contains_key("create_for_root").unwrap());
+        assert!(!wt.contains_key("find_for_root").unwrap());
+        assert!(!wt.contains_key("list_for_root").unwrap());
     }
 
     #[test]
@@ -814,6 +696,7 @@ mod tests {
             HubEvent::LuaWorktreeRequest(WorktreeRequest::Create {
                 label,
                 branch,
+                repo_root,
                 metadata,
                 prompt,
                 agent_name,
@@ -822,6 +705,7 @@ mod tests {
             }) => {
                 assert_eq!(label, "test-repo-42");
                 assert_eq!(branch, "feature-branch");
+                assert_eq!(repo_root, None);
                 assert_eq!(metadata["issue_number"], 42);
                 assert_eq!(
                     metadata["invocation_url"],
@@ -837,35 +721,60 @@ mod tests {
     }
 
     #[test]
-    fn test_create_returns_error_for_invalid_branch() {
+    fn test_create_async_accepts_explicit_repo_root_and_default_label() {
+        let lua = Lua::new();
+        let tx = new_hub_event_sender();
+        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *tx.lock().unwrap() = Some(sender.into());
+        let cache = Arc::new(HandleCache::new());
+        let base = PathBuf::from("/tmp/test-worktrees");
+
+        register(&lua, tx, cache, base).expect("Should register");
+
+        lua.load(
+            r#"worktree.create_async({
+                branch = "feature-branch",
+                repo_root = "/tmp/source-repo",
+                metadata = { target_id = "secondary" },
+            })"#,
+        )
+        .exec()
+        .expect("Should send create_async event");
+
+        let event = rx.try_recv().expect("Should have received event");
+        match event {
+            HubEvent::LuaWorktreeRequest(WorktreeRequest::Create {
+                label,
+                branch,
+                repo_root,
+                metadata,
+                ..
+            }) => {
+                assert_eq!(label, "feature-branch");
+                assert_eq!(branch, "feature-branch");
+                assert_eq!(repo_root.as_deref(), Some("/tmp/source-repo"));
+                assert_eq!(metadata["target_id"], "secondary");
+            }
+            _ => panic!("Expected LuaWorktreeRequest(Create) event"),
+        }
+    }
+
+    #[test]
+    fn test_removed_sync_create_primitives_are_not_registered() {
         let lua = Lua::new();
         let (tx, cache, base) = create_test_queue_and_cache();
 
         register(&lua, tx, cache, base).expect("Should register");
 
-        // Calling create() with a branch name when not in a repo (or invalid setup)
-        // should raise a Lua error rather than panic
-        let result: LuaResult<String> = lua
-            .load(r#"return worktree.create("test-branch-that-will-fail")"#)
-            .eval();
+        let create: LuaValue = lua.load("return worktree.create").eval().unwrap();
+        let create_for_root: LuaValue = lua.load("return worktree.create_for_root").eval().unwrap();
+        let find_for_root: LuaValue = lua.load("return worktree.find_for_root").eval().unwrap();
+        let list_for_root: LuaValue = lua.load("return worktree.list_for_root").eval().unwrap();
 
-        // The call might succeed (if running in a valid git repo) or fail gracefully.
-        // Either way, it shouldn't panic.
-        match result {
-            Ok(path) => {
-                // If it succeeded, it should return a path string
-                assert!(!path.is_empty());
-            }
-            Err(e) => {
-                // If it failed, the error should be descriptive
-                let err_msg = e.to_string();
-                assert!(
-                    err_msg.contains("Failed to create worktree") || err_msg.contains("git"),
-                    "Error should mention worktree creation failure: {}",
-                    err_msg
-                );
-            }
-        }
+        assert!(matches!(create, LuaValue::Nil));
+        assert!(matches!(create_for_root, LuaValue::Nil));
+        assert!(matches!(find_for_root, LuaValue::Nil));
+        assert!(matches!(list_for_root, LuaValue::Nil));
     }
 
     /// Proves that `worktree.list()` converts data to proper Lua tables

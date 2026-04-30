@@ -90,41 +90,9 @@ function M.activity_state(session)
   return "idle"
 end
 
---- Preview state bundle: `{ can_preview, status, url, error, install_url }`.
---- `can_preview` is true only when the session has a forwarded port — without
---- one, there's no URL to open and no "preview" affordance to show. Matches
---- the JS `!!session.port` semantics: 0 counts as "no port", not "port 0".
-function M.preview_state(session)
-  if not session then return { can_preview = false, status = "inactive" } end
-  local hp = session.hosted_preview
-  local status = (hp and hp.status) or "inactive"
-  local url = (hp and type(hp.url) == "string") and hp.url or nil
-  local error_msg = (hp and hp.error and hp.error ~= "") and hp.error or nil
-  local install_url = (hp and type(hp.install_url) == "string") and hp.install_url or nil
-  local port = session.port
-  local can_preview = port ~= nil and port ~= false and port ~= 0
-  return {
-    can_preview = can_preview,
-    status = status,
-    url = url,
-    error = error_msg,
-    install_url = install_url,
-  }
-end
-
 -- -------------------------------------------------------------------------
 -- Composite props (port of composites.ts logic without emitting nodes)
 -- -------------------------------------------------------------------------
-
---- Map preview state onto the phase-1 indicator's extended status vocabulary:
---- "inactive" | "starting" | "running" | "error" | "unavailable". When the
---- session has no forwarded port we return "unavailable" so callers can choose
---- to suppress rendering.
-function M.hosted_preview_status(session)
-  local preview = M.preview_state(session)
-  if not preview.can_preview then return "unavailable" end
-  return preview.status
-end
 
 --- Availability flags for the session actions menu. Phase 2a emits a
 --- placeholder trigger (see `web/layout.lua`); Phase 2c decides how the

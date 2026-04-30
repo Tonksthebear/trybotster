@@ -88,7 +88,7 @@ end
 ---   * is_idle       → { is_idle }
 ---   * cwd           → { cwd }
 ---   * status        → { status }
----   * hosted_preview→ { hosted_preview = { ...whole nested object... } }
+---   * plugin_state  → { plugin_state = { ...whole nested object... } }
 ---
 --- @param changed_fields table Sparse {field=value} table from Session:update.
 --- @param session table The Session record AFTER applying changes (used to

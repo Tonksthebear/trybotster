@@ -7,8 +7,8 @@ vi.mock('../../lib/actions', () => {
     WORKSPACE_TOGGLE: 'botster.workspace.toggle',
     WORKSPACE_RENAME: 'botster.workspace.rename.request',
     SESSION_SELECT: 'botster.session.select',
-    PREVIEW_TOGGLE: 'botster.session.preview.toggle',
-    PREVIEW_OPEN: 'botster.session.preview.open',
+    SESSION_ACTION_EXECUTE: 'botster.session.action.execute',
+    URL_OPEN: 'botster.url.open',
     SESSION_MOVE: 'botster.session.move.request',
     SESSION_DELETE: 'botster.session.delete.request',
   }
@@ -207,7 +207,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
     expect(localDispatch).not.toHaveBeenCalled()
   })
 
-  it('does NOT fall back to local dispatch for non-idempotent actions like preview.toggle', async () => {
+  it('does NOT fall back to local dispatch for non-idempotent hub actions', async () => {
     const { transport, send } = makeTransport(async () => false)
     const dispatch = createTransportDispatch({
       transport,
@@ -217,9 +217,9 @@ describe('createTransportDispatch — Phase 2c default', () => {
     const node: UiNode = {
       type: 'button',
       props: {
-        label: 'Toggle preview',
+        label: 'Run remote command',
         action: {
-          id: 'botster.session.preview.toggle',
+          id: 'botster.session.remote.command',
           payload: { sessionUuid: 'uuid-1' },
         },
       },
@@ -227,7 +227,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
     render(
       <UiTreeBody node={node} dispatch={dispatch} viewport={REGULAR_FINE} />,
     )
-    fireEvent.click(screen.getByRole('button', { name: 'Toggle preview' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Run remote command' }))
 
     await Promise.resolve()
     await Promise.resolve()

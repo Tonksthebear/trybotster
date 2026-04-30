@@ -204,6 +204,7 @@ hooks.on("agent_created", "broadcast_agent_created", function(info)
     -- then follow with the authoritative workspace snapshot below.
     EntityModel.upsert_session_workspace(info)
     EntityModel.publish_session(info)
+    require("lib.session_actions").publish_for_session(info)
     -- Workspaces list may have grown — re-snapshot since workspace patches
     -- are not granular enough to capture "this session now belongs here".
     local Hub = require("lib.hub")
@@ -223,6 +224,11 @@ hooks.on("agent_deleted", "broadcast_agent_deleted", function(agent_id)
     end
 
     EntityModel.remove_session(agent_id)
+    local SessionActions = require("lib.session_actions")
+    for _, action_id in ipairs(SessionActions.action_ids()) do
+        EntityModel.remove_session_action(agent_id, action_id)
+    end
+    SessionActions.purge_session(agent_id)
 
     -- Surviving sessions might leave a workspace empty. Re-snapshot the
     -- workspace list so a fully drained workspace disappears from the
@@ -441,11 +447,6 @@ hooks.on("pty_output", "idle_activity_reset", function(ctx, _data)
     local uuid = ctx.session_uuid
     if not uuid then return end
 
-    local HostedPreview = require("lib.hosted_preview")
-    if HostedPreview.handle_output(ctx, _data) then
-        return
-    end
-
     local session = Agent.get(uuid)
     if not session then return end
 
@@ -508,11 +509,6 @@ _event_subs[#_event_subs + 1] = events.on("connection_code_ready", function(data
     EntityModel.upsert_connection_code(payload)
 end)
 
-_event_subs[#_event_subs + 1] = events.on("preview_dns_ready", function(data)
-    local HostedPreview = require("lib.hosted_preview")
-    HostedPreview.handle_dns_ready(data)
-end)
-
 _event_subs[#_event_subs + 1] = events.on("connection_code_error", function(err)
     log.warn(string.format("Connection code error: %s", err or "unknown"))
     local hub_id = hub.server_id and hub.server_id() or nil
@@ -572,11 +568,6 @@ _event_subs[#_event_subs + 1] = events.on("process_exited", function(data)
     local exit_code = data.exit_code
     log.info(string.format("Process exited for %s (code=%s)",
         session_uuid or "?", tostring(exit_code)))
-
-    local HostedPreview = require("lib.hosted_preview")
-    if HostedPreview.handle_process_exited(data) then
-        return
-    end
 
     local session = (session_uuid and Session.get(session_uuid))
     if session then

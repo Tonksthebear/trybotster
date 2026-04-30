@@ -1,8 +1,8 @@
 // Wire protocol — fidelity restoration tests for `<SessionList>`.
 //
 // Verifies the current row contract: activity dot, two-line content
-// (primaryName + titleLine + subtext), inline hosted-preview indicator,
-// inline error panel for status==='error', and an actions trigger that
+// (primaryName + titleLine + subtext), inline generic session-action
+// indicators, inline error panel for action errors, and an actions trigger that
 // dispatches `botster.session.menu.open` for `<SessionActionsMenu>` to
 // pick up.
 
@@ -12,7 +12,11 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 
 import { SessionList } from '../components/composites/SessionList'
 import { WorkspaceList } from '../components/composites/WorkspaceList'
-import { useSessionStore, useWorkspaceEntityStore } from '../store/entities'
+import {
+  useSessionActionStore,
+  useSessionStore,
+  useWorkspaceEntityStore,
+} from '../store/entities'
 import { useRouteRegistryStore } from '../store/route-registry-store'
 import { useUiPresentationStore } from '../store/ui-presentation-store'
 
@@ -44,8 +48,17 @@ function seedSession(session) {
   })
 }
 
+function seedSessionActions(actions) {
+  useSessionActionStore.setState({
+    byId: Object.fromEntries(actions.map((action) => [action.id, action])),
+    order: actions.map((action) => action.id),
+    snapshotSeq: 1,
+  })
+}
+
 beforeEach(() => {
   useSessionStore.getState()._reset()
+  useSessionActionStore.getState()._reset()
   useWorkspaceEntityStore.getState()._reset()
   useRouteRegistryStore.setState({
     routesByHubId: {},
@@ -128,52 +141,69 @@ describe('<SessionList> fidelity row', () => {
     expect(sub).toHaveTextContent('codex')
   })
 
-  it('renders the hosted-preview "Running" button when status === "running" with url', () => {
+  it('renders a linked action status when a session action has status and url', () => {
     seedSession({
       id: 'sess-1',
       session_uuid: 'uuid-1',
       session_type: 'agent',
-      port: 8080,
-      hosted_preview: { status: 'running', url: 'https://preview.test' },
     })
+    seedSessionActions([
+      {
+        id: 'uuid-1:cloudflare.preview.open',
+        session_uuid: 'uuid-1',
+        action_id: 'cloudflare.preview.open',
+        label: 'Cloudflare preview',
+        status: 'running',
+        url: 'https://preview.test',
+        visibility: 'visible',
+        enabled: true,
+      },
+    ])
     const ctx = fakeCtx()
     render(<SessionList density="panel" grouping="flat" ctx={ctx} />)
-    const running = screen.getByTestId('hosted-preview-running')
+    const running = screen.getByTestId('session-action-link')
     fireEvent.click(running)
     expect(ctx.dispatch).toHaveBeenCalledWith(
       expect.objectContaining({
-        id: 'botster.session.preview.open',
+        id: 'botster.url.open',
         payload: expect.objectContaining({ url: 'https://preview.test' }),
       }),
       expect.any(Object),
     )
   })
 
-  it('renders the inline error panel when hosted_preview.status === "error"', () => {
+  it('renders the inline error panel when a session action reports an error', () => {
     seedSession({
       id: 'sess-1',
       session_uuid: 'uuid-1',
       session_type: 'agent',
-      port: 8080,
-      hosted_preview: {
+    })
+    seedSessionActions([
+      {
+        id: 'uuid-1:cloudflare.preview.toggle',
+        session_uuid: 'uuid-1',
+        action_id: 'cloudflare.preview.toggle',
+        label: 'Cloudflare preview',
         status: 'error',
         error: 'cloudflared not installed',
         install_url: 'https://install.cloudflared.test',
+        visibility: 'visible',
+        enabled: true,
       },
-    })
+    ])
     const ctx = fakeCtx()
     render(<SessionList density="panel" grouping="flat" ctx={ctx} />)
 
-    const errorPanel = screen.getByTestId('hosted-preview-error')
+    const errorPanel = screen.getByTestId('session-action-error')
     expect(errorPanel).toHaveTextContent('cloudflared not installed')
 
     const installButton = within(errorPanel).getByRole('button', {
-      name: /Install cloudflared/i,
+      name: /Open Cloudflare preview/i,
     })
     fireEvent.click(installButton)
     expect(ctx.dispatch).toHaveBeenCalledWith(
       expect.objectContaining({
-        id: 'botster.session.preview.open',
+        id: 'botster.url.open',
         payload: expect.objectContaining({
           url: 'https://install.cloudflared.test',
         }),

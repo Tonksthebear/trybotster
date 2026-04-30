@@ -498,12 +498,10 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     if not wt_path then
         if target_uses_current_runtime(resolved_target) then
             wt_path = worktree.find(branch_name)
-        else
-            wt_path = worktree.find_for_root(worktree_root, branch_name)
         end
     end
 
-    if not wt_path then
+    if not wt_path and target_uses_current_runtime(resolved_target) then
         local head_path = worktree_root .. "/.git/HEAD"
         local f = io.open(head_path, "r")
         if f then
@@ -530,25 +528,22 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         async_metadata._workspace_manifest = workspace_manifest
         async_metadata._agent_name = agent_name
 
-        if target_uses_current_runtime(resolved_target) then
-            worktree.create_async({
-                branch = branch_name,
-                prompt = prompt,
-                metadata = async_metadata,
-                agent_name = agent_name,
-                client_rows = 24,
-                client_cols = 80,
-            })
-            return nil  -- Agent spawning continues in worktree_created event handler
+        local create_args = {
+            label = branch_name,
+            branch = branch_name,
+            prompt = prompt,
+            metadata = async_metadata,
+            agent_name = agent_name,
+            client_rows = 24,
+            client_cols = 80,
+        }
+
+        if not target_uses_current_runtime(resolved_target) then
+            create_args.repo_root = worktree_root
         end
 
-        local ok, created_or_err = pcall(worktree.create_for_root, worktree_root, branch_name)
-        if not ok then
-            notify_lifecycle(branch_name, "failed", { error = tostring(created_or_err) })
-            return nil, tostring(created_or_err)
-        end
-        wt_path = created_or_err
-        notify_worktree_created(wt_path, branch_name, metadata)
+        worktree.create_async(create_args)
+        return nil  -- Agent spawning continues in worktree_created event handler
     else
         log.info(string.format("Worktree found for %s at %s", branch_name, wt_path))
     end
@@ -674,7 +669,6 @@ local function handle_delete_session(session_uuid, delete_worktree)
     return true
 end
 
--- Keep backward-compat name
 local handle_delete_agent = handle_delete_session
 
 -- ============================================================================
@@ -796,7 +790,7 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
         end
 
     elseif msg_type == "create_accessory" then
-        local accessory_name = message.accessory_name or message.session_name or message.name
+        local accessory_name = message.accessory_name
         local workspace_id = message.workspace_id
         local workspace_name = message.workspace_name
         local agent_name = message.agent_name
@@ -806,8 +800,8 @@ _event_subs[#_event_subs + 1] = events.on("command_message", function(message)
             target_repo = message.target_repo,
         })
 
-    elseif msg_type == "delete_agent" or msg_type == "delete_session" then
-        local session_id = message.id or message.agent_id or message.session_uuid or message.session_key
+    elseif msg_type == "delete_agent" then
+        local session_id = message.session_uuid
         if session_id then
             handle_delete_session(session_id, message.delete_worktree or false)
         else

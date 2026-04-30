@@ -60,11 +60,6 @@ local function fallback_command(envelope)
             session_uuid = payload.sessionUuid,
             session_id = payload.sessionId,
         }
-    elseif id == "botster.session.preview.toggle" then
-        return {
-            type = "toggle_hosted_preview",
-            session_uuid = payload.sessionUuid,
-        }
     end
 
     -- Everything else: local UI concern (toggle/rename.request/move.request/

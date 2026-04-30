@@ -180,7 +180,7 @@ fn project_fields_omits_display_name_for_isidle_change() {
 }
 
 #[test]
-fn project_fields_replaces_hosted_preview_wholesale() {
+fn project_fields_replaces_plugin_state_wholesale() {
     let (lua, _eb) = new_test_lua();
     let csp: Table = lua
         .load("return require('lib.client_session_payload')")
@@ -192,15 +192,15 @@ fn project_fields_replaces_hosted_preview_wholesale() {
     let preview: Table = lua.create_table().unwrap();
     preview.set("status", "running").unwrap();
     preview.set("url", "https://x").unwrap();
-    changed.set("hosted_preview", preview).unwrap();
+    changed.set("plugin_state", preview).unwrap();
 
     let session_after: Table = lua.create_table().unwrap();
     session_after.set("session_uuid", "sess-a").unwrap();
 
     let result: Value = project_fields.call((changed, session_after)).unwrap();
     let json: JsonValue = lua.from_value(result).unwrap();
-    assert_eq!(json["hosted_preview"]["status"], json!("running"));
-    assert_eq!(json["hosted_preview"]["url"], json!("https://x"));
+    assert_eq!(json["plugin_state"]["status"], json!("running"));
+    assert_eq!(json["plugin_state"]["url"], json!("https://x"));
     // Per §12.4: nested object is shipped wholesale, no derivations.
     assert!(json.get("display_name").is_none());
 }

@@ -5,7 +5,6 @@
 //
 //   * `<SessionList>` — the main multi-row composite
 //   * `<SessionRow>`  — the single-row variant (`ui.session_row{}`)
-//   * `<SessionActionsMenu>` — derives `previewState` for menu enablement
 //
 // No Zustand store. No side effects. The session record itself is the same
 // shape `ClientSessionPayload.build` ships under the wire protocol — every field referenced
@@ -13,7 +12,7 @@
 
 /**
  * @typedef {object} SessionRecord
- * @property {string} [id]                 deprecated alias for session_uuid
+ * @property {string} [id]                 generic entity-store id
  * @property {string} [session_uuid]
  * @property {string} [label]              user-overridden display name
  * @property {string} [display_name]       hub-derived display name
@@ -25,9 +24,7 @@
  * @property {string} [session_type]       'agent' | 'accessory'
  * @property {boolean} [is_idle]
  * @property {boolean} [notification]
- * @property {number} [port]               present iff a hosted preview can run
  * @property {boolean} [in_worktree]
- * @property {object} [hosted_preview]     { status, url, error, install_url }
  * @property {object} [close_actions]      { can_delete_worktree, ... }
  */
 
@@ -35,7 +32,7 @@
  * Primary display name. Preference order:
  *   1. user-set `label` (trimmed)
  *   2. `display_name` (hub-derived)
- *   3. `id` / `session_uuid` as last-resort identifier
+ *   3. `session_uuid` as last-resort identifier
  *
  * @param {SessionRecord} session
  * @returns {string}
@@ -44,7 +41,7 @@ export function displayName(session) {
   if (!session) return ''
   const label = typeof session.label === 'string' ? session.label.trim() : ''
   if (label) return label
-  return session.display_name || session.id || session.session_uuid || ''
+  return session.display_name || session.session_uuid || ''
 }
 
 /**
@@ -103,36 +100,9 @@ export function activityState(session) {
 }
 
 /**
- * Hosted-preview view-model. Always returns a `canPreview` boolean — even
- * for sessions that don't carry a preview, callers can early-return on
- * `!canPreview` instead of repeatedly checking `session.port`.
- *
- * @param {SessionRecord} session
- * @returns {{
- *   canPreview: boolean,
- *   status?: 'inactive' | 'starting' | 'running' | 'error' | 'unavailable',
- *   url?: string|null,
- *   error?: string|null,
- *   installUrl?: string|null,
- * }}
- */
-export function previewState(session) {
-  if (!session) return { canPreview: false }
-  const hp = session.hosted_preview
-  return {
-    canPreview: !!session.port,
-    status: hp?.status || 'inactive',
-    url: typeof hp?.url === 'string' ? hp.url : null,
-    error: hp?.error || null,
-    installUrl: typeof hp?.install_url === 'string' ? hp.install_url : null,
-  }
-}
-
-/**
  * One-shot row-props selector: composes everything `<SessionList>` /
- * `<SessionRow>` need to render a single row. Includes the actions-menu
- * availability flags and the close_actions field so the actions popover
- * and the delete dialog can render without re-deriving.
+ * `<SessionRow>` need to render a single row. Includes the close_actions field
+ * so the delete dialog can render without re-deriving.
  *
  * `selected` and `density` come in via the caller (browser-local state),
  * not the session record itself.
@@ -142,8 +112,7 @@ export function previewState(session) {
  */
 export function selectSessionRowProps(session, opts = {}) {
   if (!session) return null
-  const preview = previewState(session)
-  const sessionUuid = session.session_uuid || session.id || ''
+  const sessionUuid = session.session_uuid || ''
   return {
     sessionId: session.id || sessionUuid,
     sessionUuid,
@@ -155,37 +124,9 @@ export function selectSessionRowProps(session, opts = {}) {
     notification: !!session.notification,
     sessionType: session.session_type || 'agent',
     activityState: activityState(session),
-    hostedPreview: preview.canPreview ? preview : null,
-    previewError: preview.status === 'error' ? preview.error : null,
-    actionsMenu: {
-      canPreview: preview.canPreview,
-      previewStatus: preview.status,
-      previewUrl: preview.url,
-      canMove: true,
-      canDelete: true,
-    },
     closeActions: session.close_actions || {},
     canMoveWorkspace: true,
     canDelete: true,
     inWorktree: session.in_worktree ?? true,
-  }
-}
-
-/**
- * Hosted-preview indicator props for surfaces that render the preview
- * affordance without the rest of the row (e.g. a future status-bar pill).
- * Returns `null` when the session can't preview.
- *
- * @param {SessionRecord} session
- */
-export function selectHostedPreviewIndicatorProps(session) {
-  if (!session) return null
-  const preview = previewState(session)
-  if (!preview.canPreview) return null
-  return {
-    status: preview.status,
-    url: preview.url,
-    error: preview.error,
-    installUrl: preview.installUrl,
   }
 }

@@ -238,8 +238,7 @@ commands.register("create_agent", function(client, sub_id, command)
 end, { description = "Create a new agent (with optional worktree, agent name, and workspace)" })
 
 commands.register("create_accessory", function(client, sub_id, command)
-    -- Accept both "accessory_name" (new) and "session_name" (legacy)
-    local accessory_name = command.accessory_name or command.session_name or command.name
+    local accessory_name = command.accessory_name
     local workspace_id = command.workspace_id
     local workspace_name = command.workspace_name
     local agent_name = command.agent_name
@@ -296,7 +295,7 @@ commands.register("rename_workspace", function(client, sub_id, command)
 end, { description = "Rename a workspace" })
 
 commands.register("move_agent_workspace", function(_client, _sub_id, command)
-    local session_id = command.id or command.agent_id or command.session_uuid or command.session_key
+    local session_id = command.session_uuid
     local workspace_id = command.workspace_id
     local workspace_name = command.workspace_name
 
@@ -345,7 +344,7 @@ commands.register("move_agent_workspace", function(_client, _sub_id, command)
 end, { description = "Move a live session to another workspace" })
 
 commands.register("update_session", function(_client, _sub_id, command)
-    local session_id = command.id or command.agent_id or command.session_uuid or command.session_key
+    local session_id = command.session_uuid
     if not session_id then
         log.warn("update_session missing session identifier")
         return
@@ -402,7 +401,7 @@ commands.register("reopen_worktree", function(client, _sub_id, command)
 end, { description = "Reopen an existing worktree as an agent" })
 
 commands.register("delete_agent", function(_client, _sub_id, command)
-    local session_id = command.id or command.agent_id or command.session_uuid or command.session_key
+    local session_id = command.session_uuid
     local delete_worktree = command.delete_worktree or false
 
     if session_id then
@@ -413,54 +412,19 @@ commands.register("delete_agent", function(_client, _sub_id, command)
     end
 end, { description = "Delete a session (agent or accessory, optionally with worktree)" })
 
-commands.register("toggle_hosted_preview", function(_client, _sub_id, command)
-    local Session = require("lib.session")
-    local HostedPreview = require("lib.hosted_preview")
-    local session_id = command.session_uuid or command.agent_id or command.id
-    if not session_id then
-        log.warn("toggle_hosted_preview missing session identifier")
-        return
+commands.register("execute_session_action", function(client, sub_id, command)
+    local session_uuid = command.session_uuid
+    local action_id = command.action_id
+    local ok, result = require("lib.session_actions").run(session_uuid, action_id, {
+        client = client,
+        sub_id = sub_id,
+        params = command.params,
+    })
+    if not ok then
+        log.warn(string.format("execute_session_action failed: %s", tostring(result)))
+        send_command_error(client, sub_id, "session_action_error", result)
     end
-
-    local session = Session.get(session_id)
-    if not session then
-        log.warn(string.format("toggle_hosted_preview: session not found: %s", session_id))
-        return
-    end
-
-    if not session._port then
-        log.warn(string.format("toggle_hosted_preview: session has no forwarded port: %s", session_id))
-        return
-    end
-
-    local hosted = session.hosted_preview
-    local enabled = command.enabled
-    if enabled == nil then
-        enabled = not (hosted and (hosted.status == "starting" or hosted.status == "running"))
-    end
-
-    if enabled then
-        local _, err = HostedPreview.enable(session)
-        if err then
-            log.warn(string.format("toggle_hosted_preview failed: %s", tostring(err)))
-        end
-    else
-        HostedPreview.disable(session)
-    end
-end, { description = "Enable or disable a Cloudflare-hosted preview for a forwarded session" })
-
--- Alias: delete_session → delete_agent
-commands.register("delete_session", function(_client, _sub_id, command)
-    local session_id = command.id or command.session_uuid or command.agent_id or command.session_key
-    local delete_worktree = command.delete_worktree or false
-
-    if session_id then
-        require("handlers.agents").handle_delete_session(session_id, delete_worktree)
-        log.info(string.format("Delete session request: %s", session_id))
-    else
-        log.warn("delete_session missing session identifier")
-    end
-end, { description = "Delete a session (alias for delete_agent)" })
+end, { description = "Execute a plugin-registered session action" })
 
 commands.register("select_agent", function(_client, _sub_id, command)
     -- Wire protocol: selection is purely client-side (web
@@ -469,7 +433,7 @@ commands.register("select_agent", function(_client, _sub_id, command)
     -- handler is kept as a no-op acknowledgment for cross-client handoff
     -- flows that may evolve later (e.g. focus a session in the TUI from a
     -- browser click).
-    local new_selection = command.session_uuid or command.id
+    local new_selection = command.session_uuid
     log.debug(string.format("select_agent: %s", tostring(new_selection)))
 end, { description = "Acknowledge selection (client-side only)" })
 

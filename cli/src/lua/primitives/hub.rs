@@ -73,19 +73,33 @@ pub enum HubRequest {
     /// On build failure the Hub logs an error and keeps running — no agents
     /// are disrupted.  Intended for development iteration only.
     DevRebuild,
-    /// Wait for a quick-tunnel hostname to resolve via DoH before surfacing
-    /// the URL to the browser (avoids negative-cache poisoning on the client).
-    ProbePreviewDns {
+    /// Wait for a plugin-provided URL to resolve and answer before surfacing it
+    /// to clients.
+    ProbeUrlReady {
         /// Connector session UUID.
         connector_session_uuid: String,
         /// Parent session UUID.
         parent_session_uuid: String,
-        /// Full preview URL to surface once DNS resolves.
+        /// Full URL to surface once it is reachable.
         url: String,
         /// Bare hostname to resolve via DoH.
         hostname: String,
         /// Deadline in seconds.
         timeout_secs: f64,
+    },
+    /// Resolve a plugin command and optionally write a command config file on a
+    /// blocking worker thread, then fire `plugin_command_prepared`.
+    PreparePluginCommand {
+        /// Plugin-scoped request token used to ignore stale completions.
+        request_id: String,
+        /// Executable name or path to resolve against the Hub environment.
+        command: String,
+        /// Optional config file path to write before the command is used.
+        config_path: Option<String>,
+        /// Optional config file contents.
+        config_contents: Option<String>,
+        /// Opaque plugin-owned context returned with the completion event.
+        context: serde_json::Value,
     },
     /// Handle an incoming ActionCable signaling/control message for WebRTC.
     HandleSignalingMessage {
@@ -948,8 +962,8 @@ pub(crate) fn register(
     // hub.resolve_command_path(command) -> (path, nil) or (nil, error)
     //
     // Resolves an executable against the Hub's live environment without
-    // spawning anything. Hosted preview uses this on every enable attempt so
-    // cloudflared installation changes are picked up immediately.
+    // spawning anything. Plugins can use this on every action attempt so
+    // connector installation changes are picked up immediately.
     let resolve_command_path_fn = lua
         .create_function(|_, command: String| {
             let trimmed = command.trim().to_string();
@@ -957,7 +971,7 @@ pub(crate) fn register(
                 return Ok((None::<String>, Some("Command cannot be blank".to_string())));
             }
 
-            match crate::hosted_preview::resolve_command_path(&trimmed) {
+            match crate::plugin_helpers::resolve_command_path(&trimmed) {
                 Some(path) => Ok((Some(path.to_string_lossy().into_owned()), None::<String>)),
                 None => Ok((
                     None::<String>,
@@ -970,11 +984,53 @@ pub(crate) fn register(
     hub.set("resolve_command_path", resolve_command_path_fn)
         .map_err(|e| anyhow!("Failed to set hub.resolve_command_path: {e}"))?;
 
-    // hub.probe_preview_dns(connector_uuid, parent_uuid, url, hostname, timeout_secs?)
-    // Hosted preview readiness gate: waits for DNS plus HTTPS reachability
-    // before surfacing the URL.
-    let tx_probe_dns = hub_event_tx.clone();
-    let probe_preview_dns_fn = lua
+    // hub.prepare_plugin_command({ request_id, command, config_path?, config_contents?, context? })
+    //
+    // Queues blocking command resolution/config materialization off the Hub
+    // event loop. Completion is delivered through the generic
+    // `plugin_command_prepared` event with the original request_id and context.
+    let tx_prepare_plugin_command = hub_event_tx.clone();
+    let prepare_plugin_command_fn = lua
+        .create_function(move |lua, opts: LuaTable| {
+            let request_id: String = opts
+                .get("request_id")
+                .map_err(|_| LuaError::runtime("prepare_plugin_command: request_id is required"))?;
+            let command: String = opts
+                .get("command")
+                .map_err(|_| LuaError::runtime("prepare_plugin_command: command is required"))?;
+            let config_path: Option<String> = opts.get("config_path").ok();
+            let config_contents: Option<String> = opts.get("config_contents").ok();
+            let context_value: LuaValue = opts.get("context").unwrap_or(LuaValue::Nil);
+            let context: serde_json::Value = lua.from_value(context_value)?;
+
+            let guard = tx_prepare_plugin_command
+                .lock()
+                .expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::PreparePluginCommand {
+                    request_id,
+                    command,
+                    config_path,
+                    config_contents,
+                    context,
+                }));
+            } else {
+                ::log::warn!(
+                    "[Hub] prepare_plugin_command called before hub_event_tx set — event dropped"
+                );
+            }
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create hub.prepare_plugin_command function: {e}"))?;
+
+    hub.set("prepare_plugin_command", prepare_plugin_command_fn)
+        .map_err(|e| anyhow!("Failed to set hub.prepare_plugin_command: {e}"))?;
+
+    // hub.probe_url_ready(connector_uuid, parent_uuid, url, hostname, timeout_secs?)
+    // Plugin-facing URL readiness gate: waits for public DNS plus HTTPS
+    // reachability before surfacing the URL.
+    let tx_probe_url = hub_event_tx.clone();
+    let probe_url_ready_fn = lua
         .create_function(
             move |_,
                   (connector_session_uuid, parent_session_uuid, url, hostname, timeout_secs): (
@@ -984,9 +1040,9 @@ pub(crate) fn register(
                 String,
                 Option<f64>,
             )| {
-                let guard = tx_probe_dns.lock().expect("HubEventSender mutex poisoned");
+                let guard = tx_probe_url.lock().expect("HubEventSender mutex poisoned");
                 if let Some(ref sender) = *guard {
-                    let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::ProbePreviewDns {
+                    let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::ProbeUrlReady {
                         connector_session_uuid,
                         parent_session_uuid,
                         url,
@@ -997,10 +1053,10 @@ pub(crate) fn register(
                 Ok(())
             },
         )
-        .map_err(|e| anyhow!("Failed to create hub.probe_preview_dns function: {e}"))?;
+        .map_err(|e| anyhow!("Failed to create hub.probe_url_ready function: {e}"))?;
 
-    hub.set("probe_preview_dns", probe_preview_dns_fn)
-        .map_err(|e| anyhow!("Failed to set hub.probe_preview_dns: {e}"))?;
+    hub.set("probe_url_ready", probe_url_ready_fn)
+        .map_err(|e| anyhow!("Failed to set hub.probe_url_ready: {e}"))?;
 
     // Ensure hub table is globally registered
     lua.globals()
@@ -1058,7 +1114,55 @@ mod tests {
         assert!(hub.contains_key("exec_restart").unwrap());
         assert!(hub.contains_key("dev_rebuild").unwrap());
         assert!(hub.contains_key("resolve_command_path").unwrap());
+        assert!(hub.contains_key("prepare_plugin_command").unwrap());
         assert!(hub.contains_key("pty_tee").unwrap());
+    }
+
+    #[test]
+    fn prepare_plugin_command_sends_hub_request() {
+        let lua = Lua::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx: HubEventSender = Arc::new(Mutex::new(Some(event_tx.into())));
+        let cache = Arc::new(HandleCache::new());
+        let hid = "test-local-hub-id".to_string();
+        let sid = Arc::new(Mutex::new(Some("test-hub-id".to_string())));
+        let state = Arc::new(RwLock::new(HubState::new(std::path::PathBuf::from(
+            "/tmp/test-worktrees",
+        ))));
+        let cc = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
+
+        lua.load(
+            r#"
+            hub.prepare_plugin_command({
+              request_id = "req-1",
+              command = "cloudflared",
+              config_path = "/tmp/quick.yml",
+              config_contents = "{}\n",
+              context = { parent_session_uuid = "sess-1", port = 4567 },
+            })
+            "#,
+        )
+        .exec()
+        .expect("prepare_plugin_command should send request");
+
+        match event_rx.try_recv().expect("Should send hub request") {
+            HubEvent::LuaHubRequest(HubRequest::PreparePluginCommand {
+                request_id,
+                command,
+                config_path,
+                config_contents,
+                context,
+            }) => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(command, "cloudflared");
+                assert_eq!(config_path.as_deref(), Some("/tmp/quick.yml"));
+                assert_eq!(config_contents.as_deref(), Some("{}\n"));
+                assert_eq!(context["parent_session_uuid"], "sess-1");
+                assert_eq!(context["port"], 4567);
+            }
+            other => panic!("Expected PreparePluginCommand, got: {other:?}"),
+        }
     }
 
     #[test]

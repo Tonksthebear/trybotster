@@ -117,8 +117,7 @@ M.primitives = {
             { sig = "worktree.exists(branch)",     desc = "Check if worktree exists for branch" },
             { sig = "worktree.find(branch)",       desc = "Find worktree path for branch → string or nil" },
             { sig = "worktree.repo_root()",        desc = "Repo root directory" },
-            { sig = "worktree.create(branch)",     desc = "Sync create worktree (blocks event loop)" },
-            { sig = "worktree.create_async(opts)", desc = "Async create — fires worktree_created/worktree_create_failed events" },
+            { sig = "worktree.create_async(opts)", desc = "Async create; opts.repo_root targets another repo" },
             { sig = "worktree.delete(path, branch)", desc = "Async delete worktree" },
         },
     },
@@ -168,7 +167,8 @@ M.primitives = {
             { sig = "hub.quit()",                  desc = "Request hub shutdown" },
             { sig = "hub.graceful_restart()",      desc = "Restart hub (sessions survive)" },
             { sig = "hub.resolve_command_path(command)", desc = "Resolve an executable against the live PATH" },
-            { sig = "hub.probe_preview_dns(connector_uuid, parent_uuid, url, hostname, timeout_secs?)", desc = "DNS + HTTPS readiness gate for hosted preview URL" },
+            { sig = "hub.prepare_plugin_command(opts)", desc = "Async plugin command prep; fires plugin_command_prepared with error_kind=command_blank|command_missing|config_write_failed|task_failed" },
+            { sig = "hub.probe_url_ready(connector_uuid, parent_uuid, url, hostname, timeout_secs?)", desc = "Plugin-facing DNS + HTTPS readiness gate for public URLs" },
         },
     },
     {
@@ -358,7 +358,7 @@ M.events = {
 -- =============================================================================
 
 M.session_info_fields = {
-    { name = "id",             type = "string",      desc = "Session UUID (alias for session_uuid)" },
+    { name = "id",             type = "string",      desc = "Generic entity ID; equals session_uuid for session entities" },
     { name = "session_uuid",   type = "string",      desc = "Session UUID — primary identifier" },
     { name = "session_type",   type = "string",      desc = "'agent' or 'accessory'" },
     { name = "session_name",   type = "string",      desc = "PTY session name" },

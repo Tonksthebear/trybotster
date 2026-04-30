@@ -221,12 +221,28 @@ pub(crate) enum HubEvent {
         identities: Vec<String>,
     },
 
-    /// DNS readiness probe for a hosted preview completed.
-    PreviewDnsReady {
+    /// URL readiness probe requested by a plugin completed.
+    UrlProbeReady {
         connector_session_uuid: String,
         parent_session_uuid: String,
         url: String,
         ready: bool,
+        error: Option<String>,
+    },
+
+    /// Plugin command preparation requested from Lua completed.
+    PluginCommandPrepared {
+        /// Plugin-scoped request token from the original request.
+        request_id: String,
+        /// Resolved executable path when preparation succeeded.
+        command: Option<String>,
+        /// Optional config file path written for the command.
+        config_path: Option<String>,
+        /// Opaque plugin-owned context from the original request.
+        context: serde_json::Value,
+        /// Stable machine-readable error kind when preparation failed.
+        error_kind: Option<String>,
+        /// Error message when preparation failed.
         error: Option<String>,
     },
 
@@ -396,7 +412,8 @@ impl HubEvent {
             Self::LuaPushRequest { .. } => "lua_push_request",
             Self::BrowserPushControl { .. } => "browser_push_control",
             Self::PushSubscriptionsExpired { .. } => "push_subscriptions_expired",
-            Self::PreviewDnsReady { .. } => "preview_dns_ready",
+            Self::UrlProbeReady { .. } => "url_probe_ready",
+            Self::PluginCommandPrepared { .. } => "plugin_command_prepared",
             Self::SocketClientConnected { .. } => "socket_client_connected",
             Self::SocketClientDisconnected { .. } => "socket_client_disconnected",
             Self::SocketMessage { .. } => "socket_message",

@@ -77,14 +77,12 @@ describe('route-registry-store normalisation', () => {
     })
   })
 
-  it('assigns base_path from legacy `path` when base_path is absent', () => {
-    // Old hub still shipping only `path`. Store should fill in base_path so
-    // consumers don't have to branch on schema version.
+  it('does not derive base_path from path when base_path is absent', () => {
     useRouteRegistryStore.getState().setRoutes('h1', [
       { path: '/plugins/hello', surface: 'hello' },
     ])
     const routes = selectRoutesForHub(useRouteRegistryStore.getState(), 'h1')
-    expect(routes[0].base_path).toBe('/plugins/hello')
+    expect(routes[0].base_path).toBeNull()
   })
 
   it('preserves explicit base_path when supplied', () => {

@@ -75,6 +75,10 @@ Use `events.on(event, fn(data))` for Rust-emitted events:
 - `connection_code_error`
 - `agent_status_changed`
 - `process_exited`
+- `plugin_command_prepared` — completion for `hub.prepare_plugin_command`;
+  includes `request_id`, optional `command`/`config_path`, opaque `context`,
+  `error_kind`, and `error`.
+- `url_probe_ready` — completion for `hub.probe_url_ready`.
 - `outgoing_signal`
 
 ## Commands
@@ -91,6 +95,8 @@ end, { description = "Send Slack notification" })
 
 - Use async table-first primitives inside callbacks.
 - Do not call blocking sync primitives after the hub event loop starts.
+- Use `hub.prepare_plugin_command` for plugin command PATH/config preparation
+  that would otherwise block action handlers.
 - Store durable plugin state in `plugin.db{}` during plugin load.
 - Use `session_uuid` as the routing key.
 - Keep plugins generic; Botster should stay agent-CLI agnostic.

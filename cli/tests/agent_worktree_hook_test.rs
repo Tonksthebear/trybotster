@@ -72,9 +72,8 @@ fn new_agents_lua_vm() -> Lua {
 
         _G.worktree = {{
             repo_root = function() return "/repos/current-runtime" end,
-            find_for_root = function(_, _) return nil end,
-            create_for_root = function(root, branch)
-                return root .. "/.worktrees/" .. branch
+            create_async = function(args)
+                _G.__create_async_args = args
             end,
         }}
 
@@ -162,7 +161,7 @@ fn new_agents_lua_vm() -> Lua {
 }
 
 #[test]
-fn create_for_root_notifies_worktree_created_before_agent_spawn() {
+fn external_target_queues_async_worktree_and_spawns_after_created_event() {
     let lua = new_agents_lua_vm();
 
     lua.load(
@@ -184,6 +183,38 @@ fn create_for_root_notifies_worktree_created_before_agent_spawn() {
     )
     .exec()
     .expect("create agent through external target path");
+
+    let (queued_branch, queued_repo_root, spawned_before_event): (String, String, usize) = lua
+        .load(
+            r#"
+            return
+                _G.__create_async_args.branch,
+                _G.__create_async_args.repo_root,
+                #_G.__order
+            "#,
+        )
+        .eval()
+        .expect("read queued async request");
+
+    assert_eq!(queued_branch, "botster-issue-77");
+    assert_eq!(queued_repo_root, "/repos/jupiter");
+    assert_eq!(spawned_before_event, 0);
+
+    lua.load(
+        r#"
+        _G.__events["worktree_created"]({
+            branch = _G.__create_async_args.branch,
+            path = "/repos/jupiter/.worktrees/" .. _G.__create_async_args.branch,
+            metadata = _G.__create_async_args.metadata,
+            prompt = _G.__create_async_args.prompt,
+            agent_name = _G.__create_async_args.agent_name,
+            client_rows = _G.__create_async_args.client_rows,
+            client_cols = _G.__create_async_args.client_cols,
+        })
+        "#,
+    )
+    .exec()
+    .expect("fire async completion event");
 
     let (first, second, worktree_created_count, path, branch, repo): (
         String,

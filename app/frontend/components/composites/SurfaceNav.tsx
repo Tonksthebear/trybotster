@@ -82,7 +82,7 @@ export function SurfaceNav({
     return routeEntries
       .filter((entry) => {
         if (!entry || entry.hide_from_nav || entry.nav === false) return false
-        if (!entry.path || entry.path === '/') return false
+        if (!entry.base_path || entry.base_path === '/') return false
         const nav = entry.nav || {}
         const navSection = nav.section ?? 'workspace'
         return navSection === targetSection
@@ -93,7 +93,7 @@ export function SurfaceNav({
         return {
           key: surface,
           surface,
-          href: `/hubs/${ctx.hubId}${entry.base_path || entry.path}`,
+          href: `/hubs/${ctx.hubId}${entry.base_path}`,
           label: nav.label || entry.label || entry.surface || entry.path || 'Plugin',
           icon: nav.icon || entry.icon || 'sparkles',
           order: nav.order ?? index,

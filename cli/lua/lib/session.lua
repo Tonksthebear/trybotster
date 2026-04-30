@@ -637,7 +637,7 @@ end
 local RUNTIME_ONLY_FIELDS = {
     is_idle = true,
     notification = true,
-    hosted_preview = true,
+    plugin_state = true,
 }
 
 function Session:update(fields)
@@ -666,6 +666,7 @@ function Session:update(fields)
         -- moved). System sessions stay off the wire — the EB filter on
         -- the `session` registration drops them.
         require("lib.entity_model").patch_session(self, changed_fields)
+        require("lib.session_actions").publish_for_session(self)
     end
 end
 
@@ -928,10 +929,6 @@ end
 function Session:close(delete_worktree)
     local key = self.session_uuid
 
-    pcall(function()
-        require("lib.hosted_preview").handle_session_closing(self)
-    end)
-
     -- Notify observers
     hooks.notify("before_agent_close", self)
 
@@ -1127,6 +1124,7 @@ function Session:info()
         target_path = self.target_path,
         target_repo = self.target_repo,
         metadata = self.metadata,
+        plugin_state = self.plugin_state,
         owner_plugin = self.owner_plugin,
         visibility = self.visibility or "workspace",
         surface = self.surface,
@@ -1139,7 +1137,6 @@ function Session:info()
         status = self.status,
         notification = self.notification or false,
         port = port,
-        hosted_preview = self.hosted_preview,
         system_session = Session.is_system_session(self),
         created_at = self.created_at,
         label = self.label,

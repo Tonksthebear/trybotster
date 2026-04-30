@@ -29,13 +29,13 @@ export default function DeleteSessionDialog({ hubId }) {
 
   async function confirmKeep() {
     const hub = await waitForHub(hubId)
-    if (hub) hub.deleteAgent(context.sessionId, false)
+    if (hub) hub.deleteAgent(context.sessionUuid, false)
     close()
   }
 
   async function confirmDelete() {
     const hub = await waitForHub(hubId)
-    if (hub) hub.deleteAgent(context.sessionId, true)
+    if (hub) hub.deleteAgent(context.sessionUuid, true)
     close()
   }
 

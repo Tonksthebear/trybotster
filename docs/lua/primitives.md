@@ -169,6 +169,15 @@ Iframe content can call `window.parent.postMessage({ type =
 Only actions declared in the iframe `bridge.actions` list are forwarded to the
 hub, and Lua receives them through `plugin_assets.on_message`.
 
+## Plugin Session Actions
+
+Plugins publish per-session capabilities through `lib.session_actions`, not
+provider-specific browser commands. Core broadcasts each descriptor as a
+`session_action` entity, and clients invoke the selected capability through the
+generic `execute_session_action` hub command. See
+[`docs/lua/session-actions.md`](session-actions.md) for the descriptor shape and
+registration contract.
+
 ## Event-Driven Primitives
 
 ### `webrtc`
@@ -226,6 +235,15 @@ hub.unregister_agent(key)
 hub.quit()
 hub.detect_repo() -> string
 hub.handle_signaling_message(message)
+hub.prepare_plugin_command({
+  request_id = "plugin-owned-token",
+  command = "tool-or-/absolute/path",
+  config_path = "/tmp/tool.json",       -- optional
+  config_contents = "{}\n",             -- optional
+  context = { session_uuid = "sess-..." } -- optional, round-tripped
+})
+-- fires plugin_command_prepared
+hub.probe_url_ready(connector_uuid, parent_uuid, url, hostname, timeout_secs?)
 ```
 
 `hub.handle_signaling_message(message)` forwards a decrypted ActionCable
@@ -243,6 +261,29 @@ Supported messages:
 - `type = "signal"` with `envelope.type = "offer"` or `"ice"`
 - `type = "bundle_request"` with `browser_identity`
 
+`hub.prepare_plugin_command(opts)` resolves an executable and optionally writes a
+small config file on the blocking worker pool, then emits
+`plugin_command_prepared` with:
+
+```lua
+{
+  request_id = opts.request_id,
+  command = "/resolved/executable", -- nil on failure
+  config_path = opts.config_path,
+  context = opts.context,
+  error_kind = nil | "command_blank" | "command_missing" | "config_write_failed" | "task_failed",
+  error = nil | "message",
+}
+```
+
+Use this from plugin action handlers before spawning connector/accessory
+processes that need PATH resolution or a generated config file. Keep
+plugin-specific behavior in the plugin; the hub primitive is only the generic
+blocking-work offload and completion event.
+
+`hub.probe_url_ready(...)` waits asynchronously for public DNS and HTTPS
+reachability before a plugin surfaces a public URL to clients.
+
 ### `connection`
 ```lua
 connection.generate()              -- triggers connection_code_ready event
@@ -254,7 +295,7 @@ connection.copy_to_clipboard()
 ```lua
 worktree.find(branch) -> path
 worktree.list() -> table
-worktree.create_async(opts)        -- opts: {branch, issue_number, prompt, ...}
+worktree.create_async(opts)        -- opts: {branch, repo_root?, prompt, metadata?, ...}
 worktree.delete(path, branch)
 worktree.repo_root() -> string
 worktree.is_git_repo() -> bool

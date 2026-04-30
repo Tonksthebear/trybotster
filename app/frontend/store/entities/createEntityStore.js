@@ -7,7 +7,7 @@
 // the hub ships flow into both clients with identical semantics.
 //
 // Patch merging matches design brief §12.4: top-level fields merge, nested
-// objects (e.g. `hosted_preview`) replace wholesale rather than deep
+// objects (e.g. `plugin_state`) replace wholesale rather than deep
 // merging. Out-of-order frames (snapshot_seq < last applied, or <= for
 // deltas) are dropped so a re-ordered network delivery doesn't corrupt the
 // local view. Snapshots replace local contents only when they are at least as
@@ -76,7 +76,7 @@ export function createEntityStore(entityType, { idField = 'id' } = {}) {
     /**
      * Merge a sparse patch into an existing entity. Top-level fields merge;
      * nested objects in the patch REPLACE existing nested objects wholesale
-     * (per design brief §12.4 — `hosted_preview` is the canonical example).
+     * (per design brief §12.4 — `plugin_state` is the canonical example).
      * No-op when the entity is unknown — the next snapshot reconciles.
      */
     applyPatch(id, patch, snapshotSeq) {

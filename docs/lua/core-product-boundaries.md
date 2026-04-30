@@ -11,7 +11,11 @@ external notification services, or opinionated template catalogs.
   `worktree`, `mcp`, `watch`, and transport primitives.
 - Generic registries and protocols, such as hooks, commands, surfaces, plugin
   loading, entity broadcasts, template catalog providers,
-  template install/list/uninstall commands, and MCP prompt/tool registration.
+  template install/list/uninstall commands, MCP prompt/tool registration, and
+  session action descriptor publication.
+- Generic readiness/lifecycle primitives that plugin capabilities compose, such
+  as hidden accessory orchestration, parent-session metadata, and
+  `hub.prepare_plugin_command(...)` / `hub.probe_url_ready(...)`.
 - Built-in framework surfaces required for Botster itself, such as workspace
   sidebar/panel surfaces.
 - Current data migrations required for live hub data. Historical layout readers
@@ -19,8 +23,11 @@ external notification services, or opinionated template catalogs.
 
 ## Plugins and Templates Own
 
-- GitHub, issue tracker, chat, notification, hosted-preview, and similar
-  integration behavior.
+- GitHub, issue tracker, chat, notification, hosted-preview providers, and
+  similar integration behavior. These integrations expose user affordances as
+  plugin-owned session actions instead of adding bespoke core commands.
+- Connector process policy, including command names, install links, generated
+  config contents, retry behavior, and provider-specific readiness state.
 - Product-specific setup flows, credentials, prompts, and external API policy.
 - Agent and accessory definitions for specific tools or brands.
 - Catalog choices for which templates are offered to users.
@@ -36,5 +43,6 @@ Rails controller.
 ## Rule of Thumb
 
 If behavior can be expressed as `hooks.on`, `commands.register`,
-`surfaces.register`, `mcp.tool`, `mcp.prompt`, or a template file, keep it out of
-core Lua unless Botster cannot boot or coordinate sessions without it.
+`surfaces.register`, `session_actions.register`, `mcp.tool`, `mcp.prompt`, or a
+template file, keep it out of core Lua unless Botster cannot boot or coordinate
+sessions without it.

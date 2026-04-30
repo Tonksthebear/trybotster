@@ -13,15 +13,16 @@ vi.mock('../lib/actions', () => ({
   ACTION: {
     SESSION_DELETE: 'botster.session.delete.request',
     SESSION_MOVE: 'botster.session.move.request',
-    PREVIEW_TOGGLE: 'botster.session.preview.toggle',
-    PREVIEW_OPEN: 'botster.session.preview.open',
+    SESSION_ACTION_EXECUTE: 'botster.session.action.execute',
+    URL_OPEN: 'botster.url.open',
   },
   safeUrl: (u) => u ?? null,
   dispatch: vi.fn(),
 }))
 
 import * as hubBridge from '../lib/hub-bridge'
-import { useSessionStore } from '../store/entities'
+import { dispatch as localDispatch } from '../lib/actions'
+import { useSessionActionStore, useSessionStore } from '../store/entities'
 import UiTree, { useUiTreeDispatch } from '../components/UiTree'
 import SessionActionsMenu from '../components/workspace/SessionActionsMenu'
 
@@ -66,6 +67,11 @@ const MENU_TRIGGER_TREE = {
 }
 
 beforeEach(() => {
+  vi.stubGlobal('ResizeObserver', class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  })
   fakeTransport = new FakeTransport()
   vi.spyOn(hubBridge, 'waitForHub').mockImplementation(() => immediateHub(fakeTransport))
   // Wire protocol: seed the session entity store directly.
@@ -75,19 +81,35 @@ beforeEach(() => {
         id: 's-1',
         session_uuid: 'u-1',
         session_type: 'agent',
-        port: 8080,
-        hosted_preview: { status: 'inactive' },
       },
     },
     order: ['s-1'],
+    snapshotSeq: 1,
+  })
+  useSessionActionStore.setState({
+    byId: {
+      'u-1:cloudflare.preview.toggle': {
+        id: 'u-1:cloudflare.preview.toggle',
+        session_uuid: 'u-1',
+        action_id: 'cloudflare.preview.toggle',
+        label: 'Enable Cloudflare preview',
+        icon: 'globe',
+        visibility: 'visible',
+        enabled: true,
+        plugin: 'cloudflare-hosted-preview',
+      },
+    },
+    order: ['u-1:cloudflare.preview.toggle'],
     snapshotSeq: 1,
   })
 })
 
 afterEach(() => {
   cleanup()
+  vi.unstubAllGlobals()
   vi.restoreAllMocks()
   useSessionStore.getState()._reset()
+  useSessionActionStore.getState()._reset()
 })
 
 describe('<SessionActionsMenu> interceptor', () => {
@@ -132,6 +154,19 @@ describe('<SessionActionsMenu> interceptor', () => {
       '[data-testid="session-actions-menu-trigger"]',
     )
     expect(anchor).not.toBeNull()
+    const actionItem = screen.getByRole('menuitem', {
+      name: /Enable Cloudflare preview/i,
+    })
+    expect(actionItem).toBeInTheDocument()
+    fireEvent.click(actionItem)
+    expect(localDispatch).toHaveBeenCalledWith({
+      action: 'botster.session.action.execute',
+      payload: expect.objectContaining({
+        hubId: 'hub-1',
+        sessionUuid: 'u-1',
+        actionId: 'cloudflare.preview.toggle',
+      }),
+    })
   })
 
   it('does nothing without an anchor element (returns false from interceptor)', async () => {

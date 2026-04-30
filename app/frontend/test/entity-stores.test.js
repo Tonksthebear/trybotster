@@ -65,7 +65,7 @@ describe('createEntityStore', () => {
           session_uuid: 'sess-a',
           title: 'alpha',
           is_idle: true,
-          hosted_preview: { status: 'starting', url: null },
+          plugin_state: { example_provider: { status: 'starting', url: null } },
         },
       ],
       1
@@ -76,10 +76,10 @@ describe('createEntityStore', () => {
     expect(store.getState().byId['sess-a'].is_idle).toBe(false)
 
     // Nested object replaces wholesale (per §12.4).
-    s.applyPatch('sess-a', { hosted_preview: { status: 'running' } }, 3)
-    const hp = store.getState().byId['sess-a'].hosted_preview
-    expect(hp.status).toBe('running')
-    expect(hp.url).toBeUndefined()
+    s.applyPatch('sess-a', { plugin_state: { example_provider: { status: 'running' } } }, 3)
+    const hp = store.getState().byId['sess-a'].plugin_state
+    expect(hp.example_provider.status).toBe('running')
+    expect(hp.example_provider.url).toBeUndefined()
   })
 
   it('applyPatch on unknown id is a no-op', () => {
@@ -180,6 +180,37 @@ describe('frontend entity store dispatch', () => {
       snapshot_seq: 1,
     })
     expect(useWorkspaceEntityStore.getState().byId['ws-1'].name).toBe('Roadmap')
+  })
+
+  it('stores session_action descriptors from the generic entity stream', () => {
+    applyEntityFrame({
+      v: 2,
+      type: 'entity_snapshot',
+      entity_type: 'session_action',
+      items: [
+        {
+          id: 'sess-1:example.preview.toggle',
+          session_uuid: 'sess-1',
+          action_id: 'example.preview.toggle',
+          label: 'Enable preview',
+          status: 'inactive',
+          icon: 'globe-alt',
+          visibility: 'visible',
+          enabled: true,
+          plugin: 'example-preview',
+        },
+      ],
+      snapshot_seq: 1,
+    })
+
+    const actionStore = storeFor('session_action').getState()
+    expect(actionStore.order).toEqual(['sess-1:example.preview.toggle'])
+    expect(actionStore.byId['sess-1:example.preview.toggle']).toMatchObject({
+      session_uuid: 'sess-1',
+      action_id: 'example.preview.toggle',
+      enabled: true,
+      plugin: 'example-preview',
+    })
   })
 
   it('returns false for non-entity frames', () => {
