@@ -128,6 +128,7 @@ function renderRoutes(initialEntry) {
 describe('AppRoutes', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    localStorage.clear()
     resetHubListSubscriptionForTest()
 
     useHubStore.setState({
@@ -186,6 +187,100 @@ describe('AppRoutes', () => {
     })
   })
 
+  it('redirects a stale deep hub URL to a valid last hub without selecting the stale hub', async () => {
+    const hubs = [
+      { id: 3, name: 'Hub Three', identifier: 'hub-3', active: true },
+      { id: 4, name: 'Hub Four', identifier: 'hub-4', active: true },
+    ]
+    const selectHub = vi.fn(() => Promise.resolve())
+
+    localStorage.setItem('botster:lastHubId', '3')
+    useHubStore.setState({
+      hubList: hubs,
+      hubListLoading: false,
+      fetchHubList: vi.fn(() => Promise.resolve(hubs)),
+      selectHub,
+      getLastHubId: vi.fn(() => localStorage.getItem('botster:lastHubId')),
+    })
+
+    renderRoutes('/hubs/99/settings')
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location')).toHaveTextContent('/hubs/3')
+      expect(selectHub).toHaveBeenCalledWith(3)
+    })
+    expect(selectHub).not.toHaveBeenCalledWith('99')
+    expect(localStorage.getItem('botster:lastHubId')).toBe('3')
+  })
+
+  it('redirects a stale deep hub URL to the sole hub when no valid last hub exists', async () => {
+    const hubs = [{ id: 7, name: 'Only Hub', identifier: 'hub-7', active: true }]
+    const selectHub = vi.fn(() => Promise.resolve())
+
+    localStorage.setItem('botster:lastHubId', '99')
+    useHubStore.setState({
+      hubList: hubs,
+      hubListLoading: false,
+      fetchHubList: vi.fn(() => Promise.resolve(hubs)),
+      selectHub,
+      getLastHubId: vi.fn(() => localStorage.getItem('botster:lastHubId')),
+    })
+
+    renderRoutes('/hubs/99/settings')
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location')).toHaveTextContent('/hubs/7')
+      expect(selectHub).toHaveBeenCalledWith(7)
+    })
+    expect(selectHub).not.toHaveBeenCalledWith('99')
+    expect(localStorage.getItem('botster:lastHubId')).toBe('99')
+  })
+
+  it('redirects a stale deep hub URL to /hubs when no fallback exists', async () => {
+    const hubs = [
+      { id: 3, name: 'Hub Three', identifier: 'hub-3', active: true },
+      { id: 4, name: 'Hub Four', identifier: 'hub-4', active: true },
+    ]
+    const selectHub = vi.fn(() => Promise.resolve())
+
+    useHubStore.setState({
+      hubList: hubs,
+      hubListLoading: false,
+      fetchHubList: vi.fn(() => Promise.resolve(hubs)),
+      selectHub,
+      getLastHubId: vi.fn(() => null),
+    })
+
+    renderRoutes('/hubs/99/settings')
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location')).toHaveTextContent('/hubs')
+    })
+    expect(selectHub).not.toHaveBeenCalled()
+    expect(localStorage.getItem('botster:lastHubId')).toBe(null)
+  })
+
+  it('keeps a valid deep hub URL selected and unchanged', async () => {
+    const hubs = [{ id: 7, name: 'Fresh Hub', identifier: 'hub-7', active: true }]
+    const selectHub = vi.fn(() => Promise.resolve())
+
+    useHubStore.setState({
+      hubList: hubs,
+      hubListLoading: false,
+      fetchHubList: vi.fn(() => Promise.resolve(hubs)),
+      selectHub,
+      getLastHubId: vi.fn(() => null),
+    })
+
+    renderRoutes('/hubs/7/pairing')
+
+    await waitFor(() => {
+      expect(selectHub).toHaveBeenCalledWith(7)
+      expect(screen.getByTestId('location')).toHaveTextContent('/hubs/7/pairing')
+    })
+    expect(await screen.findByText('Hub Pairing Route')).toBeInTheDocument()
+  })
+
   it('suppresses normal auto-navigation while the booting handoff is active', async () => {
     const selectHub = vi.fn(() => Promise.resolve())
     const hubs = [{ id: 7, name: 'Fresh Hub', identifier: 'hub-7', active: true }]
@@ -232,6 +327,8 @@ describe('AppRoutes', () => {
 
   it('syncs the selected hub ID into the modal bridge on hub routes', async () => {
     useHubStore.setState({
+      hubList: [{ id: 42, name: 'Hub', identifier: 'hub-42', active: true }],
+      hubListLoading: false,
       selectedHubId: '42',
       fetchHubList: vi.fn(() => Promise.resolve([{ id: 42, name: 'Hub', identifier: 'hub-42', active: true }])),
     })
@@ -247,9 +344,12 @@ describe('AppRoutes', () => {
   })
 
   it('renders plugin-owned session routes in the flush shell without TerminalCache', async () => {
+    const hubs = [{ id: 'hub-1', name: 'Hub', identifier: 'hub-1', active: true }]
     useHubStore.setState({
+      hubList: hubs,
+      hubListLoading: false,
       selectedHubId: 'hub-1',
-      fetchHubList: vi.fn(() => Promise.resolve([{ id: 'hub-1', name: 'Hub', identifier: 'hub-1', active: true }])),
+      fetchHubList: vi.fn(() => Promise.resolve(hubs)),
     })
     useRouteRegistryStore.getState().setRoutes('hub-1', [
       {
@@ -269,9 +369,12 @@ describe('AppRoutes', () => {
   })
 
   it('renders fullscreen plugin routes in the flush shell', async () => {
+    const hubs = [{ id: 'hub-1', name: 'Hub', identifier: 'hub-1', active: true }]
     useHubStore.setState({
+      hubList: hubs,
+      hubListLoading: false,
       selectedHubId: 'hub-1',
-      fetchHubList: vi.fn(() => Promise.resolve([{ id: 'hub-1', name: 'Hub', identifier: 'hub-1', active: true }])),
+      fetchHubList: vi.fn(() => Promise.resolve(hubs)),
     })
     useRouteRegistryStore.getState().setRoutes('hub-1', [
       {
@@ -291,9 +394,12 @@ describe('AppRoutes', () => {
   })
 
   it('swaps to a plugin sidebar with a back button when the active surface declares one', async () => {
+    const hubs = [{ id: 'hub-1', name: 'Hub', identifier: 'hub-1', active: true }]
     useHubStore.setState({
+      hubList: hubs,
+      hubListLoading: false,
       selectedHubId: 'hub-1',
-      fetchHubList: vi.fn(() => Promise.resolve([{ id: 'hub-1', name: 'Hub', identifier: 'hub-1', active: true }])),
+      fetchHubList: vi.fn(() => Promise.resolve(hubs)),
     })
     useRouteRegistryStore.getState().setRoutes('hub-1', [
       {

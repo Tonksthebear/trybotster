@@ -128,6 +128,15 @@ describe('hub-store', () => {
       expect(useHubStore.getState().connectionState).toBe('error')
       expect(useHubStore.getState().connectionDetail).toBe('Connection refused')
     })
+
+    it('does not overwrite last hub ID when connect throws', async () => {
+      localStorage.setItem('botster:lastHubId', 'previous')
+      mockConnect.mockRejectedValueOnce(new Error('Connection refused'))
+
+      await useHubStore.getState().selectHub(1)
+
+      expect(localStorage.getItem('botster:lastHubId')).toBe('previous')
+    })
   })
 
   describe('subscribeHubListUpdates', () => {

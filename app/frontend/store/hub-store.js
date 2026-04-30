@@ -61,7 +61,6 @@ export const useHubStore = create((set, get) => ({
       connectionState: 'connecting',
       connectionDetail: 'Connecting to hub...',
     })
-    localStorage.setItem(LAST_HUB_KEY, hubId)
 
     try {
       const { hub, connectionId } = await connect(hubId, { surface: 'panel' })
@@ -72,6 +71,7 @@ export const useHubStore = create((set, get) => ({
         return
       }
 
+      localStorage.setItem(LAST_HUB_KEY, hubId)
       set({ _connectionRef: connectionId })
 
       if (hub) {

@@ -227,14 +227,40 @@ function PluginSidebarSection({ hubId, activeSidebar, onBack }) {
  */
 function HubRouteSync() {
   const { hubId } = useParams()
+  const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const isBooting = searchParams.get('booting') === '1'
+  const hubList = useHubStore((s) => s.hubList)
+  const hubListLoading = useHubStore((s) => s.hubListLoading)
   const selectedHubId = useHubStore((s) => s.selectedHubId)
   const selectHub = useHubStore((s) => s.selectHub)
+  const getLastHubId = useHubStore((s) => s.getLastHubId)
 
   useEffect(() => {
-    if (hubId && String(hubId) !== String(selectedHubId)) {
-      selectHub(hubId)
+    if (!hubId || isBooting || hubListLoading) return
+
+    const routeHubId = String(hubId)
+    const routeHub = hubList.find((h) => String(h.id) === routeHubId)
+
+    if (routeHub) {
+      if (routeHubId !== String(selectedHubId)) selectHub(routeHub.id)
+      return
     }
-  }, [hubId, selectedHubId, selectHub])
+
+    const lastHubId = getLastHubId()
+    const lastHub =
+      lastHubId &&
+      String(lastHubId) !== routeHubId &&
+      hubList.find((h) => String(h.id) === String(lastHubId))
+
+    if (lastHub) {
+      navigate(`/hubs/${lastHub.id}`, { replace: true })
+    } else if (hubList.length === 1) {
+      navigate(`/hubs/${hubList[0].id}`, { replace: true })
+    } else {
+      navigate('/hubs', { replace: true })
+    }
+  }, [hubId, hubList, hubListLoading, isBooting, navigate, selectedHubId, selectHub, getLastHubId])
 
   return <Outlet />
 }
