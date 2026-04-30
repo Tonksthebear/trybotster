@@ -14,6 +14,7 @@
 
 local state = require("hub.state")
 local Agent = require("lib.agent")
+local InternalClient = require("lib.internal_client")
 
 local Hub = state.class("Hub")
 
@@ -51,6 +52,35 @@ local function build_envelope(from_hub_id, from_agent_id, opts)
         payload    = opts.payload,
         expires_at = os.time() + expires_in,
     }
+end
+
+local function dispatch_local_command(command)
+    command.request_id = command.request_id or generate_msg_id()
+    return InternalClient.dispatch("hub_proxy", command)
+end
+
+local function session_payload(session)
+    return require("lib.client_session_payload").build(session, Agent.all_info())
+end
+
+local function response_for(dispatch_result, request_id)
+    for _, frame in ipairs(dispatch_result.frames or {}) do
+        if frame.type == "command_response" and frame.request_id == request_id then
+            return frame
+        end
+    end
+    return nil
+end
+
+local function dispatch_local_command_response(command)
+    command.request_id = command.request_id or generate_msg_id()
+    local request_id = command.request_id
+    local result = dispatch_local_command(command)
+    local response = response_for(result, request_id)
+    if response and response.ok == false then
+        error(response.error or "command failed")
+    end
+    return response or { ok = true }
 end
 
 -- =============================================================================
@@ -351,7 +381,7 @@ function Hub:receive_messages(agent_id)
 end
 
 --- Create an agent on this hub.
--- Local: calls handlers.agents directly. Remote: uses hub_client.request().
+-- Local: dispatches through internal client command ingress. Remote: uses hub_client.request().
 -- @param issue_or_branch string Issue number or branch name
 -- @param prompt string|nil Task prompt
 -- @param agent_name string|nil Agent config name
@@ -361,27 +391,43 @@ end
 -- @return table Result payload
 function Hub:create_agent(issue_or_branch, prompt, agent_name, workspace_id, workspace_name, target)
     if self._is_local then
-        local agents_handler = require("handlers.agents")
-        local ClientSessionPayload = require("lib.client_session_payload")
+        local before = {}
+        for _, session in ipairs(Agent.list()) do
+            before[session.session_uuid] = true
+        end
         local metadata = target and require("lib.target_context").with_metadata(nil, target) or nil
         if workspace_id or workspace_name then
             metadata = metadata or {}
             metadata.workspace_id = workspace_id
             metadata.workspace = workspace_name
         end
-        local agent, err = agents_handler.handle_create_agent(
-            issue_or_branch, prompt, nil, nil, agent_name, metadata, target
-        )
-        if agent then
-            return ClientSessionPayload.build(agent, Agent.all_info())
-        elseif err then
-            error(err)
-        else
-            return {
-                status = "pending",
-                message = "Agent creation initiated (worktree may be creating async)",
-            }
+        local response = dispatch_local_command_response({
+            type = "create_agent",
+            issue_or_branch = issue_or_branch,
+            prompt = prompt,
+            agent_name = agent_name,
+            workspace_id = workspace_id,
+            workspace_name = workspace_name,
+            target_id = target and target.target_id or nil,
+            target_path = target and target.target_path or nil,
+            target_repo = target and target.target_repo or nil,
+            metadata = metadata,
+        })
+        if response.session_uuid then
+            local created = Agent.get(response.session_uuid)
+            if created then
+                return session_payload(created)
+            end
         end
+        for _, session in ipairs(Agent.list()) do
+            if not before[session.session_uuid] then
+                return session_payload(session)
+            end
+        end
+        return {
+            status = response.status or "pending",
+            message = "Agent creation initiated (worktree may be creating async)",
+        }
     end
 
     local result = hub_client.request(self._conn_id, {
@@ -464,33 +510,14 @@ end
 -- @return table
 function Hub:rename_workspace(workspace_id, new_name)
     if self._is_local then
-        local data_dir = config.data_dir and config.data_dir() or nil
-        if not data_dir then
-            error("Hub:rename_workspace: no data_dir configured")
-        end
-
-        local ws = require("lib.workspace_store")
-        local ok = ws.rename_workspace(data_dir, workspace_id, new_name)
-        if not ok then
-            error(string.format("Hub:rename_workspace: failed for workspace %s", tostring(workspace_id)))
-        end
-
-        for _, session in ipairs(Agent.list()) do
-            if session._workspace_id == workspace_id then
-                session._workspace_name = new_name
-                session.metadata = session.metadata or {}
-                session.metadata.workspace = new_name
-                session:_sync_workspace_manifest()
-                session:_sync_session_manifest()
-                session:publish_entity()
-            end
-        end
-
-        require("lib.entity_model").patch_workspace(workspace_id, { name = new_name })
-
+        local response = dispatch_local_command_response({
+            type = "rename_workspace",
+            workspace_id = workspace_id,
+            new_name = new_name,
+        })
         return {
             workspace_id = workspace_id,
-            name = new_name,
+            name = response.name or new_name,
         }
     end
 
@@ -514,42 +541,24 @@ end
 -- @return table
 function Hub:move_agent_workspace(agent_id, workspace_id, workspace_name)
     if self._is_local then
-        local session = Agent.get(agent_id)
-        if not session then
-            error(string.format("Hub:move_agent_workspace: session '%s' not found", tostring(agent_id)))
-        end
-
-        local moved, err = session:move_to_workspace({
+        local response = dispatch_local_command_response({
+            type = "move_agent_workspace",
+            agent_id = agent_id,
+            session_uuid = agent_id,
             workspace_id = workspace_id,
             workspace_name = workspace_name,
         })
-        if not moved then
-            error(string.format("Hub:move_agent_workspace failed: %s", tostring(err)))
+        local session = Agent.get(response.session_uuid or agent_id)
+        if not session then
+            error(string.format("Hub:move_agent_workspace: session '%s' not found", tostring(agent_id)))
         end
-
-        -- Wire protocol — move_to_workspace publishes the moved session.
-        -- Upsert workspaces so target/old workspace status and membership
-        -- summaries reach clients filtering for active workspaces.
-        local EntityModel = require("lib.entity_model")
-        if require("lib.entity_broadcast").is_registered("workspace") then
-            local Hub = require("lib.hub")
-            local ok, workspaces = pcall(function()
-                return Hub.get():list_workspaces()
-            end)
-            if ok and type(workspaces) == "table" then
-                for _, workspace in ipairs(workspaces) do
-                    EntityModel.upsert_workspace(workspace)
-                end
-            end
-        end
-
         return {
             agent_id = session.session_uuid,
             session_uuid = session.session_uuid,
-            workspace_id = moved.workspace_id,
-            workspace_name = moved.workspace_name,
-            previous_workspace_id = moved.previous_workspace_id,
-            previous_workspace_name = moved.previous_workspace_name,
+            workspace_id = response.workspace_id or session._workspace_id,
+            workspace_name = response.workspace_name or session._workspace_name,
+            previous_workspace_id = response.previous_workspace_id,
+            previous_workspace_name = response.previous_workspace_name,
         }
     end
 
@@ -572,23 +581,20 @@ end
 -- @param fields table { label = string|nil, task = string|nil }
 -- @return table Updated session info
 function Hub:update_session(agent_id, fields)
+    fields = fields or {}
     if self._is_local then
-        local session = Agent.get(agent_id)
-        local ClientSessionPayload = require("lib.client_session_payload")
+        local response = dispatch_local_command_response({
+            type = "update_session",
+            agent_id = agent_id,
+            session_uuid = agent_id,
+            label = fields.label,
+            task = fields.task,
+        })
+        local session = Agent.get(response.session_uuid or agent_id)
         if not session then
             error(string.format("Hub:update_session: session '%s' not found", tostring(agent_id)))
         end
-
-        -- Whitelist: only label and task
-        local allowed = {}
-        if fields.label ~= nil then allowed.label = fields.label end
-        if fields.task ~= nil then allowed.task = fields.task end
-
-        if next(allowed) then
-            session:update(allowed)
-        end
-
-        return ClientSessionPayload.build(session, Agent.all_info())
+        return session_payload(session)
     end
 
     local result = hub_client.request(self._conn_id, {
@@ -606,7 +612,7 @@ function Hub:update_session(agent_id, fields)
 end
 
 --- Delete an agent on this hub.
--- Local: calls handlers.agents directly. Remote: uses hub_client.request().
+-- Local: dispatches through internal client command ingress. Remote: uses hub_client.request().
 -- @param agent_id string Agent key
 -- @param delete_worktree boolean|nil Also delete the git worktree (default false)
 -- @return string Result message
@@ -625,13 +631,16 @@ function Hub:delete_agent(agent_id, delete_worktree)
             end
         end
 
-        local agents_handler = require("handlers.agents")
-        local deleted = agents_handler.handle_delete_agent(resolved_id, delete_worktree or false)
-        if deleted then
+        dispatch_local_command_response({
+            type = "delete_agent",
+            agent_id = resolved_id,
+            session_uuid = resolved_id,
+            delete_worktree = delete_worktree or false,
+        })
+        if not Agent.get(resolved_id) then
             return "Agent deleted: " .. resolved_id
-        else
-            return "Agent not found: " .. resolved_id
         end
+        return "Delete requested: " .. resolved_id
     end
 
     local result = hub_client.request(self._conn_id, {

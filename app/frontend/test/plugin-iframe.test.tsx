@@ -23,7 +23,7 @@ function fakeCtx(overrides: Record<string, unknown> = {}) {
 function fakeTransport() {
   const handlers = new Set<(message: unknown) => void>()
   return {
-    send: vi.fn(async (_type: string, data: Record<string, unknown>) => {
+    sendCommand: vi.fn(async (_type: string, data: Record<string, unknown>) => {
       queueMicrotask(() => {
         for (const handler of handlers) {
           handler({
@@ -70,7 +70,7 @@ describe('<PluginIframe>', () => {
       />,
     )
 
-    expect(transport.send).toHaveBeenCalledWith('plugin_asset:read', {
+    expect(transport.sendCommand).toHaveBeenCalledWith('plugin_asset:read', {
       request_id: 'req-1',
       asset_id: 'vault:graph',
     })

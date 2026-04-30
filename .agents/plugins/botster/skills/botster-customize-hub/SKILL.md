@@ -52,6 +52,7 @@ end, { timeout_ms = 50 })
 - `pty_input` — user typed into PTY.
 - `client_connected` — client joined registry.
 - `client_disconnected` — client left registry.
+- `after_hub_command` — hub command finished; includes success/error.
 - `after_agent_create` — after `Agent.new()` completes.
 - `before_agent_close` — before sessions are killed.
 - `after_agent_close` — after agent is removed.
@@ -61,6 +62,8 @@ end, { timeout_ms = 50 })
 
 - `before_agent_create` — transform params or return nil to block creation.
 - `before_agent_delete` — transform params or return nil to block deletion.
+- `before_hub_command` — transform or block a raw command envelope.
+- `before_command` — transform or block a registered command context.
 - `before_client_subscribe` — transform or block subscriptions.
 - `filter_agent_env` — modify PTY session environment variables.
 
@@ -68,7 +71,6 @@ end, { timeout_ms = 50 })
 
 Use `events.on(event, fn(data))` for Rust-emitted events:
 
-- `command_message`
 - `worktree_created`
 - `worktree_create_failed`
 - `connection_code_ready`
@@ -82,6 +84,12 @@ Use `events.on(event, fn(data))` for Rust-emitted events:
 - `outgoing_signal`
 
 ## Commands
+
+All commands enter through `cli/lua/lib/client.lua`. Browser, TUI, socket, MCP,
+hub-to-hub, GitHub, and Rails-originated commands should dispatch through a real
+client transport or `lib.internal_client`; do not add side-channel command
+events. `create_agent` is idempotent for a matching target/workspace/issue:
+existing sessions are returned/notified instead of spawning duplicates.
 
 Register hub commands for command palette and tool-driven workflows:
 

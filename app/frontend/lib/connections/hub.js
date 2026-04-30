@@ -310,7 +310,7 @@ const TRANSPORT_METHODS = [
   "refreshTemplates",
   "reloadPlugin",
   "loadPlugin",
-  "send",
+  "sendCommand",
 ];
 
 TRANSPORT_METHODS.forEach((methodName) => {

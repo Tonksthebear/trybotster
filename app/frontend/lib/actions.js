@@ -7,7 +7,6 @@ const ACTION = {
   WORKSPACE_RENAME: 'botster.workspace.rename.request',
   SESSION_SELECT: 'botster.session.select',
   SESSION_CREATE: 'botster.session.create.request',
-  SESSION_ACTION_EXECUTE: 'botster.session.action.execute',
   URL_OPEN: 'botster.url.open',
   SESSION_MOVE: 'botster.session.move.request',
   SESSION_DELETE: 'botster.session.delete.request',
@@ -79,12 +78,6 @@ const handlers = {
       window.history.pushState({}, '', payload.url)
       window.dispatchEvent(new PopStateEvent('popstate'))
     }
-  },
-
-  [ACTION.SESSION_ACTION_EXECUTE](payload) {
-    void waitForHub(payload.hubId).then((hub) => {
-      hub?.executeSessionAction(payload.sessionUuid, payload.actionId, payload.params)
-    })
   },
 
   [ACTION.URL_OPEN](payload) {

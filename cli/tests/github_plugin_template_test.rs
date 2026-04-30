@@ -61,3 +61,27 @@ fn github_template_catalog_entry_is_a_multi_file_plugin() {
         ]
     );
 }
+
+#[test]
+fn github_event_routing_template_uses_internal_client_ingress() {
+    let template = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("catalog/templates/plugins/github/event_routing.lua"),
+    )
+    .expect("read github event routing template");
+
+    assert!(
+        template.contains(r#"require("lib.internal_client")"#),
+        "GitHub template should route application commands through client.lua ingress"
+    );
+    assert!(
+        template.contains("InternalClient.dispatch"),
+        "GitHub template should dispatch canonical commands through internal client"
+    );
+    assert!(
+        !template.contains(r#"events.emit("command_message""#),
+        "GitHub template must not use the legacy command_message bypass"
+    );
+}

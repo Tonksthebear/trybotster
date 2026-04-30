@@ -127,7 +127,7 @@ export class TerminalConnection extends HubRoute {
   }
 
   sendColorProfile(colors) {
-    return this.send("terminal_color_profile", {
+    return this.sendTelemetry("terminal_color_profile", {
       session_uuid: this.sessionUuid,
       colors,
     });
@@ -137,11 +137,11 @@ export class TerminalConnection extends HubRoute {
     // Keep local geometry in sync so requestSnapshot() sends current bounds.
     this.options.cols = cols;
     this.options.rows = rows;
-    return this.send("resize", { cols, rows });
+    return this.sendCommand("resize", { cols, rows });
   }
 
   requestSnapshot() {
-    return this.send("request_snapshot", {
+    return this.sendCommand("request_snapshot", {
       rows: this.options.rows,
       cols: this.options.cols,
     });

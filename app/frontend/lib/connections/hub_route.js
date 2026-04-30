@@ -181,7 +181,7 @@ export class HubRoute {
     }
 
     if (message.type === "dc_ping") {
-      this.send("dc_pong").catch(() => {});
+      this.#sendEncrypted({ type: "dc_pong" }).catch(() => {});
       return true;
     }
 
@@ -202,7 +202,15 @@ export class HubRoute {
     return false;
   }
 
-  async send(type, data = {}) {
+  /**
+   * Send a client command envelope through the active subscription.
+   *
+   * This is intentionally transport-only on the browser side: the command is
+   * encrypted, tagged with the route subscription, and delivered to
+   * cli/lua/lib/client.lua for dispatch. Browser code must not own a parallel
+   * command path.
+   */
+  async sendCommand(type, data = {}) {
     await this.#ensureConnected();
     if (!this.subscriptionId) return false;
 
@@ -211,6 +219,25 @@ export class HubRoute {
       return true;
     } catch (error) {
       console.error(`[${this.constructor.name}] Send failed:`, error);
+      this.#scheduleReconnect();
+      return false;
+    }
+  }
+
+  /**
+   * Send transport telemetry that is intentionally consumed before command
+   * dispatch. Use this only for client-specific data-plane state, not hub
+   * commands.
+   */
+  async sendTelemetry(type, data = {}) {
+    await this.#ensureConnected();
+    if (!this.subscriptionId) return false;
+
+    try {
+      await this.#sendEncrypted({ type, ...data });
+      return true;
+    } catch (error) {
+      console.error(`[${this.constructor.name}] Telemetry send failed:`, error);
       this.#scheduleReconnect();
       return false;
     }

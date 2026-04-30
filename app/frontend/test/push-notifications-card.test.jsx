@@ -9,7 +9,7 @@ function emit(eventName, payload) {
 }
 
 const fakeHub = {
-  send: (...args) => sendMock(...args),
+  sendCommand: (...args) => sendMock(...args),
   on: (eventName, cb) => {
     if (!listeners.has(eventName)) listeners.set(eventName, new Set())
     listeners.get(eventName).add(cb)

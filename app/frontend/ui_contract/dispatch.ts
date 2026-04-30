@@ -3,12 +3,13 @@ import type { ActionDispatch, ActionDispatchSource } from './context'
 import type { UiAction } from './types'
 
 /**
- * Minimal transport surface we need to send `ui_action` frames. Anything
- * with an async `send(type, data)` method (e.g. `HubTransport.send`) satisfies
- * this. Kept as a structural type so tests can pass a plain mock.
+ * Minimal transport surface we need to send `ui_action` command frames.
+ * Anything with an async `sendCommand(type, data)` method (e.g.
+ * `HubTransport.sendCommand`) satisfies this. Kept as a structural type so
+ * tests can pass a plain mock.
  */
 export type UiActionTransport = {
-  send: (type: string, data: Record<string, unknown>) => Promise<boolean>
+  sendCommand: (type: string, data: Record<string, unknown>) => Promise<boolean>
   on?: (event: string, handler: (message: unknown) => void) => () => void
 }
 
@@ -39,7 +40,6 @@ const LOCAL_ONLY_ACTIONS = new Set<string>([
   'botster.workspace.toggle',
   'botster.workspace.rename.request',
   'botster.session.create.request',
-  'botster.session.action.execute',
   'botster.url.open',
   'botster.session.move.request',
   'botster.session.delete.request',
@@ -134,12 +134,12 @@ export function createTransportDispatch(
       let sent = false
       try {
         sent =
-          (await transport.send('ui_action', {
+          (await transport.sendCommand('ui_action', {
             target_surface: targetSurface,
             envelope,
           })) === true
       } catch (err) {
-        console.error('[ui_contract] transport send failed', err)
+        console.error('[ui_contract] transport command failed', err)
       }
       if (!sent) return
     })()

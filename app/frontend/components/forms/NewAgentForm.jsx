@@ -204,7 +204,7 @@ export default function NewAgentForm({ hubId }) {
     setSubmitting(true)
 
     if (pendingSelection.type === 'existing') {
-      sent = await hub.send('reopen_worktree', {
+      sent = await hub.sendCommand('reopen_worktree', {
         path: pendingSelection.path,
         branch: pendingSelection.branch,
         prompt,
@@ -214,7 +214,7 @@ export default function NewAgentForm({ hubId }) {
         workspace_name: workspaceChoice?.name || null,
       })
     } else if (pendingSelection.type === 'main') {
-      sent = await hub.send('create_agent', {
+      sent = await hub.sendCommand('create_agent', {
         prompt,
         agent_name: agentName,
         target_id: selectedTargetId,
@@ -222,7 +222,7 @@ export default function NewAgentForm({ hubId }) {
         workspace_name: workspaceChoice?.name || null,
       })
     } else {
-      sent = await hub.send('create_agent', {
+      sent = await hub.sendCommand('create_agent', {
         issue_or_branch: pendingSelection.issueOrBranch,
         prompt,
         agent_name: agentName,

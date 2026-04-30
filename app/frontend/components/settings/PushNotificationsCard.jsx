@@ -109,7 +109,7 @@ export default function PushNotificationsCard({ hubId }) {
   const sendCli = useCallback(async (message) => {
     try {
       const hub = await waitForHub(hubId)
-      return await hub?.send(message.type, message)
+      return await hub?.sendCommand(message.type, message)
     } catch (e) {
       console.warn('[PushNotifications] hub command failed:', e)
       return false

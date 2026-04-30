@@ -15,6 +15,8 @@ source.
 
 ## Included
 
+- Version `0.1.9` — command-routing guidance reflects the canonical
+  `client.lua` ingress and idempotent `create_agent` behavior.
 - `.codex-plugin/plugin.json` — plugin manifest.
 - `.claude-plugin/plugin.json` — Claude Code plugin manifest.
 - `.mcp.json` — single MCP server named `botster`.
@@ -40,7 +42,7 @@ calling session:
       "command": "botster",
       "args": ["mcp-serve"],
       "env_vars": ["BOTSTER_SESSION_UUID"],
-      "default_tools_approval_mode": "auto",
+      "default_tools_approval_mode": "approve",
       "default_tools_enabled": true
     }
   }

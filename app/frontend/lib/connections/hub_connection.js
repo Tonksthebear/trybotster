@@ -218,7 +218,7 @@ export class HubTransport extends HubRoute {
    * @param {string} sessionUuid
    */
   selectAgent(sessionUuid) {
-    return this.send("select_agent", { session_uuid: sessionUuid });
+    return this.sendCommand("select_agent", { session_uuid: sessionUuid });
   }
 
   /**
@@ -227,7 +227,7 @@ export class HubTransport extends HubRoute {
    * @param {boolean} deleteWorktree - Also delete the git worktree
    */
   deleteAgent(sessionUuid, deleteWorktree = false) {
-    return this.send("delete_agent", {
+    return this.sendCommand("delete_agent", {
       session_uuid: sessionUuid,
       delete_worktree: deleteWorktree,
     });
@@ -238,7 +238,7 @@ export class HubTransport extends HubRoute {
    * @param {string} sessionUuid - Session UUID
    */
   clearNotification(sessionUuid) {
-    return this.send("clear_notification", { session_uuid: sessionUuid });
+    return this.sendCommand("clear_notification", { session_uuid: sessionUuid });
   }
 
   /**
@@ -250,7 +250,7 @@ export class HubTransport extends HubRoute {
   executeSessionAction(sessionUuid, actionId, params) {
     const payload = { session_uuid: sessionUuid, action_id: actionId };
     if (params !== undefined) payload.params = params;
-    return this.send("execute_session_action", payload);
+    return this.sendCommand("execute_session_action", payload);
   }
 
   /**
@@ -258,7 +258,7 @@ export class HubTransport extends HubRoute {
    * @param {Object} options - Agent creation options
    */
   createAgent(options = {}) {
-    return this.send("create_agent", options);
+    return this.sendCommand("create_agent", options);
   }
 
   /**
@@ -267,7 +267,7 @@ export class HubTransport extends HubRoute {
    * @param {string} newName
    */
   renameWorkspace(workspaceId, newName) {
-    return this.send("rename_workspace", {
+    return this.sendCommand("rename_workspace", {
       workspace_id: workspaceId,
       new_name: newName,
     });
@@ -280,7 +280,7 @@ export class HubTransport extends HubRoute {
    * @param {string|null} workspaceName
    */
   moveAgentWorkspace(sessionUuid, workspaceId = null, workspaceName = null) {
-    return this.send("move_agent_workspace", {
+    return this.sendCommand("move_agent_workspace", {
       session_uuid: sessionUuid,
       workspace_id: workspaceId,
       workspace_name: workspaceName,
@@ -299,7 +299,7 @@ export class HubTransport extends HubRoute {
     workspaceName = null,
     targetId = null,
   ) {
-    return this.send("create_accessory", {
+    return this.sendCommand("create_accessory", {
       accessory_name: accessoryName,
       workspace_id: workspaceId,
       workspace_name: workspaceName,
@@ -311,7 +311,7 @@ export class HubTransport extends HubRoute {
    * Request agent/accessory/workspace config from CLI.
    */
   requestAgentConfig(targetId) {
-    return this.send("list_configs", { target_id: targetId });
+    return this.sendCommand("list_configs", { target_id: targetId });
   }
 
   /**
@@ -320,7 +320,7 @@ export class HubTransport extends HubRoute {
    * @param {string|null} name
    */
   addSpawnTarget(path, name = null) {
-    return this.send("add_spawn_target", { path, name });
+    return this.sendCommand("add_spawn_target", { path, name });
   }
 
   /**
@@ -328,7 +328,7 @@ export class HubTransport extends HubRoute {
    * @param {string} targetId
    */
   removeSpawnTarget(targetId) {
-    return this.send("remove_spawn_target", { target_id: targetId });
+    return this.sendCommand("remove_spawn_target", { target_id: targetId });
   }
 
   /**
@@ -337,7 +337,7 @@ export class HubTransport extends HubRoute {
    * @param {string} newName
    */
   renameSpawnTarget(targetId, newName) {
-    return this.send("rename_spawn_target", { target_id: targetId, new_name: newName });
+    return this.sendCommand("rename_spawn_target", { target_id: targetId, new_name: newName });
   }
 
   /**
@@ -346,7 +346,7 @@ export class HubTransport extends HubRoute {
    * @param {string} sessionType - Session type name (e.g., "shell", "server")
    */
   addSession(agentId, sessionType) {
-    return this.send("add_session", {
+    return this.sendCommand("add_session", {
       agent_id: agentId,
       session_type: sessionType,
     });
@@ -357,7 +357,7 @@ export class HubTransport extends HubRoute {
    * @param {string} sessionUuid - Session UUID to remove
    */
   removeSession(sessionUuid) {
-    return this.send("remove_session", {
+    return this.sendCommand("remove_session", {
       session_uuid: sessionUuid,
     });
   }
@@ -367,14 +367,14 @@ export class HubTransport extends HubRoute {
    * @param {string} agentId - Session UUID for the agent session
    */
   requestSessionTypes(agentId) {
-    return this.send("list_session_types", { agent_id: agentId });
+    return this.sendCommand("list_session_types", { agent_id: agentId });
   }
 
   /**
    * Request connection code for sharing hub access.
    */
   requestConnectionCode() {
-    return this.send("get_connection_code");
+    return this.sendCommand("get_connection_code");
   }
 
   /**
@@ -385,7 +385,7 @@ export class HubTransport extends HubRoute {
    * Hub will disconnect; reconnect by relaunching botster within that window.
    */
   restartHub() {
-    return this.send("restart_hub");
+    return this.sendCommand("restart_hub");
   }
 
   // ========== File System API ==========
@@ -410,7 +410,7 @@ export class HubTransport extends HubRoute {
         unsub();
         response.ok ? resolve(response) : reject(new Error(response.error));
       });
-      this.send(type, { ...params, request_id: requestId });
+      this.sendCommand(type, { ...params, request_id: requestId });
     });
   }
 
@@ -471,7 +471,7 @@ export class HubTransport extends HubRoute {
         unsub();
         response.ok ? resolve(response) : reject(new Error(response.error));
       });
-      this.send(type, { ...params, request_id: requestId });
+      this.sendCommand(type, { ...params, request_id: requestId });
     });
   }
 
