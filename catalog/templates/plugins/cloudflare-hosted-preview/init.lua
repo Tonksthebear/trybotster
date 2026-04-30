@@ -1,3 +1,10 @@
+-- @template Cloudflare Hosted Preview
+-- @description Expose port-forwarded sessions with Cloudflare quick tunnels
+-- @category plugins
+-- @dest plugins/cloudflare-hosted-preview/init.lua
+-- @scope device
+-- @version 1.0.0
+
 -- Cloudflare hosted-preview session action.
 --
 -- The Cloudflare quick-tunnel lifecycle is plugin-owned: this module registers

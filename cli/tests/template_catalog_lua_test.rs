@@ -26,6 +26,37 @@ fn create_lua_vm() -> Lua {
 }
 
 #[test]
+fn repository_catalog_includes_cloudflare_hosted_preview_template() {
+    let lua = create_lua_vm();
+    let catalog_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repo root")
+        .join("catalog/templates");
+    let catalog_root = catalog_root.to_str().unwrap();
+
+    let ok: bool = lua
+        .load(format!(
+            r#"
+            local catalog = require("lib.template_catalog")
+            local templates = catalog.list({{ source_root = "{catalog_root}" }})
+            for _, template in ipairs(templates) do
+              if template.dest == "plugins/cloudflare-hosted-preview/init.lua" then
+                return template.name == "Cloudflare Hosted Preview"
+                  and template.category == "plugins"
+                  and template.scope == "device"
+                  and template.content:match("cloudflare.preview.toggle") ~= nil
+              end
+            end
+            return false
+            "#
+        ))
+        .eval()
+        .expect("repository catalog should be parseable");
+
+    assert!(ok, "catalog should expose Cloudflare hosted preview as a template");
+}
+
+#[test]
 fn template_catalog_parses_metadata_and_groups_by_category() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("templates");
