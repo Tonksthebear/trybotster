@@ -134,19 +134,31 @@ export class HubSignalingClient {
   }
 
   async connect(hubId, browserIdentity, { onMessage, onState }) {
+    const existingSubscription = this.#subscriptions.get(hubId);
+    if (existingSubscription) {
+      existingSubscription.unsubscribe();
+      this.#subscriptions.delete(hubId);
+    }
+
     const consumer = await getActionCableConsumer();
 
-    const subscription = consumer.subscriptions.create(
+    let subscription;
+    const isCurrentSubscription = () => this.#subscriptions.get(hubId) === subscription;
+
+    subscription = consumer.subscriptions.create(
       { channel: "HubSignalingChannel", hub_id: hubId, browser_identity: browserIdentity },
       {
         received: (data) => {
+          if (!isCurrentSubscription()) return;
           onMessage?.(data);
         },
         connected: () => {
+          if (!isCurrentSubscription()) return;
           onState?.("connected");
           this.#notify("signaling:state", { hubId, state: "connected" });
         },
         disconnected: () => {
+          if (!isCurrentSubscription()) return;
           onState?.("disconnected");
           this.#notify("signaling:state", { hubId, state: "disconnected" });
         },

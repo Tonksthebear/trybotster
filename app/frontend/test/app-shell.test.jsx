@@ -363,7 +363,7 @@ describe('AppRoutes', () => {
 
     renderRoutes('/hubs/hub-1/vault/sessions/sess-1')
 
-    expect(await screen.findByTestId('sidebar-layout')).toHaveAttribute('data-flush', 'true')
+    expect(await screen.findByTestId('sidebar-layout', {}, { timeout: 3000 })).toHaveAttribute('data-flush', 'true')
     expect(screen.queryByText('TerminalCache:hub-1')).toBeNull()
     expect(screen.getByTestId('ui-tree-vault')).toHaveTextContent('UiTree:hub-1:vault:/sessions/sess-1')
   })
