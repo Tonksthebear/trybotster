@@ -217,7 +217,7 @@ end
 
 --- Emit `entity_patch`. `fields` is a sparse table of field names to new
 --- values. Clients merge field-by-field into their local entity. Nested
---- objects (e.g. `hosted_preview = { ... }`) replace the prior value
+--- objects (e.g. `plugin_state = { ... }`) replace the prior value
 --- wholesale rather than deep-merging — see §12.4 of the design brief.
 ---
 --- Empty patches are silently dropped so a noop `Session:update({})` does

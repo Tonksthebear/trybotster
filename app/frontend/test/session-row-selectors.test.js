@@ -9,8 +9,6 @@ import { describe, expect, it } from 'vitest'
 import {
   activityState,
   displayName,
-  previewState,
-  selectHostedPreviewIndicatorProps,
   selectSessionRowProps,
   subtext,
   titleLine,
@@ -25,8 +23,8 @@ describe('displayName', () => {
   it('falls back to display_name', () => {
     expect(displayName({ display_name: 'beta' })).toBe('beta')
   })
-  it('falls back to id when label and display_name are missing', () => {
-    expect(displayName({ id: 'sess-a' })).toBe('sess-a')
+  it('does not use generic entity id as display fallback', () => {
+    expect(displayName({ id: 'sess-a' })).toBe('')
   })
   it('falls back to session_uuid as last resort', () => {
     expect(displayName({ session_uuid: 'uuid-z' })).toBe('uuid-z')
@@ -111,48 +109,6 @@ describe('activityState', () => {
   })
 })
 
-describe('previewState', () => {
-  it('returns canPreview=false for sessions without a port', () => {
-    expect(previewState({ id: 'no-port' })).toMatchObject({
-      canPreview: false,
-      status: 'inactive',
-      url: null,
-    })
-  })
-  it('returns bare {canPreview:false} for null/undefined', () => {
-    expect(previewState(null)).toEqual({ canPreview: false })
-    expect(previewState(undefined)).toEqual({ canPreview: false })
-  })
-  it('passes through hosted_preview shape when port is set', () => {
-    expect(
-      previewState({
-        port: 8080,
-        hosted_preview: {
-          status: 'running',
-          url: 'https://x.test',
-          error: null,
-          install_url: 'https://install.test',
-        },
-      }),
-    ).toEqual({
-      canPreview: true,
-      status: 'running',
-      url: 'https://x.test',
-      error: null,
-      installUrl: 'https://install.test',
-    })
-  })
-  it('defaults status to "inactive" when hosted_preview is absent', () => {
-    expect(previewState({ port: 8080 })).toMatchObject({
-      canPreview: true,
-      status: 'inactive',
-      url: null,
-      error: null,
-      installUrl: null,
-    })
-  })
-})
-
 describe('selectSessionRowProps', () => {
   const session = {
     id: 'sess-1',
@@ -166,8 +122,6 @@ describe('selectSessionRowProps', () => {
     is_idle: false,
     notification: true,
     session_type: 'agent',
-    port: 8080,
-    hosted_preview: { status: 'running', url: 'https://preview.test' },
     in_worktree: true,
     close_actions: { can_delete_worktree: true },
   }
@@ -188,22 +142,9 @@ describe('selectSessionRowProps', () => {
       notification: true,
       sessionType: 'agent',
       activityState: 'active',
-      previewError: null,
       canMoveWorkspace: true,
       canDelete: true,
       inWorktree: true,
-    })
-    expect(props.hostedPreview).toMatchObject({
-      canPreview: true,
-      status: 'running',
-      url: 'https://preview.test',
-    })
-    expect(props.actionsMenu).toMatchObject({
-      canPreview: true,
-      previewStatus: 'running',
-      previewUrl: 'https://preview.test',
-      canMove: true,
-      canDelete: true,
     })
     expect(props.closeActions).toEqual({ can_delete_worktree: true })
   })
@@ -212,32 +153,5 @@ describe('selectSessionRowProps', () => {
   })
   it('defaults density to "panel" when caller does not specify', () => {
     expect(selectSessionRowProps(session).density).toBe('panel')
-  })
-  it('only sets previewError when status === "error"', () => {
-    const errored = {
-      ...session,
-      hosted_preview: { status: 'error', error: 'cloudflared down' },
-    }
-    expect(selectSessionRowProps(errored).previewError).toBe('cloudflared down')
-  })
-  it('hostedPreview is null when canPreview is false', () => {
-    const noPort = { ...session, port: undefined }
-    expect(selectSessionRowProps(noPort).hostedPreview).toBeNull()
-  })
-})
-
-describe('selectHostedPreviewIndicatorProps', () => {
-  it('returns null when canPreview is false', () => {
-    expect(
-      selectHostedPreviewIndicatorProps({ id: 's' }),
-    ).toBeNull()
-  })
-  it('returns the preview slice when canPreview is true', () => {
-    expect(
-      selectHostedPreviewIndicatorProps({
-        port: 8080,
-        hosted_preview: { status: 'running', url: 'https://x.test' },
-      }),
-    ).toMatchObject({ status: 'running', url: 'https://x.test' })
   })
 })

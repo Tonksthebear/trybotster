@@ -5,7 +5,6 @@
 # config/secrets.yml
 
 config/credentials/*.key
-.claude/settings.local.json
 
 # Ignore GitHub App private key
 config/**.pem

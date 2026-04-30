@@ -43,6 +43,21 @@ function M.remove_session(session_id)
     end
 end
 
+function M.upsert_session_action(action)
+    local EB = require("lib.entity_broadcast")
+    if type(action) == "table" and action.id and EB.is_registered("session_action") then
+        EB.upsert("session_action", action)
+    end
+end
+
+function M.remove_session_action(session_uuid, action_id)
+    local EB = require("lib.entity_broadcast")
+    if session_uuid and action_id and EB.is_registered("session_action") then
+        local SessionActions = require("lib.session_actions")
+        EB.remove("session_action", SessionActions.entity_id(session_uuid, action_id))
+    end
+end
+
 function M.upsert_spawn_target(target)
     local EB = require("lib.entity_broadcast")
     if type(target) == "table" and EB.is_registered("spawn_target") then
@@ -136,6 +151,13 @@ function M.upsert_template(template)
     local EB = require("lib.entity_broadcast")
     if type(template) == "table" and template.id and EB.is_registered("template") then
         EB.upsert("template", template)
+    end
+end
+
+function M.remove_template(template_id)
+    local EB = require("lib.entity_broadcast")
+    if template_id and EB.is_registered("template") then
+        EB.remove("template", template_id)
     end
 end
 

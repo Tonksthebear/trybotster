@@ -101,6 +101,13 @@ if EB then
             return not Session.is_system_session(info)
         end,
     })
+    EB.register("session_action", {
+        id_field = "id",
+        all = function()
+            local SessionActions = require("lib.session_actions")
+            return SessionActions.all()
+        end,
+    })
     EB.register("workspace", {
         id_field = "workspace_id",
         all = function()

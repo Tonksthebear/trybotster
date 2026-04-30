@@ -299,7 +299,7 @@ mod tests {
                     "session_uuid": "sess-a",
                     "title": "alpha",
                     "is_idle": false,
-                    "hosted_preview": { "status": "running", "url": "https://x" }
+                    "plugin_state": { "example_provider": { "status": "running", "url": "https://x" } }
                 }),
                 json!({
                     "session_uuid": "sess-b",
@@ -332,7 +332,10 @@ mod tests {
         resolve_bindings(&mut value, &stores);
         assert_eq!(value["title"], json!("alpha"));
         assert_eq!(value["is_idle"], json!(false));
-        assert_eq!(value["hosted_preview"]["status"], json!("running"));
+        assert_eq!(
+            value["plugin_state"]["example_provider"]["status"],
+            json!("running")
+        );
     }
 
     #[test]
@@ -401,16 +404,16 @@ mod tests {
             "props": {
                 "label": "Open",
                 "action": {
-                    "id": "botster.session.preview.open",
+                    "id": "botster.url.open",
                     "payload": {
-                        "url": { "$bind": "/session/sess-a/hosted_preview" }
+                        "plugin_state": { "$bind": "/session/sess-a/plugin_state" }
                     }
                 }
             }
         });
         resolve_bindings(&mut tree, &stores);
-        let url = &tree["props"]["action"]["payload"]["url"];
-        assert_eq!(url["status"], json!("running"));
+        let plugin_state = &tree["props"]["action"]["payload"]["plugin_state"];
+        assert_eq!(plugin_state["example_provider"]["status"], json!("running"));
     }
 
     #[test]

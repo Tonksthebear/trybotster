@@ -15,8 +15,7 @@ import {
   DropdownDivider,
 } from '../catalyst/dropdown'
 import { useUiActionInterceptor, useUiTreeDispatch } from '../UiTree'
-import { useSessionStore } from '../../store/entities'
-import { previewState } from '../../store/selectors/session-row'
+import { useSessionActionStore, useSessionStore } from '../../store/entities'
 import { IconGlyph } from '../../ui_contract/icons'
 
 // SessionActionsMenu intercepts the placeholder action emitted by Phase 2a's
@@ -31,8 +30,8 @@ import { IconGlyph } from '../../ui_contract/icons'
 //   action = ui.action("botster.session.menu.open", { sessionId,
 //   sessionUuid }) }` on each session row.
 // - This composite registers an interceptor for that action id, captures
-//   the event's currentTarget, derives availability flags from the
-//   workspace store (canPreview / canMove / canDelete), and opens a
+//   the event's currentTarget, derives plugin-owned session actions from the
+//   entity store, and opens a
 //   Headless UI Menu via a programmatically-clicked invisible MenuButton
 //   positioned on top of the trigger.
 // - Menu items dispatch follow-up actions back through the same UiTree
@@ -41,6 +40,8 @@ import { IconGlyph } from '../../ui_contract/icons'
 export default function SessionActionsMenu() {
   const dispatch = useUiTreeDispatch()
   const sessionsById = useSessionStore((s) => s.byId)
+  const actionOrder = useSessionActionStore((s) => s.order)
+  const actionsById = useSessionActionStore((s) => s.byId)
   const [openState, setOpenState] = useState(null)
   const buttonRef = useRef(null)
 
@@ -76,30 +77,24 @@ export default function SessionActionsMenu() {
   const session = openState?.sessionId
     ? sessionsById[openState.sessionId]
     : null
-  const preview = useMemo(
-    () => (session ? previewState(session) : null),
-    [session],
+  const sessionActions = useMemo(
+    () => actionOrder
+      .map((id) => actionsById[id])
+      .filter((action) =>
+        action &&
+        action.session_uuid === openState?.sessionUuid &&
+        action.visibility !== 'hidden',
+      ),
+    [actionOrder, actionsById, openState?.sessionUuid],
   )
 
   if (!openState) return null
 
   const isAccessory = session?.session_type === 'accessory'
-  const canPreview = preview?.canPreview === true
-  const previewStatus = preview?.status ?? 'inactive'
-  const previewUrl = preview?.url ?? null
-  const previewRunning = previewStatus === 'running'
-  const previewReady = previewRunning && previewUrl
   const canMove = !isAccessory
   const canDelete = true
-  const hasPreviewItems = canPreview || previewReady
+  const hasActionItems = sessionActions.length > 0
   const hasManageItems = canMove || canDelete
-
-  function previewLabel() {
-    if (previewRunning) return 'Disable Cloudflare preview'
-    if (previewStatus === 'starting') return 'Starting\u2026'
-    if (previewStatus === 'error') return 'Retry Cloudflare preview'
-    return 'Enable Cloudflare preview'
-  }
 
   function fireAction(id, payload) {
     dispatch({ id, payload })
@@ -138,34 +133,23 @@ export default function SessionActionsMenu() {
         // trigger unmounts and we're ready for the next request.
         onClose={close}
       >
-        {canPreview && (
+        {sessionActions.map((action) => (
           <DropdownItem
+            key={action.id}
+            disabled={action.enabled === false}
             onClick={() =>
-              fireAction('botster.session.preview.toggle', {
+              fireAction('botster.session.action.execute', {
                 sessionUuid: openState.sessionUuid,
+                actionId: action.action_id,
               })
             }
           >
-            <MenuIcon name="globe" />
-            <DropdownLabel>{previewLabel()}</DropdownLabel>
+            <MenuIcon name={action.icon || 'sparkle'} />
+            <DropdownLabel>{action.label || action.action_id}</DropdownLabel>
           </DropdownItem>
-        )}
+        ))}
 
-        {previewReady && (
-          <DropdownItem
-            onClick={() =>
-              fireAction('botster.session.preview.open', {
-                sessionUuid: openState.sessionUuid,
-                url: previewUrl,
-              })
-            }
-          >
-            <MenuIcon name="external-link" />
-            <DropdownLabel>Open Cloudflare preview</DropdownLabel>
-          </DropdownItem>
-        )}
-
-        {hasPreviewItems && hasManageItems && <DropdownDivider />}
+        {hasActionItems && hasManageItems && <DropdownDivider />}
 
         {canMove && (
           <DropdownItem

@@ -7,8 +7,8 @@ const ACTION = {
   WORKSPACE_RENAME: 'botster.workspace.rename.request',
   SESSION_SELECT: 'botster.session.select',
   SESSION_CREATE: 'botster.session.create.request',
-  PREVIEW_TOGGLE: 'botster.session.preview.toggle',
-  PREVIEW_OPEN: 'botster.session.preview.open',
+  SESSION_ACTION_EXECUTE: 'botster.session.action.execute',
+  URL_OPEN: 'botster.url.open',
   SESSION_MOVE: 'botster.session.move.request',
   SESSION_DELETE: 'botster.session.delete.request',
   // Router-level navigation fired from Lua-authored trees (e.g. sidebar
@@ -66,9 +66,9 @@ const handlers = {
     // the select_agent command for cross-client handoff (browser click
     // focuses the session in the TUI), even though selection state is no
     // longer baked into broadcast trees.
-    if (payload.hubId && payload.sessionId) {
+    if (payload.hubId && payload.sessionUuid) {
       void waitForHub(payload.hubId).then((hub) => {
-        hub?.selectAgent(payload.sessionId)
+        hub?.selectAgent(payload.sessionUuid)
       })
     }
     // Navigate via React Router (pushState). Idempotent — skip when
@@ -81,13 +81,13 @@ const handlers = {
     }
   },
 
-  [ACTION.PREVIEW_TOGGLE](payload) {
+  [ACTION.SESSION_ACTION_EXECUTE](payload) {
     void waitForHub(payload.hubId).then((hub) => {
-      hub?.toggleHostedPreview(payload.sessionUuid)
+      hub?.executeSessionAction(payload.sessionUuid, payload.actionId, payload.params)
     })
   },
 
-  [ACTION.PREVIEW_OPEN](payload) {
+  [ACTION.URL_OPEN](payload) {
     const url = safeUrl(payload.url)
     if (url) {
       window.open(url, '_blank', 'noopener')

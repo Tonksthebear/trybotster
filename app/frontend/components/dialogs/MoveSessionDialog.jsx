@@ -52,7 +52,7 @@ export default function MoveSessionDialog({ hubId }) {
 
   async function moveToExisting(workspaceId, workspaceName) {
     const hub = await waitForHub(hubId)
-    if (hub) hub.moveAgentWorkspace(context.sessionId, workspaceId, workspaceName)
+    if (hub) hub.moveAgentWorkspace(context.sessionUuid, workspaceId, workspaceName)
     close()
   }
 
@@ -61,7 +61,7 @@ export default function MoveSessionDialog({ hubId }) {
     const target = newWorkspaceName.trim()
     if (!target) return
     const hub = await waitForHub(hubId)
-    if (hub) hub.moveAgentWorkspace(context.sessionId, null, target)
+    if (hub) hub.moveAgentWorkspace(context.sessionUuid, null, target)
     close()
   }
 

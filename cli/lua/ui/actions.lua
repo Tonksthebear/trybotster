@@ -641,7 +641,7 @@ function M.on_action(action, context)
             subscriptionId = "tui_hub",
             data = {
               type = "move_agent_workspace",
-              agent_id = agent_id,
+              session_uuid = agent_id,
               workspace_id = target_workspace_id,
               workspace_name = target_workspace_name,
             },
@@ -659,7 +659,7 @@ function M.on_action(action, context)
       return {
         { op = "send_msg", data = {
           subscriptionId = "tui_hub",
-          data = { type = "delete_agent", agent_id = context.selected_agent, delete_worktree = false },
+          data = { type = "delete_agent", session_uuid = context.selected_agent, delete_worktree = false },
         }},
         set_mode_ops("list"),
       }
@@ -674,7 +674,7 @@ function M.on_action(action, context)
       return {
         { op = "send_msg", data = {
           subscriptionId = "tui_hub",
-          data = { type = "delete_agent", agent_id = context.selected_agent, delete_worktree = true },
+          data = { type = "delete_agent", session_uuid = context.selected_agent, delete_worktree = true },
         }},
         set_mode_ops("list"),
       }

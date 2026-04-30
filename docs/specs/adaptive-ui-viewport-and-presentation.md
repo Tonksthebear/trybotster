@@ -313,7 +313,7 @@ The agent and workspace UI should follow these adaptive defaults.
 - persistent workspace navigation is allowed
 - row metadata can include title line and subtext
 - row action menus may be inline or trailing
-- preview error panels may render inline beneath rows
+- action error panels may render inline beneath rows
 
 ### Compact
 

@@ -24,7 +24,7 @@ import {
  *   * `/hubs/:hubId/kanban/board/42`   → subpath "/board/42"    → board(id=42)
  *
  * Prefix matching covers both the root-of-surface case and any nested
- * sub-path. `base_path` is derived from `path` if the frame omits it.
+ * sub-path. Route entries must carry `base_path` explicitly.
  *
  * Three resolution states for the current URL:
  *   1. Registry hasn't shipped its first snapshot yet for this hub

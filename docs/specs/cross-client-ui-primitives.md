@@ -385,7 +385,7 @@ Examples:
 
 - `botster.session.select`
 - `botster.session.close.request`
-- `botster.session.preview.toggle`
+- `botster.session.action.execute`
 - `botster.workspace.toggle`
 - `botster.workspace.rename.request`
 - `botster.menu.open`
@@ -407,8 +407,8 @@ Recommended composition:
 - nested `list` or `tree_item` rows for sessions
 - `status_dot` for activity
 - `icon_button` or `menu` for row actions
-- `badge` or `status_dot` for preview state
-- `panel` plus `text` for preview error
+- `badge` or `status_dot` for action state
+- `panel` plus `text` for action errors
 
 This lets both renderers share the same semantic tree even if the web temporarily keeps some helpers like `SessionRow` internally during migration.
 

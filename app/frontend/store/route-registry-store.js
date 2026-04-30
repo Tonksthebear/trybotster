@@ -76,18 +76,17 @@ export const useRouteRegistryStore = create((set) => ({
 const EMPTY_ROUTES = Object.freeze([])
 
 /**
- * Normalise an entry so consumers can rely on `base_path`. The current wire
- * format emits `base_path`; `path` remains the canonical surface root and is
- * used as the derived `base_path` when the field is absent.
+ * Normalise an entry so consumers can rely on explicit `base_path`. The wire
+ * format emits both `base_path` and `path`; `path` is retained only as the
+ * generic route target field and is not a compatibility alias for routing.
  */
 function normaliseEntry(entry) {
   if (!entry || typeof entry !== 'object') return entry
-  const basePath = typeof entry.base_path === 'string' && entry.base_path !== ''
-    ? entry.base_path
-    : typeof entry.path === 'string' ? entry.path : null
   return {
     ...entry,
-    base_path: basePath,
+    base_path: typeof entry.base_path === 'string' && entry.base_path !== ''
+      ? entry.base_path
+      : null,
   }
 }
 

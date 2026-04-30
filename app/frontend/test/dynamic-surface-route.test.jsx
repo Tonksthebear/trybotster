@@ -54,7 +54,7 @@ describe('DynamicSurfaceRoute', () => {
 
   it('mounts UiTree with the surface matching the requested path', () => {
     useRouteRegistryStore.getState().setRoutes('h1', [
-      { path: '/plugins/hello', surface: 'hello', label: 'Hello' },
+      { path: '/plugins/hello', base_path: '/plugins/hello', surface: 'hello', label: 'Hello' },
     ])
     renderDynamic('/hubs/h1/plugins/hello')
 
@@ -65,7 +65,7 @@ describe('DynamicSurfaceRoute', () => {
 
   it('renders a 404 fallback when the path is not in the registry', () => {
     useRouteRegistryStore.getState().setRoutes('h1', [
-      { path: '/plugins/hello', surface: 'hello', label: 'Hello' },
+      { path: '/plugins/hello', base_path: '/plugins/hello', surface: 'hello', label: 'Hello' },
     ])
     renderDynamic('/hubs/h1/plugins/missing')
 
@@ -75,7 +75,7 @@ describe('DynamicSurfaceRoute', () => {
 
   it('defers to the legacy session route by rendering nothing for sessions/*', () => {
     useRouteRegistryStore.getState().setRoutes('h1', [
-      { path: '/', surface: 'workspace_panel', label: 'Hub' },
+      { path: '/', base_path: '/', surface: 'workspace_panel', label: 'Hub' },
     ])
     const { container } = renderDynamic('/hubs/h1/sessions/some-session-uuid')
 
@@ -89,7 +89,7 @@ describe('DynamicSurfaceRoute', () => {
 
   it('matches the root path for the workspace_panel surface', () => {
     useRouteRegistryStore.getState().setRoutes('h1', [
-      { path: '/', surface: 'workspace_panel', label: 'Hub' },
+      { path: '/', base_path: '/', surface: 'workspace_panel', label: 'Hub' },
     ])
     renderDynamic('/hubs/h1/')
 
@@ -116,7 +116,7 @@ describe('DynamicSurfaceRoute', () => {
 
     // First frame arrives.
     useRouteRegistryStore.getState().setRoutes('h1', [
-      { path: '/plugins/hello', surface: 'hello', label: 'Hello' },
+      { path: '/plugins/hello', base_path: '/plugins/hello', surface: 'hello', label: 'Hello' },
     ])
     rerender(
       <MemoryRouter initialEntries={['/hubs/h1/plugins/hello']}>
@@ -134,7 +134,7 @@ describe('DynamicSurfaceRoute', () => {
 
     // First frame arrives — but `/plugins/nope` isn't in it.
     useRouteRegistryStore.getState().setRoutes('h1', [
-      { path: '/plugins/hello', surface: 'hello', label: 'Hello' },
+      { path: '/plugins/hello', base_path: '/plugins/hello', surface: 'hello', label: 'Hello' },
     ])
     rerender(
       <MemoryRouter initialEntries={['/hubs/h1/plugins/nope']}>
@@ -216,17 +216,13 @@ describe('DynamicSurfaceRoute', () => {
     expect(screen.getByText(/Not found/i)).toBeInTheDocument()
   })
 
-  it('falls back to legacy `path` when base_path is omitted (old hub compat)', () => {
-    // Older hubs emit only `path`. The store normaliser maps it to
-    // base_path so DynamicSurfaceRoute still resolves correctly.
+  it('does not route entries that omit explicit base_path', () => {
     useRouteRegistryStore.getState().setRoutes('h1', [
       { path: '/plugins/hello', surface: 'hello', label: 'Hello' },
     ])
     renderDynamic('/hubs/h1/plugins/hello/details')
 
-    const tree = screen.getByTestId('ui-tree')
-    expect(tree).toHaveTextContent('targetSurface=hello')
-    expect(tree).toHaveTextContent('subpath=/details')
+    expect(screen.getByText(/Not found/i)).toBeInTheDocument()
   })
 
   it('uses a full-height overflow-hidden wrapper for plugin session terminals', () => {

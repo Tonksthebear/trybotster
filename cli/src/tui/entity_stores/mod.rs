@@ -115,7 +115,7 @@ impl EntityStore {
 
     /// Merge a sparse patch into an existing entity. Top-level fields are
     /// merged; nested objects in the patch REPLACE the existing nested
-    /// object wholesale (per design brief §12.4 — `hosted_preview` is the
+    /// object wholesale (per design brief §12.4 — `plugin_state` is the
     /// canonical example). No-ops gracefully when the entity is unknown
     /// — the next snapshot will reconcile.
     pub fn apply_patch(&mut self, id: &str, patch: JsonValue, snapshot_seq: u64) {
@@ -444,7 +444,7 @@ mod tests {
                 "session_uuid": "sess-a",
                 "title": "alpha",
                 "is_idle": true,
-                "hosted_preview": { "status": "starting", "url": null },
+                "plugin_state": { "example_provider": { "status": "starting", "url": null } },
             })],
             1,
         ));
@@ -460,16 +460,16 @@ mod tests {
         assert_eq!(store.by_id["sess-a"]["is_idle"], json!(false));
 
         // Nested object REPLACES wholesale (per §12.4 — even though `url`
-        // was set in the prior nested object, the new patch's hosted_preview
+        // was set in the prior nested object, the new patch's plugin_state
         // is the source of truth and the `url` field disappears).
         stores.apply_frame(&patch_frame(
             "sess-a",
-            json!({ "hosted_preview": { "status": "running" } }),
+            json!({ "plugin_state": { "example_provider": { "status": "running" } } }),
             3,
         ));
         let store = stores.store("session").expect("store");
-        let hp = &store.by_id["sess-a"]["hosted_preview"];
-        assert_eq!(hp["status"], json!("running"));
+        let hp = &store.by_id["sess-a"]["plugin_state"];
+        assert_eq!(hp["example_provider"]["status"], json!("running"));
         assert!(
             hp.get("url").is_none(),
             "nested patch should replace wholesale: {hp}"

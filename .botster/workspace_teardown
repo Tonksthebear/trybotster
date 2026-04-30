@@ -1,12 +1,6 @@
 # Teardown commands
 # Run before worktree is deleted
 
-# Remove the worktree from Claude's trusted projects
-worktree_path="$(botster context worktree_path 2>/dev/null)"
-if [ -n "$worktree_path" ]; then
-  botster json-delete ~/.claude.json "projects.$worktree_path"
-fi
-
 issue_number="$(botster context issue_number 2>/dev/null)"
 branch_name="$(botster context branch_name 2>/dev/null)"
 

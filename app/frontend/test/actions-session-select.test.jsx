@@ -11,8 +11,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // implementation and mocks only the hub-bridge side-effect that needs a
 // live hub session.
 
+const selectAgentMock = vi.hoisted(() => vi.fn())
+
 vi.mock('../lib/hub-bridge', () => ({
-  waitForHub: () => Promise.resolve(null),
+  waitForHub: () => Promise.resolve({ selectAgent: selectAgentMock }),
 }))
 
 import { dispatch, ACTION } from '../lib/actions'
@@ -30,10 +32,11 @@ describe('lib/actions SESSION_SELECT navigation', () => {
 
   afterEach(() => {
     pushSpy.mockRestore()
+    selectAgentMock.mockClear()
     window.removeEventListener('popstate', popstateSpy)
   })
 
-  it('pushes url when not already on the target path', () => {
+  it('pushes url when not already on the target path', async () => {
     dispatch({
       action: ACTION.SESSION_SELECT,
       payload: {
@@ -51,6 +54,8 @@ describe('lib/actions SESSION_SELECT navigation', () => {
     )
     expect(popstateSpy).toHaveBeenCalledOnce()
     expect(window.location.pathname).toBe('/hubs/hub-1/sessions/u-1')
+    await Promise.resolve()
+    expect(selectAgentMock).toHaveBeenCalledWith('u-1')
   })
 
   it('is idempotent when already on the target path (transport path pushed first)', () => {

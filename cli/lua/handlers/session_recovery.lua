@@ -224,7 +224,6 @@ _event_sub = events.on("sessions_discovered", function(data)
     -- Broadcast recovered sessions to clients
     if #recovered > 0 then
         local Session = require("lib.session")
-        local HostedPreview = require("lib.hosted_preview")
 
         -- Wire protocol: the recovery hook publishes one session entity per
         -- recovered session. No list-style hub fanout is needed here.
@@ -234,7 +233,6 @@ _event_sub = events.on("sessions_discovered", function(data)
                     hooks.notify("agent_created", session:info())
                 end
             end
-            HostedPreview.reconcile()
         end)
 
         if not ok then

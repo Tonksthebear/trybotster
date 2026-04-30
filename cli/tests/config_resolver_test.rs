@@ -91,7 +91,7 @@ fn config_resolver_resolve_all_merges_current_device_and_repo_layers() {
         "device codex",
         Some(r#"{"target_id":"device-codex","label":"Device Codex","device_only":true}"#),
     );
-    write_agent(&device_root, "claude", "device claude", None);
+    write_agent(&device_root, "reviewer", "device reviewer", None);
     write_agent(&device_root, "missing-init", "", None);
     fs::remove_file(
         device_root
@@ -150,7 +150,7 @@ fn config_resolver_resolve_all_merges_current_device_and_repo_layers() {
             assert(resolved.agents.codex.manifest.label == "Repo Codex")
             assert(resolved.agents.codex.manifest.device_only == true)
             assert(resolved.agents.codex.manifest.repo_only == true)
-            assert(resolved.agents.claude.source == "device")
+            assert(resolved.agents.reviewer.source == "device")
             assert(resolved.agents.cursor.source == "repo")
             assert(resolved.agents["missing-init"] == nil)
 

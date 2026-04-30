@@ -214,21 +214,21 @@ export class HubTransport extends HubRoute {
   }
 
   /**
-   * Select an agent (focus in CLI).
-   * @param {string} agentId
+   * Select a session (focus in CLI).
+   * @param {string} sessionUuid
    */
-  selectAgent(agentId) {
-    return this.send("select_agent", { id: agentId });
+  selectAgent(sessionUuid) {
+    return this.send("select_agent", { session_uuid: sessionUuid });
   }
 
   /**
-   * Delete an agent.
-   * @param {string} agentId
+   * Delete a session.
+   * @param {string} sessionUuid
    * @param {boolean} deleteWorktree - Also delete the git worktree
    */
-  deleteAgent(agentId, deleteWorktree = false) {
+  deleteAgent(sessionUuid, deleteWorktree = false) {
     return this.send("delete_agent", {
-      id: agentId,
+      session_uuid: sessionUuid,
       delete_worktree: deleteWorktree,
     });
   }
@@ -242,14 +242,15 @@ export class HubTransport extends HubRoute {
   }
 
   /**
-   * Toggle a Cloudflare-hosted preview for a session.
+   * Execute a plugin-owned generic session action.
    * @param {string} sessionUuid - Session UUID
-   * @param {boolean} [enabled] - Explicit enable/disable. Omit to toggle.
+   * @param {string} actionId - Plugin-registered action id
+   * @param {Object} [params] - Optional plugin-specific params
    */
-  toggleHostedPreview(sessionUuid, enabled) {
-    const payload = { session_uuid: sessionUuid }
-    if (enabled !== undefined) payload.enabled = enabled
-    return this.send("toggle_hosted_preview", payload);
+  executeSessionAction(sessionUuid, actionId, params) {
+    const payload = { session_uuid: sessionUuid, action_id: actionId };
+    if (params !== undefined) payload.params = params;
+    return this.send("execute_session_action", payload);
   }
 
   /**
@@ -274,13 +275,13 @@ export class HubTransport extends HubRoute {
 
   /**
    * Move a live session to another workspace.
-   * @param {string} agentId
+   * @param {string} sessionUuid
    * @param {string|null} workspaceId
    * @param {string|null} workspaceName
    */
-  moveAgentWorkspace(agentId, workspaceId = null, workspaceName = null) {
+  moveAgentWorkspace(sessionUuid, workspaceId = null, workspaceName = null) {
     return this.send("move_agent_workspace", {
-      agent_id: agentId,
+      session_uuid: sessionUuid,
       workspace_id: workspaceId,
       workspace_name: workspaceName,
     });
@@ -341,7 +342,7 @@ export class HubTransport extends HubRoute {
 
   /**
    * Add a PTY session to a running agent.
-   * @param {string} agentId - Agent key
+   * @param {string} agentId - Session UUID for the agent session
    * @param {string} sessionType - Session type name (e.g., "shell", "server")
    */
   addSession(agentId, sessionType) {
@@ -363,7 +364,7 @@ export class HubTransport extends HubRoute {
 
   /**
    * Request available session types for an agent.
-   * @param {string} agentId - Agent key
+   * @param {string} agentId - Session UUID for the agent session
    */
   requestSessionTypes(agentId) {
     return this.send("list_session_types", { agent_id: agentId });

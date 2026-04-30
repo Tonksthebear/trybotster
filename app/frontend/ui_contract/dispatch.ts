@@ -39,7 +39,8 @@ const LOCAL_ONLY_ACTIONS = new Set<string>([
   'botster.workspace.toggle',
   'botster.workspace.rename.request',
   'botster.session.create.request',
-  'botster.session.preview.open',
+  'botster.session.action.execute',
+  'botster.url.open',
   'botster.session.move.request',
   'botster.session.delete.request',
   // Router-level nav triggered from a Lua-authored tree (e.g. the sidebar's

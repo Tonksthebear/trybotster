@@ -279,7 +279,7 @@ const TRANSPORT_METHODS = [
   "selectAgent",
   "deleteAgent",
   "clearNotification",
-  "toggleHostedPreview",
+  "executeSessionAction",
   "createAgent",
   "renameWorkspace",
   "moveAgentWorkspace",

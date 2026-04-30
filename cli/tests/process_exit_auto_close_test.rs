@@ -92,10 +92,6 @@ fn run_process_exited_case(auto_close_literal: &str) -> (i64, i64, String) {
           end,
           path = function(...) return nil end,
         }}
-        package.loaded["lib.hosted_preview"] = {{
-          handle_process_exited = function(...) return false end,
-        }}
-
         local calls = {{ close = 0, update = 0, status = "" }}
         local session = {{
           get_meta = function(_self, key)

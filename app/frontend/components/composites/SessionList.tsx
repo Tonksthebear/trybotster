@@ -7,8 +7,8 @@
 // where session.workspace_id == workspace.id (design brief §12.5).
 //
 // Fidelity restoration: each row carries the activity dot, two-line
-// content (primary name + titleLine + subtext), inline hosted-preview
-// indicator, and an actions-menu trigger. A `<SessionActionsMenu>` mounted
+// content (primary name + titleLine + subtext), inline generic session-action
+// indicators, and an actions-menu trigger. A `<SessionActionsMenu>` mounted
 // outside the tree (App.jsx / HubShow.jsx) intercepts the
 // `botster.session.menu.open` action this row dispatches and renders a
 // Catalyst dropdown anchored to the trigger button.
@@ -17,6 +17,7 @@ import React, { useMemo, type MouseEvent, type ReactElement } from 'react'
 import clsx from 'clsx'
 
 import {
+  useSessionActionStore,
   useSessionStore,
   useWorkspaceEntityStore,
 } from '../../store/entities'
@@ -28,7 +29,6 @@ import { useUiPresentationStore } from '../../store/ui-presentation-store'
 import {
   activityState,
   displayName,
-  previewState,
   subtext,
   titleLine,
 } from '../../store/selectors/session-row'
@@ -57,17 +57,28 @@ type SessionRecord = {
   surface?: string
   is_idle?: boolean
   notification?: boolean
-  port?: number
   task?: string
   target_name?: string
   branch_name?: string
   agent_name?: string
-  hosted_preview?: {
-    status?: string
-    url?: string | null
-    error?: string | null
-    install_url?: string | null
-  } | null
+  [key: string]: unknown
+}
+
+type SessionActionRecord = {
+  id?: string
+  session_uuid?: string
+  action_id?: string
+  label?: string
+  status?: string | null
+  icon?: string | null
+  visibility?: string | null
+  enabled?: boolean
+  plugin?: string | null
+  url?: string | null
+  link_url?: string | null
+  install_url?: string | null
+  installUrl?: string | null
+  error?: string | null
   [key: string]: unknown
 }
 
@@ -95,8 +106,54 @@ type RouteRegistryEntry = {
   nav?: RouteNav | false
 }
 
+type OrderedEntityState<T> = {
+  order: string[]
+  byId: Record<string, T>
+}
+
+type UiPresentationState = {
+  selectedSessionId: string | null
+  collapsedWorkspaceIds: Set<string>
+  setSelectedSessionId: (sessionId: string) => void
+  toggleWorkspaceCollapsed: (workspaceId: string) => void
+}
+
 export type SessionListProps = UiSessionListProps & {
   ctx: RenderContext
+}
+
+function visibleSessionActions(
+  actionOrder: string[],
+  actionsById: Record<string, SessionActionRecord>,
+  sessionUuid: string,
+): SessionActionRecord[] {
+  return actionOrder
+    .map((id) => actionsById[id])
+    .filter((action): action is SessionActionRecord =>
+      !!action &&
+      action.session_uuid === sessionUuid &&
+      action.visibility !== 'hidden',
+    )
+}
+
+function actionUrl(action: SessionActionRecord): string | undefined {
+  const value = action.url ?? action.link_url ?? action.install_url ?? action.installUrl
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function actionStatusLabel(status: string): string {
+  return status
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+function actionStatusColor(status: string): 'emerald' | 'amber' | 'red' | 'zinc' {
+  if (status === 'running' || status === 'ready' || status === 'active') return 'emerald'
+  if (status === 'starting' || status === 'pending' || status === 'loading') return 'amber'
+  if (status === 'error' || status === 'failed') return 'red'
+  return 'zinc'
 }
 
 export function SessionList({
@@ -114,10 +171,20 @@ export function SessionList({
     ) ?? 'panel'
   const groupingMode = grouping ?? 'workspace'
 
-  const sessionOrder = useSessionStore((state) => state.order)
-  const sessionsById = useSessionStore((state) => state.byId)
+  const sessionOrder = useSessionStore(
+    (state: OrderedEntityState<SessionRecord>) => state.order,
+  ) as string[]
+  const sessionsById = useSessionStore(
+    (state: OrderedEntityState<SessionRecord>) => state.byId,
+  ) as Record<string, SessionRecord>
+  const sessionActionOrder = useSessionActionStore(
+    (state: OrderedEntityState<SessionActionRecord>) => state.order,
+  ) as string[]
+  const sessionActionsById = useSessionActionStore(
+    (state: OrderedEntityState<SessionActionRecord>) => state.byId,
+  ) as Record<string, SessionActionRecord>
   const requestedVisibility = visibility ?? 'workspace'
-  const sessions = useMemo(
+  const sessions = useMemo<Array<readonly [string, SessionRecord]>>(
     () =>
       sessionOrder
         .map((id) => [
@@ -136,9 +203,13 @@ export function SessionList({
         }),
     [ownerPlugin, requestedVisibility, sessionOrder, sessionsById, surface],
   )
-  const workspaceOrder = useWorkspaceEntityStore((state) => state.order)
-  const workspacesById = useWorkspaceEntityStore((state) => state.byId)
-  const routeEntries = useRouteRegistryStore((state) =>
+  const workspaceOrder = useWorkspaceEntityStore(
+    (state: OrderedEntityState<WorkspaceRecord>) => state.order,
+  ) as string[]
+  const workspacesById = useWorkspaceEntityStore(
+    (state: OrderedEntityState<WorkspaceRecord>) => state.byId,
+  ) as Record<string, WorkspaceRecord>
+  const routeEntries = useRouteRegistryStore((state: unknown) =>
     selectRoutesForHub(state, ctx.hubId),
   ) as RouteRegistryEntry[]
   // Filter out closed workspaces and workspaces with no active agent. The hub
@@ -169,13 +240,17 @@ export function SessionList({
     ],
   )
 
-  const selectedSessionId = useUiPresentationStore((s) => s.selectedSessionId)
-  const collapsedWorkspaceIds = useUiPresentationStore(
-    (s) => s.collapsedWorkspaceIds,
+  const selectedSessionId = useUiPresentationStore(
+    (s: UiPresentationState) => s.selectedSessionId,
   )
-  const setSelected = useUiPresentationStore((s) => s.setSelectedSessionId)
+  const collapsedWorkspaceIds = useUiPresentationStore(
+    (s: UiPresentationState) => s.collapsedWorkspaceIds,
+  )
+  const setSelected = useUiPresentationStore(
+    (s: UiPresentationState) => s.setSelectedSessionId,
+  )
   const toggleCollapsed = useUiPresentationStore(
-    (s) => s.toggleWorkspaceCollapsed,
+    (s: UiPresentationState) => s.toggleWorkspaceCollapsed,
   )
 
   if (sessions.length === 0) {
@@ -196,7 +271,7 @@ export function SessionList({
     const surfaceName = session.surface || session.owner_plugin
     if (surfaceName && session.visibility === 'plugin') {
       const entry = routeEntries.find((candidate) => candidate.surface === surfaceName)
-      const basePath = entry?.base_path || entry?.path
+      const basePath = entry?.base_path
       if (basePath && basePath !== '/') {
         return `/hubs/${ctx.hubId}${basePath}/sessions/${sessionUuid}`
       }
@@ -260,7 +335,11 @@ export function SessionList({
     const subtitle = titleLine(session)
     const tail = subtext(session)
     const activity = activityState(session)
-    const preview = previewState(session)
+    const sessionActions = visibleSessionActions(
+      sessionActionOrder,
+      sessionActionsById as Record<string, SessionActionRecord>,
+      sessionUuid,
+    )
     const selected = selectedSessionId === sessionUuid
     const sessionHref = sessionHrefFor(session, sessionUuid)
 
@@ -278,54 +357,53 @@ export function SessionList({
       : rowState === 'active' ? 'border-emerald-500'
       : 'border-zinc-700'
 
-    // Hosted-preview indicator. Running + url → clickable Catalyst
-    // BadgeButton. Other statuses → Catalyst Badge with the right tone.
-    // Inactive / unavailable → null.
-    let previewIndicator: ReactElement | null = null
-    if (preview.canPreview) {
-      if (preview.status === 'running' && preview.url) {
-        previewIndicator = (
-          <BadgeButton
-            color="emerald"
-            onClick={(event) => {
-              event.preventDefault()
-              event.stopPropagation()
-              ctx.dispatch(
-                {
-                  id: 'botster.session.preview.open',
-                  payload: {
-                    sessionId,
-                    sessionUuid,
-                    url: preview.url ?? undefined,
-                  },
-                } as UiAction,
-                { element: event.currentTarget as Element },
-              )
-            }}
-            data-testid="hosted-preview-running"
-          >
-            Running
-          </BadgeButton>
-        )
-      } else if (preview.status !== 'inactive' && preview.status !== 'unavailable') {
-        const label =
-          preview.status === 'starting' ? 'Starting…'
-          : preview.status === 'error' ? 'Error'
-          : preview.status
-        const color =
-          preview.status === 'error' ? 'red'
-          : preview.status === 'starting' ? 'amber'
-          : 'zinc'
-        previewIndicator = (
+    const actionIndicators = sessionActions
+      .filter((action) =>
+        typeof action.status === 'string' &&
+        action.status.length > 0 &&
+        action.status !== 'inactive' &&
+        action.status !== 'hidden',
+      )
+      .map((action) => {
+        const status = action.status as string
+        const url = actionUrl(action)
+        const label = actionStatusLabel(status)
+        if (url) {
+          return (
+            <BadgeButton
+              key={action.id || action.action_id}
+              color={actionStatusColor(status)}
+              onClick={(event: MouseEvent) => {
+                event.preventDefault()
+                event.stopPropagation()
+                ctx.dispatch(
+                  {
+                    id: 'botster.url.open',
+                    payload: {
+                      sessionUuid,
+                      actionId: action.action_id,
+                      url,
+                    },
+                  } as UiAction,
+                  { element: event.currentTarget as Element },
+                )
+              }}
+              data-testid="session-action-link"
+            >
+              {label}
+            </BadgeButton>
+          )
+        }
+        return (
           <Badge
-            color={color as 'red' | 'amber' | 'zinc'}
-            data-testid={`hosted-preview-status-${preview.status}`}
+            key={action.id || action.action_id}
+            color={actionStatusColor(status)}
+            data-testid={`session-action-status-${status}`}
           >
             {label}
           </Badge>
         )
-      }
-    }
+      })
 
     // In-row actions trigger. Catalyst <Button plain> doesn't fit here —
     // its base padding is row-sized, which would visually balloon every
@@ -401,7 +479,7 @@ export function SessionList({
       <>
         {lines}
         <div className="flex shrink-0 items-center gap-1 pt-0.5">
-          {previewIndicator}
+          {actionIndicators}
           {actionsTrigger}
         </div>
       </>
@@ -437,13 +515,14 @@ export function SessionList({
       </div>
     )
 
-    // Inline error panel: shown directly below the row when the hosted
-    // preview is in error state. Mirrors the legacy web/layout.lua
-    // hosted_preview_error_panel composition.
+    const erroredAction = sessionActions.find((action) => (
+      typeof action.error === 'string' && action.error.length > 0
+    ))
+    const errorUrl = erroredAction ? actionUrl(erroredAction) : undefined
     const errorPanel =
-      preview.status === 'error' && preview.error ? (
+      erroredAction?.error ? (
         <div
-          data-testid="hosted-preview-error"
+          data-testid="session-action-error"
           className={clsx(
             'mx-2 mt-0.5 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-1',
             'text-xs text-red-300',
@@ -452,9 +531,9 @@ export function SessionList({
         >
           <div className="flex items-start gap-1">
             <span aria-hidden="true">⚠</span>
-            <span className="min-w-0 flex-1">{preview.error}</span>
+            <span className="min-w-0 flex-1">{erroredAction.error}</span>
           </div>
-          {preview.installUrl && (
+          {errorUrl && (
             <button
               type="button"
               onClick={(event) => {
@@ -462,10 +541,11 @@ export function SessionList({
                 event.stopPropagation()
                 ctx.dispatch(
                   {
-                    id: 'botster.session.preview.open',
+                    id: 'botster.url.open',
                     payload: {
                       sessionUuid,
-                      url: preview.installUrl ?? undefined,
+                      actionId: erroredAction.action_id,
+                      url: errorUrl,
                     },
                   } as UiAction,
                   { element: event.currentTarget as Element },
@@ -473,7 +553,7 @@ export function SessionList({
               }}
               className="mt-1 inline-flex text-xs text-red-300 hover:underline"
             >
-              Install cloudflared
+              Open {erroredAction.label ?? 'action link'}
             </button>
           )}
         </div>

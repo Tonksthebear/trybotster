@@ -24,7 +24,7 @@ The current `agent_list_controller.js` now owns too much application logic:
 - workspace grouping
 - selection syncing
 - per-row activity derivation
-- hosted preview lifecycle
+- session action lifecycle
 - duplicate row rendering in sidebar and main panel
 - manual DOM reconciliation through cloned templates and `data-*` mutation
 
@@ -60,7 +60,7 @@ Phase 1 originally covered only the agent/workspace UI:
 - sidebar workspace tree
 - main hub workspace list
 - shared session row logic
-- hosted preview indicator and error state
+- session action indicator and error state
 - row actions menu
 
 Later phases move the remaining frontend surfaces onto the same runtime. The React/Catalyst direction explicitly does not include:
@@ -113,7 +113,7 @@ The React island should adapt the current hub payload, not invent a second trans
 ### Hub input shape
 
 ```ts
-type HostedPreviewState = {
+type SessionActionState = {
   status?: "inactive" | "starting" | "running" | "error"
   url?: string | null
   error?: string | null
@@ -134,7 +134,7 @@ type SessionSummary = {
   notification?: boolean
   is_idle?: boolean | null
   port?: number | null
-  hosted_preview?: HostedPreviewState | null
+  plugin_state?: SessionActionState | null
   in_worktree?: boolean | null
 }
 
@@ -205,8 +205,8 @@ Rules:
 | Botster composite | `WorkspaceList` | supported | no |
 | Botster composite | `WorkspaceGroup` | supported | no |
 | Botster composite | `SessionRow` | supported | no |
-| Botster composite | `HostedPreviewIndicator` | supported | no |
-| Botster composite | `HostedPreviewError` | supported | no |
+| Botster composite | `SessionActionIndicator` | supported | no |
+| Botster composite | `SessionActionError` | supported | no |
 | Botster composite | `SessionActionsMenu` | supported | no |
 
 Deferred from `current`:
@@ -243,8 +243,8 @@ type ActionBinding = {
     | "botster.workspace.toggle"
     | "botster.workspace.rename.request"
     | "botster.session.select"
-    | "botster.session.preview.toggle"
-    | "botster.session.preview.open"
+    | "botster.session.action.execute"
+    | "botster.url.open"
     | "botster.session.move.request"
     | "botster.session.delete.request"
   payload: Record<string, unknown>
@@ -459,8 +459,8 @@ type SessionRowProps = {
   notification: boolean
   sessionType: "agent" | "accessory"
   activityState: "hidden" | "idle" | "active"
-  hostedPreview?: HostedPreviewIndicatorProps | null
-  previewError?: HostedPreviewErrorProps | null
+  sessionAction?: SessionActionIndicatorProps | null
+  actionError?: SessionActionErrorProps | null
   actionsMenu: SessionActionsMenuProps
   canMoveWorkspace: boolean
   canDelete: boolean
@@ -472,10 +472,10 @@ Emits:
 
 - `botster.session.select` with `{ sessionId, sessionUuid }`
 
-### `HostedPreviewIndicator`
+### `SessionActionIndicator`
 
 ```ts
-type HostedPreviewIndicatorProps = {
+type SessionActionIndicatorProps = {
   sessionId: string
   sessionUuid: string
   hasForwardedPort: boolean
@@ -488,12 +488,12 @@ type HostedPreviewIndicatorProps = {
 
 Emits:
 
-- `botster.session.preview.open` with `{ sessionId, sessionUuid, url }` when `status === "running"` and `url` is present
+- `botster.url.open` with `{ sessionId, sessionUuid, url }` when `status === "running"` and `url` is present
 
-### `HostedPreviewError`
+### `SessionActionError`
 
 ```ts
-type HostedPreviewErrorProps = {
+type SessionActionErrorProps = {
   sessionId: string
   sessionUuid: string
   visible: boolean
@@ -516,7 +516,7 @@ type SessionActionsMenuProps = {
   hasForwardedPort: boolean
   previewStatus: "inactive" | "starting" | "running" | "error" | "unavailable"
   previewUrl?: string | null
-  previewError?: string | null
+  actionError?: string | null
   canMoveWorkspace: boolean
   canDelete: boolean
   inWorktree?: boolean | null
@@ -525,8 +525,8 @@ type SessionActionsMenuProps = {
 
 Emits:
 
-- `botster.session.preview.toggle` with `{ sessionId, sessionUuid }`
-- `botster.session.preview.open` with `{ sessionId, sessionUuid, url }`
+- `botster.session.action.execute` with `{ sessionId, sessionUuid }`
+- `botster.url.open` with `{ sessionId, sessionUuid, url }`
 - `botster.session.move.request` with `{ sessionId, sessionUuid }`
 - `botster.session.delete.request` with `{ sessionId, sessionUuid, inWorktree }`
 
@@ -539,8 +539,8 @@ These action ids are the only user-intent events the phase-1 composites may emit
 | `botster.workspace.toggle` | `{ workspaceId }` | local UI state only |
 | `botster.workspace.rename.request` | `{ workspaceId, currentName }` | open rename UI, then call `hub.renameWorkspace` |
 | `botster.session.select` | `{ sessionId, sessionUuid }` | navigate/select, then call `hub.selectAgent` |
-| `botster.session.preview.toggle` | `{ sessionId, sessionUuid }` | call `hub.toggleHostedPreview(sessionUuid)` |
-| `botster.session.preview.open` | `{ sessionId, sessionUuid, url }` | web client navigation only |
+| `botster.session.action.execute` | `{ sessionUuid, actionId, params? }` | call `hub.executeSessionAction(sessionUuid, actionId, params)` |
+| `botster.url.open` | `{ sessionId, sessionUuid, url }` | web client navigation only |
 | `botster.session.move.request` | `{ sessionId, sessionUuid }` | open move UI, then call `hub.moveAgentWorkspace` |
 | `botster.session.delete.request` | `{ sessionId, sessionUuid, inWorktree }` | open delete UI, then call `hub.deleteAgent` |
 
@@ -568,7 +568,7 @@ Any variant beyond those two is out of scope for `current`.
 - session naming fallback rules
 - activity indicator derivation
 - accessory-vs-agent affordances
-- hosted preview state mapping
+- session action state mapping
 - action availability rules
 
 That behavior is still moving. Freezing it into the Lua contract before the React island lands would lock Botster into premature APIs. The public `current` Lua surface should therefore stop at primitives, while phase 1 uses internal composites as the migration bridge.
@@ -577,7 +577,7 @@ That behavior is still moving. Freezing it into the Lua contract before the Reac
 
 - the agent/workspace UI no longer depends on cloned HTML templates for row rendering
 - sidebar and main panel share the same row/group logic with density variants
-- hosted preview indicator, preview error state, and actions menu render from normalized state
+- session action indicator, action error state, and actions menu render from normalized state
 - hub transport remains structured state, not HTML
 - Rails continues to own the page shell and primitive registry
 - the action vocabulary above is sufficient to reproduce the current session/workspace behavior

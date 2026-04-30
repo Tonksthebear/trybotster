@@ -154,7 +154,7 @@ fn hidden_system_sessions_do_not_block_delete_worktree_action() {
                 in_worktree = true,
                 metadata = {
                   system_session = true,
-                  system_kind = "hosted_preview_connector",
+                  system_kind = "plugin_connector",
                 },
                 system_session = true,
               },

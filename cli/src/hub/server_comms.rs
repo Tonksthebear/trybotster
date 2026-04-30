@@ -1214,7 +1214,7 @@ impl Hub {
                             }
                         });
                     }
-                    HubRequest::ProbePreviewDns {
+                    HubRequest::ProbeUrlReady {
                         connector_session_uuid,
                         parent_session_uuid,
                         url,
@@ -1222,7 +1222,7 @@ impl Hub {
                         timeout_secs,
                     } => {
                         log::info!(
-                            "[HostedPreview] Probe start connector={} parent={} url={} hostname={} timeout_secs={:.1}",
+                            "[UrlReadyProbe] Probe start connector={} parent={} url={} hostname={} timeout_secs={:.1}",
                             connector_session_uuid,
                             parent_session_uuid,
                             url,
@@ -1231,7 +1231,7 @@ impl Hub {
                         );
                         let event_tx = self.hub_event_tx.clone();
                         self.tokio_runtime.spawn(async move {
-                            let result = crate::hosted_preview::wait_until_dns_ready(
+                            let result = crate::plugin_helpers::wait_until_url_ready(
                                 &hostname,
                                 &url,
                                 std::time::Duration::from_secs_f64(timeout_secs.max(0.1)),
@@ -1240,7 +1240,7 @@ impl Hub {
                             let (ready, error) = match result {
                                 Ok(()) => {
                                     log::info!(
-                                        "[HostedPreview] Probe success connector={} parent={} url={}",
+                                        "[UrlReadyProbe] Probe success connector={} parent={} url={}",
                                         connector_session_uuid,
                                         parent_session_uuid,
                                         url
@@ -1249,7 +1249,7 @@ impl Hub {
                                 }
                                 Err(e) => {
                                     log::warn!(
-                                        "[HostedPreview] Probe failure connector={} parent={} url={} reason={}",
+                                        "[UrlReadyProbe] Probe failure connector={} parent={} url={} reason={}",
                                         connector_session_uuid,
                                         parent_session_uuid,
                                         url,
@@ -1259,7 +1259,7 @@ impl Hub {
                                 }
                             };
                             let _ = event_tx.send(
-                                crate::hub::events::HubEvent::PreviewDnsReady {
+                                crate::hub::events::HubEvent::UrlProbeReady {
                                     connector_session_uuid,
                                     parent_session_uuid,
                                     url,
@@ -1267,6 +1267,67 @@ impl Hub {
                                     error,
                                 },
                             );
+                        });
+                    }
+                    HubRequest::PreparePluginCommand {
+                        request_id,
+                        command,
+                        config_path,
+                        config_contents,
+                        context,
+                    } => {
+                        let event_tx = self.hub_event_tx.clone();
+                        self.tokio_runtime.spawn(async move {
+                            let request_id_for_task = request_id.clone();
+                            let config_path_for_task = config_path.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                let config_path_ref =
+                                    config_path_for_task.as_deref().map(std::path::Path::new);
+                                crate::plugin_helpers::prepare_plugin_command(
+                                    &command,
+                                    config_path_ref,
+                                    config_contents.as_deref(),
+                                )
+                            })
+                            .await;
+
+                            let event = match result {
+                                Ok(Ok(prepared)) => {
+                                    crate::hub::events::HubEvent::PluginCommandPrepared {
+                                        request_id: request_id_for_task,
+                                        command: Some(
+                                            prepared.command.to_string_lossy().into_owned(),
+                                        ),
+                                        config_path: prepared
+                                            .config_path
+                                            .map(|path| path.to_string_lossy().into_owned()),
+                                        context,
+                                        error_kind: None,
+                                        error: None,
+                                    }
+                                }
+                                Ok(Err(error)) => {
+                                    crate::hub::events::HubEvent::PluginCommandPrepared {
+                                        request_id: request_id_for_task,
+                                        command: None,
+                                        config_path,
+                                        context,
+                                        error_kind: Some(error.kind.as_str().to_string()),
+                                        error: Some(error.to_string()),
+                                    }
+                                }
+                                Err(error) => crate::hub::events::HubEvent::PluginCommandPrepared {
+                                    request_id: request_id_for_task,
+                                    command: None,
+                                    config_path,
+                                    context,
+                                    error_kind: Some("task_failed".to_string()),
+                                    error: Some(format!(
+                                        "Plugin command preparation task failed: {error}"
+                                    )),
+                                },
+                            };
+                            let _ = event_tx.send(event);
                         });
                     }
                     HubRequest::HandleSignalingMessage { message } => {
@@ -1312,6 +1373,7 @@ impl Hub {
                     WorktreeRequest::Create {
                         label,
                         branch,
+                        repo_root,
                         metadata,
                         prompt,
                         agent_name,
@@ -1327,11 +1389,29 @@ impl Hub {
                         let result_tx = self.worktree_result_tx.clone();
                         let branch_clone = branch.clone();
                         let label_clone = label.clone();
+                        let repo_root_clone = repo_root.clone();
 
                         self.tokio_runtime.spawn(async move {
                             let result = tokio::task::spawn_blocking(move || {
                                 let manager = WorktreeManager::new(worktree_base);
-                                manager.create_worktree_with_branch(&branch_clone)
+                                if let Some(repo_root) = repo_root_clone {
+                                    let repo_path = std::path::Path::new(&repo_root);
+                                    if crate::lua::primitives::worktree::branch_is_repo_head(
+                                        repo_path,
+                                        &branch_clone,
+                                    ) {
+                                        Ok(repo_path.to_path_buf())
+                                    } else if let Some(path) = manager
+                                        .find_worktree_for_branch(repo_path, &branch_clone)?
+                                    {
+                                        Ok(path)
+                                    } else {
+                                        manager
+                                            .create_worktree_for_repo_root(repo_path, &branch_clone)
+                                    }
+                                } else {
+                                    manager.create_worktree_with_branch(&branch_clone)
+                                }
                             })
                             .await;
 
@@ -1345,6 +1425,7 @@ impl Hub {
                                 .try_send(WorktreeCreateResult {
                                     label: label_clone,
                                     branch,
+                                    repo_root,
                                     result: outcome,
                                     metadata,
                                     prompt,
@@ -1410,7 +1491,7 @@ impl Hub {
                     log::error!("[Worktree] Async deletion failed for {}: {}", branch, e);
                 }
             },
-            HubEvent::PreviewDnsReady {
+            HubEvent::UrlProbeReady {
                 connector_session_uuid,
                 parent_session_uuid,
                 url,
@@ -1424,8 +1505,31 @@ impl Hub {
                     "ready": ready,
                     "error": error,
                 });
-                if let Err(e) = self.lua.fire_json_event("preview_dns_ready", &payload) {
-                    log::error!("Failed to fire preview_dns_ready: {e}");
+                if let Err(e) = self.lua.fire_json_event("url_probe_ready", &payload) {
+                    log::error!("Failed to fire url_probe_ready: {e}");
+                }
+            }
+            HubEvent::PluginCommandPrepared {
+                request_id,
+                command,
+                config_path,
+                context,
+                error_kind,
+                error,
+            } => {
+                let payload = serde_json::json!({
+                    "request_id": request_id,
+                    "command": command,
+                    "config_path": config_path,
+                    "context": context,
+                    "error_kind": error_kind,
+                    "error": error,
+                });
+                if let Err(e) = self
+                    .lua
+                    .fire_json_event("plugin_command_prepared", &payload)
+                {
+                    log::error!("Failed to fire plugin_command_prepared: {e}");
                 }
             }
             HubEvent::MessageDelivered { message_len } => {

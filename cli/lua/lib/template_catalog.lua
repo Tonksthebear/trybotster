@@ -109,6 +109,31 @@ local function read_cache()
     return payload.templates, payload
 end
 
+local function template_id_set(templates)
+    local ids = {}
+    for _, template in ipairs(templates or {}) do
+        if type(template) == "table" and type(template.id) == "string" and template.id ~= "" then
+            ids[template.id] = true
+        end
+    end
+    return ids
+end
+
+local function sorted_stale_template_ids(previous_templates, refreshed_templates)
+    local refreshed_ids = template_id_set(refreshed_templates)
+    local stale_ids = {}
+    local seen_stale = {}
+    for _, template in ipairs(previous_templates or {}) do
+        local id = type(template) == "table" and template.id or nil
+        if type(id) == "string" and id ~= "" and not refreshed_ids[id] and not seen_stale[id] then
+            seen_stale[id] = true
+            stale_ids[#stale_ids + 1] = id
+        end
+    end
+    table.sort(stale_ids)
+    return stale_ids
+end
+
 local function is_template_file(relative)
     return TEMPLATE_PATTERN[extname(relative)] == true
 end
@@ -301,13 +326,15 @@ function M.refresh_async(opts)
     refresh_in_flight = true
     local url = opts.url or M.default_remote_url()
     local templates = {}
+    local previous_templates = read_cache() or {}
     local visited = {}
     local pending = 0
     local failed = false
     local completed = false
+    local dispatching = 0
 
     local function finish_if_done()
-        if pending > 0 or failed or completed then return end
+        if pending > 0 or dispatching > 0 or failed or completed then return end
         completed = true
         refresh_in_flight = false
         sort_templates(templates)
@@ -315,6 +342,9 @@ function M.refresh_async(opts)
 
         local EntityModel = require("lib.entity_model")
         for _, template in ipairs(templates) do EntityModel.upsert_template(template) end
+        for _, id in ipairs(sorted_stale_template_ids(previous_templates, templates)) do
+            EntityModel.remove_template(id)
+        end
     end
 
     local function fail(message)
@@ -340,7 +370,9 @@ function M.refresh_async(opts)
                 fail(err or (resp and resp.status) or "request failed")
                 return
             end
+            dispatching = dispatching + 1
             callback(resp.body or "")
+            dispatching = dispatching - 1
             finish_if_done()
         end)
     end

@@ -95,6 +95,37 @@ Event-driven primitives:
 - `update`
 - `push`
 
+## Session Actions And Blocking Prep
+
+Use `lib.session_actions` for plugin-owned per-session affordances. Core
+publishes action descriptors as `session_action` entities, and every client
+invokes them through `execute_session_action`.
+
+Action handlers run on the hub command path. They should validate, update
+plugin-owned state, queue work, and return promptly. Do not resolve executables
+or write generated config files directly in an action handler. Use
+`hub.prepare_plugin_command({
+  request_id,
+  command,
+  config_path?,
+  config_contents?,
+  context?,
+})` to offload PATH/filesystem preparation to the blocking worker pool, then
+continue from `events.on("plugin_command_prepared", ...)`.
+
+Completion events include:
+
+- `request_id` — plugin token used to ignore stale completions.
+- `command` and `config_path` on success.
+- `context` — the opaque table passed by the plugin.
+- `error_kind` — `command_blank`, `command_missing`,
+  `config_write_failed`, or `task_failed`.
+- `error` — human-readable message.
+
+Store the active request token in plugin-owned state and drop completion events
+whose `request_id` is no longer current. This covers disable/retry/reload races
+without adding provider-specific behavior to core.
+
 Hook observers:
 
 - `agent_created`
