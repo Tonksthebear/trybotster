@@ -29,6 +29,18 @@ If either prerequisite drops while WebRTC is disconnected, the middle badge
 should stay disconnected. When both prerequisites become true again, WebRTC
 should retry automatically.
 
+## Route Selection
+
+On `/hubs/:hubId/*` routes, the URL hub id is authoritative. Refreshing or
+deep-linking to a hub URL must select and connect that hub even when
+`localStorage` has no last-used hub or has a different one. The last-used hub is
+only a convenience for `/hubs` with no id in the URL.
+
+Route-owned consumers that require the shared hub session should use
+`waitForHub(hubId, null)` for a durable wait. The default `waitForHub(hubId)`
+and bounded `waitForHub(hubId, ms)` forms are for optional consumers that can
+settle with no hub.
+
 ## Implementation Notes
 
 - [connection_status_controller.js](../app/javascript/controllers/connection_status_controller.js) renders the badges.

@@ -22,6 +22,7 @@ const callerHub = new Map() // callerId → hubId
  * route-registry seed/follow loop.
  */
 export function connect(hubId, _options = {}) {
+  hubId = normalizeHubId(hubId)
   const callerId = nextCallerId++
   callerHub.set(callerId, hubId)
 
@@ -51,6 +52,7 @@ async function doConnect(hubId, callerId) {
     hub = await HubManager.acquire(hubId)
   } catch (err) {
     callerHub.delete(callerId)
+    notifyHubUnavailable(hubId)
     throw err
   }
 
@@ -125,15 +127,18 @@ function doDisconnect(hubId, callerId) {
 }
 
 function currentHub(hubId) {
-  return hubState.get(hubId)?.hub || null
+  return hubState.get(normalizeHubId(hubId))?.hub || null
 }
 
+// Route-owned leaves that cannot operate without the hub should pass
+// `timeoutMs = null` for a durable wait. Default/bounded waits are for optional
+// consumers that can tolerate settling with no hub.
 export function waitForHub(hubId, timeoutMs = 10000) {
   if (!hubId) return Promise.resolve(null)
-  const existing = currentHub(hubId)
+  const key = String(hubId)
+  const existing = currentHub(key)
   if (existing) return Promise.resolve(existing)
 
-  const key = String(hubId)
   return new Promise((resolve) => {
     let settled = false
     let timer = null
@@ -151,7 +156,9 @@ export function waitForHub(hubId, timeoutMs = 10000) {
     if (!hubWaiters.has(key)) hubWaiters.set(key, new Set())
     hubWaiters.get(key).add(finish)
 
-    timer = window.setTimeout(() => finish(currentHub(key)), timeoutMs)
+    if (timeoutMs != null) {
+      timer = window.setTimeout(() => finish(currentHub(key)), timeoutMs)
+    }
   })
 }
 
@@ -176,10 +183,22 @@ function resolveHubManager() {
   return HubManager
 }
 
+function normalizeHubId(hubId) {
+  return String(hubId)
+}
+
 function notifyHubAvailable(hubId, hub) {
-  const key = String(hubId)
+  const key = normalizeHubId(hubId)
   const waiters = hubWaiters.get(key)
   if (!waiters) return
   hubWaiters.delete(key)
   for (const callback of waiters) callback(hub)
+}
+
+function notifyHubUnavailable(hubId) {
+  const key = normalizeHubId(hubId)
+  const waiters = hubWaiters.get(key)
+  if (!waiters) return
+  hubWaiters.delete(key)
+  for (const callback of waiters) callback(null)
 }

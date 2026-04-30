@@ -4,7 +4,6 @@ import {
   Routes,
   Route,
   Outlet,
-  useParams,
   useLocation,
   useNavigate,
   useSearchParams,
@@ -222,21 +221,15 @@ function PluginSidebarSection({ hubId, activeSidebar, onBack }) {
 }
 
 /**
- * Syncs route :hubId param into the hub store.
  * Renders inside /hubs/:hubId routes.
  */
 function HubRouteSync() {
-  const { hubId } = useParams()
-  const selectedHubId = useHubStore((s) => s.selectedHubId)
-  const selectHub = useHubStore((s) => s.selectHub)
-
-  useEffect(() => {
-    if (hubId && String(hubId) !== String(selectedHubId)) {
-      selectHub(hubId)
-    }
-  }, [hubId, selectedHubId, selectHub])
-
   return <Outlet />
+}
+
+function hubIdFromPath(pathname) {
+  const match = pathname.match(/^\/hubs\/([^/]+)/)
+  return match ? decodeURIComponent(match[1]) : null
 }
 
 /**
@@ -261,6 +254,7 @@ function HubShell() {
   const disconnectHub = useHubStore((s) => s.disconnectHub)
   const getLastHubId = useHubStore((s) => s.getLastHubId)
   const openNewSession = useDialogStore((s) => s.openNewSession)
+  const routeHubId = hubIdFromPath(location.pathname)
 
   // Fetch hub list on mount
   useEffect(() => {
@@ -334,16 +328,22 @@ function HubShell() {
     }
   }, [isBooting, pendingFingerprint, fetchHubList, selectHub, navigate])
 
+  // On /hubs/:hubId/* routes, the URL is authoritative. This also repairs
+  // StrictMode/effect-cleanup clears while the route is still mounted.
+  useEffect(() => {
+    if (routeHubId && String(routeHubId) !== String(selectedHubId)) {
+      selectHub(routeHubId)
+    }
+  }, [routeHubId, selectedHubId, selectHub])
+
   // Auto-select last-used hub when at /hubs (no hub in URL)
   useEffect(() => {
     if (hubListLoading) return
     if (isBooting) return // booting effect owns selection until the new hub registers
 
     const hubList = useHubStore.getState().hubList
-    const isHubRoute = /^\/hubs\/[^/]/.test(location.pathname)
-
     // Only auto-select when at /hubs with no hub in URL
-    if (isHubRoute) return
+    if (routeHubId) return
 
     const lastId = getLastHubId()
     const target = lastId && hubList.find((h) => String(h.id) === String(lastId))
@@ -355,7 +355,7 @@ function HubShell() {
       selectHub(hubList[0].id)
       navigate(`/hubs/${hubList[0].id}`, { replace: true })
     }
-  }, [hubListLoading, isBooting, location.pathname, navigate, selectHub, getLastHubId])
+  }, [hubListLoading, isBooting, routeHubId, navigate, selectHub, getLastHubId])
 
   // Keep modal-bridge in sync
   useEffect(() => {
