@@ -63,6 +63,57 @@ fn github_template_catalog_entry_is_a_multi_file_plugin() {
 }
 
 #[test]
+fn project_pipelines_template_catalog_entry_is_a_multi_file_plugin() {
+    let catalog_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates");
+    let catalog_root = catalog_root.to_str().unwrap();
+
+    let lua = create_lua_vm();
+
+    let files: Vec<String> = lua
+        .load(format!(
+            r#"
+            local catalog = require("lib.template_catalog")
+            local templates = catalog.list({{ source_root = "{catalog_root}" }})
+            local out = {{}}
+            for _, template in ipairs(templates) do
+              if template.dest:match("^plugins/project%-pipelines/") then
+                out[#out + 1] = template.dest
+              end
+            end
+            table.sort(out)
+            return out
+            "#
+        ))
+        .eval()
+        .expect("template catalog should load Project Pipelines plugin template files");
+
+    assert_eq!(
+        files,
+        vec![
+            "plugins/project-pipelines/README.md",
+            "plugins/project-pipelines/init.lua",
+            "plugins/project-pipelines/project_pipelines/db.lua",
+            "plugins/project-pipelines/project_pipelines/engine.lua",
+            "plugins/project-pipelines/project_pipelines/mcp.lua",
+            "plugins/project-pipelines/project_pipelines/repo.lua",
+            "plugins/project-pipelines/project_pipelines/util.lua",
+            "plugins/project-pipelines/project_pipelines/web/actions.lua",
+            "plugins/project-pipelines/project_pipelines/web/screens/home.lua",
+            "plugins/project-pipelines/project_pipelines/web/screens/new.lua",
+            "plugins/project-pipelines/project_pipelines/web/screens/pipelines.lua",
+            "plugins/project-pipelines/project_pipelines/web/screens/project.lua",
+            "plugins/project-pipelines/project_pipelines/web/screens/run.lua",
+            "plugins/project-pipelines/project_pipelines/web/screens/ticket.lua",
+            "plugins/project-pipelines/project_pipelines/web/surface.lua",
+            "plugins/project-pipelines/project_pipelines/web/ui.lua",
+        ]
+    );
+}
+
+#[test]
 fn github_event_routing_template_uses_internal_client_ingress() {
     let template = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -15,6 +15,7 @@
 --
 -- Tools:
 --   post_message     - post structured message to a session inbox (supports agent_label)
+--   notify_session   - send attention-only PTY notification without inbox state
 --   receive_messages - drain your inbox of pending messages
 
 local Hub = require("lib.hub")
@@ -42,7 +43,7 @@ mcp.tool("post_message", {
             },
             msg_type = {
                 type = "string",
-                description = "Message type: 'message' (default), 'task', 'result', 'query'. Use 'notify' to write directly to PTY instead of inbox.",
+                description = "Message type: 'message' (default), 'task', 'result', or 'query'. Attention-only wakeups use notify_session instead.",
             },
             reply_to = {
                 type = "string",
@@ -91,6 +92,75 @@ mcp.tool("post_message", {
             expires_in    = params.expires_in,
             from_agent_id = sender_key,
             from_label    = sender_display,
+        })
+    end)
+    return json.encode(result)
+end)
+
+mcp.tool("notify_session", {
+    description = "Send an attention-only notification to a session without writing a generic inbox message. Use this when durable state lives in a plugin-specific tool or surface.",
+    input_schema = {
+        type = "object",
+        properties = {
+            hub_id = {
+                type = "string",
+                description = "Hub ID where the session lives. Omit for local hub.",
+            },
+            session_uuid = {
+                type = "string",
+                description = "Session UUID.",
+            },
+            agent_label = {
+                type = "string",
+                description = "Agent label (alternative to session_uuid). Resolved by label lookup on the local hub.",
+            },
+            source = {
+                type = "string",
+                description = "Notification source shown in brackets.",
+            },
+            title = {
+                type = "string",
+                description = "Short notification title.",
+            },
+            body = {
+                type = "string",
+                description = "Optional notification body.",
+            },
+            hint = {
+                type = "string",
+                description = "Optional action hint shown on the notification line.",
+            },
+            action = {
+                description = "Optional structured action hint, for example {kind='mcp_tool', name='tool_name', params={...}}.",
+            },
+        },
+        required = { "title" },
+    },
+}, function(params, context)
+    local target_session_uuid = params.session_uuid
+    if not target_session_uuid and params.agent_label then
+        for _, agent in ipairs(Agent.list()) do
+            if agent.label == params.agent_label then
+                target_session_uuid = agent.session_uuid
+                break
+            end
+        end
+        if not target_session_uuid then
+            return json.encode({ error = string.format("No agent found with label '%s'", params.agent_label) })
+        end
+    end
+    if not target_session_uuid then
+        return json.encode({ error = "Either session_uuid or agent_label is required" })
+    end
+
+    local result = Hub.call_safely(params.hub_id, function()
+        return Hub.get(params.hub_id):notify(target_session_uuid, {
+            source = params.source or "botster",
+            title = params.title,
+            body = params.body,
+            hint = params.hint,
+            action = params.action,
+            session = params.session,
         })
     end)
     return json.encode(result)
