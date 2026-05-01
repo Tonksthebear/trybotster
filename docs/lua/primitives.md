@@ -224,6 +224,62 @@ generic `execute_session_action` hub command. See
 [`docs/lua/session-actions.md`](session-actions.md) for the descriptor shape and
 registration contract.
 
+## Plugin-Owned Entities
+
+Plugins publish durable dynamic state through `lib.entity_broadcast`. This is
+the only shared model-state path for plugin UI; do not add browser-only refresh
+commands or plugin-specific list snapshots. `ui_tree_snapshot` frames describe
+presentation, while entity frames carry the data that both browser and TUI
+stores consume.
+
+Plugin entity names must be `<plugin>.<type>`, and the `<plugin>` prefix must
+match the plugin that registers the type. Built-in names such as `session`,
+`workspace`, `spawn_target`, `worktree`, `hub`, `connection_code`, `template`,
+and `session_action` are reserved. Plugin records must use `id` as a non-empty
+string id field so generic browser and TUI entity stores can consume them
+without per-plugin wiring.
+
+```lua
+local EB = require("lib.entity_broadcast")
+
+local boards = {
+  { id = "board-1", name = "Roadmap", status = "active" },
+}
+
+EB.register("kanban.board", {
+  id_field = "id",
+  all = function()
+    return boards
+  end,
+})
+
+EB.upsert("kanban.board", {
+  id = "board-2",
+  name = "Triage",
+  status = "active",
+})
+
+EB.patch("kanban.board", "board-2", {
+  status = "archived",
+  counts = { open = 0 },
+})
+
+EB.remove("kanban.board", "board-2")
+```
+
+When registering outside plugin load tests or helper modules, pass
+`owner_plugin = "kanban"`. During normal plugin loading, Botster supplies the
+owner context from the plugin manifest/display name; repo-sourced loader keys
+include paths and are not valid wire namespaces. Hot reload may re-register the
+same type from the same plugin; another plugin cannot take ownership of that
+entity type.
+
+Snapshot `all()` callbacks must return an array of entity tables. Records
+without a string `id` are logged and skipped. Patches merge only top-level
+fields; nested tables replace prior nested values, so send the full nested value
+you want clients to keep. Broadcaster errors are logged and isolated from the
+mutator path.
+
 ## Event-Driven Primitives
 
 ### `webrtc`
