@@ -185,6 +185,8 @@ function M.context_for(run_id, session_uuid)
         open_questions = repo.ticket_questions(run.ticket_id, "open"),
         questions = repo.ticket_questions(run.ticket_id),
         question_answers = repo.question_answers({ run_id = run.id, asked_by_session_uuid = session_uuid }),
+        dependencies = repo.ticket_dependencies(run.ticket_id),
+        blocking_dependencies = repo.blocking_ticket_dependencies(run.ticket_id),
         recent_events = repo.run_events(run.id, 25),
         assignment = assignment,
     }
@@ -210,7 +212,7 @@ local function spawn_step_agent(run, step)
         "If you need human help, call project_pipelines_ask_human with a concise blocking question, then wait for a Project Pipelines notification and call project_pipelines_receive_question_answers.",
         "If you need another agent's opinion, call project_pipelines_ask_agent with the specific question and context you want reviewed, then wait for a Project Pipelines notification and call project_pipelines_receive_question_answers.",
         "When work is ready for advancement, submit the required gate evidence with project_pipelines_submit_gate, then call project_pipelines_request_step_advance.",
-        "If you are reviewing, call project_pipelines_submit_review with findings or approval.",
+        "If you are reviewing, check correctness, regressions, architecture fit, missing tests, documentation gaps, dead code, deprecated code paths, and unwired implementation. Do not accept pre-existing failures as a blanket excuse; require exact evidence that a failure is unrelated or send the work back. Call project_pipelines_submit_review with findings or approval.",
     }, "\n\n")
 
     if existing and existing.agent_session_uuid and Agent.get(existing.agent_session_uuid) then
@@ -224,6 +226,16 @@ local function spawn_step_agent(run, step)
                     ticket_id = run.ticket_id,
                     step_id = step.id,
                     instructions = role_prompt,
+                },
+            })
+            Hub.get():notify(existing.agent_session_uuid, {
+                source = OWNER,
+                title = "Pipeline step returned",
+                body = "Ticket " .. tostring(ticket and ticket.title or run.ticket_id) .. " is back at " .. tostring(step.name) .. ".",
+                action = {
+                    kind = "mcp_tool",
+                    name = "project_pipelines_current_context",
+                    params = { run_id = run.id },
                 },
             })
         end)
@@ -429,6 +441,18 @@ function M.request_merge(params, context)
     if not run or run.status ~= "done" then
         error("ticket must have a completed latest run before merge")
     end
+    for _, event in ipairs(repo.ticket_events(ticket.id, "ticket.merge_requested", 5)) do
+        local payload = util.decode(event.payload, {})
+        if payload.session_uuid and Agent.get(payload.session_uuid) then
+            return {
+                ticket = ticket,
+                run = run,
+                agent = Agent.get(payload.session_uuid):info(),
+                request_id = payload.request_id,
+                status = "already_requested",
+            }
+        end
+    end
 
     local prompt = table.concat({
         "You are the Project Pipelines merge agent.",
@@ -438,9 +462,9 @@ function M.request_merge(params, context)
         "Use the repo's conventions for merge strategy.",
         "If this repo expects a PR instead of a direct merge, create or update the PR only through the Botster MCP PR tools. Do not use gh, hub, direct GitHub API calls, browser automation, or manual web UI actions for PR creation or PR updates.",
         "If the Botster MCP PR tools are unavailable, ask a human question and wait instead of creating the PR another way.",
-        "If there are conflicts or verification failures, do not merge. Add an artifact or question explaining the blocker.",
-        "After a successful merge or PR creation, add a project_pipelines_add_artifact summary.",
-        "Close the ticket only when the merge process is genuinely complete by calling project_pipelines_close_ticket with merge_confirmed=true.",
+        "If there are conflicts, dead/deprecated code, unwired implementation, or verification failures, do not merge. Add an artifact or question explaining the blocker. Do not accept pre-existing failures unless you prove with exact evidence they are unrelated to this ticket.",
+        "After a successful merge or PR creation, add a project_pipelines_add_artifact summary with the merge commit or PR URL.",
+        "Close the ticket only when the merge process is genuinely complete by calling project_pipelines_close_ticket with merge_confirmed=true and include merge_commit, pr_url, or merge_summary when available.",
     }, "\n\n")
 
     local request_id = string.format("%s:%s:merge:agent", OWNER, ticket.id)
@@ -504,10 +528,30 @@ function M.close_ticket(ticket_id, attrs)
         end
     end
 
+    if latest_run and attrs.merge_confirmed == true then
+        local summary = attrs.merge_summary or attrs.summary or "Merge confirmed before ticket closure."
+        local payload = attrs.merge_payload or {
+            merge_confirmed = true,
+            merge_commit = attrs.merge_commit,
+            pr_url = attrs.pr_url,
+            closed_by_session_uuid = attrs.closed_by_session_uuid,
+        }
+        repo.add_artifact{
+            run_id = latest_run.id,
+            kind = attrs.merge_kind or "merge",
+            uri = attrs.pr_url,
+            summary = summary,
+            payload = payload,
+        }
+    end
+
     local updated = repo.close_ticket(ticket_id, {
         merge_confirmed = attrs.merge_confirmed == true,
         closed_sessions = closed_sessions,
         errors = errors,
+        merge_commit = attrs.merge_commit,
+        pr_url = attrs.pr_url,
+        merge_summary = attrs.merge_summary or attrs.summary,
     })
     refresh_surfaces()
     return { ticket = updated, closed_sessions = closed_sessions, errors = errors }
@@ -625,6 +669,14 @@ function M.start_run(params)
     end
     if util.is_blank(ticket.target_id) then
         error("ticket target_id is required before starting a run")
+    end
+    local blockers = repo.blocking_ticket_dependencies(params.ticket_id)
+    if #blockers > 0 then
+        local names = {}
+        for _, blocker in ipairs(blockers) do
+            names[#names + 1] = (blocker.depends_on_title or blocker.depends_on_ticket_id) .. " (" .. tostring(blocker.depends_on_status or "open") .. ")"
+        end
+        error("ticket dependencies must close before starting a run: " .. table.concat(names, ", "))
     end
     local pipeline = repo.get_pipeline(pipeline_id)
     if not pipeline then

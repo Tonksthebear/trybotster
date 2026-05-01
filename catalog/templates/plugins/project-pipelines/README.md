@@ -133,6 +133,10 @@ Review agents leave findings through `project_pipelines_submit_review`. Blocker 
 
 Agents ask for help through project-pipelines tools, not the generic Botster inbox. `project_pipelines_ask_human` creates a durable human question visible in the sidebar and ticket page. `project_pipelines_ask_agent` creates the same durable question and spawns an advisor agent. Answers are read with `project_pipelines_receive_question_answers` or from `project_pipelines_current_context`; question answers wake the asking session with a Project Pipelines notification, not a generic `receive_messages()` inbox doorbell.
 
+Review agents must reject dead code, deprecated code paths, unwired implementation, missing focused tests, and broad "pre-existing failure" excuses. If a failure is not fixed, the reviewer should require exact evidence that it is unrelated to the ticket.
+
+When a run returns to an existing step agent, Project Pipelines sends both a structured task message and a plugin notification pointing the agent back to `project_pipelines_current_context`.
+
 ## GUI
 
 The `Pipelines` surface shows tickets, runs, pipeline definitions, selected agent per step, reviews, findings, artifacts, recent events, questions, and plugin-owned sessions. When any question is open, the workspace plugin nav entry for Pipelines shows a notification marker.
@@ -150,6 +154,10 @@ Pipeline edits mutate the shared pipeline definition. They affect future runs, n
 The plugin sidebar is ticket-first. It intentionally does not show active agents; terminals are reached through the ticket page so the user stays oriented around the work item.
 
 Ticket closure closes every Botster session associated with every run for that ticket without deleting worktrees. Step completion does not close agents; they remain available for inspection and for future prompts if a run returns to their step.
+
+Merge completion should leave a durable merge artifact on the ticket. Merge agents should include `merge_commit`, `pr_url`, or `merge_summary` when calling `project_pipelines_close_ticket` with `merge_confirmed=true`.
+
+Tickets can optionally depend on other tickets. A ticket with open dependencies cannot start a pipeline run until each dependency ticket is closed. Project tickets remain visible from the project page; the sidebar ticket list shows standalone tickets only, plus notification badges when their associated sessions need attention.
 
 ## Persistence And Evolution
 

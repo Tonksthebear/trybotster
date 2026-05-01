@@ -235,6 +235,39 @@ function M.register()
         return action.HANDLED
     end)
 
+    action.on("project_pipelines.update_dependency_draft", "project_pipelines.update_dependency_draft", function(envelope, ctx)
+        local payload = value_payload(envelope)
+        if payload.ticket_id then
+            current_draft(ctx)["dependency_" .. payload.ticket_id] = payload.value or ""
+            current_feedback(ctx).dependency_error = nil
+        end
+        return action.HANDLED
+    end)
+
+    action.on("project_pipelines.add_ticket_dependency", "project_pipelines.add_ticket_dependency", function(envelope, ctx)
+        local payload = value_payload(envelope)
+        if payload.ticket_id then
+            local depends_on_ticket_id = current_draft(ctx)["dependency_" .. payload.ticket_id] or payload.depends_on_ticket_id
+            local ok, result = pcall(repo.add_ticket_dependency, payload.ticket_id, depends_on_ticket_id)
+            current_feedback(ctx).dependency_error = ok and nil or tostring(result)
+            if ok then
+                current_draft(ctx)["dependency_" .. payload.ticket_id] = nil
+            end
+            refresh(ctx)
+        end
+        return action.HANDLED
+    end)
+
+    action.on("project_pipelines.remove_ticket_dependency", "project_pipelines.remove_ticket_dependency", function(envelope, ctx)
+        local payload = value_payload(envelope)
+        if payload.dependency_id then
+            local ok, result = pcall(repo.remove_ticket_dependency, payload.dependency_id)
+            current_feedback(ctx).dependency_error = ok and nil or tostring(result)
+            refresh(ctx)
+        end
+        return action.HANDLED
+    end)
+
     action.on("project_pipelines.request_merge", "project_pipelines.request_merge", function(envelope, ctx)
         local payload = value_payload(envelope)
         if payload.ticket_id then

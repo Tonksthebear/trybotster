@@ -396,6 +396,75 @@ local function question_rows(ticket, ctx)
     return children
 end
 
+local function dependency_rows(ticket, ctx)
+    local children = {}
+    local dependencies = repo.ticket_dependencies(ticket.id)
+    for _, dependency in ipairs(dependencies) do
+        table.insert(children, view.panel{
+            view.row{
+                view.badge(dependency.depends_on_status or "missing", dependency.depends_on_status == "closed" and "success" or "danger"),
+                ui.text{
+                    text = dependency.depends_on_title or dependency.depends_on_ticket_id,
+                    size = "sm",
+                    weight = "semibold",
+                },
+                ui.button{
+                    label = "Remove",
+                    icon = "x-mark",
+                    variant = "ghost",
+                    action = ui.action("project_pipelines.remove_ticket_dependency", { dependency_id = dependency.id }),
+                },
+            },
+        })
+    end
+
+    if ticket.status ~= "closed" then
+        local existing = {}
+        for _, dependency in ipairs(dependencies) do
+            existing[dependency.depends_on_ticket_id] = true
+        end
+        local options = {}
+        for _, candidate in ipairs(repo.visible_tickets()) do
+            if candidate.id ~= ticket.id and not existing[candidate.id] then
+                table.insert(options, {
+                    value = candidate.id,
+                    label = candidate.title .. " (" .. tostring(candidate.status or "open") .. ")",
+                })
+            end
+        end
+        if #options > 0 then
+            table.insert(children, view.panel{
+                ui.stack{ direction = "vertical", gap = "2", children = {
+                    ui.select{
+                        id = "dependency-" .. ticket.id,
+                        label = "Add dependency",
+                        placeholder = "Select ticket",
+                        options = options,
+                        on_change = view.field_action("project_pipelines.update_dependency_draft", { ticket_id = ticket.id }),
+                    },
+                    ui.button{
+                        label = "Add dependency",
+                        icon = "link",
+                        variant = "solid",
+                        tone = "accent",
+                        action = ui.action("project_pipelines.add_ticket_dependency", { ticket_id = ticket.id }),
+                    },
+                } },
+            })
+        elseif #children == 0 then
+            table.insert(children, ui.text{ text = "No available tickets to depend on.", size = "sm", tone = "muted" })
+        end
+    elseif #children == 0 then
+        table.insert(children, ui.text{ text = "No dependencies.", size = "sm", tone = "muted" })
+    end
+
+    local feedback = actions.feedback(ctx)
+    if feedback.dependency_error then
+        table.insert(children, ui.text{ text = feedback.dependency_error, size = "sm", tone = "danger" })
+    end
+    return children
+end
+
 local function merge_controls(ticket, ctx)
     local run = repo.latest_ticket_run(ticket.id)
     if not run or run.status ~= "done" or ticket.status == "closed" then
@@ -410,9 +479,9 @@ local function merge_controls(ticket, ctx)
                     view.badge("ready to merge", "success"),
                     ui.text{ text = "Final signoff is complete.", size = "sm", weight = "semibold" },
                 },
-                ui.text{ text = "Spawn a merge agent to merge or prepare the repo-specific merge path, then close the ticket when complete.", size = "sm", tone = "muted" },
+                ui.text{ text = "Approve a merge agent to perform the repo-specific merge or PR path. The ticket closes only after merge confirmation is recorded.", size = "sm", tone = "muted" },
                 ui.button{
-                    label = "Start merge",
+                    label = #merge_events > 0 and "Merge requested" or "Approve merge",
                     icon = "arrow-path",
                     variant = "solid",
                     tone = "accent",
@@ -480,7 +549,7 @@ function M.render(view_state, ctx)
     end
     if ticket.status ~= "closed" and latest_run and latest_run.status == "done" then
         table.insert(header, ui.button{
-            label = "Start merge",
+            label = "Approve merge",
             icon = "arrow-path",
             variant = "solid",
             tone = "accent",
@@ -507,6 +576,7 @@ function M.render(view_state, ctx)
         view.panel{ ui.stack{ direction = "vertical", gap = "2", children = header_panel } },
         current_state_panel(ticket, ctx),
         view.section("Questions", question_rows(ticket, ctx)),
+        view.section("Dependencies", dependency_rows(ticket, ctx)),
     }
     local merge_children = merge_controls(ticket, ctx)
     if #merge_children > 0 then
