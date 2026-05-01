@@ -245,11 +245,11 @@ registration contract.
 
 ## Plugin-Owned Entities
 
-Plugins publish durable dynamic state through `lib.entity_broadcast`. This is
-the only shared model-state path for plugin UI; do not add browser-only refresh
-commands or plugin-specific list snapshots. `ui_tree_snapshot` frames describe
-presentation, while entity frames carry the data that both browser and TUI
-stores consume.
+Plugins publish durable dynamic state through the Hub entity API backed by
+`lib.entity_broadcast`. This is the only shared model-state path for plugin UI;
+do not add browser-only refresh commands or plugin-specific list snapshots.
+`ui_tree_snapshot` frames describe presentation, while entity frames carry the
+data that both browser and TUI stores consume.
 
 Plugin entity names must be `<plugin>.<type>`, and the `<plugin>` prefix must
 match the plugin that registers the type. Built-in names such as `session`,
@@ -260,6 +260,7 @@ without per-plugin wiring.
 
 ```lua
 local EB = require("lib.entity_broadcast")
+local Hub = require("lib.hub")
 
 local boards = {
   { id = "board-1", name = "Roadmap", status = "active" },
@@ -272,18 +273,20 @@ EB.register("kanban.board", {
   end,
 })
 
-EB.upsert("kanban.board", {
+Hub.get():entity_snapshot("kanban.board", boards)
+
+Hub.get():entity_upsert("kanban.board", {
   id = "board-2",
   name = "Triage",
   status = "active",
 })
 
-EB.patch("kanban.board", "board-2", {
+Hub.get():entity_patch("kanban.board", "board-2", {
   status = "archived",
   counts = { open = 0 },
 })
 
-EB.remove("kanban.board", "board-2")
+Hub.get():entity_remove("kanban.board", "board-2")
 ```
 
 When registering outside plugin load tests or helper modules, pass
@@ -292,6 +295,13 @@ owner context from the plugin manifest/display name; repo-sourced loader keys
 include paths and are not valid wire namespaces. Hot reload may re-register the
 same type from the same plugin; another plugin cannot take ownership of that
 entity type.
+
+`Hub.get():entity_snapshot`, `entity_upsert`, `entity_patch`, and
+`entity_remove` only publish plugin-owned entity types. They reject built-in
+types, cross-plugin namespaces, unregistered plugin types, and records whose
+`id` is not a non-empty string. `entity_snapshot` is for replacing the client
+baseline after a plugin refresh; subscribe-time snapshots still come from the
+registered `all()` function.
 
 Snapshot `all()` callbacks must return an array of entity tables. Records
 without a string `id` are logged and skipped. Patches merge only top-level
