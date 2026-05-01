@@ -54,6 +54,27 @@ local function build_envelope(from_hub_id, from_agent_id, opts)
     }
 end
 
+local function render_notification(opts)
+    opts = opts or {}
+    local source = opts.source or opts.from_label or opts.from_agent_id or "botster"
+    local title = opts.title or "Notification"
+    local body = opts.body
+    local action = opts.action or {}
+    local hint = opts.hint
+    if not hint and action.kind == "mcp_tool" and action.name then
+        hint = string.format("call %s() via Botster MCP", tostring(action.name))
+    end
+
+    local line = string.format("\n\xe2\xac\xa1 [%s] %s", tostring(source), tostring(title))
+    if hint and hint ~= "" then
+        line = line .. " - " .. tostring(hint)
+    end
+    if body and body ~= "" then
+        line = line .. "\n" .. tostring(body)
+    end
+    return line .. "\n"
+end
+
 local function dispatch_local_command(command)
     command.request_id = command.request_id or generate_msg_id()
     return InternalClient.dispatch("hub_proxy", command)
@@ -277,10 +298,39 @@ function Hub:send_message(agent_id, text, session)
     return result.result
 end
 
+--- Send an attention notification to an agent without writing an inbox message.
+-- This is for plugin-owned state changes where the durable data lives in the
+-- plugin, not in Botster's generic message inbox. Prefer `post` when the
+-- recipient should call receive_messages(); prefer `notify` when the recipient
+-- should call a plugin-specific MCP tool or inspect plugin state.
+-- @param agent_id string Agent key or session_uuid
+-- @param opts table { source, title, body, hint, action }
+-- @return table { status }
+function Hub:notify(agent_id, opts)
+    opts = opts or {}
+    local text = render_notification(opts)
+
+    if self._is_local then
+        local agent = Agent.get(agent_id)
+        if not agent then
+            error(string.format("Hub:notify: agent '%s' not found", agent_id))
+        end
+        if not agent.session then
+            error(string.format("Hub:notify: no PTY session on agent '%s'", agent_id))
+        end
+        agent.session:send_message(text)
+        return { status = "delivered" }
+    end
+
+    self:send_message(agent_id, text, opts.session or "agent")
+    return { status = "delivered" }
+end
+
 --- Post a structured message to an agent's inbox.
 -- Builds a full envelope (msg_id, from, expires_at) and writes it to the
 -- agent's inbox. Fires a PTY doorbell so the agent knows to call receive_messages().
--- For type="notify", skips inbox and writes text directly to PTY instead.
+-- Use Hub:notify for attention-only plugin notifications whose durable state
+-- lives outside the generic inbox.
 -- Local: writes inbox directly. Remote: RPC to target hub.
 -- @param agent_id string Agent key or session_uuid
 -- @param opts table { type, payload, reply_to, expires_in, session, from_agent_id }
@@ -288,6 +338,9 @@ end
 function Hub:post(agent_id, opts)
     opts = opts or {}
     local msg_type = opts.type or "message"
+    if msg_type == "notify" then
+        error("Hub:post: type='notify' was removed; use Hub:notify for attention-only notifications")
+    end
 
     if self._is_local then
         local agent = Agent.get(agent_id)
@@ -295,17 +348,8 @@ function Hub:post(agent_id, opts)
             error(string.format("Hub:post: agent '%s' not found", agent_id))
         end
         -- Only agents accept inbox messages; accessories have no AI to read them
-        if agent.session_type ~= "agent" and msg_type ~= "notify" then
+        if agent.session_type ~= "agent" then
             error(string.format("Hub:post: session '%s' is an accessory, not an agent", agent_id))
-        end
-
-        if msg_type == "notify" then
-            -- PTY-only: write text directly, no inbox, no doorbell
-            if not agent.session then
-                error(string.format("Hub:post: no PTY session on agent '%s'", agent_id))
-            end
-            agent.session:send_message(opts.payload or "")
-            return { msg_id = nil, status = "delivered" }
         end
 
         -- Build envelope — hub injects msg_id and timestamps
