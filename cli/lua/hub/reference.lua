@@ -415,6 +415,22 @@ M.mcp_api = {
 
 M.lua_libs = {
     {
+        name = "Hub proxy",
+        require_path = "lib.hub",
+        description = "Local/remote hub orchestration helper for plugins.",
+        class_methods = {
+            { sig = "Hub.get(hub_id?)", desc = "Return local hub or transparent remote proxy" },
+        },
+        instance_methods = {
+            { sig = "hub:create_agent(opts)", desc = "Spawn a new session with target/workspace/prompt metadata" },
+            { sig = "hub:send_message(session_uuid, text, session?)", desc = "Write raw PTY text to an existing session" },
+            { sig = "hub:notify(session_uuid, opts)", desc = "Attention-only notification; durable data stays in the owning plugin. opts={source,title,body,hint,action}" },
+            { sig = "hub:post(session_uuid, opts)", desc = "Durable generic inbox message; recipient drains with Agent.receive_messages()/receive_messages()" },
+            { sig = "hub:receive_messages(session_uuid)", desc = "Drain generic inbox messages for a session" },
+            { sig = "hub:list_owned_sessions(owner_plugin)", desc = "Recover plugin-owned sessions after reload" },
+        },
+    },
+    {
         name = "Agent / Session",
         require_path = "lib.agent",
         description = "Agent inherits from Session. Use Agent in plugins.",

@@ -142,9 +142,10 @@ Initial terminal handshake with dimensions.
 
 Create an agent for a target/workspace/issue identity. This is an intentional
 spawn command: each accepted request creates a new agent session. Clients that
-want to focus an existing session should use `select_agent`; producers that want
-to notify an existing session should use the hub/MCP message APIs such as
-`post_message` instead of relying on `create_agent` to infer reuse.
+want to focus an existing session should use `select_agent`; producers that need
+attention-only wakeups for existing sessions should use the hub notification API
+instead of relying on `create_agent` to infer reuse. Use inbox message APIs only
+when the recipient should later drain durable generic messages.
 
 ```json
 {
