@@ -6,7 +6,7 @@
 -- @version 1.0.0
 
 local db = plugin.db{
-    version = 3,
+    version = 4,
     models = {
         tickets = {
             id = { "text", required = true, primary = true },
@@ -18,6 +18,12 @@ local db = plugin.db{
             status = { "text", required = true },
             created_at = { "integer", required = true },
             updated_at = { "integer", required = true },
+        },
+        ticket_dependencies = {
+            id = { "text", required = true, primary = true },
+            ticket_id = { "text", required = true },
+            depends_on_ticket_id = { "text", required = true },
+            created_at = { "integer", required = true },
         },
         projects = {
             id = { "text", required = true, primary = true },
@@ -176,6 +182,9 @@ local indexes = {
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_steps_pipeline_position ON pipeline_steps(pipeline_id, position)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_tickets_project ON tickets(project_id, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_tickets_target ON tickets(target_id, updated_at)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_project_pipelines_ticket_dependencies_unique ON ticket_dependencies(ticket_id, depends_on_ticket_id)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_ticket_dependencies_ticket ON ticket_dependencies(ticket_id)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_ticket_dependencies_depends_on ON ticket_dependencies(depends_on_ticket_id)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_project_targets_project ON project_targets(project_id, target_id)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_gates_step ON pipeline_gates(step_id)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_runs_ticket ON runs(ticket_id, created_at)",

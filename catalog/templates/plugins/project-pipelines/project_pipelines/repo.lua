@@ -223,6 +223,12 @@ function M.visible_tickets()
     return rows("SELECT * FROM tickets WHERE COALESCE(status, 'open') != 'closed' ORDER BY updated_at DESC, created_at DESC")
 end
 
+function M.standalone_tickets()
+    return rows([[SELECT * FROM tickets
+                  WHERE (project_id IS NULL OR project_id = '')
+                  ORDER BY updated_at DESC, created_at DESC]])
+end
+
 function M.search_tickets(filters)
     filters = filters or {}
     local where = {}
@@ -285,6 +291,8 @@ function M.ticket_status(ticket_id)
         latest_run = latest_run,
         latest_run_steps = latest_run and M.run_steps(latest_run.id) or {},
         sessions = M.ticket_session_uuids(ticket_id),
+        dependencies = M.ticket_dependencies(ticket_id),
+        blocking_dependencies = M.blocking_ticket_dependencies(ticket_id),
         open_findings = latest_run and M.open_findings(latest_run.id) or {},
         open_questions = M.ticket_questions(ticket_id, "open"),
     }
@@ -308,6 +316,69 @@ function M.create_ticket(attrs)
     db.tickets:insert(ticket)
     M.append_event("ticket.created", { ticket_id = ticket.id, payload = ticket })
     return ticket
+end
+
+function M.add_ticket_dependency(ticket_id, depends_on_ticket_id)
+    util.assert_present(ticket_id, "ticket_id")
+    util.assert_present(depends_on_ticket_id, "depends_on_ticket_id")
+    if ticket_id == depends_on_ticket_id then
+        error("ticket cannot depend on itself")
+    end
+    if not M.get_ticket(ticket_id) then
+        error("ticket not found: " .. tostring(ticket_id))
+    end
+    if not M.get_ticket(depends_on_ticket_id) then
+        error("dependency ticket not found: " .. tostring(depends_on_ticket_id))
+    end
+    local existing = rows([[SELECT * FROM ticket_dependencies
+                            WHERE ticket_id = ? AND depends_on_ticket_id = ?
+                            LIMIT 1]], ticket_id, depends_on_ticket_id)[1]
+    if existing then
+        return existing
+    end
+    local dependency = {
+        id = util.id("dependency"),
+        ticket_id = ticket_id,
+        depends_on_ticket_id = depends_on_ticket_id,
+        created_at = util.now(),
+    }
+    db.ticket_dependencies:insert(dependency)
+    M.append_event("ticket.dependency_added", {
+        ticket_id = ticket_id,
+        payload = { dependency_id = dependency.id, depends_on_ticket_id = depends_on_ticket_id },
+    })
+    return dependency
+end
+
+function M.remove_ticket_dependency(dependency_id)
+    util.assert_present(dependency_id, "dependency_id")
+    local dependency = db.ticket_dependencies:where{ id = dependency_id }
+    if not dependency then
+        error("ticket dependency not found: " .. tostring(dependency_id))
+    end
+    db:eval("DELETE FROM ticket_dependencies WHERE id = ?", dependency_id)
+    M.append_event("ticket.dependency_removed", {
+        ticket_id = dependency.ticket_id,
+        payload = { dependency_id = dependency.id, depends_on_ticket_id = dependency.depends_on_ticket_id },
+    })
+    return dependency
+end
+
+function M.ticket_dependencies(ticket_id)
+    return rows([[SELECT td.*, t.title AS depends_on_title, t.status AS depends_on_status
+                  FROM ticket_dependencies td
+                  LEFT JOIN tickets t ON t.id = td.depends_on_ticket_id
+                  WHERE td.ticket_id = ?
+                  ORDER BY td.created_at ASC]], ticket_id)
+end
+
+function M.blocking_ticket_dependencies(ticket_id)
+    return rows([[SELECT td.*, t.title AS depends_on_title, t.status AS depends_on_status
+                  FROM ticket_dependencies td
+                  LEFT JOIN tickets t ON t.id = td.depends_on_ticket_id
+                  WHERE td.ticket_id = ?
+                    AND COALESCE(t.status, 'open') != 'closed'
+                  ORDER BY td.created_at ASC]], ticket_id)
 end
 
 function M.update_ticket(ticket_id, attrs)

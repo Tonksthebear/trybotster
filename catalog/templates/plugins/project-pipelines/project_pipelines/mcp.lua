@@ -98,14 +98,14 @@ function M.register()
             },
         }, function(args)
             local role = args and args.role or "pipeline step"
-            return "You are operating as a Project Pipelines " .. role .. ". First call project_pipelines_current_context. Treat returned gate prompts as hard requirements. Submit gate evidence, reviews, findings, and artifacts through the project_pipelines_* MCP tools. Request advancement only after required evidence is recorded."
+            return "You are operating as a Project Pipelines " .. role .. ". First call project_pipelines_current_context. Treat returned gate prompts as hard requirements. Submit gate evidence, reviews, findings, and artifacts through the project_pipelines_* MCP tools. Request advancement only after required evidence is recorded. Do not leave dead, deprecated, or unwired code behind."
         end)
 
         mcp.prompt("project-pipelines-review-role", {
             description = "System-level instructions for Project Pipelines review agents.",
             arguments = {},
         }, function(_args)
-            return "You are a Project Pipelines review agent. Review for correctness, regressions, architecture fit, missing tests, and documentation gaps. Submit project_pipelines_submit_review with verdict, summary, and structured findings. Blocker and high findings block review_clear gates until resolved or waived."
+            return "You are a Project Pipelines review agent. Review for correctness, regressions, architecture fit, missing tests, documentation gaps, dead code, deprecated code paths, and unwired implementation. Everything claimed complete must be wired into the product and covered by focused verification. Do not accept pre-existing failures as a blanket excuse; require the agent to either fix them or prove with exact evidence that they are unrelated to this ticket. Submit project_pipelines_submit_review with verdict, summary, and structured findings. Blocker and high findings block review_clear gates until resolved or waived."
         end)
     end
 
@@ -547,21 +547,74 @@ function M.register()
     end)
 
     tool("project_pipelines_close_ticket", {
-        description = "Close a ticket. Completed pipeline work requires merge_confirmed=true and should be called by the merge agent only after merge or PR completion.",
+        description = "Close a ticket. Completed pipeline work requires merge_confirmed=true and should be called by the merge agent only after merge or PR completion. When merge_confirmed is true, include merge_commit, pr_url, or merge_summary when available so the ticket keeps a merge artifact.",
         input_schema = {
             type = "object",
             properties = {
                 ticket_id = { type = "string" },
                 merge_confirmed = { type = "boolean" },
+                merge_commit = { type = "string" },
+                pr_url = { type = "string" },
+                merge_summary = { type = "string" },
+            },
+            required = { "ticket_id" },
+        },
+    }, function(params, context)
+        return ok(engine.close_ticket(params.ticket_id, {
+            merge_confirmed = params.merge_confirmed == true,
+            merge_commit = params.merge_commit,
+            pr_url = params.pr_url,
+            merge_summary = params.merge_summary,
+            closed_by_session_uuid = context and context.session_uuid,
+        }))
+    end)
+
+    tool("project_pipelines_add_ticket_dependency", {
+        description = "Add an ordering dependency. The ticket cannot start a pipeline run until the dependency ticket is closed.",
+        input_schema = {
+            type = "object",
+            properties = {
+                ticket_id = { type = "string" },
+                depends_on_ticket_id = { type = "string" },
+            },
+            required = { "ticket_id", "depends_on_ticket_id" },
+        },
+    }, function(params)
+        return ok(repo.add_ticket_dependency(params.ticket_id, params.depends_on_ticket_id))
+    end)
+
+    tool("project_pipelines_remove_ticket_dependency", {
+        description = "Remove a ticket ordering dependency.",
+        input_schema = {
+            type = "object",
+            properties = {
+                dependency_id = { type = "string" },
+            },
+            required = { "dependency_id" },
+        },
+    }, function(params)
+        return ok(repo.remove_ticket_dependency(params.dependency_id))
+    end)
+
+    tool("project_pipelines_list_ticket_dependencies", {
+        description = "List ordering dependencies for a ticket, including whether dependency tickets are still open.",
+        input_schema = {
+            type = "object",
+            properties = {
+                ticket_id = { type = "string" },
+                blocking_only = { type = "boolean" },
             },
             required = { "ticket_id" },
         },
     }, function(params)
-        return ok(engine.close_ticket(params.ticket_id, { merge_confirmed = params.merge_confirmed == true }))
+        if params.blocking_only then
+            return ok(repo.blocking_ticket_dependencies(params.ticket_id))
+        end
+        return ok(repo.ticket_dependencies(params.ticket_id))
     end)
 
     tool("project_pipelines_current_context", {
-        description = "Return ticket, run, current step, gate prompts, reviews, findings, artifacts, and events for the current pipeline run. If run_id is omitted, infer it from the calling agent session.",
+        description = "Return ticket, run, current step, gate prompts, reviews, findings, artifacts, dependencies, questions, and events for the current pipeline run. If run_id is omitted, infer it from the calling agent session.",
         input_schema = {
             type = "object",
             properties = {
