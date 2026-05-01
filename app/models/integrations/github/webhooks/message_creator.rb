@@ -208,7 +208,7 @@ module Integrations
           lines << "## Requirements"
 
           if requirements[:must_use_trybotster_mcp]
-            lines << "- You MUST use ONLY the trybotster MCP server for ALL GitHub interactions"
+            lines << "- You MUST use ONLY the marketplace-installed Botster GitHub tools for ALL GitHub interactions"
           end
 
           if requirements[:fetch_first] && requirements[:number_to_fetch]

@@ -112,6 +112,32 @@ ui.button{ label = ..., action = ..., variant = ..., tone = ..., icon = ... }
 -- No `disabled` field: use `action.disabled`.
 ui.icon_button{ icon = ..., label = ..., action = ..., tone = ... }
 
+-- Form primitives. If `value` / `selected` is omitted and `id` is present,
+-- renderers may own local state; otherwise Lua owns the controlled state.
+-- `on_change` actions receive the next `{ value = ... }` or
+-- `{ selected = ... }` payload merged into the action payload.
+ui.text_input{ id = ..., label = ..., value = ..., placeholder = ...,
+               on_change = ui.action(...) }
+
+ui.textarea{ id = ..., label = ..., value = ..., placeholder = ...,
+             on_change = ui.action(...) }
+
+-- TUI v1 note: textarea renders as read-only/display-only text in the TUI.
+-- Web uses the Catalyst textarea and emits on_change. Use text_input for
+-- editable TUI text entry until multiline editing is added to the adapter.
+
+ui.checkbox{ id = ..., label = ..., selected = ...,
+             on_change = ui.action(...) }
+
+ui.select{
+  id = ..., label = ..., value = ..., placeholder = ...,
+  options = {
+    { value = "normal", label = "Normal" },
+    { value = "high", label = "High" },
+  },
+  on_change = ui.action(...),
+}
+
 -- No shared props in current (web's `density` is renderer-internal).
 ui.tree{ children = {...} }
 
@@ -147,16 +173,11 @@ can adopt it in Phase B / Phase C. Presentation defaults to `"auto"`. Top-level
 `body` and `footer` keys are automatically hoisted into `slots` per the
 cross-client spec's Dialog shape.
 
-### `Menu` / `MenuItem`
+### `Menu` / `MenuItem` / `Toggle`
 
-**Intentionally not exposed.** Both are web-runtime-internal in current until the
-cross-client menu interaction model stabilizes.
-
-### `TextInput` / `Checkbox` / `Toggle` / `Select`
-
-**Intentionally not exposed in current.** These belong to the broader cross-client
-shared vocabulary but are deferred from the current Lua-public inventory per
-`phase one web ui composites stay internal while Lua public contract stops at primitives.md`.
+**Intentionally not exposed.** Menu primitives are web-runtime-internal in
+current until the cross-client menu interaction model stabilizes. `Toggle` is
+deferred from the first shared form primitive set.
 
 ### Adaptive helpers
 

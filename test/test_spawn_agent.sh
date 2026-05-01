@@ -65,18 +65,18 @@ Repository: #{ENV['TEST_REPO']}
 Issue Number: ##{ENV['TEST_ISSUE_NUMBER']}
 
 Your task is to:
-1. Use the trybotster MCP server to fetch the issue details
+1. Use the marketplace-installed Botster GitHub tools to fetch the issue details
 2. Review and understand the problem
 3. Investigate the codebase if needed
 4. Implement a solution if appropriate
 5. Either submit a Pull Request with the fix OR post a comment with your findings/answer
 
 IMPORTANT:
-- Use the trybotster MCP tools to interact with GitHub (fetch issue, post comments, create PRs)
-- The trybotster MCP server is already configured in this project
-- If you cannot access the trybotster MCP server, explain that you need it to interact with GitHub
+- Use the marketplace-installed Botster GitHub tools to interact with GitHub (fetch issue, post comments, create PRs)
+- Agent tool wiring is installed outside Botster through the plugin marketplace
+- If you cannot access the Botster GitHub tools, explain that the marketplace tooling is required for GitHub interaction
 
-Start by fetching the issue details using the trybotster MCP server."
+Start by fetching the issue details using the Botster GitHub tools."
 
 message = Integrations::Github::Message.create!(
   event_type: 'github_mention',

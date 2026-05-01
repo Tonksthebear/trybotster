@@ -9,22 +9,14 @@
 # Claude Agent initialization — runs when the agent PTY session starts.
 #
 # Sets up the worktree environment and launches Claude in acceptEdits mode.
-# No MCP server or GitHub integration — just Claude and the codebase.
+# Plugin/tool installation is handled by the external plugin marketplace, not
+# by this session initialization script.
 
 # Uncomment if using mise
 # mise trust 2>/dev/null
 
 # Change to the worktree directory
 cd "$(botster context worktree_path)"
-
-# ---------------------------------------------------------------------------
-# Hub MCP tools
-# ---------------------------------------------------------------------------
-# Registers the local hub MCP bridge so agents can use plugin-provided tools
-# (orchestrator, custom plugin tools, etc.) via the Botster hub.
-
-echo "Registering botster hub MCP tools..."
-claude mcp add botster-hub -- botster mcp-serve
 
 # ---------------------------------------------------------------------------
 # Launch

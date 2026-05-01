@@ -11,6 +11,12 @@
 local commands = require("lib.commands")
 local TargetContext = require("lib.target_context")
 
+local function generate_request_id()
+    local hub_id = hub and hub.hub_id and hub.hub_id() or nil
+    local hub_prefix = hub_id and hub_id:sub(1, 8) or "00000000"
+    return string.format("msg_%s_%d_%06x", hub_prefix, os.time(), math.random(0, 0xffffff))
+end
+
 local function send_command_response(client, sub_id, command, data)
     if not client or not command.request_id then return end
     data = data or {}
@@ -204,6 +210,7 @@ end, { description = "List available agent config (alias for list_configs)" })
 -- ============================================================================
 
 commands.register("create_agent", function(client, sub_id, command)
+    command.request_id = command.request_id or generate_request_id()
     local issue_or_branch = command.issue_or_branch or command.branch
     local prompt = command.prompt
     local from_worktree = command.from_worktree
@@ -220,6 +227,15 @@ commands.register("create_agent", function(client, sub_id, command)
     end
 
     local metadata = TargetContext.with_metadata(command.metadata, target)
+    if command.request_id and metadata.request_id == nil then
+        metadata.request_id = command.request_id
+    end
+    if command.label and metadata.label == nil then
+        metadata.label = command.label
+    end
+    if command.assignment_id and metadata.assignment_id == nil then
+        metadata.assignment_id = command.assignment_id
+    end
     if workspace_id or workspace_name then
         metadata.workspace_id = workspace_id or metadata.workspace_id
         metadata.workspace = workspace_name or metadata.workspace
@@ -258,11 +274,13 @@ commands.register("create_agent", function(client, sub_id, command)
             ok = true,
             session_uuid = agent.session_uuid,
             id = agent.session_uuid,
+            assignment_id = metadata.assignment_id,
         })
     else
         send_command_response(client, sub_id, command, {
             ok = true,
             status = "pending",
+            assignment_id = metadata.assignment_id,
         })
     end
     log.info(string.format("Create agent request: %s (agent: %s, workspace: %s, target: %s)",
@@ -306,6 +324,30 @@ commands.register("create_accessory", function(client, sub_id, command)
     log.info(string.format("Create accessory request: %s (workspace: %s, target: %s)",
         accessory_name, tostring(workspace_id or workspace_name or "none"), tostring(target.target_id)))
 end, { description = "Create an accessory session (no AI autonomy)" })
+
+commands.register("list_owned_sessions", function(client, sub_id, command)
+    local owner_plugin = command.owner_plugin
+    if not owner_plugin or owner_plugin == "" then
+        send_command_response(client, sub_id, command, { ok = false, error = "owner_plugin is required" })
+        return
+    end
+
+    local owned = {}
+    local Agent = require("lib.agent")
+    for _, session in ipairs(Agent.list()) do
+        if session.owner_plugin == owner_plugin
+                or (session.metadata and session.metadata.owner_plugin == owner_plugin) then
+            owned[#owned + 1] = {
+                session_uuid = session.session_uuid,
+                label = session.label,
+                metadata = session.metadata,
+                status = session.status,
+            }
+        end
+    end
+
+    send_command_response(client, sub_id, command, { ok = true, sessions = owned })
+end, { description = "List sessions owned by a plugin" })
 
 commands.register("rename_workspace", function(client, sub_id, command)
     local workspace_id = command.workspace_id

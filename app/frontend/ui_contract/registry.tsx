@@ -1,4 +1,5 @@
 import React, {
+  type ChangeEvent,
   type MouseEvent,
   type ReactElement,
   type ReactNode,
@@ -9,6 +10,7 @@ import { IconGlyph } from './icons'
 import type {
   BadgeProps,
   ButtonProps,
+  CheckboxProps,
   DialogProps,
   EmptyStateProps,
   IconButtonProps,
@@ -16,8 +18,11 @@ import type {
   InlineProps,
   PanelProps,
   ScrollAreaProps,
+  SelectProps,
   StackProps,
   StatusDotProps,
+  TextareaProps,
+  TextInputProps,
   TextProps,
   TreeItemProps,
   UiAction,
@@ -41,6 +46,11 @@ import type {
   UiValue,
 } from './types'
 import { resolveValue } from './viewport'
+import { Input } from '../components/catalyst/input'
+import { Textarea } from '../components/catalyst/textarea'
+import { Checkbox, CheckboxField } from '../components/catalyst/checkbox'
+import { Field, Label } from '../components/catalyst/fieldset'
+import { Select } from '../components/catalyst/select'
 
 // ---------- Renderer signature ----------
 
@@ -186,6 +196,39 @@ function wrapActionClick(
     event.stopPropagation()
     ctx.dispatch(action, { element: event.currentTarget as Element })
   }
+}
+
+function actionWithPayload(
+  action: UiAction,
+  payload: Record<string, unknown>,
+): UiAction {
+  return {
+    ...action,
+    payload: {
+      ...(action.payload ?? {}),
+      ...payload,
+    },
+  }
+}
+
+function dispatchChangedValue(
+  action: UiAction | undefined,
+  ctx: RenderContext,
+  value: string,
+  element: Element,
+) {
+  if (!action || action.disabled) return
+  ctx.dispatch(actionWithPayload(action, { value }), { element })
+}
+
+function dispatchChangedSelected(
+  action: UiAction | undefined,
+  ctx: RenderContext,
+  selected: boolean,
+  element: Element,
+) {
+  if (!action || action.disabled) return
+  ctx.dispatch(actionWithPayload(action, { selected }), { element })
 }
 
 // ---------- Primitive renderers ----------
@@ -468,6 +511,137 @@ const renderIconButton: PrimitiveRenderer = ({ props, ctx }) => {
   )
 }
 
+const renderTextInput: PrimitiveRenderer = ({ node, props, ctx }) => {
+  const p = props as Partial<TextInputProps>
+  const inputId = node.id
+  const valueProps =
+    p.value !== undefined ? { value: p.value } : { defaultValue: '' }
+  const control = (
+    <Input
+      id={inputId}
+      name={inputId}
+      placeholder={p.placeholder}
+      disabled={p.onChange?.disabled === true}
+      {...valueProps}
+      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+        dispatchChangedValue(
+          p.onChange,
+          ctx,
+          event.currentTarget.value,
+          event.currentTarget,
+        )
+      }
+    />
+  )
+  if (p.label === undefined) return control
+  return (
+    <Field>
+      <Label>{p.label}</Label>
+      {control}
+    </Field>
+  )
+}
+
+const renderTextarea: PrimitiveRenderer = ({ node, props, ctx }) => {
+  const p = props as Partial<TextareaProps>
+  const inputId = node.id
+  const valueProps =
+    p.value !== undefined ? { value: p.value } : { defaultValue: '' }
+  const control = (
+    <Textarea
+      id={inputId}
+      name={inputId}
+      placeholder={p.placeholder}
+      disabled={p.onChange?.disabled === true}
+      {...valueProps}
+      onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+        dispatchChangedValue(
+          p.onChange,
+          ctx,
+          event.currentTarget.value,
+          event.currentTarget,
+        )
+      }
+    />
+  )
+  if (p.label === undefined) return control
+  return (
+    <Field>
+      <Label>{p.label}</Label>
+      {control}
+    </Field>
+  )
+}
+
+const renderCheckbox: PrimitiveRenderer = ({ node, props, ctx }) => {
+  const p = props as Partial<CheckboxProps>
+  const checkedProps =
+    p.selected !== undefined ? { checked: p.selected } : { defaultChecked: false }
+  const control = (
+    <Checkbox
+      id={node.id}
+      name={node.id}
+      disabled={p.onChange?.disabled === true}
+      {...checkedProps}
+      onChange={(selected: boolean) =>
+        dispatchChangedSelected(
+          p.onChange,
+          ctx,
+          selected,
+          document.activeElement ?? document.body,
+        )
+      }
+    />
+  )
+  if (p.label === undefined) return control
+  return (
+    <CheckboxField>
+      {control}
+      <Label>{p.label}</Label>
+    </CheckboxField>
+  )
+}
+
+const renderSelect: PrimitiveRenderer = ({ node, props, ctx }) => {
+  const p = props as Partial<SelectProps>
+  const valueProps =
+    p.value !== undefined ? { value: p.value } : { defaultValue: '' }
+  const control = (
+    <Select
+      id={node.id}
+      name={node.id}
+      disabled={p.onChange?.disabled === true}
+      {...valueProps}
+      onChange={(event: ChangeEvent<HTMLSelectElement>) =>
+        dispatchChangedValue(
+          p.onChange,
+          ctx,
+          event.currentTarget.value,
+          event.currentTarget,
+        )
+      }
+    >
+      {p.placeholder !== undefined && (
+        <option value="" disabled>
+          {p.placeholder}
+        </option>
+      )}
+      {(p.options ?? []).map((option) => (
+        <option key={option.value} value={option.value}>
+          {option.label}
+        </option>
+      ))}
+    </Select>
+  )
+  if (p.label === undefined) return control
+  return (
+    <Field>
+      <Label>{p.label}</Label>
+      {control}
+    </Field>
+  )
+}
+
 const renderTree: PrimitiveRenderer = ({ children }) => {
   return (
     <ul role="tree" className="flex flex-col">
@@ -687,6 +861,10 @@ export const PRIMITIVE_REGISTRY: Record<string, PrimitiveRenderer> = {
   empty_state: renderEmptyState,
   button: renderButton,
   icon_button: renderIconButton,
+  text_input: renderTextInput,
+  textarea: renderTextarea,
+  checkbox: renderCheckbox,
+  select: renderSelect,
   tree: renderTree,
   tree_item: renderTreeItem,
   dialog: renderDialog,

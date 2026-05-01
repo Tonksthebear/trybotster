@@ -62,6 +62,10 @@ pub fn register(lua: &Lua) -> Result<()> {
     register_primitive(lua, &ui, "empty_state", Primitive::EmptyState)?;
     register_primitive(lua, &ui, "button", Primitive::Button)?;
     register_primitive(lua, &ui, "icon_button", Primitive::IconButton)?;
+    register_primitive(lua, &ui, "text_input", Primitive::TextInput)?;
+    register_primitive(lua, &ui, "textarea", Primitive::Textarea)?;
+    register_primitive(lua, &ui, "checkbox", Primitive::Checkbox)?;
+    register_primitive(lua, &ui, "select", Primitive::Select)?;
     register_primitive(lua, &ui, "tree", Primitive::Tree)?;
     register_primitive(lua, &ui, "tree_item", Primitive::TreeItem)?;
     register_primitive(lua, &ui, "dialog", Primitive::Dialog)?;
@@ -108,6 +112,10 @@ enum Primitive {
     EmptyState,
     Button,
     IconButton,
+    TextInput,
+    Textarea,
+    Checkbox,
+    Select,
     Tree,
     TreeItem,
     /// Flagged internal in current — registered so renderers can consume it while
@@ -151,6 +159,10 @@ impl Primitive {
             Self::EmptyState => "empty_state",
             Self::Button => "button",
             Self::IconButton => "icon_button",
+            Self::TextInput => "text_input",
+            Self::Textarea => "textarea",
+            Self::Checkbox => "checkbox",
+            Self::Select => "select",
             Self::Tree => "tree",
             Self::TreeItem => "tree_item",
             Self::Dialog => "dialog",
@@ -217,6 +229,9 @@ impl Primitive {
             Self::EmptyState => &["title", "description", "icon", "primaryAction"],
             Self::Button => &["label", "action", "variant", "tone", "icon"],
             Self::IconButton => &["icon", "label", "action", "tone"],
+            Self::TextInput | Self::Textarea => &["label", "value", "placeholder", "onChange"],
+            Self::Checkbox => &["label", "selected", "onChange"],
+            Self::Select => &["label", "value", "placeholder", "options", "onChange"],
             Self::Tree => &[],
             Self::TreeItem => &["expanded", "selected", "notification", "action"],
             Self::Dialog => &["open", "title", "presentation"],
@@ -554,6 +569,8 @@ fn validate(_lua: &Lua, kind: Primitive, node: &Table) -> mlua::Result<()> {
             require_prop_string(node, "label", "ui.icon_button")?;
             require_prop_table(node, "action", "ui.icon_button")?;
         }
+        Primitive::TextInput | Primitive::Textarea | Primitive::Checkbox => {}
+        Primitive::Select => validate_select_options(node)?,
         Primitive::Dialog => {
             require_prop_string(node, "title", "ui.dialog")?;
             let props: Table = node.get("props").map_err(|e| {
@@ -670,6 +687,51 @@ fn require_prop_table(node: &Table, key: &str, ctor: &str) -> mlua::Result<()> {
             "{ctor} requires a `{key}` table"
         ))),
     }
+}
+
+fn validate_select_options(node: &Table) -> mlua::Result<()> {
+    let props = node.get::<Value>("props").ok();
+    let Some(Value::Table(props)) = props else {
+        return Err(mlua::Error::RuntimeError(
+            "ui.select requires an `options` table".to_string(),
+        ));
+    };
+    let options = match props.get::<Value>("options") {
+        Ok(Value::Table(options)) => options,
+        _ => {
+            return Err(mlua::Error::RuntimeError(
+                "ui.select requires an `options` table".to_string(),
+            ));
+        }
+    };
+
+    for pair in options.pairs::<Value, Value>() {
+        let (key, option) = pair?;
+        let Value::Table(option) = option else {
+            return Err(mlua::Error::RuntimeError(format!(
+                "ui.select options must be tables with string `value` and `label` fields (bad option key: {})",
+                key.type_name()
+            )));
+        };
+        match option.get::<Value>("value") {
+            Ok(Value::String(_)) => {}
+            _ => {
+                return Err(mlua::Error::RuntimeError(
+                    "ui.select option requires a string `value`".to_string(),
+                ));
+            }
+        }
+        match option.get::<Value>("label") {
+            Ok(Value::String(_)) => {}
+            _ => {
+                return Err(mlua::Error::RuntimeError(
+                    "ui.select option requires a string `label`".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -195,8 +195,8 @@ This is the recommended shared primitive inventory.
 ### Input primitives
 
 - `text_input`
+- `textarea`
 - `checkbox`
-- `toggle`
 - `select`
 
 ### Botster-specialized primitives
@@ -344,17 +344,58 @@ Optional slots:
 
 ```ts
 type TextInputProps = {
-  id: string
   value?: string
   placeholder?: string
   label?: string
+  onChange?: UiAction
 }
 ```
 
 Controlled/uncontrolled rule:
 
 - if `value` is present, Lua owns the input state
-- if `value` is absent and `id` is present, the renderer may own local state
+- if `value` is absent and the node `id` is present, the renderer may own local state
+
+The renderer emits `onChange` with the next `{ value }` merged into the action payload.
+
+### `textarea`
+
+```ts
+type TextareaProps = {
+  value?: string
+  placeholder?: string
+  label?: string
+  onChange?: UiAction
+}
+```
+
+The ownership and `onChange` rules match `text_input`.
+
+### `checkbox`
+
+```ts
+type CheckboxProps = {
+  label?: string
+  selected?: boolean
+  onChange?: UiAction
+}
+```
+
+For `checkbox`, explicit `selected` means Lua-controlled; omitted
+`selected` plus a stable node `id` lets renderers own local state. Renderers emit
+`onChange` with the next `{ selected }` merged into the action payload.
+
+### `select`
+
+```ts
+type SelectProps = {
+  label?: string
+  value?: string
+  placeholder?: string
+  options: Array<{ value: string; label: string }>
+  onChange?: UiAction
+}
+```
 
 That matches the TUI's current controlled/uncontrolled widget behavior and should be preserved in web as well.
 

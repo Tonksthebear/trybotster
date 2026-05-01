@@ -61,16 +61,16 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::tui::entity_stores::TuiEntityStores;
 use crate::tui::render_tree::{
-    BlockConfig, BorderStyle, ListItemProps, ListProps, ParagraphAlignment, ParagraphProps,
-    RenderNode, SpanStyle, StyledContent, StyledSpan, WidgetProps, WidgetType,
+    BlockConfig, BorderStyle, InputProps, ListItemProps, ListProps, ParagraphAlignment,
+    ParagraphProps, RenderNode, SpanStyle, StyledContent, StyledSpan, WidgetProps, WidgetType,
 };
 use crate::ui_contract::node::{UiAction, UiChild, UiNode};
 use crate::ui_contract::props::{
-    BadgeProps, ButtonProps, ConnectionCodeProps, DialogProps, EmptyStateProps,
+    BadgeProps, ButtonProps, CheckboxProps, ConnectionCodeProps, DialogProps, EmptyStateProps,
     HubRecoveryStateProps, IconButtonProps, IconProps, IframeProps, NewSessionButtonProps,
-    PanelProps, SessionListProps, SessionRowProps, SessionTerminalProps, SpawnTargetListProps,
-    StackProps, StatusDotProps, SurfaceNavProps, TextProps, TreeItemProps, WorkspaceListProps,
-    WorktreeListProps,
+    PanelProps, SelectProps, SessionListProps, SessionRowProps, SessionTerminalProps,
+    SpawnTargetListProps, StackProps, StatusDotProps, SurfaceNavProps, TextInputProps, TextProps,
+    TextareaProps, TreeItemProps, WorkspaceListProps, WorktreeListProps,
 };
 use crate::ui_contract::tokens::{UiSessionListGrouping, UiStackDirection, UiSurfaceDensity};
 use crate::ui_contract::viewport::UiViewport;
@@ -108,6 +108,11 @@ const UI_NODE_TYPE_NAMES: &[&str] = &[
     // Action
     "button",
     "icon_button",
+    // Input
+    "text_input",
+    "textarea",
+    "checkbox",
+    "select",
     // Collections
     "list",
     "list_item",
@@ -204,6 +209,10 @@ pub fn render_ui_node_with_stores(
         "empty_state" => render_empty_state(node, viewport, actions),
         "button" => render_button(node, viewport, actions),
         "icon_button" => render_icon_button(node, viewport, actions),
+        "text_input" => render_text_input(node, viewport, actions),
+        "textarea" => render_textarea(node, viewport, actions),
+        "checkbox" => render_checkbox(node, viewport, actions),
+        "select" => render_select(node, viewport, actions),
         "list" => render_list(node, viewport, actions),
         "list_item" => render_standalone_list_item(node, viewport, actions),
         // `tree` / `tree_item` use flatten_tree_item which extracts text
@@ -547,6 +556,166 @@ fn render_icon_button(
     let render = button_widget(&label, &props.action, None, tone);
     actions.insert(node.id.as_deref(), props.action);
     Ok(apply_id(render, node.id.clone()))
+}
+
+// =============================================================================
+// Input primitives
+// =============================================================================
+
+fn render_text_input(
+    node: &UiNode,
+    viewport: &UiViewport,
+    actions: &mut ActionTable,
+) -> Result<RenderNode> {
+    let props = decode_props::<TextInputProps>(&node.props, viewport, "text_input")?;
+    if let Some(action) = props.on_change {
+        actions.insert(node.id.as_deref(), action);
+    }
+    Ok(RenderNode::Widget {
+        widget_type: WidgetType::Input,
+        id: node.id.clone(),
+        block: None,
+        custom_lines: None,
+        props: Some(WidgetProps::Input(InputProps {
+            lines: label_lines(props.label.as_deref()),
+            value: props.value,
+            placeholder: props.placeholder,
+            alignment: ParagraphAlignment::Left,
+        })),
+    })
+}
+
+fn render_textarea(
+    node: &UiNode,
+    viewport: &UiViewport,
+    actions: &mut ActionTable,
+) -> Result<RenderNode> {
+    let props = decode_props::<TextareaProps>(&node.props, viewport, "textarea")?;
+    if let Some(action) = props.on_change {
+        actions.insert(node.id.as_deref(), action);
+    }
+    let mut lines = label_lines(props.label.as_deref());
+    let body = props
+        .value
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or(props.placeholder.as_deref())
+        .unwrap_or("");
+    lines.extend(
+        body.lines()
+            .map(|line| StyledContent::Plain(line.to_owned())),
+    );
+    Ok(RenderNode::Widget {
+        widget_type: WidgetType::Paragraph,
+        id: node.id.clone(),
+        block: None,
+        custom_lines: None,
+        props: Some(WidgetProps::Paragraph(ParagraphProps {
+            lines,
+            alignment: ParagraphAlignment::Left,
+            wrap: true,
+        })),
+    })
+}
+
+fn render_checkbox(
+    node: &UiNode,
+    viewport: &UiViewport,
+    actions: &mut ActionTable,
+) -> Result<RenderNode> {
+    let props = decode_props::<CheckboxProps>(&node.props, viewport, "checkbox")?;
+    let selected = props.selected.unwrap_or(false);
+    let label = props.label.as_deref().unwrap_or("Checkbox");
+    let action = props
+        .on_change
+        .map(|action| merge_action_payload(action, serde_json::json!({ "selected": !selected })));
+    Ok(boolean_control_widget(
+        node, label, selected, action, actions, "[x]", "[ ]",
+    ))
+}
+
+fn render_select(
+    node: &UiNode,
+    viewport: &UiViewport,
+    actions: &mut ActionTable,
+) -> Result<RenderNode> {
+    let props = decode_props::<SelectProps>(&node.props, viewport, "select")?;
+    let mut items = Vec::new();
+
+    if let Some(label) = &props.label {
+        items.push(ListItemProps {
+            content: StyledContent::Plain(label.clone()),
+            secondary: None,
+            tertiary: None,
+            header: true,
+            style: Some(SpanStyle {
+                bold: true,
+                ..SpanStyle::default()
+            }),
+            action: None,
+        });
+    }
+
+    if props.options.is_empty() {
+        items.push(ListItemProps {
+            content: StyledContent::Plain(
+                props.placeholder.unwrap_or_else(|| "No options".to_owned()),
+            ),
+            secondary: None,
+            tertiary: None,
+            header: false,
+            style: Some(SpanStyle {
+                dim: true,
+                ..SpanStyle::default()
+            }),
+            action: None,
+        });
+    } else {
+        for option in props.options {
+            let selected = props.value.as_deref() == Some(option.value.as_str());
+            let action = props.on_change.clone().map(|action| {
+                merge_action_payload(action, serde_json::json!({ "value": option.value }))
+            });
+            let action_id = action
+                .as_ref()
+                .filter(|action| !action.disabled.unwrap_or(false))
+                .map(|action| action.id.clone());
+            if let Some(action) = action {
+                actions.insert(node.id.as_deref(), action);
+            }
+            items.push(ListItemProps {
+                content: StyledContent::Plain(format!(
+                    "{} {}",
+                    if selected { ">" } else { " " },
+                    option.label
+                )),
+                secondary: None,
+                tertiary: None,
+                header: false,
+                style: selected.then_some(SpanStyle {
+                    bold: true,
+                    ..SpanStyle::default()
+                }),
+                action: action_id,
+            });
+        }
+    }
+
+    Ok(RenderNode::Widget {
+        widget_type: WidgetType::List,
+        id: node.id.clone(),
+        block: None,
+        custom_lines: None,
+        props: Some(WidgetProps::List(ListProps {
+            items,
+            selected: None,
+            highlight_style: Some(SpanStyle {
+                reversed: true,
+                ..SpanStyle::default()
+            }),
+            highlight_symbol: Some(BUTTON_HIGHLIGHT_SYMBOL.to_owned()),
+        })),
+    })
 }
 
 // =============================================================================
@@ -1210,6 +1379,80 @@ fn paragraph_widget_line(
             lines: vec![content],
             alignment,
             wrap: true,
+        })),
+    }
+}
+
+fn label_lines(label: Option<&str>) -> Vec<StyledContent> {
+    label
+        .map(|text| {
+            vec![StyledContent::Styled(vec![StyledSpan {
+                text: text.to_owned(),
+                style: SpanStyle {
+                    bold: true,
+                    ..SpanStyle::default()
+                },
+            }])]
+        })
+        .unwrap_or_default()
+}
+
+fn merge_action_payload(mut action: UiAction, payload: JsonValue) -> UiAction {
+    if let JsonValue::Object(map) = payload {
+        for (key, value) in map {
+            action.payload.insert(key, value);
+        }
+    }
+    action
+}
+
+fn boolean_control_widget(
+    node: &UiNode,
+    label: &str,
+    selected: bool,
+    action: Option<UiAction>,
+    actions: &mut ActionTable,
+    selected_marker: &str,
+    unselected_marker: &str,
+) -> RenderNode {
+    let marker = if selected {
+        selected_marker
+    } else {
+        unselected_marker
+    };
+    let disabled = action
+        .as_ref()
+        .is_some_and(|action| action.disabled.unwrap_or(false));
+    let action_id = action
+        .as_ref()
+        .filter(|_| !disabled)
+        .map(|action| action.id.clone());
+    if let Some(action) = action {
+        actions.insert(node.id.as_deref(), action);
+    }
+    RenderNode::Widget {
+        widget_type: WidgetType::List,
+        id: node.id.clone(),
+        block: None,
+        custom_lines: None,
+        props: Some(WidgetProps::List(ListProps {
+            items: vec![ListItemProps {
+                content: StyledContent::Plain(format!("{marker} {label}")),
+                secondary: None,
+                tertiary: None,
+                header: false,
+                style: disabled.then_some(SpanStyle {
+                    dim: true,
+                    ..SpanStyle::default()
+                }),
+                action: action_id,
+            }],
+            selected: Some(0),
+            highlight_style: Some(SpanStyle {
+                reversed: true,
+                ..SpanStyle::default()
+            }),
+            highlight_symbol: Some(BUTTON_HIGHLIGHT_SYMBOL.to_owned()),
         })),
     }
 }

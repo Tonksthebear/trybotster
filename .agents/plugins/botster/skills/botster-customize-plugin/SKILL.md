@@ -95,7 +95,7 @@ Event-driven primitives:
 - `update`
 - `push`
 
-## Session Actions And Blocking Prep
+## Session Actions, Agent Spawns, And Command Gates
 
 Use `lib.session_actions` for plugin-owned per-session affordances. Core
 publishes action descriptors as `session_action` entities, and every client
@@ -126,6 +126,62 @@ Store the active request token in plugin-owned state and drop completion events
 whose `request_id` is no longer current. This covers disable/retry/reload races
 without adding provider-specific behavior to core.
 
+Use `hub.run_command_gate({...})` when a plugin needs a one-shot command result
+such as a test, lint, or build gate. It composes with
+`hub.prepare_plugin_command`, runs off the hub event loop, captures bounded
+stdout/stderr tails, hard-kills timed-out process groups, and emits
+`command_gate_completed`.
+
+```lua
+hub.run_command_gate{
+  request_id = "gate-123",
+  command = "./cli/test.sh --unit -- plugin_helpers",
+  cwd = "/repo/cli",
+  timeout_secs = 600,
+  metadata = { ticket_id = "T-42", gate_id = "tests" },
+  context = { run_id = "R-9" },
+}
+
+events.on("command_gate_completed", function(event)
+  if event.request_id ~= "gate-123" then return end
+  -- event.success, event.exit_status, event.stdout_tail,
+  -- event.stderr_tail, event.error_kind, event.error
+end)
+```
+
+Keep `metadata` and `context` small, JSON-serializable, and correlation-only.
+They are echoed back to plugin events; do not include secrets or unbounded
+command output.
+
+Use `Hub.get():create_agent({...})` for plugin-owned agent sessions. Always use
+or persist the returned `request_id`; it is echoed through lifecycle events so
+async worktree creation can be correlated with the final `session_uuid`.
+
+```lua
+local Hub = require("lib.hub")
+
+local result = Hub.get():create_agent{
+  target_id = "tgt_...",
+  agent_name = "codex",
+  label = "T-42 implementer",
+  prompt = "Implement the ticket",
+  request_id = "spawn-T-42-worker",
+  metadata = {
+    owner_plugin = "projects",
+    visibility = "plugin",
+    surface = "projects",
+    ticket_id = "T-42",
+    run_id = "R-9",
+    gate_id = "implementation",
+    role = "worker",
+  },
+}
+```
+
+Recover plugin-owned sessions after reload with
+`Hub.get():list_owned_sessions("projects")`. It returns the same session-array
+shape for local and remote hubs.
+
 Hook observers:
 
 - `agent_created`
@@ -143,6 +199,13 @@ Hook observers:
 - `before_agent_close`
 - `after_agent_close`
 - `shutdown`
+
+Event observers:
+
+- `plugin_command_prepared` — completion for `hub.prepare_plugin_command`.
+- `command_gate_completed` — completion for `hub.run_command_gate`; includes
+  `request_id`, `success`, `exit_status`, bounded output tails, optional
+  `metadata`/`context`, and error fields.
 
 Hook interceptors:
 
@@ -240,6 +303,21 @@ ui.session_terminal{
 Notification URLs for plugin-owned sessions route through
 `/hubs/<hub>/<surface>/sessions/<session_uuid>` when the session has
 `visibility = "plugin"` and a matching `surface`/`owner_plugin`.
+
+### Form Primitives
+
+Use the shared Lua form primitives for plugin surfaces before reaching for a
+custom iframe. The v1 public set is intentionally small:
+
+- `ui.text_input`
+- `ui.textarea`
+- `ui.checkbox`
+- `ui.select`
+
+Web rendering is Catalyst-first. Do not create raw custom form controls in the
+parent app. TUI rendering is operational and compact: `textarea` is
+read-only/display-only in TUI v1, so use `text_input` for editable TUI text
+entry until multiline editing lands.
 
 ### Custom HTML Views
 

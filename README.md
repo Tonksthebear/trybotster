@@ -256,32 +256,16 @@ BOTSTER_TOKEN=your_api_key
 BOTSTER_TUNNEL_PORT=4001
 ```
 
-Additional env vars may be injected by plugins (e.g., the GitHub plugin adds `BOTSTER_MCP_TOKEN` and `BOTSTER_MCP_URL`).
+Additional env vars may be injected by installed plugins.
 
-### Codex MCP (session UUID passthrough)
-
-`botster mcp-serve` resolves hub context from `BOTSTER_SESSION_UUID`.
-Use a single Codex MCP server entry named `botster` (do not register additional Botster MCP aliases in session scripts).
+### Plugin Marketplace Tooling
 
 For Botster agent sessions, launch Codex with `--no-alt-screen` so PTY scrollback is preserved.
 Accessory sessions can keep Codex default/auto alternate-screen behavior.
 
-Configure Codex to forward that PTY env var to the MCP subprocess:
-
-```toml
-[mcp_servers.botster]
-command = "botster"
-args = ["mcp-serve"]
-env_vars = ["BOTSTER_SESSION_UUID"]
-```
-
-Verify:
-
-```bash
-codex mcp get botster
-```
-
-The output should show `env_vars: BOTSTER_SESSION_UUID`.
+Agent tool wiring is installed outside Botster through the plugin marketplace.
+Do not add Botster tool servers from session initialization scripts; the
+marketplace install owns the agent-side configuration and any supporting setup.
 
 ## Templates
 

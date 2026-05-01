@@ -136,6 +136,52 @@ ui.session_terminal{
 }
 ```
 
+Shared form controls are available in plugin surfaces through the same
+renderer-agnostic `ui` contract. Use semantic props only; browser details such
+as CSS classes or DOM attributes are not part of the Lua contract. Change
+events are action envelopes, and renderers merge the next value into the action
+payload:
+
+```lua
+ui.text_input{
+  id = "project-name",
+  label = "Project name",
+  value = project.name,
+  placeholder = "Name",
+  on_change = ui.action("workflow.project.name.change", { project_id = project.id }),
+}
+
+ui.textarea{
+  id = "project-notes",
+  label = "Notes",
+  value = project.notes,
+  on_change = ui.action("workflow.project.notes.change", { project_id = project.id }),
+}
+
+ui.checkbox{
+  id = "requires-review",
+  label = "Requires review",
+  selected = project.requires_review,
+  on_change = ui.action("workflow.project.review.toggle", { project_id = project.id }),
+}
+
+ui.select{
+  id = "priority",
+  label = "Priority",
+  value = project.priority,
+  options = {
+    { value = "normal", label = "Normal" },
+    { value = "high", label = "High" },
+  },
+  on_change = ui.action("workflow.project.priority.change", { project_id = project.id }),
+}
+```
+
+TUI v1 renders `ui.textarea` as read-only/display-only text. The web renderer
+uses the Catalyst textarea and emits `on_change`; TUI authors who need editable
+text entry should use `ui.text_input` until multiline editing lands in the TUI
+adapter.
+
 Plugins can also expose generated static HTML through a sandboxed iframe. The
 web client fetches `botster-plugin-asset://...` sources over the existing hub
 connection and mounts them as blob URLs, so remote/tunneled clients do not
@@ -243,6 +289,18 @@ hub.prepare_plugin_command({
   context = { session_uuid = "sess-..." } -- optional, round-tripped
 })
 -- fires plugin_command_prepared
+hub.run_command_gate({
+  request_id = "plugin-owned-token",
+  command = "bin/check-workflow-ready",
+  cwd = "/repo/worktree",
+  timeout_secs = 30,
+  env = { RAILS_ENV = "test" },          -- optional
+  config_path = "/tmp/gate.json",        -- optional
+  config_contents = "{}\n",              -- optional
+  metadata = { stage = "verify" },       -- optional, round-tripped
+  context = { session_uuid = "sess-..." } -- optional, round-tripped
+})
+-- fires command_gate_completed
 hub.probe_url_ready(connector_uuid, parent_uuid, url, hostname, timeout_secs?)
 ```
 
@@ -280,6 +338,43 @@ Use this from plugin action handlers before spawning connector/accessory
 processes that need PATH resolution or a generated config file. Keep
 plugin-specific behavior in the plugin; the hub primitive is only the generic
 blocking-work offload and completion event.
+
+`hub.run_command_gate(opts)` runs a one-shot command on the blocking
+worker pool and emits `command_gate_completed` with:
+
+```lua
+{
+  request_id = opts.request_id,
+  metadata = opts.metadata,
+  context = opts.context,
+  success = true | false,
+  exit_status = 0, -- nil when unavailable
+  stdout_tail = "...", -- bounded capture
+  stderr_tail = "...", -- bounded capture
+  output_truncated = false,
+  error_kind = nil | "command_blank" | "cwd_missing" | "cwd_invalid" |
+    "timeout_invalid" | "command_parse_failed" | "command_missing" |
+    "config_write_failed" | "spawn_failed" | "wait_failed" |
+    "timeout" | "exit_status" | "task_failed",
+  error = nil | "message",
+  duration_ms = 123,
+}
+```
+
+`command`, `cwd`, `request_id`, and `timeout_secs` are required. The primitive
+parses `command`, resolves the first word and optional config materialization
+through `hub.prepare_plugin_command`'s helper path, then runs the command as a
+non-PTY captured process. It rejects blank commands and missing/invalid working
+directories before spawning. Captured stdout/stderr tails are bounded so noisy
+workflow gates cannot grow hub memory without limit. Store the active
+`request_id` in plugin state and ignore stale completions after retries or
+reloads.
+
+`metadata` and `context` are trusted-plugin payloads echoed back into the
+completion event, not durable storage or client-facing display text. Keep them
+small, JSON-serializable, and limited to correlation fields such as
+`session_uuid`, workflow stage, attempt number, or plugin request tokens. Do
+not put secrets or unbounded command output in either field.
 
 `hub.probe_url_ready(...)` waits asynchronously for public DNS and HTTPS
 reachability before a plugin surfaces a public URL to clients.
@@ -401,7 +496,8 @@ hub_client.close(conn_id)
 
 ### `mcp` (Lua module, not a Rust primitive)
 
-Lua-side MCP tool registry. Plugins register tools that agents can invoke via the MCP stdio bridge (`botster mcp-serve`).
+Lua-side MCP tool registry. Plugins register tools that agents receive through
+the marketplace-installed Botster tooling.
 
 ```lua
 -- Register a tool (typically in a plugin's init.lua)
@@ -430,26 +526,10 @@ mcp.count() -> number
 
 Tools track their source plugin automatically via `_G._loading_plugin_source` (set by `loader.lua`). On plugin hot-reload, `mcp.reset(source)` clears that plugin's tools before re-registering. The hub emits a `tools_list_changed` notification to connected MCP clients so they re-fetch the tool list.
 
-**MCP stdio bridge**: Run `botster mcp-serve` to expose registered tools over JSON-RPC stdio. Botster resolves the session through the hub context; session definitions should use `botster context ...` helpers instead of wiring Botster-specific environment variables.
-
-```toml
-[mcp_servers.botster]
-command = "botster"
-args = ["mcp-serve"]
-```
-
-Editor clients that use `.mcp.json` can still configure the same command directly:
-
-```json
-{
-  "mcpServers": {
-    "botster": {
-      "command": "botster",
-      "args": ["mcp-serve"]
-    }
-  }
-}
-```
+**Agent tool installation**: Plugin-provided tools are installed for agents by
+the external plugin marketplace. Do not add Botster tool servers from session
+initialization scripts. Session definitions should focus on launching the agent
+process and should use `botster context ...` helpers for runtime context.
 
 ### `update`
 ```lua

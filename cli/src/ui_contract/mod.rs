@@ -39,11 +39,12 @@ pub use node::{
     UiResponsiveHeight, UiResponsiveWidth, UiValue,
 };
 pub use props::{
-    BadgeProps, ButtonProps, ConnectionCodeProps, DialogProps, EmptyStateProps,
+    BadgeProps, ButtonProps, CheckboxProps, ConnectionCodeProps, DialogProps, EmptyStateProps,
     HubRecoveryStateProps, IconButtonProps, IconProps, IframeBridgeProps, IframeProps, InlineProps,
-    NewSessionButtonProps, PanelProps, ScrollAreaProps, SessionListProps, SessionRowProps,
-    SessionTerminalProps, SpawnTargetListProps, StackProps, StatusDotProps, SurfaceNavProps,
-    TextProps, TreeItemProps, WorkspaceListProps, WorktreeListProps,
+    NewSessionButtonProps, PanelProps, ScrollAreaProps, SelectOptionProps, SelectProps,
+    SessionListProps, SessionRowProps, SessionTerminalProps, SpawnTargetListProps, StackProps,
+    StatusDotProps, SurfaceNavProps, TextInputProps, TextProps, TextareaProps, TreeItemProps,
+    WorkspaceListProps, WorktreeListProps,
 };
 pub use tokens::{
     UiAlign, UiBadgeSize, UiBadgeTone, UiButtonTone, UiButtonVariant, UiInteractionDensity,

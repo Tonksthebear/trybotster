@@ -131,8 +131,11 @@ fn create_agent_creates_even_when_matching_agent_exists() {
               find_by_meta = function(_, _) return {} end,
             }
             package.loaded["handlers.agents"] = {
-              handle_create_agent = function()
+              handle_create_agent = function(_, _, _, _, _, metadata)
                 spawned = spawned + 1
+                assert(metadata.request_id == "req-create")
+                assert(metadata.assignment_id == "assign-create")
+                assert(metadata.label == "Workflow worker")
                 return { session_uuid = "sess-new" }
               end,
             }
@@ -141,8 +144,10 @@ fn create_agent_creates_even_when_matching_agent_exists() {
             local result = require("lib.internal_client").dispatch("test", {
               type = "create_agent",
               request_id = "req-create",
+              assignment_id = "assign-create",
               issue_or_branch = "42",
               prompt = "Please look at this",
+              label = "Workflow worker",
               target_id = "target-1",
               metadata = {
                 issue_number = 42,
@@ -154,11 +159,357 @@ fn create_agent_creates_even_when_matching_agent_exists() {
             assert(result.frames[1].type == "command_response")
             assert(result.frames[1].ok == true)
             assert(result.frames[1].session_uuid == "sess-new")
+            assert(result.frames[1].request_id == "req-create")
+            assert(result.frames[1].assignment_id == "assign-create")
             return "ok"
             "#,
         )
         .eval()
         .expect("create_agent should create a new session");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn hub_create_agent_table_api_preserves_plugin_metadata() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            hub = {{ hub_id = function() return "hub-local" end }}
+            local dispatched = nil
+
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+            package.loaded["lib.agent"] = {{
+              list = function() return {{}} end,
+              get = function() return nil end,
+              all_info = function() return {{}} end,
+            }}
+            package.loaded["lib.internal_client"] = {{
+              dispatch = function(_, command)
+                dispatched = command
+                return {{
+                  frames = {{
+                    {{
+                      type = "command_response",
+                      request_id = command.request_id,
+                      ok = true,
+                      status = "pending",
+                      assignment_id = command.metadata.assignment_id,
+                    }},
+                  }},
+                }}
+              end,
+            }}
+
+            local Hub = require("lib.hub")
+            local result = Hub.get():create_agent({{
+              target_id = "target-1",
+              target_path = "/repo",
+              target_repo = "owner/repo",
+              agent_name = "codex",
+              issue_or_branch = "workflow-branch",
+              label = "Workflow worker",
+              prompt = "Implement the workflow",
+              workspace_id = "ws-1",
+              workspace_name = "Workflow",
+              request_id = "req-api",
+              assignment_id = "assign-api",
+              metadata = {{
+                owner_plugin = "workflow",
+                visibility = "plugin",
+                surface = "workflow.queue",
+                ticket_id = "TKT-1",
+                run_id = "run-1",
+                gate_id = "gate-1",
+                role = "implementer",
+                custom_field = "kept",
+              }},
+            }})
+
+            assert(result.status == "pending")
+            assert(result.request_id == "req-api")
+            assert(result.assignment_id == "assign-api")
+            assert(dispatched.type == "create_agent")
+            assert(dispatched.issue_or_branch == "workflow-branch")
+            assert(dispatched.label == "Workflow worker")
+            assert(dispatched.prompt == "Implement the workflow")
+            assert(dispatched.agent_name == "codex")
+            assert(dispatched.workspace_id == "ws-1")
+            assert(dispatched.workspace_name == "Workflow")
+            assert(dispatched.target_id == "target-1")
+            assert(dispatched.target_path == "/repo")
+            assert(dispatched.target_repo == "owner/repo")
+            assert(dispatched.request_id == "req-api")
+            assert(dispatched.metadata.request_id == "req-api")
+            assert(dispatched.metadata.assignment_id == "assign-api")
+            assert(dispatched.metadata.label == "Workflow worker")
+            assert(dispatched.metadata.owner_plugin == "workflow")
+            assert(dispatched.metadata.visibility == "plugin")
+            assert(dispatched.metadata.surface == "workflow.queue")
+            assert(dispatched.metadata.ticket_id == "TKT-1")
+            assert(dispatched.metadata.run_id == "run-1")
+            assert(dispatched.metadata.gate_id == "gate-1")
+            assert(dispatched.metadata.role == "implementer")
+            assert(dispatched.metadata.custom_field == "kept")
+            assert(dispatched.metadata.workspace_id == "ws-1")
+            assert(dispatched.metadata.workspace == "Workflow")
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("table-style hub.create_agent should preserve plugin metadata");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn hub_create_agent_mints_request_id_and_lists_owned_sessions() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            hub = {{ hub_id = function() return "hub-local" end }}
+            local dispatched = nil
+            local owned_session = {{
+              session_uuid = "sess-owned",
+              owner_plugin = "workflow",
+              label = "Owned worker",
+              metadata = {{ owner_plugin = "workflow", assignment_id = "assign-owned" }},
+              status = "running",
+            }}
+            local other_session = {{
+              session_uuid = "sess-other",
+              owner_plugin = "other",
+              metadata = {{ owner_plugin = "other" }},
+              status = "running",
+            }}
+
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+            package.loaded["lib.agent"] = {{
+              list = function() return {{ owned_session, other_session }} end,
+              get = function() return nil end,
+              all_info = function() return {{}} end,
+            }}
+            package.loaded["lib.internal_client"] = {{
+              dispatch = function(_, command)
+                dispatched = command
+                return {{
+                  frames = {{
+                    {{
+                      type = "command_response",
+                      request_id = command.request_id,
+                      ok = true,
+                      status = "pending",
+                    }},
+                  }},
+                }}
+              end,
+            }}
+
+            local Hub = require("lib.hub")
+            local created = Hub.get():create_agent({{
+              target_id = "target-1",
+              target_path = "/repo",
+              agent_name = "codex",
+              metadata = {{ owner_plugin = "workflow" }},
+            }})
+            local owned = Hub.get():list_owned_sessions("workflow")
+
+            assert(type(dispatched.request_id) == "string")
+            assert(dispatched.request_id ~= "")
+            assert(dispatched.request_id:match("^msg_hub%-loca_"))
+            assert(dispatched.metadata.request_id == dispatched.request_id)
+            assert(created.request_id == dispatched.request_id)
+            assert(#owned == 1)
+            assert(owned[1].session_uuid == "sess-owned")
+            assert(owned[1].label == "Owned worker")
+            assert(owned[1].metadata.assignment_id == "assign-owned")
+            assert(owned[1].status == "running")
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("hub create_agent should mint request_id and list owned sessions");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn hub_create_agent_sync_success_includes_correlation() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            hub = {{ hub_id = function() return "hub-local" end }}
+            local created_session = {{
+              session_uuid = "sess-created",
+              metadata = {{ request_id = "req-sync", assignment_id = "assign-sync" }},
+            }}
+
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+            package.loaded["lib.agent"] = {{
+              list = function() return {{}} end,
+              get = function(id)
+                if id == "sess-created" then return created_session end
+              end,
+              all_info = function() return {{}} end,
+            }}
+            package.loaded["lib.client_session_payload"] = {{
+              build = function(session)
+                return {{
+                  session_uuid = session.session_uuid,
+                  metadata = session.metadata,
+                }}
+              end,
+            }}
+            package.loaded["lib.internal_client"] = {{
+              dispatch = function(_, command)
+                return {{
+                  frames = {{
+                    {{
+                      type = "command_response",
+                      request_id = command.request_id,
+                      ok = true,
+                      session_uuid = "sess-created",
+                      assignment_id = command.metadata.assignment_id,
+                    }},
+                  }},
+                }}
+              end,
+            }}
+
+            local Hub = require("lib.hub")
+            local result = Hub.get():create_agent({{
+              target_id = "target-1",
+              target_path = "/repo",
+              request_id = "req-sync",
+              assignment_id = "assign-sync",
+              metadata = {{ owner_plugin = "workflow" }},
+            }})
+
+            assert(result.session_uuid == "sess-created")
+            assert(result.request_id == "req-sync")
+            assert(result.assignment_id == "assign-sync")
+            assert(result.metadata.request_id == "req-sync")
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("sync create_agent result should include correlation");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn hub_list_owned_sessions_remote_returns_sessions_array() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            hub = {{ hub_id = function() return "hub-local" end }}
+            events = {{ emit = function() end }}
+            hub_discovery = {{
+              socket_path = function(hub_id)
+                if hub_id == "hub-remote" then return "/tmp/hub-remote.sock" end
+              end,
+            }}
+            hub_client = {{
+              connect = function(_) return "conn-remote" end,
+              request = function(conn_id, command)
+                assert(conn_id == "conn-remote")
+                assert(command.type == "list_owned_sessions")
+                assert(command.owner_plugin == "workflow")
+                return {{
+                  result = {{
+                    ok = true,
+                    sessions = {{
+                      {{
+                        session_uuid = "sess-remote",
+                        label = "Remote worker",
+                        metadata = {{ owner_plugin = "workflow" }},
+                        status = "running",
+                      }},
+                    }},
+                  }},
+                }}
+              end,
+            }}
+
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+            package.loaded["lib.agent"] = {{
+              list = function() return {{}} end,
+              all_info = function() return {{}} end,
+            }}
+            package.loaded["lib.internal_client"] = {{
+              dispatch = function() error("remote path should use hub_client") end,
+            }}
+
+            local Hub = require("lib.hub")
+            local sessions = Hub.get("hub-remote"):list_owned_sessions("workflow")
+
+            assert(#sessions == 1)
+            assert(sessions[1].session_uuid == "sess-remote")
+            assert(sessions[1].label == "Remote worker")
+            assert(sessions[1].metadata.owner_plugin == "workflow")
+            assert(sessions[1].status == "running")
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("remote list_owned_sessions should return sessions array");
 
     assert_eq!(result, "ok");
 }

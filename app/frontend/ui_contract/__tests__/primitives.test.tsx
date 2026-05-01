@@ -248,6 +248,111 @@ describe('ui_contract registry — action primitives', () => {
   })
 })
 
+describe('ui_contract registry — form primitives', () => {
+  it('text_input dispatches onChange with value payload', () => {
+    const onAction = vi.fn()
+    renderTree(
+      {
+        type: 'text_input',
+        id: 'project-name',
+        props: {
+          label: 'Project name',
+          value: 'Old',
+          placeholder: 'Name',
+          onChange: {
+            id: 'workflow.project.name.change',
+            payload: { projectId: 'p1' },
+          },
+        },
+      },
+      { onAction },
+    )
+    const input = screen.getByLabelText('Project name')
+    fireEvent.change(input, { target: { value: 'New' } })
+    expect(onAction.mock.calls[0]![0]).toEqual({
+      id: 'workflow.project.name.change',
+      payload: { projectId: 'p1', value: 'New' },
+    })
+  })
+
+  it('textarea dispatches onChange with value payload', () => {
+    const onAction = vi.fn()
+    renderTree(
+      {
+        type: 'textarea',
+        id: 'notes',
+        props: {
+          label: 'Notes',
+          value: 'Draft',
+          onChange: { id: 'workflow.project.notes.change' },
+        },
+      },
+      { onAction },
+    )
+    fireEvent.change(screen.getByLabelText('Notes'), {
+      target: { value: 'Revised' },
+    })
+    expect(onAction.mock.calls[0]![0]).toEqual({
+      id: 'workflow.project.notes.change',
+      payload: { value: 'Revised' },
+    })
+  })
+
+  it('checkbox dispatches selected payload', () => {
+    const onAction = vi.fn()
+    renderTree(
+      {
+        type: 'stack',
+        props: { direction: 'vertical' },
+        children: [
+          {
+            type: 'checkbox',
+            id: 'review',
+            props: {
+              label: 'Requires review',
+              selected: false,
+              onChange: { id: 'workflow.project.review.toggle' },
+            },
+          },
+        ],
+      },
+      { onAction },
+    )
+    fireEvent.click(screen.getByLabelText('Requires review'))
+    expect(onAction.mock.calls[0]![0]).toEqual({
+      id: 'workflow.project.review.toggle',
+      payload: { selected: true },
+    })
+  })
+
+  it('select renders options and dispatches value payload', () => {
+    const onAction = vi.fn()
+    renderTree(
+      {
+        type: 'select',
+        id: 'priority',
+        props: {
+          label: 'Priority',
+          value: 'normal',
+          options: [
+            { value: 'normal', label: 'Normal' },
+            { value: 'high', label: 'High' },
+          ],
+          onChange: { id: 'workflow.project.priority.change' },
+        },
+      },
+      { onAction },
+    )
+    fireEvent.change(screen.getByLabelText('Priority'), {
+      target: { value: 'high' },
+    })
+    expect(onAction.mock.calls[0]![0]).toEqual({
+      id: 'workflow.project.priority.change',
+      payload: { value: 'high' },
+    })
+  })
+})
+
 describe('ui_contract registry — collection primitives', () => {
   it('tree renders a role=tree container with items', () => {
     const { container } = renderTree({
