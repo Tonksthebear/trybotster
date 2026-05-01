@@ -51,6 +51,14 @@ local function repo_label_for_target(target)
     return TargetContext.default_repo_label(target)
 end
 
+local function correlation_fields(metadata)
+    metadata = metadata or {}
+    return {
+        request_id = metadata.request_id,
+        assignment_id = metadata.assignment_id,
+    }
+end
+
 local function current_runtime_repo_root()
     return (worktree and worktree.repo_root and worktree.repo_root()) or nil
 end
@@ -179,11 +187,14 @@ local function notify_worktree_created(path, branch, metadata)
     local target = TargetContext.resolve({
         metadata = metadata or {},
     })
+    local correlation = correlation_fields(metadata)
 
     hooks.notify("worktree_created", {
         path = path,
         branch = branch,
         repo = target and target.target_repo or nil,
+        request_id = correlation.request_id,
+        assignment_id = correlation.assignment_id,
         metadata = metadata or {},
     })
 end
@@ -210,15 +221,19 @@ local spawn_accessory
 local function spawn_agent(branch_name, wt_path, prompt, client, agent_name, metadata, workspace_manifest, target)
     local resolved_target, target_err = resolve_target(target, metadata)
     if not resolved_target then
-        notify_lifecycle(branch_name, "failed", { error = tostring(target_err) })
+        local failure = correlation_fields(metadata)
+        failure.error = tostring(target_err)
+        notify_lifecycle(branch_name, "failed", failure)
         return nil, tostring(target_err)
     end
 
     local repo = resolved_target.target_repo or repo_label_for_target(resolved_target)
     local repo_root = resolved_target.target_path
+    local full_metadata = TargetContext.with_metadata(metadata, resolved_target)
+    local correlation = correlation_fields(full_metadata)
 
     -- Broadcast: spawning PTYs
-    notify_lifecycle(branch_name, "spawning_ptys")
+    notify_lifecycle(branch_name, "spawning_ptys", correlation)
 
     -- Resolve config across device + repo layers
     local device_root = config.data_dir and config.data_dir() or nil
@@ -231,7 +246,9 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_name, met
         local msg = string.format("Config resolution failed for agent '%s': %s",
             tostring(agent_name), tostring(err))
         log.error(msg)
-        notify_lifecycle(branch_name, "failed", { error = tostring(err) })
+        local failure = correlation_fields(full_metadata)
+        failure.error = tostring(err)
+        notify_lifecycle(branch_name, "failed", failure)
         return nil, msg
     end
 
@@ -242,7 +259,6 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_name, met
     local dims = { rows = 24, cols = 80 }
 
     -- Workspace orchestration is explicit; no implicit branch-based grouping.
-    local full_metadata = TargetContext.with_metadata(metadata, resolved_target)
     local workspace_name = full_metadata and full_metadata.workspace or nil
     local workspace_id = full_metadata and full_metadata.workspace_id or nil
     local workspace_metadata = full_metadata and full_metadata.workspace_metadata or nil
@@ -274,6 +290,7 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_name, met
         session = session_config,
         dims = dims,
         agent_name = agent_name,
+        label = session_metadata and session_metadata.label,
         owner_plugin = session_metadata and session_metadata.owner_plugin,
         visibility = session_metadata and session_metadata.visibility,
         surface = session_metadata and session_metadata.surface,
@@ -283,7 +300,9 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_name, met
         local msg = string.format("Failed to spawn agent for %s: %s",
             branch_name, tostring(agent))
         log.error(msg)
-        notify_lifecycle(branch_name, "failed", { error = tostring(agent) })
+        local failure = correlation_fields(session_metadata)
+        failure.error = tostring(agent)
+        notify_lifecycle(branch_name, "failed", failure)
         return nil, msg
     end
 
@@ -291,7 +310,10 @@ local function spawn_agent(branch_name, wt_path, prompt, client, agent_name, met
     workspace_name = agent._workspace_name or workspace_name
 
     -- Notify via hooks (connections.lua observes and broadcasts to clients)
-    hooks.notify("agent_created", agent:info())
+    local info = agent:info()
+    info.request_id = session_metadata and session_metadata.request_id
+    info.assignment_id = session_metadata and session_metadata.assignment_id
+    hooks.notify("agent_created", info)
 
     -- Auto-spawn accessories from workspace manifest
     if workspace_manifest and workspace_manifest.accessories then
@@ -384,6 +406,7 @@ spawn_accessory = function(branch_name, wt_path, accessory_name, agent_name, met
         workspace_expect_new = workspace_expect_new,
         dims = { rows = 24, cols = 80 },
         agent_name = agent_name,
+        label = session_metadata and session_metadata.label,
         owner_plugin = session_metadata and session_metadata.owner_plugin,
         visibility = session_metadata and session_metadata.visibility,
         surface = session_metadata and session_metadata.surface,
@@ -394,7 +417,10 @@ spawn_accessory = function(branch_name, wt_path, accessory_name, agent_name, met
         return nil, tostring(agent)
     end
 
-    hooks.notify("agent_created", agent:info())
+    local info = agent:info()
+    info.request_id = session_metadata and session_metadata.request_id
+    info.assignment_id = session_metadata and session_metadata.assignment_id
+    hooks.notify("agent_created", info)
     return agent
 end
 
@@ -423,10 +449,14 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         agent_name = agent_name,
         metadata = metadata,
         target = target,
+        request_id = metadata and metadata.request_id,
+        assignment_id = metadata and metadata.assignment_id,
     })
     if params == nil then
         log.info("before_agent_create interceptor blocked agent creation")
-        notify_lifecycle(early_id, "failed", { error = "Blocked by interceptor" })
+        local failure = correlation_fields(metadata)
+        failure.error = "Blocked by interceptor"
+        notify_lifecycle(early_id, "failed", failure)
         return nil, "Blocked by interceptor"
     end
     issue_or_branch = params.issue_or_branch
@@ -435,11 +465,22 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     agent_name = params.agent_name
     metadata = params.metadata
     target = params.target
+    if (params.request_id or params.assignment_id) and not metadata then
+        metadata = {}
+    end
+    if params.request_id and metadata and metadata.request_id == nil then
+        metadata.request_id = params.request_id
+    end
+    if params.assignment_id and metadata and metadata.assignment_id == nil then
+        metadata.assignment_id = params.assignment_id
+    end
 
     local resolved_target, target_err = resolve_target(target, metadata)
     if not resolved_target then
         log.error(string.format("Target resolution failed: %s", tostring(target_err)))
-        notify_lifecycle(early_id, "failed", { error = tostring(target_err) })
+        local failure = correlation_fields(metadata)
+        failure.error = tostring(target_err)
+        notify_lifecycle(early_id, "failed", failure)
         return nil, tostring(target_err)
     end
     metadata = TargetContext.with_metadata(metadata, resolved_target)
@@ -449,7 +490,9 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     local resolved_name, name_err = resolve_agent_name(device_root, resolved_target.target_path, agent_name)
     if name_err then
         log.error(string.format("Agent resolution failed: %s", name_err))
-        notify_lifecycle(early_id, "failed", { error = name_err })
+        local failure = correlation_fields(metadata)
+        failure.error = name_err
+        notify_lifecycle(early_id, "failed", failure)
         return nil, "Agent resolution failed: " .. name_err
     end
     agent_name = resolved_name
@@ -511,7 +554,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     end
 
     if not wt_path then
-        notify_lifecycle(branch_name, "creating_worktree")
+        notify_lifecycle(branch_name, "creating_worktree", correlation_fields(metadata))
         log.info(string.format("No worktree found for %s, queueing async creation...", branch_name))
 
         -- Stash workspace_manifest and agent_name in metadata so they survive
@@ -704,7 +747,9 @@ end)
 _event_subs[#_event_subs + 1] = events.on("worktree_create_failed", function(info)
     log.error(string.format("Async worktree creation failed for %s: %s",
         info.branch, info.error))
-    notify_lifecycle(info.branch or "unknown", "failed", { error = info.error })
+    local failure = correlation_fields(info.metadata)
+    failure.error = info.error
+    notify_lifecycle(info.branch or "unknown", "failed", failure)
 end)
 
 -- ============================================================================

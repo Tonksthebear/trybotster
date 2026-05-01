@@ -110,7 +110,7 @@ module Github
       assert_includes formatted, "Answer the question about the PR changes"
 
       assert_includes formatted, "## Requirements"
-      assert_includes formatted, "- You MUST use ONLY the trybotster MCP server"
+      assert_includes formatted, "- You MUST use ONLY the marketplace-installed Botster GitHub tools"
       assert_includes formatted, "- Start by fetching pr #731 details"
       assert_includes formatted, "- You may fetch issue #720 for additional context"
     end

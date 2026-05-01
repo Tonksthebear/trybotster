@@ -380,43 +380,101 @@ function Hub:receive_messages(agent_id)
     return result.result
 end
 
+local function copy_table(src)
+    local out = {}
+    if src then
+        for k, v in pairs(src) do out[k] = v end
+    end
+    return out
+end
+
+local function normalize_create_agent_opts(issue_or_branch, prompt, agent_name, workspace_id, workspace_name, target)
+    if type(issue_or_branch) == "table" then
+        local opts = copy_table(issue_or_branch)
+        opts.issue_or_branch = opts.issue_or_branch or opts.branch
+        opts.metadata = copy_table(opts.metadata)
+        return opts
+    end
+
+    return {
+        issue_or_branch = issue_or_branch,
+        prompt = prompt,
+        agent_name = agent_name,
+        workspace_id = workspace_id,
+        workspace_name = workspace_name,
+        target_id = target and target.target_id or nil,
+        target_path = target and target.target_path or nil,
+        target_repo = target and target.target_repo or nil,
+        metadata = target and require("lib.target_context").with_metadata(nil, target) or {},
+    }
+end
+
+local function create_agent_command(opts)
+    local request_id = opts.request_id or (opts.metadata and opts.metadata.request_id) or generate_msg_id()
+    local metadata = copy_table(opts.metadata)
+    if opts.label and metadata.label == nil then
+        metadata.label = opts.label
+    end
+    if opts.workspace_id or opts.workspace_name then
+        metadata.workspace_id = opts.workspace_id or metadata.workspace_id
+        metadata.workspace = opts.workspace_name or metadata.workspace
+    end
+    if metadata.request_id == nil then
+        metadata.request_id = request_id
+    end
+    if opts.assignment_id and metadata.assignment_id == nil then
+        metadata.assignment_id = opts.assignment_id
+    end
+
+    return {
+        type = "create_agent",
+        request_id = request_id,
+        issue_or_branch = opts.issue_or_branch,
+        branch = opts.branch,
+        label = opts.label,
+        prompt = opts.prompt,
+        from_worktree = opts.from_worktree,
+        agent_name = opts.agent_name,
+        workspace_id = opts.workspace_id,
+        workspace_name = opts.workspace_name,
+        workspace_template = opts.workspace_template,
+        invocation_url = opts.invocation_url,
+        target_id = opts.target_id,
+        target_path = opts.target_path,
+        target_repo = opts.target_repo,
+        repo = opts.repo,
+        metadata = metadata,
+    }
+end
+
 --- Create an agent on this hub.
+-- Preferred plugin API: Hub.get():create_agent({
+--   target_id = "...", target_path = "...", agent_name = "...",
+--   issue_or_branch = "branch-or-ticket", label = "Worker label",
+--   prompt = "...", request_id = "...",
+--   assignment_id = "...", metadata = { owner_plugin = "...", ... },
+-- })
+-- Backward-compatible positional arguments are still accepted.
 -- Local: dispatches through internal client command ingress. Remote: uses hub_client.request().
--- @param issue_or_branch string Issue number or branch name
--- @param prompt string|nil Task prompt
--- @param agent_name string|nil Agent config name
--- @param workspace_id string|nil Workspace ID
--- @param workspace_name string|nil Workspace display name
--- @param target table|nil Optional target context { target_id, target_path, target_repo }
 -- @return table Result payload
 function Hub:create_agent(issue_or_branch, prompt, agent_name, workspace_id, workspace_name, target)
+    local opts = normalize_create_agent_opts(issue_or_branch, prompt, agent_name, workspace_id, workspace_name, target)
+    opts.issue_or_branch = opts.issue_or_branch or opts.branch
+    local command = create_agent_command(opts)
+
     if self._is_local then
         local before = {}
         for _, session in ipairs(Agent.list()) do
             before[session.session_uuid] = true
         end
-        local metadata = target and require("lib.target_context").with_metadata(nil, target) or nil
-        if workspace_id or workspace_name then
-            metadata = metadata or {}
-            metadata.workspace_id = workspace_id
-            metadata.workspace = workspace_name
-        end
-        local response = dispatch_local_command_response({
-            type = "create_agent",
-            issue_or_branch = issue_or_branch,
-            prompt = prompt,
-            agent_name = agent_name,
-            workspace_id = workspace_id,
-            workspace_name = workspace_name,
-            target_id = target and target.target_id or nil,
-            target_path = target and target.target_path or nil,
-            target_repo = target and target.target_repo or nil,
-            metadata = metadata,
-        })
+        local response = dispatch_local_command_response(command)
         if response.session_uuid then
             local created = Agent.get(response.session_uuid)
             if created then
-                return session_payload(created)
+                local payload = session_payload(created)
+                payload.request_id = response.request_id or command.request_id
+                payload.assignment_id = response.assignment_id or command.metadata.assignment_id
+                return payload
             end
         end
         for _, session in ipairs(Agent.list()) do
@@ -426,27 +484,55 @@ function Hub:create_agent(issue_or_branch, prompt, agent_name, workspace_id, wor
         end
         return {
             status = response.status or "pending",
+            request_id = response.request_id or command.request_id,
+            assignment_id = response.assignment_id or command.metadata.assignment_id,
             message = "Agent creation initiated (worktree may be creating async)",
         }
     end
 
-    local result = hub_client.request(self._conn_id, {
-        type = "create_agent",
-        issue_or_branch = issue_or_branch,
-        prompt = prompt,
-        agent_name = agent_name,
-        workspace_id = workspace_id,
-        workspace_name = workspace_name,
-        target_id = target and target.target_id or nil,
-        target_path = target and target.target_path or nil,
-        target_repo = target and target.target_repo or nil,
-    }, 60000)
+    local result = hub_client.request(self._conn_id, command, 60000)
 
     if result.error then
         error(string.format("Hub:create_agent remote error: %s", result.error))
     end
 
     return result.result
+end
+
+--- List sessions owned by a plugin.
+-- @param owner_plugin string Plugin key
+-- @return array of { session_uuid, label, metadata, status }
+function Hub:list_owned_sessions(owner_plugin)
+    if self._is_local then
+        local owned = {}
+        for _, session in ipairs(Agent.list()) do
+            if session.owner_plugin == owner_plugin
+                    or (session.metadata and session.metadata.owner_plugin == owner_plugin) then
+                owned[#owned + 1] = {
+                    session_uuid = session.session_uuid,
+                    label = session.label,
+                    metadata = session.metadata,
+                    status = session.status,
+                }
+            end
+        end
+        return owned
+    end
+
+    local result = hub_client.request(self._conn_id, {
+        type = "list_owned_sessions",
+        owner_plugin = owner_plugin,
+    }, 10000)
+
+    if result.error then
+        error(string.format("Hub:list_owned_sessions remote error: %s", result.error))
+    end
+
+    local response = result.result or {}
+    if response.sessions then
+        return response.sessions
+    end
+    return response
 end
 
 --- List workspaces on this hub.

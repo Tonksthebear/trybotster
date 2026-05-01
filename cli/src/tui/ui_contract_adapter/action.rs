@@ -27,6 +27,8 @@
 //!
 //! - `id:<node.id>` when the source [`UiNode`] has an explicit stable
 //!   [`UiNode::id`], or
+//! - `id:<node.id>#<n>` when several controls under the same source node
+//!   each emit an action, or
 //! - `anon:<n>` where `n` is a monotonic counter incremented every time
 //!   the adapter records an anonymous action.
 //!
@@ -51,8 +53,9 @@ use crate::ui_contract::node::UiAction;
 #[derive(Debug, Clone)]
 pub struct ActionEntry {
     /// Walk-order-unique key. `id:<node.id>` when the source node has an
-    /// explicit id; `anon:<n>` otherwise. Never collides across rows in
-    /// the same render pass.
+    /// explicit id, `id:<node.id>#<n>` for later actions sharing that node id,
+    /// or `anon:<n>` otherwise. Never collides across rows in the same render
+    /// pass.
     pub key: String,
     /// The source node's stable id, mirrored from [`UiNode::id`] when
     /// present. Separate from `key` so callers can correlate against
@@ -86,15 +89,22 @@ impl ActionTable {
 
     /// Record an action envelope.
     ///
-    /// When `node_id` is `Some`, the entry's key is
-    /// `"id:<node_id>"`; otherwise the adapter mints a fresh
-    /// `"anon:<n>"` key so same-id rows do not collide.
+    /// When `node_id` is `Some`, the first entry's key is `"id:<node_id>"`.
+    /// Later entries for the same node id get `"id:<node_id>#<n>"`.
+    /// Anonymous entries get a fresh `"anon:<n>"` key.
     ///
     /// Returns the newly inserted entry's key so the caller can correlate
     /// it back to the rendered row if needed.
     pub fn insert(&mut self, node_id: Option<&str>, action: UiAction) -> String {
         let key = if let Some(id) = node_id {
-            format!("id:{id}")
+            let base = format!("id:{id}");
+            if self.entries.iter().any(|entry| entry.key == base) {
+                let n = self.next_anon;
+                self.next_anon = self.next_anon.wrapping_add(1);
+                format!("{base}#{n}")
+            } else {
+                base
+            }
         } else {
             let n = self.next_anon;
             self.next_anon = self.next_anon.wrapping_add(1);
@@ -171,6 +181,16 @@ mod tests {
         let key = table.insert(Some("row-1"), UiAction::new("x"));
         assert_eq!(key, "id:row-1");
         assert_eq!(table.get("id:row-1").expect("found").action.id, "x");
+    }
+
+    #[test]
+    fn insert_with_repeated_node_id_produces_unique_scoped_keys() {
+        let mut table = ActionTable::new();
+        let k1 = table.insert(Some("select-1"), UiAction::new("choose"));
+        let k2 = table.insert(Some("select-1"), UiAction::new("choose"));
+        assert_eq!(k1, "id:select-1");
+        assert_eq!(k2, "id:select-1#0");
+        assert_eq!(table.len(), 2);
     }
 
     #[test]

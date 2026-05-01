@@ -175,6 +175,7 @@ end
 --   env             table    (optional)  base environment variables
 --   dims            table    (optional)  { rows = 24, cols = 80 }
 --   agent_name      string   (optional)  config agent name (e.g., "codex")
+--   label           string   (optional)  human-readable session label
 --   owner_plugin    string   (optional)  plugin that owns this session
 --   visibility      string   (optional)  "workspace" (default), "plugin", or "hidden"
 --   surface         string   (optional)  owning surface for plugin-scoped navigation
@@ -241,6 +242,8 @@ function Session._init(self, config)
     self._workspace_name = workspace_name
     self._workspace_metadata = config.workspace_metadata or {}
     self.agent_name = config.agent_name
+    self.label = config.label
+    self.task = config.task
     self.owner_plugin = config.owner_plugin or metadata.owner_plugin
     self.visibility = config.visibility or metadata.visibility or "workspace"
     self.surface = config.surface or metadata.surface

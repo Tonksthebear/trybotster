@@ -1330,6 +1330,71 @@ impl Hub {
                             let _ = event_tx.send(event);
                         });
                     }
+                    HubRequest::RunCommandGate {
+                        request_id,
+                        command,
+                        cwd,
+                        timeout_secs,
+                        env,
+                        config_path,
+                        config_contents,
+                        metadata,
+                        context,
+                    } => {
+                        let event_tx = self.hub_event_tx.clone();
+                        self.tokio_runtime.spawn(async move {
+                            let request_id_for_task = request_id.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                crate::plugin_helpers::run_command_gate(
+                                    crate::plugin_helpers::CommandGateRequest {
+                                        command,
+                                        cwd: std::path::PathBuf::from(cwd),
+                                        timeout: if timeout_secs > 0.0 {
+                                            std::time::Duration::from_secs_f64(timeout_secs)
+                                        } else {
+                                            std::time::Duration::ZERO
+                                        },
+                                        env,
+                                        config_path: config_path.map(std::path::PathBuf::from),
+                                        config_contents,
+                                    },
+                                )
+                            })
+                            .await;
+
+                            let event = match result {
+                                Ok(completion) => {
+                                    crate::hub::events::HubEvent::CommandGateCompleted {
+                                        request_id: request_id_for_task,
+                                        metadata,
+                                        context,
+                                        success: completion.success,
+                                        exit_status: completion.exit_status,
+                                        stdout_tail: completion.output_summary.stdout_tail,
+                                        stderr_tail: completion.output_summary.stderr_tail,
+                                        output_truncated: completion.output_summary.truncated,
+                                        error_kind: completion.error_kind,
+                                        error: completion.error,
+                                        duration_ms: completion.duration_ms,
+                                    }
+                                }
+                                Err(error) => crate::hub::events::HubEvent::CommandGateCompleted {
+                                    request_id: request_id_for_task,
+                                    metadata,
+                                    context,
+                                    success: false,
+                                    exit_status: None,
+                                    stdout_tail: String::new(),
+                                    stderr_tail: String::new(),
+                                    output_truncated: false,
+                                    error_kind: Some("task_failed".to_string()),
+                                    error: Some(format!("Command gate task failed: {error}")),
+                                    duration_ms: 0,
+                                },
+                            };
+                            let _ = event_tx.send(event);
+                        });
+                    }
                     HubRequest::HandleSignalingMessage { message } => {
                         self.handle_signaling_message(message);
                     }
@@ -1530,6 +1595,36 @@ impl Hub {
                     .fire_json_event("plugin_command_prepared", &payload)
                 {
                     log::error!("Failed to fire plugin_command_prepared: {e}");
+                }
+            }
+            HubEvent::CommandGateCompleted {
+                request_id,
+                metadata,
+                context,
+                success,
+                exit_status,
+                stdout_tail,
+                stderr_tail,
+                output_truncated,
+                error_kind,
+                error,
+                duration_ms,
+            } => {
+                let payload = serde_json::json!({
+                    "request_id": request_id,
+                    "metadata": metadata,
+                    "context": context,
+                    "success": success,
+                    "exit_status": exit_status,
+                    "stdout_tail": stdout_tail,
+                    "stderr_tail": stderr_tail,
+                    "output_truncated": output_truncated,
+                    "error_kind": error_kind,
+                    "error": error,
+                    "duration_ms": duration_ms,
+                });
+                if let Err(e) = self.lua.fire_json_event("command_gate_completed", &payload) {
+                    log::error!("Failed to fire command_gate_completed: {e}");
                 }
             }
             HubEvent::MessageDelivered { message_len } => {

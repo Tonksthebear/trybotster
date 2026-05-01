@@ -80,6 +80,10 @@ Use `events.on(event, fn(data))` for Rust-emitted events:
 - `plugin_command_prepared` — completion for `hub.prepare_plugin_command`;
   includes `request_id`, optional `command`/`config_path`, opaque `context`,
   `error_kind`, and `error`.
+- `command_gate_completed` — completion for `hub.run_command_gate`; includes
+  `request_id`, `success`, `exit_status`, `duration_ms`, bounded
+  `stdout_tail`/`stderr_tail`, optional `metadata`/`context`, `error_kind`,
+  and `error`.
 - `url_probe_ready` — completion for `hub.probe_url_ready`.
 - `outgoing_signal`
 
@@ -99,12 +103,48 @@ commands.register("notify-slack", function(client, sub_id, command)
 end, { description = "Send Slack notification" })
 ```
 
+## Plugin-Orchestration Helpers
+
+For plugin-owned agent sessions, prefer the table-style hub API:
+
+```lua
+local Hub = require("lib.hub")
+
+local result = Hub.get():create_agent{
+  target_id = "tgt_...",
+  agent_name = "codex",
+  label = "Workflow worker",
+  prompt = "Do the assigned work",
+  request_id = "spawn-run-123",
+  metadata = {
+    owner_plugin = "projects",
+    visibility = "plugin",
+    surface = "projects",
+    run_id = "run-123",
+    role = "worker",
+  },
+}
+```
+
+`request_id` is the correlation token. If omitted, Botster mints a
+hub-prefixed `msg_...` ID. It is echoed through create/lifecycle/worktree paths
+so plugins can recover async worktree creation. Use
+`Hub.get():list_owned_sessions(owner_plugin)` after reload to rebuild a
+plugin's in-flight session projection.
+
+Use `hub.run_command_gate({...})` for one-shot command gates. It composes with
+`hub.prepare_plugin_command`, executes off the event loop, captures bounded
+output tails, and emits `command_gate_completed`. Keep `metadata`/`context`
+small and correlation-only because they are echoed into the completion event.
+
 ## Rules
 
 - Use async table-first primitives inside callbacks.
 - Do not call blocking sync primitives after the hub event loop starts.
 - Use `hub.prepare_plugin_command` for plugin command PATH/config preparation
   that would otherwise block action handlers.
+- Use `hub.run_command_gate` for test/build/lint gates that need captured exit
+  status and bounded output without a PTY session.
 - Store durable plugin state in `plugin.db{}` during plugin load.
 - Use `session_uuid` as the routing key.
 - Keep plugins generic; Botster should stay agent-CLI agnostic.

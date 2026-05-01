@@ -114,6 +114,24 @@ handled by Rust and does not reach Lua.
 - `connection_code`
 - `empty`
 
+## Shared UI Contract Forms
+
+Plugin surfaces should use the shared `ui_contract` primitives rather than
+hand-rolled renderer-specific controls. The v1 public form set is:
+
+- `ui.text_input` — editable in web and TUI.
+- `ui.textarea` — Catalyst textarea on web; read-only/display-only paragraph in
+  TUI v1.
+- `ui.checkbox` — Catalyst checkbox on web; compact `[x]`/`[ ]` list row in TUI.
+- `ui.select` — Catalyst select on web; list rows with per-option actions in TUI.
+
+Toggle and tabs are intentionally not public v1 primitives. Represent a binary
+choice with checkbox or select until a real cross-client need justifies a
+separate primitive.
+
+Keep Lua descriptors semantic and renderer-neutral. Use `on_change` actions for
+input changes; do not add web-only props such as class names.
+
 ## Action Ops
 
 - `set_mode`

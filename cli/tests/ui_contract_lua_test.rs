@@ -23,9 +23,9 @@
 use botster::ui_contract::lua::register;
 use botster::ui_contract::node::{UiChild, UiConditional, UiNode};
 use botster::ui_contract::{
-    BadgeProps, ButtonProps, DialogProps, EmptyStateProps, IconButtonProps, IconProps, InlineProps,
-    PanelProps, ScrollAreaProps, StackProps, StatusDotProps, TextProps, TreeItemProps,
-    UiWidthClass,
+    BadgeProps, ButtonProps, CheckboxProps, DialogProps, EmptyStateProps, IconButtonProps,
+    IconProps, InlineProps, PanelProps, ScrollAreaProps, SelectProps, StackProps, StatusDotProps,
+    TextInputProps, TextProps, TextareaProps, TreeItemProps, UiWidthClass,
 };
 use mlua::{Lua, LuaSerdeExt, Value};
 use serde_json::{json, Value as JsonValue};
@@ -183,6 +183,116 @@ fn icon_button_rejects_disabled() {
         .eval::<Value>()
         .unwrap_err();
     assert!(err.to_string().contains("disabled"), "got {err}");
+}
+
+#[test]
+fn form_primitives_round_trip_semantic_props() {
+    let lua = new_ui_lua();
+
+    let text_input = eval_to_node(
+        &lua,
+        r#"return ui.text_input{
+            id = "project-name",
+            label = "Project name",
+            value = "Botster",
+            placeholder = "Name",
+            on_change = ui.action("workflow.project.name.change", { projectId = "p1" }),
+        }"#,
+    );
+    assert_eq!(text_input.node_type, "text_input");
+    assert_eq!(text_input.id.as_deref(), Some("project-name"));
+    let props: TextInputProps =
+        serde_json::from_value(serde_json::Value::Object(text_input.props)).expect("text input");
+    assert_eq!(props.label.as_deref(), Some("Project name"));
+    assert_eq!(
+        props.on_change.as_ref().map(|action| action.id.as_str()),
+        Some("workflow.project.name.change")
+    );
+
+    let textarea = eval_to_node(
+        &lua,
+        r#"return ui.textarea{
+            id = "project-notes",
+            label = "Notes",
+            placeholder = "Describe the workflow",
+            on_change = ui.action("workflow.project.notes.change"),
+        }"#,
+    );
+    let props: TextareaProps =
+        serde_json::from_value(serde_json::Value::Object(textarea.props)).expect("textarea");
+    assert_eq!(props.placeholder.as_deref(), Some("Describe the workflow"));
+
+    let checkbox = eval_to_node(
+        &lua,
+        r#"return ui.checkbox{
+            id = "requires-review",
+            label = "Requires review",
+            selected = true,
+            on_change = ui.action("workflow.project.review.toggle"),
+        }"#,
+    );
+    let props: CheckboxProps =
+        serde_json::from_value(serde_json::Value::Object(checkbox.props)).expect("checkbox");
+    assert_eq!(props.selected, Some(true));
+
+    let select = eval_to_node(
+        &lua,
+        r#"return ui.select{
+            id = "priority",
+            label = "Priority",
+            value = "high",
+            options = {
+                { value = "normal", label = "Normal" },
+                { value = "high", label = "High" },
+            },
+            on_change = ui.action("workflow.project.priority.change"),
+        }"#,
+    );
+    let props: SelectProps =
+        serde_json::from_value(serde_json::Value::Object(select.props)).expect("select");
+    assert_eq!(props.value.as_deref(), Some("high"));
+    assert_eq!(props.options.len(), 2);
+}
+
+#[test]
+fn form_primitives_reject_web_only_props() {
+    let lua = new_ui_lua();
+    let err = lua
+        .load(r#"return ui.text_input{ id = "x", class_name = "web-only" }"#)
+        .eval::<Value>()
+        .unwrap_err();
+    assert!(err.to_string().contains("unknown prop"), "got {err}");
+    assert!(err.to_string().contains("className"), "got {err}");
+}
+
+#[test]
+fn select_options_require_value_and_label_at_construction() {
+    let lua = new_ui_lua();
+    let err = lua
+        .load(
+            r#"return ui.select{
+                id = "priority",
+                options = {
+                    { value = "high" },
+                },
+            }"#,
+        )
+        .eval::<Value>()
+        .unwrap_err();
+    assert!(err.to_string().contains("label"), "got {err}");
+
+    let err = lua
+        .load(
+            r#"return ui.select{
+                id = "priority",
+                options = {
+                    { label = "High" },
+                },
+            }"#,
+        )
+        .eval::<Value>()
+        .unwrap_err();
+    assert!(err.to_string().contains("value"), "got {err}");
 }
 
 #[test]
@@ -641,18 +751,11 @@ fn menu_and_menu_item_not_lua_public() {
 }
 
 #[test]
-fn text_input_checkbox_toggle_select_not_lua_public() {
-    // These primitives are in the broader cross-client shared vocabulary but
-    // intentionally deferred from the current Lua-public inventory per
-    // `phase one web ui composites stay internal while Lua public contract stops at primitives.md`.
+fn toggle_not_lua_public() {
+    // Toggle is deferred from the v1 form primitive set.
     let lua = new_ui_lua();
-    for name in ["text_input", "checkbox", "toggle", "select"] {
-        let v: Value = lua.load(&format!("return ui.{name}")).eval().expect("eval");
-        assert!(
-            matches!(v, Value::Nil),
-            "ui.{name} must not be exposed in current"
-        );
-    }
+    let v: Value = lua.load("return ui.toggle").eval().expect("eval");
+    assert!(matches!(v, Value::Nil));
 }
 
 #[test]

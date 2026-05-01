@@ -51,7 +51,12 @@ fn new_agents_lua_vm() -> Lua {
                     push_order("worktree_created")
                 end
             end,
-            call = function(_, params) return params end,
+            call = function(event, params)
+                if event == "before_agent_create" then
+                    _G.__before_agent_create = params
+                end
+                return params
+            end,
         }}
 
         _G.events = {{
@@ -130,12 +135,14 @@ fn new_agents_lua_vm() -> Lua {
                 count = function() return 0 end,
                 new = function(config)
                     push_order("agent_new")
+                    _G.__agent_new_config = config
                     return {{
                         info = function()
                             return {{
                                 session_uuid = "agent-1",
                                 branch_name = config.branch_name,
                                 worktree_path = config.worktree_path,
+                                metadata = config.metadata,
                             }}
                         end,
                     }}
@@ -172,7 +179,19 @@ fn external_target_queues_async_worktree_and_spawns_after_created_event() {
             nil,
             nil,
             "codex",
-            { source = "test" },
+            {
+                source = "test",
+                request_id = "req-async-77",
+                assignment_id = "assign-77",
+                owner_plugin = "workflow",
+                visibility = "plugin",
+                surface = "workflow.queue",
+                ticket_id = "TKT-77",
+                run_id = "run-77",
+                gate_id = "gate-77",
+                role = "implementer",
+                label = "Workflow worker",
+            },
             {
                 target_id = "target-jupiter",
                 target_path = "/repos/jupiter",
@@ -184,12 +203,20 @@ fn external_target_queues_async_worktree_and_spawns_after_created_event() {
     .exec()
     .expect("create agent through external target path");
 
-    let (queued_branch, queued_repo_root, spawned_before_event): (String, String, usize) = lua
+    let (
+        queued_branch,
+        queued_repo_root,
+        queued_request_id,
+        queued_assignment_id,
+        spawned_before_event,
+    ): (String, String, String, String, usize) = lua
         .load(
             r#"
             return
                 _G.__create_async_args.branch,
                 _G.__create_async_args.repo_root,
+                _G.__create_async_args.metadata.request_id,
+                _G.__create_async_args.metadata.assignment_id,
                 #_G.__order
             "#,
         )
@@ -198,6 +225,8 @@ fn external_target_queues_async_worktree_and_spawns_after_created_event() {
 
     assert_eq!(queued_branch, "botster-issue-77");
     assert_eq!(queued_repo_root, "/repos/jupiter");
+    assert_eq!(queued_request_id, "req-async-77");
+    assert_eq!(queued_assignment_id, "assign-77");
     assert_eq!(spawned_before_event, 0);
 
     lua.load(
@@ -216,32 +245,84 @@ fn external_target_queues_async_worktree_and_spawns_after_created_event() {
     .exec()
     .expect("fire async completion event");
 
-    let (first, second, worktree_created_count, path, branch, repo): (
+    let (
+        first,
+        second,
+        worktree_created_count,
+        path,
+        branch,
+        repo,
+        before_request_id,
+        before_assignment_id,
+        worktree_request_id,
+        worktree_assignment_id,
+        agent_metadata_ok,
+        agent_created_request_id,
+        agent_created_assignment_id,
+        agent_config_label,
+        after_agent_create_count,
+    ): (
         String,
         String,
         usize,
         String,
         String,
         String,
+        String,
+        String,
+        String,
+        String,
+        bool,
+        String,
+        String,
+        String,
+        usize,
     ) = lua
         .load(
             r#"
             local hook_payload
+            local agent_created_payload
+            local after_agent_create_count = 0
             local worktree_created_count = 0
             for _, note in ipairs(_G.__notifications) do
                 if note.event == "worktree_created" then
                     worktree_created_count = worktree_created_count + 1
                     hook_payload = note.payload
+                elseif note.event == "agent_created" then
+                    agent_created_payload = note.payload
+                elseif note.event == "after_agent_create" then
+                    after_agent_create_count = after_agent_create_count + 1
                 end
             end
 
+            local m = _G.__agent_new_config.metadata
             return
                 _G.__order[1],
                 _G.__order[2],
                 worktree_created_count,
                 hook_payload.path,
                 hook_payload.branch,
-                hook_payload.repo
+                hook_payload.repo,
+                _G.__before_agent_create.request_id,
+                _G.__before_agent_create.assignment_id,
+                hook_payload.request_id,
+                hook_payload.assignment_id,
+                m.request_id == "req-async-77"
+                    and m.assignment_id == "assign-77"
+                    and m.owner_plugin == "workflow"
+                    and m.visibility == "plugin"
+                    and m.surface == "workflow.queue"
+                    and m.ticket_id == "TKT-77"
+                    and m.run_id == "run-77"
+                    and m.gate_id == "gate-77"
+                    and m.role == "implementer"
+                    and m.target_id == "target-jupiter"
+                    and m.target_path == "/repos/jupiter"
+                    and m.target_repo == "acme/jupiter",
+                agent_created_payload.request_id,
+                agent_created_payload.assignment_id,
+                _G.__agent_new_config.label,
+                after_agent_create_count
             "#,
         )
         .eval()
@@ -253,4 +334,16 @@ fn external_target_queues_async_worktree_and_spawns_after_created_event() {
     assert_eq!(path, "/repos/jupiter/.worktrees/botster-issue-77");
     assert_eq!(branch, "botster-issue-77");
     assert_eq!(repo, "acme/jupiter");
+    assert_eq!(before_request_id, "req-async-77");
+    assert_eq!(before_assignment_id, "assign-77");
+    assert_eq!(worktree_request_id, "req-async-77");
+    assert_eq!(worktree_assignment_id, "assign-77");
+    assert!(
+        agent_metadata_ok,
+        "agent spawn should preserve plugin metadata"
+    );
+    assert_eq!(agent_created_request_id, "req-async-77");
+    assert_eq!(agent_created_assignment_id, "assign-77");
+    assert_eq!(agent_config_label, "Workflow worker");
+    assert_eq!(after_agent_create_count, 0);
 }

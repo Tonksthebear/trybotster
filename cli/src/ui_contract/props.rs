@@ -223,6 +223,95 @@ pub struct IconButtonProps {
     pub tone: Option<UiButtonTone>,
 }
 
+/// `TextInput` props.
+///
+/// `value = Some(_)` means Lua owns the current value. When `value` is absent
+/// and the node has a stable envelope id, renderers may keep local input state.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextInputProps {
+    /// Optional label text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Current value in controlled mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Placeholder text for empty input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    /// Action emitted when the value changes. Renderers merge `value` into
+    /// the action payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_change: Option<UiAction>,
+}
+
+/// `Textarea` props.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextareaProps {
+    /// Optional label text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Current value in controlled mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Placeholder text for empty textarea.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    /// Action emitted when the value changes. Renderers merge `value` into
+    /// the action payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_change: Option<UiAction>,
+}
+
+/// `Checkbox` props.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckboxProps {
+    /// Optional label text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Current selected state in controlled mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<bool>,
+    /// Action emitted when the selection changes. Renderers merge `selected`
+    /// into the action payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_change: Option<UiAction>,
+}
+
+/// One option in a `Select` primitive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectOptionProps {
+    /// Stable option value.
+    pub value: String,
+    /// Human label shown by renderers.
+    pub label: String,
+}
+
+/// `Select` props.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectProps {
+    /// Optional label text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Current value in controlled mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Placeholder text for no selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    /// Selectable options.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<SelectOptionProps>,
+    /// Action emitted when the value changes. Renderers merge `value` into
+    /// the action payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_change: Option<UiAction>,
+}
+
 // Tree has no shared props in current — the web-only `density` surface variant
 // is a renderer-internal concern and is intentionally excluded from this
 // contract. No `TreeProps` struct exists; renderers deserialize Tree

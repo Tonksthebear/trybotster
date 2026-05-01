@@ -101,6 +101,28 @@ pub enum HubRequest {
         /// Opaque plugin-owned context returned with the completion event.
         context: serde_json::Value,
     },
+    /// Run a plugin-owned one-shot command gate on the blocking worker pool,
+    /// then fire `command_gate_completed`.
+    RunCommandGate {
+        /// Plugin-scoped request token used to ignore stale completions.
+        request_id: String,
+        /// Command line to execute.
+        command: String,
+        /// Required working directory.
+        cwd: String,
+        /// Deadline in seconds.
+        timeout_secs: f64,
+        /// Extra environment variables for the command.
+        env: std::collections::BTreeMap<String, String>,
+        /// Optional config file path to write before running the command.
+        config_path: Option<String>,
+        /// Optional config file contents.
+        config_contents: Option<String>,
+        /// Opaque plugin-owned metadata returned with the completion event.
+        metadata: serde_json::Value,
+        /// Opaque plugin-owned context returned with the completion event.
+        context: serde_json::Value,
+    },
     /// Handle an incoming ActionCable signaling/control message for WebRTC.
     HandleSignalingMessage {
         /// Full message payload from the Lua ActionCable adapter.
@@ -998,8 +1020,8 @@ pub(crate) fn register(
             let command: String = opts
                 .get("command")
                 .map_err(|_| LuaError::runtime("prepare_plugin_command: command is required"))?;
-            let config_path: Option<String> = opts.get("config_path").ok();
-            let config_contents: Option<String> = opts.get("config_contents").ok();
+            let config_path: Option<String> = optional_string_field(&opts, "config_path")?;
+            let config_contents: Option<String> = optional_string_field(&opts, "config_contents")?;
             let context_value: LuaValue = opts.get("context").unwrap_or(LuaValue::Nil);
             let context: serde_json::Value = lua.from_value(context_value)?;
 
@@ -1025,6 +1047,90 @@ pub(crate) fn register(
 
     hub.set("prepare_plugin_command", prepare_plugin_command_fn)
         .map_err(|e| anyhow!("Failed to set hub.prepare_plugin_command: {e}"))?;
+
+    // hub.run_command_gate({ request_id, command, cwd, timeout_secs, env?, metadata?, context? })
+    //
+    // Queues a one-shot command on the blocking worker pool. Completion
+    // is delivered through `command_gate_completed` with bounded output and
+    // the original request_id, metadata, and context.
+    let tx_run_command_gate = Arc::clone(&hub_event_tx);
+    let run_command_gate_fn = lua
+        .create_function(move |lua, opts: LuaTable| {
+            let request_id: String = opts.get("request_id").map_err(|e| {
+                LuaError::runtime(format!("run_command_gate: request_id is required: {e}"))
+            })?;
+            let command: String = opts.get("command").map_err(|e| {
+                LuaError::runtime(format!("run_command_gate: command is required: {e}"))
+            })?;
+            let cwd: String = opts.get("cwd").map_err(|e| {
+                LuaError::runtime(format!("run_command_gate: cwd is required: {e}"))
+            })?;
+            let timeout_secs: f64 = opts
+                .get("timeout_secs")
+                .or_else(|_| opts.get("timeout"))
+                .map_err(|e| {
+                    LuaError::runtime(format!("run_command_gate: timeout_secs is required: {e}"))
+                })?;
+            if !timeout_secs.is_finite() {
+                return Err(LuaError::runtime(
+                    "run_command_gate: timeout_secs must be finite",
+                ));
+            }
+
+            let env = match opts.get::<LuaValue>("env").unwrap_or(LuaValue::Nil) {
+                LuaValue::Nil => std::collections::BTreeMap::new(),
+                LuaValue::Table(table) => {
+                    let mut env = std::collections::BTreeMap::new();
+                    for pair in table.pairs::<String, String>() {
+                        let (key, value) = pair.map_err(|e| {
+                            LuaError::runtime(format!(
+                                "run_command_gate: env must be a string map: {e}"
+                            ))
+                        })?;
+                        env.insert(key, value);
+                    }
+                    env
+                }
+                _ => {
+                    return Err(LuaError::runtime(
+                        "run_command_gate: env must be a table when provided",
+                    ))
+                }
+            };
+            let config_path: Option<String> = optional_string_field(&opts, "config_path")?;
+            let config_contents: Option<String> = optional_string_field(&opts, "config_contents")?;
+
+            let metadata_value: LuaValue = opts.get("metadata").unwrap_or(LuaValue::Nil);
+            let metadata: serde_json::Value = lua.from_value(metadata_value)?;
+            let context_value: LuaValue = opts.get("context").unwrap_or(LuaValue::Nil);
+            let context: serde_json::Value = lua.from_value(context_value)?;
+
+            let guard = tx_run_command_gate
+                .lock()
+                .expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaHubRequest(HubRequest::RunCommandGate {
+                    request_id,
+                    command,
+                    cwd,
+                    timeout_secs,
+                    env,
+                    config_path,
+                    config_contents,
+                    metadata,
+                    context,
+                }));
+            } else {
+                ::log::warn!(
+                    "[Hub] run_command_gate called before hub_event_tx set — event dropped"
+                );
+            }
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create hub.run_command_gate function: {e}"))?;
+
+    hub.set("run_command_gate", run_command_gate_fn)
+        .map_err(|e| anyhow!("Failed to set hub.run_command_gate: {e}"))?;
 
     // hub.probe_url_ready(connector_uuid, parent_uuid, url, hostname, timeout_secs?)
     // Plugin-facing URL readiness gate: waits for public DNS plus HTTPS
@@ -1064,6 +1170,17 @@ pub(crate) fn register(
         .map_err(|e| anyhow!("Failed to register hub table globally: {e}"))?;
 
     Ok(())
+}
+
+fn optional_string_field(table: &LuaTable, key: &str) -> LuaResult<Option<String>> {
+    match table.get::<LuaValue>(key)? {
+        LuaValue::Nil => Ok(None),
+        LuaValue::String(value) => Ok(Some(value.to_str()?.to_string())),
+        other => Err(LuaError::runtime(format!(
+            "run_command_gate: {key} must be a string when provided, got {}",
+            other.type_name()
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -1115,6 +1232,7 @@ mod tests {
         assert!(hub.contains_key("dev_rebuild").unwrap());
         assert!(hub.contains_key("resolve_command_path").unwrap());
         assert!(hub.contains_key("prepare_plugin_command").unwrap());
+        assert!(hub.contains_key("run_command_gate").unwrap());
         assert!(hub.contains_key("pty_tee").unwrap());
     }
 
@@ -1163,6 +1281,133 @@ mod tests {
             }
             other => panic!("Expected PreparePluginCommand, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn run_command_gate_sends_hub_request() {
+        let lua = Lua::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx: HubEventSender = Arc::new(Mutex::new(Some(event_tx.into())));
+        let cache = Arc::new(HandleCache::new());
+        let hid = "test-local-hub-id".to_string();
+        let sid = Arc::new(Mutex::new(Some("test-hub-id".to_string())));
+        let state = Arc::new(RwLock::new(HubState::new(std::path::PathBuf::from(
+            "/tmp/test-worktrees",
+        ))));
+        let cc = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
+
+        lua.load(
+            r#"
+            hub.run_command_gate({
+              request_id = "gate-1",
+              command = "bin/check-ready",
+              cwd = "/tmp/project",
+              timeout_secs = 2,
+              env = { RAILS_ENV = "test" },
+              config_path = "/tmp/gate.json",
+              config_contents = "{}\n",
+              metadata = { stage = "verify" },
+              context = { session_uuid = "sess-1" },
+            })
+            "#,
+        )
+        .exec()
+        .expect("run_command_gate should send request");
+
+        match event_rx.try_recv().expect("Should send hub request") {
+            HubEvent::LuaHubRequest(HubRequest::RunCommandGate {
+                request_id,
+                command,
+                cwd,
+                timeout_secs,
+                env,
+                config_path,
+                config_contents,
+                metadata,
+                context,
+            }) => {
+                assert_eq!(request_id, "gate-1");
+                assert_eq!(command, "bin/check-ready");
+                assert_eq!(cwd, "/tmp/project");
+                assert_eq!(timeout_secs, 2.0);
+                assert_eq!(env.get("RAILS_ENV").map(String::as_str), Some("test"));
+                assert_eq!(config_path.as_deref(), Some("/tmp/gate.json"));
+                assert_eq!(config_contents.as_deref(), Some("{}\n"));
+                assert_eq!(metadata["stage"], "verify");
+                assert_eq!(context["session_uuid"], "sess-1");
+            }
+            other => panic!("Expected RunCommandGate, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_command_gate_rejects_non_string_config_options() {
+        let lua = Lua::new();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx: HubEventSender = Arc::new(Mutex::new(Some(event_tx.into())));
+        let cache = Arc::new(HandleCache::new());
+        let hid = "test-local-hub-id".to_string();
+        let sid = Arc::new(Mutex::new(Some("test-hub-id".to_string())));
+        let state = Arc::new(RwLock::new(HubState::new(std::path::PathBuf::from(
+            "/tmp/test-worktrees",
+        ))));
+        let cc = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
+
+        let err = lua
+            .load(
+                r#"
+                hub.run_command_gate({
+                  request_id = "gate-1",
+                  command = "bin/check-ready",
+                  cwd = "/tmp/project",
+                  timeout_secs = 2,
+                  config_path = { "/tmp/gate.json" },
+                })
+                "#,
+            )
+            .exec()
+            .expect_err("non-string config_path should fail");
+
+        assert!(
+            err.to_string().contains("config_path must be a string"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn run_command_gate_rejects_non_finite_timeout() {
+        let lua = Lua::new();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tx: HubEventSender = Arc::new(Mutex::new(Some(event_tx.into())));
+        let cache = Arc::new(HandleCache::new());
+        let hid = "test-local-hub-id".to_string();
+        let sid = Arc::new(Mutex::new(Some("test-hub-id".to_string())));
+        let state = Arc::new(RwLock::new(HubState::new(std::path::PathBuf::from(
+            "/tmp/test-worktrees",
+        ))));
+        let cc = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
+
+        let err = lua
+            .load(
+                r#"
+                hub.run_command_gate({
+                  request_id = "gate-1",
+                  command = "bin/check-ready",
+                  cwd = "/tmp/project",
+                  timeout_secs = 0 / 0,
+                })
+                "#,
+            )
+            .exec()
+            .expect_err("NaN timeout should fail");
+
+        assert!(
+            err.to_string().contains("timeout_secs must be finite"),
+            "{err}"
+        );
     }
 
     #[test]

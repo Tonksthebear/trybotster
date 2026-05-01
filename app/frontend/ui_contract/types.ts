@@ -216,6 +216,39 @@ export type IconButtonProps = {
   tone?: UiButtonTone
 }
 
+export type TextInputProps = {
+  label?: string
+  value?: string
+  placeholder?: string
+  onChange?: UiAction
+}
+
+export type TextareaProps = {
+  label?: string
+  value?: string
+  placeholder?: string
+  onChange?: UiAction
+}
+
+export type CheckboxProps = {
+  label?: string
+  selected?: boolean
+  onChange?: UiAction
+}
+
+export type SelectOptionProps = {
+  value: string
+  label: string
+}
+
+export type SelectProps = {
+  label?: string
+  value?: string
+  placeholder?: string
+  options: SelectOptionProps[]
+  onChange?: UiAction
+}
+
 /**
  * Tree has no shared props in current — the web-only `density` surface variant is
  * renderer-internal. Renderers read Tree nodes without a props struct.
@@ -323,6 +356,10 @@ export type UiPrimitiveType =
   | 'empty_state'
   | 'button'
   | 'icon_button'
+  | 'text_input'
+  | 'textarea'
+  | 'checkbox'
+  | 'select'
   | 'tree'
   | 'tree_item'
   | 'dialog'

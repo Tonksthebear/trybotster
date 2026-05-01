@@ -246,6 +246,32 @@ pub(crate) enum HubEvent {
         error: Option<String>,
     },
 
+    /// One-shot plugin command gate completed.
+    CommandGateCompleted {
+        /// Plugin-scoped request token from the original request.
+        request_id: String,
+        /// Opaque plugin-owned metadata from the original request.
+        metadata: serde_json::Value,
+        /// Opaque plugin-owned context from the original request.
+        context: serde_json::Value,
+        /// Whether the command exited successfully before timeout.
+        success: bool,
+        /// Process exit status when available.
+        exit_status: Option<i32>,
+        /// Bounded stdout tail.
+        stdout_tail: String,
+        /// Bounded stderr tail.
+        stderr_tail: String,
+        /// True when captured output exceeded the tail bound.
+        output_truncated: bool,
+        /// Stable machine-readable error kind when the gate failed.
+        error_kind: Option<String>,
+        /// Human-readable error message when the gate failed.
+        error: Option<String>,
+        /// Elapsed runtime in milliseconds.
+        duration_ms: u128,
+    },
+
     // =========================================================================
     // Socket IPC events — Unix domain socket client connections
     // =========================================================================
@@ -414,6 +440,7 @@ impl HubEvent {
             Self::PushSubscriptionsExpired { .. } => "push_subscriptions_expired",
             Self::UrlProbeReady { .. } => "url_probe_ready",
             Self::PluginCommandPrepared { .. } => "plugin_command_prepared",
+            Self::CommandGateCompleted { .. } => "command_gate_completed",
             Self::SocketClientConnected { .. } => "socket_client_connected",
             Self::SocketClientDisconnected { .. } => "socket_client_disconnected",
             Self::SocketMessage { .. } => "socket_message",

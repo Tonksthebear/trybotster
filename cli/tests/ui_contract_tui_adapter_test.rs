@@ -401,6 +401,118 @@ fn icon_button_embeds_icon_in_label() {
     assert!(plain.contains("Apply"), "plain={plain:?}");
 }
 
+#[test]
+fn text_input_maps_to_input_widget_and_records_change_action() {
+    let lua = new_ui_lua();
+    let (render, actions) = render_lua(
+        &lua,
+        r#"return ui.text_input{
+            id = "project-name",
+            label = "Project name",
+            value = "Botster",
+            placeholder = "Name",
+            on_change = ui.action("workflow.project.name.change"),
+        }"#,
+        &regular_viewport(),
+    );
+    match render {
+        RenderNode::Widget {
+            widget_type: WidgetType::Input,
+            props: Some(WidgetProps::Input(input)),
+            ..
+        } => {
+            assert_eq!(input.value.as_deref(), Some("Botster"));
+            assert_eq!(input.placeholder.as_deref(), Some("Name"));
+            assert_eq!(input.lines.len(), 1);
+        }
+        other => panic!("expected Input widget, got {other:?}"),
+    }
+    assert!(actions
+        .first_by_action_id("workflow.project.name.change")
+        .is_some());
+}
+
+#[test]
+fn textarea_maps_to_operational_paragraph() {
+    let lua = new_ui_lua();
+    let (render, actions) = render_lua(
+        &lua,
+        r#"return ui.textarea{
+            id = "notes",
+            label = "Notes",
+            value = "line one\nline two",
+            on_change = ui.action("workflow.project.notes.change"),
+        }"#,
+        &regular_viewport(),
+    );
+    assert!(paragraph_text_contains(&render, "line one"));
+    assert!(paragraph_text_contains(&render, "line two"));
+    assert!(actions
+        .first_by_action_id("workflow.project.notes.change")
+        .is_some());
+}
+
+#[test]
+fn checkbox_renders_boolean_control_with_next_selected_payload() {
+    let lua = new_ui_lua();
+    let (checkbox, checkbox_actions) = render_lua(
+        &lua,
+        r#"return ui.checkbox{
+            id = "review",
+            label = "Requires review",
+            selected = true,
+            on_change = ui.action("workflow.project.review.toggle"),
+        }"#,
+        &regular_viewport(),
+    );
+    let checkbox_items = expect_list_props(&checkbox);
+    assert!(list_item_plain(&checkbox_items.items[0].content).contains("[x] Requires review"));
+    assert_eq!(
+        checkbox_actions
+            .first_by_action_id("workflow.project.review.toggle")
+            .and_then(|action| action.payload.get("selected")),
+        Some(&serde_json::json!(false))
+    );
+}
+
+#[test]
+fn select_renders_options_and_records_value_payloads() {
+    let lua = new_ui_lua();
+    let (render, actions) = render_lua(
+        &lua,
+        r#"return ui.select{
+            id = "priority",
+            label = "Priority",
+            value = "high",
+            options = {
+                { value = "normal", label = "Normal" },
+                { value = "high", label = "High" },
+            },
+            on_change = ui.action("workflow.project.priority.change"),
+        }"#,
+        &regular_viewport(),
+    );
+    let list = expect_list_props(&render);
+    assert_eq!(list.items.len(), 3);
+    assert!(list_item_plain(&list.items[2].content).contains("> High"));
+    let payloads: Vec<_> = actions
+        .by_action_id("workflow.project.priority.change")
+        .map(|entry| entry.action.payload.get("value").cloned())
+        .collect();
+    assert_eq!(
+        payloads,
+        vec![
+            Some(serde_json::json!("normal")),
+            Some(serde_json::json!("high"))
+        ]
+    );
+    let keys: Vec<_> = actions
+        .by_action_id("workflow.project.priority.change")
+        .map(|entry| entry.key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["id:priority", "id:priority#0"]);
+}
+
 // =============================================================================
 // Collection primitives
 // =============================================================================
