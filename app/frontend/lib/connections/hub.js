@@ -1,5 +1,6 @@
 import { HubConnectionManager } from "connections/hub_connection_manager";
 import { HubTransport } from "connections/hub_connection";
+import { HubGateError, HUB_GATE_ERROR_CODES } from "connections/hub_gate_error";
 import { HubResource, HubScopedResource } from "connections/hub_resource";
 import {
   buildHubConnectionStatus,
@@ -83,6 +84,7 @@ export class HubSession {
     if (this.destroyed) return;
     this.destroyed = true;
 
+    this.emit("destroyed", this);
     this.unsubscribers.forEach((unsub) => unsub());
     this.unsubscribers = [];
     this.subscribers.clear();
@@ -148,6 +150,52 @@ export class HubSession {
   ensureAgentConfig(targetId, options = {}) {
     if (!targetId) return Promise.resolve(cloneConfig(EMPTY_CONFIG));
     return this.configs.load(targetId, options);
+  }
+
+  /**
+   * Run a hub operation after the session reaches the requested readiness.
+   *
+   * By default this waits for the route-owned transport to be connected.
+   * Pass `requireTransport: false` only for rare object-only callers that can
+   * safely inspect the HubSession without sending commands.
+   */
+  async perform(operation, options = {}) {
+    const {
+      timeoutMs = null,
+      signal = null,
+      requireTransport = true,
+    } = options;
+
+    if (typeof operation !== "function") {
+      throw new TypeError("HubSession.perform requires an operation function");
+    }
+
+    if (signal?.aborted) {
+      throw new HubGateError(
+        HUB_GATE_ERROR_CODES.ABORTED,
+        "Hub operation was aborted",
+      );
+    }
+
+    if (this.destroyed) {
+      throw new HubGateError(
+        HUB_GATE_ERROR_CODES.DESTROYED,
+        "Hub session has been destroyed",
+      );
+    }
+
+    if (requireTransport && !this.transport) {
+      throw new HubGateError(
+        HUB_GATE_ERROR_CODES.MISSING_TRANSPORT,
+        "Hub session transport is not available",
+      );
+    }
+
+    if (requireTransport && !this.isConnected()) {
+      await this.#waitUntilConnected({ timeoutMs, signal });
+    }
+
+    return this.#runOperation(operation, { timeoutMs, signal });
   }
 
   #bindTransport() {
@@ -270,6 +318,128 @@ export class HubSession {
   #syncConnectionStatus() {
     this.connectionStatus.set(buildHubConnectionStatus(this.transport));
     this.emit("connectionStatusChange", this.connectionStatus.current());
+  }
+
+  #waitUntilConnected({ timeoutMs, signal }) {
+    if (this.destroyed) {
+      return Promise.reject(new HubGateError(
+        HUB_GATE_ERROR_CODES.DESTROYED,
+        "Hub session has been destroyed",
+      ));
+    }
+
+    if (!this.transport) {
+      return Promise.reject(new HubGateError(
+        HUB_GATE_ERROR_CODES.MISSING_TRANSPORT,
+        "Hub session transport is not available",
+      ));
+    }
+
+    if (this.isConnected()) return Promise.resolve(this);
+
+    return new Promise((resolve, reject) => {
+      let timer = null;
+      let offConnected = null;
+      let offDestroyed = null;
+
+      const cleanup = () => {
+        if (timer) {
+          window.clearTimeout(timer);
+          timer = null;
+        }
+        signal?.removeEventListener?.("abort", onAbort);
+        offConnected?.();
+        offDestroyed?.();
+      };
+
+      const finish = (callback, value) => {
+        cleanup();
+        callback(value);
+      };
+
+      const onAbort = () => finish(reject, new HubGateError(
+        HUB_GATE_ERROR_CODES.ABORTED,
+        "Hub operation was aborted",
+      ));
+
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+
+      offConnected = this.on("connected", () => {
+        finish(resolve, this);
+      });
+      offDestroyed = this.on("destroyed", () => {
+        finish(reject, new HubGateError(
+          HUB_GATE_ERROR_CODES.DESTROYED,
+          "Hub session was destroyed before the operation could run",
+        ));
+      });
+      signal?.addEventListener?.("abort", onAbort, { once: true });
+
+      if (timeoutMs != null) {
+        timer = window.setTimeout(() => {
+          finish(reject, new HubGateError(
+            HUB_GATE_ERROR_CODES.TIMEOUT,
+            "Timed out waiting for the hub transport to connect",
+          ));
+        }, timeoutMs);
+      }
+    });
+  }
+
+  #runOperation(operation, { timeoutMs, signal }) {
+    if (signal?.aborted) {
+      return Promise.reject(new HubGateError(
+        HUB_GATE_ERROR_CODES.ABORTED,
+        "Hub operation was aborted",
+      ));
+    }
+
+    const operationPromise = Promise.resolve().then(() => operation(this));
+    if (timeoutMs == null && !signal) return operationPromise;
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timer = null;
+
+      const cleanup = () => {
+        if (timer) {
+          window.clearTimeout(timer);
+          timer = null;
+        }
+        signal?.removeEventListener?.("abort", onAbort);
+      };
+
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback(value);
+      };
+
+      const onAbort = () => finish(reject, new HubGateError(
+        HUB_GATE_ERROR_CODES.ABORTED,
+        "Hub operation was aborted",
+      ));
+
+      signal?.addEventListener?.("abort", onAbort, { once: true });
+
+      if (timeoutMs != null) {
+        timer = window.setTimeout(() => {
+          finish(reject, new HubGateError(
+            HUB_GATE_ERROR_CODES.TIMEOUT,
+            "Timed out waiting for the hub operation to finish",
+          ));
+        }, timeoutMs);
+      }
+
+      operationPromise.then(
+        (value) => finish(resolve, value),
+        (error) => finish(reject, error),
+      );
+    });
   }
 }
 

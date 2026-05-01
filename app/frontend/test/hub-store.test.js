@@ -91,6 +91,17 @@ describe('hub-store', () => {
       expect(localStorage.getItem('botster:lastHubId')).toBe('1')
     })
 
+    it('can defer last hub persistence until a selected hub is validated', async () => {
+      await useHubStore.getState().selectHub(1, { persistLastHub: false })
+      expect(localStorage.getItem('botster:lastHubId')).toBe(null)
+
+      mockConnect.mockClear()
+      await useHubStore.getState().selectHub(1)
+
+      expect(mockConnect).not.toHaveBeenCalled()
+      expect(localStorage.getItem('botster:lastHubId')).toBe('1')
+    })
+
     it('disconnects previous hub when switching', async () => {
       await useHubStore.getState().selectHub(1)
       const firstRef = useHubStore.getState()._connectionRef

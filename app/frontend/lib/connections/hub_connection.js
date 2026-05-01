@@ -24,6 +24,7 @@
  */
 
 import { HubRoute } from "connections/hub_route";
+import { HubGateError, HUB_GATE_ERROR_CODES } from "connections/hub_gate_error";
 import { applyEntityFrame, isEntityFrame } from "../../store/entities";
 
 /**
@@ -398,20 +399,54 @@ export class HubTransport extends HubRoute {
    * @param {number} timeout - Timeout in ms
    * @returns {Promise<Object>}
    */
-  fsRequest(type, params = {}, timeout = 10000) {
+  async fsRequest(type, params = {}, timeout = 10000) {
     const requestId = crypto.randomUUID();
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        unsub();
+    let unsub = null;
+    let timer = null;
+
+    const responsePromise = new Promise((resolve, reject) => {
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        unsub?.();
+      };
+
+      timer = setTimeout(() => {
+        cleanup();
         reject(new Error(`${type} timed out`));
       }, timeout);
-      const unsub = this.on(`fs:response:${requestId}`, (response) => {
-        clearTimeout(timer);
-        unsub();
+      unsub = this.on(`fs:response:${requestId}`, (response) => {
+        cleanup();
         response.ok ? resolve(response) : reject(new Error(response.error));
       });
-      this.sendCommand(type, { ...params, request_id: requestId });
     });
+    responsePromise.catch(() => {});
+
+    try {
+      const sent = await this.sendCommand(type, { ...params, request_id: requestId });
+      if (sent === false) {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        unsub?.();
+        throw new HubGateError(
+          HUB_GATE_ERROR_CODES.SEND_REJECTED,
+          `${type} could not be sent`,
+        );
+      }
+    } catch (error) {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      unsub?.();
+      throw error;
+    }
+
+    return responsePromise;
   }
 
   readFile(path, scope, targetId) {
@@ -459,20 +494,54 @@ export class HubTransport extends HubRoute {
    * Send a template request and wait for the correlated response.
    * Same pattern as fsRequest but for template:* commands.
    */
-  templateRequest(type, params = {}, timeout = 15000) {
+  async templateRequest(type, params = {}, timeout = 15000) {
     const requestId = crypto.randomUUID();
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        unsub();
+    let unsub = null;
+    let timer = null;
+
+    const responsePromise = new Promise((resolve, reject) => {
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        unsub?.();
+      };
+
+      timer = setTimeout(() => {
+        cleanup();
         reject(new Error(`${type} timed out`));
       }, timeout);
-      const unsub = this.on(`template:response:${requestId}`, (response) => {
-        clearTimeout(timer);
-        unsub();
+      unsub = this.on(`template:response:${requestId}`, (response) => {
+        cleanup();
         response.ok ? resolve(response) : reject(new Error(response.error));
       });
-      this.sendCommand(type, { ...params, request_id: requestId });
     });
+    responsePromise.catch(() => {});
+
+    try {
+      const sent = await this.sendCommand(type, { ...params, request_id: requestId });
+      if (sent === false) {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        unsub?.();
+        throw new HubGateError(
+          HUB_GATE_ERROR_CODES.SEND_REJECTED,
+          `${type} could not be sent`,
+        );
+      }
+    } catch (error) {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      unsub?.();
+      throw error;
+    }
+
+    return responsePromise;
   }
 
   installTemplate(dest, content, scope, targetId) {

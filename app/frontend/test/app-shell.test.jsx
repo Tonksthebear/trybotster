@@ -213,6 +213,25 @@ describe('AppRoutes', () => {
     expect(localStorage.getItem('botster:lastHubId')).toBe('3')
   })
 
+  it('preselects the route hub during a deep reload before the hub list validates it', async () => {
+    const selectHub = vi.fn(() => Promise.resolve())
+
+    useHubStore.setState({
+      hubList: [],
+      hubListLoading: true,
+      fetchHubList: vi.fn(() => Promise.resolve([])),
+      selectHub,
+      getLastHubId: vi.fn(() => null),
+    })
+
+    renderRoutes('/hubs/7/settings')
+
+    await waitFor(() => {
+      expect(selectHub).toHaveBeenCalledWith('7', { persistLastHub: false })
+      expect(screen.getByTestId('location')).toHaveTextContent('/hubs/7/settings')
+    })
+  })
+
   it('redirects a stale deep hub URL to the sole hub when no valid last hub exists', async () => {
     const hubs = [{ id: 7, name: 'Only Hub', identifier: 'hub-7', active: true }]
     const selectHub = vi.fn(() => Promise.resolve())
@@ -258,6 +277,50 @@ describe('AppRoutes', () => {
     })
     expect(selectHub).not.toHaveBeenCalled()
     expect(localStorage.getItem('botster:lastHubId')).toBe(null)
+  })
+
+  it('clears an optimistically selected stale route hub when validation has no fallback', async () => {
+    const hubs = [
+      { id: 3, name: 'Hub Three', identifier: 'hub-3', active: true },
+      { id: 4, name: 'Hub Four', identifier: 'hub-4', active: true },
+    ]
+    const selectHub = vi.fn(() => Promise.resolve())
+
+    useHubStore.setState({
+      hubList: hubs,
+      hubListLoading: false,
+      selectedHubId: '99',
+      fetchHubList: vi.fn(() => Promise.resolve(hubs)),
+      selectHub,
+      getLastHubId: vi.fn(() => null),
+    })
+
+    renderRoutes('/hubs/99/settings')
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location')).toHaveTextContent('/hubs')
+      expect(selectHub).toHaveBeenCalledWith(null)
+    })
+  })
+
+  it('keeps an optimistically selected route hub when the hub list is empty', async () => {
+    const selectHub = vi.fn(() => Promise.resolve())
+
+    useHubStore.setState({
+      hubList: [],
+      hubListLoading: false,
+      selectedHubId: '7',
+      fetchHubList: vi.fn(() => Promise.resolve([])),
+      selectHub,
+      getLastHubId: vi.fn(() => null),
+    })
+
+    renderRoutes('/hubs/7/settings')
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location')).toHaveTextContent('/hubs/7/settings')
+    })
+    expect(selectHub).not.toHaveBeenCalled()
   })
 
   it('keeps a valid deep hub URL selected and unchanged', async () => {

@@ -237,13 +237,21 @@ function HubRouteSync() {
   const getLastHubId = useHubStore((s) => s.getLastHubId)
 
   useEffect(() => {
-    if (!hubId || isBooting || hubListLoading) return
+    if (!hubId || isBooting) return
 
     const routeHubId = String(hubId)
     const routeHub = hubList.find((h) => String(h.id) === routeHubId)
+    const routeHubSelected = routeHubId === String(selectedHubId)
 
     if (routeHub) {
-      if (routeHubId !== String(selectedHubId)) selectHub(routeHub.id)
+      selectHub(routeHub.id)
+      return
+    }
+
+    if (hubListLoading || hubList.length === 0) {
+      if (!routeHubSelected) {
+        selectHub(routeHubId, { persistLastHub: false })
+      }
       return
     }
 
@@ -258,6 +266,7 @@ function HubRouteSync() {
     } else if (hubList.length === 1) {
       navigate(`/hubs/${hubList[0].id}`, { replace: true })
     } else {
+      if (routeHubSelected) selectHub(null)
       navigate('/hubs', { replace: true })
     }
   }, [hubId, hubList, hubListLoading, isBooting, navigate, selectedHubId, selectHub, getLastHubId])
