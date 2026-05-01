@@ -107,6 +107,26 @@ local function merge(row, attrs)
     return out
 end
 
+local function dependency_reaches(start_ticket_id, target_ticket_id, seen)
+    if util.is_blank(start_ticket_id) or util.is_blank(target_ticket_id) then
+        return false
+    end
+    if start_ticket_id == target_ticket_id then
+        return true
+    end
+    seen = seen or {}
+    if seen[start_ticket_id] then
+        return false
+    end
+    seen[start_ticket_id] = true
+    for _, dependency in ipairs(rows("SELECT depends_on_ticket_id FROM ticket_dependencies WHERE ticket_id = ?", start_ticket_id)) do
+        if dependency_reaches(dependency.depends_on_ticket_id, target_ticket_id, seen) then
+            return true
+        end
+    end
+    return false
+end
+
 local function decode_required_fields(value)
     if type(value) == "string" then
         return util.decode(value, {})
@@ -330,6 +350,9 @@ function M.add_ticket_dependency(ticket_id, depends_on_ticket_id)
     if not M.get_ticket(depends_on_ticket_id) then
         error("dependency ticket not found: " .. tostring(depends_on_ticket_id))
     end
+    if dependency_reaches(depends_on_ticket_id, ticket_id) then
+        error("ticket dependency would create a cycle")
+    end
     local existing = rows([[SELECT * FROM ticket_dependencies
                             WHERE ticket_id = ? AND depends_on_ticket_id = ?
                             LIMIT 1]], ticket_id, depends_on_ticket_id)[1]
@@ -410,7 +433,18 @@ function M.delete_ticket(ticket_id)
     if #M.ticket_runs(ticket_id) > 0 then
         error("cannot delete ticket with run history: " .. tostring(ticket_id))
     end
-    db.tickets:delete{ id = ticket_id }
+    local dependencies = rows([[SELECT * FROM ticket_dependencies
+                                WHERE ticket_id = ? OR depends_on_ticket_id = ?]], ticket_id, ticket_id)
+    with_transaction(function()
+        db:eval("DELETE FROM ticket_dependencies WHERE ticket_id = ? OR depends_on_ticket_id = ?", { ticket_id, ticket_id })
+        db:eval("DELETE FROM tickets WHERE id = ?", ticket_id)
+    end)
+    if #dependencies > 0 then
+        M.append_event("ticket.dependencies_purged", {
+            ticket_id = ticket_id,
+            payload = { ticket_id = ticket_id, dependencies = dependencies },
+        })
+    end
     M.append_event("ticket.deleted", { ticket_id = ticket_id, payload = { ticket_id = ticket_id } })
     return ticket
 end

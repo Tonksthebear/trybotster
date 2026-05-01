@@ -247,7 +247,7 @@ function M.register()
     action.on("project_pipelines.add_ticket_dependency", "project_pipelines.add_ticket_dependency", function(envelope, ctx)
         local payload = value_payload(envelope)
         if payload.ticket_id then
-            local depends_on_ticket_id = current_draft(ctx)["dependency_" .. payload.ticket_id] or payload.depends_on_ticket_id
+            local depends_on_ticket_id = current_draft(ctx)["dependency_" .. payload.ticket_id]
             local ok, result = pcall(repo.add_ticket_dependency, payload.ticket_id, depends_on_ticket_id)
             current_feedback(ctx).dependency_error = ok and nil or tostring(result)
             if ok then

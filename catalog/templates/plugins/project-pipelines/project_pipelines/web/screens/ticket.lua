@@ -548,8 +548,9 @@ function M.render(view_state, ctx)
         table.insert(header, view.badge("ready", "muted"))
     end
     if ticket.status ~= "closed" and latest_run and latest_run.status == "done" then
+        local merge_events = repo.ticket_events(ticket.id, "ticket.merge_requested", 1)
         table.insert(header, ui.button{
-            label = "Approve merge",
+            label = #merge_events > 0 and "Merge requested" or "Approve merge",
             icon = "arrow-path",
             variant = "solid",
             tone = "accent",
