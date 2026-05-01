@@ -53,6 +53,17 @@ describe('HubSwitcher', () => {
     expect(screen.getByText('My Hub')).toBeInTheDocument()
   })
 
+  it('shows the selected hub id while the hub list is still loading', () => {
+    renderSwitcher({
+      hubList: [],
+      hubListLoading: true,
+      selectedHubId: 7,
+      connectionState: 'connecting',
+    })
+
+    expect(screen.getByText('Hub 7')).toBeInTheDocument()
+  })
+
   it('shows a green status dot when connected', () => {
     renderSwitcher({
       hubList: [{ id: 1, name: 'My Hub', identifier: 'hub-1', active: true }],

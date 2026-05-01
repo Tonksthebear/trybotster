@@ -36,10 +36,14 @@ export const useHubStore = create((set, get) => ({
     }
   },
 
-  selectHub: async (hubId) => {
+  selectHub: async (hubId, options = {}) => {
+    const { persistLastHub = true } = options
     if (hubId != null) hubId = String(hubId)
     const { selectedHubId, _connectionRef, _statusUnsub } = get()
-    if (hubId === selectedHubId) return
+    if (hubId === selectedHubId) {
+      if (hubId && persistLastHub) localStorage.setItem(LAST_HUB_KEY, hubId)
+      return
+    }
 
     // Tear down previous connection
     if (_statusUnsub) _statusUnsub()
@@ -71,7 +75,7 @@ export const useHubStore = create((set, get) => ({
         return
       }
 
-      localStorage.setItem(LAST_HUB_KEY, hubId)
+      if (persistLastHub) localStorage.setItem(LAST_HUB_KEY, hubId)
       set({ _connectionRef: connectionId })
 
       if (hub) {

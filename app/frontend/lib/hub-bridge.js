@@ -1,4 +1,5 @@
 import { HubManager } from 'connections'
+import { HubGateError, HUB_GATE_ERROR_CODES } from 'connections/hub_gate_error'
 import { useUiPresentationStore } from '../store/ui-presentation-store'
 import { useRouteRegistryStore } from '../store/route-registry-store'
 
@@ -6,6 +7,8 @@ import { useRouteRegistryStore } from '../store/route-registry-store'
 const hubState = new Map()  // hubId → { hub, unsubscribers, callerIds: Set }
 const chains = new Map()    // hubId → Promise (serializes connect/disconnect per hub)
 const hubWaiters = new Map() // hubId → Set<callback>
+const hubGateWaiters = new Map() // hubId → Set<{ resolve, reject, cleanup }>
+const hubOperationWaiters = new Map() // hubId → Set<{ reject, cleanup }>
 
 // Caller identity
 let nextCallerId = 0
@@ -51,6 +54,14 @@ async function doConnect(hubId, callerId) {
     hub = await HubManager.acquire(hubId)
   } catch (err) {
     callerHub.delete(callerId)
+    rejectHubGateWaiters(
+      hubId,
+      new HubGateError(
+        HUB_GATE_ERROR_CODES.UNAVAILABLE,
+        `Hub ${hubId} is unavailable`,
+        { cause: err },
+      ),
+    )
     throw err
   }
 
@@ -120,6 +131,20 @@ function doDisconnect(hubId, callerId) {
   state.hub.release()
   hubState.delete(hubId)
   chains.delete(hubId)
+  rejectHubGateWaiters(
+    hubId,
+    new HubGateError(
+      HUB_GATE_ERROR_CODES.UNAVAILABLE,
+      `Hub ${hubId} disconnected before the operation could run`,
+    ),
+  )
+  rejectHubOperationWaiters(
+    hubId,
+    new HubGateError(
+      HUB_GATE_ERROR_CODES.UNAVAILABLE,
+      `Hub ${hubId} disconnected before the operation could finish`,
+    ),
+  )
   useUiPresentationStore.getState().setSelectedSessionId(null)
   useRouteRegistryStore.getState().clearRoutes(hubId)
 }
@@ -158,6 +183,31 @@ export function waitForHub(hubId, timeoutMs = 10000) {
 }
 
 /**
+ * Run an operation against the route-owned HubSession.
+ *
+ * The default readiness gate requires a connected transport. Pass
+ * `requireTransport: false` only for rare object-only callers that can safely
+ * inspect the HubSession without sending hub commands.
+ */
+export async function withHub(hubId, operation, options = {}) {
+  if (!hubId) {
+    throw new HubGateError(
+      HUB_GATE_ERROR_CODES.UNAVAILABLE,
+      "Hub id is required",
+    )
+  }
+  if (typeof operation !== 'function') {
+    throw new TypeError('withHub requires an operation function')
+  }
+
+  const existing = currentHub(hubId)
+  if (existing) return performWithBridgeGate(hubId, existing, operation, options)
+
+  const hub = await waitForHubGate(hubId, options)
+  return performWithBridgeGate(hubId, hub, operation, options)
+}
+
+/**
  * Sync the per-browser selectedSessionId from the URL. Wire protocol
  * keeps selection client-side: a `/hubs/<id>/sessions/<uuid>` URL hydrates
  * the presentation store; the hub never sees per-client selection.
@@ -181,7 +231,149 @@ function resolveHubManager() {
 function notifyHubAvailable(hubId, hub) {
   const key = String(hubId)
   const waiters = hubWaiters.get(key)
+  if (waiters) {
+    hubWaiters.delete(key)
+    for (const callback of waiters) callback(hub)
+  }
+
+  const gateWaiters = hubGateWaiters.get(key)
+  if (!gateWaiters) return
+  hubGateWaiters.delete(key)
+  for (const waiter of gateWaiters) {
+    waiter.cleanup()
+    waiter.resolve(hub)
+  }
+}
+
+function waitForHubGate(hubId, { timeoutMs = null, signal = null } = {}) {
+  const key = String(hubId)
+  const existing = currentHub(key)
+  if (existing) return Promise.resolve(existing)
+
+  if (signal?.aborted) {
+    return Promise.reject(new HubGateError(
+      HUB_GATE_ERROR_CODES.ABORTED,
+      "Hub operation was aborted",
+    ))
+  }
+
+  return new Promise((resolve, reject) => {
+    let timer = null
+    let waiter = null
+
+    const cleanup = () => {
+      if (timer) {
+        window.clearTimeout(timer)
+        timer = null
+      }
+      signal?.removeEventListener?.('abort', onAbort)
+      const set = hubGateWaiters.get(key)
+      set?.delete(waiter)
+      if (set && set.size === 0) hubGateWaiters.delete(key)
+    }
+
+    const finish = (callback, value) => {
+      cleanup()
+      callback(value)
+    }
+
+    const onAbort = () => finish(reject, new HubGateError(
+      HUB_GATE_ERROR_CODES.ABORTED,
+      "Hub operation was aborted",
+    ))
+
+    waiter = { resolve, reject, cleanup }
+
+    if (!hubGateWaiters.has(key)) hubGateWaiters.set(key, new Set())
+    hubGateWaiters.get(key).add(waiter)
+    signal?.addEventListener?.('abort', onAbort, { once: true })
+
+    if (timeoutMs != null) {
+      timer = window.setTimeout(() => {
+        finish(reject, new HubGateError(
+          HUB_GATE_ERROR_CODES.TIMEOUT,
+          `Timed out waiting for hub ${key}`,
+        ))
+      }, timeoutMs)
+    }
+  })
+}
+
+function rejectHubGateWaiters(hubId, error) {
+  const key = String(hubId)
+  const waiters = hubGateWaiters.get(key)
   if (!waiters) return
-  hubWaiters.delete(key)
-  for (const callback of waiters) callback(hub)
+  hubGateWaiters.delete(key)
+  for (const waiter of waiters) {
+    waiter.cleanup()
+    waiter.reject(error)
+  }
+}
+
+function performWithBridgeGate(hubId, hub, operation, options) {
+  const requireTransport = options.requireTransport ?? true
+  if (!requireTransport || hub.isConnected?.()) {
+    return hub.perform(operation, options)
+  }
+
+  const key = String(hubId)
+  const controller = new AbortController()
+  const onUserAbort = () => controller.abort()
+  if (options.signal?.aborted) {
+    controller.abort()
+  } else {
+    options.signal?.addEventListener?.('abort', onUserAbort, { once: true })
+  }
+  const gatedOptions = { ...options, signal: controller.signal }
+  let waiter = null
+  let settled = false
+
+  const cleanup = () => {
+    options.signal?.removeEventListener?.('abort', onUserAbort)
+    const set = hubOperationWaiters.get(key)
+    set?.delete(waiter)
+    if (set && set.size === 0) hubOperationWaiters.delete(key)
+  }
+
+  const bridgeDisconnect = new Promise((_, reject) => {
+    waiter = {
+      cleanup,
+      reject: (error) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(error)
+        controller.abort()
+      },
+    }
+  })
+
+  if (!hubOperationWaiters.has(key)) hubOperationWaiters.set(key, new Set())
+  hubOperationWaiters.get(key).add(waiter)
+
+  const operationPromise = Promise.resolve().then(() => (
+    hub.perform(operation, gatedOptions)
+  ))
+  operationPromise.then(() => {
+    if (settled) return
+    settled = true
+    cleanup()
+  }, () => {
+    if (settled) return
+    settled = true
+    cleanup()
+  })
+
+  return Promise.race([operationPromise, bridgeDisconnect])
+}
+
+function rejectHubOperationWaiters(hubId, error) {
+  const key = String(hubId)
+  const waiters = hubOperationWaiters.get(key)
+  if (!waiters) return
+  hubOperationWaiters.delete(key)
+  for (const waiter of waiters) {
+    waiter.cleanup()
+    waiter.reject(error)
+  }
 }

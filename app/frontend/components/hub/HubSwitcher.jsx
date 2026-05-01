@@ -54,6 +54,11 @@ export default function HubSwitcher() {
   const selectHub = useHubStore((s) => s.selectHub)
 
   const selectedHub = hubList.find((h) => String(h.id) === String(selectedHubId))
+  const selectedHubLabel = selectedHub
+    ? (selectedHub.name || selectedHub.identifier)
+    : selectedHubId
+      ? `Hub ${selectedHubId}`
+      : 'Select a hub'
   const dotClass = STATE_DOT[connectionState] || STATE_DOT.disconnected
 
   return (
@@ -62,7 +67,7 @@ export default function HubSwitcher() {
         <HubIcon />
         <SidebarLabel className="flex items-center gap-2">
           <span className="truncate">
-            {selectedHub ? (selectedHub.name || selectedHub.identifier) : 'Select a hub'}
+            {selectedHubLabel}
           </span>
           <span className={`size-2 shrink-0 rounded-full ${dotClass}`} />
         </SidebarLabel>
