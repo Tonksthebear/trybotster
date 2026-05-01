@@ -218,6 +218,7 @@ export type IconButtonProps = {
 
 export type TextInputProps = {
   label?: string
+  required?: boolean
   value?: string
   placeholder?: string
   onChange?: UiAction
@@ -225,6 +226,7 @@ export type TextInputProps = {
 
 export type TextareaProps = {
   label?: string
+  required?: boolean
   value?: string
   placeholder?: string
   onChange?: UiAction
@@ -243,6 +245,7 @@ export type SelectOptionProps = {
 
 export type SelectProps = {
   label?: string
+  required?: boolean
   value?: string
   placeholder?: string
   options: SelectOptionProps[]

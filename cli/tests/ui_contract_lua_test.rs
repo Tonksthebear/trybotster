@@ -194,6 +194,7 @@ fn form_primitives_round_trip_semantic_props() {
         r#"return ui.text_input{
             id = "project-name",
             label = "Project name",
+            required = true,
             value = "Botster",
             placeholder = "Name",
             on_change = ui.action("workflow.project.name.change", { projectId = "p1" }),
@@ -204,6 +205,7 @@ fn form_primitives_round_trip_semantic_props() {
     let props: TextInputProps =
         serde_json::from_value(serde_json::Value::Object(text_input.props)).expect("text input");
     assert_eq!(props.label.as_deref(), Some("Project name"));
+    assert_eq!(props.required, Some(true));
     assert_eq!(
         props.on_change.as_ref().map(|action| action.id.as_str()),
         Some("workflow.project.name.change")
@@ -214,6 +216,7 @@ fn form_primitives_round_trip_semantic_props() {
         r#"return ui.textarea{
             id = "project-notes",
             label = "Notes",
+            required = true,
             placeholder = "Describe the workflow",
             on_change = ui.action("workflow.project.notes.change"),
         }"#,
@@ -221,6 +224,7 @@ fn form_primitives_round_trip_semantic_props() {
     let props: TextareaProps =
         serde_json::from_value(serde_json::Value::Object(textarea.props)).expect("textarea");
     assert_eq!(props.placeholder.as_deref(), Some("Describe the workflow"));
+    assert_eq!(props.required, Some(true));
 
     let checkbox = eval_to_node(
         &lua,
@@ -240,6 +244,7 @@ fn form_primitives_round_trip_semantic_props() {
         r#"return ui.select{
             id = "priority",
             label = "Priority",
+            required = true,
             value = "high",
             options = {
                 { value = "normal", label = "Normal" },
@@ -251,7 +256,20 @@ fn form_primitives_round_trip_semantic_props() {
     let props: SelectProps =
         serde_json::from_value(serde_json::Value::Object(select.props)).expect("select");
     assert_eq!(props.value.as_deref(), Some("high"));
+    assert_eq!(props.required, Some(true));
     assert_eq!(props.options.len(), 2);
+
+    let form = eval_to_node(
+        &lua,
+        r#"return ui.form{
+            children = {
+                ui.text_input{ id = "name", label = "Name", required = true },
+                ui.button{ label = "Save", action = ui.action("workflow.save") },
+            },
+        }"#,
+    );
+    assert_eq!(form.node_type, "form");
+    assert_eq!(form.children.len(), 2);
 }
 
 #[test]

@@ -186,6 +186,7 @@ const ACTION_TEST_IDS: Record<string, string> = {
 function wrapActionClick(
   action: UiAction,
   ctx: RenderContext,
+  options: { validate?: boolean } = {},
 ): (event: MouseEvent) => void {
   return (event: MouseEvent) => {
     if (action.disabled) {
@@ -194,8 +195,40 @@ function wrapActionClick(
     }
     event.preventDefault()
     event.stopPropagation()
+    if (options.validate && !reportActionValidity(event.currentTarget as HTMLButtonElement)) return
     ctx.dispatch(action, { element: event.currentTarget as Element })
   }
+}
+
+type ValidatableControl =
+  | HTMLInputElement
+  | HTMLSelectElement
+  | HTMLTextAreaElement
+
+function reportActionValidity(button: HTMLButtonElement): boolean {
+  // `.form` covers current submit-style buttons; closest() keeps the helper
+  // usable if a future non-button primitive opts into form validation.
+  const form = button.form ?? button.closest('form[data-ui-form]')
+  if (!form) return true
+
+  const controls = Array.from(form.querySelectorAll<ValidatableControl>('input, select, textarea'))
+  for (const control of controls) {
+    if (!control.checkValidity()) return control.reportValidity()
+  }
+  return true
+}
+
+const renderForm: PrimitiveRenderer = ({ children }) => {
+  return (
+    <form
+      data-ui-form
+      onSubmit={(event) => event.preventDefault()}
+      // Keep the native form layout-transparent inside Catalyst panels/stacks.
+      className="contents"
+    >
+      {children}
+    </form>
+  )
 }
 
 function actionWithPayload(
@@ -454,7 +487,7 @@ const renderButton: PrimitiveRenderer = ({ props, ctx }) => {
   if (!action) {
     return <button type="button" disabled>{label}</button>
   }
-  const onClick = wrapActionClick(action, ctx)
+  const onClick = wrapActionClick(action, ctx, { validate: true })
   const toneClass =
     variant === 'solid' ? BUTTON_TONE_SOLID[tone] : BUTTON_TONE_GHOST[tone]
   const testId = ACTION_TEST_IDS[action.id]
@@ -521,6 +554,7 @@ const renderTextInput: PrimitiveRenderer = ({ node, props, ctx }) => {
       id={inputId}
       name={inputId}
       placeholder={p.placeholder}
+      required={p.required === true}
       disabled={p.onChange?.disabled === true}
       {...valueProps}
       onChange={(event: ChangeEvent<HTMLInputElement>) =>
@@ -552,6 +586,7 @@ const renderTextarea: PrimitiveRenderer = ({ node, props, ctx }) => {
       id={inputId}
       name={inputId}
       placeholder={p.placeholder}
+      required={p.required === true}
       disabled={p.onChange?.disabled === true}
       {...valueProps}
       onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
@@ -610,6 +645,7 @@ const renderSelect: PrimitiveRenderer = ({ node, props, ctx }) => {
     <Select
       id={node.id}
       name={node.id}
+      required={p.required === true}
       disabled={p.onChange?.disabled === true}
       {...valueProps}
       onChange={(event: ChangeEvent<HTMLSelectElement>) =>
@@ -852,6 +888,7 @@ const renderNewSessionButton: PrimitiveRenderer = ({ props, ctx }) => (
 export const PRIMITIVE_REGISTRY: Record<string, PrimitiveRenderer> = {
   stack: renderStack,
   inline: renderInline,
+  form: renderForm,
   panel: renderPanel,
   scroll_area: renderScrollArea,
   text: renderText,

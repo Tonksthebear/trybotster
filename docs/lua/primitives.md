@@ -143,39 +143,58 @@ events are action envelopes, and renderers merge the next value into the action
 payload:
 
 ```lua
-ui.text_input{
-  id = "project-name",
-  label = "Project name",
-  value = project.name,
-  placeholder = "Name",
-  on_change = ui.action("workflow.project.name.change", { project_id = project.id }),
-}
-
-ui.textarea{
-  id = "project-notes",
-  label = "Notes",
-  value = project.notes,
-  on_change = ui.action("workflow.project.notes.change", { project_id = project.id }),
-}
-
-ui.checkbox{
-  id = "requires-review",
-  label = "Requires review",
-  selected = project.requires_review,
-  on_change = ui.action("workflow.project.review.toggle", { project_id = project.id }),
-}
-
-ui.select{
-  id = "priority",
-  label = "Priority",
-  value = project.priority,
-  options = {
-    { value = "normal", label = "Normal" },
-    { value = "high", label = "High" },
+ui.form{
+  children = {
+    ui.text_input{
+      id = "project-name",
+      label = "Project name",
+      required = true,
+      value = project.name,
+      placeholder = "Name",
+      on_change = ui.action("workflow.project.name.change", { project_id = project.id }),
+    },
+    ui.textarea{
+      id = "project-notes",
+      label = "Notes",
+      required = true,
+      value = project.notes,
+      on_change = ui.action("workflow.project.notes.change", { project_id = project.id }),
+    },
+    ui.checkbox{
+      id = "requires-review",
+      label = "Requires review",
+      selected = project.requires_review,
+      on_change = ui.action("workflow.project.review.toggle", { project_id = project.id }),
+    },
+    ui.select{
+      id = "priority",
+      label = "Priority",
+      required = true,
+      value = project.priority,
+      options = {
+        { value = "normal", label = "Normal" },
+        { value = "high", label = "High" },
+      },
+      on_change = ui.action("workflow.project.priority.change", { project_id = project.id }),
+    },
+    ui.button{
+      label = "Save",
+      action = ui.action("workflow.project.save", { project_id = project.id }),
+    },
   },
-  on_change = ui.action("workflow.project.priority.change", { project_id = project.id }),
 }
 ```
+
+`required = true` is supported on `ui.text_input`, `ui.textarea`, and
+`ui.select`. It is renderer metadata for accessibility, styling, and native web
+control attributes. Put related controls and the submit-style `ui.button` inside
+`ui.form` to make the web renderer run native validity checks before dispatching
+the button action. This is only client-side UX; always keep plugin-side or
+hub-side validation for required fields.
+
+`ui.checkbox` does not accept `required` yet; required checkbox semantics mean
+"must be checked", so model that as domain validation until the shared contract
+adds a checked-required checkbox state.
 
 TUI v1 renders `ui.textarea` as read-only/display-only text. The web renderer
 uses the Catalyst textarea and emits `on_change`; TUI authors who need editable
