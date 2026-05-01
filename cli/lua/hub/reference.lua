@@ -428,6 +428,10 @@ M.lua_libs = {
             { sig = "hub:post(session_uuid, opts)", desc = "Durable generic inbox message; recipient drains with Agent.receive_messages()/receive_messages()" },
             { sig = "hub:receive_messages(session_uuid)", desc = "Drain generic inbox messages for a session" },
             { sig = "hub:list_owned_sessions(owner_plugin)", desc = "Recover plugin-owned sessions after reload" },
+            { sig = "hub:entity_snapshot(entity_type, items, opts?)", desc = "Publish plugin-owned entity_snapshot after a plugin refresh" },
+            { sig = "hub:entity_upsert(entity_type, entity, opts?)", desc = "Publish plugin-owned entity_upsert; entity.id must be a non-empty string" },
+            { sig = "hub:entity_patch(entity_type, id, patch, opts?)", desc = "Publish plugin-owned entity_patch with sparse top-level fields" },
+            { sig = "hub:entity_remove(entity_type, id, opts?)", desc = "Publish plugin-owned entity_remove" },
         },
     },
     {
