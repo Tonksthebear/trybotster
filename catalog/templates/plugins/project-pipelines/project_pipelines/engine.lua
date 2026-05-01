@@ -471,7 +471,7 @@ function M.request_merge(params, context)
     local ok, created = pcall(function()
         return Hub.get():create_agent{
             request_id = request_id,
-            agent_name = params.agent_name or "claude",
+            agent_name = params.agent_name or "codex",
             issue_or_branch = ticket_branch_for(ticket, run.id),
             target_id = run.target_id or ticket.target_id,
             target_path = run.target_path or ticket.target_path,
