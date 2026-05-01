@@ -35,6 +35,7 @@ type RouteRegistryEntry = {
   icon?: string
   hide_from_nav?: boolean
   nav?: RouteNav | false
+  notification?: boolean
 }
 
 type SessionRecord = {
@@ -97,7 +98,7 @@ export function SurfaceNav({
           label: nav.label || entry.label || entry.surface || entry.path || 'Plugin',
           icon: nav.icon || entry.icon || 'sparkles',
           order: nav.order ?? index,
-          notification: notifiedSurfaces.has(surface),
+          notification: entry.notification === true || notifiedSurfaces.has(surface),
         }
       })
       .sort((a, b) => {
