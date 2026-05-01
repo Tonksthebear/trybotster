@@ -42,7 +42,23 @@ local state = require("hub.state")
 
 local M = {}
 
--- entity_type -> { id_field = string, all = function, filter = function? }
+local BUILTIN_ENTITY_TYPES = {
+    session = true,
+    session_action = true,
+    workspace = true,
+    spawn_target = true,
+    worktree = true,
+    hub = true,
+    connection_code = true,
+    template = true,
+}
+
+-- entity_type -> {
+--   id_field = string,
+--   all = function,
+--   filter = function?,
+--   owner_plugin = string?,
+-- }
 local registry = {}
 
 -- entity_type -> integer (monotonic per hub process)
@@ -81,6 +97,55 @@ local function get_entry(entity_type, op_label)
         return nil
     end
     return entry
+end
+
+local function plugin_type_parts(entity_type)
+    if type(entity_type) ~= "string" then return nil, nil end
+    local plugin_name, type_name = entity_type:match("^([%w_-]+)%.([%w_][%w_.-]*)$")
+    if not plugin_name or not type_name then return nil, nil end
+    if type_name:find("..", 1, true) or type_name:sub(-1) == "." then
+        return nil, nil
+    end
+    return plugin_name, type_name
+end
+
+local function loading_plugin_name()
+    -- Entity namespaces use the manifest/display name, not the loader key:
+    -- repo-sourced plugin keys include paths (`repo:/...:name`) that are not
+    -- valid wire namespaces.
+    local display_name = rawget(_G, "_loading_plugin_display_name")
+    if type(display_name) == "string" and display_name ~= "" then return display_name end
+    local name = rawget(_G, "_loading_plugin_name")
+    if type(name) == "string" and name ~= "" then return name end
+    return nil
+end
+
+local function register_owner(entity_type, opts)
+    local namespace = plugin_type_parts(entity_type)
+    if not namespace then
+        if BUILTIN_ENTITY_TYPES[entity_type] then return nil end
+        error(string.format(
+            "entity_broadcast.register: entity_type %q must be a reserved built-in type or plugin-owned <plugin>.<type>",
+            tostring(entity_type)), 3)
+    end
+
+    local owner = opts.owner_plugin or opts.plugin or loading_plugin_name()
+    if type(owner) ~= "string" or owner == "" then
+        error(string.format(
+            "entity_broadcast.register: plugin entity_type %q requires owner_plugin or plugin load context",
+            entity_type), 3)
+    end
+    if owner ~= namespace then
+        error(string.format(
+            "entity_broadcast.register: plugin entity_type %q must be owned by namespace %q, got %q",
+            entity_type, namespace, owner), 3)
+    end
+    if opts.id_field ~= "id" then
+        error(string.format(
+            "entity_broadcast.register: plugin entity_type %q must use id_field=\"id\"",
+            entity_type), 3)
+    end
+    return owner
 end
 
 -- Resolve the entity id from a payload using the registered id_field, with
@@ -150,10 +215,11 @@ end
 ---   id_field = string,        -- payload field that supplies the entity id
 ---   all = function -> array,  -- snapshot source called on subscribe
 ---   filter = function? -> bool, -- optional per-item gate (true = include)
+---   owner_plugin = string?,   -- required for plugin types outside plugin load
 --- }
 ---
---- Re-registration overwrites the prior entry; a warning is logged so the
---- "two providers fighting over one type" footgun is at least visible.
+--- Re-registration by the same owner overwrites the prior entry for hot reload.
+--- Re-registration by another plugin is rejected so ownership stays explicit.
 function M.register(entity_type, opts)
     assert(type(entity_type) == "string" and entity_type ~= "",
         "entity_broadcast.register: entity_type must be a non-empty string")
@@ -165,8 +231,15 @@ function M.register(entity_type, opts)
     if opts.filter ~= nil and type(opts.filter) ~= "function" then
         error("entity_broadcast.register: opts.filter must be a function or nil")
     end
+    local owner_plugin = register_owner(entity_type, opts)
 
-    if registry[entity_type] then
+    local existing = registry[entity_type]
+    if existing and existing.owner_plugin and existing.owner_plugin ~= owner_plugin then
+        error(string.format(
+            "entity_broadcast.register: entity_type %q already owned by plugin %q",
+            entity_type, existing.owner_plugin))
+    end
+    if existing then
         log.warn(string.format(
             "entity_broadcast: re-registering type %q", entity_type))
     end
@@ -174,12 +247,23 @@ function M.register(entity_type, opts)
         id_field = opts.id_field,
         all = opts.all,
         filter = opts.filter,
+        owner_plugin = owner_plugin,
     }
 end
 
 --- Drop a registration. Used by plugin teardown and by tests.
 function M.unregister(entity_type)
     registry[entity_type] = nil
+end
+
+--- Drop all entity types owned by a plugin. Used by plugin unload/hot reload.
+function M.unregister_plugin(owner_plugin)
+    if type(owner_plugin) ~= "string" or owner_plugin == "" then return end
+    for entity_type, entry in pairs(registry) do
+        if entry.owner_plugin == owner_plugin then
+            registry[entity_type] = nil
+        end
+    end
 end
 
 -- -------------------------------------------------------------------------
@@ -230,7 +314,13 @@ function M.patch(entity_type, id, fields)
             "entity_broadcast.patch: missing id for %q", entity_type))
         return
     end
-    if type(fields) ~= "table" or next(fields) == nil then return end
+    if type(fields) ~= "table" then
+        log.warn(string.format(
+            "entity_broadcast.patch: patch for %q/%q must be a table",
+            entity_type, id))
+        return
+    end
+    if next(fields) == nil then return end
     emit({
         v = 2,
         type = "entity_patch",
@@ -285,11 +375,20 @@ local function snapshot_items(entry, entity_type)
             entity_type, type(items)))
         return {}
     end
-    if not entry.filter then return items end
     local kept = {}
     for _, item in ipairs(items) do
-        local ok_f, keep = pcall(entry.filter, item)
-        if ok_f and keep then kept[#kept + 1] = item end
+        if type(item) ~= "table" then
+            log.warn(string.format(
+                "entity_broadcast.snapshot: dropping non-table item for %q",
+                entity_type))
+        elseif resolve_id(entry, item, "snapshot") then
+            if not entry.filter then
+                kept[#kept + 1] = item
+            else
+                local ok_f, keep = pcall(entry.filter, item)
+                if ok_f and keep then kept[#kept + 1] = item end
+            end
+        end
     end
     return kept
 end
@@ -365,6 +464,14 @@ function M._reset_for_tests()
     state.set("entity_broadcast.seq_by_type", seq_by_type)
     state.set("entity_broadcast.seq_epoch", 0)
     broadcaster = function(_frame) end
+end
+
+local ok_hooks, hooks = pcall(require, "hub.hooks")
+if ok_hooks and hooks and type(hooks.on) == "function" then
+    hooks.on("plugin_unloading", "entity_broadcast.unregister_plugin", function(info)
+        if type(info) ~= "table" then return end
+        M.unregister_plugin(info.plugin_name or info.name or info.key)
+    end)
 end
 
 return M

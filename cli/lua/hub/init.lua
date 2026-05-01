@@ -84,7 +84,7 @@ safe_require("lib.tree_snapshot")
 -- so `Session:update` (which calls EB.patch) and the agent_created/deleted
 -- hooks (which call EB.upsert/remove) always land on a populated registry.
 -- Plugins can also register their own entity types after this point via
--- `EB.register("<plugin>.<type>", { id_field, all, filter? })`.
+-- `EB.register("<plugin>.<type>", { id_field = "id", all, filter? })`.
 
 local EB = safe_require("lib.entity_broadcast")
 if EB then

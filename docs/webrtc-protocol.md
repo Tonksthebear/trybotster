@@ -236,12 +236,34 @@ transient events must not be treated as alternate model-state channels.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `entity_type` | string | `session`, `workspace`, `spawn_target`, `worktree`, `hub`, or `connection_code` |
+| `entity_type` | string | Reserved built-in type (`session`, `session_action`, `workspace`, `spawn_target`, `worktree`, `hub`, `connection_code`, `template`) or plugin-owned `<plugin>.<type>` |
 | `snapshot_seq` | integer | Monotonic sequence used to reject stale frames |
 | `items` | array | Full records for `entity_snapshot` |
 | `id` | string | Entity id for upsert, patch, and remove frames |
 | `entity` | object | Full record for `entity_upsert` |
 | `patch` | object | Sparse top-level field changes for `entity_patch` |
+
+Plugin entity types are owned by exactly one plugin. Their wire name must be
+`<plugin>.<type>`, where `<plugin>` matches the plugin name that registered the
+type. Plugins must use `id` as the entity id field, and every snapshot/upserted
+record must carry a non-empty string `id`. Built-in records may expose their
+domain id under a built-in id field, but the envelope `id` is always a string.
+
+Snapshots are authoritative reconnect baselines. On hub-channel subscribe, the
+hub sends all registered `entity_snapshot` frames before any
+`ui_tree_snapshot` frames so renderer trees can bind to already-populated
+entity stores. Snapshot frames for each type carry the current per-type
+`snapshot_seq`; upsert, patch, and remove increment that type's sequence.
+Clients drop stale deltas whose sequence is not newer than the local baseline,
+while same-sequence snapshots are accepted as resyncs.
+
+`entity_patch` performs a top-level merge only. Nested objects replace the
+previous nested value wholesale; clients do not deep-merge plugin-owned state.
+
+Invalid plugin records are not repaired on the client. The hub logs and drops
+snapshot/upsert records with missing or non-string ids, drops invalid patches,
+and isolates broadcaster failures so one bad client transport cannot break the
+plugin mutator path.
 
 **Session fields:**
 
