@@ -134,6 +134,24 @@ local function prepare_node_dependencies(repo_root, worktree_path)
     )
 end
 
+local function prepare_repo_submodules(repo_root, worktree_path)
+    local gitmodules_path = repo_root .. "/.gitmodules"
+    if not fs.exists(gitmodules_path) then
+        return
+    end
+
+    local gitmodules = fs.read(gitmodules_path) or ""
+    if not gitmodules:find("path%s*=%s*cli/vendor/ghostty") then
+        return
+    end
+
+    run_command(
+        "git -C " .. shell_quote(worktree_path) .. " submodule update --init --recursive cli/vendor/ghostty >/dev/null 2>&1",
+        "[rails-worktree-lifecycle] Initialized Ghostty submodule in " .. worktree_path,
+        "[rails-worktree-lifecycle] Ghostty submodule initialization failed in " .. worktree_path
+    )
+end
+
 local function copy_file(repo_root, worktree_path, relative_path)
     local src = repo_root .. "/" .. relative_path
     local dst = worktree_path .. "/" .. relative_path
@@ -290,6 +308,7 @@ local function on_worktree_created(ctx)
 
     write_database_env(repo_root, ctx.path, ctx.branch)
     trust_mise(ctx.path)
+    prepare_repo_submodules(repo_root, ctx.path)
     prepare_node_dependencies(repo_root, ctx.path)
 end
 
