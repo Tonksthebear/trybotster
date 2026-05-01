@@ -104,6 +104,32 @@ local function dispatch_local_command_response(command)
     return response or { ok = true }
 end
 
+local function loading_plugin_name()
+    local display_name = rawget(_G, "_loading_plugin_display_name")
+    if type(display_name) == "string" and display_name ~= "" then return display_name end
+    local name = rawget(_G, "_loading_plugin_name")
+    if type(name) == "string" and name ~= "" then return name end
+    return nil
+end
+
+local function owner_plugin_from_opts(opts)
+    if type(opts) == "table" and type(opts.owner_plugin) == "string" and opts.owner_plugin ~= "" then
+        return opts.owner_plugin
+    end
+    return loading_plugin_name()
+end
+
+local function ensure_local_entity_publish_api(self, method_name)
+    if not self._is_local then
+        error(string.format("Hub:%s is local-only; publish plugin entities on the owning hub", method_name))
+    end
+    return require("lib.entity_broadcast")
+end
+
+local function assert_plugin_publish(eb, entity_type, opts, method_name)
+    return eb.assert_plugin_publish_owner(entity_type, owner_plugin_from_opts(opts), method_name)
+end
+
 -- =============================================================================
 -- Constructor (internal — use Hub.get())
 -- =============================================================================
@@ -577,6 +603,72 @@ function Hub:list_owned_sessions(owner_plugin)
         return response.sessions
     end
     return response
+end
+
+--- Publish an authoritative plugin entity snapshot.
+-- Plugins must register their entity type first with `lib.entity_broadcast`
+-- so reconnect snapshots have a source of truth. `entity_type` must be
+-- `<plugin>.<type>`, the namespace must match the owning plugin, and each
+-- item must carry a non-empty string `id`.
+-- @param entity_type string Plugin-owned type, e.g. "kanban.board"
+-- @param items table Array of entity records
+-- @param opts table|nil { owner_plugin = string }
+-- @return table { entity_type, count }
+function Hub:entity_snapshot(entity_type, items, opts)
+    local eb = ensure_local_entity_publish_api(self, "entity_snapshot")
+    assert_plugin_publish(eb, entity_type, opts, "entity_snapshot")
+    eb.snapshot(entity_type, items)
+    return { entity_type = entity_type, count = type(items) == "table" and #items or 0 }
+end
+
+--- Publish a plugin entity upsert.
+-- @param entity_type string Plugin-owned type, e.g. "kanban.board"
+-- @param entity table Entity record with non-empty string `id`
+-- @param opts table|nil { owner_plugin = string }
+-- @return table { entity_type, id }
+function Hub:entity_upsert(entity_type, entity, opts)
+    local eb = ensure_local_entity_publish_api(self, "entity_upsert")
+    local entry = assert_plugin_publish(eb, entity_type, opts, "entity_upsert")
+    local id = entity and (entity[entry.id_field] or entity.id) or nil
+    if type(id) ~= "string" or id == "" then
+        error(string.format("Hub:entity_upsert: entity for %q must carry non-empty string id", tostring(entity_type)))
+    end
+    eb.upsert(entity_type, entity)
+    return { entity_type = entity_type, id = id }
+end
+
+--- Publish a plugin entity patch.
+-- @param entity_type string Plugin-owned type, e.g. "kanban.board"
+-- @param id string Entity id
+-- @param fields table Sparse top-level field patch
+-- @param opts table|nil { owner_plugin = string }
+-- @return table { entity_type, id }
+function Hub:entity_patch(entity_type, id, fields, opts)
+    local eb = ensure_local_entity_publish_api(self, "entity_patch")
+    assert_plugin_publish(eb, entity_type, opts, "entity_patch")
+    if type(id) ~= "string" or id == "" then
+        error(string.format("Hub:entity_patch: id for %q must be a non-empty string", tostring(entity_type)))
+    end
+    if type(fields) ~= "table" then
+        error(string.format("Hub:entity_patch: patch for %q/%q must be a table", tostring(entity_type), tostring(id)))
+    end
+    eb.patch(entity_type, id, fields)
+    return { entity_type = entity_type, id = id }
+end
+
+--- Publish a plugin entity removal.
+-- @param entity_type string Plugin-owned type, e.g. "kanban.board"
+-- @param id string Entity id
+-- @param opts table|nil { owner_plugin = string }
+-- @return table { entity_type, id }
+function Hub:entity_remove(entity_type, id, opts)
+    local eb = ensure_local_entity_publish_api(self, "entity_remove")
+    assert_plugin_publish(eb, entity_type, opts, "entity_remove")
+    if type(id) ~= "string" or id == "" then
+        error(string.format("Hub:entity_remove: id for %q must be a non-empty string", tostring(entity_type)))
+    end
+    eb.remove(entity_type, id)
+    return { entity_type = entity_type, id = id }
 end
 
 --- List workspaces on this hub.

@@ -109,6 +109,11 @@ local function plugin_type_parts(entity_type)
     return plugin_name, type_name
 end
 
+local function plugin_entity_type_owner(entity_type)
+    local plugin_name = plugin_type_parts(entity_type)
+    return plugin_name
+end
+
 local function loading_plugin_name()
     -- Entity namespaces use the manifest/display name, not the loader key:
     -- repo-sourced plugin keys include paths (`repo:/...:name`) that are not
@@ -118,6 +123,11 @@ local function loading_plugin_name()
     local name = rawget(_G, "_loading_plugin_name")
     if type(name) == "string" and name ~= "" then return name end
     return nil
+end
+
+local function normalize_owner_plugin(owner_plugin)
+    if type(owner_plugin) == "string" and owner_plugin ~= "" then return owner_plugin end
+    return loading_plugin_name()
 end
 
 local function register_owner(entity_type, opts)
@@ -148,6 +158,42 @@ local function register_owner(entity_type, opts)
     return owner
 end
 
+local function assert_plugin_publish_owner(entity_type, owner_plugin, op_label)
+    local namespace = plugin_entity_type_owner(entity_type)
+    if not namespace then
+        error(string.format(
+            "entity_broadcast.%s: entity_type %q must be plugin-owned <plugin>.<type>",
+            tostring(op_label or "publish"), tostring(entity_type)), 3)
+    end
+
+    local owner = normalize_owner_plugin(owner_plugin)
+    if type(owner) ~= "string" or owner == "" then
+        error(string.format(
+            "entity_broadcast.%s: plugin entity_type %q requires owner_plugin or plugin load context",
+            tostring(op_label or "publish"), entity_type), 3)
+    end
+    if owner ~= namespace then
+        error(string.format(
+            "entity_broadcast.%s: plugin entity_type %q must be owned by namespace %q, got %q",
+            tostring(op_label or "publish"), entity_type, namespace, owner), 3)
+    end
+
+    local entry = get_entry(entity_type, op_label)
+    if not entry then
+        error(string.format(
+            "entity_broadcast.%s: plugin entity_type %q is not registered",
+            tostring(op_label or "publish"), entity_type), 3)
+    end
+    if entry.owner_plugin ~= owner then
+        error(string.format(
+            "entity_broadcast.%s: plugin entity_type %q is registered to owner %q, got %q",
+            tostring(op_label or "publish"), entity_type,
+            tostring(entry.owner_plugin), owner), 3)
+    end
+
+    return entry, owner
+end
+
 -- Resolve the entity id from a payload using the registered id_field, with
 -- `id` as a fallback. Returns nil + warns when neither is present so the
 -- caller can drop the frame instead of shipping an unidentified entity.
@@ -161,6 +207,45 @@ local function resolve_id(entry, payload, op_label)
         return nil
     end
     return id
+end
+
+local function validate_id(id, entity_type, op_label)
+    if type(id) ~= "string" or id == "" then
+        error(string.format(
+            "entity_broadcast.%s: entity id for %q must be a non-empty string",
+            tostring(op_label or "publish"), tostring(entity_type)), 3)
+    end
+end
+
+local function validate_payload_id(entry, entity_type, payload, op_label)
+    if type(payload) ~= "table" then
+        error(string.format(
+            "entity_broadcast.%s: entity for %q must be a table",
+            tostring(op_label or "publish"), tostring(entity_type)), 3)
+    end
+    local id = payload[entry.id_field] or payload.id
+    validate_id(id, entity_type, op_label)
+    return id
+end
+
+local function validate_snapshot_items(entry, entity_type, items, op_label)
+    if type(items) ~= "table" then
+        error(string.format(
+            "entity_broadcast.%s: items for %q must be a table",
+            tostring(op_label or "snapshot"), tostring(entity_type)), 3)
+    end
+
+    local out = {}
+    for index, item in ipairs(items) do
+        if type(item) ~= "table" then
+            error(string.format(
+                "entity_broadcast.%s: item %d for %q must be a table",
+                tostring(op_label or "snapshot"), index, tostring(entity_type)), 3)
+        end
+        validate_payload_id(entry, entity_type, item, op_label or "snapshot")
+        out[#out + 1] = item
+    end
+    return out
 end
 
 local function emit(frame)
@@ -347,6 +432,29 @@ function M.remove(entity_type, id)
         id = id,
         snapshot_seq = next_seq(entity_type),
     })
+end
+
+--- Emit `entity_snapshot` for a registered entity type. This is primarily
+--- used by the plugin-facing Hub API after a plugin refreshes its local
+--- read model and wants clients to replace their baseline immediately.
+function M.snapshot(entity_type, items)
+    local entry = get_entry(entity_type, "snapshot")
+    if not entry then return end
+    local kept = validate_snapshot_items(entry, entity_type, items, "snapshot")
+    emit({
+        v = 2,
+        type = "entity_snapshot",
+        entity_type = entity_type,
+        items = kept,
+        snapshot_seq = next_seq(entity_type),
+    })
+end
+
+--- Validate that a caller may publish a plugin-owned entity type. Exposed for
+--- `lib.hub`, which is the polished plugin API layer over this lower-level
+--- broadcaster.
+function M.assert_plugin_publish_owner(entity_type, owner_plugin, op_label)
+    return assert_plugin_publish_owner(entity_type, owner_plugin, op_label)
 end
 
 -- -------------------------------------------------------------------------
