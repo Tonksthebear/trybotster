@@ -160,6 +160,119 @@ fn register_rejects_missing_id_field() {
     assert!(err.to_string().contains("id_field"), "{err}");
 }
 
+#[test]
+fn register_rejects_unreserved_non_plugin_entity_type() {
+    let (lua, eb) = new_eb_lua();
+    let register: Function = eb.get("register").unwrap();
+    let opts: Table = lua.create_table().unwrap();
+    opts.set("id_field", "id").unwrap();
+    let all: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
+    opts.set("all", all).unwrap();
+
+    let err = register.call::<()>(("kanban_board", opts)).unwrap_err();
+    assert!(err.to_string().contains("<plugin>.<type>"), "{err}");
+}
+
+#[test]
+fn register_rejects_malformed_plugin_entity_type() {
+    let (lua, eb) = new_eb_lua();
+    let register: Function = eb.get("register").unwrap();
+    let opts: Table = lua.create_table().unwrap();
+    opts.set("id_field", "id").unwrap();
+    opts.set("owner_plugin", "kanban").unwrap();
+    let all: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
+    opts.set("all", all).unwrap();
+
+    let err = register.call::<()>(("kanban..board", opts)).unwrap_err();
+    assert!(err.to_string().contains("<plugin>.<type>"), "{err}");
+}
+
+#[test]
+fn plugin_entity_type_requires_owner_namespace_and_id_field() {
+    let (lua, eb) = new_eb_lua();
+    let register: Function = eb.get("register").unwrap();
+
+    let missing_owner: Table = lua.create_table().unwrap();
+    missing_owner.set("id_field", "id").unwrap();
+    let all: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
+    missing_owner.set("all", all).unwrap();
+    let err = register
+        .call::<()>(("kanban.board", missing_owner))
+        .unwrap_err();
+    assert!(err.to_string().contains("owner_plugin"), "{err}");
+
+    let wrong_owner: Table = lua.create_table().unwrap();
+    wrong_owner.set("id_field", "id").unwrap();
+    wrong_owner.set("owner_plugin", "other").unwrap();
+    let all: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
+    wrong_owner.set("all", all).unwrap();
+    let err = register
+        .call::<()>(("kanban.board", wrong_owner))
+        .unwrap_err();
+    assert!(err.to_string().contains("namespace"), "{err}");
+
+    let wrong_id: Table = lua.create_table().unwrap();
+    wrong_id.set("id_field", "board_id").unwrap();
+    wrong_id.set("owner_plugin", "kanban").unwrap();
+    let all: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
+    wrong_id.set("all", all).unwrap();
+    let err = register.call::<()>(("kanban.board", wrong_id)).unwrap_err();
+    assert!(err.to_string().contains("id_field=\"id\""), "{err}");
+}
+
+#[test]
+fn plugin_entity_type_rejects_cross_plugin_ownership_conflict() {
+    let (lua, eb) = new_eb_lua();
+    let register: Function = eb.get("register").unwrap();
+
+    let opts: Table = lua.create_table().unwrap();
+    opts.set("id_field", "id").unwrap();
+    opts.set("owner_plugin", "kanban").unwrap();
+    let all: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
+    opts.set("all", all).unwrap();
+    register.call::<()>(("kanban.board", opts)).unwrap();
+
+    let same_owner: Table = lua.create_table().unwrap();
+    same_owner.set("id_field", "id").unwrap();
+    same_owner.set("owner_plugin", "kanban").unwrap();
+    let all: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
+    same_owner.set("all", all).unwrap();
+    register
+        .call::<()>(("kanban.board", same_owner))
+        .expect("same plugin hot reload should re-register");
+
+    let hijack: Table = lua.create_table().unwrap();
+    hijack.set("id_field", "id").unwrap();
+    hijack.set("owner_plugin", "kanban").unwrap();
+    let all: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
+    hijack.set("all", all).unwrap();
+    let err = register
+        .call::<()>(("other.board", hijack))
+        .unwrap_err();
+    assert!(err.to_string().contains("namespace"), "{err}");
+}
+
+#[test]
+fn unregister_plugin_removes_only_owned_plugin_entity_types() {
+    let (lua, eb) = new_eb_lua();
+    register_session_type(&lua, &eb);
+
+    let register: Function = eb.get("register").unwrap();
+    let opts: Table = lua.create_table().unwrap();
+    opts.set("id_field", "id").unwrap();
+    opts.set("owner_plugin", "kanban").unwrap();
+    let all: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
+    opts.set("all", all).unwrap();
+    register.call::<()>(("kanban.board", opts)).unwrap();
+
+    let unregister_plugin: Function = eb.get("unregister_plugin").unwrap();
+    unregister_plugin.call::<()>(("kanban",)).unwrap();
+
+    let is_registered: Function = eb.get("is_registered").unwrap();
+    assert!(!is_registered.call::<bool>(("kanban.board",)).unwrap());
+    assert!(is_registered.call::<bool>(("session",)).unwrap());
+}
+
 // =============================================================================
 // upsert / patch / remove emit the right wire shapes
 // =============================================================================
@@ -357,6 +470,60 @@ fn send_snapshots_to_emits_one_snapshot_per_registered_type() {
     assert_eq!(json_frames[1]["entity_type"], json!("workspace"));
     assert_eq!(json_frames[1]["items"].as_array().unwrap().len(), 1);
     assert_eq!(json_frames[1]["items"][0]["workspace_id"], json!("ws-1"));
+}
+
+#[test]
+fn plugin_snapshot_drops_items_without_string_id() {
+    let (lua, eb) = new_eb_lua();
+    let register: Function = eb.get("register").unwrap();
+    let opts: Table = lua.create_table().unwrap();
+    opts.set("id_field", "id").unwrap();
+    opts.set("owner_plugin", "kanban").unwrap();
+    let all_fn: Function = lua
+        .create_function(|lua, ()| {
+            let arr = lua.create_table()?;
+            let valid = lua.create_table()?;
+            valid.set("id", "board-1")?;
+            valid.set("name", "Roadmap")?;
+            arr.set(1, valid)?;
+
+            let missing = lua.create_table()?;
+            missing.set("name", "No id")?;
+            arr.set(2, missing)?;
+
+            let numeric = lua.create_table()?;
+            numeric.set("id", 99)?;
+            numeric.set("name", "Numeric id")?;
+            arr.set(3, numeric)?;
+
+            arr.set(4, "not an entity")?;
+            Ok(arr)
+        })
+        .unwrap();
+    opts.set("all", all_fn).unwrap();
+    register.call::<()>(("kanban.board", opts)).unwrap();
+
+    let captured: Table = lua.create_table().unwrap();
+    let client: Table = lua.create_table().unwrap();
+    let captured_for_send = captured.clone();
+    let send: Function = lua
+        .create_function(move |_, (_self, frame): (Table, Table)| {
+            let next_idx = captured_for_send.raw_len() + 1;
+            captured_for_send.raw_set(next_idx, frame)?;
+            Ok(())
+        })
+        .unwrap();
+    client.set("send", send).unwrap();
+
+    let send_snapshots_to: Function = eb.get("send_snapshots_to").unwrap();
+    send_snapshots_to.call::<()>((client, "sub-plugin")).unwrap();
+
+    let frames = frames_as_json(&lua, &captured);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["entity_type"], json!("kanban.board"));
+    let items = frames[0]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "only records with string id survive");
+    assert_eq!(items[0]["id"], json!("board-1"));
 }
 
 #[test]
