@@ -133,6 +133,33 @@ fn inline_maps_to_hsplit() {
 }
 
 #[test]
+fn form_maps_to_vertical_stack_without_direction_prop() {
+    let lua = new_ui_lua();
+    let (render, actions) = render_lua(
+        &lua,
+        r#"return ui.form{
+            children = {
+                ui.text_input{ id = "project-name", label = "Project name", required = true },
+                ui.button{ label = "Create", action = ui.action("workflow.project.create") },
+            },
+        }"#,
+        &regular_viewport(),
+    );
+
+    match render {
+        RenderNode::VSplit {
+            constraints,
+            children,
+        } => {
+            assert_eq!(constraints.len(), 2);
+            assert_eq!(children.len(), 2);
+        }
+        other => panic!("expected VSplit, got {other:?}"),
+    }
+    assert_eq!(actions.len(), 1);
+}
+
+#[test]
 fn panel_with_single_child_attaches_block_to_child() {
     let lua = new_ui_lua();
     let (render, _) = render_lua(
@@ -409,6 +436,7 @@ fn text_input_maps_to_input_widget_and_records_change_action() {
         r#"return ui.text_input{
             id = "project-name",
             label = "Project name",
+            required = true,
             value = "Botster",
             placeholder = "Name",
             on_change = ui.action("workflow.project.name.change"),
@@ -440,6 +468,7 @@ fn textarea_maps_to_operational_paragraph() {
         r#"return ui.textarea{
             id = "notes",
             label = "Notes",
+            required = true,
             value = "line one\nline two",
             on_change = ui.action("workflow.project.notes.change"),
         }"#,
@@ -483,6 +512,7 @@ fn select_renders_options_and_records_value_payloads() {
         r#"return ui.select{
             id = "priority",
             label = "Priority",
+            required = true,
             value = "high",
             options = {
                 { value = "normal", label = "Normal" },

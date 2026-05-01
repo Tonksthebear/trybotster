@@ -165,6 +165,7 @@ This is the recommended shared primitive inventory.
 
 - `stack`
 - `inline`
+- `form`
 - `panel`
 - `scroll_area`
 - `overlay`
@@ -232,6 +233,20 @@ type StackProps = {
 ```
 
 This deliberately replaces separate `HSplit` and `VSplit` as the shared semantic contract. The TUI can still translate `stack.direction` into its internal split nodes.
+
+### `form`
+
+```ts
+type FormProps = {}
+```
+
+`form` is an explicit validation boundary for input controls and submit-style
+buttons. The web renderer maps it to a native `<form>` and prevents native page
+submission; `button` actions inside the form run native validity checks before
+dispatching their Botster action. Non-submit action primitives such as
+`icon_button`, tree item actions, and empty-state primary actions do not validate
+the form. The TUI may render a form like a vertical stack until richer form
+affordances exist.
 
 ### `panel`
 
@@ -347,6 +362,7 @@ type TextInputProps = {
   value?: string
   placeholder?: string
   label?: string
+  required?: boolean
   onChange?: UiAction
 }
 ```
@@ -358,6 +374,13 @@ Controlled/uncontrolled rule:
 
 The renderer emits `onChange` with the next `{ value }` merged into the action payload.
 
+`required` is shared metadata for accessibility, renderer styling, and native
+web control attributes where available. It does not replace action-handler
+validation: renderers may block submit-style button dispatch for invalid
+controls inside `form`, but the hub/plugin action handler must still validate
+required fields. The TUI may ignore the visual treatment until editable form
+affordances mature.
+
 ### `textarea`
 
 ```ts
@@ -365,6 +388,7 @@ type TextareaProps = {
   value?: string
   placeholder?: string
   label?: string
+  required?: boolean
   onChange?: UiAction
 }
 ```
@@ -384,6 +408,9 @@ type CheckboxProps = {
 For `checkbox`, explicit `selected` means Lua-controlled; omitted
 `selected` plus a stable node `id` lets renderers own local state. Renderers emit
 `onChange` with the next `{ selected }` merged into the action payload.
+`required` is intentionally not part of `CheckboxProps` yet because checkbox
+requiredness means "must be checked" rather than "must have a value"; model that
+as domain validation until a checked-required checkbox contract is specified.
 
 ### `select`
 
@@ -392,6 +419,7 @@ type SelectProps = {
   label?: string
   value?: string
   placeholder?: string
+  required?: boolean
   options: Array<{ value: string; label: string }>
   onChange?: UiAction
 }

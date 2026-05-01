@@ -226,6 +226,95 @@ describe('ui_contract registry — action primitives', () => {
     expect(onAction).not.toHaveBeenCalled()
   })
 
+  it('button action waits for required controls in the nearest form scope', () => {
+    const onAction = vi.fn()
+    renderTree(
+      {
+        type: 'form',
+        children: [
+          {
+            type: 'text_input',
+            id: 'project-name',
+            props: { label: 'Project name', required: true },
+          },
+          {
+            type: 'button',
+            props: {
+              label: 'Create',
+              action: { id: 'workflow.project.create' },
+            },
+          },
+        ],
+      },
+      { onAction },
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    expect(onAction).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByLabelText('Project name'), {
+      target: { value: 'Apollo' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    expect(onAction).toHaveBeenCalledOnce()
+  })
+
+  it('button outside a form ignores unrelated required controls', () => {
+    const onAction = vi.fn()
+    renderTree(
+      {
+        type: 'stack',
+        props: { direction: 'vertical' },
+        children: [
+          {
+            type: 'text_input',
+            id: 'project-name',
+            props: { label: 'Project name', required: true },
+          },
+          {
+            type: 'button',
+            props: {
+              label: 'Cancel',
+              action: { id: 'workflow.cancel' },
+            },
+          },
+        ],
+      },
+      { onAction },
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(onAction).toHaveBeenCalledOnce()
+  })
+
+  it('icon_button inside a form does not submit or validate the form', () => {
+    const onAction = vi.fn()
+    renderTree(
+      {
+        type: 'form',
+        children: [
+          {
+            type: 'text_input',
+            id: 'project-name',
+            props: { label: 'Project name', required: true },
+          },
+          {
+            type: 'icon_button',
+            props: {
+              icon: 'search',
+              label: 'Search',
+              action: { id: 'workflow.search' },
+            },
+          },
+        ],
+      },
+      { onAction },
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    expect(onAction).toHaveBeenCalledOnce()
+  })
+
   it('icon_button carries accessible label and fires action', () => {
     const onAction = vi.fn()
     renderTree(
@@ -273,6 +362,39 @@ describe('ui_contract registry — form primitives', () => {
       id: 'workflow.project.name.change',
       payload: { projectId: 'p1', value: 'New' },
     })
+  })
+
+  it('text_input, textarea, and select render native required metadata', () => {
+    renderTree({
+      type: 'stack',
+      props: { direction: 'vertical' },
+      children: [
+        {
+          type: 'text_input',
+          id: 'project-name',
+          props: { label: 'Project name', required: true },
+        },
+        {
+          type: 'textarea',
+          id: 'notes',
+          props: { label: 'Notes', required: true },
+        },
+        {
+          type: 'select',
+          id: 'priority',
+          props: {
+            label: 'Priority',
+            required: true,
+            placeholder: 'Pick one',
+            options: [{ value: 'high', label: 'High' }],
+          },
+        },
+      ],
+    })
+
+    expect(screen.getByLabelText('Project name')).toBeRequired()
+    expect(screen.getByLabelText('Notes')).toBeRequired()
+    expect(screen.getByLabelText('Priority')).toBeRequired()
   })
 
   it('textarea dispatches onChange with value payload', () => {

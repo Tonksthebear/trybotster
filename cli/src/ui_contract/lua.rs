@@ -53,6 +53,7 @@ pub fn register(lua: &Lua) -> Result<()> {
 
     register_primitive(lua, &ui, "stack", Primitive::Stack)?;
     register_primitive(lua, &ui, "inline", Primitive::Inline)?;
+    register_primitive(lua, &ui, "form", Primitive::Form)?;
     register_primitive(lua, &ui, "panel", Primitive::Panel)?;
     register_primitive(lua, &ui, "scroll_area", Primitive::ScrollArea)?;
     register_primitive(lua, &ui, "text", Primitive::Text)?;
@@ -103,6 +104,7 @@ pub fn register(lua: &Lua) -> Result<()> {
 enum Primitive {
     Stack,
     Inline,
+    Form,
     Panel,
     ScrollArea,
     Text,
@@ -150,6 +152,7 @@ impl Primitive {
         match self {
             Self::Stack => "stack",
             Self::Inline => "inline",
+            Self::Form => "form",
             Self::Panel => "panel",
             Self::ScrollArea => "scroll_area",
             Self::Text => "text",
@@ -212,6 +215,7 @@ impl Primitive {
         match self {
             Self::Stack => &["direction", "gap", "align", "justify"],
             Self::Inline => &["gap", "align", "justify", "wrap"],
+            Self::Form => &[],
             Self::Panel => &["title", "tone", "border", "interactionDensity"],
             Self::ScrollArea => &["axis"],
             Self::Text => &[
@@ -229,9 +233,18 @@ impl Primitive {
             Self::EmptyState => &["title", "description", "icon", "primaryAction"],
             Self::Button => &["label", "action", "variant", "tone", "icon"],
             Self::IconButton => &["icon", "label", "action", "tone"],
-            Self::TextInput | Self::Textarea => &["label", "value", "placeholder", "onChange"],
+            Self::TextInput | Self::Textarea => {
+                &["label", "required", "value", "placeholder", "onChange"]
+            }
             Self::Checkbox => &["label", "selected", "onChange"],
-            Self::Select => &["label", "value", "placeholder", "options", "onChange"],
+            Self::Select => &[
+                "label",
+                "required",
+                "value",
+                "placeholder",
+                "options",
+                "onChange",
+            ],
             Self::Tree => &[],
             Self::TreeItem => &["expanded", "selected", "notification", "action"],
             Self::Dialog => &["open", "title", "presentation"],
@@ -607,6 +620,7 @@ fn validate(_lua: &Lua, kind: Primitive, node: &Table) -> mlua::Result<()> {
         // the prop allowlist already rejects typos.
         Primitive::Tree
         | Primitive::Inline
+        | Primitive::Form
         | Primitive::Panel
         | Primitive::ScrollArea
         | Primitive::SessionList

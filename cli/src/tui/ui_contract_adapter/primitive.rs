@@ -96,6 +96,7 @@ const UI_NODE_TYPE_NAMES: &[&str] = &[
     // Layout
     "stack",
     "inline",
+    "form",
     "panel",
     "scroll_area",
     "overlay",
@@ -199,6 +200,7 @@ pub fn render_ui_node_with_stores(
     match node.node_type.as_str() {
         "stack" => render_stack(node, viewport, actions, stores),
         "inline" => render_inline(node, viewport, actions, stores),
+        "form" => render_form(node, viewport, actions, stores),
         "panel" => render_panel(node, viewport, actions, stores),
         "scroll_area" => render_scroll_area(node, viewport, actions, stores),
         "overlay" => render_overlay(node, viewport, actions, stores),
@@ -274,6 +276,21 @@ fn render_inline(
     let rendered = render_children(&children, viewport, actions, stores)?;
     let constraints = default_min_zero_constraints(rendered.len());
     Ok(RenderNode::HSplit {
+        constraints,
+        children: rendered,
+    })
+}
+
+fn render_form(
+    node: &UiNode,
+    viewport: &UiViewport,
+    actions: &mut ActionTable,
+    stores: Option<&TuiEntityStores>,
+) -> Result<RenderNode> {
+    let children = filter_children(&node.children, viewport);
+    let rendered = render_children(&children, viewport, actions, stores)?;
+    let constraints = default_min_zero_constraints(rendered.len());
+    Ok(RenderNode::VSplit {
         constraints,
         children: rendered,
     })

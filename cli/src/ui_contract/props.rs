@@ -233,6 +233,9 @@ pub struct TextInputProps {
     /// Optional label text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Whether browser/native validation should require a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
     /// Current value in controlled mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
@@ -252,6 +255,9 @@ pub struct TextareaProps {
     /// Optional label text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Whether browser/native validation should require a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
     /// Current value in controlled mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
@@ -265,6 +271,10 @@ pub struct TextareaProps {
 }
 
 /// `Checkbox` props.
+///
+/// `required` is intentionally not part of this prop set. Required checkbox
+/// semantics mean "must be checked" rather than "must have a value", so keep
+/// that as domain validation until the shared contract specifies it explicitly.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckboxProps {
@@ -297,6 +307,9 @@ pub struct SelectProps {
     /// Optional label text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Whether browser/native validation should require a selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
     /// Current value in controlled mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
@@ -905,6 +918,94 @@ mod tests {
         };
         let v = serde_json::to_value(&p).expect("serialize");
         assert!(v.get("disabled").is_none());
+    }
+
+    // ---------- Form primitives ----------
+
+    #[test]
+    fn text_input_round_trip_required() {
+        let p = TextInputProps {
+            label: Some("Project".into()),
+            required: Some(true),
+            value: Some("Apollo".into()),
+            placeholder: Some("Project name".into()),
+            on_change: Some(UiAction::new("project.name.change")),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(
+            v,
+            json!({
+                "label": "Project",
+                "required": true,
+                "value": "Apollo",
+                "placeholder": "Project name",
+                "onChange": { "id": "project.name.change" }
+            })
+        );
+        let back: TextInputProps = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn textarea_round_trip_required() {
+        let p = TextareaProps {
+            label: Some("Notes".into()),
+            required: Some(true),
+            value: Some("Ship the feature".into()),
+            placeholder: Some("Implementation notes".into()),
+            on_change: Some(UiAction::new("project.notes.change")),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(
+            v,
+            json!({
+                "label": "Notes",
+                "required": true,
+                "value": "Ship the feature",
+                "placeholder": "Implementation notes",
+                "onChange": { "id": "project.notes.change" }
+            })
+        );
+        let back: TextareaProps = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn select_round_trip_required() {
+        let p = SelectProps {
+            label: Some("Priority".into()),
+            required: Some(true),
+            value: Some("high".into()),
+            placeholder: Some("Choose priority".into()),
+            options: vec![
+                SelectOptionProps {
+                    value: "normal".into(),
+                    label: "Normal".into(),
+                },
+                SelectOptionProps {
+                    value: "high".into(),
+                    label: "High".into(),
+                },
+            ],
+            on_change: Some(UiAction::new("project.priority.change")),
+        };
+        let v = serde_json::to_value(&p).expect("serialize");
+        assert_eq!(
+            v,
+            json!({
+                "label": "Priority",
+                "required": true,
+                "value": "high",
+                "placeholder": "Choose priority",
+                "options": [
+                    { "value": "normal", "label": "Normal" },
+                    { "value": "high", "label": "High" }
+                ],
+                "onChange": { "id": "project.priority.change" }
+            })
+        );
+        let back: SelectProps = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(back, p);
     }
 
     // ---------- Tree: intentionally no TreeProps struct ----------
