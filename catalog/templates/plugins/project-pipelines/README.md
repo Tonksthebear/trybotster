@@ -14,17 +14,17 @@ Device-level Botster development plugin for project/ticket workflows.
 The plugin is intentionally split across modules:
 
 - `init.lua` clears hot-reload module cache, registers tools, surfaces, and events.
-- `project_pipelines_db.lua` owns the plugin SQLite schema.
-- `project_pipelines_repo.lua` owns persistence and audit events.
-- `project_pipelines_engine.lua` owns run advancement, gates, agent creation, and command gates.
-- `project_pipelines_mcp.lua` exposes the agent-facing API.
-- `project_pipelines_surface.lua` registers routes and sidebar navigation.
-- `project_pipelines_screen_home.lua` renders the overview.
-- `project_pipelines_screen_pipelines.lua` renders the pipeline index and edit form.
-- `project_pipelines_screen_run.lua` renders run details.
-- `project_pipelines_actions.lua` handles Catalyst UI action envelopes.
-- `project_pipelines_ui.lua` contains shared UI helpers.
-- `project_pipelines_util.lua` contains shared helpers.
+- `project_pipelines/db.lua` owns the plugin SQLite schema.
+- `project_pipelines/repo.lua` owns persistence and audit events.
+- `project_pipelines/engine.lua` owns run advancement, gates, agent creation, and command gates.
+- `project_pipelines/mcp.lua` exposes the agent-facing API.
+- `project_pipelines/web/surface.lua` registers routes and sidebar navigation.
+- `project_pipelines/web/screens/home.lua` renders the overview.
+- `project_pipelines/web/screens/pipelines.lua` renders the pipeline index and edit form.
+- `project_pipelines/web/screens/run.lua` renders run details.
+- `project_pipelines/web/actions.lua` handles Catalyst UI action envelopes.
+- `project_pipelines/web/ui.lua` contains shared UI helpers.
+- `project_pipelines/util.lua` contains shared helpers.
 
 ## Concepts
 

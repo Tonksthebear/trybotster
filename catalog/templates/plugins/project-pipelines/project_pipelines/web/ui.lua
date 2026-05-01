@@ -176,8 +176,7 @@ function M.visible_tickets(repo)
     if not repo then
         return tickets
     end
-    local source = repo.standalone_tickets and repo.standalone_tickets() or repo.list_tickets()
-    for _, ticket in ipairs(source) do
+    for _, ticket in ipairs(repo.standalone_tickets()) do
         if M.ticket_should_show(ticket, repo) then
             table.insert(tickets, ticket)
         end
