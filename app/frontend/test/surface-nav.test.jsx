@@ -118,4 +118,28 @@ describe('<SurfaceNav>', () => {
     fireEvent.click(screen.getByRole('button', { name: /plugins/i }))
     expect(screen.queryByTestId('surface-nav-entry')).toBeNull()
   })
+
+  it('marks surfaces with route-registry notifications', () => {
+    useRouteRegistryStore.getState().setRoutes('hub-1', [
+      {
+        path: '/pipelines',
+        base_path: '/pipelines',
+        surface: 'pipelines',
+        label: 'Pipelines',
+        nav: { section: 'workspace', order: 30 },
+        notification: true,
+      },
+    ])
+
+    render(
+      <MemoryRouter>
+        <SurfaceNav density="sidebar" ctx={fakeCtx()} />
+      </MemoryRouter>,
+    )
+
+    const link = screen.getByTestId('surface-nav-entry')
+    expect(link).toHaveTextContent('Pipelines')
+    expect(link).toHaveAttribute('data-notification', 'true')
+    expect(link.className).toContain('border-amber-400')
+  })
 })

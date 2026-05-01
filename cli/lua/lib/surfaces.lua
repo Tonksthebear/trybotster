@@ -167,6 +167,20 @@ local function normalize_sidebar(opts)
     }
 end
 
+local function resolve_notification(value)
+    if type(value) == "function" then
+        local ok, result = pcall(value)
+        if ok then
+            return result == true
+        end
+        if log and log.warn then
+            log.warn("surfaces: notification resolver failed: " .. tostring(result))
+        end
+        return false
+    end
+    return value == true
+end
+
 local function notify_changed()
     if type(hooks) == "table" and type(hooks.notify) == "function" then
         pcall(hooks.notify, "surfaces_changed", { registry = M })
@@ -496,6 +510,7 @@ function M.register(name, opts)
         icon = is_nonempty_string(opts.icon) and opts.icon or nil,
         nav = nav,
         sidebar = sidebar,
+        notification = opts.notification,
         render = render,
         compiled_routes = compiled_routes,
         input_builder = type(opts.input_builder) == "function" and opts.input_builder or nil,
@@ -614,6 +629,7 @@ function M.list()
             icon = entry.icon,
             nav = entry.nav,
             sidebar = entry.sidebar,
+            notification = resolve_notification(entry.notification),
             hide_from_nav = entry.hide_from_nav,
             order = entry.order,
             seq = entry.seq,
@@ -669,6 +685,7 @@ function M.build_route_registry_payload(hub_id)
                 icon = summary.icon,
                 nav = summary.nav,
                 sidebar = summary.sidebar,
+                notification = summary.notification or nil,
                 hide_from_nav = summary.hide_from_nav or nil,
                 routes = sub_patterns,
             }
