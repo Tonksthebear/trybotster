@@ -258,6 +258,24 @@ export type SelectProps = {
  */
 export type TreeProps = Record<string, never>
 
+export type ListProps = Record<string, never>
+
+export type ListItemProps = {
+  selected?: boolean
+  notification?: boolean
+  action?: UiAction
+}
+
+export type TableColumnProps = {
+  key: string
+  label: string
+}
+
+export type TableProps = {
+  columns?: TableColumnProps[]
+  rows?: Record<string, unknown>[]
+}
+
 export type TreeItemProps = {
   expanded?: boolean
   selected?: boolean
@@ -363,6 +381,9 @@ export type UiPrimitiveType =
   | 'textarea'
   | 'checkbox'
   | 'select'
+  | 'list'
+  | 'list_item'
+  | 'table'
   | 'tree'
   | 'tree_item'
   | 'dialog'

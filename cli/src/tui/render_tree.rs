@@ -99,6 +99,8 @@ pub enum WidgetProps {
     Terminal(TerminalBinding),
     /// List widget props.
     List(ListProps),
+    /// Table widget props.
+    Table(TableProps),
     /// Paragraph widget props.
     Paragraph(ParagraphProps),
     /// Input widget props.
@@ -116,6 +118,8 @@ pub enum WidgetType {
     Terminal,
     /// Generic selectable list with optional headers.
     List,
+    /// Generic table.
+    Table,
     /// Static styled text block.
     Paragraph,
     /// Text input with prompt lines.
@@ -158,6 +162,15 @@ pub struct ListItemProps {
     pub style: Option<SpanStyle>,
     /// Optional action identifier triggered when this item is selected.
     pub action: Option<String>,
+}
+
+/// Props for a generic table widget.
+#[derive(Debug, Clone)]
+pub struct TableProps {
+    /// Header labels.
+    pub headers: Vec<String>,
+    /// Row cells, already stringified for terminal rendering.
+    pub rows: Vec<Vec<String>>,
 }
 
 /// Props for a paragraph widget.
@@ -503,6 +516,7 @@ impl RenderNode {
         let widget_type = match type_name {
             "terminal" => WidgetType::Terminal,
             "list" => WidgetType::List,
+            "table" => WidgetType::Table,
             "paragraph" => WidgetType::Paragraph,
             "input" => WidgetType::Input,
             "connection_code" => WidgetType::ConnectionCode,
@@ -518,6 +532,7 @@ impl RenderNode {
         let props = match widget_type {
             WidgetType::Terminal => parse_terminal_props(table),
             WidgetType::List => parse_list_props(table),
+            WidgetType::Table => None,
             WidgetType::Paragraph => parse_paragraph_props(table),
             WidgetType::Input => parse_input_props(table),
             _ => None,
@@ -1008,6 +1023,13 @@ fn render_widget(
                     widget_id,
                     widget_states,
                 );
+            } else {
+                f.render_widget(block, area);
+            }
+        }
+        WidgetType::Table => {
+            if let Some(WidgetProps::Table(table_props)) = props {
+                super::render::render_table_widget(f, area, block, table_props);
             } else {
                 f.render_widget(block, area);
             }

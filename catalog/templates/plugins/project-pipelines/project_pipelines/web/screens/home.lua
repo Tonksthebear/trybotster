@@ -10,73 +10,58 @@ local view = require("project_pipelines.web.ui")
 local M = {}
 
 local function ticket_template()
-    return view.panel{
-        ui.stack{ direction = "vertical", gap = "2", children = {
-            view.row{
-                ui.text{ text = ui.bind("@/title"), size = "sm", weight = "semibold" },
-                ui.badge{ text = ui.bind("@/latest_run_badge"), tone = ui.bind("@/latest_run_tone") },
-                ui.badge{ text = ui.bind("@/secondary_badge"), tone = ui.bind("@/secondary_badge_tone") },
-            },
+    return ui.list_item{
+        id = ui.bind("@/id"),
+        action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
+        title = {
+            ui.text{ text = ui.bind("@/title"), size = "sm", weight = "semibold" },
+        },
+        subtitle = {
             ui.text{ text = ui.bind("@/description"), size = "xs", tone = "muted" },
-            view.row{
-                ui.text{ text = ui.bind("@/run_count_label"), size = "xs", tone = "muted" },
-                ui.text{ text = ui.bind("@/tail_label"), size = "xs", tone = "muted" },
-                ui.button{
-                    label = "Open ticket",
-                    icon = "arrow-right",
-                    variant = "solid",
-                    tone = "accent",
-                    action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
-                },
-            },
-        } },
+        },
+        end_ = {
+            ui.badge{ text = ui.bind("@/latest_run_badge"), tone = ui.bind("@/latest_run_tone") },
+            ui.badge{ text = ui.bind("@/secondary_badge"), tone = ui.bind("@/secondary_badge_tone") },
+        },
+        detail = {
+            ui.text{ text = ui.bind("@/run_count_label"), size = "xs", tone = "muted" },
+            ui.text{ text = ui.bind("@/tail_label"), size = "xs", tone = "muted" },
+        },
     }
 end
 
 local function pipeline_template()
-    return view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
-        view.row{
+    return ui.list_item{
+        id = ui.bind("@/id"),
+        action = ui.action("botster.nav.open", {
+            path = ui.bind("@/edit_path"),
+        }),
+        title = {
             ui.text{ text = ui.bind("@/name"), size = "sm", weight = "semibold" },
-            ui.button{
-                label = "Edit",
-                icon = "pencil-square",
-                variant = "solid",
-                tone = "accent",
-                action = ui.action("botster.nav.open", {
-                    path = ui.bind("@/edit_path"),
-                }),
-            },
         },
-        ui.text{ text = ui.bind("@/description"), size = "xs", tone = "muted" },
-        ui.text{ text = ui.bind("@/step_count_label"), size = "xs", tone = "muted" },
-    } } }
-end
-
-local function project_template()
-    return view.panel{
-        ui.stack{ direction = "vertical", gap = "2", children = {
-            view.row{
-                ui.text{ text = ui.bind("@/name"), size = "sm", weight = "semibold" },
-                ui.badge{ text = ui.bind("@/status"), tone = ui.bind("@/status_tone") },
-            },
+        subtitle = {
             ui.text{ text = ui.bind("@/description"), size = "xs", tone = "muted" },
-            ui.button{
-                label = "Open project",
-                icon = "folder-open",
-                variant = "solid",
-                tone = "accent",
-                action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
-            },
-        } },
+        },
+        end_ = {
+            ui.text{ text = ui.bind("@/step_count_label"), size = "xs", tone = "muted" },
+        },
     }
 end
 
-local function run_template()
-    return ui.button{
-        label = ui.bind("@/label"),
-        icon = "queue-list",
-        variant = "ghost",
+local function project_template()
+    return ui.tree_item{
+        id = ui.bind("@/id"),
+        expanded = true,
         action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
+        title = {
+            ui.text{ text = ui.bind("@/name"), size = "sm", weight = "semibold" },
+        },
+        subtitle = {
+            ui.text{ text = ui.bind("@/description"), size = "xs", tone = "muted" },
+        },
+        end_ = {
+            ui.badge{ text = ui.bind("@/status"), tone = ui.bind("@/status_tone") },
+        },
     }
 end
 
@@ -114,16 +99,29 @@ function M.render(_view_state, ctx)
             },
         } } },
         view.panel{ view.section("Projects", {
-            ui.bind_list{ source = "/project-pipelines.project", item_template = project_template() },
+            ui.tree{ children = {
+                ui.bind_list{ source = "/project-pipelines.project", item_template = project_template() },
+            } },
         }) },
         view.panel{ view.section("Tickets", {
-            ui.bind_list{ source = "/project-pipelines.ticket", item_template = ticket_template() },
+            ui.list{ children = {
+                ui.bind_list{ source = "/project-pipelines.ticket", item_template = ticket_template() },
+            } },
         }) },
         view.panel{ view.section("Recent Runs", {
-            ui.bind_list{ source = "/project-pipelines.run", item_template = run_template() },
+            ui.table{
+                columns = {
+                    { key = "pipeline_name", label = "Pipeline" },
+                    { key = "status", label = "Status" },
+                    { key = "ticket_title", label = "Ticket" },
+                },
+                rows = ui.bind("/project-pipelines.run"),
+            },
         }) },
         view.section("Pipeline Definitions", {
-            ui.bind_list{ source = "/project-pipelines.pipeline", item_template = pipeline_template() },
+            ui.list{ children = {
+                ui.bind_list{ source = "/project-pipelines.pipeline", item_template = pipeline_template() },
+            } },
         }),
     } }
 end
