@@ -192,6 +192,44 @@ control attributes. Put related controls and the submit-style `ui.button` inside
 the button action. This is only client-side UX; always keep plugin-side or
 hub-side validation for required fields.
 
+Submit-style `ui.button` and `ui.icon_button` actions use the generic
+`ui_action` lifecycle. The browser generates an `action_request_id` when the
+user activates the control, marks that submitter pending immediately, and sends
+the id beside the action envelope:
+
+```json
+{
+  "type": "ui_action",
+  "target_surface": "project_pipelines",
+  "action_request_id": "ua_...",
+  "envelope": { "id": "workflow.project.save", "payload": { "project_id": "p1" } }
+}
+```
+
+Handlers return `action.HANDLED` for a generic success,
+`action.result{ message = "Saved" }` for specific result text,
+`action.result{ message = "Saved", navigate = { label = "Open", path =
+"/pipelines/tickets/t1" } }` for a follow-up navigation affordance, or
+`action.result{ ok = false, error = "Select a target." }` for errors. The
+hub replies on the same subscription with:
+
+```json
+{
+  "type": "ui_action_result",
+  "v": 1,
+  "target_surface": "project_pipelines",
+  "action_request_id": "ua_...",
+  "action_id": "workflow.project.save",
+  "ok": true,
+  "handled": true,
+  "via": "handler",
+  "message": "Saved"
+}
+```
+
+This feedback path is renderer-owned. Do not add CSS, DOM attributes, or
+web-only pending state to Lua payloads.
+
 `ui.checkbox` does not accept `required` yet; required checkbox semantics mean
 "must be checked", so model that as domain validation until the shared contract
 adds a checked-required checkbox state.
