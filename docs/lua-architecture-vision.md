@@ -47,10 +47,17 @@ This feedback loop is the entire point. Everything else follows from it.
 - Agent lifecycle management
 - Event handlers / hooks
 - TUI layout and logic
-- Web routes and templates
-- State management
+- Web surface routes and renderer-neutral UI primitive trees
+- Plugin state models published through entity frames
 - Business logic
 - User customizations
+
+Plugin-authored UI follows the shared entity and UI contract described in
+[Plugin Entities](plugin-entities.md). Lua publishes durable model records with
+`entity_snapshot`, `entity_upsert`, `entity_patch`, and `entity_remove`; browser
+and TUI clients render shared primitive trees that bind into those records.
+`ui_tree_snapshot` remains presentation/control structure, not a model-state
+transport.
 
 ### Why This Split?
 
@@ -73,7 +80,7 @@ Lua handles things that:
 │                        LUA LAYER                            │
 │                                                             │
 │   Agent lifecycle       Event handlers      Business logic  │
-│   TUI layout/widgets    Web routes          State mgmt      │
+│   TUI layout/widgets    Web surfaces        Entity models   │
 │   User customizations   Self-improvements                   │
 │                                                             │
 │   ↓ calls primitives ↓                                      │

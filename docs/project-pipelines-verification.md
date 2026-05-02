@@ -1,5 +1,42 @@
 # Project Pipelines Verification
 
+## 2026-05-02 Plugin Entity Documentation Verification
+
+Scope:
+
+- Plugin-owned entity architecture documentation.
+- Lua primitive reference and UI contract docs.
+- Project Pipelines authoring guide and entity-backed UI case study.
+
+Static checks performed:
+
+```bash
+rg -n "entity_snapshot|entity_upsert|entity_patch|entity_remove|bind_list|ui_action_result|action_request_id" docs cli/src/ui_contract catalog/templates/plugins/project-pipelines
+rg -n "browser-only|plugin-specific list snapshot|template cloning|legacy|v1|v2|ui_tree_snapshot" docs cli/src/ui_contract catalog/templates/plugins/project-pipelines
+rg -n "lib.entity_broadcast|entity_snapshot|ui.bind_list|action.result" catalog/templates/plugins/project-pipelines cli/lua
+```
+
+Results:
+
+- Required entity, binding, and action lifecycle terms appear in the new
+  canonical guide plus Lua, UI contract, web runtime, and Project Pipelines docs.
+- Any remaining `legacy` matches are implementation cleanup identifiers such as
+  `pipeline.legacy_prune_checked`, not a documented plugin UI compatibility
+  mode.
+- `ui_tree_snapshot` matches should describe presentation/control structure,
+  not a durable plugin model-state channel.
+- All documented paths for this pass were present:
+  `docs/plugin-entities.md`, `docs/lua/primitives.md`,
+  `docs/lua/session-actions.md`, `cli/src/ui_contract/README.md`,
+  `docs/specs/cross-client-ui-primitives.md`,
+  `docs/specs/web-ui-primitives-runtime.md`,
+  `catalog/templates/plugins/project-pipelines/README.md`,
+  `docs/project-pipelines-verification.md`, `README.md`, and
+  `docs/lua-architecture-vision.md`.
+
+Project Pipelines remains the reference plugin for entity-backed dynamic state
+and generic action lifecycle feedback.
+
 ## 2026-05-01 Dependency And Merge Polish
 
 Manual verification was run against the live `~/.botster-dev/plugins/project-pipelines` plugin after reloading the plugin and layout.

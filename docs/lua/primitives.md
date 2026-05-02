@@ -285,7 +285,7 @@ registration contract.
 
 Plugins publish durable dynamic state through the Hub entity API backed by
 `lib.entity_broadcast`. This is the only shared model-state path for plugin UI;
-do not add browser-only refresh commands or plugin-specific list snapshots.
+do not add client-specific refresh commands or per-plugin collection snapshots.
 `ui_tree_snapshot` frames describe presentation, while entity frames carry the
 data that both browser and TUI stores consume.
 
@@ -306,25 +306,26 @@ local boards = {
 
 EB.register("kanban.board", {
   id_field = "id",
+  owner_plugin = "kanban",
   all = function()
     return boards
   end,
 })
 
-Hub.get():entity_snapshot("kanban.board", boards)
+Hub.get():entity_snapshot("kanban.board", boards, { owner_plugin = "kanban" })
 
 Hub.get():entity_upsert("kanban.board", {
   id = "board-2",
   name = "Triage",
   status = "active",
-})
+}, { owner_plugin = "kanban" })
 
 Hub.get():entity_patch("kanban.board", "board-2", {
   status = "archived",
   counts = { open = 0 },
-})
+}, { owner_plugin = "kanban" })
 
-Hub.get():entity_remove("kanban.board", "board-2")
+Hub.get():entity_remove("kanban.board", "board-2", { owner_plugin = "kanban" })
 ```
 
 Lua-authored surfaces bind to these plugin entities with the normal UI
@@ -373,6 +374,19 @@ without a string `id` are logged and skipped. Patches merge only top-level
 fields; nested tables replace prior nested values, so send the full nested value
 you want clients to keep. Broadcaster errors are logged and isolated from the
 mutator path.
+
+Project Pipelines is the reference plugin for this pattern. It registers every
+workflow record family in
+`catalog/templates/plugins/project-pipelines/project_pipelines/entities.lua`,
+publishes subscribe-time baselines through `publish_snapshots()`, and lets repo
+mutators call `entities.upsert(...)` or `entities.remove(...)` after persistence
+changes. Its overview binds lists from `/project-pipelines.ticket`,
+`/project-pipelines.project`, and `/project-pipelines.pipeline`; its project
+detail screen filters the shared ticket family with
+`ui.bind_list{ where = { project_id = project_id } }`. Its web actions return
+`action.HANDLED` for local draft changes and `action.result{...}` for
+submitters that need generic `ui_action_result` feedback. See
+[`../plugin-entities.md`](../plugin-entities.md) for the authoring guide.
 
 ## Event-Driven Primitives
 
