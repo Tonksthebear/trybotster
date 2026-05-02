@@ -89,6 +89,18 @@ Rules:
 - Settings mutations that change agent/accessory config invalidate the matching React Query keys instead of forcing a legacy hub cache refresh.
 - Loading UI must describe unknown/pending state as loading. Empty or "not configured" states render only after the query resolves successfully.
 - Hub UI uses the single shared hub connection acquired through `hub-bridge`; React is not a privileged second client and must use the same wire-format events and collections as other clients.
+- Plugin-owned durable state must use the generic entity path. Unknown
+  namespaced entity types such as `project-pipelines.ticket` are accepted by
+  the browser entity store registry with `id` as the record key; Project
+  Pipelines and other plugins must not add plugin-specific Zustand stores,
+  hooks, reducers, or browser-only snapshots for that state.
+- Browser consumers that need plugin entity data should use the generic
+  selectors in `app/frontend/lib/entity-selectors.js`:
+  `selectEntityList({ entityType, hubId? })`,
+  `selectEntity({ entityType, id, hubId? })`, and
+  `selectEntityField({ entityType, id, field, hubId? })`. The optional
+  `hubId` filters returned records but does not partition the underlying
+  single connected-hub stores.
 
 ## Contract Layers
 

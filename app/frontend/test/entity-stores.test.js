@@ -11,6 +11,7 @@ import { createEntityStore } from '../store/entities/createEntityStore'
 import {
   ENTITY_STORES,
   applyEntityFrame,
+  idFieldFor,
   isEntityFrame,
   storeFor,
   useSessionStore,
@@ -230,6 +231,70 @@ describe('frontend entity store dispatch', () => {
     })
     const pluginStore = storeFor('kanban.board').getState()
     expect(pluginStore.order).toEqual(['board-1', 'board-2'])
+  })
+
+  it('keeps built-in id field defaults while plugin types use id', () => {
+    expect(idFieldFor('session')).toBe('session_uuid')
+    expect(idFieldFor('workspace')).toBe('workspace_id')
+    expect(idFieldFor('hub')).toBe('hub_id')
+    expect(idFieldFor('project-pipelines.ticket')).toBe('id')
+  })
+
+  it('round-trips namespaced plugin entity frames with string ids', () => {
+    applyEntityFrame({
+      v: 2,
+      type: 'entity_snapshot',
+      entity_type: 'project-pipelines.ticket',
+      items: [
+        { id: 'ticket-1', title: 'Plan', status: 'open' },
+        { id: 'ticket-2', title: 'Implement', status: 'active' },
+      ],
+      snapshot_seq: 1,
+    })
+    applyEntityFrame({
+      v: 2,
+      type: 'entity_upsert',
+      entity_type: 'project-pipelines.ticket',
+      id: 'ticket-3',
+      entity: { id: 'ticket-3', title: 'Review', status: 'open' },
+      snapshot_seq: 2,
+    })
+    applyEntityFrame({
+      v: 2,
+      type: 'entity_patch',
+      entity_type: 'project-pipelines.ticket',
+      id: 'ticket-2',
+      patch: { status: 'done' },
+      snapshot_seq: 3,
+    })
+    applyEntityFrame({
+      v: 2,
+      type: 'entity_remove',
+      entity_type: 'project-pipelines.ticket',
+      id: 'ticket-1',
+      snapshot_seq: 4,
+    })
+
+    const pluginStore = storeFor('project-pipelines.ticket').getState()
+    expect(pluginStore.order).toEqual(['ticket-2', 'ticket-3'])
+    expect(pluginStore.byId['ticket-2']).toMatchObject({ title: 'Implement', status: 'done' })
+    expect(pluginStore.byId['ticket-3'].title).toBe('Review')
+    expect(pluginStore.byId['ticket-1']).toBeUndefined()
+  })
+
+  it('rejects plugin entity deltas with non-string ids', () => {
+    applyEntityFrame({
+      v: 2,
+      type: 'entity_upsert',
+      entity_type: 'project-pipelines.ticket',
+      id: 123,
+      entity: { id: 123, title: 'Invalid' },
+      snapshot_seq: 1,
+    })
+
+    const pluginStore = storeFor('project-pipelines.ticket').getState()
+    expect(pluginStore.order).toEqual([])
+    expect(pluginStore.byId).toEqual({})
   })
 
   it('built-in stores are exposed in ENTITY_STORES', () => {
