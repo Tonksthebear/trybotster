@@ -7,15 +7,12 @@
 
 local repo = require("project_pipelines.repo")
 local util = require("project_pipelines.util")
+local entities = require("project_pipelines.entities")
 local Hub = require("lib.hub")
 local Agent = require("lib.agent")
 
 local OWNER = "project-pipelines"
 local SURFACE = "pipelines"
-local ENTITY_TICKET = OWNER .. ".ticket"
-local ENTITY_RUN = OWNER .. ".run"
-local ENTITY_PROJECT = OWNER .. ".project"
-local ENTITY_PIPELINE = OWNER .. ".pipeline"
 
 local function lua_pattern_escape(value)
     return tostring(value):gsub("([^%w])", "%%%1")
@@ -43,155 +40,19 @@ end
 
 local M = {}
 
-local function entity_publish_opts()
-    return { owner_plugin = OWNER }
-end
-
-local function with_web_view()
-    local ok, view = pcall(require, "project_pipelines.web.ui")
-    if ok then
-        return view
-    end
-    return nil
-end
-
-local function ticket_entity(ticket)
-    local view = with_web_view()
-    local runs = repo.ticket_runs(ticket.id)
-    local latest = runs[1]
-    local current_step = latest and latest.current_step_id and repo.get_step(latest.current_step_id) or nil
-    local notifications = view and view.ticket_notification_count(ticket.id, repo) or 0
-    return {
-        id = ticket.id,
-        title = ticket.title,
-        description = ticket.description or "",
-        status = ticket.status,
-        target_id = ticket.target_id,
-        target_path = ticket.target_path,
-        target_label = view and view.target_label(ticket.target_id, ticket.target_path) or (ticket.target_id or ticket.target_path or "No target"),
-        run_count = #runs,
-        run_count_label = string.format("%d run%s", #runs, #runs == 1 and "" or "s"),
-        latest_run_id = latest and latest.id or nil,
-        latest_run_status = latest and latest.status or nil,
-        latest_run_badge = latest and (latest.status == "done" and "complete" or latest.status == "blocked" and "blocked" or "in progress") or "ready",
-        latest_run_tone = latest and (latest.status == "done" and "success" or latest.status == "blocked" and "danger" or "accent") or "muted",
-        tail_label = latest and (current_step and ("Working: " .. current_step.name) or "In pipeline") or "No runs yet",
-        notification_count = notifications,
-        notification_label = tostring(notifications) .. " notification",
-        secondary_badge = notifications > 0 and (tostring(notifications) .. " notification") or (view and view.target_label(ticket.target_id, ticket.target_path) or (ticket.target_id or ticket.target_path or "No target")),
-        secondary_badge_tone = notifications > 0 and "danger" or "muted",
-        path = "/pipelines/tickets/" .. ticket.id,
-    }
-end
-
-local function run_entity(run)
-    local ticket = repo.get_ticket(run.ticket_id)
-    local pipeline = repo.get_pipeline(run.pipeline_id)
-    return {
-        id = run.id,
-        ticket_id = run.ticket_id,
-        pipeline_id = run.pipeline_id,
-        status = run.status,
-        current_step_id = run.current_step_id,
-        ticket_title = ticket and ticket.title or run.ticket_id,
-        pipeline_name = pipeline and pipeline.name or run.pipeline_id,
-        label = (ticket and ticket.title or run.id) .. " - " .. (pipeline and pipeline.name or run.pipeline_id) .. " (" .. run.status .. ")",
-        path = "/pipelines/runs/" .. run.id,
-    }
-end
-
-local function project_entity(project)
-    local view = with_web_view()
-    return {
-        id = project.id,
-        name = project.name,
-        description = project.description or "",
-        status = project.status,
-        status_tone = view and view.status_tone(project.status) or "muted",
-        path = "/pipelines/projects/" .. project.id,
-    }
-end
-
-local function pipeline_entity(pipeline)
-    local steps = repo.pipeline_steps(pipeline.id)
-    return {
-        id = pipeline.id,
-        name = pipeline.name,
-        description = pipeline.description or "",
-        step_count = #steps,
-        step_count_label = string.format("%d step%s", #steps, #steps == 1 and "" or "s"),
-        edit_path = "/pipelines/pipelines/" .. pipeline.id .. "/edit",
-    }
-end
-
-local function ticket_entities()
-    local view = with_web_view()
-    local tickets = view and view.visible_tickets(repo) or repo.standalone_tickets()
-    local out = {}
-    for _, ticket in ipairs(tickets) do
-        out[#out + 1] = ticket_entity(ticket)
-    end
-    return out
-end
-
-local function run_entities()
-    local out = {}
-    for _, run in ipairs(repo.list_runs(8)) do
-        out[#out + 1] = run_entity(run)
-    end
-    return out
-end
-
-local function project_entities()
-    local out = {}
-    for _, project in ipairs(repo.list_projects()) do
-        out[#out + 1] = project_entity(project)
-    end
-    return out
-end
-
-local function pipeline_entities()
-    local out = {}
-    for _, pipeline in ipairs(repo.list_pipelines()) do
-        out[#out + 1] = pipeline_entity(pipeline)
-    end
-    return out
-end
-
 function M.register_entities()
-    local EB = require("lib.entity_broadcast")
-    EB.register(ENTITY_TICKET, { id_field = "id", owner_plugin = OWNER, all = ticket_entities })
-    EB.register(ENTITY_RUN, { id_field = "id", owner_plugin = OWNER, all = run_entities })
-    EB.register(ENTITY_PROJECT, { id_field = "id", owner_plugin = OWNER, all = project_entities })
-    EB.register(ENTITY_PIPELINE, { id_field = "id", owner_plugin = OWNER, all = pipeline_entities })
+    entities.register()
 end
 
 function M.publish_entity_snapshots()
-    local hub = Hub.get()
-    hub:entity_snapshot(ENTITY_TICKET, ticket_entities(), entity_publish_opts())
-    hub:entity_snapshot(ENTITY_RUN, run_entities(), entity_publish_opts())
-    hub:entity_snapshot(ENTITY_PROJECT, project_entities(), entity_publish_opts())
-    hub:entity_snapshot(ENTITY_PIPELINE, pipeline_entities(), entity_publish_opts())
+    entities.publish_snapshots()
 end
 
 local function refresh_surfaces(ctx)
-    pcall(M.publish_entity_snapshots)
-
-    if ctx and ctx.client and ctx.sub_id and type(ctx.client.send_ui_tree_snapshots) == "function" then
-        pcall(ctx.client.send_ui_tree_snapshots, ctx.client, ctx.sub_id, {
-            force = true,
-            only_surface = SURFACE,
-        })
-        return
-    end
-
-    local ok, connections = pcall(require, "handlers.connections")
-    if ok and connections and type(connections.broadcast_ui_tree_snapshots) == "function" then
-        pcall(connections.broadcast_ui_tree_snapshots)
-        if type(connections.broadcast_ui_route_registry) == "function" then
-            pcall(connections.broadcast_ui_route_registry)
-        end
-    end
+    -- Data changes now flow through plugin-owned entity frames. Route/tree
+    -- snapshots remain structural and are sent only by the generic surface
+    -- subscription path, not by Project Pipelines mutators.
+    return ctx
 end
 
 local function step_gate_status(run, step, gate)

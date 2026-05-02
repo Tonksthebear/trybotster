@@ -35,8 +35,10 @@ runtime resolves them from the same Zustand entity stores that consume
 Plugin entity types use the existing `<plugin>.<type>` store key directly, so
 `/project-pipelines.ticket` expands a ticket list and
 `/project-pipelines.ticket/ticket_123/title` resolves one scalar field. A
-tree containing bindings subscribes to the referenced entity stores, allowing
-an `entity_patch` to update bound text without another `ui_tree_snapshot`.
+`bind_list` can add `where: { field: value }` to filter records by exact
+top-level field matches before expanding the row template. A tree containing
+bindings subscribes to the referenced entity stores, allowing an `entity_patch`
+to update bound text without another `ui_tree_snapshot`.
 
 Lua-authored action submitters use the generic `ui_action` lifecycle in the
 React/Catalyst primitive registry. The web renderer generates

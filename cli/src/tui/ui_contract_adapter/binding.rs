@@ -139,6 +139,7 @@ fn expand_bind_list(
 ) -> JsonValue {
     let source = map.get("source").and_then(|v| v.as_str()).unwrap_or("");
     let template = map.get("item_template").cloned().unwrap_or(JsonValue::Null);
+    let where_clause = map.get("where").and_then(JsonValue::as_object);
 
     let entity_type = strip_leading_slash(source);
     let Some(store) = stores.store(entity_type) else {
@@ -147,6 +148,9 @@ fn expand_bind_list(
 
     let mut out = Vec::with_capacity(store.order.len());
     for (_id, record) in store.iter() {
+        if !matches_where(record, where_clause) {
+            continue;
+        }
         let mut clone = template.clone();
         // Item-relative paths use `record` as the resolution root; the
         // outer parent_item (if any) is shadowed inside this template.
@@ -159,6 +163,18 @@ fn expand_bind_list(
         let _unused_for_clarity = parent_item; // intentionally not threaded down: bind_list shadows
     }
     JsonValue::Array(out)
+}
+
+fn matches_where(record: &JsonValue, where_clause: Option<&JsonMap<String, JsonValue>>) -> bool {
+    let Some(where_clause) = where_clause else {
+        return true;
+    };
+    let JsonValue::Object(fields) = record else {
+        return false;
+    };
+    where_clause
+        .iter()
+        .all(|(field, expected)| fields.get(field) == Some(expected))
 }
 
 /// Resolve a single `$bind` path. Path forms:
@@ -519,6 +535,24 @@ mod tests {
         assert_eq!(children.len(), 2);
         assert_eq!(children[0]["props"]["text"], json!("Add bindings"));
         assert_eq!(children[1]["props"]["text"], json!("Review bindings"));
+    }
+
+    #[test]
+    fn bind_list_filters_records_with_exact_where_matches() {
+        let stores = stores_with_plugin_tickets();
+        let mut value = json!({
+            "$kind": "bind_list",
+            "source": "/project-pipelines.ticket",
+            "where": { "status": "open" },
+            "item_template": {
+                "type": "text",
+                "props": { "text": { "$bind": "@/title" } }
+            }
+        });
+        resolve_bindings(&mut value, &stores);
+        let arr = value.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["props"]["text"], json!("Review bindings"));
     }
 
     #[test]
