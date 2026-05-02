@@ -31,43 +31,65 @@ local function has_open_questions()
     return #repo.open_questions() > 0
 end
 
+local function sidebar_button(attrs)
+    local row = {
+        ui.button{
+            id = attrs.id,
+            label = attrs.label,
+            icon = attrs.icon,
+            variant = attrs.variant or "ghost",
+            tone = attrs.tone,
+            action = ui.action("botster.nav.open", { path = attrs.path }),
+        },
+    }
+    if attrs.badge then
+        table.insert(row, attrs.badge)
+    end
+    if attrs.status then
+        table.insert(row, ui.status_dot{ state = attrs.status, label = attrs.status_label or attrs.status })
+    end
+    return view.metadata(row)
+end
+
 local function render_sidebar()
     local children = {
-        ui.button{
+        sidebar_button{
+            id = "pipelines-sidebar-overview",
             label = "Overview",
             icon = "home",
-            variant = "ghost",
-            action = ui.action("botster.nav.open", { path = "/pipelines" }),
+            path = "/pipelines",
         },
-        ui.button{
+        sidebar_button{
+            id = "pipelines-sidebar-new-ticket",
             label = "New ticket",
             icon = "plus",
             variant = "solid",
             tone = "accent",
-            action = ui.action("botster.nav.open", { path = "/pipelines/new-ticket" }),
+            path = "/pipelines/new-ticket",
         },
-        ui.button{
+        sidebar_button{
+            id = "pipelines-sidebar-new-project",
             label = "New project",
             icon = "folder-plus",
-            variant = "ghost",
-            action = ui.action("botster.nav.open", { path = "/pipelines/new-project" }),
+            path = "/pipelines/new-project",
         },
-        ui.button{
+        sidebar_button{
+            id = "pipelines-sidebar-pipelines",
             label = "Pipelines",
             icon = "queue-list",
-            variant = "ghost",
-            action = ui.action("botster.nav.open", { path = "/pipelines/pipelines" }),
+            path = "/pipelines/pipelines",
         },
     }
     local projects = repo.list_projects()
     if #projects > 0 then
         table.insert(children, ui.text{ text = "Projects", size = "xs", weight = "semibold", tone = "muted" })
         for _, project in ipairs(projects) do
-            table.insert(children, ui.button{
-                label = project.name .. " (" .. project.status .. ")",
+            table.insert(children, sidebar_button{
+                id = "pipelines-sidebar-project-" .. project.id,
+                label = project.name,
                 icon = "folder",
-                variant = "ghost",
-                action = ui.action("botster.nav.open", { path = "/pipelines/projects/" .. project.id }),
+                path = "/pipelines/projects/" .. project.id,
+                badge = view.badge(project.status),
             })
         end
     end
@@ -76,22 +98,24 @@ local function render_sidebar()
         table.insert(children, ui.text{ text = "Questions", size = "xs", weight = "semibold", tone = "muted" })
         for _, question in ipairs(questions) do
             local ticket = repo.get_ticket(question.ticket_id)
-            table.insert(children, ui.button{
-                label = (question.blocking == 1 and "Blocking: " or "") .. (ticket and ticket.title or question.ticket_id),
+            table.insert(children, sidebar_button{
+                id = "pipelines-sidebar-question-" .. question.id,
+                label = ticket and ticket.title or question.ticket_id,
                 icon = question.kind == "agent" and "user-circle" or "question-mark-circle",
-                variant = "ghost",
-                action = ui.action("botster.nav.open", { path = "/pipelines/tickets/" .. question.ticket_id }),
+                path = "/pipelines/tickets/" .. question.ticket_id,
+                badge = view.badge(question.blocking == 1 and "blocking" or "open", question.blocking == 1 and "danger" or "accent"),
             })
         end
     end
     table.insert(children, ui.text{ text = "Tickets", size = "xs", weight = "semibold", tone = "muted" })
     for _, ticket in ipairs(view.visible_tickets(repo)) do
         local notifications = view.ticket_notification_count(ticket.id, repo)
-        table.insert(children, ui.button{
-            label = notifications > 0 and (ticket.title .. "  " .. tostring(notifications)) or ticket.title,
+        table.insert(children, sidebar_button{
+            id = "pipelines-sidebar-ticket-" .. ticket.id,
+            label = ticket.title,
             icon = notifications > 0 and "exclamation-circle" or "ticket",
-            variant = "ghost",
-            action = ui.action("botster.nav.open", { path = "/pipelines/tickets/" .. ticket.id }),
+            path = "/pipelines/tickets/" .. ticket.id,
+            badge = view.notification_badge(notifications),
         })
     end
 

@@ -16,6 +16,9 @@ local ENTITY_TICKET = OWNER .. ".ticket"
 local ENTITY_RUN = OWNER .. ".run"
 local ENTITY_PROJECT = OWNER .. ".project"
 local ENTITY_PIPELINE = OWNER .. ".pipeline"
+local ENTITY_QUESTION = OWNER .. ".question"
+local ENTITY_TICKET_SESSION = OWNER .. ".ticket_session"
+local ENTITY_TIMELINE_ITEM = OWNER .. ".timeline_item"
 
 local function lua_pattern_escape(value)
     return tostring(value):gsub("([^%w])", "%%%1")
@@ -87,15 +90,18 @@ end
 local function run_entity(run)
     local ticket = repo.get_ticket(run.ticket_id)
     local pipeline = repo.get_pipeline(run.pipeline_id)
+    local step = run.current_step_id and repo.get_step(run.current_step_id) or nil
     return {
         id = run.id,
         ticket_id = run.ticket_id,
         pipeline_id = run.pipeline_id,
         status = run.status,
         current_step_id = run.current_step_id,
+        current_step_name = step and step.name or nil,
         ticket_title = ticket and ticket.title or run.ticket_id,
         pipeline_name = pipeline and pipeline.name or run.pipeline_id,
         label = (ticket and ticket.title or run.id) .. " - " .. (pipeline and pipeline.name or run.pipeline_id) .. " (" .. run.status .. ")",
+        status_tone = run.status == "done" and "success" or (run.status == "blocked" and "danger" or "accent"),
         path = "/pipelines/runs/" .. run.id,
     }
 end
@@ -158,12 +164,169 @@ local function pipeline_entities()
     return out
 end
 
+local function question_entity(question)
+    local view = with_web_view()
+    local ticket = repo.get_ticket(question.ticket_id)
+    return {
+        id = question.id,
+        ticket_id = question.ticket_id,
+        run_id = question.run_id,
+        run_step_id = question.run_step_id,
+        ticket_title = ticket and ticket.title or question.ticket_id,
+        kind = question.kind,
+        kind_label = question.kind == "agent" and "agent question" or "human question",
+        status = question.status,
+        status_tone = question.status == "open" and "danger" or "success",
+        blocking = question.blocking == 1,
+        blocking_label = question.blocking == 1 and "blocking" or "",
+        question = question.question,
+        answer = question.answer or "",
+        updated_at = question.updated_at,
+        path = "/pipelines/tickets/" .. question.ticket_id,
+        kind_tone = question.kind == "agent" and "accent" or "muted",
+        badge_tone = question.blocking == 1 and "danger" or "accent",
+        title = question.question,
+        subtitle = ticket and ticket.title or question.ticket_id,
+        target_label = ticket and view and view.target_label(ticket.target_id, ticket.target_path) or nil,
+    }
+end
+
+local function question_entities()
+    local out = {}
+    for _, ticket in ipairs(repo.list_tickets()) do
+        for _, question in ipairs(repo.ticket_questions(ticket.id)) do
+            out[#out + 1] = question_entity(question)
+        end
+    end
+    return out
+end
+
+local function add_ticket_session_entity(out, seen, ticket_id, uuid, label, status)
+    if util.is_blank(uuid) or seen[uuid] then
+        return
+    end
+    seen[uuid] = true
+    local view = with_web_view()
+    local info = view and view.session_info(uuid) or nil
+    local alive = info ~= nil
+    local notified = view and view.session_has_notification(uuid) or false
+    out[#out + 1] = {
+        id = ticket_id .. ":" .. uuid,
+        ticket_id = ticket_id,
+        session_uuid = uuid,
+        label = label or uuid,
+        status = status,
+        state = alive and "running" or "closed",
+        state_tone = alive and "accent" or "muted",
+        notification = notified,
+        notification_label = notified and "needs attention" or "",
+        path = "/pipelines/tickets/" .. ticket_id .. "/sessions/" .. uuid,
+    }
+end
+
+local function ticket_session_entities()
+    local out = {}
+    for _, ticket in ipairs(repo.list_tickets()) do
+        local seen = {}
+        for _, step in ipairs(repo.ticket_run_steps(ticket.id)) do
+            add_ticket_session_entity(out, seen, ticket.id, step.agent_session_uuid, step.name .. " - " .. (step.agent_name or step.agent_session_uuid), step.status)
+        end
+        for _, event in ipairs(repo.ticket_events(ticket.id, nil, 100)) do
+            local payload = util.decode(event.payload, {})
+            if event.kind == "ticket.merge_requested" or event.kind == "ticket.merge_agent_linked" then
+                add_ticket_session_entity(out, seen, ticket.id, payload.session_uuid, "Merge agent", "merge")
+            elseif event.kind == "question.agent_linked" then
+                add_ticket_session_entity(out, seen, ticket.id, payload.session_uuid, "Question advisor", "question")
+            end
+        end
+    end
+    return out
+end
+
+local function timeline_entities()
+    local out = {}
+    local view = with_web_view()
+    for _, run in ipairs(repo.list_runs(100)) do
+        local questions_by_run_step = {}
+        for _, question in ipairs(repo.ticket_questions(run.ticket_id)) do
+            if not util.is_blank(question.run_step_id) then
+                questions_by_run_step[question.run_step_id] = questions_by_run_step[question.run_step_id] or {}
+                table.insert(questions_by_run_step[question.run_step_id], question)
+            end
+        end
+        for index, step in ipairs(repo.run_steps(run.id)) do
+            local notified = view and view.session_has_notification(step.agent_session_uuid) or false
+            out[#out + 1] = {
+                id = step.id,
+                ticket_id = run.ticket_id,
+                run_id = run.id,
+                run_step_id = step.id,
+                kind = "step",
+                sequence = index,
+                title = tostring(index) .. ". " .. step.name,
+                status = step.status,
+                status_tone = view and view.status_tone(step.status) or "muted",
+                detail = step.agent_name or step.kind,
+                session_uuid = step.agent_session_uuid,
+                notification = notified,
+            }
+            for _, result in ipairs(repo.run_step_gate_results(step.id)) do
+                out[#out + 1] = {
+                    id = result.id,
+                    ticket_id = run.ticket_id,
+                    run_id = run.id,
+                    run_step_id = step.id,
+                    kind = "gate",
+                    sequence = index,
+                    title = "Gate handoff",
+                    status = result.status,
+                    status_tone = view and view.status_tone(result.status) or "muted",
+                    detail = result.summary,
+                }
+            end
+            for _, review in ipairs(repo.run_step_reviews(step.id)) do
+                out[#out + 1] = {
+                    id = review.id,
+                    ticket_id = run.ticket_id,
+                    run_id = run.id,
+                    run_step_id = step.id,
+                    kind = "review",
+                    sequence = index,
+                    title = "Review handoff",
+                    status = review.verdict,
+                    status_tone = view and view.status_tone(review.verdict) or "muted",
+                    detail = review.summary,
+                }
+            end
+            for _, question in ipairs(questions_by_run_step[step.id] or {}) do
+                out[#out + 1] = {
+                    id = "timeline:" .. question.id,
+                    ticket_id = run.ticket_id,
+                    run_id = run.id,
+                    run_step_id = step.id,
+                    kind = "question",
+                    sequence = index,
+                    title = "Question asked",
+                    status = question.status,
+                    status_tone = question.status == "open" and "danger" or "success",
+                    detail = question.question,
+                    notification = question.status == "open",
+                }
+            end
+        end
+    end
+    return out
+end
+
 function M.register_entities()
     local EB = require("lib.entity_broadcast")
     EB.register(ENTITY_TICKET, { id_field = "id", owner_plugin = OWNER, all = ticket_entities })
     EB.register(ENTITY_RUN, { id_field = "id", owner_plugin = OWNER, all = run_entities })
     EB.register(ENTITY_PROJECT, { id_field = "id", owner_plugin = OWNER, all = project_entities })
     EB.register(ENTITY_PIPELINE, { id_field = "id", owner_plugin = OWNER, all = pipeline_entities })
+    EB.register(ENTITY_QUESTION, { id_field = "id", owner_plugin = OWNER, all = question_entities })
+    EB.register(ENTITY_TICKET_SESSION, { id_field = "id", owner_plugin = OWNER, all = ticket_session_entities })
+    EB.register(ENTITY_TIMELINE_ITEM, { id_field = "id", owner_plugin = OWNER, all = timeline_entities })
 end
 
 function M.publish_entity_snapshots()
@@ -172,6 +335,9 @@ function M.publish_entity_snapshots()
     hub:entity_snapshot(ENTITY_RUN, run_entities(), entity_publish_opts())
     hub:entity_snapshot(ENTITY_PROJECT, project_entities(), entity_publish_opts())
     hub:entity_snapshot(ENTITY_PIPELINE, pipeline_entities(), entity_publish_opts())
+    hub:entity_snapshot(ENTITY_QUESTION, question_entities(), entity_publish_opts())
+    hub:entity_snapshot(ENTITY_TICKET_SESSION, ticket_session_entities(), entity_publish_opts())
+    hub:entity_snapshot(ENTITY_TIMELINE_ITEM, timeline_entities(), entity_publish_opts())
 end
 
 local function refresh_surfaces(ctx)
