@@ -320,10 +320,10 @@ the test file. Use focused test names or run the full integration suite with
 - No TUI adapter — Phase B.
 - No React renderer — Phase C.
 - No `Menu` / `MenuItem` exposure to Lua.
-- ~~No phase-1 composites (`WorkspaceList`, `SessionRow`, …) — those stay
-  web-runtime-internal per
-  `docs/specs/web-ui-primitives-runtime.md`.~~ — **Superseded:** wire protocol
-  the wire protocol promotes these to first-class cross-client composites (see below).
+- Workspace/session composites (`WorkspaceList`, `SessionRow`, …) stay
+  web-runtime-internal per `docs/specs/web-ui-primitives-runtime.md`; public Lua
+  plugin surfaces use shared primitives, entity bindings, and the composite
+  primitives listed below.
 
 ## Wire protocol — composite primitives
 
@@ -398,13 +398,15 @@ Plugin-owned entity types use the same first path segment; there is no
 `/plugin/...` prefix. For example, a Project Pipelines ticket title binds as
 `/project-pipelines.ticket/ticket_123/title`, and the ticket collection binds
 as `/project-pipelines.ticket`. Missing stores, ids, and fields resolve to
-`null`; missing list sources resolve to `[]`.
+`null`; missing list sources resolve to `[]`. `@/...` paths are only valid while
+expanding a list template, because they resolve against the current list item.
 
 Plus the list expansion helper:
 
 ```lua
 ui.bind_list{
   source = "/project-pipelines.ticket",
+  where = { status = "open" },
   item_template = ui.tree_item{
     id = ui.bind("@/id"),
     title = { ui.text{ text = ui.bind("@/title") } },
@@ -417,7 +419,8 @@ The web resolver (`app/frontend/ui_contract/binding.tsx`) and the TUI
 resolver (`cli/src/tui/ui_contract_adapter/binding.rs`) must agree on
 this grammar. `bind_list` expands to ordinary sibling nodes when placed inside
 `children` or slot arrays so plugin layouts can use it directly in stable
-presentation trees.
+presentation trees. `where` filters are exact top-level field matches and are
+applied by both renderers before the row template expands.
 
 ## Versioning
 

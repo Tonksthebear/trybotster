@@ -4,9 +4,16 @@ Session actions are the generic capability model for plugin-owned affordances
 on a Botster session. Core owns the registry, entity publication, and invocation
 command. Plugins own the external policy and side effects.
 
+`session_action` is a built-in entity family for per-session capabilities. Use
+plugin-owned entities such as `project-pipelines.ticket` or `vault.card` for
+arbitrary plugin domain records; do not overload `session_action` for general
+plugin state. Both models share the same client entity stream, but
+`session_action` descriptors are joined to core sessions by `session_uuid` and
+invoked through `execute_session_action`.
+
 Use this model when a plugin wants clients to show a per-session action such as
 opening a provider URL, toggling a connector, retrying a workflow, or launching a
-plugin-specific task. Do not add browser-only commands or provider-specific hub
+plugin-specific task. Do not add client-specific commands or provider-specific hub
 commands for those cases.
 
 ## Register
@@ -93,6 +100,12 @@ the visibility/enabled checks.
 
 Use `session_uuid` for all public identifiers. `id` is only the entity-store key
 for a `session_action` descriptor.
+
+Submit-style UI controls inside Lua-authored plugin surfaces use the generic
+`ui_action` / `ui_action_result` lifecycle documented in
+[`primitives.md`](primitives.md). That lifecycle is separate from
+`execute_session_action`: use `ui_action` for surface buttons and
+`session_action` for reusable per-session capabilities.
 
 ## Runtime Work
 

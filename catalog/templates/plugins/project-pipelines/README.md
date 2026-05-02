@@ -142,6 +142,14 @@ When a run returns to an existing step agent, Project Pipelines sends both a str
 
 The `Pipelines` surface shows tickets, runs, pipeline definitions, selected agent per step, reviews, findings, artifacts, recent events, questions, and plugin-owned sessions. When any question is open, the workspace plugin nav entry for Pipelines shows a notification marker.
 
+### Plugin Entity Case Study
+
+Project Pipelines is the reference plugin for Botster's entity-backed UI model.
+`project_pipelines/entities.lua` registers every dynamic workflow record family
+under the `project-pipelines.*` namespace, publishes subscribe-time baselines
+with `publish_snapshots()`, and exposes targeted `upsert` / `remove` helpers so
+repo mutators can update clients after persistence changes.
+
 Dynamic state is published as plugin-owned entities:
 
 - `/project-pipelines.ticket`
@@ -177,6 +185,13 @@ detail screens need row-level handoff updates. Snapshot publishing is reserved
 for registration/recovery paths; mutators publish targeted entity deltas instead
 of forcing fresh `ui_tree_snapshot` frames for data-only changes.
 
+Stable submitter `id` values are required in repeated rows so the generic
+`ui_action` lifecycle can scope pending, success, and error feedback to the
+clicked control. `project_pipelines/web/actions.lua` returns `action.HANDLED`
+for draft/local updates and `action.result{ message = ..., navigate = ... }` or
+`action.result{ ok = false, error = ... }` for submitters that need visible
+feedback.
+
 ### GUI Implementation Contract
 
 Project Pipelines is a Botster Lua plugin surface rendered through the shared
@@ -197,13 +212,12 @@ browser components:
 - Submitters in repeated rows must carry stable node `id` values so the generic
   `ui_action` lifecycle can scope pending and result feedback to the clicked
   button.
-- Dynamic collections should publish plugin-owned entity records and bind with
+- Dynamic collections publish plugin-owned entity records and bind with
   `ui.bind` or `ui.bind_list` from sources such as `/project-pipelines.ticket`.
   Publish filterable record supersets rather than per-view browser stores.
-- Keep detail rows snapshot-rendered only when the current UI contract cannot
-  express the needed filtered binding. When doing that, still publish the
-  underlying entity family so the later migration is a binding change, not a
-  schema change.
+- Detail rows use `ui.bind_list{ where = { ... } }` for filtered children when
+  they need dynamic entity-backed rows. Keep `ui_tree_snapshot` for route
+  scaffolding, current-path controls, and other presentation structure.
 
 Before restyling visible Catalyst primitives, inspect `tmp/tailwind_plus_preview`
 if it exists in the worktree. If the directory is absent, use the vendored
@@ -217,8 +231,9 @@ Tickets and Pipeline Definitions use `ui.list` / `ui.list_item`, Projects use
 `ui.tree` / `ui.tree_item`, and Recent Runs uses `ui.table` with rows bound from
 `/project-pipelines.run`. Keep these collections entity-backed; mutators that
 only change collection data should publish entity snapshots or deltas instead
-of forcing a fresh `ui_tree_snapshot`. Detail screens still render presentation
-snapshots until they are explicitly migrated.
+of forcing a fresh `ui_tree_snapshot`. Detail screens render presentation
+snapshots for route scaffolding and controls, but dynamic model rows are
+entity-backed through `ui.bind` / `ui.bind_list`.
 
 Routes:
 
