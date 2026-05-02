@@ -341,6 +341,9 @@ fn register_hidden(lua: &Lua, ui: &Table) -> Result<()> {
 /// * `/<type>` — list of records sorted by store insertion order
 /// * `@/<field>` — item-relative (only valid inside `ui.bind_list`)
 ///
+/// Plugin entity types such as `project-pipelines.ticket` occupy the
+/// `<type>` segment directly; there is no `/plugin/...` prefix.
+///
 /// Both renderers (TUI binding.rs, web binding.tsx) honor the same grammar.
 fn register_bind(lua: &Lua, ui: &Table) -> Result<()> {
     let constructor = lua
@@ -1795,6 +1798,19 @@ mod tests {
     }
 
     #[test]
+    fn bind_accepts_plugin_namespaced_entity_path() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.bind("/project-pipelines.ticket/ticket-1/title")"#,
+        );
+        assert_eq!(
+            v,
+            json!({ "$bind": "/project-pipelines.ticket/ticket-1/title" })
+        );
+    }
+
+    #[test]
     fn bind_rejects_empty_path() {
         let lua = new_lua();
         let err = lua
@@ -1840,6 +1856,19 @@ mod tests {
             v["item_template"]["props"]["text"],
             json!({ "$bind": "@/title" })
         );
+    }
+
+    #[test]
+    fn bind_list_accepts_plugin_namespaced_source() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.bind_list{
+                source = "/project-pipelines.ticket",
+                item_template = ui.text{ text = ui.bind("@/title") },
+            }"#,
+        );
+        assert_eq!(v["source"], json!("/project-pipelines.ticket"));
     }
 
     #[test]

@@ -3,9 +3,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, fireEvent } from '@testing-library/react'
 import { UiTreeBody, createRawDispatch } from '..'
 import type { UiAction, UiNode, UiViewport } from '../types'
+import {
+  applyEntityFrame,
+  _resetEntityStoresForTest,
+} from '../../store/entities'
 
 afterEach(() => {
   cleanup()
+  _resetEntityStoresForTest()
 })
 
 const REGULAR_FINE: UiViewport = {
@@ -124,6 +129,44 @@ describe('ui_contract registry — content primitives', () => {
     expect(span.className).toContain('italic')
     expect(span.className).toContain('font-mono')
     expect(span.className).toContain('truncate')
+  })
+
+  it('bound plugin entity lists update from entity_patch without a new tree snapshot', async () => {
+    applyEntityFrame({
+      v: 2,
+      type: 'entity_snapshot',
+      entity_type: 'project-pipelines.ticket',
+      items: [{ id: 'ticket-1', title: 'Initial title' }],
+      snapshot_seq: 1,
+    })
+
+    const tree: UiNode = {
+      type: 'stack',
+      children: [
+        {
+          $kind: 'bind_list',
+          source: '/project-pipelines.ticket',
+          item_template: {
+            type: 'text',
+            props: { text: { $bind: '@/title' } },
+          },
+        } as any,
+      ],
+    }
+
+    renderTree(tree)
+    expect(screen.getByText('Initial title')).toBeInTheDocument()
+
+    applyEntityFrame({
+      v: 2,
+      type: 'entity_patch',
+      entity_type: 'project-pipelines.ticket',
+      id: 'ticket-1',
+      patch: { title: 'Patched title' },
+      snapshot_seq: 2,
+    })
+
+    expect(await screen.findByText('Patched title')).toBeInTheDocument()
   })
 
   it('icon exposes name via data-icon', () => {

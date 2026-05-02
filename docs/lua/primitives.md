@@ -289,6 +289,28 @@ Hub.get():entity_patch("kanban.board", "board-2", {
 Hub.get():entity_remove("kanban.board", "board-2")
 ```
 
+Lua-authored surfaces bind to these plugin entities with the normal UI
+contract binding grammar. The plugin entity type is the first path segment:
+
+```lua
+ui.bind("/kanban.board/board-1/name")
+
+ui.bind_list{
+  source = "/kanban.board",
+  item_template = ui.tree_item{
+    id = ui.bind("@/id"),
+    title = { ui.text{ text = ui.bind("@/name") } },
+    subtitle = { ui.text{ text = ui.bind("@/status") } },
+  },
+}
+```
+
+Dynamic plugin lists should use entity-backed `ui.bind_list` rows instead of
+forcing a fresh `ui_tree_snapshot` after every field or collection change.
+`ui_tree_snapshot` remains the presentation tree; plugin state changes flow
+through `entity_snapshot`, `entity_upsert`, `entity_patch`, and
+`entity_remove`.
+
 When registering outside plugin load tests or helper modules, pass
 `owner_plugin = "kanban"`. During normal plugin loading, Botster supplies the
 owner context from the plugin manifest/display name; repo-sourced loader keys

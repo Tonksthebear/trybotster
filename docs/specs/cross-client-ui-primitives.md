@@ -557,6 +557,13 @@ UI nodes against those stores. Route registries, UI tree snapshots, transient
 events, and request-scoped replies are presentation or control inputs around
 the entity store, not replacement model stores.
 
+Bindings use the shared `/<entity_type>/<id>/<field>` grammar. Plugin-owned
+types such as `project-pipelines.ticket` occupy the `<entity_type>` segment
+directly, so a list source is `/project-pipelines.ticket` and a field binding
+is `/project-pipelines.ticket/ticket_123/title`. `ui.bind_list` expands over
+the entity store in insertion order and must flatten into ordinary children or
+slot siblings in both browser and TUI renderers.
+
 The shared primitives can map onto the current Rust render tree like this:
 
 | Shared primitive | Current TUI concept |

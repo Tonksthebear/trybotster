@@ -38,6 +38,16 @@ describe('resolveBindings', () => {
       ],
       snapshot_seq: 1,
     })
+    applyEntityFrame({
+      v: 2,
+      type: 'entity_snapshot',
+      entity_type: 'project-pipelines.ticket',
+      items: [
+        { id: 'ticket-1', title: 'Add bindings', status: 'active' },
+        { id: 'ticket-2', title: 'Review bindings', status: 'open' },
+      ],
+      snapshot_seq: 1,
+    })
   })
 
   it('resolves a scalar field path', () => {
@@ -62,6 +72,15 @@ describe('resolveBindings', () => {
     expect(resolveBindings({ $bind: '/session/unknown/title' })).toBeNull()
     expect(resolveBindings({ $bind: '/session/sess-a/missing_field' })).toBeNull()
     expect(resolveBindings({ $bind: '/never_seen/x/title' })).toBeNull()
+  })
+
+  it('resolves plugin namespaced entity paths', () => {
+    expect(
+      resolveBindings({ $bind: '/project-pipelines.ticket/ticket-1/title' }),
+    ).toBe('Add bindings')
+    expect(resolveBindings({ $bind: '/project-pipelines.ticket/ticket-2' }))
+      .toMatchObject({ status: 'open' })
+    expect(resolveBindings({ $bind: '/project-pipelines.ticket' })).toHaveLength(2)
   })
 
   it('walks into nested props trees', () => {
@@ -92,6 +111,25 @@ describe('resolveBindings', () => {
     expect((out as any[])[0].id).toBe('sess-a')
     expect((out as any[])[0].slots.title[0].props.text).toBe('alpha')
     expect((out as any[])[1].id).toBe('sess-b')
+  })
+
+  it('flattens bind_list expansion inside children arrays', () => {
+    const out = resolveBindings({
+      type: 'stack',
+      children: [
+        {
+          $kind: 'bind_list',
+          source: '/project-pipelines.ticket',
+          item_template: {
+            type: 'text',
+            props: { text: { $bind: '@/title' } },
+          },
+        },
+      ],
+    })
+    expect((out as any).children).toHaveLength(2)
+    expect((out as any).children[0].props.text).toBe('Add bindings')
+    expect((out as any).children[1].props.text).toBe('Review bindings')
   })
 
   it('@-relative path outside bind_list resolves null', () => {
