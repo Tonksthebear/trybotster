@@ -26,8 +26,8 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, StatefulWidget, Widget, Wrap,
+        Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, StatefulWidget, Table, Widget, Wrap,
     },
     Frame, Terminal,
 };
@@ -44,7 +44,7 @@ pub struct WidgetArea {
 }
 
 use super::render_tree::{
-    InputProps, ListProps, ParagraphAlignment, ParagraphProps, SpanStyle, StyledContent,
+    InputProps, ListProps, ParagraphAlignment, ParagraphProps, SpanStyle, StyledContent, TableProps,
 };
 use super::widget_state::WidgetStateStore;
 use crate::compat::{BrowserDimensions, VpnStatus};
@@ -397,6 +397,23 @@ pub(super) fn render_list_widget(
         let mut state = ListState::default();
         f.render_stateful_widget(list, area, &mut state);
     }
+}
+
+/// Render a generic table widget.
+pub(super) fn render_table_widget(f: &mut Frame, area: Rect, block: Block, props: &TableProps) {
+    let column_count = props.headers.len().max(1);
+    let widths = vec![ratatui::layout::Constraint::Min(8); column_count];
+    let header = Row::new(props.headers.iter().cloned().map(Cell::from))
+        .style(Style::default().add_modifier(Modifier::BOLD | Modifier::DIM));
+    let rows = props
+        .rows
+        .iter()
+        .map(|row| Row::new(row.iter().cloned().map(Cell::from)));
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(2);
+    f.render_widget(table, area);
 }
 
 /// Render a paragraph widget with styled lines, alignment, and optional wrapping.

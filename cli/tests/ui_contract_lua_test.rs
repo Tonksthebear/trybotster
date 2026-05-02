@@ -523,6 +523,60 @@ fn tree_item_with_all_optional_slots() {
 }
 
 #[test]
+fn list_and_list_item_are_public_lua_primitives() {
+    let lua = new_ui_lua();
+    let v = eval_to_json(
+        &lua,
+        r#"
+            return ui.list{
+                children = {
+                    ui.list_item{
+                        id = "ticket-1",
+                        selected = true,
+                        notification = true,
+                        action = ui.action("botster.nav.open", { path = "/tickets/1" }),
+                        title = { ui.text{ text = "Ticket" } },
+                        subtitle = { ui.text{ text = "Ready" } },
+                        detail = { ui.text{ text = "2 runs" } },
+                    },
+                },
+            }
+        "#,
+    );
+    assert_eq!(v.get("type").and_then(|v| v.as_str()), Some("list"));
+    let child = &v["children"][0];
+    assert_eq!(
+        child.get("type").and_then(|v| v.as_str()),
+        Some("list_item")
+    );
+    assert!(child["slots"].get("detail").is_some());
+    assert_eq!(child["props"]["selected"], serde_json::json!(true));
+}
+
+#[test]
+fn table_is_public_lua_primitive_with_columns_and_bound_rows() {
+    let lua = new_ui_lua();
+    let v = eval_to_json(
+        &lua,
+        r#"
+            return ui.table{
+                columns = {
+                    { key = "title", label = "Title" },
+                    { key = "status", label = "Status" },
+                },
+                rows = ui.bind("/project-pipelines.ticket"),
+            }
+        "#,
+    );
+    assert_eq!(v.get("type").and_then(|v| v.as_str()), Some("table"));
+    assert_eq!(v["props"]["columns"][0]["key"], serde_json::json!("title"));
+    assert_eq!(
+        v["props"]["rows"],
+        serde_json::json!({ "$bind": "/project-pipelines.ticket" })
+    );
+}
+
+#[test]
 fn tree_item_without_title_slot_raises_error() {
     let lua = new_ui_lua();
     let err = lua

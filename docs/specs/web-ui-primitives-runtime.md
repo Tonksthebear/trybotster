@@ -22,6 +22,12 @@ they are not Hotwire/Elements work and should not add Rails-rendered fragments
 or Stimulus reconciliation paths. Consult `tmp/tailwind_plus_preview` only when
 the change introduces or restyles visible Catalyst primitives; state binding and
 entity-store work should preserve the existing primitive presentation.
+Collection primitives follow the same split: web `table` renders through
+`app/frontend/components/catalyst/table.jsx`, while `list`, `list_item`, `tree`,
+and `tree_item` render through the shared primitive registry. TUI renderers map
+the same nodes to ratatui widgets. Do not add plugin-specific browser or TUI
+renderers when a Lua-authored surface can express the view with these shared
+primitives and `$bind` / `bind_list`.
 
 Lua-authored trees may contain `$bind` and `bind_list` sentinels. The web
 runtime resolves them from the same Zustand entity stores that consume
@@ -228,6 +234,9 @@ Rules:
 | Actions | `IconButton` | supported | yes |
 | Actions | `Menu` | supported | no |
 | Actions | `MenuItem` | supported | no |
+| Collections | `List` | supported | yes |
+| Collections | `ListItem` | supported | yes |
+| Collections | `Table` | supported | yes |
 | Navigation | `Tree` | supported | yes |
 | Navigation | `TreeItem` | supported | yes |
 | Botster composite | `WorkspaceList` | supported | no |
@@ -331,6 +340,56 @@ type ScrollAreaProps = {
   children: Node[]
 }
 ```
+
+### `List`
+
+```ts
+type ListProps = {}
+```
+
+`List` gives both web and TUI renderers a native collection boundary. Its rows
+are `ListItem` children, often expanded from `ui.bind_list`.
+
+### `ListItem`
+
+```ts
+type ListItemProps = {
+  selected?: boolean
+  notification?: boolean
+  action?: ActionBinding
+}
+```
+
+Required slot:
+
+- `title`
+
+Optional slots:
+
+- `subtitle`
+- `start`
+- `end`
+- `detail`
+
+### `Table`
+
+```ts
+type TableColumnProps = {
+  key: string
+  label: string
+}
+
+type TableProps = {
+  columns?: TableColumnProps[]
+  rows?: Record<string, unknown>[]
+}
+```
+
+`Table` is the shared primitive for read-oriented tabular plugin data. Web uses
+the Catalyst table components; the TUI uses ratatui `Table`. Keep row data in
+the generic entity stores and bind it directly, for example
+`rows = ui.bind("/project-pipelines.run")`, instead of creating plugin-specific
+client state.
 
 ### `Text`
 

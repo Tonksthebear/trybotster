@@ -17,6 +17,7 @@
 //! [`crate::ui_contract::node::UiNode::slots`], not in these Props structs.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 use crate::ui_contract::node::{UiAction, UiValue};
 use crate::ui_contract::tokens::{
@@ -329,6 +330,31 @@ pub struct SelectProps {
 // is a renderer-internal concern and is intentionally excluded from this
 // contract. No `TreeProps` struct exists; renderers deserialize Tree
 // nodes without a props struct.
+
+/// One column in a `Table` primitive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableColumnProps {
+    /// Stable key looked up on each row object.
+    pub key: String,
+    /// Human label shown in the table header.
+    pub label: String,
+}
+
+/// `Table` props.
+///
+/// Rows are intentionally plain JSON objects so plugin-owned entity lists can
+/// bind directly to `rows = ui.bind("/plugin.entity")` without a second cache.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableProps {
+    /// Ordered columns.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<TableColumnProps>,
+    /// Ordered row objects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<JsonValue>,
+}
 
 /// `TreeItem` props.
 ///

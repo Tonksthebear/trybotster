@@ -16,11 +16,13 @@ import type {
   IconButtonProps,
   IconProps,
   InlineProps,
+  ListItemProps,
   PanelProps,
   ScrollAreaProps,
   SelectProps,
   StackProps,
   StatusDotProps,
+  TableProps,
   TextareaProps,
   TextInputProps,
   TextProps,
@@ -51,6 +53,14 @@ import { Textarea } from '../components/catalyst/textarea'
 import { Checkbox, CheckboxField } from '../components/catalyst/checkbox'
 import { Field, Label } from '../components/catalyst/fieldset'
 import { Select } from '../components/catalyst/select'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '../components/catalyst/table'
 
 // ---------- Renderer signature ----------
 
@@ -686,6 +696,90 @@ const renderTree: PrimitiveRenderer = ({ children }) => {
   )
 }
 
+const renderList: PrimitiveRenderer = ({ children }) => {
+  return <ul className="flex flex-col gap-1">{children}</ul>
+}
+
+const renderListItem: PrimitiveRenderer = ({ props, slots, ctx, node }) => {
+  const p = props as Partial<ListItemProps>
+  const selected = p.selected ?? false
+  const notification = p.notification ?? false
+  const action = p.action
+  const onClick = action ? wrapActionClick(action, ctx) : undefined
+
+  const titleSlot = slots['title'] ?? []
+  const subtitleSlot = slots['subtitle']
+  const startSlot = slots['start']
+  const endSlot = slots['end']
+  const detailSlot = slots['detail']
+
+  return (
+    <li
+      data-list-item-id={node.id}
+      data-notification={notification || undefined}
+      className={clsx(
+        'flex min-w-0 flex-col rounded-md px-2 py-1.5',
+        selected
+          ? 'bg-sky-500/20 text-sky-300'
+          : action
+            ? 'cursor-pointer text-zinc-200 hover:bg-zinc-800/50'
+            : 'text-zinc-200',
+        notification && 'border-l-2 border-yellow-400',
+      )}
+      onClick={onClick}
+    >
+      <div className="flex min-w-0 items-center gap-2">
+        {startSlot && <div className="shrink-0">{startSlot}</div>}
+        <div className="min-w-0 flex-1">
+          <div className="min-w-0 truncate">{titleSlot}</div>
+          {subtitleSlot && (
+            <div className="min-w-0 truncate text-xs text-zinc-500">
+              {subtitleSlot}
+            </div>
+          )}
+        </div>
+        {endSlot && <div className="shrink-0">{endSlot}</div>}
+      </div>
+      {detailSlot && (
+        <div className="mt-1 min-w-0 text-xs text-zinc-500">{detailSlot}</div>
+      )}
+    </li>
+  )
+}
+
+function stringifyCell(value: unknown): string {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return JSON.stringify(value)
+}
+
+const renderTable: PrimitiveRenderer = ({ props }) => {
+  const p = props as Partial<TableProps>
+  const columns = p.columns ?? []
+  const rows = p.rows ?? []
+  return (
+    <Table dense striped>
+      <TableHead>
+        <TableRow>
+          {columns.map((column) => (
+            <TableHeader key={column.key}>{column.label}</TableHeader>
+          ))}
+        </TableRow>
+      </TableHead>
+      <TableBody>
+        {rows.map((row, index) => (
+          <TableRow key={(row.id as string | undefined) ?? index}>
+            {columns.map((column) => (
+              <TableCell key={column.key}>{stringifyCell(row[column.key])}</TableCell>
+            ))}
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  )
+}
+
 const renderTreeItem: PrimitiveRenderer = ({ props, slots, ctx, node }) => {
   const p = props as Partial<TreeItemProps>
   const selected = p.selected ?? false
@@ -902,6 +996,9 @@ export const PRIMITIVE_REGISTRY: Record<string, PrimitiveRenderer> = {
   textarea: renderTextarea,
   checkbox: renderCheckbox,
   select: renderSelect,
+  list: renderList,
+  list_item: renderListItem,
+  table: renderTable,
   tree: renderTree,
   tree_item: renderTreeItem,
   dialog: renderDialog,

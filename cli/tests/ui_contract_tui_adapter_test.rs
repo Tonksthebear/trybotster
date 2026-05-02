@@ -21,16 +21,19 @@
     reason = "UiViewport is Copy but helpers pass it by reference to match the adapter's signatures — consistency is more valuable here than the trivial copy optimisation"
 )]
 
+use botster::tui::entity_stores::TuiEntityStores;
 use botster::tui::render_tree::{
     ListProps, ParagraphProps, RenderNode, StyledContent, WidgetProps, WidgetType,
 };
 use botster::tui::ui_contract_adapter::{
-    derive_viewport_from_terminal, render_lua_ui_node, render_ui_node, ActionTable,
+    derive_viewport_from_terminal, render_lua_ui_node, render_lua_ui_node_with_stores,
+    render_ui_node, ActionTable,
 };
 use botster::ui_contract::lua::register;
 use botster::ui_contract::node::UiNode;
 use botster::ui_contract::viewport::{UiHeightClass, UiPointer, UiViewport, UiWidthClass};
 use mlua::{Lua, LuaSerdeExt, Value};
+use serde_json::json;
 
 fn new_ui_lua() -> Lua {
     let lua = Lua::new();
@@ -76,6 +79,20 @@ fn render_lua(lua: &Lua, code: &str, viewport: &UiViewport) -> (RenderNode, Acti
 fn eval_node(lua: &Lua, code: &str) -> UiNode {
     let value: Value = lua.load(code).eval().expect("Lua eval failed");
     lua.from_value(value).expect("Lua -> UiNode")
+}
+
+fn plugin_stores_with_tickets() -> TuiEntityStores {
+    let mut stores = TuiEntityStores::new();
+    stores.apply_frame(&json!({
+        "type": "entity_snapshot",
+        "entity_type": "project-pipelines.ticket",
+        "snapshot_seq": 1,
+        "items": [
+            { "id": "ticket-1", "title": "First", "status": "open" },
+            { "id": "ticket-2", "title": "Second", "status": "closed" },
+        ],
+    }));
+    stores
 }
 
 // =============================================================================
@@ -954,20 +971,15 @@ fn list_item_disabled_action_drops_legacy_string_but_keeps_envelope() {
 /// flows through the adapter (no fall-through to the legacy parser).
 #[test]
 fn routing_accepts_top_level_list() {
-    // The Lua DSL does not expose a `ui.list` constructor in current, so we
-    // hand-build the node. The point of the test is that the adapter's
-    // is_ui_node_type recognises `list` and the call_render path would
-    // route to it. We test this directly via render_lua_ui_node, which
-    // is what LayoutLua::call_render delegates to on a type-name match.
     let lua = new_ui_lua();
     let table: mlua::Table = lua
         .load(
-            r#"return {
-                type = "list",
+            r#"return ui.list{
                 children = {
-                    { type = "list_item",
-                      props = { action = ui.action("botster.session.select", { sessionUuid = "only" }) },
-                      slots = { title = { ui.text{ text = "Only" } } } },
+                    ui.list_item{
+                        action = ui.action("botster.session.select", { sessionUuid = "only" }),
+                        title = { ui.text{ text = "Only" } },
+                    },
                 },
             }"#,
         )
@@ -982,6 +994,40 @@ fn routing_accepts_top_level_list() {
             ..
         }
     ));
+}
+
+#[test]
+fn table_renders_rows_from_plugin_entity_bind() {
+    let lua = new_ui_lua();
+    let stores = plugin_stores_with_tickets();
+    let table: mlua::Table = lua
+        .load(
+            r#"return ui.table{
+                columns = {
+                    { key = "title", label = "Title" },
+                    { key = "status", label = "Status" },
+                },
+                rows = ui.bind("/project-pipelines.ticket"),
+            }"#,
+        )
+        .eval()
+        .expect("eval");
+    let (rendered, _actions) =
+        render_lua_ui_node_with_stores(&lua, &table, &regular_viewport(), Some(&stores))
+            .expect("adapter");
+
+    match rendered {
+        RenderNode::Widget {
+            widget_type: WidgetType::Table,
+            props: Some(WidgetProps::Table(table)),
+            ..
+        } => {
+            assert_eq!(table.headers, vec!["Title", "Status"]);
+            assert_eq!(table.rows[0], vec!["First", "open"]);
+            assert_eq!(table.rows[1], vec!["Second", "closed"]);
+        }
+        other => panic!("expected table widget, got {other:?}"),
+    }
 }
 
 /// F2 — routing accepts a top-level `overlay` node.

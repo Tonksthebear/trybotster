@@ -184,6 +184,7 @@ This is the recommended shared primitive inventory.
 - `list_item`
 - `tree`
 - `tree_item`
+- `table`
 
 ### Action primitives
 
@@ -278,7 +279,7 @@ type TextProps = {
 ```ts
 type ListItemProps = {
   selected?: boolean
-  disabled?: boolean
+  notification?: boolean
   action?: UiAction
 }
 ```
@@ -293,6 +294,10 @@ Optional slots:
 - `start`
 - `end`
 - `detail`
+
+`list` has no shared props in `current`. It exists to give renderers a native
+collection boundary; rows are authored as `list_item` children or expanded from
+`ui.bind_list`.
 
 ### `tree_item`
 
@@ -316,6 +321,38 @@ Optional slots:
 - `start`
 - `end`
 - `children`
+
+### `table`
+
+```ts
+type TableColumnProps = {
+  key: string
+  label: string
+}
+
+type TableProps = {
+  columns?: TableColumnProps[]
+  rows?: Record<string, unknown>[]
+}
+```
+
+`columns` define the ordered visible fields. Each column `key` is looked up on
+each row object and `label` is rendered in the header. `rows` are plain JSON
+objects so plugin-owned entity lists can bind directly:
+
+```lua
+ui.table{
+  columns = {
+    { key = "title", label = "Ticket" },
+    { key = "status", label = "Status" },
+  },
+  rows = ui.bind("/project-pipelines.ticket"),
+}
+```
+
+Tables are for read-oriented, scannable collections. Row actions or row-local
+composition should use `list` / `list_item` or `tree` / `tree_item` until the
+table contract grows explicit row action semantics.
 
 ### `button`
 
@@ -573,6 +610,7 @@ The shared primitives can map onto the current Rust render tree like this:
 | `overlay` | `Centered` plus clear/block handling |
 | `panel` | `BlockConfig` |
 | `list` / `list_item` | `WidgetType::List` and `ListProps` |
+| `table` | ratatui `Table` |
 | `text` | `WidgetType::Paragraph` lines/spans |
 | `text_input` | `WidgetType::Input` |
 | `terminal_view` | `WidgetType::Terminal` |

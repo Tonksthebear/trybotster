@@ -93,6 +93,8 @@ local function run_entity(run)
         pipeline_id = run.pipeline_id,
         status = run.status,
         current_step_id = run.current_step_id,
+        ticket_title = ticket and ticket.title or run.ticket_id,
+        pipeline_name = pipeline and pipeline.name or run.pipeline_id,
         label = (ticket and ticket.title or run.id) .. " - " .. (pipeline and pipeline.name or run.pipeline_id) .. " (" .. run.status .. ")",
         path = "/pipelines/runs/" .. run.id,
     }

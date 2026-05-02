@@ -519,6 +519,63 @@ describe('ui_contract registry — form primitives', () => {
 })
 
 describe('ui_contract registry — collection primitives', () => {
+  it('list and list_item render semantic rows and dispatch actions', () => {
+    const onAction = vi.fn()
+    const { container } = renderTree(
+      {
+        type: 'list',
+        children: [
+          {
+            type: 'list_item',
+            id: 'ticket-1',
+            props: {
+              selected: true,
+              notification: true,
+              action: { id: 'botster.nav.open', payload: { path: '/tickets/1' } },
+            },
+            slots: {
+              title: [{ type: 'text', props: { text: 'Ticket one' } }],
+              subtitle: [{ type: 'text', props: { text: 'Ready' } }],
+              detail: [{ type: 'text', props: { text: '2 runs' } }],
+            },
+          },
+        ],
+      },
+      { onAction },
+    )
+    const row = container.querySelector('[data-list-item-id="ticket-1"]')
+    expect(row).not.toBeNull()
+    expect(row?.getAttribute('data-notification')).toBe('true')
+    expect(row?.textContent).toContain('Ticket one')
+    expect(row?.textContent).toContain('Ready')
+    expect(row?.textContent).toContain('2 runs')
+    fireEvent.click(row as Element)
+    expect(onAction.mock.calls[0]![0]).toEqual({
+      id: 'botster.nav.open',
+      payload: { path: '/tickets/1' },
+    })
+  })
+
+  it('table renders Catalyst table rows from plugin entity data', () => {
+    renderTree({
+      type: 'table',
+      props: {
+        columns: [
+          { key: 'title', label: 'Title' },
+          { key: 'status', label: 'Status' },
+        ],
+        rows: [
+          { id: 'ticket-1', title: 'Ticket one', status: 'open' },
+          { id: 'ticket-2', title: 'Ticket two', status: 'closed' },
+        ],
+      },
+    })
+    expect(screen.getByRole('columnheader', { name: 'Title' })).toBeInTheDocument()
+    expect(screen.getByRole('columnheader', { name: 'Status' })).toBeInTheDocument()
+    expect(screen.getByText('Ticket one')).toBeInTheDocument()
+    expect(screen.getByText('closed')).toBeInTheDocument()
+  })
+
   it('tree renders a role=tree container with items', () => {
     const { container } = renderTree({
       type: 'tree',

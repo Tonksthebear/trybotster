@@ -67,8 +67,11 @@ pub fn register(lua: &Lua) -> Result<()> {
     register_primitive(lua, &ui, "textarea", Primitive::Textarea)?;
     register_primitive(lua, &ui, "checkbox", Primitive::Checkbox)?;
     register_primitive(lua, &ui, "select", Primitive::Select)?;
+    register_primitive(lua, &ui, "list", Primitive::List)?;
+    register_primitive(lua, &ui, "list_item", Primitive::ListItem)?;
     register_primitive(lua, &ui, "tree", Primitive::Tree)?;
     register_primitive(lua, &ui, "tree_item", Primitive::TreeItem)?;
+    register_primitive(lua, &ui, "table", Primitive::Table)?;
     register_primitive(lua, &ui, "dialog", Primitive::Dialog)?;
     // Wire protocol composites — data-driven, no children, no slots.
     register_primitive(lua, &ui, "session_list", Primitive::SessionList)?;
@@ -118,8 +121,11 @@ enum Primitive {
     Textarea,
     Checkbox,
     Select,
+    List,
+    ListItem,
     Tree,
     TreeItem,
+    Table,
     /// Flagged internal in current — registered so renderers can consume it while
     /// Phase B / Phase C catch up.
     Dialog,
@@ -166,8 +172,11 @@ impl Primitive {
             Self::Textarea => "textarea",
             Self::Checkbox => "checkbox",
             Self::Select => "select",
+            Self::List => "list",
+            Self::ListItem => "list_item",
             Self::Tree => "tree",
             Self::TreeItem => "tree_item",
+            Self::Table => "table",
             Self::Dialog => "dialog",
             Self::SessionList => "session_list",
             Self::WorkspaceList => "workspace_list",
@@ -188,6 +197,7 @@ impl Primitive {
     /// at construction.
     const fn allowed_slots(self) -> &'static [&'static str] {
         match self {
+            Self::ListItem => &["title", "subtitle", "start", "end", "detail"],
             Self::TreeItem => &["title", "subtitle", "start", "end", "children"],
             Self::Dialog => &["body", "footer"],
             _ => &[],
@@ -198,6 +208,7 @@ impl Primitive {
     /// a Lua error at construction.
     const fn required_slots(self) -> &'static [&'static str] {
         match self {
+            Self::ListItem => &["title"],
             Self::TreeItem => &["title"],
             _ => &[],
         }
@@ -245,8 +256,11 @@ impl Primitive {
                 "options",
                 "onChange",
             ],
+            Self::List => &[],
+            Self::ListItem => &["selected", "notification", "action"],
             Self::Tree => &[],
             Self::TreeItem => &["expanded", "selected", "notification", "action"],
+            Self::Table => &["columns", "rows"],
             Self::Dialog => &["open", "title", "presentation"],
             Self::SessionList => &[
                 "density",
@@ -433,11 +447,20 @@ fn build_node(lua: &Lua, kind: Primitive, args: Value) -> mlua::Result<Table> {
     out.set("type", kind.wire_name())?;
 
     // id
-    if let Ok(Value::String(id)) = input.get::<Value>("id") {
-        out.set("id", id)?;
+    if let Ok(id_value) = input.get::<Value>("id") {
+        if matches!(id_value, Value::Nil) {
+            // absent
+        } else if matches!(id_value, Value::String(_)) || is_bind_sentinel(&id_value) {
+            out.set("id", id_value)?;
+        } else {
+            return Err(mlua::Error::RuntimeError(format!(
+                "ui.{}: id must be a string or ui.bind sentinel",
+                kind.wire_name()
+            )));
+        }
     } else if !matches!(input.get::<Value>("id"), Ok(Value::Nil) | Err(_)) {
         return Err(mlua::Error::RuntimeError(format!(
-            "ui.{}: id must be a string",
+            "ui.{}: id must be a string or ui.bind sentinel",
             kind.wire_name()
         )));
     }
@@ -587,6 +610,7 @@ fn validate(_lua: &Lua, kind: Primitive, node: &Table) -> mlua::Result<()> {
         }
         Primitive::TextInput | Primitive::Textarea | Primitive::Checkbox => {}
         Primitive::Select => validate_select_options(node)?,
+        Primitive::Table => {}
         Primitive::Dialog => {
             require_prop_string(node, "title", "ui.dialog")?;
             let props: Table = node.get("props").map_err(|e| {
@@ -622,6 +646,8 @@ fn validate(_lua: &Lua, kind: Primitive, node: &Table) -> mlua::Result<()> {
         // Composites with all-optional or no props need no extra validation —
         // the prop allowlist already rejects typos.
         Primitive::Tree
+        | Primitive::List
+        | Primitive::ListItem
         | Primitive::Inline
         | Primitive::Form
         | Primitive::Panel

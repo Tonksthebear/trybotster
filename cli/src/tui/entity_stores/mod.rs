@@ -601,6 +601,35 @@ mod tests {
     }
 
     #[test]
+    fn plugin_snapshot_with_same_seq_replaces_stale_contents() {
+        let mut stores = TuiEntityStores::new();
+        stores.apply_frame(&json!({
+            "v": 2,
+            "type": "entity_snapshot",
+            "entity_type": "kanban.board",
+            "items": [
+                { "id": "board-old", "name": "Stale" }
+            ],
+            "snapshot_seq": 7
+        }));
+        stores.apply_frame(&json!({
+            "v": 2,
+            "type": "entity_snapshot",
+            "entity_type": "kanban.board",
+            "items": [
+                { "id": "board-new", "name": "Fresh" }
+            ],
+            "snapshot_seq": 7
+        }));
+
+        let store = stores.store("kanban.board").expect("plugin store");
+        assert_eq!(store.order, vec!["board-new"]);
+        assert!(!store.by_id.contains_key("board-old"));
+        assert_eq!(store.by_id["board-new"]["name"], json!("Fresh"));
+        assert_eq!(store.snapshot_seq, 7);
+    }
+
+    #[test]
     fn registered_types_returns_sorted_names() {
         let mut stores = TuiEntityStores::new();
         stores.store_mut("workspace");

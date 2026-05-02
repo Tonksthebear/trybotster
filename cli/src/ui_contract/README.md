@@ -141,6 +141,28 @@ ui.select{
 -- No shared props in current (web's `density` is renderer-internal).
 ui.tree{ children = {...} }
 
+-- No shared props in current. Use list_item children or ui.bind_list rows.
+ui.list{ children = {...} }
+
+-- `title` slot is REQUIRED; `detail` is optional for secondary row content:
+ui.list_item{
+  id = ..., selected = ..., notification = ..., action = ...,
+  title    = { ... },  -- required
+  subtitle = { ... },  -- optional
+  start    = { ... },  -- optional
+  end_     = { ... },  -- optional (Lua `end` is reserved)
+  detail   = { ... },  -- optional
+}
+
+-- Scannable read-oriented tables. Rows may be a direct entity binding.
+ui.table{
+  columns = {
+    { key = "title", label = "Ticket" },
+    { key = "status", label = "Status" },
+  },
+  rows = ui.bind("/project-pipelines.ticket"),
+}
+
 -- `title` slot is REQUIRED; spec slot keys may be hoisted to top level:
 ui.tree_item{
   id = ..., expanded = ..., selected = ..., notification = ..., action = ...,
@@ -278,20 +300,20 @@ Unit tests (all Props round-trip + Lua constructor unit tests):
 
 ```bash
 cd cli
-BOTSTER_ENV=test cargo test --lib ui_contract
+./test.sh --unit -- ui_contract
 ```
 
 Integration tests (end-to-end Lua → JSON wire shapes):
 
 ```bash
 cd cli
-BOTSTER_ENV=test cargo test --test ui_contract_lua_test
+./test.sh --integration -- list_and_list_item_are_public_lua_primitives
+./test.sh --integration -- table_renders_rows_from_plugin_entity_bind
 ```
 
-Note: `./test.sh --integration -- ui_contract` filters the *test name* pattern,
-not the test file, and will silently filter away these tests. Use the explicit
-`cargo test --test ui_contract_lua_test` invocation above instead, or run the
-full integration suite with `./test.sh --integration`.
+`./test.sh --integration -- ui_contract` filters the *test name* pattern, not
+the test file. Use focused test names or run the full integration suite with
+`./test.sh --integration`.
 
 ## Non-goals for Phase A
 

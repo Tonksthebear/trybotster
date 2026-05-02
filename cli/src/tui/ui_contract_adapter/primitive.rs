@@ -62,15 +62,16 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use crate::tui::entity_stores::TuiEntityStores;
 use crate::tui::render_tree::{
     BlockConfig, BorderStyle, InputProps, ListItemProps, ListProps, ParagraphAlignment,
-    ParagraphProps, RenderNode, SpanStyle, StyledContent, StyledSpan, WidgetProps, WidgetType,
+    ParagraphProps, RenderNode, SpanStyle, StyledContent, StyledSpan,
+    TableProps as RenderTableProps, WidgetProps, WidgetType,
 };
 use crate::ui_contract::node::{UiAction, UiChild, UiNode};
 use crate::ui_contract::props::{
     BadgeProps, ButtonProps, CheckboxProps, ConnectionCodeProps, DialogProps, EmptyStateProps,
     HubRecoveryStateProps, IconButtonProps, IconProps, IframeProps, NewSessionButtonProps,
     PanelProps, SelectProps, SessionListProps, SessionRowProps, SessionTerminalProps,
-    SpawnTargetListProps, StackProps, StatusDotProps, SurfaceNavProps, TextInputProps, TextProps,
-    TextareaProps, TreeItemProps, WorkspaceListProps, WorktreeListProps,
+    SpawnTargetListProps, StackProps, StatusDotProps, SurfaceNavProps, TableProps as UiTableProps,
+    TextInputProps, TextProps, TextareaProps, TreeItemProps, WorkspaceListProps, WorktreeListProps,
 };
 use crate::ui_contract::tokens::{UiSessionListGrouping, UiStackDirection, UiSurfaceDensity};
 use crate::ui_contract::viewport::UiViewport;
@@ -117,6 +118,7 @@ const UI_NODE_TYPE_NAMES: &[&str] = &[
     // Collections
     "list",
     "list_item",
+    "table",
     "tree",
     "tree_item",
     // Internal / experimental — recognised so renderers can consume
@@ -217,6 +219,7 @@ pub fn render_ui_node_with_stores(
         "select" => render_select(node, viewport, actions),
         "list" => render_list(node, viewport, actions),
         "list_item" => render_standalone_list_item(node, viewport, actions),
+        "table" => render_table(node, viewport),
         // `tree` / `tree_item` use flatten_tree_item which extracts text
         // from slots; no composite recursion through them today.
         "tree" => render_tree(node, viewport, actions),
@@ -881,6 +884,45 @@ fn render_standalone_list_item(
             highlight_symbol: Some(BUTTON_HIGHLIGHT_SYMBOL.to_owned()),
         })),
     })
+}
+
+fn render_table(node: &UiNode, viewport: &UiViewport) -> Result<RenderNode> {
+    let props = decode_props::<UiTableProps>(&node.props, viewport, "table")?;
+    let headers: Vec<String> = props
+        .columns
+        .iter()
+        .map(|column| column.label.clone())
+        .collect();
+    let rows: Vec<Vec<String>> = props
+        .rows
+        .iter()
+        .filter_map(JsonValue::as_object)
+        .map(|row| {
+            props
+                .columns
+                .iter()
+                .map(|column| stringify_table_cell(row.get(&column.key)))
+                .collect()
+        })
+        .collect();
+
+    Ok(RenderNode::Widget {
+        widget_type: WidgetType::Table,
+        id: node.id.clone(),
+        block: None,
+        custom_lines: None,
+        props: Some(WidgetProps::Table(RenderTableProps { headers, rows })),
+    })
+}
+
+fn stringify_table_cell(value: Option<&JsonValue>) -> String {
+    match value {
+        Some(JsonValue::String(s)) => s.clone(),
+        Some(JsonValue::Number(n)) => n.to_string(),
+        Some(JsonValue::Bool(b)) => b.to_string(),
+        Some(JsonValue::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    }
 }
 
 fn render_tree(
