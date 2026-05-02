@@ -502,6 +502,18 @@ Rules:
 - payloads use stable domain ids like `sessionUuid` and `workspaceId`
 - renderer-local events may exist internally, but the public contract stays semantic
 
+Submit-style actions are correlated request/response interactions. The renderer
+that dispatches a `button` or `icon_button` action generates an
+`action_request_id`, marks only that submitter pending, and sends the id beside
+the semantic action envelope. The hub echoes the id in a `ui_action_result`
+frame with numeric `v` versioning, the original `action_id`, `ok`, `handled`,
+`via`, and optional `message`, `error`, or `navigate = { label, path }`.
+
+Pending and result rendering belong to each renderer. Lua/plugin payloads may
+return semantic result metadata through the action handler, but they must not
+carry DOM attributes, Tailwind classes, spinner choices, or other
+renderer-specific feedback state.
+
 ## Shared Botster Surface Composition
 
 The workspace/session UI should be described using shared primitives rather than client-specific composites.

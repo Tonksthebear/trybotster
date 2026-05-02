@@ -11,12 +11,6 @@ local actions = require("project_pipelines.web.actions")
 
 local M = {}
 
-local function append_all(target, values)
-    for _, value in ipairs(values or {}) do
-        table.insert(target, value)
-    end
-end
-
 local function project_options(selected_project_id)
     local options = {
         { value = "", label = "No project" },
@@ -28,7 +22,6 @@ local function project_options(selected_project_id)
 end
 
 function M.ticket(_view_state, ctx)
-    local state = actions.feedback(ctx)
     local recent = {}
     for _, ticket in ipairs(view.visible_tickets(repo)) do
         local run = repo.open_ticket_run(ticket.id)
@@ -57,27 +50,6 @@ function M.ticket(_view_state, ctx)
         table.insert(recent, ui.text{ text = "No tickets yet.", size = "sm", tone = "muted" })
     end
 
-    local notices = {}
-    if state.ticket_error then
-        table.insert(notices, view.panel{
-            ui.text{ text = state.ticket_error, size = "sm", tone = "danger" },
-        })
-    end
-    if state.created_ticket_id then
-        table.insert(notices, view.panel{
-            ui.stack{ direction = "vertical", gap = "2", children = {
-                ui.text{ text = "Ticket created.", size = "sm", weight = "semibold" },
-                ui.button{
-                    label = "Open ticket",
-                    icon = "arrow-right",
-                    variant = "solid",
-                    tone = "accent",
-                    action = ui.action("botster.nav.open", { path = ctx.path("/tickets/" .. state.created_ticket_id) }),
-                },
-            } },
-        })
-    end
-
     local children = {
         view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
             view.row{
@@ -92,7 +64,6 @@ function M.ticket(_view_state, ctx)
             ui.text{ text = "A ticket is one concrete unit of work in one spawn target.", size = "sm", tone = "muted" },
         } } },
     }
-    append_all(children, notices)
     table.insert(children, view.panel{ ui.form{ children = {
         ui.stack{ direction = "vertical", gap = "3", children = {
             ui.select{
@@ -139,38 +110,8 @@ end
 
 function M.project_ticket(view_state, ctx)
     local params = view_state and view_state.params or {}
-    local state = actions.feedback(ctx)
     local project = repo.get_project(params.project_id)
     local title = project and ("New Ticket - " .. project.name) or "New Ticket"
-    local notices = {}
-    if state.ticket_error then
-        table.insert(notices, view.panel{
-            ui.text{ text = state.ticket_error, size = "sm", tone = "danger" },
-        })
-    end
-    if state.created_ticket_id then
-        table.insert(notices, view.panel{
-            ui.stack{ direction = "vertical", gap = "2", children = {
-                ui.text{ text = "Ticket created for this project.", size = "sm", weight = "semibold" },
-                view.row{
-                    ui.button{
-                        label = "Open ticket",
-                        icon = "arrow-right",
-                        variant = "solid",
-                        tone = "accent",
-                        action = ui.action("botster.nav.open", { path = ctx.path("/tickets/" .. state.created_ticket_id) }),
-                    },
-                    ui.button{
-                        label = "Open project",
-                        icon = "folder-open",
-                        variant = "solid",
-                        tone = "accent",
-                        action = ui.action("botster.nav.open", { path = ctx.path("/projects/" .. params.project_id) }),
-                    },
-                },
-            } },
-        })
-    end
 
     local children = {
         view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
@@ -186,7 +127,6 @@ function M.project_ticket(view_state, ctx)
             ui.text{ text = "A project ticket still belongs to one spawn target.", size = "sm", tone = "muted" },
         } } },
     }
-    append_all(children, notices)
     table.insert(children, view.panel{ ui.form{ children = {
         ui.stack{ direction = "vertical", gap = "3", children = {
             ui.select{
@@ -231,7 +171,6 @@ function M.project_ticket(view_state, ctx)
 end
 
 function M.project(_view_state, ctx)
-    local state = actions.feedback(ctx)
     local recent = {}
     for _, project in ipairs(repo.list_projects()) do
         table.insert(recent, view.panel{
@@ -257,22 +196,6 @@ function M.project(_view_state, ctx)
     if #recent == 0 then
         table.insert(recent, ui.text{ text = "No projects yet.", size = "sm", tone = "muted" })
     end
-    local notices = {}
-    if state.created_project_id then
-        table.insert(notices, view.panel{
-            ui.stack{ direction = "vertical", gap = "2", children = {
-                ui.text{ text = "Project created.", size = "sm", weight = "semibold" },
-                ui.button{
-                    label = "Open project",
-                    icon = "folder-open",
-                    variant = "solid",
-                    tone = "accent",
-                    action = ui.action("botster.nav.open", { path = ctx.path("/projects/" .. state.created_project_id) }),
-                },
-            } },
-        })
-    end
-
     local children = {
         view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
             view.row{
@@ -287,7 +210,6 @@ function M.project(_view_state, ctx)
             ui.text{ text = "A project coordinates multi-phase or cross-target work. Projects are optional.", size = "sm", tone = "muted" },
         } } },
     }
-    append_all(children, notices)
     table.insert(children, view.panel{ ui.form{ children = {
         ui.stack{ direction = "vertical", gap = "3", children = {
             ui.text_input{

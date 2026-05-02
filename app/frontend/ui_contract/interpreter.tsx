@@ -117,6 +117,7 @@ export type UiTreeBodyProps = {
    * one.
    */
   hubId?: string
+  targetSurface?: string
   transport?: UiActionTransport | null
 }
 
@@ -135,6 +136,7 @@ export function UiTreeBody({
   capabilities,
   viewport,
   hubId,
+  targetSurface,
   transport,
 }: UiTreeBodyProps): ReactElement {
   const liveViewport = useViewport()
@@ -145,6 +147,7 @@ export function UiTreeBody({
     capabilities: capabilities ?? DEFAULT_WEB_CAPABILITIES,
     dispatch,
     hubId,
+    targetSurface,
     transport,
   }
   return (
