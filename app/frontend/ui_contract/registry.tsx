@@ -61,6 +61,7 @@ import {
   TableHeader,
   TableRow,
 } from '../components/catalyst/table'
+import { useUiActionLifecycle } from './action_lifecycle_store'
 
 // ---------- Renderer signature ----------
 
@@ -196,7 +197,7 @@ const ACTION_TEST_IDS: Record<string, string> = {
 function wrapActionClick(
   action: UiAction,
   ctx: RenderContext,
-  options: { validate?: boolean } = {},
+  options: { validate?: boolean; sourceKey?: string | null } = {},
 ): (event: MouseEvent) => void {
   return (event: MouseEvent) => {
     if (action.disabled) {
@@ -206,7 +207,10 @@ function wrapActionClick(
     event.preventDefault()
     event.stopPropagation()
     if (options.validate && !reportActionValidity(event.currentTarget as HTMLButtonElement)) return
-    ctx.dispatch(action, { element: event.currentTarget as Element })
+    ctx.dispatch(action, {
+      element: event.currentTarget as Element,
+      uiActionSourceKey: options.sourceKey ?? action.id,
+    })
   }
 }
 
@@ -488,51 +492,141 @@ const renderEmptyState: PrimitiveRenderer = ({ props, ctx }) => {
   )
 }
 
-const renderButton: PrimitiveRenderer = ({ props, ctx }) => {
-  const p = props as Partial<ButtonProps>
-  const label = p.label ?? ''
-  const action = p.action
-  const variant: UiButtonVariant = p.variant ?? 'solid'
-  const tone: UiButtonTone = p.tone ?? 'default'
+function PendingDot() {
+  return (
+    <span
+      aria-hidden="true"
+      className="inline-block size-3 shrink-0 animate-spin rounded-full border-2 border-current border-t-transparent opacity-80"
+    />
+  )
+}
+
+function ActionResultText({
+  result,
+  hubId,
+}: {
+  result: ReturnType<typeof useUiActionLifecycle>['result']
+  hubId?: string
+}) {
+  if (!result) return null
+  const text = result.ok ? result.message : result.error
+  const navigate = result.ok ? result.navigate : undefined
+  if (!text && !navigate) return null
+  const openNavigate = () => {
+    const path = navigate?.path
+    if (!path || typeof window === 'undefined' || !window.history?.pushState) return
+    let target = path
+    if (!target.startsWith('/hubs/') && hubId) {
+      const trimmed = target.startsWith('/') ? target : `/${target}`
+      target = `/hubs/${hubId}${trimmed === '/' ? '' : trimmed}`
+    }
+    if (window.location.pathname === target) return
+    window.history.pushState({}, '', target)
+    window.dispatchEvent(new PopStateEvent('popstate'))
+  }
+  return (
+    <span className="inline-flex items-center gap-2">
+      {text && (
+        <span
+          role="status"
+          className={clsx(
+            'text-xs font-normal',
+            result.ok ? 'text-emerald-400' : 'text-red-400',
+          )}
+        >
+          {text}
+        </span>
+      )}
+      {navigate && (
+        <button
+          type="button"
+          onClick={openNavigate}
+          className="text-xs font-medium text-sky-400 hover:text-sky-300"
+        >
+          {navigate.label ?? 'Open'}
+        </button>
+      )}
+    </span>
+  )
+}
+
+function ActionButton({
+  node,
+  props,
+  ctx,
+}: {
+  node: UiNode
+  props: Partial<ButtonProps>
+  ctx: RenderContext
+}) {
+  const label = props.label ?? ''
+  const action = props.action
+  const sourceKey = node.id ?? action?.id ?? ''
+  const targetSurface = ctx.targetSurface ?? ''
+  const scopedLifecycle = useUiActionLifecycle(action?.id ?? '', targetSurface, sourceKey)
+  const variant: UiButtonVariant = props.variant ?? 'solid'
+  const tone: UiButtonTone = props.tone ?? 'default'
   if (!action) {
     return <button type="button" disabled>{label}</button>
   }
-  const onClick = wrapActionClick(action, ctx, { validate: true })
+  const pending = scopedLifecycle.pending
+  const onClick = wrapActionClick(action, ctx, { validate: true, sourceKey })
   const toneClass =
     variant === 'solid' ? BUTTON_TONE_SOLID[tone] : BUTTON_TONE_GHOST[tone]
   const testId = ACTION_TEST_IDS[action.id]
   return (
-    <button
-      type="button"
-      data-action-id={action.id}
-      data-testid={testId}
-      onClick={onClick}
-      disabled={action.disabled === true}
-      className={clsx(
-        'inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50',
-        toneClass,
-      )}
-    >
-      {p.icon !== undefined && (
-        <span data-icon={p.icon} aria-hidden="true" className="inline-flex size-4 items-center justify-center">
-          <IconGlyph name={p.icon} className="h-full w-full" />
-        </span>
-      )}
-      {label}
-    </button>
+    <span className="inline-flex flex-col items-start gap-1">
+      <button
+        type="button"
+        data-action-id={action.id}
+        data-testid={testId}
+        data-ui-action-pending={pending ? 'true' : undefined}
+        aria-busy={pending ? true : undefined}
+        onClick={onClick}
+        disabled={action.disabled === true || pending}
+        className={clsx(
+          'inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50',
+          toneClass,
+        )}
+      >
+        {pending ? (
+          <PendingDot />
+        ) : props.icon !== undefined ? (
+          <span data-icon={props.icon} aria-hidden="true" className="inline-flex size-4 items-center justify-center">
+            <IconGlyph name={props.icon} className="h-full w-full" />
+          </span>
+        ) : null}
+        {label}
+      </button>
+      <ActionResultText result={scopedLifecycle.result} hubId={ctx.hubId} />
+    </span>
   )
 }
 
-const renderIconButton: PrimitiveRenderer = ({ props, ctx }) => {
-  const p = props as Partial<IconButtonProps>
-  const icon = p.icon ?? ''
-  const label = p.label ?? ''
-  const action = p.action
-  const tone: UiButtonTone = p.tone ?? 'default'
+const renderButton: PrimitiveRenderer = ({ node, props, ctx }) => {
+  const p = props as Partial<ButtonProps>
+  return <ActionButton node={node} props={p} ctx={ctx} />
+}
+
+function ActionIconButton({
+  node,
+  props,
+  ctx,
+}: {
+  node: UiNode
+  props: Partial<IconButtonProps>
+  ctx: RenderContext
+}) {
+  const icon = props.icon ?? ''
+  const label = props.label ?? ''
+  const action = props.action
+  const sourceKey = node.id ?? action?.id ?? ''
+  const lifecycle = useUiActionLifecycle(action?.id ?? '', ctx.targetSurface ?? '', sourceKey)
+  const tone: UiButtonTone = props.tone ?? 'default'
   if (!action) {
     return <button type="button" aria-label={label} disabled />
   }
-  const onClick = wrapActionClick(action, ctx)
+  const onClick = wrapActionClick(action, ctx, { sourceKey })
   const testId = ACTION_TEST_IDS[action.id]
   return (
     <button
@@ -540,18 +634,25 @@ const renderIconButton: PrimitiveRenderer = ({ props, ctx }) => {
       aria-label={label}
       data-action-id={action.id}
       data-testid={testId}
+      data-ui-action-pending={lifecycle.pending ? 'true' : undefined}
+      aria-busy={lifecycle.pending ? true : undefined}
       onClick={onClick}
-      disabled={action.disabled === true}
+      disabled={action.disabled === true || lifecycle.pending}
       className={clsx(
         'inline-flex size-7 items-center justify-center rounded-md transition-colors disabled:cursor-not-allowed disabled:opacity-50',
         BUTTON_TONE_GHOST[tone],
       )}
     >
       <span data-icon={icon} aria-hidden="true" className="inline-flex size-4 items-center justify-center">
-        <IconGlyph name={icon} className="h-full w-full" />
+        {lifecycle.pending ? <PendingDot /> : <IconGlyph name={icon} className="h-full w-full" />}
       </span>
     </button>
   )
+}
+
+const renderIconButton: PrimitiveRenderer = ({ node, props, ctx }) => {
+  const p = props as Partial<IconButtonProps>
+  return <ActionIconButton node={node} props={p} ctx={ctx} />
 }
 
 const renderTextInput: PrimitiveRenderer = ({ node, props, ctx }) => {

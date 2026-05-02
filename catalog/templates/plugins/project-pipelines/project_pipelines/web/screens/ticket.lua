@@ -458,10 +458,6 @@ local function dependency_rows(ticket, ctx)
         table.insert(children, ui.text{ text = "No dependencies.", size = "sm", tone = "muted" })
     end
 
-    local feedback = actions.feedback(ctx)
-    if feedback.dependency_error then
-        table.insert(children, ui.text{ text = feedback.dependency_error, size = "sm", tone = "danger" })
-    end
     return children
 end
 
@@ -470,7 +466,6 @@ local function merge_controls(ticket, ctx)
     if not run or run.status ~= "done" or ticket.status == "closed" then
         return {}
     end
-    local feedback = actions.feedback(ctx)
     local merge_events = repo.ticket_events(ticket.id, "ticket.merge_requested", 1)
     local children = {
         view.panel{
@@ -490,12 +485,7 @@ local function merge_controls(ticket, ctx)
             } },
         },
     }
-    if feedback.merge_error then
-        table.insert(children, ui.text{ text = feedback.merge_error, size = "sm", tone = "danger" })
-    end
-    if feedback.merge_notice then
-        table.insert(children, ui.text{ text = feedback.merge_notice, size = "sm", tone = "success" })
-    elseif #merge_events > 0 then
+    if #merge_events > 0 then
         local payload = util.decode(merge_events[1].payload, {})
         table.insert(children, ui.text{ text = payload.session_uuid and ("Merge agent running: " .. payload.session_uuid) or "Merge agent has been requested.", size = "sm", tone = "muted" })
     end
@@ -528,7 +518,6 @@ function M.render(view_state, ctx)
 
     local latest_run = repo.latest_ticket_run(ticket.id)
     local open_run = latest_run and (latest_run.status == "active" or latest_run.status == "blocked") and latest_run or nil
-    local feedback = actions.feedback(ctx)
 
     local header = {
         ui.button{
@@ -569,10 +558,6 @@ function M.render(view_state, ctx)
         view.row(header),
         ui.text{ text = ticket.description or "", size = "sm", tone = "muted" },
     }
-    if feedback.close_error then
-        table.insert(header_panel, ui.text{ text = feedback.close_error, size = "sm", tone = "danger" })
-    end
-
     local children = {
         view.panel{ ui.stack{ direction = "vertical", gap = "2", children = header_panel } },
         current_state_panel(ticket, ctx),

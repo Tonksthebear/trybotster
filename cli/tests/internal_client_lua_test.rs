@@ -92,6 +92,80 @@ fn internal_dispatch_enters_client_command_hooks() {
 }
 
 #[test]
+fn ui_action_dispatch_emits_correlated_success_result() {
+    let lua = new_lua();
+
+    let result: String = lua
+        .load(
+            r#"
+            local action = require("lib.action")
+            require("handlers.commands")
+
+            action._reset_for_tests()
+            action.on("demo.save", "test.demo", function(_, _)
+              return action.HANDLED
+            end)
+
+            local result = require("lib.internal_client").dispatch("test", {
+              type = "ui_action",
+              target_surface = "project_pipelines",
+              action_request_id = "req-1",
+              envelope = { id = "demo.save", payload = { value = "ok" } },
+            })
+
+            assert(#result.frames == 1)
+            local frame = result.frames[1]
+            assert(frame.type == "ui_action_result")
+            assert(frame.v == 1)
+            assert(frame.target_surface == "project_pipelines")
+            assert(frame.action_request_id == "req-1")
+            assert(frame.action_id == "demo.save")
+            assert(frame.ok == true)
+            assert(frame.handled == true)
+            assert(frame.via == "handler")
+            return "ok"
+            "#,
+        )
+        .eval()
+        .expect("ui_action should emit result frame");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn ui_action_invalid_envelope_emits_correlated_error_result() {
+    let lua = new_lua();
+
+    let result: String = lua
+        .load(
+            r#"
+            require("handlers.commands")
+
+            local result = require("lib.internal_client").dispatch("test", {
+              type = "ui_action",
+              target_surface = "project_pipelines",
+              action_request_id = "req-bad",
+              envelope = "bad",
+            })
+
+            assert(#result.frames == 1)
+            local frame = result.frames[1]
+            assert(frame.type == "ui_action_result")
+            assert(frame.v == 1)
+            assert(frame.action_request_id == "req-bad")
+            assert(frame.ok == false)
+            assert(frame.handled == false)
+            assert(frame.error == "Invalid UI action envelope.")
+            return "ok"
+            "#,
+        )
+        .eval()
+        .expect("invalid ui_action should emit error result frame");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn create_agent_creates_even_when_matching_agent_exists() {
     let lua = new_lua();
 
