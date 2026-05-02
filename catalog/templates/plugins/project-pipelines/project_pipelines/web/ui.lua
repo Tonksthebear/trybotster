@@ -31,7 +31,26 @@ function M.panel(children)
 end
 
 function M.row(children)
-    return ui.inline{ gap = "2", align = "center", children = children }
+    return ui.inline{ gap = "2", align = "center", wrap = true, children = children }
+end
+
+function M.responsive_row(children, opts)
+    opts = opts or {}
+    return ui.stack{
+        direction = ui.responsive({ compact = "vertical", expanded = "horizontal" }),
+        gap = opts.gap or "2",
+        align = opts.align or ui.responsive({ compact = "stretch", expanded = "center" }),
+        justify = opts.justify,
+        children = children,
+    }
+end
+
+function M.action_row(children)
+    return M.responsive_row(children, { gap = "2", align = ui.responsive({ compact = "stretch", expanded = "center" }) })
+end
+
+function M.metadata(children)
+    return ui.inline{ gap = "2", align = "center", wrap = true, children = children }
 end
 
 function M.section(title, children)
@@ -40,6 +59,61 @@ function M.section(title, children)
         table.insert(nodes, child)
     end
     return ui.stack{ direction = "vertical", gap = "2", children = nodes }
+end
+
+function M.empty(title, description, icon)
+    return ui.empty_state{
+        title = title,
+        description = description,
+        icon = icon or "inbox",
+    }
+end
+
+function M.action_button(attrs)
+    return ui.button{
+        id = attrs.id,
+        label = attrs.label,
+        icon = attrs.icon,
+        variant = attrs.variant or "solid",
+        tone = attrs.tone or "accent",
+        action = attrs.action,
+    }
+end
+
+function M.page_header(attrs)
+    local start = {}
+    if attrs.back_path then
+        table.insert(start, ui.button{
+            id = attrs.back_id,
+            label = attrs.back_label or "Back",
+            icon = "arrow-left",
+            variant = "ghost",
+            action = ui.action("botster.nav.open", { path = attrs.back_path }),
+        })
+    end
+    table.insert(start, ui.text{ text = attrs.title or "", size = "lg", weight = "semibold" })
+    for _, item in ipairs(attrs.meta or {}) do
+        table.insert(start, item)
+    end
+
+    local children = {
+        M.responsive_row({
+            M.metadata(start),
+            M.action_row(attrs.actions or {}),
+        }, { gap = "3", align = ui.responsive({ compact = "stretch", expanded = "center" }), justify = "between" }),
+    }
+    if attrs.description and attrs.description ~= "" then
+        table.insert(children, ui.text{ text = attrs.description, size = "sm", tone = "muted" })
+    end
+    return M.panel{ ui.stack{ direction = "vertical", gap = "2", children = children } }
+end
+
+function M.notification_badge(count)
+    count = tonumber(count or 0) or 0
+    if count <= 0 then
+        return nil
+    end
+    return M.badge(tostring(count) .. " notification", "danger")
 end
 
 function M.field_action(id, payload)

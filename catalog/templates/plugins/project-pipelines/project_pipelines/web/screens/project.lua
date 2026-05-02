@@ -128,6 +128,7 @@ local function dependency_tree_nodes(project_id, ctx)
                 },
                 ui.text{ text = details, size = "xs", tone = "muted" },
                 ui.button{
+                    id = "project-" .. project_id .. "-tree-ticket-" .. ticket.id,
                     label = "Open ticket",
                     icon = "arrow-right",
                     variant = "ghost",
@@ -158,6 +159,7 @@ local function timeline_nodes(project_id, ctx)
                 view.row{
                     view.badge(ui.bind("@/target_label"), "accent"),
                     ui.button{
+                        id = "project-" .. project_id .. "-timeline-ticket-" .. ticket.id,
                         label = "Open",
                         icon = "arrow-right",
                         variant = "ghost",
@@ -178,17 +180,14 @@ function M.render(view_state, ctx)
     end
 
     return ui.stack{ direction = "vertical", gap = "4", children = {
-        view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
-            view.row{
+        view.page_header{
+            title = project.name,
+            back_id = "project-" .. project.id .. "-back",
+            back_path = ctx.path("/"),
+            meta = { view.badge(project.status) },
+            actions = {
                 ui.button{
-                    label = "Back",
-                    icon = "arrow-left",
-                    variant = "ghost",
-                    action = ui.action("botster.nav.open", { path = ctx.path("/") }),
-                },
-                ui.text{ text = project.name, size = "lg", weight = "semibold" },
-                view.badge(project.status),
-                ui.button{
+                    id = "project-" .. project.id .. "-new-ticket",
                     label = "New ticket",
                     icon = "plus",
                     variant = "solid",
@@ -196,8 +195,8 @@ function M.render(view_state, ctx)
                     action = ui.action("botster.nav.open", { path = ctx.path("/projects/" .. project.id .. "/new-ticket") }),
                 },
             },
-            ui.text{ text = project.description or "", size = "sm", tone = "muted" },
-        } } },
+            description = project.description or "",
+        },
         view.section("Project Targets", project_target_nodes(project.id)),
         view.section("Dependency Tree", dependency_tree_nodes(project.id, ctx)),
         view.section("Chronological Timeline", timeline_nodes(project.id, ctx)),
