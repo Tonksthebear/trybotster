@@ -56,7 +56,7 @@ pub use agent_handle::{SessionHandle, SessionType};
 pub use state::{HubState, SharedHubState};
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 
@@ -207,6 +207,82 @@ pub(crate) struct PeerSendState {
     pub dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Handle for the spawned send task (aborted on cleanup).
     pub task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PeerBurstState {
+    entries: std::collections::VecDeque<(String, Instant)>,
+    warned: std::collections::HashSet<String>,
+}
+
+impl PeerBurstState {
+    pub(crate) const WINDOW: Duration = Duration::from_secs(30);
+    pub(crate) const THRESHOLD: usize = 10;
+    pub(crate) const PEER_CAP: usize = 16;
+
+    pub(crate) fn record(&mut self, peer_id: &str, now: Instant) -> Option<(String, usize)> {
+        let prefix = peer_id.chars().take(24).collect::<String>();
+        while self
+            .entries
+            .front()
+            .is_some_and(|(_, at)| now.duration_since(*at) > Self::WINDOW)
+        {
+            if let Some((old_prefix, _)) = self.entries.pop_front() {
+                if !self.entries.iter().any(|(p, _)| p == &old_prefix) {
+                    self.warned.remove(&old_prefix);
+                }
+            }
+        }
+
+        let distinct = self
+            .entries
+            .iter()
+            .map(|(p, _)| p)
+            .collect::<std::collections::HashSet<_>>();
+        if distinct.len() >= Self::PEER_CAP && !distinct.contains(&prefix) {
+            return None;
+        }
+
+        self.entries.push_back((prefix.clone(), now));
+        let count = self.entries.iter().filter(|(p, _)| p == &prefix).count();
+        if count >= Self::THRESHOLD && self.warned.insert(prefix.clone()) {
+            Some((prefix, count))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct VolumeBurstState {
+    entries: std::collections::VecDeque<(&'static str, Instant)>,
+    warned: std::collections::HashSet<&'static str>,
+}
+
+impl VolumeBurstState {
+    pub(crate) const WINDOW: Duration = Duration::from_secs(30);
+    pub(crate) const THRESHOLD: usize = 1000;
+
+    pub(crate) fn record(&mut self, name: &'static str, now: Instant) -> Option<usize> {
+        while self
+            .entries
+            .front()
+            .is_some_and(|(_, at)| now.duration_since(*at) > Self::WINDOW)
+        {
+            if let Some((old_name, _)) = self.entries.pop_front() {
+                if !self.entries.iter().any(|(n, _)| *n == old_name) {
+                    self.warned.remove(old_name);
+                }
+            }
+        }
+        self.entries.push_back((name, now));
+        let count = self.entries.iter().filter(|(n, _)| *n == name).count();
+        if count > Self::THRESHOLD && self.warned.insert(name) {
+            Some(count)
+        } else {
+            None
+        }
+    }
 }
 
 impl std::fmt::Debug for PeerSendState {
@@ -372,6 +448,8 @@ pub struct Hub {
     /// Connections that don't reach "Connected" within the bounded cleanup
     /// window are removed so retries do not require a manual refresh.
     webrtc_connection_started: std::collections::HashMap<String, Instant>,
+    /// Time a DataChannel reached Connected/open state, for close-after-connect diagnostics.
+    webrtc_connected_at: std::collections::HashMap<String, Instant>,
 
     /// Per-peer async send tasks, keyed by browser identity.
     ///
@@ -379,6 +457,10 @@ pub struct Hub {
     /// items and performs the actual async DataChannel send. Created when
     /// `DcOpened` fires; dropped when the peer disconnects.
     pub(crate) webrtc_send_tasks: std::collections::HashMap<String, PeerSendState>,
+    /// Bounded unknown-peer send burst guardrail state.
+    unknown_peer_bursts: std::sync::Mutex<PeerBurstState>,
+    /// Bounded OSC/timer volume guardrail state.
+    volume_bursts: std::sync::Mutex<VolumeBurstState>,
 
     /// Periodic DataChannel ping tasks, keyed by browser identity.
     ///
@@ -668,7 +750,6 @@ impl Hub {
         tokio_runtime: Arc<tokio::runtime::Runtime>,
     ) -> anyhow::Result<Self> {
         use std::sync::RwLock;
-        use std::time::Duration;
 
         let state = Arc::new(RwLock::new(HubState::new(config.worktree_base.clone())));
 
@@ -729,7 +810,10 @@ impl Hub {
             handle_cache,
             webrtc_channels: std::collections::HashMap::new(),
             webrtc_connection_started: std::collections::HashMap::new(),
+            webrtc_connected_at: std::collections::HashMap::new(),
             webrtc_send_tasks: std::collections::HashMap::new(),
+            unknown_peer_bursts: std::sync::Mutex::new(PeerBurstState::default()),
+            volume_bursts: std::sync::Mutex::new(VolumeBurstState::default()),
             dc_ping_tasks: std::collections::HashMap::new(),
             webrtc_pending_closes: std::collections::HashMap::new(),
             webrtc_offer_generation: std::collections::HashMap::new(),
@@ -1080,6 +1164,8 @@ impl Hub {
         if path.exists() {
             return;
         }
+        self.hub_event_metrics
+            .record_counter("socket_path.repair", 1);
 
         log::error!(
             "[Socket] Hub socket path disappeared while hub is running; rebinding {}",
@@ -1103,6 +1189,8 @@ impl Hub {
                 );
             }
             Err(e) => {
+                self.hub_event_metrics
+                    .record_counter("socket_path.repair_error", 1);
                 log::error!(
                     "[Socket] Failed to rebind missing hub socket at {}: {e}",
                     socket_path
@@ -1281,6 +1369,7 @@ impl Hub {
             });
         }
         self.webrtc_connection_started.clear();
+        self.webrtc_connected_at.clear();
         self.webrtc_pending_ice_candidates.clear();
 
         // Notify server of shutdown (skip in offline mode)

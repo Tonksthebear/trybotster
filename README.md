@@ -125,6 +125,9 @@ Web client / TUI
 
 **Lua runtime** — Hot-reloadable event-driven plugin system. Core handlers manage agent lifecycle, WebRTC signaling, hub commands, and TUI keybindings. User-extensible via plugins in `.botster/`.
 
+Hub event-loop and WebRTC data-plane diagnostics are documented in
+[Hub Hot-Path Observability](docs/hub-hot-path-observability.md).
+
 ## TUI Controls
 
 The TUI has two primary modes:

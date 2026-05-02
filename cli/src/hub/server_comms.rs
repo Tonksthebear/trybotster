@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use crate::channel::Channel;
 use crate::hub::actions::{self, HubAction};
 use crate::hub::{
-    registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest, WebRtcPtyOutput,
+    registration, Hub, PeerBurstState, PendingTerminalAttach, PendingTerminalAttachRequest,
+    WebRtcPtyOutput,
 };
 use crate::notifications::push::send_push_direct;
 use base64::Engine;
@@ -74,6 +75,95 @@ impl Hub {
     /// How long a terminal attach intent can stay pending before `not_found`.
     const TERMINAL_ATTACH_NOT_FOUND_TIMEOUT: Duration = Duration::from_secs(10);
     const RESTTY_FIXTURE_LIVE_CHUNK_LIMIT: usize = 8;
+    const HOT_SUBHANDLER_SLOW: Duration = Duration::from_millis(50);
+    const SNAPSHOT_SLOW: Duration = Duration::from_millis(100);
+    const CLEANUP_SCAN_SLOW: Duration = Duration::from_millis(50);
+    const CLOSED_AFTER_CONNECT_WINDOW: Duration = Duration::from_secs(10);
+
+    fn record_hot_span(&self, span: &'static str, started: Instant, bytes: usize, label: &str) {
+        self.hub_event_metrics.record_span_with_threshold(
+            span,
+            started.elapsed(),
+            bytes,
+            Self::HOT_SUBHANDLER_SLOW,
+            label,
+        );
+    }
+
+    fn record_volume_guardrail(&self, counter: &'static str, burst_counter: &'static str) {
+        self.hub_event_metrics.record_counter(counter, 1);
+        let Some(count) = self
+            .volume_bursts
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.record(counter, Instant::now()))
+        else {
+            return;
+        };
+        self.hub_event_metrics.record_counter(burst_counter, 1);
+        log::warn!(
+            "[HubEvent-Guardrail] event=volume_burst subtype={} count={} window_ms=30000",
+            counter,
+            count
+        );
+    }
+
+    fn webrtc_send_item_len(item: &super::WebRtcSendItem) -> usize {
+        match item {
+            super::WebRtcSendItem::Pty { data, .. }
+            | super::WebRtcSendItem::Json { data }
+            | super::WebRtcSendItem::Binary { data }
+            | super::WebRtcSendItem::Stream { payload: data, .. } => data.len(),
+            super::WebRtcSendItem::BundleRefresh { bundle_bytes } => bundle_bytes.len(),
+        }
+    }
+
+    fn format_metrics_spans(
+        spans: &std::collections::BTreeMap<&'static str, super::events::HubEventSpanSnapshot>,
+    ) -> String {
+        spans
+            .iter()
+            .filter(|(_, s)| s.count > 0)
+            .map(|(span, s)| {
+                let avg_us = if s.count > 0 {
+                    s.total_ns / s.count / 1_000
+                } else {
+                    0
+                };
+                format!(
+                    "{span}:count={} avg_us={} max_us={} slow={} bytes={}",
+                    s.count,
+                    avg_us,
+                    s.max_ns / 1_000,
+                    s.slow_count,
+                    s.bytes_total
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn format_metrics_counters(counters: &std::collections::BTreeMap<&'static str, u64>) -> String {
+        counters
+            .iter()
+            .filter(|(_, value)| **value > 0)
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn format_metrics_slow_samples(samples: &[super::events::HubEventSlowSample]) -> String {
+        samples
+            .iter()
+            .map(|sample| {
+                format!(
+                    "{}:elapsed_us={} bytes={} label={}",
+                    sample.span, sample.elapsed_us, sample.bytes, sample.label
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 
     /// Spawn a background task to reconnect to a session process.
     ///
@@ -599,6 +689,14 @@ impl Hub {
                 session_name,
                 event,
             } => {
+                let counter = match &event {
+                    crate::agent::pty::PtyEvent::TitleChanged(_) => "pty_osc.title",
+                    crate::agent::pty::PtyEvent::CwdChanged(_) => "pty_osc.cwd",
+                    crate::agent::pty::PtyEvent::PromptMark(_) => "pty_osc.prompt",
+                    crate::agent::pty::PtyEvent::CursorVisibilityChanged(_) => "pty_osc.cursor",
+                    _ => "pty_osc.other",
+                };
+                self.record_volume_guardrail(counter, "pty_osc.volume_burst");
                 self.lua
                     .notify_pty_osc_event(&session_uuid, &session_name, &event);
             }
@@ -623,6 +721,10 @@ impl Hub {
                 }
             }
             HubEvent::PtyOutputObserved { session_uuid, data } => {
+                self.hub_event_metrics
+                    .record_counter("pty_output.messages", 1);
+                self.hub_event_metrics
+                    .record_counter("pty_output.bytes", data.len() as u64);
                 // Learn terminal probes from raw session output (headless-safe).
                 // Without this, probe responses are only learned through client
                 // input paths (TUI/WebRTC/socket), missing headless sessions.
@@ -637,6 +739,7 @@ impl Hub {
                 }
             }
             HubEvent::TimerFired { timer_id } => {
+                self.record_volume_guardrail("timer_fired.count", "timer_fired.volume_burst");
                 self.lua.fire_timer_callback(&timer_id);
             }
             HubEvent::AcChannelMessage {
@@ -727,7 +830,14 @@ impl Hub {
                 browser_identity,
                 payload,
             } => {
+                let started = Instant::now();
                 self.handle_webrtc_message(&browser_identity, &payload);
+                self.record_hot_span(
+                    "webrtc_message.total",
+                    started,
+                    payload.len(),
+                    &browser_identity,
+                );
                 // Check for decrypt failure threshold (ratchet restart).
                 if let Some(channel) = self.webrtc_channels.get(&browser_identity) {
                     let failures = channel.decrypt_failure_count();
@@ -784,8 +894,11 @@ impl Hub {
                         0
                     };
                     let max_us = m.handler_time_max_ns / 1_000;
+                    let spans = Self::format_metrics_spans(&m.spans);
+                    let counters = Self::format_metrics_counters(&m.counters);
+                    let slow_samples = Self::format_metrics_slow_samples(&m.slow_samples);
                     log::info!(
-                        "[HubEventMetrics] enqueue_ok={} dequeue={} failed={} pending={} pending_hwm={} bytes_pending={} bytes_hwm={} avg_us={} max_us={} by_type=[{}]",
+                        "[HubEventMetrics] enqueue_ok={} dequeue={} failed={} pending={} pending_hwm={} bytes_pending={} bytes_hwm={} avg_us={} max_us={} by_type=[{}] counters=[{}] spans=[{}] slow_samples=[{}]",
                         m.enqueue_ok_total,
                         m.dequeue_total,
                         m.enqueue_failed_total,
@@ -795,13 +908,20 @@ impl Hub {
                         m.bytes_high_water_total,
                         avg_us,
                         max_us,
-                        by_type
+                        by_type,
+                        counters,
+                        spans,
+                        slow_samples
                     );
                     self.hub_event_metrics_last_log = std::time::Instant::now();
                 }
 
                 // Retry pending session reconnects.
                 if !self.pending_reconnects.is_empty() {
+                    self.hub_event_metrics.record_high_water(
+                        "reconnect.pending",
+                        self.pending_reconnects.len() as u64,
+                    );
                     let now = Instant::now();
                     let reconnect_deadline = Duration::from_secs(110);
                     let in_flight_timeout = Duration::from_secs(10);
@@ -833,6 +953,8 @@ impl Hub {
                             "[Session] Reconnect expired for '{}'",
                             &uuid[..uuid.len().min(16)]
                         );
+                        self.hub_event_metrics
+                            .record_counter("reconnect.expired", 1);
                         self.pending_reconnects.remove(&uuid);
                         if let Some(sh) = self.handle_cache.get_session(&uuid) {
                             sh.pty().notify_process_exited(None);
@@ -847,10 +969,13 @@ impl Hub {
                     // Phase 3: retry non-in-flight entries.
                     for (uuid, generation) in retryable {
                         self.spawn_session_reconnect(uuid, generation);
+                        self.hub_event_metrics.record_counter("reconnect.retry", 1);
                     }
                 }
             }
             HubEvent::DcOpened { browser_identity } => {
+                self.webrtc_connected_at
+                    .insert(browser_identity.clone(), Instant::now());
                 log::info!(
                     "[WebRTC] DataChannel opened for {}, firing peer_connected",
                     &browser_identity[..browser_identity.len().min(8)],
@@ -986,10 +1111,12 @@ impl Hub {
                 }
             }
             HubEvent::SocketMessage { client_id, msg } => {
+                let bytes = serde_json::to_vec(&msg).map_or(0, |v| v.len());
                 // Intercept focus_changed before Lua — it updates pty_clients
                 // focus state for notification suppression, independent of
                 // whether the child PTY requested focus reporting.
                 if msg.get("type").and_then(|v| v.as_str()) == Some("focus_changed") {
+                    let started = Instant::now();
                     if let Some(session_uuid) = msg.get("session_uuid").and_then(|v| v.as_str()) {
                         let focused = msg
                             .get("focused")
@@ -998,10 +1125,30 @@ impl Hub {
                         self.set_active_terminal_peer(session_uuid, &client_id, focused);
                         self.lua.set_pty_focused(session_uuid, &client_id, focused);
                     }
-                } else if self.handle_terminal_color_profile_message(&client_id, &msg) {
-                    // Handled above — do not route client profile updates through Lua.
-                } else if let Err(e) = self.lua.call_socket_message(&client_id, msg) {
-                    log::error!("[Socket] Lua message handling error for {}: {e}", client_id);
+                    self.record_hot_span(
+                        "socket_message.focus_changed",
+                        started,
+                        bytes,
+                        &client_id,
+                    );
+                } else {
+                    let started = Instant::now();
+                    if self.handle_terminal_color_profile_message(&client_id, &msg) {
+                        self.record_hot_span(
+                            "socket_message.terminal_color_profile",
+                            started,
+                            bytes,
+                            &client_id,
+                        );
+                        // Handled above — do not route client profile updates through Lua.
+                    } else if let Err(e) = self.lua.call_socket_message(&client_id, msg) {
+                        self.hub_event_metrics
+                            .record_counter("socket_message.error", 1);
+                        log::error!("[Socket] Lua message handling error for {}: {e}", client_id);
+                        self.record_hot_span("socket_message.lua", started, bytes, &client_id);
+                    } else {
+                        self.record_hot_span("socket_message.lua", started, bytes, &client_id);
+                    }
                 }
             }
             HubEvent::SocketPtyInput {
@@ -1674,6 +1821,7 @@ impl Hub {
                             );
 
                             // Immediately spawn background reconnect.
+                            self.hub_event_metrics.record_counter("reconnect.retry", 1);
                             self.spawn_session_reconnect(session_uuid, generation);
                             return;
                         }
@@ -1713,6 +1861,8 @@ impl Hub {
                         &session_uuid[..session_uuid.len().min(16)],
                         generation
                     );
+                    self.hub_event_metrics
+                        .record_counter("reconnect.stale_generation", 1);
                     drop(conn);
                     return;
                 }
@@ -1723,6 +1873,7 @@ impl Hub {
                         "[Session] Session '{}' disappeared during reconnect",
                         &session_uuid[..session_uuid.len().min(16)]
                     );
+                    self.hub_event_metrics.record_counter("reconnect.failed", 1);
                     self.pending_reconnects.remove(&session_uuid);
                     return;
                 };
@@ -1742,6 +1893,7 @@ impl Hub {
                         "[Session] Failed to install reader after reconnect for '{}': {e}",
                         &session_uuid[..session_uuid.len().min(16)]
                     );
+                    self.hub_event_metrics.record_counter("reconnect.failed", 1);
                     self.pending_reconnects.remove(&session_uuid);
                     // Fire deferred exit.
                     pty.notify_process_exited(None);
@@ -1771,6 +1923,7 @@ impl Hub {
 
                 // Clean up pending entry.
                 self.pending_reconnects.remove(&session_uuid);
+                self.hub_event_metrics.record_counter("reconnect.ready", 1);
 
                 log::info!(
                     "[Session] Reconnected to '{}' successfully",
@@ -2337,6 +2490,11 @@ impl Hub {
         first: WebRtcPtyOutput,
         rx: &mut Option<tokio::sync::mpsc::Receiver<WebRtcPtyOutput>>,
     ) {
+        let started = Instant::now();
+        let queued = rx.as_ref().map_or(0, tokio::sync::mpsc::Receiver::len);
+        let first_len = first.data.len();
+        self.hub_event_metrics
+            .record_high_water("pty_output.batch_hwm", (queued + 1) as u64);
         // Process the first message directly to preserve ordering.
         self.process_single_pty_output(first);
 
@@ -2345,6 +2503,13 @@ impl Hub {
         self.poll_webrtc_pty_output();
         // Extract it back out
         *rx = self.webrtc_pty_output_rx.take();
+        self.hub_event_metrics.record_span_with_threshold(
+            "pty_output.drain_batch",
+            started.elapsed(),
+            first_len,
+            Self::HOT_SUBHANDLER_SLOW,
+            "select",
+        );
     }
 
     /// Poll user file watches created by `watch.directory()` in Lua.
@@ -2678,6 +2843,7 @@ impl Hub {
     /// to release resources, including aborting any associated PTY forwarders.
     fn cleanup_disconnected_webrtc_channels(&mut self) {
         use crate::channel::ConnectionState;
+        let scan_started = Instant::now();
 
         // Enter tokio runtime for channel state() calls
         let _guard = self.tokio_runtime.enter();
@@ -2722,6 +2888,9 @@ impl Hub {
             .collect();
         for id in connected {
             self.webrtc_connection_started.remove(&id);
+            self.webrtc_connected_at
+                .entry(id)
+                .or_insert_with(Instant::now);
         }
 
         // Clean up stale channels
@@ -2736,6 +2905,13 @@ impl Hub {
         // whose receiver is already `true` (disconnect finished) is safe to drop.
         self.webrtc_pending_closes
             .retain(|_, close_rx| !*close_rx.borrow());
+        self.hub_event_metrics.record_span_with_threshold(
+            "cleanup.webrtc_scan",
+            scan_started.elapsed(),
+            self.webrtc_channels.len(),
+            Self::CLEANUP_SCAN_SLOW,
+            "channels",
+        );
     }
 
     /// Clean up a single WebRTC channel and its associated resources.
@@ -2746,12 +2922,23 @@ impl Hub {
     /// 3. Aborts any PTY forwarder tasks for this browser
     /// 4. Notifies Lua of peer disconnection
     fn cleanup_webrtc_channel(&mut self, browser_identity: &str, reason: &str) {
+        let cleanup_started = Instant::now();
+        let reason_counter = match reason {
+            "disconnected" => "cleanup.webrtc.reason.disconnected",
+            "timeout" => "cleanup.webrtc.reason.timeout",
+            "send_failed" => "cleanup.webrtc.reason.send_failed",
+            "replaced" => "cleanup.webrtc.reason.replaced",
+            _ => "cleanup.webrtc.reason.other",
+        };
+        self.hub_event_metrics.record_counter(reason_counter, 1);
         // Guard against duplicate cleanup calls (e.g. handle_webrtc_send and
         // poll_webrtc_pty_output both detecting the same dead channel in the
         // same tick). If the channel is already gone this is a no-op — we must
         // not fire peer_disconnected a second time or the browser JS state
         // machine will enter an unrecoverable state and stop reconnecting.
         let Some(mut channel) = self.webrtc_channels.remove(browser_identity) else {
+            self.hub_event_metrics
+                .record_counter("cleanup.webrtc.duplicate_skipped", 1);
             log::debug!(
                 "[WebRTC] cleanup_webrtc_channel({}) called but channel already removed (duplicate skipped)",
                 &browser_identity[..browser_identity.len().min(8)]
@@ -2764,6 +2951,21 @@ impl Hub {
             reason,
             &browser_identity[..browser_identity.len().min(8)]
         );
+        if let Some(connected_at) = self.webrtc_connected_at.remove(browser_identity) {
+            let connected_age = connected_at.elapsed();
+            if connected_age <= Self::CLOSED_AFTER_CONNECT_WINDOW
+                && matches!(reason, "disconnected" | "send_failed" | "timeout")
+            {
+                self.hub_event_metrics
+                    .record_counter("webrtc_channel.closed_after_connect", 1);
+                log::warn!(
+                    "[WebRTC-Guardrail] event=closed_after_connect peer={} reason={} connected_age_ms={}",
+                    &browser_identity[..browser_identity.len().min(24)],
+                    reason,
+                    connected_age.as_millis()
+                );
+            }
+        }
 
         // Track close notification so the offer handler can await socket release
         // before creating a replacement channel (prevents fd exhaustion).
@@ -2837,6 +3039,13 @@ impl Hub {
         if let Err(e) = self.lua.call_peer_disconnected(browser_identity) {
             log::warn!("[WebRTC] Lua peer_disconnected callback error: {e}");
         }
+        self.hub_event_metrics.record_span_with_threshold(
+            "cleanup.webrtc_channel",
+            cleanup_started.elapsed(),
+            0,
+            Self::HOT_SUBHANDLER_SLOW,
+            browser_identity,
+        );
     }
 
     /// Handle a message received from a WebRTC DataChannel.
@@ -2848,17 +3057,33 @@ impl Hub {
     /// Note: Crypto envelope decryption happens inside WebRtcChannel.try_recv(),
     /// so we receive plaintext JSON here.
     fn handle_webrtc_message(&mut self, browser_identity: &str, payload: &[u8]) {
+        let parse_started = Instant::now();
         let msg: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(payload) {
             Ok(v) => v,
             Err(e) => {
+                self.hub_event_metrics
+                    .record_counter("webrtc_message.parse_error", 1);
+                self.record_hot_span(
+                    "webrtc_message.parse_json",
+                    parse_started,
+                    payload.len(),
+                    browser_identity,
+                );
                 log::error!("[WebRTC-MSG] JSON parse failed: {e}");
                 return;
             }
         };
+        self.record_hot_span(
+            "webrtc_message.parse_json",
+            parse_started,
+            payload.len(),
+            browser_identity,
+        );
 
         if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
             match msg_type {
                 "dc_ping" => {
+                    let started = Instant::now();
                     // Browser sent a heartbeat ping — respond immediately so it
                     // doesn't declare the connection stalled after 3 missed pongs.
                     let pong = serde_json::to_vec(&serde_json::json!({ "type": "dc_pong" }))
@@ -2867,9 +3092,16 @@ impl Hub {
                         browser_identity,
                         super::WebRtcSendItem::Json { data: pong },
                     );
+                    self.record_hot_span(
+                        "webrtc_message.dc_ping",
+                        started,
+                        payload.len(),
+                        browser_identity,
+                    );
                     return;
                 }
                 "dc_pong" => {
+                    let started = Instant::now();
                     // Browser responded to our dc_ping — connection is alive.
                     // Informational logging only; the browser side uses missed
                     // pongs to detect dead connections and trigger reconnect.
@@ -2877,10 +3109,23 @@ impl Hub {
                         "[WebRTC] dc_pong from {}",
                         &browser_identity[..browser_identity.len().min(8)]
                     );
+                    self.record_hot_span(
+                        "webrtc_message.dc_pong",
+                        started,
+                        payload.len(),
+                        browser_identity,
+                    );
                     return;
                 }
                 "terminal_color_profile" => {
+                    let started = Instant::now();
                     self.handle_terminal_color_profile_message(browser_identity, &msg);
+                    self.record_hot_span(
+                        "webrtc_message.terminal_color_profile",
+                        started,
+                        payload.len(),
+                        browser_identity,
+                    );
                     return;
                 }
                 _ => {}
@@ -2888,7 +3133,14 @@ impl Hub {
         }
 
         // Delegate all other message handling to Lua
+        let started = Instant::now();
         self.call_lua_webrtc_message(browser_identity, msg);
+        self.record_hot_span(
+            "webrtc_message.lua",
+            started,
+            payload.len(),
+            browser_identity,
+        );
     }
 
     /// Call Lua WebRTC message handler.
@@ -2898,6 +3150,8 @@ impl Hub {
     fn call_lua_webrtc_message(&mut self, browser_identity: &str, msg: serde_json::Value) {
         // Call Lua callback
         if let Err(e) = self.lua.call_webrtc_message(browser_identity, msg) {
+            self.hub_event_metrics
+                .record_counter("webrtc_message.lua_error", 1);
             log::error!("[WebRTC-LUA] Lua callback error: {e}");
         }
     }
@@ -3590,6 +3844,7 @@ impl Hub {
         let prefix = req.prefix.clone().unwrap_or_else(|| vec![0x01]);
         let active_flag = req.active_flag.clone();
         let active_terminal_peers = Arc::clone(&self.active_terminal_peers);
+        let metrics = Arc::clone(&self.hub_event_metrics);
 
         // Use browser-provided subscription ID for message routing.
         let subscription_id = req.subscription_id.clone();
@@ -3606,6 +3861,7 @@ impl Hub {
             let mut query_filter_buffer = Vec::new();
             let mut dumped_live_chunks = 0usize;
 
+            let rpc_started = Instant::now();
             let (snapshot, mut pty_rx) = match tokio::task::spawn_blocking(move || {
                 if pty_for_snapshot.is_session_backed() {
                     if Self::should_force_snapshot_redraw(
@@ -3644,6 +3900,13 @@ impl Hub {
                     (Vec::new(), pty_handle.subscribe())
                 }
             };
+            metrics.record_span_with_threshold(
+                "snapshot.rpc_get",
+                rpc_started.elapsed(),
+                snapshot.len(),
+                Hub::SNAPSHOT_SLOW,
+                &session_uuid,
+            );
 
             log::debug!(
                 "[Lua] Snapshot bytes for peer {} session {}: {}",
@@ -3665,6 +3928,7 @@ impl Hub {
             }
 
             if !Self::queue_webrtc_terminal_snapshot(
+                &metrics,
                 &output_tx,
                 &hub_event_tx,
                 &peer_id,
@@ -3807,9 +4071,11 @@ impl Hub {
         let session_uuid = req.session_uuid.clone();
         let target_rows = req.rows;
         let target_cols = req.cols;
+        let metrics = Arc::clone(&self.hub_event_metrics);
 
         let _guard = self.tokio_runtime.enter();
         tokio::spawn(async move {
+            let rpc_started = Instant::now();
             let snapshot = match tokio::task::spawn_blocking(move || {
                 if pty_handle.is_session_backed() {
                     if Self::should_force_snapshot_redraw(&pty_handle, target_rows, target_cols) {
@@ -3834,8 +4100,16 @@ impl Hub {
                     Vec::new()
                 }
             };
+            metrics.record_span_with_threshold(
+                "snapshot.rpc_get",
+                rpc_started.elapsed(),
+                snapshot.len(),
+                Hub::SNAPSHOT_SLOW,
+                &session_uuid,
+            );
 
             Self::queue_webrtc_terminal_snapshot(
+                &metrics,
                 &output_tx,
                 &hub_event_tx,
                 &peer_id,
@@ -3847,6 +4121,7 @@ impl Hub {
     }
 
     fn queue_webrtc_terminal_snapshot(
+        metrics: &super::events::HubEventMetrics,
         output_tx: &tokio::sync::mpsc::Sender<WebRtcPtyOutput>,
         hub_event_tx: &super::events::HubEventTx,
         peer_id: &str,
@@ -3855,9 +4130,11 @@ impl Hub {
         snapshot: Vec<u8>,
     ) -> bool {
         if snapshot.is_empty() {
+            metrics.record_counter("snapshot.empty", 1);
             return true;
         }
 
+        let gzip_started = Instant::now();
         // Pre-gzip the snapshot so the plaintext on the wire is small enough
         // to survive Olm encryption and SCTP's negotiated 16 MB max message
         // size. For large scrollback sessions the raw snapshot can exceed that
@@ -3889,6 +4166,13 @@ impl Hub {
                 plain
             }
         };
+        metrics.record_span_with_threshold(
+            "snapshot.gzip_queue",
+            gzip_started.elapsed(),
+            uncompressed_len + raw_message.len(),
+            Hub::SNAPSHOT_SLOW,
+            session_uuid,
+        );
 
         log::debug!(
             "[Lua] Sending snapshot for session {} ({} bytes raw, {} bytes on wire)",
@@ -3905,6 +4189,7 @@ impl Hub {
         }) {
             Ok(()) => true,
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                metrics.record_counter("snapshot.queue_full", 1);
                 log::warn!(
                     "[Lua] WebRTC PTY output queue full during snapshot send for {}",
                     &peer_id[..peer_id.len().min(8)]
@@ -3916,6 +4201,7 @@ impl Hub {
                 false
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                metrics.record_counter("snapshot.queue_closed", 1);
                 log::trace!("[Lua] PTY output queue closed during snapshot send");
                 false
             }
@@ -3980,9 +4266,11 @@ impl Hub {
                 let session_uuid = entry.session_uuid.clone();
                 let subscription_id = entry.subscription_id.clone();
                 let browser_identity = entry.browser_identity.clone();
+                let metrics = Arc::clone(&self.hub_event_metrics);
 
                 let _guard = self.tokio_runtime.enter();
                 tokio::spawn(async move {
+                    let rpc_started = Instant::now();
                     let snapshot = match tokio::task::spawn_blocking(move || {
                         pty_handle.get_snapshot()
                     })
@@ -3995,11 +4283,20 @@ impl Hub {
                                 &session_uuid[..session_uuid.len().min(8)],
                                 e
                             );
+                            metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
                             return;
                         }
                     };
+                    metrics.record_span_with_threshold(
+                        "snapshot.rpc_get",
+                        rpc_started.elapsed(),
+                        snapshot.len(),
+                        Hub::SNAPSHOT_SLOW,
+                        &session_uuid,
+                    );
 
                     if snapshot.is_empty() {
+                        metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
                         return;
                     }
 
@@ -4010,7 +4307,7 @@ impl Hub {
                         &session_uuid[..session_uuid.len().min(8)]
                     );
 
-                    Self::send_snapshot_to_peer(&peer_tx, &subscription_id, &snapshot);
+                    Self::send_snapshot_to_peer(&metrics, &peer_tx, &subscription_id, &snapshot);
                 });
                 continue;
             }
@@ -4021,7 +4318,9 @@ impl Hub {
             let browser_identity = entry.browser_identity.clone();
             let session_uuid = entry.session_uuid.clone();
             let peer_tx = peer_state.unwrap().tx.clone();
+            let metrics = Arc::clone(&self.hub_event_metrics);
             tokio::spawn(async move {
+                let rpc_started = Instant::now();
                 let snapshot = match tokio::task::spawn_blocking(move || pty_handle.get_snapshot())
                     .await
                 {
@@ -4032,11 +4331,20 @@ impl Hub {
                             &session_uuid[..session_uuid.len().min(8)],
                             e
                         );
+                        metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
                         return;
                     }
                 };
+                metrics.record_span_with_threshold(
+                    "snapshot.rpc_get",
+                    rpc_started.elapsed(),
+                    snapshot.len(),
+                    Hub::SNAPSHOT_SLOW,
+                    &session_uuid,
+                );
 
                 if snapshot.is_empty() {
+                    metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
                     return;
                 }
 
@@ -4047,7 +4355,7 @@ impl Hub {
                     &session_uuid[..session_uuid.len().min(8)]
                 );
 
-                Self::send_snapshot_to_peer(&peer_tx, &subscription_id, &snapshot);
+                Self::send_snapshot_to_peer(&metrics, &peer_tx, &subscription_id, &snapshot);
             });
         }
     }
@@ -4057,6 +4365,7 @@ impl Hub {
     /// Bypasses the output queue to avoid re-triggering backpressure.
     /// Used by both sync (cached) and async recovery paths.
     fn send_snapshot_to_peer(
+        metrics: &super::events::HubEventMetrics,
         peer_tx: &tokio::sync::mpsc::Sender<super::WebRtcSendItem>,
         subscription_id: &str,
         snapshot: &[u8],
@@ -4069,10 +4378,20 @@ impl Hub {
 
         // try_send to avoid blocking; if still full, the snapshot
         // is best-effort — live stream will eventually resync.
-        let _ = peer_tx.try_send(super::WebRtcSendItem::Pty {
+        match peer_tx.try_send(super::WebRtcSendItem::Pty {
             subscription_id: subscription_id.to_string(),
             data: raw_message,
-        });
+        }) {
+            Ok(()) => metrics.record_counter("snapshot.backpressure_recovery.sent", 1),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                metrics.record_counter("snapshot.queue_full", 1);
+                metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                metrics.record_counter("snapshot.queue_closed", 1);
+                metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
+            }
+        }
     }
 
     /// Process pending terminal attach intents.
@@ -5025,11 +5344,15 @@ impl Hub {
         data: Vec<u8>,
     ) -> super::WebRtcSendOutcome {
         let Some(state) = self.webrtc_send_tasks.get(browser_identity) else {
+            self.hub_event_metrics
+                .record_counter("webrtc_send.dead_peer", 1);
             return super::WebRtcSendOutcome::Dead;
         };
 
         // Circuit breaker: send task detected dead peer
         if state.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            self.hub_event_metrics
+                .record_counter("webrtc_send.dead_peer", 1);
             return super::WebRtcSendOutcome::Dead;
         }
 
@@ -5037,8 +5360,13 @@ impl Hub {
             subscription_id: subscription_id.to_string(),
             data,
         }) {
-            Ok(()) => super::WebRtcSendOutcome::Sent,
+            Ok(()) => {
+                self.hub_event_metrics
+                    .record_counter("webrtc_send.queued", 1);
+                super::WebRtcSendOutcome::Sent
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.hub_event_metrics.record_counter("webrtc_send.full", 1);
                 // Per-peer channel full — peer is slow, drop this frame.
                 // PTY output is a continuous stream; dropping is acceptable
                 // but a recovery snapshot will be scheduled to resync state.
@@ -5050,6 +5378,8 @@ impl Hub {
                 super::WebRtcSendOutcome::Backpressure
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.hub_event_metrics
+                    .record_counter("webrtc_send.closed", 1);
                 // Send task exited — mark dead for fast circuit-breaker on
                 // subsequent sends before the cleanup tick runs.
                 state.dead.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5063,15 +5393,35 @@ impl Hub {
     /// Logs warnings on failure but never blocks the event loop. Used by
     /// `HubEvent::WebRtcSend` (Lua sends) and stream frame delivery.
     fn try_send_to_peer(&self, peer_id: &str, item: super::WebRtcSendItem) {
+        let bytes = Self::webrtc_send_item_len(&item);
         let Some(state) = self.webrtc_send_tasks.get(peer_id) else {
-            log::debug!(
-                "[WebRTC] Send to unknown/disconnected peer: {}",
-                &peer_id[..peer_id.len().min(8)]
-            );
+            self.hub_event_metrics
+                .record_counter("webrtc_send.unknown_peer", 1);
+            let burst = self
+                .unknown_peer_bursts
+                .lock()
+                .ok()
+                .and_then(|mut guard| guard.record(peer_id, Instant::now()));
+            if let Some((prefix, count)) = burst {
+                self.hub_event_metrics
+                    .record_counter("webrtc_send.unknown_peer_burst", 1);
+                log::warn!(
+                    "[WebRTC-Guardrail] event=unknown_peer_burst peer={} count={} window_ms=30000",
+                    prefix,
+                    count
+                );
+            } else {
+                log::debug!(
+                    "[WebRTC] Send to unknown/disconnected peer: {}",
+                    &peer_id[..peer_id.len().min(8)]
+                );
+            }
             return;
         };
 
         if state.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            self.hub_event_metrics
+                .record_counter("webrtc_send.dead_peer", 1);
             log::debug!(
                 "[WebRTC] Send to dead peer: {}",
                 &peer_id[..peer_id.len().min(8)]
@@ -5080,8 +5430,14 @@ impl Hub {
         }
 
         match state.tx.try_send(item) {
-            Ok(()) => {}
+            Ok(()) => {
+                self.hub_event_metrics
+                    .record_counter("webrtc_send.queued", 1);
+                self.hub_event_metrics
+                    .record_span("webrtc_send.queue", Duration::ZERO, bytes);
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.hub_event_metrics.record_counter("webrtc_send.full", 1);
                 // Channel full — the send task is still alive but can't keep up.
                 // Don't mark dead: the send task itself will detect a truly dead
                 // peer via timeout. A full channel during a PTY output burst is
@@ -5092,6 +5448,8 @@ impl Hub {
                 );
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.hub_event_metrics
+                    .record_counter("webrtc_send.closed", 1);
                 state.dead.store(true, std::sync::atomic::Ordering::Relaxed);
                 log::debug!(
                     "[WebRTC] Send channel closed for {}, marking peer dead",
@@ -5122,6 +5480,7 @@ impl Hub {
         let dead = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dead_clone = std::sync::Arc::clone(&dead);
         let bi = browser_identity.to_string();
+        let metrics = Arc::clone(&self.hub_event_metrics);
 
         let task = self.tokio_runtime.spawn(async move {
             while let Some(item) = rx.recv().await {
@@ -5144,6 +5503,7 @@ impl Hub {
                                 &bi[..bi.len().min(8)],
                                 msg
                             );
+                            metrics.record_counter("webrtc_send.dead_peer", 1);
                             dead_clone.store(true, std::sync::atomic::Ordering::Relaxed);
                             break;
                         }
@@ -5157,6 +5517,7 @@ impl Hub {
                             "[WebRTC-Send] Send timed out for {} (SCTP congestion), marking dead",
                             &bi[..bi.len().min(8)]
                         );
+                        metrics.record_counter("webrtc_send.dead_peer", 1);
                         dead_clone.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
@@ -5262,6 +5623,10 @@ impl Hub {
         {
             self.pty_output_messages_drained += 1;
         }
+        self.hub_event_metrics
+            .record_counter("pty_output.messages", 1);
+        self.hub_event_metrics
+            .record_counter("pty_output.bytes", msg.data.len() as u64);
 
         let ctx = PtyOutputContext {
             session_uuid: msg.session_uuid.clone(),
@@ -5331,6 +5696,14 @@ impl Hub {
         let messages: Vec<WebRtcPtyOutput> = std::iter::from_fn(|| rx.try_recv().ok())
             .take(DRAIN_BUDGET)
             .collect();
+        let drained_len = messages.len();
+        let drained_bytes: usize = messages.iter().map(|msg| msg.data.len()).sum();
+        self.hub_event_metrics
+            .record_counter("pty_output.messages", drained_len as u64);
+        self.hub_event_metrics
+            .record_counter("pty_output.bytes", drained_bytes as u64);
+        self.hub_event_metrics
+            .record_high_water("pty_output.batch_hwm", drained_len as u64);
 
         // Track how many messages were drained for regression testing.
         #[cfg(test)]
@@ -6324,11 +6697,21 @@ impl Hub {
             .lock()
             .expect("SharedServerId mutex poisoned") = Some(botster_id.clone());
         // Keep runtime manifest aligned with server-assigned hub ID.
+        let manifest_started = Instant::now();
         if let Err(e) =
             crate::hub::daemon::write_manifest(&self.hub_identifier, self.botster_id.as_deref())
         {
+            self.hub_event_metrics
+                .record_counter("manifest.write_error", 1);
             log::warn!("Failed to refresh hub manifest after server registration: {e}");
         }
+        self.hub_event_metrics.record_span_with_threshold(
+            "manifest.write",
+            manifest_started.elapsed(),
+            0,
+            Duration::from_millis(10),
+            &self.hub_identifier,
+        );
 
         // Prefetch ICE config so the first WebRTC offer doesn't pay
         // the HTTP round-trip cost (100-300ms saved on first connection).
@@ -7344,8 +7727,49 @@ mod tests {
             hub.pty_output_messages_drained, 5,
             "All messages in the batch must be processed"
         );
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert_eq!(snapshot.counters["pty_output.messages"], 5);
+        assert_eq!(snapshot.counters["pty_output.bytes"], 10);
+        assert_eq!(snapshot.counters["pty_output.batch_hwm"], 5);
+        assert!(snapshot.spans.contains_key("pty_output.drain_batch"));
 
         hub.webrtc_pty_output_rx = rx;
+    }
+
+    #[test]
+    fn test_unknown_peer_burst_guardrail_is_bounded_and_rate_limited() {
+        let (hub, _request_tx, _output_rx) = e2e_hub();
+
+        for _ in 0..super::PeerBurstState::THRESHOLD {
+            hub.try_send_to_peer(
+                "peer-alpha-abcdefghijklmnopqrstuvwxyz",
+                crate::hub::WebRtcSendItem::Json { data: vec![1] },
+            );
+        }
+        for i in 0..32 {
+            hub.try_send_to_peer(
+                &format!("peer-distinct-{i}"),
+                crate::hub::WebRtcSendItem::Json { data: vec![1] },
+            );
+        }
+
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert_eq!(
+            snapshot.counters["webrtc_send.unknown_peer_burst"], 1,
+            "same peer should warn once per window"
+        );
+        assert_eq!(
+            snapshot.counters["webrtc_send.unknown_peer"],
+            (super::PeerBurstState::THRESHOLD + 32) as u64
+        );
+        let distinct = hub.unknown_peer_bursts.lock().unwrap();
+        let peer_count = distinct
+            .entries
+            .iter()
+            .map(|(peer, _)| peer)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(peer_count <= super::PeerBurstState::PEER_CAP);
     }
 
     #[test]
