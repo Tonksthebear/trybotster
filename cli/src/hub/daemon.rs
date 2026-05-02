@@ -20,7 +20,8 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -262,6 +263,7 @@ pub fn write_pid_file(hub_id: &str) -> Result<()> {
 
 /// Write or update the hub runtime manifest.
 pub fn write_manifest(hub_id: &str, server_id: Option<&str>) -> Result<()> {
+    let started = Instant::now();
     let socket = socket_path(hub_id)?;
     let path = manifest_path(hub_id)?;
     let manifest = HubManifest {
@@ -279,9 +281,64 @@ pub fn write_manifest(hub_id: &str, server_id: Option<&str>) -> Result<()> {
     };
     let content =
         serde_json::to_string_pretty(&manifest).context("Failed to serialize hub manifest")?;
+    let bytes = content.len();
     fs::write(&path, content)
         .with_context(|| format!("Failed to write hub manifest: {}", path.display()))?;
+    record_manifest_write_log(hub_id, bytes, started.elapsed());
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ManifestWriteStorm {
+    writes: std::collections::VecDeque<Instant>,
+    warned: bool,
+}
+
+fn manifest_write_storms() -> &'static Mutex<std::collections::HashMap<String, ManifestWriteStorm>>
+{
+    static STORMS: OnceLock<Mutex<std::collections::HashMap<String, ManifestWriteStorm>>> =
+        OnceLock::new();
+    STORMS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn record_manifest_write_log(hub_id: &str, bytes: usize, elapsed: Duration) {
+    const WINDOW: Duration = Duration::from_secs(10);
+    const THRESHOLD: usize = 3;
+    let now = Instant::now();
+    let mut storm_count = 0usize;
+    let mut should_warn = false;
+    if let Ok(mut storms) = manifest_write_storms().lock() {
+        let state = storms.entry(hub_id.to_string()).or_default();
+        while state
+            .writes
+            .front()
+            .is_some_and(|at| now.duration_since(*at) > WINDOW)
+        {
+            state.writes.pop_front();
+        }
+        if state.writes.is_empty() {
+            state.warned = false;
+        }
+        state.writes.push_back(now);
+        storm_count = state.writes.len();
+        if storm_count > THRESHOLD && !state.warned {
+            state.warned = true;
+            should_warn = true;
+        }
+    }
+    log::debug!(
+        "[ManifestMetrics] event=write hub={} elapsed_ms={} bytes={}",
+        &hub_id[..hub_id.len().min(8)],
+        elapsed.as_millis(),
+        bytes
+    );
+    if should_warn {
+        log::warn!(
+            "[ManifestMetrics] event=write_storm hub={} count={} window_ms=10000",
+            &hub_id[..hub_id.len().min(8)],
+            storm_count
+        );
+    }
 }
 
 /// Read a hub runtime manifest.
@@ -538,11 +595,17 @@ pub fn is_hub_running(hub_id: &str) -> bool {
 /// already running, this is a no-op to avoid clobbering a live hub's files.
 /// Safe to call even if files don't exist.
 pub fn cleanup_stale_files(hub_id: &str) {
+    let started = Instant::now();
     // If the hub is still running, don't touch its files
     if is_hub_running(hub_id) {
         log::debug!(
             "Hub {} is still running, skipping stale cleanup",
             &hub_id[..hub_id.len().min(8)]
+        );
+        log::debug!(
+            "[RuntimeArtifactsMetrics] event=cleanup_stale_files hub={} elapsed_ms={}",
+            &hub_id[..hub_id.len().min(8)],
+            started.elapsed().as_millis()
         );
         return;
     }
@@ -564,6 +627,11 @@ pub fn cleanup_stale_files(hub_id: &str) {
                 "Preserving live hub socket despite stale PID metadata: {}",
                 path.display()
             );
+            log::debug!(
+                "[RuntimeArtifactsMetrics] event=cleanup_stale_files hub={} elapsed_ms={}",
+                &hub_id[..hub_id.len().min(8)],
+                started.elapsed().as_millis()
+            );
             return;
         }
         if path.exists() {
@@ -571,6 +639,11 @@ pub fn cleanup_stale_files(hub_id: &str) {
             log::debug!("Removed stale socket file: {}", path.display());
         }
     }
+    log::debug!(
+        "[RuntimeArtifactsMetrics] event=cleanup_stale_files hub={} elapsed_ms={}",
+        &hub_id[..hub_id.len().min(8)],
+        started.elapsed().as_millis()
+    );
 }
 
 /// Remove PID and socket files on shutdown.
