@@ -19,7 +19,7 @@ use crate::lua::primitives::webrtc::WebRtcSendRequest;
 use crate::lua::primitives::websocket::WsEvent;
 use crate::lua::primitives::worktree::WorktreeRequest;
 use crate::socket::client_conn::SocketClientConn;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -515,6 +515,26 @@ pub(crate) struct HubEventMetricsSnapshot {
     pub handler_time_total_ns: u64,
     pub handler_time_max_ns: u64,
     pub by_type: BTreeMap<&'static str, HubEventTypeSnapshot>,
+    pub counters: BTreeMap<&'static str, u64>,
+    pub spans: BTreeMap<&'static str, HubEventSpanSnapshot>,
+    pub slow_samples: Vec<HubEventSlowSample>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HubEventSpanSnapshot {
+    pub count: u64,
+    pub total_ns: u64,
+    pub max_ns: u64,
+    pub slow_count: u64,
+    pub bytes_total: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HubEventSlowSample {
+    pub span: &'static str,
+    pub elapsed_us: u64,
+    pub bytes: usize,
+    pub label: String,
 }
 
 #[derive(Debug, Default)]
@@ -531,6 +551,15 @@ struct HubEventTypeMetrics {
 }
 
 #[derive(Debug, Default)]
+struct HubEventSpanMetrics {
+    count: u64,
+    total_ns: u64,
+    max_ns: u64,
+    slow_count: u64,
+    bytes_total: u64,
+}
+
+#[derive(Debug, Default)]
 pub(crate) struct HubEventMetrics {
     enqueue_ok_total: AtomicU64,
     enqueue_failed_total: AtomicU64,
@@ -542,9 +571,16 @@ pub(crate) struct HubEventMetrics {
     handler_time_total_ns: AtomicU64,
     handler_time_max_ns: AtomicU64,
     by_type: Mutex<BTreeMap<&'static str, HubEventTypeMetrics>>,
+    counters: Mutex<BTreeMap<&'static str, u64>>,
+    spans: Mutex<BTreeMap<&'static str, HubEventSpanMetrics>>,
+    slow_samples: Mutex<VecDeque<HubEventSlowSample>>,
 }
 
 impl HubEventMetrics {
+    pub(crate) const SLOW_SAMPLE_LIMIT: usize = 32;
+    pub(crate) const SLOW_SAMPLE_LOG_LIMIT: usize = 8;
+    const SLOW_LABEL_LIMIT: usize = 24;
+
     fn bump_high_water(atom: &AtomicUsize, value: usize) {
         let mut current = atom.load(Ordering::Relaxed);
         while value > current {
@@ -622,6 +658,92 @@ impl HubEventMetrics {
         }
     }
 
+    pub(crate) fn record_counter(&self, name: &'static str, amount: u64) {
+        if let Ok(mut map) = self.counters.lock() {
+            let entry = map.entry(name).or_default();
+            *entry = entry.saturating_add(amount);
+        }
+    }
+
+    pub(crate) fn record_high_water(&self, name: &'static str, value: u64) {
+        if let Ok(mut map) = self.counters.lock() {
+            let entry = map.entry(name).or_default();
+            *entry = (*entry).max(value);
+        }
+    }
+
+    pub(crate) fn record_span(
+        &self,
+        span: &'static str,
+        elapsed: std::time::Duration,
+        bytes: usize,
+    ) {
+        self.record_span_labeled(span, elapsed, bytes, "");
+    }
+
+    pub(crate) fn record_span_labeled(
+        &self,
+        span: &'static str,
+        elapsed: std::time::Duration,
+        bytes: usize,
+        label: &str,
+    ) {
+        self.record_span_with_threshold(span, elapsed, bytes, std::time::Duration::MAX, label);
+    }
+
+    pub(crate) fn record_span_with_threshold(
+        &self,
+        span: &'static str,
+        elapsed: std::time::Duration,
+        bytes: usize,
+        slow_threshold: std::time::Duration,
+        label: &str,
+    ) {
+        let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        let is_slow = elapsed >= slow_threshold;
+        if let Ok(mut map) = self.spans.lock() {
+            let entry = map.entry(span).or_default();
+            entry.count = entry.count.saturating_add(1);
+            entry.total_ns = entry.total_ns.saturating_add(nanos);
+            entry.max_ns = entry.max_ns.max(nanos);
+            entry.bytes_total = entry.bytes_total.saturating_add(bytes as u64);
+            if is_slow {
+                entry.slow_count = entry.slow_count.saturating_add(1);
+            }
+        }
+        if is_slow {
+            self.record_slow_sample(span, elapsed, bytes, label);
+        }
+    }
+
+    fn record_slow_sample(
+        &self,
+        span: &'static str,
+        elapsed: std::time::Duration,
+        bytes: usize,
+        label: &str,
+    ) {
+        let mut capped = label
+            .chars()
+            .take(Self::SLOW_LABEL_LIMIT)
+            .collect::<String>();
+        if capped.is_empty() {
+            capped = "-".to_string();
+        }
+        let sample = HubEventSlowSample {
+            span,
+            elapsed_us: elapsed.as_micros().min(u64::MAX as u128) as u64,
+            bytes,
+            label: capped,
+        };
+        if let Ok(mut samples) = self.slow_samples.lock() {
+            if samples.len() >= Self::SLOW_SAMPLE_LIMIT {
+                samples.pop_front();
+            }
+            samples.push_back(sample);
+        }
+    }
+
     #[must_use]
     pub(crate) fn snapshot(&self) -> HubEventMetricsSnapshot {
         let by_type = if let Ok(map) = self.by_type.lock() {
@@ -646,6 +768,38 @@ impl HubEventMetrics {
         } else {
             BTreeMap::new()
         };
+        let counters = self
+            .counters
+            .lock()
+            .map(|map| map.clone())
+            .unwrap_or_default();
+        let spans = self
+            .spans
+            .lock()
+            .map(|map| {
+                map.iter()
+                    .map(|(k, v)| {
+                        (
+                            *k,
+                            HubEventSpanSnapshot {
+                                count: v.count,
+                                total_ns: v.total_ns,
+                                max_ns: v.max_ns,
+                                slow_count: v.slow_count,
+                                bytes_total: v.bytes_total,
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut slow_samples = self
+            .slow_samples
+            .lock()
+            .map(|samples| samples.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        slow_samples.sort_by(|a, b| b.elapsed_us.cmp(&a.elapsed_us));
+        slow_samples.truncate(Self::SLOW_SAMPLE_LOG_LIMIT);
 
         HubEventMetricsSnapshot {
             enqueue_ok_total: self.enqueue_ok_total.load(Ordering::Relaxed),
@@ -658,6 +812,9 @@ impl HubEventMetrics {
             handler_time_total_ns: self.handler_time_total_ns.load(Ordering::Relaxed),
             handler_time_max_ns: self.handler_time_max_ns.load(Ordering::Relaxed),
             by_type,
+            counters,
+            spans,
+            slow_samples,
         }
     }
 }
@@ -731,5 +888,41 @@ mod tests {
         assert_eq!(kind.handler_time_max_ns, 250_000);
         assert_eq!(snapshot.handler_time_total_ns, 250_000);
         assert_eq!(snapshot.handler_time_max_ns, 250_000);
+    }
+
+    #[test]
+    fn metrics_snapshot_includes_counters_spans_and_bounded_slow_samples() {
+        let metrics = HubEventMetrics::default();
+        metrics.record_counter("webrtc_send.queued", 2);
+        metrics.record_counter("webrtc_send.queued", 3);
+        metrics.record_high_water("pty_output.batch_hwm", 5);
+        metrics.record_high_water("pty_output.batch_hwm", 3);
+
+        metrics.record_span("webrtc_message.dc_ping", Duration::from_micros(200), 64);
+        for i in 0..40 {
+            metrics.record_span_with_threshold(
+                "socket_message.lua",
+                Duration::from_millis(60 + i),
+                i as usize,
+                Duration::from_millis(50),
+                "peer-abcdefghijklmnopqrstuvwxyz",
+            );
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters["webrtc_send.queued"], 5);
+        assert_eq!(snapshot.counters["pty_output.batch_hwm"], 5);
+        let span = snapshot.spans.get("socket_message.lua").unwrap();
+        assert_eq!(span.count, 40);
+        assert_eq!(span.slow_count, 40);
+        assert_eq!(
+            snapshot.slow_samples.len(),
+            HubEventMetrics::SLOW_SAMPLE_LOG_LIMIT
+        );
+        assert!(snapshot
+            .slow_samples
+            .iter()
+            .all(|sample| sample.label.chars().count() <= 24));
+        assert_eq!(snapshot.slow_samples[0].elapsed_us, 99_000);
     }
 }
