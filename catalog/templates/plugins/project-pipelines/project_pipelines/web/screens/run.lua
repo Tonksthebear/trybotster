@@ -29,6 +29,7 @@ local function render_step(step, ctx, ticket_id)
     }
     if step.agent_session_uuid and step.agent_session_uuid ~= "" then
         table.insert(children, ui.button{
+            id = "run-" .. step.run_id .. "-terminal-" .. step.id,
             label = "Open terminal",
             icon = "command-line",
             variant = "ghost",
@@ -136,23 +137,13 @@ function M.render(view_state, ctx)
     end
 
     return ui.stack{ direction = "vertical", gap = "4", children = {
-        view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
-            view.row{
-                ui.button{
-                    label = "Back",
-                    icon = "arrow-left",
-                    variant = "ghost",
-                    action = ui.action("botster.nav.open", { path = ctx.path("/") }),
-                },
-                ui.text{ text = ticket and ticket.title or run.id, size = "lg", weight = "semibold" },
-                view.badge(run.status),
-            },
-            ui.text{
-                text = (pipeline and pipeline.name or run.pipeline_id) .. " - current step: " .. (run.current_step_id or "none"),
-                size = "sm",
-                tone = "muted",
-            },
-        } } },
+        view.page_header{
+            title = ticket and ticket.title or run.id,
+            back_id = "run-" .. run.id .. "-back",
+            back_path = ctx.path("/"),
+            meta = { view.badge(run.status) },
+            description = (pipeline and pipeline.name or run.pipeline_id) .. " - current step: " .. (run.current_step_id or "none"),
+        },
         view.section("Steps", step_nodes),
         view.section("Reviews", review_nodes(run.id)),
         view.section("Findings", finding_nodes(run.id)),

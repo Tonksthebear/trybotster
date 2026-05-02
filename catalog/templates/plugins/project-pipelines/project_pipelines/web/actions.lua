@@ -206,15 +206,23 @@ function M.register()
 
     action.on("project_pipelines.start_ticket_pipeline", "project_pipelines.start_ticket_pipeline", function(envelope, ctx)
         local payload = value_payload(envelope)
+        local started = nil
         if payload.ticket_id and payload.pipeline_id then
-            engine.start_run{
+            local ok, result = pcall(engine.start_run, {
                 ticket_id = payload.ticket_id,
                 pipeline_id = payload.pipeline_id,
                 workspace_name = payload.workspace_name or "Pipelines",
-            }
+            })
             refresh(ctx)
+            if not ok then
+                return action.result{ ok = false, error = tostring(result) }
+            end
+            started = result
         end
-        return action.HANDLED
+        return action.result{
+            message = "Pipeline started.",
+            navigate = started and started.run and { label = "Open run", path = "/pipelines/runs/" .. started.run.id } or nil,
+        }
     end)
 
     action.on("project_pipelines.close_ticket", "project_pipelines.close_ticket", function(envelope, ctx)

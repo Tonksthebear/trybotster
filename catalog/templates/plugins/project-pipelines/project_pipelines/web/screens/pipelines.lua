@@ -31,6 +31,7 @@ local function pipeline_card(pipeline, ctx)
         view.row{
             ui.text{ text = pipeline.name, size = "sm", weight = "semibold" },
             ui.button{
+                id = "pipeline-" .. pipeline.id .. "-edit",
                 label = "Edit",
                 icon = "pencil-square",
                 variant = "ghost",
@@ -49,22 +50,16 @@ end
 
 function M.index(_view_state, ctx)
     local children = {
-        view.row{
-            ui.button{
-                label = "Back",
-                icon = "arrow-left",
-                variant = "ghost",
-                action = ui.action("botster.nav.open", { path = ctx.path("/") }),
-            },
-            ui.text{ text = "Pipeline Definitions", size = "lg", weight = "semibold" },
+        view.page_header{
+            title = "Pipeline Definitions",
+            back_id = "pipeline-index-back",
+            back_path = ctx.path("/"),
         },
     }
 
     local pipelines = repo.list_pipelines()
     if #pipelines == 0 then
-        table.insert(children, view.panel{
-            ui.text{ text = "No pipelines yet. Ask an agent to create one with the Project Pipelines MCP tools.", size = "sm", tone = "muted" },
-        })
+        table.insert(children, view.empty("No pipelines yet", "Ask an agent to create one with the Project Pipelines MCP tools.", "queue-list"))
     end
     for _, pipeline in ipairs(pipelines) do
         table.insert(children, pipeline_card(pipeline, ctx))
@@ -260,14 +255,14 @@ function M.edit(view_state, ctx)
     local state = actions.feedback(ctx)
     local steps = repo.pipeline_steps(pipeline.id)
     local children = {
-        view.row{
-            ui.button{
-                label = "Back",
-                icon = "arrow-left",
-                variant = "ghost",
-                action = ui.action("botster.nav.open", { path = ctx.path("/pipelines") }),
+        view.page_header{
+            title = "Edit Pipeline",
+            back_id = "pipeline-" .. pipeline.id .. "-back",
+            back_path = ctx.path("/pipelines"),
+            meta = {
+                view.badge(pipeline.id, "muted"),
+                view.badge(tostring(#steps) .. " steps", "muted"),
             },
-            ui.text{ text = "Edit Pipeline", size = "lg", weight = "semibold" },
         },
         edit_pipeline_fields(pipeline, state),
         ui.text{ text = "Steps", size = "md", weight = "semibold" },
