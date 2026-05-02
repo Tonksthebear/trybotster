@@ -16,6 +16,7 @@ The plugin is intentionally split across modules:
 - `init.lua` clears hot-reload module cache, registers tools, surfaces, and events.
 - `project_pipelines/db.lua` owns the plugin SQLite schema.
 - `project_pipelines/repo.lua` owns persistence and audit events.
+- `project_pipelines/entities.lua` owns plugin entity read models and publishes dynamic state to clients.
 - `project_pipelines/engine.lua` owns run advancement, gates, agent creation, and command gates.
 - `project_pipelines/mcp.lua` exposes the agent-facing API.
 - `project_pipelines/web/surface.lua` registers routes and sidebar navigation.
@@ -141,14 +142,40 @@ When a run returns to an existing step agent, Project Pipelines sends both a str
 
 The `Pipelines` surface shows tickets, runs, pipeline definitions, selected agent per step, reviews, findings, artifacts, recent events, questions, and plugin-owned sessions. When any question is open, the workspace plugin nav entry for Pipelines shows a notification marker.
 
-The overview's dynamic Projects, Tickets, Recent Runs, and Pipeline Definitions
-sections render from plugin-owned entities through shared UI primitives:
-Tickets and Pipeline Definitions use `ui.list` / `ui.list_item`, Projects use
-`ui.tree` / `ui.tree_item`, and Recent Runs uses `ui.table` with rows bound from
-`/project-pipelines.run`. Keep these collections entity-backed; mutators that
-only change collection data should publish entity snapshots or deltas instead
-of forcing a fresh `ui_tree_snapshot`. Detail screens still render presentation
-snapshots until they are explicitly migrated.
+Dynamic state is published as plugin-owned entities:
+
+- `/project-pipelines.ticket`
+- `/project-pipelines.project`
+- `/project-pipelines.project_target`
+- `/project-pipelines.ticket_dependency`
+- `/project-pipelines.pipeline`
+- `/project-pipelines.pipeline_step`
+- `/project-pipelines.pipeline_gate`
+- `/project-pipelines.run`
+- `/project-pipelines.run_step`
+- `/project-pipelines.gate_result`
+- `/project-pipelines.review`
+- `/project-pipelines.finding`
+- `/project-pipelines.artifact`
+- `/project-pipelines.question`
+- `/project-pipelines.event`
+
+The overview and detail pages render dynamic rows from plugin-owned entities
+through shared UI primitives. Tickets, Projects, Pipeline Definitions, Recent
+Runs, ticket handoffs, ticket questions, run steps, run reviews, findings,
+artifacts, events, pipeline steps, and pipeline gates use `ui.bind_list` /
+`ui.bind` against the entity families above. Detail subsections scope child rows
+with `ui.bind_list{ where = { ... } }` instead of pre-rendering per-run or
+per-step collections into the tree snapshot. `/project-pipelines.ticket`
+publishes standalone and project-scoped tickets; standalone lists and project
+timelines filter the shared entity family in the view layer. Route scaffolding
+and form controls that depend on the current path or available actions still
+render structurally.
+Pipeline steps and gates are first-class entities, not embedded arrays on the
+pipeline entity, because the editor mutates individual step and gate fields and
+detail screens need row-level handoff updates. Snapshot publishing is reserved
+for registration/recovery paths; mutators publish targeted entity deltas instead
+of forcing fresh `ui_tree_snapshot` frames for data-only changes.
 
 Routes:
 

@@ -132,6 +132,19 @@ describe('resolveBindings', () => {
     expect((out as any).children[1].props.text).toBe('Review bindings')
   })
 
+  it('filters bind_list records with exact where matches', () => {
+    const out = resolveBindings({
+      $kind: 'bind_list',
+      source: '/project-pipelines.ticket',
+      where: { status: 'open' },
+      item_template: {
+        type: 'text',
+        props: { text: { $bind: '@/title' } },
+      },
+    })
+    expect((out as any[]).map((node) => node.props.text)).toEqual(['Review bindings'])
+  })
+
   it('@-relative path outside bind_list resolves null', () => {
     const out = resolveBindings({ $bind: '@/title' })
     expect(out).toBeNull()
