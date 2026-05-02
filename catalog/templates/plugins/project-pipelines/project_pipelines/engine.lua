@@ -59,6 +59,10 @@ end
 
 local function step_gate_status(run, step, gate)
     if gate.kind == "review_clear" then
+        local review = repo.latest_review_for_run_step(run.current_run_step_id)
+        if review and (review.verdict == "changes_required" or review.verdict == "blocked") then
+            return { satisfied = true, status = "passed", source = "review_transition", review = review }
+        end
         local blockers = repo.open_blocking_findings(run.id)
         if #blockers == 0 then
             return { satisfied = true, status = "passed", source = "review_clear" }
