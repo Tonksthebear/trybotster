@@ -377,12 +377,13 @@ fn register_bind(lua: &Lua, ui: &Table) -> Result<()> {
     Ok(())
 }
 
-/// `ui.bind_list{ source, item_template }` — wire protocol sentinel for
+/// `ui.bind_list{ source, where, item_template }` — wire protocol sentinel for
 /// reactive list expansion. Emits a `$kind = "bind_list"` envelope:
 ///
 /// ```json
 /// { "$kind": "bind_list",
 ///   "source": "/<entity_type>",
+///   "where": { "field": "value" },
 ///   "item_template": <UiNode> }
 /// ```
 ///
@@ -417,6 +418,11 @@ fn register_bind_list(lua: &Lua, ui: &Table) -> Result<()> {
             let out = lua.create_table()?;
             out.set("$kind", "bind_list")?;
             out.set("source", source)?;
+            if let Ok(where_clause) = args.get::<Value>("where") {
+                if !matches!(where_clause, Value::Nil) {
+                    out.set("where", where_clause)?;
+                }
+            }
             out.set("item_template", template)?;
             Ok(out)
         })
@@ -1895,6 +1901,20 @@ mod tests {
             }"#,
         );
         assert_eq!(v["source"], json!("/project-pipelines.ticket"));
+    }
+
+    #[test]
+    fn bind_list_emits_optional_where_filter() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.bind_list{
+                source = "/project-pipelines.run_step",
+                where = { run_id = "run-1" },
+                item_template = ui.text{ text = ui.bind("@/name") },
+            }"#,
+        );
+        assert_eq!(v["where"]["run_id"], json!("run-1"));
     }
 
     #[test]

@@ -31,6 +31,14 @@ import { storeFor } from '../store/entities'
 const ITEM_RELATIVE_PREFIX = '@'
 
 type EntityRecord = Record<string, unknown>
+type EntityState = {
+  order: string[]
+  byId: Record<string, unknown>
+}
+type EntityStoreHook = {
+  <T>(selector: (state: EntityState) => T): T
+  getState: () => EntityState
+}
 type ItemContext = EntityRecord | undefined
 
 /**
@@ -88,11 +96,12 @@ function isPlainObject(value: unknown): boolean {
 
 function expandBindList(envelope: UiBindList, parentItem: ItemContext): unknown[] {
   const entityType = envelope.source.replace(/^\//, '')
-  const store = storeFor(entityType).getState()
+  const store = (storeFor(entityType) as EntityStoreHook).getState()
   const out: unknown[] = []
   for (const id of store.order) {
     const record = store.byId[id] as EntityRecord | undefined
     if (record == null) continue
+    if (!matchesWhere(record, envelope.where)) continue
     // Per-item resolution shadows the outer item context.
     const expanded = resolveBindingsInner(envelope.item_template, record)
     if (expanded != null) out.push(expanded)
@@ -100,6 +109,14 @@ function expandBindList(envelope: UiBindList, parentItem: ItemContext): unknown[
   // `parentItem` deliberately not threaded down — bind_list always shadows.
   void parentItem
   return out
+}
+
+function matchesWhere(record: EntityRecord, where: Record<string, unknown> | undefined): boolean {
+  if (where == null) return true
+  for (const [field, expected] of Object.entries(where)) {
+    if (record[field] !== expected) return false
+  }
+  return true
 }
 
 /**
@@ -124,11 +141,11 @@ export function resolvePath(path: string, item: ItemContext): unknown {
     case 0:
       return null
     case 1:
-      return resolveList(parts[0])
+      return resolveList(parts[0] as string)
     case 2:
-      return resolveRecord(parts[0], parts[1])
+      return resolveRecord(parts[0] as string, parts[1] as string)
     case 3:
-      return resolveScalar(parts[0], parts[1], parts[2])
+      return resolveScalar(parts[0] as string, parts[1] as string, parts[2] as string)
     default:
       // Too many segments — return null and log for debugging. Matches the
       // TUI's defensive default.
@@ -139,14 +156,14 @@ export function resolvePath(path: string, item: ItemContext): unknown {
 }
 
 function resolveList(entityType: string): EntityRecord[] {
-  const store = storeFor(entityType).getState()
+  const store = (storeFor(entityType) as EntityStoreHook).getState()
   return store.order
     .map((id) => store.byId[id] as EntityRecord | undefined)
     .filter((entity): entity is EntityRecord => entity != null)
 }
 
 function resolveRecord(entityType: string, id: string): EntityRecord | null {
-  const store = storeFor(entityType).getState()
+  const store = (storeFor(entityType) as EntityStoreHook).getState()
   return (store.byId[id] as EntityRecord | undefined) ?? null
 }
 
@@ -219,7 +236,7 @@ export function useBindingValue(path: string, item?: EntityRecord): unknown {
   // We need a stable store reference — we always subscribe to the same store
   // for the lifetime of the component. `storeFor` may register a new plugin
   // store on first call; subsequent calls return the same instance.
-  const useStore = storeFor(entityType)
+  const useStore = storeFor(entityType) as EntityStoreHook
   // The selector returns just the slice we care about, so re-renders only
   // happen when that slice changes.
   return useStore((state) => {
@@ -229,12 +246,15 @@ export function useBindingValue(path: string, item?: EntityRecord): unknown {
         .filter((entity: EntityRecord | undefined): entity is EntityRecord => entity != null)
     }
     if (parts.length === 2) {
-      return (state.byId[parts[1]] as EntityRecord | undefined) ?? null
+      const id = parts[1] as string
+      return (state.byId[id] as EntityRecord | undefined) ?? null
     }
     if (parts.length === 3) {
-      const record = state.byId[parts[1]] as EntityRecord | undefined
+      const id = parts[1] as string
+      const field = parts[2] as string
+      const record = state.byId[id] as EntityRecord | undefined
       if (record == null) return null
-      return parts[2] in record ? record[parts[2]] : null
+      return field in record ? record[field] : null
     }
     return null
   })

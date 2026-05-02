@@ -611,7 +611,9 @@ types such as `project-pipelines.ticket` occupy the `<entity_type>` segment
 directly, so a list source is `/project-pipelines.ticket` and a field binding
 is `/project-pipelines.ticket/ticket_123/title`. `ui.bind_list` expands over
 the entity store in insertion order and must flatten into ordinary children or
-slot siblings in both browser and TUI renderers.
+slot siblings in both browser and TUI renderers. `ui.bind_list` may include a
+`where` object; browser and TUI renderers must apply it as exact matches against
+top-level entity fields before expanding the row template.
 
 The shared primitives can map onto the current Rust render tree like this:
 

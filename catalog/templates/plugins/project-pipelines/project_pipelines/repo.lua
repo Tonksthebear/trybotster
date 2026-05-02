@@ -81,6 +81,20 @@ local function with_transaction(fn)
     end)
 end
 
+local function publish_entity(entity_key, row)
+    local ok, entities = pcall(require, "project_pipelines.entities")
+    if ok and entities and entities.types and entities.types[entity_key] and type(entities.upsert) == "function" then
+        pcall(entities.upsert, entities.types[entity_key], row)
+    end
+end
+
+local function remove_entity(entity_key, id)
+    local ok, entities = pcall(require, "project_pipelines.entities")
+    if ok and entities and entities.types and entities.types[entity_key] and type(entities.remove) == "function" then
+        pcall(entities.remove, entities.types[entity_key], id)
+    end
+end
+
 local function filter_update(attrs, allowed)
     local set = {}
     for key, value in pairs(attrs or {}) do
@@ -232,6 +246,7 @@ function M.append_event(kind, attrs)
         created_at = util.now(),
     }
     db.events:insert(event)
+    publish_entity("event", event)
     return event
 end
 
@@ -334,6 +349,7 @@ function M.create_ticket(attrs)
         updated_at = now,
     }
     db.tickets:insert(ticket)
+    publish_entity("ticket", ticket)
     M.append_event("ticket.created", { ticket_id = ticket.id, payload = ticket })
     return ticket
 end
@@ -366,6 +382,7 @@ function M.add_ticket_dependency(ticket_id, depends_on_ticket_id)
         created_at = util.now(),
     }
     db.ticket_dependencies:insert(dependency)
+    publish_entity("ticket_dependency", dependency)
     M.append_event("ticket.dependency_added", {
         ticket_id = ticket_id,
         payload = { dependency_id = dependency.id, depends_on_ticket_id = depends_on_ticket_id },
@@ -380,6 +397,7 @@ function M.remove_ticket_dependency(dependency_id)
         error("ticket dependency not found: " .. tostring(dependency_id))
     end
     db:eval("DELETE FROM ticket_dependencies WHERE id = ?", dependency_id)
+    remove_entity("ticket_dependency", dependency_id)
     M.append_event("ticket.dependency_removed", {
         ticket_id = dependency.ticket_id,
         payload = { dependency_id = dependency.id, depends_on_ticket_id = dependency.depends_on_ticket_id },
@@ -421,6 +439,7 @@ function M.update_ticket(ticket_id, attrs)
     end
     set.updated_at = util.now()
     db.tickets:update{ where = { id = ticket_id }, set = set }
+    publish_entity("ticket", M.get_ticket(ticket_id))
     M.append_event("ticket.updated", { ticket_id = ticket_id, payload = set })
     return M.get_ticket(ticket_id)
 end
@@ -439,6 +458,7 @@ function M.delete_ticket(ticket_id)
         db:eval("DELETE FROM ticket_dependencies WHERE ticket_id = ? OR depends_on_ticket_id = ?", { ticket_id, ticket_id })
         db:eval("DELETE FROM tickets WHERE id = ?", ticket_id)
     end)
+    remove_entity("ticket", ticket_id)
     if #dependencies > 0 then
         M.append_event("ticket.dependencies_purged", {
             ticket_id = ticket_id,
@@ -481,6 +501,7 @@ function M.create_project(attrs)
         updated_at = now,
     }
     db.projects:insert(project)
+    publish_entity("project", project)
     if attrs.target_id then
         M.add_project_target(project.id, attrs.target_id, attrs.target_path)
     end
@@ -502,6 +523,7 @@ function M.update_project(project_id, attrs)
     end
     set.updated_at = util.now()
     db.projects:update{ where = { id = project_id }, set = set }
+    publish_entity("project", M.get_project(project_id))
     M.append_event("project.updated", { payload = { project_id = project_id, fields = set } })
     return M.get_project(project_id)
 end
@@ -519,6 +541,7 @@ function M.delete_project(project_id)
         db.projects:delete{ id = project_id }
         M.append_event("project.deleted", { payload = { project_id = project_id } })
     end)
+    remove_entity("project", project_id)
     return project
 end
 
@@ -536,6 +559,7 @@ function M.add_project_target(project_id, target_id, target_path)
         created_at = util.now(),
     }
     db.project_targets:insert(row)
+    publish_entity("project_target", row)
     M.append_event("project.target_added", {
         payload = { project_id = project_id, target_id = target_id, target_path = target_path },
     })
@@ -552,6 +576,7 @@ function M.remove_project_target(project_target_id)
         return nil
     end
     db.project_targets:delete{ id = project_target_id }
+    remove_entity("project_target", project_target_id)
     M.append_event("project.target_removed", {
         payload = { project_id = row.project_id, project_target_id = project_target_id, target_id = row.target_id },
     })
@@ -604,6 +629,7 @@ function M.update_pipeline(pipeline_id, attrs)
     end
     set.updated_at = util.now()
     db.pipelines:update{ where = { id = pipeline_id }, set = set }
+    publish_entity("pipeline", M.get_pipeline(pipeline_id))
     M.append_event("pipeline.updated", {
         payload = { pipeline_id = pipeline_id, fields = set },
     })
@@ -623,6 +649,7 @@ function M.update_step(step_id, attrs)
     assert_step_links_in_pipeline(proposed, proposed.pipeline_id)
     set.updated_at = util.now()
     db.pipeline_steps:update{ where = { id = step_id }, set = set }
+    publish_entity("pipeline_step", M.get_step(step_id))
     M.append_event("pipeline.step_updated", {
         payload = { step_id = step_id, fields = set },
     })
@@ -653,6 +680,7 @@ function M.update_gate(gate_id, attrs)
         set.required_fields = util.encode(set.required_fields)
     end
     db.pipeline_gates:update{ where = { id = gate_id }, set = set }
+    publish_entity("pipeline_gate", decode_gate_row(M.get_gate(gate_id)))
     M.append_event("pipeline.gate_updated", {
         payload = { gate_id = gate_id, fields = set },
     })
@@ -723,6 +751,7 @@ function M.create_pipeline(attrs)
         end
         M.append_event("pipeline.created", { payload = pipeline })
     end)
+    publish_entity("pipeline", M.get_pipeline(pipeline.id))
     return pipeline
 end
 
@@ -747,6 +776,7 @@ function M.create_step(attrs)
             payload = { pipeline_id = step.pipeline_id, step_id = step.id },
         })
     end)
+    publish_entity("pipeline_step", M.get_step(step.id))
     return M.get_step(step.id)
 end
 
@@ -778,6 +808,7 @@ function M.delete_step(step_id)
             payload = { pipeline_id = step.pipeline_id, step_id = step_id },
         })
     end)
+    remove_entity("pipeline_step", step_id)
     return step
 end
 
@@ -788,6 +819,7 @@ function M.create_gate(attrs)
         error("step not found: " .. tostring(attrs.step_id))
     end
     local gate = insert_gate(attrs, util.now())
+    publish_entity("pipeline_gate", decode_gate_row(gate))
     M.append_event("pipeline.gate_created", {
         payload = { step_id = gate.step_id, gate_id = gate.id },
     })
@@ -809,6 +841,7 @@ function M.delete_gate(gate_id)
             payload = { step_id = gate.step_id, gate_id = gate_id },
         })
     end)
+    remove_entity("pipeline_gate", gate_id)
     return gate
 end
 
@@ -827,6 +860,7 @@ function M.delete_pipeline(pipeline_id)
         db:eval("DELETE FROM pipelines WHERE id = ?", pipeline_id)
         M.append_event("pipeline.deleted", { payload = { pipeline_id = pipeline_id } })
     end)
+    remove_entity("pipeline", pipeline_id)
     return pipeline
 end
 
@@ -870,6 +904,7 @@ function M.create_run(attrs)
         updated_at = now,
     }
     db.runs:insert(run)
+    publish_entity("run", run)
     M.append_event("run.created", { run_id = run.id, ticket_id = run.ticket_id, payload = run })
     return run
 end
@@ -882,6 +917,7 @@ function M.update_run(run_id, attrs)
     local set = util.copy(attrs or {})
     set.updated_at = util.now()
     db.runs:update{ where = { id = run_id }, set = set }
+    publish_entity("run", M.get_run(run_id))
     return M.get_run(run_id)
 end
 
@@ -976,6 +1012,7 @@ function M.update_run_step_visit(run_step_id, attrs)
     local set = util.copy(attrs or {})
     set.updated_at = util.now()
     db.run_steps:update{ where = { id = run_step_id }, set = set }
+    publish_entity("run_step", M.get_run_step_visit(run_step_id))
     return M.get_run_step_visit(run_step_id)
 end
 
@@ -1000,6 +1037,7 @@ function M.create_run_step_visit(run_id, step_id, attrs)
         updated_at = now,
     }
     db.run_steps:insert(visit)
+    publish_entity("run_step", visit)
     return visit
 end
 
@@ -1077,6 +1115,7 @@ function M.submit_gate(attrs)
         created_at = util.now(),
     }
     db.gate_results:insert(result)
+    publish_entity("gate_result", result)
     M.append_event("gate.submitted", {
         run_id = result.run_id,
         payload = {
@@ -1114,8 +1153,9 @@ function M.create_review(attrs)
         created_at = util.now(),
     }
     db.reviews:insert(review)
+    publish_entity("review", review)
     for _, finding in ipairs(attrs.findings or {}) do
-        db.review_findings:insert{
+        local finding_row = {
             id = finding.id or util.id("finding"),
             review_id = review.id,
             run_id = review.run_id,
@@ -1131,6 +1171,8 @@ function M.create_review(attrs)
             created_at = util.now(),
             updated_at = util.now(),
         }
+        db.review_findings:insert(finding_row)
+        publish_entity("finding", finding_row)
     end
     M.append_event("review.submitted", {
         run_id = review.run_id,
@@ -1174,6 +1216,7 @@ function M.resolve_finding(finding_id, attrs)
         },
     }
     local finding = db.review_findings:where{ id = finding_id }
+    publish_entity("finding", finding)
     M.append_event("finding.resolved", {
         run_id = finding and finding.run_id or nil,
         payload = { finding_id = finding_id, resolution = attrs.resolution or attrs.summary },
@@ -1192,7 +1235,9 @@ function M.close_ticket(ticket_id, attrs)
             where = { id = run.id },
             set = { status = "closed", updated_at = now },
         }
+        publish_entity("run", M.get_run(run.id))
     end
+    publish_entity("ticket", M.get_ticket(ticket_id))
     M.append_event("ticket.closed", {
         ticket_id = ticket_id,
         payload = attrs or {},
@@ -1214,6 +1259,7 @@ function M.add_artifact(attrs)
         created_at = util.now(),
     }
     db.artifacts:insert(artifact)
+    publish_entity("artifact", artifact)
     M.append_event("artifact.added", { run_id = artifact.run_id, payload = artifact })
     return artifact
 end
@@ -1244,6 +1290,7 @@ function M.create_question(attrs)
         updated_at = now,
     }
     db.questions:insert(question)
+    publish_entity("question", question)
     M.append_event("question.created", {
         run_id = question.run_id,
         ticket_id = question.ticket_id,
@@ -1273,6 +1320,7 @@ function M.update_question(question_id, attrs)
     set.updated_at = util.now()
     db.questions:update{ where = { id = question_id }, set = set }
     local updated = db.questions:where{ id = question_id }
+    publish_entity("question", updated)
     M.append_event("question.updated", {
         run_id = updated.run_id,
         ticket_id = updated.ticket_id,

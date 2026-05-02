@@ -9,6 +9,7 @@ for _, module_name in ipairs({
     "project_pipelines.util",
     "project_pipelines.db",
     "project_pipelines.repo",
+    "project_pipelines.entities",
     "project_pipelines.engine",
     "project_pipelines.mcp",
     "project_pipelines.web.ui",

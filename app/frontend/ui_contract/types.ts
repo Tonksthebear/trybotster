@@ -360,6 +360,7 @@ export type UiBind = { $bind: string }
 export type UiBindList = {
   $kind: 'bind_list'
   source: string
+  where?: Record<string, unknown>
   item_template: UiNode
 }
 
