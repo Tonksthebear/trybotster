@@ -4,8 +4,9 @@
 -- clients via the `ui_action` message type. Every handler in the chain
 -- runs (handlers observe; they don't short-circuit each other). A handler
 -- that wants to suppress the legacy-command fallback must return
--- `action.HANDLED`. Any other return value — including `nil`, `false`, or a
--- user-supplied table — is treated as "observed, not consumed", so the
+-- `action.HANDLED` or `action.result{...}`. Any other return value —
+-- including `nil`, `false`, or an unmarked table — is treated as
+-- "observed, not consumed", so the
 -- fallback still fires for action ids that have one.
 --
 -- This matters because the common plugin shape is an observer (log the
@@ -35,6 +36,14 @@ local M = {}
 --- cannot collide with any user-defined truthy value (e.g., a boolean
 --- `true` a plugin might reasonably return for diagnostic flow).
 M.HANDLED = setmetatable({}, { __tostring = function() return "action.HANDLED" end })
+
+--- Return from a handler to claim an action and attach result metadata for
+--- the browser's generic pending/result lifecycle.
+function M.result(fields)
+    fields = fields or {}
+    fields.__ui_action_result = true
+    return fields
+end
 
 -- -------------------------------------------------------------------------
 -- Fallback routing — semantic action id -> legacy hub command + payload map
@@ -84,12 +93,12 @@ end
 --- Register a handler for a semantic action id.
 ---
 --- Handlers receive `(envelope, ctx)` where `ctx` is `{ client, sub_id,
---- target_surface }` and may be used to send responses on the same channel.
+--- target_surface, action_request_id }` and may be used to send responses on the same channel.
 ---
 --- All registered handlers run for every envelope (observer semantics).
 --- Return `action.HANDLED` to suppress the legacy-command fallback; return
---- anything else (including `nil`, `false`, or a result table) to leave the
---- fallback path intact.
+--- `action.result{ ok = false, error = "..." }` to suppress fallback and
+--- attach generic result metadata. Other values leave the fallback path intact.
 ---
 --- Idempotent: registering the same `name` twice replaces the earlier entry
 --- so hot-reloadable modules can re-register without duplication.
@@ -159,19 +168,20 @@ end
 --- ctx typically carries `{ client, sub_id, target_surface }` so handlers
 --- can reply on the same subscription channel; tests may pass `{}`.
 ---
---- Returns a table `{ handled, via, handler_count, handled_count }` for
+--- Returns a table `{ handled, via, handler_count, handled_count, ok }` for
 --- callers/tests that need to observe the dispatch outcome. `via` is one
 --- of "handler" (any handler returned HANDLED), "fallback" (legacy command
 --- dispatched), or "unhandled" (neither). `handler_count` counts all
 --- handlers that ran; `handled_count` counts those that returned HANDLED.
 -- @param envelope table { id, payload?, disabled? }
 -- @param ctx table? optional routing context
--- @return table { handled = bool, via, handler_count, handled_count }
+-- @return table { handled = bool, via, ok, handler_count, handled_count }
 function M.dispatch(envelope, ctx)
     if type(envelope) ~= "table" or type(envelope.id) ~= "string" then
         log.warn("action.dispatch: invalid envelope (missing .id)")
         return {
-            handled = false, via = "unhandled",
+            handled = false, via = "unhandled", ok = false,
+            error = "Invalid UI action envelope.",
             handler_count = 0, handled_count = 0,
         }
     end
@@ -179,6 +189,10 @@ function M.dispatch(envelope, ctx)
 
     local handler_count = 0
     local handled_count = 0
+    local ok_result = true
+    local message = nil
+    local error_message = nil
+    local navigate = nil
 
     local slot = registry[envelope.id]
     if slot then
@@ -189,8 +203,16 @@ function M.dispatch(envelope, ctx)
                 log.warn(string.format(
                     "action handler %s for %s raised: %s",
                     entry.name, envelope.id, tostring(result)))
+                ok_result = false
+                error_message = tostring(result)
             elseif result == M.HANDLED then
                 handled_count = handled_count + 1
+            elseif type(result) == "table" and result.__ui_action_result == true then
+                handled_count = handled_count + 1
+                if result.ok == false then ok_result = false end
+                if type(result.message) == "string" then message = result.message end
+                if type(result.error) == "string" then error_message = result.error end
+                if type(result.navigate) == "table" then navigate = result.navigate end
             end
             -- Any other return value: observed but not consumed. Fall
             -- through to remaining handlers (observer semantics).
@@ -199,7 +221,8 @@ function M.dispatch(envelope, ctx)
 
     if handled_count > 0 then
         return {
-            handled = true, via = "handler",
+            handled = true, via = "handler", ok = ok_result,
+            message = message, error = error_message, navigate = navigate,
             handler_count = handler_count, handled_count = handled_count,
         }
     end
@@ -210,9 +233,10 @@ function M.dispatch(envelope, ctx)
     local cmd = fallback_command(envelope)
     if cmd then
         local commands = require("lib.commands")
-        commands.dispatch(ctx.client, ctx.sub_id, cmd)
+        local ok, err = pcall(commands.dispatch, ctx.client, ctx.sub_id, cmd)
         return {
-            handled = true, via = "fallback",
+            handled = ok, via = "fallback", ok = ok and ok_result,
+            error = ok and error_message or tostring(err),
             handler_count = handler_count, handled_count = handled_count,
         }
     end
@@ -221,7 +245,8 @@ function M.dispatch(envelope, ctx)
         log.debug(string.format("action.dispatch: unhandled %s", envelope.id))
     end
     return {
-        handled = false, via = "unhandled",
+        handled = false, via = "unhandled", ok = false,
+        error = error_message or "No hub handler handled this action.",
         handler_count = handler_count, handled_count = handled_count,
     }
 end

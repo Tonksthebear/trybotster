@@ -10,6 +10,8 @@ import type { UiActionTransport } from './dispatch'
 export type ActionDispatchSource = {
   /** The DOM element that triggered the action (e.g. the clicked button). */
   element?: Element | null
+  /** Renderer-local submitter key for correlated pending/result feedback. */
+  uiActionSourceKey?: string | null
 }
 
 /**
@@ -37,6 +39,8 @@ export type RenderContext = {
   hubId?: string
   /** Hub transport, when a web-only composite needs request/response frames. */
   transport?: UiActionTransport | null
+  /** Current hub surface name for correlated action lifecycle state. */
+  targetSurface?: string
 }
 
 /** Default web capability set. Renderers may override in tests. */

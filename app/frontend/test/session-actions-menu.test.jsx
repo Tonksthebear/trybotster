@@ -162,16 +162,17 @@ describe('<SessionActionsMenu> interceptor', () => {
     fireEvent.click(actionItem)
     await Promise.resolve()
     await Promise.resolve()
-    expect(fakeTransport.sendCommand).toHaveBeenCalledWith('ui_action', {
+    expect(fakeTransport.sendCommand).toHaveBeenCalledWith('ui_action', expect.objectContaining({
+      action_request_id: expect.stringMatching(/^ua_/),
       target_surface: 'workspace_panel',
-      envelope: {
+      envelope: expect.objectContaining({
         id: 'botster.session.action.execute',
         payload: {
           sessionUuid: 'u-1',
           actionId: 'cloudflare.preview.toggle',
         },
-      },
-    })
+      }),
+    }))
     expect(localDispatch).not.toHaveBeenCalledWith(
       expect.objectContaining({ action: 'botster.session.action.execute' }),
     )

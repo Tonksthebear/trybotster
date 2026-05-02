@@ -79,12 +79,8 @@ function M.register()
     action.on("project_pipelines.update_ticket_draft", "project_pipelines.update_ticket_draft", function(envelope, ctx)
         local payload = value_payload(envelope)
         local draft = current_draft(ctx)
-        local status = current_feedback(ctx)
         if payload.field == "title" or payload.field == "description" or payload.field == "target_id" or payload.field == "project_id" then
             draft[payload.field] = payload.value or ""
-            status.ticket_error = nil
-            status.created_ticket_id = nil
-            status.created_ticket_project_id = nil
         end
         return action.HANDLED
     end)
@@ -103,7 +99,6 @@ function M.register()
         local payload = value_payload(envelope)
         local key = draft_key(ctx)
         local draft = drafts[key] or {}
-        local status = current_feedback(ctx)
         local title = draft.title
         if not title or title:match("^%s*$") then
             title = "Untitled ticket"
@@ -115,11 +110,8 @@ function M.register()
             target_path = target and target.path or nil
         end
         if not target_id or target_id == "" then
-            status.ticket_error = "Select a spawn target before creating the ticket."
-            status.created_ticket_id = nil
-            status.created_ticket_project_id = nil
             refresh(ctx)
-            return action.HANDLED
+            return action.result{ ok = false, error = "Select a spawn target before creating the ticket." }
         end
         local project_id = (draft.project_id and draft.project_id ~= "" and draft.project_id)
             or (payload.project_id and payload.project_id ~= "" and payload.project_id)
@@ -132,20 +124,18 @@ function M.register()
             target_path = target_path,
         }
         drafts[key] = {}
-        status.ticket_error = nil
-        status.created_ticket_id = ticket.id
-        status.created_ticket_project_id = project_id
         refresh(ctx)
-        return action.HANDLED
+        return action.result{
+            message = "Ticket created.",
+            navigate = { label = "Open ticket", path = "/pipelines/tickets/" .. ticket.id },
+        }
     end)
 
     action.on("project_pipelines.update_project_draft", "project_pipelines.update_project_draft", function(envelope, ctx)
         local payload = value_payload(envelope)
         local draft = current_draft(ctx)
-        local status = current_feedback(ctx)
         if payload.field == "name" or payload.field == "description" or payload.field == "target_id" then
             draft["project_" .. payload.field] = payload.value or ""
-            status.created_project_id = nil
         end
         return action.HANDLED
     end)
@@ -171,9 +161,11 @@ function M.register()
         draft.project_name = nil
         draft.project_description = nil
         draft.project_target_id = nil
-        current_feedback(ctx).created_project_id = project.id
         refresh(ctx)
-        return action.HANDLED
+        return action.result{
+            message = "Project created.",
+            navigate = { label = "Open project", path = "/pipelines/projects/" .. project.id },
+        }
     end)
 
     action.on("project_pipelines.update_pipeline_field", "project_pipelines.update_pipeline_field", function(envelope, ctx)
@@ -229,17 +221,18 @@ function M.register()
         local payload = value_payload(envelope)
         if payload.ticket_id then
             local ok, err = pcall(engine.close_ticket, payload.ticket_id, { merge_confirmed = payload.merge_confirmed == true })
-            current_feedback(ctx).close_error = ok and nil or tostring(err)
             refresh(ctx)
+            if not ok then
+                return action.result{ ok = false, error = tostring(err) }
+            end
         end
-        return action.HANDLED
+        return action.result{ message = "Ticket closed." }
     end)
 
     action.on("project_pipelines.update_dependency_draft", "project_pipelines.update_dependency_draft", function(envelope, ctx)
         local payload = value_payload(envelope)
         if payload.ticket_id then
             current_draft(ctx)["dependency_" .. payload.ticket_id] = payload.value or ""
-            current_feedback(ctx).dependency_error = nil
         end
         return action.HANDLED
     end)
@@ -249,23 +242,27 @@ function M.register()
         if payload.ticket_id then
             local depends_on_ticket_id = current_draft(ctx)["dependency_" .. payload.ticket_id]
             local ok, result = pcall(repo.add_ticket_dependency, payload.ticket_id, depends_on_ticket_id)
-            current_feedback(ctx).dependency_error = ok and nil or tostring(result)
             if ok then
                 current_draft(ctx)["dependency_" .. payload.ticket_id] = nil
             end
             refresh(ctx)
+            if not ok then
+                return action.result{ ok = false, error = tostring(result) }
+            end
         end
-        return action.HANDLED
+        return action.result{ message = "Dependency added." }
     end)
 
     action.on("project_pipelines.remove_ticket_dependency", "project_pipelines.remove_ticket_dependency", function(envelope, ctx)
         local payload = value_payload(envelope)
         if payload.dependency_id then
             local ok, result = pcall(repo.remove_ticket_dependency, payload.dependency_id)
-            current_feedback(ctx).dependency_error = ok and nil or tostring(result)
             refresh(ctx)
+            if not ok then
+                return action.result{ ok = false, error = tostring(result) }
+            end
         end
-        return action.HANDLED
+        return action.result{ message = "Dependency removed." }
     end)
 
     action.on("project_pipelines.request_merge", "project_pipelines.request_merge", function(envelope, ctx)
@@ -276,11 +273,12 @@ function M.register()
                 agent_name = payload.agent_name,
                 workspace_name = payload.workspace_name or "Project Management",
             }, {})
-            current_feedback(ctx).merge_error = ok and nil or tostring(result)
-            current_feedback(ctx).merge_notice = ok and "Merge agent requested." or nil
             refresh(ctx)
+            if not ok then
+                return action.result{ ok = false, error = tostring(result) }
+            end
         end
-        return action.HANDLED
+        return action.result{ message = "Merge agent requested." }
     end)
 
     action.on("project_pipelines.update_question_answer", "project_pipelines.update_question_answer", function(envelope, ctx)
@@ -305,10 +303,12 @@ function M.register()
             if ok then
                 draft["answer_" .. payload.question_id] = nil
             end
-            current_feedback(ctx).question_error = ok and nil or tostring(err)
             refresh(ctx)
+            if not ok then
+                return action.result{ ok = false, error = tostring(err) }
+            end
         end
-        return action.HANDLED
+        return action.result{ message = "Question answered." }
     end)
 end
 

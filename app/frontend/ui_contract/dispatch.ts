@@ -1,6 +1,10 @@
 import { dispatch as dispatchLocalAction } from '../lib/actions'
 import type { ActionDispatch, ActionDispatchSource } from './context'
 import type { UiAction } from './types'
+import {
+  beginUiActionLifecycle,
+  failUiActionLifecycle,
+} from './action_lifecycle_store'
 
 /**
  * Minimal transport surface we need to send `ui_action` command frames.
@@ -101,7 +105,7 @@ export function createTransportDispatch(
   opts: CreateTransportDispatchOptions,
 ): ActionDispatch {
   const { transport, hubId, targetSurface } = opts
-  return (action: UiAction, _source?: ActionDispatchSource) => {
+  return (action: UiAction, source?: ActionDispatchSource) => {
     if (action.disabled === true) return
     const mergedPayload = {
       hubId,
@@ -130,18 +134,29 @@ export function createTransportDispatch(
     // update is synchronous with the click.
     navigateToSessionLocally(action, mergedPayload)
 
+    const actionRequestId = beginUiActionLifecycle({
+      actionId: action.id,
+      targetSurface,
+      sourceKey: source?.uiActionSourceKey ?? action.id,
+    })
+
     void (async () => {
       let sent = false
       try {
         sent =
           (await transport.sendCommand('ui_action', {
             target_surface: targetSurface,
+            action_request_id: actionRequestId,
             envelope,
           })) === true
       } catch (err) {
         console.error('[ui_contract] transport command failed', err)
+        failUiActionLifecycle(actionRequestId, 'Action could not be sent.')
+        return
       }
-      if (!sent) return
+      if (!sent) {
+        failUiActionLifecycle(actionRequestId, 'Action could not be sent.')
+      }
     })()
   }
 }
