@@ -27,13 +27,14 @@ function M.ticket(_view_state, ctx)
         local run = repo.open_ticket_run(ticket.id)
         table.insert(recent, view.panel{
             ui.stack{ direction = "vertical", gap = "2", children = {
-                view.row{
+                view.metadata{
                     ui.text{ text = ticket.title, size = "sm", weight = "semibold" },
                     run and view.badge(run.status == "blocked" and "blocked" or "in progress", run.status == "blocked" and "danger" or "accent") or view.badge("ready", "muted"),
                     view.badge(view.target_label(ticket.target_id, ticket.target_path), "accent"),
                 },
                 ui.text{ text = ticket.description or "", size = "xs", tone = "muted" },
                 ui.button{
+                    id = "new-ticket-recent-ticket-" .. ticket.id,
                     label = "Open ticket",
                     icon = "arrow-right",
                     variant = "solid",
@@ -51,36 +52,32 @@ function M.ticket(_view_state, ctx)
     end
 
     local children = {
-        view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
-            view.row{
-                ui.button{
-                    label = "Back",
-                    icon = "arrow-left",
-                    variant = "ghost",
-                    action = ui.action("botster.nav.open", { path = ctx.path("/") }),
-                },
-                ui.text{ text = "New Ticket", size = "lg", weight = "semibold" },
-            },
-            ui.text{ text = "A ticket is one concrete unit of work in one spawn target.", size = "sm", tone = "muted" },
-        } } },
+        view.page_header{
+            title = "New Ticket",
+            back_id = "new-ticket-back",
+            back_path = ctx.path("/"),
+            description = "A ticket is one concrete unit of work in one spawn target.",
+        },
     }
     table.insert(children, view.panel{ ui.form{ children = {
         ui.stack{ direction = "vertical", gap = "3", children = {
-            ui.select{
-                id = "new-ticket-target",
-                label = "Spawn target",
-                required = true,
-                placeholder = "Select target",
-                options = view.target_options(),
-                on_change = view.field_action("project_pipelines.update_ticket_draft", { field = "target_id" }),
-            },
-            ui.select{
-                id = "new-ticket-project",
-                label = "Project",
-                value = "",
-                options = project_options(),
-                on_change = view.field_action("project_pipelines.update_ticket_draft", { field = "project_id" }),
-            },
+            view.responsive_row({
+                ui.select{
+                    id = "new-ticket-target",
+                    label = "Spawn target",
+                    required = true,
+                    placeholder = "Select target",
+                    options = view.target_options(),
+                    on_change = view.field_action("project_pipelines.update_ticket_draft", { field = "target_id" }),
+                },
+                ui.select{
+                    id = "new-ticket-project",
+                    label = "Project",
+                    value = "",
+                    options = project_options(),
+                    on_change = view.field_action("project_pipelines.update_ticket_draft", { field = "project_id" }),
+                },
+            }),
             ui.text_input{
                 id = "new-ticket-title",
                 label = "Title",
@@ -95,6 +92,7 @@ function M.ticket(_view_state, ctx)
                 on_change = view.field_action("project_pipelines.update_ticket_draft", { field = "description" }),
             },
             ui.button{
+                id = "new-ticket-create",
                 label = "Create ticket",
                 icon = "plus",
                 variant = "solid",
@@ -114,36 +112,32 @@ function M.project_ticket(view_state, ctx)
     local title = project and ("New Ticket - " .. project.name) or "New Ticket"
 
     local children = {
-        view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
-            view.row{
-                ui.button{
-                    label = "Back",
-                    icon = "arrow-left",
-                    variant = "ghost",
-                    action = ui.action("botster.nav.open", { path = ctx.path("/projects/" .. params.project_id) }),
-                },
-                ui.text{ text = title, size = "lg", weight = "semibold" },
-            },
-            ui.text{ text = "A project ticket still belongs to one spawn target.", size = "sm", tone = "muted" },
-        } } },
+        view.page_header{
+            title = title,
+            back_id = "new-project-ticket-back",
+            back_path = ctx.path("/projects/" .. params.project_id),
+            description = "A project ticket still belongs to one spawn target.",
+        },
     }
     table.insert(children, view.panel{ ui.form{ children = {
         ui.stack{ direction = "vertical", gap = "3", children = {
-            ui.select{
-                id = "new-project-ticket-target",
-                label = "Spawn target",
-                required = true,
-                placeholder = "Select target",
-                options = view.target_options(),
-                on_change = view.field_action("project_pipelines.update_ticket_draft", { field = "target_id" }),
-            },
-            ui.select{
-                id = "new-project-ticket-project",
-                label = "Project",
-                value = params.project_id or "",
-                options = project_options(params.project_id),
-                on_change = view.field_action("project_pipelines.update_ticket_draft", { field = "project_id" }),
-            },
+            view.responsive_row({
+                ui.select{
+                    id = "new-project-ticket-target",
+                    label = "Spawn target",
+                    required = true,
+                    placeholder = "Select target",
+                    options = view.target_options(),
+                    on_change = view.field_action("project_pipelines.update_ticket_draft", { field = "target_id" }),
+                },
+                ui.select{
+                    id = "new-project-ticket-project",
+                    label = "Project",
+                    value = params.project_id or "",
+                    options = project_options(params.project_id),
+                    on_change = view.field_action("project_pipelines.update_ticket_draft", { field = "project_id" }),
+                },
+            }),
             ui.text_input{
                 id = "new-project-ticket-title",
                 label = "Title",
@@ -158,6 +152,7 @@ function M.project_ticket(view_state, ctx)
                 on_change = view.field_action("project_pipelines.update_ticket_draft", { field = "description" }),
             },
             ui.button{
+                id = "new-project-ticket-create",
                 label = "Create ticket",
                 icon = "plus",
                 variant = "solid",
@@ -175,12 +170,13 @@ function M.project(_view_state, ctx)
     for _, project in ipairs(repo.list_projects()) do
         table.insert(recent, view.panel{
             ui.stack{ direction = "vertical", gap = "2", children = {
-                view.row{
+                view.metadata{
                     ui.text{ text = project.name, size = "sm", weight = "semibold" },
                     view.badge(project.status),
                 },
                 ui.text{ text = project.description or "", size = "xs", tone = "muted" },
                 ui.button{
+                    id = "new-project-recent-project-" .. project.id,
                     label = "Open project",
                     icon = "folder-open",
                     variant = "solid",
@@ -197,18 +193,12 @@ function M.project(_view_state, ctx)
         table.insert(recent, ui.text{ text = "No projects yet.", size = "sm", tone = "muted" })
     end
     local children = {
-        view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
-            view.row{
-                ui.button{
-                    label = "Back",
-                    icon = "arrow-left",
-                    variant = "ghost",
-                    action = ui.action("botster.nav.open", { path = ctx.path("/") }),
-                },
-                ui.text{ text = "New Project", size = "lg", weight = "semibold" },
-            },
-            ui.text{ text = "A project coordinates multi-phase or cross-target work. Projects are optional.", size = "sm", tone = "muted" },
-        } } },
+        view.page_header{
+            title = "New Project",
+            back_id = "new-project-back",
+            back_path = ctx.path("/"),
+            description = "A project coordinates multi-phase or cross-target work. Projects are optional.",
+        },
     }
     table.insert(children, view.panel{ ui.form{ children = {
         ui.stack{ direction = "vertical", gap = "3", children = {
@@ -233,6 +223,7 @@ function M.project(_view_state, ctx)
                 on_change = view.field_action("project_pipelines.update_project_draft", { field = "target_id" }),
             },
             ui.button{
+                id = "new-project-create",
                 label = "Create project",
                 icon = "folder-plus",
                 variant = "solid",
