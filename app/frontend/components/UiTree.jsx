@@ -450,6 +450,7 @@ export default function UiTree({
               dispatch={dispatch}
               capabilities={capabilities}
               hubId={hubId}
+              targetSurface={targetSurface}
               transport={transport}
             />
           ) : (

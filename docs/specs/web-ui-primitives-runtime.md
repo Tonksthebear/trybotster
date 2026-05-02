@@ -38,6 +38,21 @@ Plugin entity types use the existing `<plugin>.<type>` store key directly, so
 tree containing bindings subscribes to the referenced entity stores, allowing
 an `entity_patch` to update bound text without another `ui_tree_snapshot`.
 
+Lua-authored action submitters use the generic `ui_action` lifecycle in the
+React/Catalyst primitive registry. The web renderer generates
+`action_request_id`, disables only the activating button or icon button while
+pending, renders the pending affordance from local Catalyst/Tailwind classes,
+and then renders semantic success/error text plus optional navigation returned
+by `ui_action_result`. Do not reintroduce plugin-specific pending keys,
+per-screen notice panels, or Lua-provided CSS/classes for this feedback path.
+
+When this lifecycle changes visible button, icon button, or result treatment,
+inspect `tmp/tailwind_plus_preview` if reference material exists; otherwise use
+the vendored Catalyst primitives and existing registry styles. This remains
+React/Catalyst web work, not Elements/Hotwire/Stimulus work. A Hotwire surface
+would need its own adapter later, with Stimulus limited to behavior/data
+attributes and styling still owned by the applicable UI layer.
+
 ## Problem
 
 The current `agent_list_controller.js` now owns too much application logic:

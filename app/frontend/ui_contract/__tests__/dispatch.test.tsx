@@ -21,6 +21,11 @@ vi.mock('../../lib/actions', () => {
 
 import { dispatch as localDispatch } from '../../lib/actions'
 import {
+  _resetUiActionLifecycleForTests,
+  getUiActionLifecycleSnapshot,
+  receiveUiActionResult,
+} from '../action_lifecycle_store'
+import {
   UiTreeBody,
   createTransportDispatch,
   type UiActionTransport,
@@ -36,6 +41,7 @@ const REGULAR_FINE: UiViewport = {
 afterEach(() => {
   cleanup()
   vi.mocked(localDispatch).mockClear()
+  _resetUiActionLifecycleForTests()
 })
 
 function selectButton(label: string): UiNode {
@@ -49,6 +55,10 @@ function selectButton(label: string): UiNode {
       },
     },
   }
+}
+
+function sentUiActionData(send: ReturnType<typeof vi.fn>, index = 0) {
+  return send.mock.calls[index]?.[1] as Record<string, unknown>
 }
 
 describe('createTransportDispatch — Phase 2c default', () => {
@@ -83,12 +93,67 @@ describe('createTransportDispatch — Phase 2c default', () => {
     expect(send).toHaveBeenCalledOnce()
     expect(send).toHaveBeenCalledWith('ui_action', {
       target_surface: 'workspace_surface',
+      action_request_id: expect.stringMatching(/^ua_/),
       envelope: {
         id: 'botster.session.select',
         payload: { sessionId: 'sess-1', sessionUuid: 'uuid-1' },
       },
     })
     expect(localDispatch).not.toHaveBeenCalled()
+  })
+
+  it('marks the clicked submitter pending before async send resolves and clears on result', async () => {
+    let resolveSend: (value: boolean) => void = () => {}
+    const { transport, send } = makeTransport(
+      () => new Promise((resolve) => { resolveSend = resolve }),
+    )
+    const dispatch = createTransportDispatch({
+      transport,
+      hubId: 'hub-7',
+      targetSurface: 'workspace_surface',
+    })
+    render(
+      <UiTreeBody
+        node={{ ...selectButton('Select'), id: 'select-submitter' }}
+        dispatch={dispatch}
+        viewport={REGULAR_FINE}
+        targetSurface="workspace_surface"
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Select' }))
+
+    const requestId = sentUiActionData(send).action_request_id as string
+    expect(getUiActionLifecycleSnapshot(
+      'botster.session.select',
+      'workspace_surface',
+      'select-submitter',
+    ).pending).toBe(true)
+    expect(screen.getByRole('button', { name: 'Select' })).toBeDisabled()
+
+    receiveUiActionResult({
+      type: 'ui_action_result',
+      v: 1,
+      action_request_id: requestId,
+      action_id: 'botster.session.select',
+      target_surface: 'workspace_surface',
+      ok: true,
+      handled: true,
+      via: 'fallback',
+      message: 'Selected',
+      navigate: { label: 'Open ticket', path: '/pipelines/tickets/t1' },
+    })
+    resolveSend(true)
+    await Promise.resolve()
+
+    expect(getUiActionLifecycleSnapshot(
+      'botster.session.select',
+      'workspace_surface',
+      'select-submitter',
+    ).pending).toBe(false)
+    expect(screen.getByText('Selected')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Open ticket' }))
+    expect(window.location.pathname).toBe('/pipelines/tickets/t1')
   })
 
   it('pushes session URL into history on session.select success (hub handles focus, browser owns route)', () => {
@@ -161,6 +226,16 @@ describe('createTransportDispatch — Phase 2c default', () => {
     await Promise.resolve()
 
     expect(send).toHaveBeenCalledOnce()
+    const requestId = sentUiActionData(send).action_request_id as string
+    expect(getUiActionLifecycleSnapshot(
+      'botster.session.select',
+      'workspace_surface',
+      'botster.session.select',
+    ).result).toMatchObject({
+      action_request_id: requestId,
+      ok: false,
+      error: 'Action could not be sent.',
+    })
     expect(localDispatch).not.toHaveBeenCalled()
   })
 
@@ -188,6 +263,16 @@ describe('createTransportDispatch — Phase 2c default', () => {
     await Promise.resolve()
 
     expect(send).toHaveBeenCalledOnce()
+    const requestId = sentUiActionData(send).action_request_id as string
+    expect(getUiActionLifecycleSnapshot(
+      'botster.session.select',
+      'workspace_surface',
+      'botster.session.select',
+    ).result).toMatchObject({
+      action_request_id: requestId,
+      ok: false,
+      error: 'Action could not be sent.',
+    })
     expect(localDispatch).not.toHaveBeenCalled()
     errSpy.mockRestore()
   })

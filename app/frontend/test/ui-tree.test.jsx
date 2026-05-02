@@ -31,6 +31,7 @@ import {
   useSessionStore,
   useWorkspaceEntityStore,
 } from '../store/entities'
+import { _resetUiActionLifecycleForTests } from '../ui_contract/action_lifecycle_store'
 
 // ---------- Mock hub-bridge.waitForHub returning a fake transport ----------
 
@@ -65,6 +66,7 @@ function immediateHub(transport) {
 
 beforeEach(() => {
   _resetUiTreeSnapshotCacheForTests()
+  _resetUiActionLifecycleForTests()
   fakeTransport = new FakeTransport()
   vi.spyOn(hubBridge, 'waitForHub').mockImplementation(() => immediateHub(fakeTransport))
 })
@@ -73,6 +75,7 @@ afterEach(() => {
   cleanup()
   useSessionStore.getState()._reset()
   useWorkspaceEntityStore.getState()._reset()
+  _resetUiActionLifecycleForTests()
   vi.mocked(legacyDispatch).mockClear()
   vi.restoreAllMocks()
 })
@@ -240,13 +243,14 @@ describe('<UiTree>', () => {
     await Promise.resolve()
     await Promise.resolve()
     expect(transportA.sendCommand).not.toHaveBeenCalled()
-    expect(transportB.sendCommand).toHaveBeenCalledWith('ui_action', {
+    expect(transportB.sendCommand).toHaveBeenCalledWith('ui_action', expect.objectContaining({
+      action_request_id: expect.stringMatching(/^ua_/),
       target_surface: 'workspace_panel',
-      envelope: {
+      envelope: expect.objectContaining({
         id: 'botster.session.select',
         payload: { sessionId: 's-x' },
-      },
-    })
+      }),
+    }))
 
     // Hub-b broadcasts; new tree renders.
     await act(async () => {
@@ -323,13 +327,18 @@ describe('<UiTree>', () => {
     await Promise.resolve()
     await Promise.resolve()
 
-    expect(fakeTransport.sendCommand).toHaveBeenCalledWith('ui_action', {
+    const selectCalls = fakeTransport.sendCommand.mock.calls.filter(
+      ([, body]) => body?.envelope?.id === 'botster.session.select',
+    )
+    expect(selectCalls).toHaveLength(1)
+    expect(selectCalls[0][1]).toEqual(expect.objectContaining({
+      action_request_id: expect.stringMatching(/^ua_/),
       target_surface: 'workspace_panel',
-      envelope: {
+      envelope: expect.objectContaining({
         id: 'botster.session.select',
         payload: { sessionId: 's-1', sessionUuid: 'u-1' },
-      },
-    })
+      }),
+    }))
     expect(legacyDispatch).not.toHaveBeenCalled()
   })
 
@@ -523,13 +532,14 @@ describe('<UiTree> interceptor context', () => {
     })
     await Promise.resolve()
     await Promise.resolve()
-    expect(fakeTransport.sendCommand).toHaveBeenCalledWith('ui_action', {
+    expect(fakeTransport.sendCommand).toHaveBeenCalledWith('ui_action', expect.objectContaining({
+      action_request_id: expect.stringMatching(/^ua_/),
       target_surface: 'workspace_panel',
-      envelope: {
+      envelope: expect.objectContaining({
         id: 'botster.session.select',
         payload: { sessionId: 's-z' },
-      },
-    })
+      }),
+    }))
   })
 })
 

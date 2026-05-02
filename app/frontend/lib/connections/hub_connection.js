@@ -26,6 +26,7 @@
 import { HubRoute } from "connections/hub_route";
 import { HubGateError, HUB_GATE_ERROR_CODES } from "connections/hub_gate_error";
 import { applyEntityFrame, isEntityFrame } from "../../store/entities";
+import { receiveUiActionResult } from "../../ui_contract/action_lifecycle_store";
 
 /**
  * Extract a `{ [surfaceName]: subpath }` prime map from the current
@@ -147,6 +148,11 @@ export class HubTransport extends HubRoute {
     }
 
     switch (message.type) {
+      case "ui_action_result":
+        receiveUiActionResult(message);
+        this.emit("uiActionResult", message);
+        break;
+
       case "spawn_target_feedback":
         // Spawn-target add/remove confirmation toast — kept (not data, just
         // user feedback for an in-flight request).

@@ -562,16 +562,42 @@ end, { description = "Acknowledge selection (client-side only)" })
 -- so browsers emitting `ui_action` do not regress vs `select_agent` etc.
 commands.register("ui_action", function(client, sub_id, command)
     local envelope = command.envelope
+    local action = require("lib.action")
+    local action_request_id = command.action_request_id
+    local function send_action_result(result)
+        if not client or not action_request_id then return end
+        client:send({
+            subscriptionId = sub_id,
+            type = "ui_action_result",
+            v = 1,
+            target_surface = command.target_surface,
+            action_request_id = action_request_id,
+            action_id = (type(envelope) == "table" and envelope.id) or "",
+            ok = result.ok == true,
+            handled = result.handled == true,
+            via = result.via,
+            message = result.message,
+            error = result.error,
+            navigate = result.navigate,
+        })
+    end
     if type(envelope) ~= "table" then
         log.warn("ui_action missing envelope table")
+        send_action_result({
+            ok = false,
+            handled = false,
+            via = "unhandled",
+            error = "Invalid UI action envelope.",
+        })
         return
     end
-    local action = require("lib.action")
-    action.dispatch(envelope, {
+    local result = action.dispatch(envelope, {
         client = client,
         sub_id = sub_id,
         target_surface = command.target_surface,
+        action_request_id = action_request_id,
     })
+    send_action_result(result)
 end, { description = "Dispatch a semantic UI action envelope to hub handlers" })
 
 do

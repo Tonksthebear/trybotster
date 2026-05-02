@@ -4,6 +4,10 @@ import { cleanup, render, screen, fireEvent } from '@testing-library/react'
 import { UiTreeBody, createRawDispatch } from '..'
 import type { UiAction, UiNode, UiViewport } from '../types'
 import {
+  _resetUiActionLifecycleForTests,
+  beginUiActionLifecycle,
+} from '../action_lifecycle_store'
+import {
   applyEntityFrame,
   _resetEntityStoresForTest,
 } from '../../store/entities'
@@ -11,6 +15,7 @@ import {
 afterEach(() => {
   cleanup()
   _resetEntityStoresForTest()
+  _resetUiActionLifecycleForTests()
 })
 
 const REGULAR_FINE: UiViewport = {
@@ -25,6 +30,7 @@ function renderTree(
     viewport?: UiViewport
     onAction?: (action: UiAction) => void
     hubId?: string
+    targetSurface?: string
   } = {},
 ): ReturnType<typeof render> {
   const handler = vi.fn(opts.onAction ?? (() => {}))
@@ -34,6 +40,7 @@ function renderTree(
       dispatch={createRawDispatch(handler)}
       viewport={opts.viewport ?? REGULAR_FINE}
       hubId={opts.hubId}
+      targetSurface={opts.targetSurface}
     />,
   )
 }
@@ -269,6 +276,55 @@ describe('ui_contract registry — action primitives', () => {
     expect(onAction).not.toHaveBeenCalled()
   })
 
+  it('button renders busy and disabled while its action request is pending', () => {
+    beginUiActionLifecycle({
+      actionId: 'workflow.project.create',
+      targetSurface: 'project_pipelines',
+      sourceKey: 'create-button',
+    })
+
+    renderTree(
+      {
+        type: 'button',
+        id: 'create-button',
+        props: {
+          label: 'Create',
+          action: { id: 'workflow.project.create' },
+        },
+      },
+      { targetSurface: 'project_pipelines' },
+    )
+
+    const btn = screen.getByRole('button', { name: 'Create' })
+    expect(btn).toBeDisabled()
+    expect(btn).toHaveAttribute('aria-busy', 'true')
+    expect(btn).toHaveAttribute('data-ui-action-pending', 'true')
+  })
+
+  it('pending button prevents a second submit for the same submitter', () => {
+    const onAction = vi.fn()
+    beginUiActionLifecycle({
+      actionId: 'workflow.project.create',
+      targetSurface: 'project_pipelines',
+      sourceKey: 'create-button',
+    })
+
+    renderTree(
+      {
+        type: 'button',
+        id: 'create-button',
+        props: {
+          label: 'Create',
+          action: { id: 'workflow.project.create' },
+        },
+      },
+      { onAction, targetSurface: 'project_pipelines' },
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }))
+    expect(onAction).not.toHaveBeenCalled()
+  })
+
   it('button action waits for required controls in the nearest form scope', () => {
     const onAction = vi.fn()
     renderTree(
@@ -377,6 +433,31 @@ describe('ui_contract registry — action primitives', () => {
     const btn = screen.getByRole('button', { name: 'Close session' })
     fireEvent.click(btn)
     expect(onAction).toHaveBeenCalledOnce()
+  })
+
+  it('icon_button exposes pending state without changing its accessible label', () => {
+    beginUiActionLifecycle({
+      actionId: 'workflow.search',
+      targetSurface: 'project_pipelines',
+      sourceKey: 'search-button',
+    })
+
+    renderTree(
+      {
+        type: 'icon_button',
+        id: 'search-button',
+        props: {
+          icon: 'search',
+          label: 'Search',
+          action: { id: 'workflow.search' },
+        },
+      },
+      { targetSurface: 'project_pipelines' },
+    )
+
+    const btn = screen.getByRole('button', { name: 'Search' })
+    expect(btn).toBeDisabled()
+    expect(btn).toHaveAttribute('aria-busy', 'true')
   })
 })
 
