@@ -11,40 +11,29 @@ local actions = require("project_pipelines.web.actions")
 
 local M = {}
 
-local function pipeline_step_summary(step)
+local function pipeline_step_summary_template()
     local bits = {
-        view.badge(step.position, "muted"),
-        ui.text{ text = step.name, size = "xs", weight = "medium" },
-        view.badge(step.kind, "muted"),
+        view.badge(ui.bind("@/position"), "muted"),
+        ui.text{ text = ui.bind("@/name"), size = "xs", weight = "medium" },
+        view.badge(ui.bind("@/kind"), "muted"),
     }
-    if step.agent_name then
-        table.insert(bits, view.badge(step.agent_name, "accent"))
-    end
-    if step.command and step.command ~= "" then
-        table.insert(bits, ui.text{ text = step.command, size = "xs", tone = "muted" })
-    end
     return view.row(bits)
 end
 
-local function pipeline_card(pipeline, ctx)
-    local children = {
+local function pipeline_card_template(ctx)
+    return view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
         view.row{
-            ui.text{ text = pipeline.name, size = "sm", weight = "semibold" },
+            ui.text{ text = ui.bind("@/name"), size = "sm", weight = "semibold" },
             ui.button{
                 label = "Edit",
                 icon = "pencil-square",
                 variant = "ghost",
-                action = ui.action("botster.nav.open", {
-                    path = ctx.path("/pipelines/" .. pipeline.id .. "/edit"),
-                }),
+                action = ui.action("botster.nav.open", { path = ui.bind("@/edit_path") }),
             },
         },
-        ui.text{ text = pipeline.description or "", size = "xs", tone = "muted" },
-    }
-    for _, step in ipairs(repo.pipeline_steps(pipeline.id)) do
-        table.insert(children, pipeline_step_summary(step))
-    end
-    return view.panel{ ui.stack{ direction = "vertical", gap = "2", children = children } }
+        ui.text{ text = ui.bind("@/description"), size = "xs", tone = "muted" },
+        ui.text{ text = ui.bind("@/step_count_label"), size = "xs", tone = "muted" },
+    } } }
 end
 
 function M.index(_view_state, ctx)
@@ -60,15 +49,10 @@ function M.index(_view_state, ctx)
         },
     }
 
-    local pipelines = repo.list_pipelines()
-    if #pipelines == 0 then
-        table.insert(children, view.panel{
-            ui.text{ text = "No pipelines yet. Ask an agent to create one with the Project Pipelines MCP tools.", size = "sm", tone = "muted" },
-        })
-    end
-    for _, pipeline in ipairs(pipelines) do
-        table.insert(children, pipeline_card(pipeline, ctx))
-    end
+    table.insert(children, ui.bind_list{
+        source = "/project-pipelines.pipeline",
+        item_template = pipeline_card_template(ctx),
+    })
 
     return ui.stack{ direction = "vertical", gap = "4", children = children }
 end
@@ -132,43 +116,23 @@ local function edit_pipeline_fields(pipeline, state)
     }
 end
 
-local function edit_gate(gate, state)
+local function edit_gate_template(state)
     local children = {
         view.row{
-            view.badge(gate.kind, "muted"),
-            ui.text{ text = gate.id, size = "xs", tone = "muted" },
+            view.badge(ui.bind("@/kind"), "muted"),
+            ui.text{ text = ui.bind("@/id"), size = "xs", tone = "muted" },
         },
         ui.textarea{
-            id = "gate-" .. gate.id .. "-prompt",
+            id = ui.bind("@/id"),
             label = "Gate prompt",
-            placeholder = gate.prompt or "",
+            placeholder = ui.bind("@/prompt"),
             on_change = view.field_action("project_pipelines.update_gate_field", {
-                gate_id = gate.id,
+                gate_id = ui.bind("@/id"),
                 field = "prompt",
             }),
         },
     }
-    local prompt_error = feedback_error(state, gate.id, "prompt")
-    if prompt_error then
-        table.insert(children, ui.text{ text = prompt_error, size = "xs", tone = "danger" })
-    end
-
-    if gate.kind == "command" then
-        table.insert(children, ui.text_input{
-            id = "gate-" .. gate.id .. "-command",
-            label = "Command",
-            placeholder = gate.command or "",
-            on_change = view.field_action("project_pipelines.update_gate_field", {
-                gate_id = gate.id,
-                field = "command",
-            }),
-        })
-        local err = feedback_error(state, gate.id, "command")
-        if err then
-            table.insert(children, ui.text{ text = err, size = "xs", tone = "danger" })
-        end
-    end
-
+    local _state = state
     return view.panel{ ui.stack{ direction = "vertical", gap = "2", children = children } }
 end
 
@@ -239,13 +203,12 @@ local function edit_step(step, steps, state)
         end
     end
 
-    local gates = repo.step_gates(step.id)
-    if #gates > 0 then
-        table.insert(children, ui.text{ text = "Gates", size = "xs", weight = "semibold" })
-        for _, gate in ipairs(gates) do
-            table.insert(children, edit_gate(gate, state))
-        end
-    end
+    table.insert(children, ui.text{ text = "Gates", size = "xs", weight = "semibold" })
+    table.insert(children, ui.bind_list{
+        source = "/project-pipelines.pipeline_gate",
+        where = { step_id = step.id },
+        item_template = edit_gate_template(state),
+    })
 
     return view.panel{ ui.stack{ direction = "vertical", gap = "3", children = children } }
 end

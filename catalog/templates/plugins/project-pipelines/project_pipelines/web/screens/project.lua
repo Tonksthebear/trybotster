@@ -143,41 +143,31 @@ local function dependency_tree_nodes(project_id, ctx)
 end
 
 local function timeline_nodes(project_id, ctx)
-    local nodes = {}
-    for _, ticket in ipairs(sorted_project_tickets(project_id)) do
-        local dependencies = repo.ticket_dependencies(ticket.id)
-        local dependency_count = #dependencies
-        local notifications = view.ticket_notification_count(ticket.id, repo)
-        local header = {
-            ui.text{ text = time_label(ticket.created_at), size = "xs", tone = "muted" },
-            ui.text{ text = ticket.title, size = "sm", weight = "semibold" },
-            ticket_status_badge(ticket),
-            dependency_count > 0 and view.badge(tostring(dependency_count) .. " dependencies", "muted") or view.badge("root", "muted"),
-        }
-        if notifications > 0 then
-            table.insert(header, view.badge(tostring(notifications) .. " notification", "danger"))
-        end
-        table.insert(nodes, view.panel{
+    return {
+        ui.bind_list{
+            source = "/project-pipelines.ticket",
+            where = { project_id = project_id },
+            item_template = view.panel{
             ui.stack{ direction = "vertical", gap = "2", children = {
-                view.row(header),
-                ui.text{ text = ticket.description or "", size = "xs", tone = "muted" },
                 view.row{
-                    latest_run_badge(ticket),
-                    view.badge(view.target_label(ticket.target_id, ticket.target_path), "accent"),
+                    ui.text{ text = ui.bind("@/title"), size = "sm", weight = "semibold" },
+                    view.badge(ui.bind("@/status")),
+                    view.badge(ui.bind("@/latest_run_badge"), ui.bind("@/latest_run_tone")),
+                },
+                ui.text{ text = ui.bind("@/description"), size = "xs", tone = "muted" },
+                view.row{
+                    view.badge(ui.bind("@/target_label"), "accent"),
                     ui.button{
                         label = "Open",
                         icon = "arrow-right",
                         variant = "ghost",
-                        action = ui.action("botster.nav.open", { path = ctx.path("/tickets/" .. ticket.id) }),
+                        action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
                     },
                 },
             } },
-        })
-    end
-    if #nodes == 0 then
-        table.insert(nodes, ui.text{ text = "No tickets in this project yet.", size = "sm", tone = "muted" })
-    end
-    return nodes
+        },
+        },
+    }
 end
 
 function M.render(view_state, ctx)
