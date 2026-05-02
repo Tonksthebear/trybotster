@@ -254,6 +254,20 @@ local function unmet_gates(run, step)
     return unmet
 end
 
+local function has_review_kickback(run, step)
+    local review = repo.latest_review_for_run_step(run.current_run_step_id)
+    if not review then
+        return false
+    end
+    if review.verdict == "changes_required" then
+        return not util.is_blank(step.on_changes_requested_step_id)
+    end
+    if review.verdict == "blocked" then
+        return not util.is_blank(step.on_blocked_step_id or step.on_changes_requested_step_id)
+    end
+    return false
+end
+
 local function context_from_params(params, context)
     local session_uuid = context and context.session_uuid or params.session_uuid
     local run_id = params.run_id
@@ -857,7 +871,8 @@ function M.request_step_advance(params, context)
         return { ok = false, status = run.status, error = "run has no current step" }
     end
     local step = repo.get_step(run.current_step_id)
-    local missing = unmet_gates(run, step)
+    local active_visit_id = run.current_run_step_id
+    local missing = has_review_kickback(run, step) and {} or unmet_gates(run, step)
     if #missing > 0 then
         repo.append_event("step.advance_blocked", {
             run_id = run.id,
@@ -867,7 +882,6 @@ function M.request_step_advance(params, context)
         return { ok = false, status = "blocked", step = step, unmet_gates = missing }
     end
 
-    local active_visit_id = run.current_run_step_id
     local next_step, transition_error = repo.next_step(run, step, active_visit_id)
     if transition_error then
         repo.update_run(run.id, { status = "blocked" })
