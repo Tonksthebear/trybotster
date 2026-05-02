@@ -209,6 +209,10 @@ These frames are the only durable shared state path. The browser applies them
 to frontend entity stores; the TUI applies the same envelopes to Rust entity
 stores. Presentation snapshots, route registries, request responses, and
 transient events must not be treated as alternate model-state channels.
+Lua UI bindings read from these stores with paths like
+`/project-pipelines.ticket`, `/project-pipelines.ticket/ticket_123`, and
+`/project-pipelines.ticket/ticket_123/title`; no separate plugin binding
+namespace exists.
 
 ```json
 {

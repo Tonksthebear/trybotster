@@ -141,6 +141,13 @@ When a run returns to an existing step agent, Project Pipelines sends both a str
 
 The `Pipelines` surface shows tickets, runs, pipeline definitions, selected agent per step, reviews, findings, artifacts, recent events, questions, and plugin-owned sessions. When any question is open, the workspace plugin nav entry for Pipelines shows a notification marker.
 
+The overview's dynamic Projects, Tickets, Recent Runs, and Pipeline Definitions
+sections render from plugin-owned entities through `ui.bind_list`. Keep those
+lists entity-backed; mutators that only change collection data should publish
+entity snapshots or deltas instead of forcing a fresh `ui_tree_snapshot`.
+Detail screens still render presentation snapshots until they are explicitly
+migrated.
+
 Routes:
 
 - `/pipelines` is the overview.

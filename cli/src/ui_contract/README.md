@@ -372,23 +372,30 @@ Path grammar:
 | `/<type>` | array of records, sorted by store insertion order |
 | `@/<field>` | item-relative — only valid inside `ui.bind_list`'s `item_template` |
 
+Plugin-owned entity types use the same first path segment; there is no
+`/plugin/...` prefix. For example, a Project Pipelines ticket title binds as
+`/project-pipelines.ticket/ticket_123/title`, and the ticket collection binds
+as `/project-pipelines.ticket`. Missing stores, ids, and fields resolve to
+`null`; missing list sources resolve to `[]`.
+
 Plus the list expansion helper:
 
 ```lua
 ui.bind_list{
-  source = "/session",
+  source = "/project-pipelines.ticket",
   item_template = ui.tree_item{
-    id = ui.bind("@/session_uuid"),
+    id = ui.bind("@/id"),
     title = { ui.text{ text = ui.bind("@/title") } },
+    subtitle = { ui.text{ text = ui.bind("@/status") } },
   },
 }
 ```
 
 The web resolver (`app/frontend/ui_contract/binding.tsx`) and the TUI
 resolver (`cli/src/tui/ui_contract_adapter/binding.rs`) must agree on
-this grammar; a shared spec snippet under `docs/specs/` ensures they do
-not drift. (Both resolvers land in later commits; this README documents
-the wire shape they consume.)
+this grammar. `bind_list` expands to ordinary sibling nodes when placed inside
+`children` or slot arrays so plugin layouts can use it directly in stable
+presentation trees.
 
 ## Versioning
 

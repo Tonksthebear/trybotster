@@ -17,7 +17,7 @@
 //     enclosing tree. Currently used by plugin layouts whose authors want
 //     finer reactivity than the per-snapshot tree rebuild.
 
-import React, { type ReactNode } from 'react'
+import React, { useMemo, useSyncExternalStore, type ReactNode } from 'react'
 
 import {
   isBindList,
@@ -47,7 +47,16 @@ export function resolveBindings(value: unknown): unknown {
 
 function resolveBindingsInner(value: unknown, item: ItemContext): unknown {
   if (Array.isArray(value)) {
-    return value.map((v) => resolveBindingsInner(v, item))
+    const out: unknown[] = []
+    for (const v of value) {
+      const resolved = resolveBindingsInner(v, item)
+      if (Array.isArray(resolved)) {
+        out.push(...resolved)
+      } else {
+        out.push(resolved)
+      }
+    }
+    return out
   }
   if (value === null || typeof value !== 'object') {
     return value
@@ -250,6 +259,53 @@ export function countBindings(value: unknown): number {
     if (isBindSentinel(v) || isBindList(v)) count += 1
   })
   return count
+}
+
+export function bindingEntityTypes(value: unknown): string[] {
+  const types = new Set<string>()
+  walk(value, (v) => {
+    if (isBindSentinel(v)) {
+      const entityType = entityTypeFromPath(v.$bind)
+      if (entityType) types.add(entityType)
+    } else if (isBindList(v)) {
+      const entityType = entityTypeFromPath(v.source)
+      if (entityType) types.add(entityType)
+    }
+  })
+  return [...types].sort()
+}
+
+export function useBindingInvalidation(value: unknown): void {
+  const entityTypes = useMemo(() => bindingEntityTypes(value), [value])
+  const getSnapshot = () =>
+    entityTypes
+      .map((entityType) => {
+        const state = storeFor(entityType).getState()
+        return `${entityType}:${state.snapshotSeq}:${state.order.length}`
+      })
+      .join('\u0000')
+  useSyncExternalStore(
+    (onStoreChange) => {
+      if (entityTypes.length === 0) return () => {}
+      const unsubscribers = entityTypes.map((entityType) =>
+        storeFor(entityType).subscribe(onStoreChange),
+      )
+      return () => {
+        for (const unsubscribe of unsubscribers) unsubscribe()
+      }
+    },
+    getSnapshot,
+    getSnapshot,
+  )
+}
+
+function entityTypeFromPath(path: string): string | null {
+  if (path.startsWith(ITEM_RELATIVE_PREFIX)) return null
+  const [entityType] = path
+    .replace(/^\//, '')
+    .split('/')
+    .filter((s) => s.length > 0)
+  return entityType ?? null
 }
 
 function walk(value: unknown, visit: (v: unknown) => void): void {

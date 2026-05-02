@@ -16,7 +16,7 @@ import type {
 } from './types'
 import { isConditional } from './types'
 import { matchesCondition, useViewport } from './viewport'
-import { resolveBindings } from './binding'
+import { resolveBindings, useBindingInvalidation } from './binding'
 
 function renderChild(
   child: UiChild,
@@ -138,6 +138,7 @@ export function UiTreeBody({
   transport,
 }: UiTreeBodyProps): ReactElement {
   const liveViewport = useViewport()
+  useBindingInvalidation(node)
   const effectiveViewport = viewport ?? liveViewport
   const ctx: RenderContext = {
     viewport: effectiveViewport,

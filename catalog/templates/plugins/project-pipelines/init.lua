@@ -32,6 +32,7 @@ local surface = require("project_pipelines.web.surface")
 local M = {}
 
 repo.prune_legacy_seed_data()
+engine.register_entities()
 mcp_tools.register()
 surface.register()
 

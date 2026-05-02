@@ -93,11 +93,17 @@ fn resolve_bindings_inner(
         }
         JsonValue::Array(arr) => {
             // After bind_list expansion produces an array, we need to allow
-            // further recursion into each element. For ordinary arrays this
-            // is just a normal walk.
-            for item in arr.iter_mut() {
-                resolve_bindings_inner(item, stores, item_context);
+            // further recursion into each element. Flatten expanded lists so
+            // children/slot arrays receive node siblings, not nested arrays.
+            let mut flattened = Vec::with_capacity(arr.len());
+            for mut item in std::mem::take(arr) {
+                resolve_bindings_inner(&mut item, stores, item_context);
+                match item {
+                    JsonValue::Array(items) => flattened.extend(items),
+                    other => flattened.push(other),
+                }
             }
+            *arr = flattened;
         }
         _ => {}
     }
@@ -313,6 +319,20 @@ mod tests {
         stores
     }
 
+    fn stores_with_plugin_tickets() -> TuiEntityStores {
+        let mut stores = TuiEntityStores::new();
+        let store = stores.store_mut("project-pipelines.ticket");
+        store.apply_snapshot(
+            vec![
+                json!({ "id": "ticket-1", "title": "Add bindings", "status": "active" }),
+                json!({ "id": "ticket-2", "title": "Review bindings", "status": "open" }),
+            ],
+            "id",
+            1,
+        );
+        stores
+    }
+
     // -------------------------------------------------------------------------
     // $bind — scalar / record / list
     // -------------------------------------------------------------------------
@@ -375,6 +395,22 @@ mod tests {
         let mut list = json!({ "$bind": "/missing" });
         resolve_bindings(&mut list, &stores);
         assert_eq!(list, json!([]));
+    }
+
+    #[test]
+    fn bind_resolves_plugin_namespaced_entity_paths() {
+        let stores = stores_with_plugin_tickets();
+        let mut scalar = json!({ "$bind": "/project-pipelines.ticket/ticket-1/title" });
+        resolve_bindings(&mut scalar, &stores);
+        assert_eq!(scalar, json!("Add bindings"));
+
+        let mut record = json!({ "$bind": "/project-pipelines.ticket/ticket-2" });
+        resolve_bindings(&mut record, &stores);
+        assert_eq!(record["status"], json!("open"));
+
+        let mut list = json!({ "$bind": "/project-pipelines.ticket" });
+        resolve_bindings(&mut list, &stores);
+        assert_eq!(list.as_array().expect("array").len(), 2);
     }
 
     // -------------------------------------------------------------------------
@@ -460,6 +496,29 @@ mod tests {
         assert_eq!(arr[0]["slots"]["title"][0]["props"]["text"], json!("alpha"));
         assert_eq!(arr[1]["id"], json!("sess-b"));
         assert_eq!(arr[1]["slots"]["title"][0]["props"]["text"], json!("beta"));
+    }
+
+    #[test]
+    fn bind_list_over_plugin_entities_flattens_inside_children_arrays() {
+        let stores = stores_with_plugin_tickets();
+        let mut value = json!({
+            "type": "stack",
+            "children": [
+                {
+                    "$kind": "bind_list",
+                    "source": "/project-pipelines.ticket",
+                    "item_template": {
+                        "type": "text",
+                        "props": { "text": { "$bind": "@/title" } }
+                    }
+                }
+            ]
+        });
+        resolve_bindings(&mut value, &stores);
+        let children = value["children"].as_array().expect("children");
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0]["props"]["text"], json!("Add bindings"));
+        assert_eq!(children[1]["props"]["text"], json!("Review bindings"));
     }
 
     #[test]

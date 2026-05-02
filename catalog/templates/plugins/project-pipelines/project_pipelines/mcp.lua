@@ -59,6 +59,11 @@ local function ok(value)
     return { ok = true, result = value }
 end
 
+local function sync_ok(value)
+    pcall(engine.publish_entity_snapshots)
+    return ok(value)
+end
+
 local function tool(name, spec, handler)
     mcp.tool(name, spec, function(params, context)
         return handler(params or {}, context or {})
@@ -123,7 +128,7 @@ function M.register()
             required = { "title", "target_id" },
         },
     }, function(params)
-        return ok(repo.create_ticket(params))
+        return sync_ok(repo.create_ticket(params))
     end)
 
     tool("project_pipelines_list_tickets", {
@@ -183,7 +188,7 @@ function M.register()
         for _, field in ipairs({ "title", "description", "project_id", "target_id", "target_path", "status" }) do
             if params[field] ~= nil then fields[field] = params[field] end
         end
-        return ok(repo.update_ticket(params.ticket_id, fields))
+        return sync_ok(repo.update_ticket(params.ticket_id, fields))
     end)
 
     tool("project_pipelines_delete_ticket", {
@@ -196,7 +201,7 @@ function M.register()
             required = { "ticket_id" },
         },
     }, function(params)
-        return ok(repo.delete_ticket(params.ticket_id))
+        return sync_ok(repo.delete_ticket(params.ticket_id))
     end)
 
     tool("project_pipelines_create_project", {
@@ -212,7 +217,7 @@ function M.register()
             required = { "name" },
         },
     }, function(params)
-        return ok(repo.create_project(params))
+        return sync_ok(repo.create_project(params))
     end)
 
     tool("project_pipelines_list_projects", {
@@ -252,7 +257,7 @@ function M.register()
         for _, field in ipairs({ "name", "description", "status" }) do
             if params[field] ~= nil then fields[field] = params[field] end
         end
-        return ok(repo.update_project(params.project_id, fields))
+        return sync_ok(repo.update_project(params.project_id, fields))
     end)
 
     tool("project_pipelines_delete_project", {
@@ -265,7 +270,7 @@ function M.register()
             required = { "project_id" },
         },
     }, function(params)
-        return ok(repo.delete_project(params.project_id))
+        return sync_ok(repo.delete_project(params.project_id))
     end)
 
     tool("project_pipelines_add_project_target", {
@@ -280,7 +285,7 @@ function M.register()
             required = { "project_id", "target_id" },
         },
     }, function(params)
-        return ok(repo.add_project_target(params.project_id, params.target_id, params.target_path))
+        return sync_ok(repo.add_project_target(params.project_id, params.target_id, params.target_path))
     end)
 
     tool("project_pipelines_remove_project_target", {
@@ -293,7 +298,7 @@ function M.register()
             required = { "project_target_id" },
         },
     }, function(params)
-        return ok(repo.remove_project_target(params.project_target_id))
+        return sync_ok(repo.remove_project_target(params.project_target_id))
     end)
 
     tool("project_pipelines_list_pipelines", {
@@ -334,7 +339,7 @@ function M.register()
             required = { "id", "name", "steps" },
         },
     }, function(params)
-        return ok(repo.create_pipeline(params))
+        return sync_ok(repo.create_pipeline(params))
     end)
 
     tool("project_pipelines_update_pipeline", {
@@ -352,7 +357,7 @@ function M.register()
         local fields = {}
         if params.name ~= nil then fields.name = params.name end
         if params.description ~= nil then fields.description = params.description end
-        return ok(repo.update_pipeline(params.pipeline_id, fields))
+        return sync_ok(repo.update_pipeline(params.pipeline_id, fields))
     end)
 
     tool("project_pipelines_delete_pipeline", {
@@ -365,7 +370,7 @@ function M.register()
             required = { "pipeline_id" },
         },
     }, function(params)
-        return ok(repo.delete_pipeline(params.pipeline_id))
+        return sync_ok(repo.delete_pipeline(params.pipeline_id))
     end)
 
     tool("project_pipelines_create_step", {
@@ -390,7 +395,7 @@ function M.register()
             required = { "pipeline_id", "name" },
         },
     }, function(params)
-        return ok(repo.create_step(params))
+        return sync_ok(repo.create_step(params))
     end)
 
     tool("project_pipelines_update_step", {
@@ -417,7 +422,7 @@ function M.register()
         for _, field in ipairs({ "name", "position", "kind", "agent_name", "prompt", "command", "next_step_id", "on_approved_step_id", "on_changes_requested_step_id", "on_blocked_step_id" }) do
             if params[field] ~= nil then fields[field] = params[field] end
         end
-        return ok(repo.update_step(params.step_id, fields))
+        return sync_ok(repo.update_step(params.step_id, fields))
     end)
 
     tool("project_pipelines_delete_step", {
@@ -430,7 +435,7 @@ function M.register()
             required = { "step_id" },
         },
     }, function(params)
-        return ok(repo.delete_step(params.step_id))
+        return sync_ok(repo.delete_step(params.step_id))
     end)
 
     tool("project_pipelines_create_gate", {
@@ -448,7 +453,7 @@ function M.register()
             required = { "step_id", "prompt" },
         },
     }, function(params)
-        return ok(repo.create_gate(params))
+        return sync_ok(repo.create_gate(params))
     end)
 
     tool("project_pipelines_update_gate", {
@@ -469,7 +474,7 @@ function M.register()
         for _, field in ipairs({ "kind", "prompt", "required_fields", "command" }) do
             if params[field] ~= nil then fields[field] = params[field] end
         end
-        return ok(repo.update_gate(params.gate_id, fields))
+        return sync_ok(repo.update_gate(params.gate_id, fields))
     end)
 
     tool("project_pipelines_delete_gate", {
@@ -482,7 +487,7 @@ function M.register()
             required = { "gate_id" },
         },
     }, function(params)
-        return ok(repo.delete_gate(params.gate_id))
+        return sync_ok(repo.delete_gate(params.gate_id))
     end)
 
     tool("project_pipelines_list_agent_choices", {
@@ -508,7 +513,7 @@ function M.register()
             required = { "step_id", "agent_name" },
         },
     }, function(params)
-        return ok(repo.update_step_agent(params.step_id, params.agent_name))
+        return sync_ok(repo.update_step_agent(params.step_id, params.agent_name))
     end)
 
     tool("project_pipelines_start_run", {
@@ -527,7 +532,7 @@ function M.register()
             required = { "ticket_id" },
         },
     }, function(params)
-        return ok(engine.start_run(params))
+        return sync_ok(engine.start_run(params))
     end)
 
     tool("project_pipelines_request_merge", {
@@ -580,7 +585,7 @@ function M.register()
             required = { "ticket_id", "depends_on_ticket_id" },
         },
     }, function(params)
-        return ok(repo.add_ticket_dependency(params.ticket_id, params.depends_on_ticket_id))
+        return sync_ok(repo.add_ticket_dependency(params.ticket_id, params.depends_on_ticket_id))
     end)
 
     tool("project_pipelines_remove_ticket_dependency", {
@@ -593,7 +598,7 @@ function M.register()
             required = { "dependency_id" },
         },
     }, function(params)
-        return ok(repo.remove_ticket_dependency(params.dependency_id))
+        return sync_ok(repo.remove_ticket_dependency(params.dependency_id))
     end)
 
     tool("project_pipelines_list_ticket_dependencies", {
@@ -707,7 +712,7 @@ function M.register()
         },
     }, function(params, context)
         params.created_by_session_uuid = context.session_uuid
-        return ok(repo.submit_gate(params))
+        return sync_ok(repo.submit_gate(params))
     end)
 
     tool("project_pipelines_request_step_advance", {
@@ -721,7 +726,7 @@ function M.register()
             },
         },
     }, function(params, context)
-        return ok(engine.request_step_advance(params, context))
+        return sync_ok(engine.request_step_advance(params, context))
     end)
 
     tool("project_pipelines_submit_review", {
@@ -740,7 +745,7 @@ function M.register()
         },
     }, function(params, context)
         params.reviewer_session_uuid = context.session_uuid
-        return ok(repo.create_review(params))
+        return sync_ok(repo.create_review(params))
     end)
 
     tool("project_pipelines_resolve_finding", {
@@ -755,7 +760,7 @@ function M.register()
             required = { "finding_id", "resolution" },
         },
     }, function(params)
-        return ok(repo.resolve_finding(params.finding_id, params))
+        return sync_ok(repo.resolve_finding(params.finding_id, params))
     end)
 
     tool("project_pipelines_add_artifact", {
@@ -774,7 +779,7 @@ function M.register()
             required = { "run_id" },
         },
     }, function(params)
-        return ok(repo.add_artifact(params))
+        return sync_ok(repo.add_artifact(params))
     end)
 
     tool("project_pipelines_create_child_run", {
@@ -817,7 +822,7 @@ function M.register()
             ticket_id = parent.ticket_id,
             payload = { child_run_id = started.run.id, child_ticket_id = ticket.id },
         })
-        return ok({ ticket = ticket, run = started.run, activation = started.activation })
+        return sync_ok({ ticket = ticket, run = started.run, activation = started.activation })
     end)
 end
 

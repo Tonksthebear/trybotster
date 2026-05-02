@@ -16,6 +16,22 @@ This is the web equivalent of the TUI model:
 
 Botster's operator frontend is a React/Catalyst application hosted by Rails. Rails still owns authentication, persistence, and HTTP endpoints, but live hub surfaces, settings workflows, and plugin-defined UI should use the React runtime and the hub collection/event contract instead of Turbo, Stimulus, or server-rendered HTML fragments.
 
+UI contract work should be classified by the rendered surface. Lua-authored
+primitive trees use the React/Catalyst primitive registry on the web client;
+they are not Hotwire/Elements work and should not add Rails-rendered fragments
+or Stimulus reconciliation paths. Consult `tmp/tailwind_plus_preview` only when
+the change introduces or restyles visible Catalyst primitives; state binding and
+entity-store work should preserve the existing primitive presentation.
+
+Lua-authored trees may contain `$bind` and `bind_list` sentinels. The web
+runtime resolves them from the same Zustand entity stores that consume
+`entity_snapshot`, `entity_upsert`, `entity_patch`, and `entity_remove`.
+Plugin entity types use the existing `<plugin>.<type>` store key directly, so
+`/project-pipelines.ticket` expands a ticket list and
+`/project-pipelines.ticket/ticket_123/title` resolves one scalar field. A
+tree containing bindings subscribes to the referenced entity stores, allowing
+an `entity_patch` to update bound text without another `ui_tree_snapshot`.
+
 ## Problem
 
 The current `agent_list_controller.js` now owns too much application logic:
