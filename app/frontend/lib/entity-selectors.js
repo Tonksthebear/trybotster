@@ -1,3 +1,26 @@
+import { storeFor } from '../store/entities'
+
+export function selectEntityList({ entityType, hubId } = {}) {
+  if (!validEntityType(entityType)) return []
+  return storeFor(entityType)
+    .getState()
+    .list()
+    .map(([, entity]) => entity)
+    .filter((entity) => matchesHub(entity, hubId))
+}
+
+export function selectEntity({ entityType, id, hubId } = {}) {
+  if (!validEntityType(entityType) || typeof id !== 'string' || id === '') return undefined
+  const entity = storeFor(entityType).getState().byId[id]
+  if (!matchesHub(entity, hubId)) return undefined
+  return entity
+}
+
+export function selectEntityField({ entityType, id, field, hubId } = {}) {
+  if (typeof field !== 'string' || field === '') return undefined
+  return selectEntity({ entityType, id, hubId })?.[field]
+}
+
 export function orderedEntities(state) {
   return state.order
     .map((id) => state.byId[id])
@@ -67,4 +90,13 @@ export function activeAgentWorkspaces({
         isActiveAgentInWorkspace(sessionsById[sessionId], workspace.id, sessionFilter),
       )
     })
+}
+
+function validEntityType(entityType) {
+  return typeof entityType === 'string' && entityType !== ''
+}
+
+function matchesHub(entity, hubId) {
+  if (typeof hubId !== 'string' || hubId === '') return true
+  return entity?.hub_id === hubId
 }
