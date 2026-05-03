@@ -12,9 +12,10 @@ reconnect, shutdown, lifecycle, and backpressure handling through
 directly.
 
 Client workers are transport-neutral. They own a per-client stream of session
-subscriptions and outbound terminal/control messages using
-`worker::client::ClientWorkerMessage`. They identify clients with the existing
-`ClientId` type so browser, TUI, socket, and internal clients stay equal.
+subscriptions, liveness state, outbound terminal/control messages, and PTY
+input routing using `worker::client::ClientWorkerMessage`. They identify
+clients with the existing `ClientId` type so browser, TUI, socket, and internal
+clients stay equal.
 
 Transport adapters are the only transport-specific boundary. A WebRTC adapter,
 TUI adapter, socket adapter, or future adapter converts its local framing into
@@ -76,6 +77,36 @@ encoding and delivery details; the client worker owns client-scoped stream
 state; the session I/O worker owns session-scoped PTY interaction; the hub owns
 orchestration state and lifecycle policy.
 
+`worker::client::ClientWorker::start` is the executable core for this boundary.
+It creates a bounded client mailbox, records subscriptions by session UUID,
+emits hub-owned attach/detach/reconnect/shutdown/backpressure requests, routes
+subscribed `SessionInput` frames to attached `SessionIoRequest::PtyInput`
+mailboxes, and forwards subscribed session output/control frames to the
+transport egress queue. Production hub traffic still needs explicit wiring onto
+this actor; the current implementation proves the runtime contract without
+moving WebRTC, TUI, or socket send loops into the worker.
+
+The first client-worker runtime accepts the session I/O sender map at start
+time. Production hub wiring that creates or tears down session I/O workers while
+a client worker stays alive should add explicit attach/detach messages for
+those senders before relying on long-lived client workers for dynamic session
+sets.
+
+Reconnect generation is tracked by the client worker. Frames wrapped with an
+older generation are dropped before delivery, and reconnect health emits a
+typed `HubControlMessage::Reconnect` so hub policy stays centralized. `Ping`
+has an explicit observability response: the worker emits a transport-neutral
+`TransportEgress::Control` pong with the original request ID.
+
+Subscription cleanup remains a hub policy boundary. `ProcessExited` control
+frames are delivered only to subscribed clients; the client worker does not
+auto-unsubscribe after delivery. The hub should send the matching
+`UnsubscribeSession` or detach request when process lifecycle policy says the
+client stream is over. If a client subscribes to the same session UUID with a
+new subscription ID, the worker emits a fresh `AttachClient`; hub routing policy
+must treat that as replacement or the worker should grow an explicit
+old-subscription detach before production traffic depends on this path.
+
 ## Bounded Queues
 
 Each worker contract exposes a `BoundedQueueConfig` constant:
@@ -97,6 +128,13 @@ backpressure carries routing context, including the source, capacity,
 decide policy and mutate orchestration state. Client-worker backpressure keeps
 only the local source and capacity, because that mailbox is already scoped to a
 single client and should not grow a parallel routing identity.
+
+Outbound terminal delivery uses `try_send` into a bounded transport egress
+queue. A full queue drops that hot-path frame and reports
+`HubControlMessage::Backpressure` with the worker's `client_id` and the
+session UUID for session-scoped traffic. Control and close frames are still
+transport-neutral; close uses normal async send during shutdown so the adapter
+has a chance to observe the reason.
 
 ## Session Process Boundary
 
