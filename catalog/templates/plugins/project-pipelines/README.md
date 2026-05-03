@@ -249,7 +249,7 @@ The plugin sidebar is ticket-first. It intentionally does not show active agents
 
 Ticket closure closes every Botster session associated with every run for that ticket without deleting worktrees. Step completion does not close agents; they remain available for inspection and for future prompts if a run returns to their step.
 
-Merge completion should leave a durable merge artifact on the ticket. Merge agents should include `merge_commit`, `pr_url`, or `merge_summary` when calling `project_pipelines_close_ticket` with `merge_confirmed=true`.
+Merge completion should leave a durable merge artifact on the ticket. Merge agents are final acceptance gates, not just Git operators: they must verify the ticket intent, review findings, runtime wiring, docs, tests, and removed/deprecated paths before merging. They should include `merge_commit`, `pr_url`, or `merge_summary` when calling `project_pipelines_close_ticket` with `merge_confirmed=true`.
 
 Tickets can optionally depend on other tickets. A ticket with open dependencies cannot start a pipeline run until each dependency ticket is closed. Project tickets remain visible from the project page; the sidebar ticket list shows standalone tickets only, plus notification badges when their associated sessions need attention.
 
