@@ -1,7 +1,7 @@
 //! Hub-side connection to a per-session process.
 //!
 //! Each `SessionConnection` owns a Unix socket stream to one session process.
-//! After `install_reader()`, a dedicated thread reads all frames from the socket:
+//! After `install_reader()`, a SessionIoWorker reads all frames from the socket:
 //!
 //! - `PtyOutput` → broadcast as `PtyEvent::Output` (no shadow screen)
 //! - Structured events (0x10-0x15) → mapped to `PtyEvent` variants, atomics updated
@@ -16,13 +16,13 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::sync::broadcast;
 
-use crate::agent::notification::AgentNotification;
-use crate::agent::pty::{PromptMark, PtyEvent};
+use crate::agent::pty::PtyEvent;
+use crate::worker::session_io_runtime::{SessionIoWorker, SessionIoWorkerConfig};
 
 use super::protocol::*;
 use super::SpawnConfig;
@@ -41,7 +41,7 @@ pub struct SessionConnection {
     decoder: FrameDecoder,
     /// Post-reader: RPC responses arrive here.
     response_rx: Option<std::sync::mpsc::Receiver<Frame>>,
-    /// Whether the reader thread is alive.
+    /// Whether the session I/O worker is alive.
     reader_alive: Arc<AtomicBool>,
     /// Protocol version negotiated during handshake.
     pub protocol_version: u8,
@@ -88,9 +88,9 @@ impl SessionConnection {
         Ok(())
     }
 
-    /// Install the reader thread.
+    /// Install the session I/O worker.
     ///
-    /// Spawns a background thread that reads all frames from a dup of the
+    /// Spawns a background worker that reads all frames from a dup of the
     /// session socket and routes them:
     ///
     /// - `PtyOutput` → broadcasts `PtyEvent::Output` (no shadow screen parsing)
@@ -117,38 +117,28 @@ impl SessionConnection {
         let (response_tx, response_rx) = std::sync::mpsc::channel::<Frame>();
         self.response_rx = Some(response_rx);
         self.reader_alive.store(true, Ordering::Release);
-        let alive_flag = Arc::clone(&self.reader_alive);
-
-        std::thread::Builder::new()
-            .name(format!(
-                "session-reader-{}",
-                &session_uuid[..session_uuid.len().min(16)]
-            ))
-            .spawn(move || {
-                session_reader(
-                    reader_stream,
-                    session_uuid,
-                    event_tx,
-                    kitty_enabled,
-                    cursor_visible,
-                    resize_pending,
-                    last_output_at,
-                    response_tx,
-                    hub_event_tx,
-                );
-                alive_flag.store(false, Ordering::Release);
-            })
-            .context("spawn session reader thread")?;
+        let _handle = SessionIoWorker::spawn(SessionIoWorkerConfig {
+            stream: reader_stream,
+            session_uuid,
+            event_tx,
+            kitty_enabled,
+            cursor_visible,
+            resize_pending,
+            last_output_at,
+            response_tx,
+            hub_event_tx,
+            reader_alive: Arc::clone(&self.reader_alive),
+        })?;
 
         Ok(())
     }
 
-    /// Whether the reader thread has been installed.
+    /// Whether the session I/O worker has been installed.
     pub fn has_reader(&self) -> bool {
         self.response_rx.is_some()
     }
 
-    /// Whether the reader thread is still running.
+    /// Whether the session I/O worker is still running.
     pub fn is_reader_alive(&self) -> bool {
         self.reader_alive.load(Ordering::Acquire)
     }
@@ -303,232 +293,12 @@ impl SessionConnection {
     }
 }
 
-// ─── Reader thread ───────────────────────────────────────────────────────────
-
-/// Per-session reader thread.
-///
-/// Reads all frames from the session socket and routes them:
-/// - PtyOutput → broadcast as PtyEvent::Output (no shadow screen parsing)
-/// - Structured events (0x10-0x15) → map to PtyEvent variants, update atomics
-/// - ProcessExited → send HubEvent
-/// - Control responses (Snapshot, Screen, ModeFlags, Pong) → route to response_tx
-fn session_reader(
-    stream: UnixStream,
-    session_uuid: String,
-    event_tx: broadcast::Sender<PtyEvent>,
-    kitty_enabled: Arc<AtomicBool>,
-    cursor_visible: Arc<AtomicBool>,
-    resize_pending: Arc<AtomicBool>,
-    last_output_at: Arc<AtomicU64>,
-    response_tx: std::sync::mpsc::Sender<Frame>,
-    hub_event_tx: crate::hub::events::HubEventTx,
-) {
-    let mut decoder = FrameDecoder::new();
-    let mut stream = stream;
-    let _ = stream.set_read_timeout(None); // block indefinitely
-    let mut buf = [0u8; 8192];
-    let mut saw_process_exit = false;
-
-    log::info!(
-        "[session-reader] started for {}",
-        &session_uuid[..session_uuid.len().min(16)]
-    );
-
-    loop {
-        let n = match stream.read(&mut buf) {
-            Ok(0) => {
-                log::info!("[session-reader] session socket EOF");
-                break;
-            }
-            Err(e) => {
-                log::warn!("[session-reader] read error: {e}");
-                break;
-            }
-            Ok(n) => n,
-        };
-
-        let frames = decoder.feed(&buf[..n]);
-
-        // Check for sustained protocol corruption — the decoder saw enough
-        // consecutive bad headers to conclude the stream is irrecoverable.
-        if decoder.is_desynced() {
-            log::warn!("[session-reader] protocol desync detected — treating as connection death");
-            break;
-        }
-
-        for frame in frames {
-            match frame.frame_type {
-                FRAME_PTY_OUTPUT => {
-                    let data = &frame.payload;
-
-                    // Clear resize_pending — the app has redrawn after resize
-                    resize_pending.store(false, Ordering::Release);
-
-                    // Update idle timestamp
-                    last_output_at.store(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64,
-                        Ordering::Relaxed,
-                    );
-
-                    // Emit raw output observation for Lua hooks
-                    let _ = hub_event_tx.send(crate::hub::events::HubEvent::PtyOutputObserved {
-                        session_uuid: session_uuid.clone(),
-                        data: data.to_vec(),
-                    });
-
-                    // Broadcast raw bytes to subscribers (TUI, browser, socket forwarders)
-                    let _ = event_tx.send(PtyEvent::output(data.to_vec()));
-                }
-
-                // ── Structured events from session process (0x10-0x15) ──────
-                FRAME_TITLE_CHANGED => {
-                    let title = String::from_utf8_lossy(&frame.payload).into_owned();
-                    let _ = event_tx.send(PtyEvent::title_changed(title));
-                }
-
-                FRAME_BELL => {
-                    let _ = event_tx.send(PtyEvent::notification(AgentNotification::Bell));
-                }
-
-                FRAME_MODE_CHANGED => {
-                    if let Ok(mode) = frame.json::<ModeChanged>() {
-                        if let Some(kitty) = mode.kitty_enabled {
-                            let old = kitty_enabled.load(Ordering::Relaxed);
-                            if kitty != old {
-                                kitty_enabled.store(kitty, Ordering::Relaxed);
-                                let _ = event_tx.send(PtyEvent::kitty_changed(kitty));
-                            }
-                        }
-                        if let Some(vis) = mode.cursor_visible {
-                            cursor_visible.store(vis, Ordering::Relaxed);
-                            let _ = event_tx.send(PtyEvent::cursor_visibility_changed(vis));
-                        }
-                        if let Some(focus) = mode.focus_reporting {
-                            let _ = event_tx.send(PtyEvent::focus_reporting_changed(focus));
-                        }
-                        // Alt screen transitions are handled by the raw output
-                        // stream — the TUI's parser processes CSI ?1049h/l directly.
-                    }
-                }
-
-                FRAME_CWD_CHANGED => {
-                    let cwd = String::from_utf8_lossy(&frame.payload).into_owned();
-                    let _ = event_tx.send(PtyEvent::cwd_changed(cwd));
-                }
-
-                FRAME_PROMPT_MARK => {
-                    if let Ok(payload) = frame.json::<PromptMarkPayload>() {
-                        let mark = PromptMark::from_name(payload.mark.as_str());
-                        if let Some(m) = mark {
-                            let _ = event_tx.send(PtyEvent::prompt_mark(m));
-                        }
-                    }
-                }
-
-                FRAME_NOTIFICATION => {
-                    if let Ok(payload) = frame.json::<NotificationPayload>() {
-                        let notif = if payload.title.is_empty() {
-                            AgentNotification::Osc9(if payload.body.is_empty() {
-                                None
-                            } else {
-                                Some(payload.body)
-                            })
-                        } else {
-                            AgentNotification::Osc777 {
-                                title: payload.title,
-                                body: payload.body,
-                            }
-                        };
-                        let _ = event_tx.send(PtyEvent::notification(notif));
-                    }
-                }
-
-                // ── Existing control frames ─────────────────────────────────
-                FRAME_PROCESS_EXITED => {
-                    let exit_code = frame
-                        .json::<serde_json::Value>()
-                        .ok()
-                        .and_then(|v| v["exit_code"].as_i64())
-                        .map(|c| c as i32);
-                    saw_process_exit = true;
-                    let _ = hub_event_tx.send(crate::hub::events::HubEvent::SessionProcessExited {
-                        session_uuid: session_uuid.clone(),
-                        exit_code,
-                    });
-                    log::info!("[session-reader] process exited (code={:?})", exit_code);
-                }
-
-                _ => {
-                    // Control response — route to RPC callers
-                    if response_tx.send(frame).is_err() {
-                        log::debug!("[session-reader] response channel closed");
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    // Session socket closed — notify hub
-    if !saw_process_exit {
-        let _ = hub_event_tx.send(crate::hub::events::HubEvent::SessionProcessExited {
-            session_uuid,
-            exit_code: None,
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::net::Shutdown;
-
     use super::*;
-    use tokio::sync::mpsc;
 
     #[test]
     fn shared_session_connection_type_compiles() {
         let _conn: SharedSessionConnection = Arc::new(Mutex::new(None));
-    }
-
-    #[test]
-    fn session_reader_does_not_emit_disconnect_after_process_exited_frame() {
-        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
-        let (event_tx, _event_rx) = broadcast::channel(8);
-        let (response_tx, _response_rx) = std::sync::mpsc::channel::<Frame>();
-        let (hub_tx, mut hub_rx) = mpsc::unbounded_channel();
-        let hub_event_tx = crate::hub::events::HubEventTx::from(hub_tx);
-
-        let handle = std::thread::spawn(move || {
-            session_reader(
-                reader,
-                "sess-test-reader".to_string(),
-                event_tx,
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(AtomicBool::new(true)),
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(AtomicU64::new(0)),
-                response_tx,
-                hub_event_tx,
-            );
-        });
-
-        let frame = encode_json(FRAME_PROCESS_EXITED, &serde_json::json!({ "exit_code": 0 }))
-            .expect("encode exit frame");
-        writer.write_all(&frame).expect("write exit frame");
-        writer.shutdown(Shutdown::Both).expect("shutdown writer");
-
-        handle.join().expect("reader thread joins");
-
-        let mut exits = Vec::new();
-        while let Ok(event) = hub_rx.try_recv() {
-            if let crate::hub::events::HubEvent::SessionProcessExited { exit_code, .. } = event {
-                exits.push(exit_code);
-            }
-        }
-
-        assert_eq!(exits, vec![Some(0)]);
     }
 }

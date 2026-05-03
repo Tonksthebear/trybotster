@@ -80,6 +80,13 @@ pub(crate) enum HubEvent {
         data: Vec<u8>,
     },
 
+    /// Compact session-I/O worker batch.
+    ///
+    /// Worker-origin batches preserve byte order while intentionally allowing
+    /// Lua `pty_output` observers to see coalesced chunks instead of the
+    /// session protocol's original frame boundaries.
+    SessionIoBatch(crate::worker::session_io::SessionIoBatch),
+
     /// WebRTC DataChannel has opened for a browser peer.
     ///
     /// Sent from the `on_data_channel` callback. Triggers `peer_connected`
@@ -418,6 +425,7 @@ impl HubEvent {
             },
             Self::PtyProcessExited { .. } => "pty_process_exited",
             Self::PtyOutputObserved { .. } => "pty_output_observed",
+            Self::SessionIoBatch(_) => "session_io_batch",
             Self::DcOpened { .. } => "dc_opened",
             Self::WebRtcIngressBackpressure { .. } => "webrtc_ingress_backpressure",
             Self::TimerFired { .. } => "timer_fired",
@@ -477,6 +485,12 @@ impl HubEvent {
                 channel_id,
                 message,
             } => BASE + channel_id.len() + message.to_string().len(),
+            Self::PtyOutputObserved { session_uuid, data } => {
+                BASE + session_uuid.len() + data.len()
+            }
+            Self::SessionIoBatch(batch) => {
+                BASE + batch.session_uuid.len() + batch.output.as_ref().map_or(0, Vec::len)
+            }
             Self::UserFileWatch { watch_id, events } => BASE + watch_id.len() + (events.len() * 48),
             Self::PushSubscriptionsExpired { identities } => {
                 BASE + identities
