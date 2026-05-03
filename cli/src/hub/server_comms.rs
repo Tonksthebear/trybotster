@@ -3278,14 +3278,86 @@ impl Hub {
             browser_identity,
         );
 
-        let client_message = self.webrtc.ingress_to_client(
-            browser_identity,
-            crate::worker::transport::TransportIngress::Json(msg),
-        );
+        let msg_type = msg.get("type").and_then(|t| t.as_str()).map(str::to_string);
+        let ingress = match msg_type.as_deref() {
+            Some("dc_ping") => crate::worker::transport::TransportIngress::DcPing,
+            Some("dc_pong") => crate::worker::transport::TransportIngress::DcPong,
+            Some("focus_changed") => {
+                let session_uuid = msg
+                    .get("session_uuid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let focused = msg
+                    .get("focused")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                crate::worker::transport::TransportIngress::FocusChanged {
+                    session_uuid,
+                    focused,
+                }
+            }
+            _ => crate::worker::transport::TransportIngress::BoundaryJson(msg),
+        };
+        let client_message = self.webrtc.ingress_to_client(browser_identity, ingress);
         let msg = match client_message {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
-                crate::worker::client::ClientControlFrame::Json(value),
+                crate::worker::client::ClientControlFrame::BoundaryJson(value),
             ) => value,
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::DcPong,
+            ) => {
+                let started = Instant::now();
+                let pong = serde_json::to_vec(&crate::worker::transport::egress_dc_pong())
+                    .expect("static JSON serialization cannot fail");
+                self.queue_webrtc_peer_command(
+                    browser_identity,
+                    crate::worker::webrtc::WebRtcAdapterCommand::Json { data: pong },
+                );
+                self.record_hot_span(
+                    "webrtc_message.dc_ping",
+                    started,
+                    payload.len(),
+                    browser_identity,
+                );
+                return;
+            }
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::DcPongReceived,
+            ) => {
+                let started = Instant::now();
+                log::trace!(
+                    "[WebRTC] dc_pong from {}",
+                    &browser_identity[..browser_identity.len().min(8)]
+                );
+                self.record_hot_span(
+                    "webrtc_message.dc_pong",
+                    started,
+                    payload.len(),
+                    browser_identity,
+                );
+                return;
+            }
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::FocusChanged {
+                    session_uuid,
+                    focused,
+                },
+            ) => {
+                let started = Instant::now();
+                if !session_uuid.is_empty() {
+                    self.set_active_terminal_peer(&session_uuid, browser_identity, focused);
+                    self.lua
+                        .set_pty_focused(&session_uuid, browser_identity, focused);
+                }
+                self.record_hot_span(
+                    "webrtc_message.focus_changed",
+                    started,
+                    payload.len(),
+                    browser_identity,
+                );
+                return;
+            }
             other => {
                 log::debug!(
                     "[WebRTC-MSG] Adapter converted inbound message for {} into non-JSON client message: {:?}",
@@ -3298,41 +3370,6 @@ impl Hub {
 
         if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
             match msg_type {
-                "dc_ping" => {
-                    let started = Instant::now();
-                    // Browser sent a heartbeat ping — respond immediately so it
-                    // doesn't declare the connection stalled after 3 missed pongs.
-                    let pong = serde_json::to_vec(&serde_json::json!({ "type": "dc_pong" }))
-                        .expect("static JSON serialization cannot fail");
-                    self.queue_webrtc_peer_command(
-                        browser_identity,
-                        crate::worker::webrtc::WebRtcAdapterCommand::Json { data: pong },
-                    );
-                    self.record_hot_span(
-                        "webrtc_message.dc_ping",
-                        started,
-                        payload.len(),
-                        browser_identity,
-                    );
-                    return;
-                }
-                "dc_pong" => {
-                    let started = Instant::now();
-                    // Browser responded to our dc_ping — connection is alive.
-                    // Informational logging only; the browser side uses missed
-                    // pongs to detect dead connections and trigger reconnect.
-                    log::trace!(
-                        "[WebRTC] dc_pong from {}",
-                        &browser_identity[..browser_identity.len().min(8)]
-                    );
-                    self.record_hot_span(
-                        "webrtc_message.dc_pong",
-                        started,
-                        payload.len(),
-                        browser_identity,
-                    );
-                    return;
-                }
                 "terminal_color_profile" => {
                     let started = Instant::now();
                     self.handle_terminal_color_profile_message(browser_identity, &msg);
@@ -3878,7 +3915,19 @@ impl Hub {
         session_uuid: &str,
         state: &str,
     ) {
-        let payload = Self::terminal_attach_state_payload(subscription_id, session_uuid, state);
+        let Ok(attach_state) = crate::worker::client::TerminalAttachState::try_from(state) else {
+            log::warn!(
+                "[WebRTC] Refusing unknown terminal_attach state '{}' for {}",
+                state,
+                session_uuid
+            );
+            return;
+        };
+        let payload = crate::worker::transport::egress_terminal_attach(
+            subscription_id.to_string(),
+            session_uuid.to_string(),
+            attach_state,
+        );
         match serde_json::to_vec(&payload) {
             Ok(data) => self.queue_webrtc_peer_command(
                 peer_id,
@@ -3894,32 +3943,30 @@ impl Hub {
         }
     }
 
-    fn terminal_attach_state_payload(
-        subscription_id: &str,
-        session_uuid: &str,
-        state: &str,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "type": "terminal_attach",
-            "subscriptionId": subscription_id,
-            "session_uuid": session_uuid,
-            "state": state,
-        })
-    }
-
     fn send_worker_terminal_attach_state(
         worker: &crate::worker::client::ClientWorkerHandle,
         subscription_id: &str,
         session_uuid: &str,
         state: &str,
     ) {
-        let payload = Self::terminal_attach_state_payload(subscription_id, session_uuid, state);
+        let Ok(state) = crate::worker::client::TerminalAttachState::try_from(state) else {
+            log::warn!(
+                "[ClientWorker] Refusing unknown terminal_attach state '{}' for {}",
+                state,
+                session_uuid
+            );
+            return;
+        };
         if let Err(e) = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
-            crate::worker::client::ClientControlFrame::Json(payload),
+            crate::worker::client::ClientControlFrame::TerminalAttach {
+                subscription_id: subscription_id.to_string(),
+                session_uuid: session_uuid.to_string(),
+                state,
+            },
         )) {
             log::warn!(
                 "[ClientWorker] Failed to queue terminal_attach state '{}' for {}: {}",
-                state,
+                state.as_str(),
                 session_uuid,
                 e
             );
@@ -4755,7 +4802,9 @@ impl Hub {
         );
         let task = tokio::spawn(async move {
             use crate::agent::pty::PtyEvent;
-            use crate::worker::client::{ClientControlFrame, ClientWorkerMessage};
+            use crate::worker::client::{
+                ClientControlFrame, ClientWorkerMessage, TerminalAttachState,
+            };
 
             log::info!(
                 "[Lua-TUI] Started PTY forwarder for session {}",
@@ -4843,14 +4892,13 @@ impl Hub {
                         &session_uuid[..session_uuid.len().min(16)]
                     );
                     let _ = worker
-                        .send(ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(
-                            serde_json::json!({
-                                "type": "terminal_attach",
-                                "subscriptionId": subscription_id,
-                                "session_uuid": session_uuid,
-                                "state": "reconnecting",
-                            }),
-                        )))
+                        .send(ClientWorkerMessage::ControlFrame(
+                            ClientControlFrame::TerminalAttach {
+                                subscription_id: subscription_id.clone(),
+                                session_uuid: session_uuid.clone(),
+                                state: TerminalAttachState::Reconnecting,
+                            },
+                        ))
                         .await;
                 }
             }
@@ -4956,22 +5004,20 @@ impl Hub {
                                 PtyEvent::KittyChanged(enabled) => {
                                     let _ = worker
                                         .send(ClientWorkerMessage::ControlFrame(
-                                            ClientControlFrame::Json(serde_json::json!({
-                                                "type": "kitty_changed",
-                                                "enabled": enabled,
-                                                "session_uuid": session_uuid,
-                                            })),
+                                            ClientControlFrame::KittyChanged {
+                                                session_uuid: session_uuid.clone(),
+                                                enabled,
+                                            },
                                         ))
                                         .await;
                                 }
                                 PtyEvent::FocusReportingChanged(enabled) => {
                                     let _ = worker
                                         .send(ClientWorkerMessage::ControlFrame(
-                                            ClientControlFrame::Json(serde_json::json!({
-                                                "type": "focus_reporting_changed",
-                                                "enabled": enabled,
-                                                "session_uuid": session_uuid,
-                                            })),
+                                            ClientControlFrame::FocusReportingChanged {
+                                                session_uuid: session_uuid.clone(),
+                                                enabled,
+                                            },
                                         ))
                                         .await;
                                 }
@@ -5001,24 +5047,22 @@ impl Hub {
                     }
                     Ok(PtyEvent::KittyChanged(enabled)) => {
                         let _ = worker
-                            .send(ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(
-                                serde_json::json!({
-                                    "type": "kitty_changed",
-                                    "enabled": enabled,
-                                    "session_uuid": session_uuid,
-                                }),
-                            )))
+                            .send(ClientWorkerMessage::ControlFrame(
+                                ClientControlFrame::KittyChanged {
+                                    session_uuid: session_uuid.clone(),
+                                    enabled,
+                                },
+                            ))
                             .await;
                     }
                     Ok(PtyEvent::FocusReportingChanged(enabled)) => {
                         let _ = worker
-                            .send(ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(
-                                serde_json::json!({
-                                    "type": "focus_reporting_changed",
-                                    "enabled": enabled,
-                                    "session_uuid": session_uuid,
-                                }),
-                            )))
+                            .send(ClientWorkerMessage::ControlFrame(
+                                ClientControlFrame::FocusReportingChanged {
+                                    session_uuid: session_uuid.clone(),
+                                    enabled,
+                                },
+                            ))
                             .await;
                     }
                     Ok(_) => {}
@@ -5151,7 +5195,9 @@ impl Hub {
         );
         let task = tokio::spawn(async move {
             use crate::agent::pty::PtyEvent;
-            use crate::worker::client::{ClientControlFrame, ClientWorkerMessage};
+            use crate::worker::client::{
+                ClientControlFrame, ClientWorkerMessage, TerminalAttachState,
+            };
 
             log::info!(
                 "[Lua-Socket] Started PTY forwarder for {} session {}",
@@ -5244,14 +5290,13 @@ impl Hub {
                         &session_uuid[..session_uuid.len().min(16)]
                     );
                     let _ = worker
-                        .send(ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(
-                            serde_json::json!({
-                                "type": "terminal_attach",
-                                "subscriptionId": subscription_id,
-                                "session_uuid": session_uuid,
-                                "state": "reconnecting",
-                            }),
-                        )))
+                        .send(ClientWorkerMessage::ControlFrame(
+                            ClientControlFrame::TerminalAttach {
+                                subscription_id: subscription_id.clone(),
+                                session_uuid: session_uuid.clone(),
+                                state: TerminalAttachState::Reconnecting,
+                            },
+                        ))
                         .await;
                 }
             }
@@ -5338,24 +5383,22 @@ impl Hub {
                     }
                     Ok(PtyEvent::KittyChanged(enabled)) => {
                         let _ = worker
-                            .send(ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(
-                                serde_json::json!({
-                                    "type": "kitty_changed",
-                                    "enabled": enabled,
-                                    "session_uuid": session_uuid,
-                                }),
-                            )))
+                            .send(ClientWorkerMessage::ControlFrame(
+                                ClientControlFrame::KittyChanged {
+                                    session_uuid: session_uuid.clone(),
+                                    enabled,
+                                },
+                            ))
                             .await;
                     }
                     Ok(PtyEvent::FocusReportingChanged(enabled)) => {
                         let _ = worker
-                            .send(ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(
-                                serde_json::json!({
-                                    "type": "focus_reporting_changed",
-                                    "enabled": enabled,
-                                    "session_uuid": session_uuid,
-                                }),
-                            )))
+                            .send(ClientWorkerMessage::ControlFrame(
+                                ClientControlFrame::FocusReportingChanged {
+                                    session_uuid: session_uuid.clone(),
+                                    enabled,
+                                },
+                            ))
                             .await;
                     }
                     Ok(_) => {}
@@ -7400,6 +7443,29 @@ mod tests {
             .expect("active peers mutex")
             .get(session_uuid)
             .is_none());
+    }
+
+    #[test]
+    fn test_webrtc_focus_message_updates_active_terminal_peer() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-webrtc-focus";
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "type": "focus_changed",
+            "session_uuid": session_uuid,
+            "focused": true,
+        }))
+        .expect("focus payload");
+
+        hub.handle_webrtc_message("browser-a", &payload);
+
+        assert_eq!(
+            hub.active_terminal_peers
+                .lock()
+                .expect("active peers mutex")
+                .get(session_uuid)
+                .cloned(),
+            Some("browser-a".to_string())
+        );
     }
 
     #[test]
