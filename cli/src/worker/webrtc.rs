@@ -1212,6 +1212,7 @@ mod tests {
         let mut registry = WebRtcPeerRegistry::new();
         let browser_identity = "olm-key:tab-1";
         let first = registry.next_offer_generation(browser_identity);
+        assert_eq!(first, 1);
         let first_candidate = serde_json::json!({
             "candidate": "candidate:first",
             "sdpMid": "0",
@@ -1239,6 +1240,82 @@ mod tests {
         assert_eq!(queued[0].0, first);
         assert_eq!(queued[1].0, second);
         assert_eq!(registry.current_offer_generation(browser_identity), second);
+    }
+
+    #[test]
+    fn registry_recovery_and_generation_state_stay_bounded_under_reconnect_churn() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let first = registry.next_offer_generation(browser_identity);
+        assert_eq!(first, 1);
+        assert_eq!(
+            registry.queue_ice_for_current_generation(
+                browser_identity,
+                serde_json::json!({ "candidate": "candidate:first" }),
+                1,
+            ),
+            Some(1)
+        );
+        let second = registry.next_offer_generation(browser_identity);
+        assert_eq!(
+            registry.queue_ice_for_current_generation(
+                browser_identity,
+                serde_json::json!({ "candidate": "candidate:second" }),
+                1,
+            ),
+            Some(1)
+        );
+
+        let queued = registry
+            .drain_pending_ice(browser_identity)
+            .expect("queued candidates");
+        assert_eq!(
+            queued,
+            vec![(
+                second,
+                serde_json::json!({ "candidate": "candidate:second" })
+            )]
+        );
+
+        let key = format!("{browser_identity}:sess-1");
+        registry.record_backpressure_recovery(
+            key.clone(),
+            BackpressureRecoveryEntry {
+                browser_identity: browser_identity.to_string(),
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-1".to_string(),
+                last_drop: Instant::now() - BACKPRESSURE_SNAPSHOT_COOLDOWN,
+            },
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let task = runtime.spawn(async {});
+        registry.send_tasks.insert(
+            browser_identity.to_string(),
+            PeerSendState {
+                tx,
+                dead: Arc::new(AtomicBool::new(false)),
+                task,
+            },
+        );
+
+        assert_eq!(
+            registry
+                .cooled_backpressure_recoveries(Instant::now())
+                .len(),
+            1
+        );
+        assert!(registry
+            .take_recovery_sender(&key, browser_identity)
+            .is_some());
+        assert!(registry
+            .cooled_backpressure_recoveries(Instant::now())
+            .is_empty());
+
+        registry.clear_offer_state(browser_identity);
+        assert_eq!(registry.current_offer_generation(browser_identity), 0);
+        assert!(registry.drain_pending_ice(browser_identity).is_none());
     }
 
     #[test]

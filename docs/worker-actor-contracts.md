@@ -172,6 +172,15 @@ replacement waits, and coalesced send-to-unknown-peer noise. Use the repository
 test wrapper, for example `cd cli && ./test.sh --unit worker`, rather than raw
 `cargo test`.
 
+Load and recovery verification for the workerized data plane should use
+deterministic reproductions of observed daemon log shapes instead of live
+`/tmp` log dependencies. Current coverage includes 1001-frame noisy PTY replay
+with OSC title/cursor traffic, repeated session-reader EOF behavior,
+generation-scoped WebRTC reconnect churn, cooled backpressure recovery sender
+selection, and browser/TUI/socket parity through the same `ClientWorker` path.
+These tests assert preserved byte order, bounded hub batch volume, stale
+generation drops, and typed recovery state cleanup at the worker boundary.
+
 The first client-worker runtime accepts the session I/O sender map at start
 time. Production hub wiring that creates or tears down session I/O workers while
 a client worker stays alive should add explicit attach/detach messages for
