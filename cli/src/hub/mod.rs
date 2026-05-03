@@ -590,8 +590,8 @@ pub struct Hub {
     file_input_rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::FileInputIncoming>>,
     /// Sender for file transfers (cloned into each WebRtcChannel).
     pub file_input_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::FileInputIncoming>,
-    /// Temp files from browser paste/drop, keyed by agent session key.
-    /// Cleaned up when the agent is closed.
+    /// Temp files from browser paste/drop, keyed by session UUID.
+    /// Cleaned up when the session is closed or the hub exits.
     paste_files: std::collections::HashMap<String, Vec<std::path::PathBuf>>,
 
     // === Handle Cache ===
