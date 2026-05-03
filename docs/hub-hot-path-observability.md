@@ -2,8 +2,8 @@
 
 The Rust hub records compact diagnostics for event-loop paths that can make a
 client look connected but stale: socket messages, WebRTC messages, PTY output,
-OSC/timer volume, terminal snapshots, manifest writes, socket repair, cleanup,
-and reconnect handling.
+session-I/O worker batches, OSC/timer volume, terminal snapshots, manifest
+writes, socket repair, cleanup, and reconnect handling.
 
 These diagnostics are intentionally local to the daemon. They use existing
 structured log lines and in-process `HubEventMetrics`; there is no external
@@ -57,6 +57,11 @@ The most useful span names are:
 Hot socket/WebRTC subhandlers and cleanup scans are slow at 50ms. Snapshot RPC
 and gzip/queue spans are slow at 100ms. Manifest writes are slow at 10ms.
 
+Session-process PTY output now reaches the hub as
+`HubEvent::SessionIoBatch`. The worker coalesces durable-session output before
+delivery to reduce hub event volume; WebRTC and other legacy PTY output queues
+still use the existing drain-batch span.
+
 ## Counters
 
 Counters are cumulative within the daemon process. High-water counters keep the
@@ -94,6 +99,12 @@ largest observed value instead of summing every sample.
 | `socket_path.repair` | missing hub socket path repair attempt |
 | `socket_path.repair_error` | socket path repair failed |
 | `manifest.write_error` | manifest refresh failed at a hub-owned call site |
+
+For session-process output, one `pty_output.messages` increment represents one
+coalesced `SessionIoBatch`, not necessarily one session protocol
+`FRAME_PTY_OUTPUT`. `pty_output.bytes` remains the total byte count processed.
+Lua `pty_output` observers receive those coalesced chunks for session-process
+output; byte order is preserved.
 
 ## Guardrail Logs
 
@@ -153,8 +164,10 @@ cd cli
 ```
 
 The original instrumentation slice was verified with `1437 passed; 0 failed; 1
-ignored`. Direct tests cover `HubEventMetrics` counters/spans/slow sample
-bounding, unknown-peer burst rate limiting and peer-prefix caps, and PTY output
-batch metrics. Snapshot counter paths and manifest write-storm rate limiting
-are not directly unit-tested yet; use manual log verification or add focused
-tests when changing those paths.
+ignored`. The session-I/O worker slice was verified with `1456 passed; 0
+failed; 1 ignored`. Direct tests cover `HubEventMetrics` counters/spans/slow
+sample bounding, unknown-peer burst rate limiting and peer-prefix caps, PTY
+output batch metrics, and session-I/O worker output coalescing. Snapshot
+counter paths and manifest write-storm rate limiting are not directly
+unit-tested yet; use manual log verification or add focused tests when changing
+those paths.

@@ -8,6 +8,7 @@
 pub mod client;
 pub mod hub_control;
 pub mod session_io;
+pub(crate) mod session_io_runtime;
 pub mod transport;
 
 /// Stable identifier for a Botster session.
