@@ -671,6 +671,9 @@ pub struct Hub {
     socket_server: Option<crate::socket::server::SocketServer>,
     /// Connected socket clients, keyed by client_id.
     socket_clients: std::collections::HashMap<String, crate::socket::client_conn::SocketClientConn>,
+    /// Workerized terminal clients, keyed by terminal forwarder id.
+    terminal_client_workers:
+        std::collections::HashMap<String, crate::worker::client::ClientWorkerHandle>,
 
     // === TUI via Lua (Hub-side Processing) ===
     /// Sender for TUI output messages to TuiRunner.
@@ -858,6 +861,7 @@ impl Hub {
             singleton_lock: None,
             socket_server: None,
             socket_clients: std::collections::HashMap::new(),
+            terminal_client_workers: std::collections::HashMap::new(),
             tui_output_tx: None,
             tui_wake_fd: None,
             tui_request_rx: None,

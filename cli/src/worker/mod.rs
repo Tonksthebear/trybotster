@@ -173,6 +173,9 @@ mod tests {
                 TransportIngress::Json(value) => {
                     ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(value))
                 }
+                TransportIngress::Binary(data) => {
+                    ClientWorkerMessage::ControlFrame(ClientControlFrame::Binary(data))
+                }
             }
         }
 
@@ -181,6 +184,7 @@ mod tests {
                 ClientWorkerMessage::TerminalBytes { data, .. } => {
                     Some(TransportEgress::TerminalBytes {
                         subscription_id: "echo".to_string(),
+                        session_uuid: "sess-1".to_string(),
                         data,
                     })
                 }
