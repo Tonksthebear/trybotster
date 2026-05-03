@@ -2,7 +2,8 @@
 
 Botster's workerized runtime boundary starts with typed Rust contracts. Some
 contracts are scaffolding for later slices; the session I/O worker is now the
-production read path for durable session-process PTY output.
+production read path for durable session-process PTY output, and WebRTC peer
+state now lives behind the client transport adapter boundary.
 
 ## Ownership
 
@@ -103,9 +104,69 @@ It creates a bounded client mailbox, records subscriptions by session UUID,
 emits hub-owned attach/detach/reconnect/shutdown/backpressure requests, routes
 subscribed `SessionInput` frames to attached `SessionIoRequest::PtyInput`
 mailboxes, and forwards subscribed session output/control frames to the
-transport egress queue. Production hub traffic still needs explicit wiring onto
-this actor; the current implementation proves the runtime contract without
-moving WebRTC, TUI, or socket send loops into the worker.
+transport egress queue. TUI and socket traffic still need explicit production
+wiring onto this actor. WebRTC production traffic now enters the transport
+adapter boundary through `worker::webrtc::WebRtcPeerRegistry` and
+`WebRtcTransportRunner`; the adapter converts decoded ingress into
+`ClientWorkerMessage` before hub policy handles the legacy Lua routing surface.
+
+## WebRTC Transport Adapter
+
+`WebRtcPeerRegistry` is the only holder of per-browser `WebRtcChannel`
+instances. The Hub owns one registry handle and keeps auth, pairing,
+capability, Rails relay coordination, Lua callbacks, terminal attach policy,
+and summarized cleanup policy. WebRTC peer connection state, offer generation,
+pending ICE queues, per-peer bounded send queues, DataChannel liveness pings,
+unknown-peer burst coalescing, backpressure recovery tracking, and peer cleanup
+bookkeeping stay inside the registry.
+
+The Hub must not recover the old escape hatch by reaching into a channel map or
+`WebRtcSender` directly. New WebRTC work should add a typed registry method or
+a typed adapter command instead. The expected production path is:
+
+```text
+browser DataChannel
+  -> WebRtcChannel decrypt/decode
+  -> WebRtcPeerRegistry
+  -> WebRtcTransportRunner
+  -> WebRtcTransportAdapter
+  -> ClientWorkerMessage
+  -> Hub-owned policy / Lua routing
+```
+
+Outbound WebRTC delivery follows the reverse ownership boundary. Hub policy
+produces transport-neutral work or WebRTC adapter commands, then queues them
+through `WebRtcPeerRegistry::queue_command` or the narrower PTY helpers. The
+registry owns the bounded per-peer command channel and the async send task that
+serializes PTY, JSON, stream, binary, and bundle-refresh frames onto the
+DataChannel. Binary adapter commands must use the raw DataChannel send helper;
+JSON helpers are only for JSON frames.
+
+WebRTC transport summaries cross back to the Hub through typed
+`HubControlMessage` variants:
+
+- `TransportPeerStateChanged`
+- `TransportSignalReady`
+- `TransportBackpressure`
+- `TransportRatchetRestartRequested`
+
+`TransportSignal` envelopes intentionally carry `serde_json::Value` only at
+the Rails relay boundary because those values are already serialized Olm
+envelopes. Do not let that exception spread to new adapter control surfaces.
+
+Crypto ownership is split by lifecycle phase. DataChannel encrypt/decrypt
+failure tracking and ratchet-delivery transport are adapter/registry concerns.
+The Hub still generates fresh ratchet bundles and, for now, performs
+handshake-time SDP answer encryption before emitting `TransportSignalReady`;
+that is a known follow-up boundary, not permission to move hot-path
+DataChannel crypto back into Hub code.
+
+Regression coverage for this boundary should stay focused on the failure modes
+that motivated the migration: a DataChannel closing after `Connected`, stale
+offer completions during reconnect bursts, generation-scoped pending ICE, close
+replacement waits, and coalesced send-to-unknown-peer noise. Use the repository
+test wrapper, for example `cd cli && ./test.sh --unit worker`, rather than raw
+`cargo test`.
 
 The first client-worker runtime accepts the session I/O sender map at start
 time. Production hub wiring that creates or tears down session I/O workers while
