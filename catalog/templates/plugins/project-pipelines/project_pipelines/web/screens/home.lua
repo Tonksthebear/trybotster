@@ -67,10 +67,12 @@ end
 
 function M.render(_view_state, ctx)
     return ui.stack{ direction = "vertical", gap = "4", children = {
-        view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
-            view.row{
-                ui.text{ text = "Project Pipelines", size = "lg", weight = "semibold" },
+        view.page_header{
+            title = "Project Pipelines",
+            description = "Pipeline state, gate prompts, reviews, findings, artifacts, and plugin-owned sessions are persisted here.",
+            actions = {
                 ui.button{
+                    id = "pipelines-home-new-ticket",
                     label = "New ticket",
                     icon = "plus",
                     variant = "solid",
@@ -78,6 +80,7 @@ function M.render(_view_state, ctx)
                     action = ui.action("botster.nav.open", { path = ctx.path("/new-ticket") }),
                 },
                 ui.button{
+                    id = "pipelines-home-new-project",
                     label = "New project",
                     icon = "folder-plus",
                     variant = "solid",
@@ -85,6 +88,7 @@ function M.render(_view_state, ctx)
                     action = ui.action("botster.nav.open", { path = ctx.path("/new-project") }),
                 },
                 ui.button{
+                    id = "pipelines-home-index",
                     label = "Pipeline index",
                     icon = "queue-list",
                     variant = "solid",
@@ -92,12 +96,7 @@ function M.render(_view_state, ctx)
                     action = ui.action("botster.nav.open", { path = ctx.path("/pipelines") }),
                 },
             },
-            ui.text{
-                text = "Pipeline state, gate prompts, reviews, findings, artifacts, and plugin-owned sessions are persisted here.",
-                size = "sm",
-                tone = "muted",
-            },
-        } } },
+        },
         view.panel{ view.section("Projects", {
             ui.tree{ children = {
                 ui.bind_list{ source = "/project-pipelines.project", item_template = project_template() },

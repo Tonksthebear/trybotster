@@ -85,6 +85,10 @@ Both the browser and TUI are equal consumers of this entity-frame stream. They
 may store it in different local structures, but the entity envelopes are the
 only shared durable model-state path.
 
+Plugin entity types occupy the binding path's first segment directly. A Project
+Pipelines ticket collection binds as `/project-pipelines.ticket`; one title
+field binds as `/project-pipelines.ticket/ticket_123/title`.
+
 Presentation and control state is separate:
 
 - selection
@@ -547,6 +551,12 @@ That reduces payload size and keeps selectors shared.
 surface. It is not a competing durable state stream. If a row needs live session
 or workspace data, reference the entity store by id or binding path and let both
 clients resolve it from the same `entity_*` frames.
+
+For plugin UI, this is mandatory rather than an optimization: publish durable
+records through `entity_snapshot`, `entity_upsert`, `entity_patch`, and
+`entity_remove`, then bind UI nodes to those records. Do not introduce
+client-local model stores or presentation snapshots as alternate durable data
+paths.
 
 ### 2. Share action ids across clients
 

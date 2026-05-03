@@ -5,6 +5,7 @@ import {
   _resetUiActionLifecycleForTests,
   beginUiActionLifecycle,
   getUiActionLifecycleSnapshot,
+  receiveUiActionResult,
 } from '../ui_contract/action_lifecycle_store'
 
 function transport() {
@@ -56,5 +57,52 @@ describe('HubTransport ui_action_result frames', () => {
     })
     expect(specific).toHaveBeenCalledOnce()
     expect(generic).not.toHaveBeenCalled()
+  })
+
+  it('clears pending only for the matching repeated-row source key', () => {
+    const firstRequestId = beginUiActionLifecycle({
+      actionId: 'project_pipelines.answer_question',
+      targetSurface: 'project_pipelines',
+      sourceKey: 'question-1-answer',
+    })
+    const secondRequestId = beginUiActionLifecycle({
+      actionId: 'project_pipelines.answer_question',
+      targetSurface: 'project_pipelines',
+      sourceKey: 'question-2-answer',
+    })
+
+    receiveUiActionResult({
+      type: 'ui_action_result',
+      v: 1,
+      action_request_id: firstRequestId,
+      action_id: 'project_pipelines.answer_question',
+      target_surface: 'project_pipelines',
+      ok: true,
+      handled: true,
+      via: 'handler',
+      message: 'Answered',
+    })
+
+    expect(getUiActionLifecycleSnapshot(
+      'project_pipelines.answer_question',
+      'project_pipelines',
+      'question-1-answer',
+    )).toMatchObject({
+      pending: false,
+      result: {
+        action_request_id: firstRequestId,
+        ok: true,
+        message: 'Answered',
+      },
+    })
+    expect(getUiActionLifecycleSnapshot(
+      'project_pipelines.answer_question',
+      'project_pipelines',
+      'question-2-answer',
+    )).toMatchObject({
+      pending: true,
+      result: null,
+    })
+    expect(firstRequestId).not.toBe(secondRequestId)
   })
 })

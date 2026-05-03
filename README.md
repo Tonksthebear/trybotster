@@ -200,7 +200,7 @@ The `port_forward` sentinel file tells Botster to assign a `$PORT` and tunnel it
 
 ## Plugins
 
-Plugins are Lua scripts that extend Botster's behavior. They live in `.botster/plugins/{name}/init.lua` at either the device or project level, with project config overriding device defaults.
+Plugins are Lua scripts that extend Botster's behavior. They live in `.botster/plugins/{name}/init.lua` at either the device or project level, with project config overriding device defaults. Plugin UI is authored as shared Lua primitives and durable plugin entity frames, so browser and TUI clients consume the same model state. See [Plugin Entities](docs/plugin-entities.md) for the canonical entity, binding, and action feedback model.
 
 ### Installing plugins
 
@@ -227,7 +227,7 @@ The plugin also:
 
 ### Writing custom plugins
 
-Plugins have access to the full Lua runtime API: `events`, `hooks`, `action_cable`, `http`, `json`, `secrets`, `log`, and more. See the GitHub plugin source for a comprehensive example.
+Plugins have access to the full Lua runtime API: `events`, `hooks`, `action_cable`, `http`, `json`, `secrets`, `log`, entity publishing, and shared UI primitives. See the GitHub plugin source for integration hooks and [Plugin Entities](docs/plugin-entities.md) for entity-backed UI authoring.
 
 ## Configuration
 

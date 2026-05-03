@@ -44,6 +44,7 @@ local function pipeline_start_controls(ticket, ctx)
                     },
                     ui.text{ text = step and ("Current step: " .. step.name) or "Pipeline is running.", size = "sm", tone = "muted" },
                     ui.button{
+                        id = "ticket-" .. ticket.id .. "-open-run-" .. open_run.id,
                         label = "Open run",
                         icon = "queue-list",
                         variant = "solid",
@@ -65,6 +66,7 @@ local function pipeline_start_controls(ticket, ctx)
                     },
                     ui.text{ text = "Close or resolve the existing run before starting another pipeline.", size = "sm", tone = "muted" },
                     ui.button{
+                        id = "ticket-" .. ticket.id .. "-open-blocked-run-" .. open_run.id,
                         label = "Open run",
                         icon = "queue-list",
                         variant = "solid",
@@ -80,38 +82,38 @@ local function pipeline_start_controls(ticket, ctx)
         return { ui.text{ text = "This older ticket has no spawn target. Create a target-bound ticket to start a pipeline.", size = "sm", tone = "danger" } }
     end
 
-    table.insert(children, ui.bind_list{
-        source = "/project-pipelines.pipeline",
-        item_template = view.panel{
+    for _, pipeline in ipairs(repo.list_pipelines()) do
+        table.insert(children, view.panel{
             ui.stack{
                 direction = "vertical",
                 gap = "3",
                 children = {
                     ui.stack{ direction = "vertical", gap = "1", children = {
                         view.row{
-                            ui.text{ text = ui.bind("@/name"), size = "sm", weight = "semibold" },
-                            view.badge(ui.bind("@/id"), "muted"),
+                            ui.text{ text = pipeline.name, size = "sm", weight = "semibold" },
+                            view.badge(pipeline.id, "muted"),
                         },
-                        ui.text{ text = ui.bind("@/description"), size = "xs", tone = "muted" },
+                        ui.text{ text = pipeline.description or "", size = "xs", tone = "muted" },
                     } },
                     view.row{
                         view.badge(view.target_label(ticket.target_id, ticket.target_path), "accent"),
                         ui.button{
+                            id = "ticket-" .. ticket.id .. "-start-pipeline-" .. pipeline.id,
                             label = "Start pipeline",
                             icon = "play",
                             variant = "solid",
                             tone = "accent",
                             action = ui.action("project_pipelines.start_ticket_pipeline", {
                                 ticket_id = ticket.id,
-                                pipeline_id = ui.bind("@/id"),
+                                pipeline_id = pipeline.id,
                                 workspace_name = "Pipelines",
                             }),
                         },
                     },
                 },
             },
-        },
-    })
+        })
+    end
 
     return children
 end
@@ -142,6 +144,7 @@ local function session_rows(ticket_id, ctx)
             }
             if alive then
                 table.insert(panel_children, ui.button{
+                    id = "ticket-" .. ticket_id .. "-terminal-" .. uuid,
                     label = "Open terminal",
                     icon = "command-line",
                     variant = "solid",
@@ -190,6 +193,7 @@ local function active_session_button(run, ctx)
         return nil
     end
     return ui.button{
+        id = "ticket-" .. run.ticket_id .. "-current-terminal-" .. current.agent_session_uuid,
         label = "Open current terminal",
         icon = "command-line",
         variant = "solid",
@@ -240,71 +244,164 @@ local function handoff_rows(run, ctx)
         return { ui.text{ text = "No timeline yet.", size = "sm", tone = "muted" } }
     end
 
-    return {
-        ui.bind_list{ source = "/project-pipelines.run_step", where = { run_id = run.id }, item_template = view.panel{
-            ui.stack{ direction = "vertical", gap = "2", children = {
-                view.row{
-                    ui.text{ text = ui.bind("@/name"), size = "sm", weight = "semibold" },
-                    view.badge(ui.bind("@/status")),
-                    view.badge(ui.bind("@/agent_name"), "muted"),
-                },
-                ui.text{ text = ui.bind("@/prompt"), size = "xs", tone = "muted" },
-            } },
-        } },
-        ui.bind_list{ source = "/project-pipelines.gate_result", where = { run_id = run.id }, item_template = ui.stack{ direction = "vertical", gap = "1", children = {
-            view.row{
-                ui.text{ text = "Gate handoff", size = "xs", weight = "semibold", tone = "muted" },
-                view.badge(ui.bind("@/status")),
-            },
-            ui.text{ text = ui.bind("@/summary"), size = "xs", tone = "muted" },
-        } } },
-        ui.bind_list{ source = "/project-pipelines.question", where = { run_id = run.id }, item_template = ui.stack{ direction = "vertical", gap = "1", children = {
-            view.row{
+    local children = {}
+    local steps = repo.run_steps(run.id)
+    local questions_by_run_step = {}
+    for _, question in ipairs(repo.ticket_questions(run.ticket_id)) do
+        local key = question.run_step_id
+        if not util.is_blank(key) then
+            questions_by_run_step[key] = questions_by_run_step[key] or {}
+            table.insert(questions_by_run_step[key], question)
+        end
+    end
+    for index, step in ipairs(steps) do
+        local header = {
+            ui.text{ text = tostring(index) .. ". " .. step.name, size = "sm", weight = "semibold" },
+            view.badge(step.status),
+        }
+        if step.agent_name and step.agent_name ~= "" then
+            table.insert(header, view.badge(step.agent_name, "muted"))
+        end
+
+        local step_children = {
+            view.row(header),
+        }
+        if step.agent_session_uuid and step.agent_session_uuid ~= "" then
+            local notified = view.session_has_notification(step.agent_session_uuid)
+            if notified then
+                table.insert(step_children, view.badge("notification", "danger"))
+            end
+            table.insert(step_children, ui.button{
+                id = "ticket-" .. run.ticket_id .. "-timeline-terminal-" .. step.id,
+                label = "Open terminal",
+                icon = "command-line",
+                variant = "ghost",
+                action = ui.action("botster.nav.open", {
+                    path = ctx.path("/tickets/" .. run.ticket_id .. "/sessions/" .. step.agent_session_uuid),
+                }),
+            })
+        end
+        table.insert(children, view.panel{ ui.stack{ direction = "vertical", gap = "2", children = step_children } })
+
+        local handoffs = {}
+        for _, result in ipairs(repo.run_step_gate_results(step.id)) do
+            table.insert(handoffs, {
+                label = "Gate",
+                status = result.status,
+                summary = result.summary,
+                evidence = util.decode(result.evidence, {}),
+            })
+        end
+        for _, review in ipairs(repo.run_step_reviews(step.id)) do
+            table.insert(handoffs, {
+                label = "Review",
+                status = review.verdict,
+                summary = review.summary,
+            })
+        end
+
+        if #handoffs > 0 then
+            for _, handoff in ipairs(handoffs) do
+                local summary = handoff.summary
+                if util.is_blank(summary) and type(handoff.evidence) == "table" then
+                    summary = handoff.evidence.summary or handoff.evidence.evidence
+                end
+                table.insert(children, ui.stack{ direction = "vertical", gap = "1", children = {
+                    view.row{
+                        ui.text{ text = handoff.label .. " handoff", size = "xs", weight = "semibold", tone = "muted" },
+                        view.badge(handoff.status),
+                    },
+                    ui.text{ text = util.is_blank(summary) and "No handoff note attached." or tostring(summary), size = "xs", tone = "muted" },
+                } })
+            end
+        elseif step.status == "done" then
+            table.insert(children, ui.text{ text = "Handed off without an attached note.", size = "xs", tone = "muted" })
+        end
+
+        for _, question in ipairs(questions_by_run_step[step.id] or {}) do
+            local header = {
                 ui.text{ text = "Question asked", size = "xs", weight = "semibold", tone = "muted" },
-                view.badge(ui.bind("@/kind"), "accent"),
-                view.badge(ui.bind("@/status")),
-            },
-            ui.text{ text = ui.bind("@/question"), size = "xs", tone = "muted" },
-            ui.text{ text = ui.bind("@/answer"), size = "xs", tone = "muted" },
-        } } },
-    }
+                view.badge(question.kind == "agent" and "agent" or "human", question.kind == "agent" and "accent" or "muted"),
+                view.badge(question.status, question.status == "open" and "danger" or "success"),
+            }
+            if question.blocking == 1 then
+                table.insert(header, view.badge("blocking", "danger"))
+            end
+            local details = {
+                view.row(header),
+                ui.text{ text = question.question, size = "xs", tone = "muted" },
+                ui.text{ text = "Asked by " .. actor_label(question.asked_by_session_uuid, "pipeline agent"), size = "xs", tone = "muted" },
+            }
+            if question.status ~= "open" then
+                table.insert(details, ui.text{
+                    text = "Answered by " .. actor_label(question.answered_by_session_uuid, "human"),
+                    size = "xs",
+                    tone = "muted",
+                })
+                table.insert(details, ui.text{
+                    text = util.is_blank(question.answer) and "No answer text recorded." or tostring(question.answer),
+                    size = "xs",
+                    tone = "muted",
+                })
+            end
+            table.insert(children, ui.stack{ direction = "vertical", gap = "1", children = details })
+        end
+    end
+
+    if #children == 0 then
+        table.insert(children, ui.text{ text = "No timeline yet.", size = "sm", tone = "muted" })
+    end
+    return children
 end
 
 local function question_rows(ticket, ctx)
-    local _ctx = ctx
-    return {
-        ui.bind_list{ source = "/project-pipelines.question", where = { ticket_id = ticket.id, status = "open" }, item_template = view.panel{
+    local questions = repo.ticket_questions(ticket.id, "open")
+    local children = {}
+    for _, question in ipairs(questions) do
+        local header = {
+            view.badge(question.kind == "agent" and "agent question" or "human question", question.blocking == 1 and "danger" or "accent"),
+        }
+        if question.blocking == 1 then
+            table.insert(header, view.badge("blocking", "danger"))
+        end
+        table.insert(children, view.panel{
             ui.stack{ direction = "vertical", gap = "2", children = {
-                view.row{ view.badge(ui.bind("@/kind"), "accent") },
-                ui.text{ text = ui.bind("@/question"), size = "sm", weight = "semibold" },
+                view.row(header),
+                ui.text{ text = question.question, size = "sm", weight = "semibold" },
                 ui.textarea{
-                    id = ui.bind("@/id"),
+                    id = "question-answer-" .. question.id,
                     label = "Answer",
                     placeholder = "Answer this question",
-                    on_change = view.field_action("project_pipelines.update_question_answer", { question_id = ui.bind("@/id") }),
+                    on_change = view.field_action("project_pipelines.update_question_answer", { question_id = question.id }),
                 },
                 view.row{
                     ui.button{
+                        id = "question-" .. question.id .. "-answer",
                         label = "Answer",
                         icon = "check",
                         variant = "solid",
                         tone = "accent",
-                        action = ui.action("project_pipelines.answer_question", { question_id = ui.bind("@/id") }),
+                        action = ui.action("project_pipelines.answer_question", { question_id = question.id }),
                     },
                     ui.button{
+                        id = "question-" .. question.id .. "-dismiss",
                         label = "Dismiss",
                         icon = "x-mark",
                         variant = "ghost",
                         action = ui.action("project_pipelines.answer_question", {
-                            question_id = ui.bind("@/id"),
+                            question_id = question.id,
                             answer = "Dismissed by human.",
                             status = "dismissed",
                         }),
                     },
                 },
             } },
-        } },
-    }
+        })
+    end
+    if #children == 0 then
+        table.insert(children, ui.text{ text = "No open questions.", size = "sm", tone = "muted" })
+    end
+    return children
 end
 
 local function dependency_rows(ticket, ctx)
@@ -320,6 +417,7 @@ local function dependency_rows(ticket, ctx)
                     weight = "semibold",
                 },
                 ui.button{
+                    id = "dependency-" .. dependency.id .. "-remove",
                     label = "Remove",
                     icon = "x-mark",
                     variant = "ghost",
@@ -354,6 +452,7 @@ local function dependency_rows(ticket, ctx)
                         on_change = view.field_action("project_pipelines.update_dependency_draft", { ticket_id = ticket.id }),
                     },
                     ui.button{
+                        id = "ticket-" .. ticket.id .. "-add-dependency",
                         label = "Add dependency",
                         icon = "link",
                         variant = "solid",
@@ -387,6 +486,7 @@ local function merge_controls(ticket, ctx)
                 },
                 ui.text{ text = "Approve a merge agent to perform the repo-specific merge or PR path. The ticket closes only after merge confirmation is recorded.", size = "sm", tone = "muted" },
                 ui.button{
+                    id = "ticket-" .. ticket.id .. "-request-merge",
                     label = #merge_events > 0 and "Merge requested" or "Approve merge",
                     icon = "arrow-path",
                     variant = "solid",
@@ -408,6 +508,7 @@ local function run_rows(ticket_id, ctx)
     for _, run in ipairs(repo.ticket_runs(ticket_id)) do
         local pipeline = repo.get_pipeline(run.pipeline_id)
         table.insert(children, ui.button{
+            id = "ticket-" .. ticket_id .. "-run-" .. run.id,
             label = (pipeline and pipeline.name or run.pipeline_id) .. " - " .. run.status,
             icon = "queue-list",
             variant = "ghost",
@@ -430,26 +531,25 @@ function M.render(view_state, ctx)
     local latest_run = repo.latest_ticket_run(ticket.id)
     local open_run = latest_run and (latest_run.status == "active" or latest_run.status == "blocked") and latest_run or nil
 
-    local header = {
-        ui.button{
-            label = "Back",
-            icon = "arrow-left",
-            variant = "ghost",
-            action = ui.action("botster.nav.open", { path = ctx.path("/") }),
-        },
-        ui.text{ text = ticket.title, size = "lg", weight = "semibold" },
+    local meta = {
         view.badge(view.target_label(ticket.target_id, ticket.target_path), "accent"),
     }
     if ticket.status == "closed" then
-        table.insert(header, view.badge("closed", "muted"))
+        table.insert(meta, view.badge("closed", "muted"))
     elseif open_run then
-        table.insert(header, view.badge(open_run.status == "blocked" and "blocked" or "in progress", open_run.status == "blocked" and "danger" or "accent"))
+        table.insert(meta, view.badge(open_run.status == "blocked" and "blocked" or "in progress", open_run.status == "blocked" and "danger" or "accent"))
     else
-        table.insert(header, view.badge("ready", "muted"))
+        table.insert(meta, view.badge("ready", "muted"))
     end
+    local notification = view.notification_badge(view.ticket_notification_count(ticket.id, repo))
+    if notification then
+        table.insert(meta, notification)
+    end
+    local header_actions = {}
     if ticket.status ~= "closed" and latest_run and latest_run.status == "done" then
         local merge_events = repo.ticket_events(ticket.id, "ticket.merge_requested", 1)
-        table.insert(header, ui.button{
+        table.insert(header_actions, ui.button{
+            id = "ticket-" .. ticket.id .. "-header-request-merge",
             label = #merge_events > 0 and "Merge requested" or "Approve merge",
             icon = "arrow-path",
             variant = "solid",
@@ -457,7 +557,8 @@ function M.render(view_state, ctx)
             action = ui.action("project_pipelines.request_merge", { ticket_id = ticket.id }),
         })
     elseif ticket.status ~= "closed" then
-        table.insert(header, ui.button{
+        table.insert(header_actions, ui.button{
+            id = "ticket-" .. ticket.id .. "-close",
             label = "Close ticket",
             variant = "solid",
             tone = "danger",
@@ -465,12 +566,15 @@ function M.render(view_state, ctx)
         })
     end
 
-    local header_panel = {
-        view.row(header),
-        ui.text{ text = ticket.description or "", size = "sm", tone = "muted" },
-    }
     local children = {
-        view.panel{ ui.stack{ direction = "vertical", gap = "2", children = header_panel } },
+        view.page_header{
+            title = ticket.title,
+            back_id = "ticket-" .. ticket.id .. "-back",
+            back_path = ctx.path("/"),
+            meta = meta,
+            actions = header_actions,
+            description = ticket.description or "",
+        },
         current_state_panel(ticket, ctx),
         view.section("Questions", question_rows(ticket, ctx)),
         view.section("Dependencies", dependency_rows(ticket, ctx)),
