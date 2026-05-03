@@ -623,6 +623,27 @@ impl Hub {
             .observe_input(session_uuid, peer_id, data);
     }
 
+    fn handle_observed_pty_output(&mut self, session_uuid: String, data: Vec<u8>) {
+        self.hub_event_metrics
+            .record_counter("pty_output.messages", 1);
+        self.hub_event_metrics
+            .record_counter("pty_output.bytes", data.len() as u64);
+        // Learn terminal probes from raw session output (headless-safe).
+        // Without this, probe responses are only learned through client
+        // input paths (TUI/WebRTC/socket), missing headless sessions.
+        self.learn_terminal_probe_replies(&session_uuid, "session", &data);
+
+        if self.lua.has_observers("pty_output") {
+            let ctx = crate::lua::primitives::PtyOutputContext {
+                peer_id: format!("session:{session_uuid}"),
+                session_uuid,
+            };
+            // SessionIoWorker intentionally hands coalesced chunks to Lua
+            // observers; byte order and total bytes remain unchanged.
+            self.lua.notify_pty_output_observers(&ctx, &data);
+        }
+    }
+
     /// Legacy polling entrypoint — calls all poll functions + flush.
     ///
     /// Only available in tests. Production uses `run_event_loop()` which drives
@@ -721,21 +742,11 @@ impl Hub {
                 }
             }
             HubEvent::PtyOutputObserved { session_uuid, data } => {
-                self.hub_event_metrics
-                    .record_counter("pty_output.messages", 1);
-                self.hub_event_metrics
-                    .record_counter("pty_output.bytes", data.len() as u64);
-                // Learn terminal probes from raw session output (headless-safe).
-                // Without this, probe responses are only learned through client
-                // input paths (TUI/WebRTC/socket), missing headless sessions.
-                self.learn_terminal_probe_replies(&session_uuid, "session", &data);
-
-                if self.lua.has_observers("pty_output") {
-                    let ctx = crate::lua::primitives::PtyOutputContext {
-                        peer_id: format!("session:{session_uuid}"),
-                        session_uuid,
-                    };
-                    self.lua.notify_pty_output_observers(&ctx, &data);
+                self.handle_observed_pty_output(session_uuid, data);
+            }
+            HubEvent::SessionIoBatch(batch) => {
+                if let Some(output) = batch.output {
+                    self.handle_observed_pty_output(batch.session_uuid, output);
                 }
             }
             HubEvent::TimerFired { timer_id } => {
@@ -7274,6 +7285,40 @@ mod tests {
             session_uuid: session_uuid.to_string(),
             data: b"\x1b]11;?\x07".to_vec(),
         });
+
+        hub.learn_terminal_probe_replies(
+            session_uuid,
+            "browser-a",
+            b"\x1b]11;rgb:1234/5678/9abc\x07",
+        );
+
+        assert_eq!(
+            hub.terminal_profiles.headless_reply(
+                session_uuid,
+                crate::hub::terminal_profile::TerminalProbe::DefaultBackground
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_session_io_batch_preserves_output_metrics_and_probe_learning() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-worker-batch-probe";
+
+        hub.handle_cache
+            .add_session(test_local_session_handle(session_uuid));
+
+        hub.handle_hub_event(crate::hub::events::HubEvent::SessionIoBatch(
+            crate::worker::session_io::SessionIoBatch {
+                session_uuid: session_uuid.to_string(),
+                output: Some(b"\x1b]11;?\x07payload".to_vec()),
+            },
+        ));
+
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert_eq!(snapshot.counters["pty_output.messages"], 1);
+        assert_eq!(snapshot.counters["pty_output.bytes"], 14);
 
         hub.learn_terminal_probe_replies(
             session_uuid,

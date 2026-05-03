@@ -1,8 +1,8 @@
 # Worker Actor Contracts
 
-Botster's workerized runtime boundary starts with typed Rust contracts. This
-document describes those contracts without claiming production traffic has moved
-onto them yet.
+Botster's workerized runtime boundary starts with typed Rust contracts. Some
+contracts are scaffolding for later slices; the session I/O worker is now the
+production read path for durable session-process PTY output.
 
 ## Ownership
 
@@ -27,6 +27,39 @@ PTY input, resize, snapshot, mode flags, plain screen, color profile, structured
 terminal events, and process-exit messages as Rust actor messages. The Unix
 socket wire protocol in `cli/src/session/protocol.rs` remains the durable
 process boundary.
+
+## Session I/O Worker Runtime
+
+`SessionConnection::install_reader()` installs one `SessionIoWorker` per active
+session connection. The worker owns the blocking read side of that connection's
+Unix socket and exits with that connection; reconnect creates a fresh
+`SessionConnection` and a fresh worker after the hub's generation checks pass.
+
+The worker keeps the session process protocol unchanged. `SessionConnection`
+still owns writes and synchronous RPC methods, while the worker decodes every
+socket frame and routes snapshot, screen, mode-flags, and other control
+responses back to the existing `response_rx` channel. This avoids socket read
+contention without moving hub orchestration policy into the worker.
+
+PTY output crosses into the hub as `HubEvent::SessionIoBatch`, not one hub
+event per `FRAME_PTY_OUTPUT`. The worker preserves byte order while coalescing
+output until any of these flush boundaries is reached:
+
+- 32 KiB of buffered output
+- 16 output frames
+- 4 ms since the first buffered output or metadata update
+- an ordered structured event such as prompt mark, bell, notification, or
+  process exit
+- EOF, protocol desync, or worker shutdown
+
+Sparse terminal metadata is coalesced in the same short window: mode fields
+merge with last value winning, title and CWD keep the last value, and prompt
+marks, bells, notifications, and process exits remain ordered boundaries.
+
+Browser and TUI clients still receive the existing `PtyEvent` payloads. Lua
+`pty_output` observers intentionally see the coalesced byte chunks emitted by
+`SessionIoBatch` rather than the session protocol's original frame boundaries;
+total bytes and byte order are preserved.
 
 ## Data Flow
 
