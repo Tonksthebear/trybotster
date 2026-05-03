@@ -377,7 +377,6 @@ pub struct Hub {
 
     /// Tracks peers that received a ratchet restart during the current cleanup window.
     /// Cleared every `CleanupTick` (5s) to coalesce decrypt failure storms.
-    ratchet_restarted_peers: std::collections::HashSet<String>,
 
     /// Sessions with dead reader threads awaiting background reconnect.
     ///
@@ -557,7 +556,6 @@ impl Hub {
             #[cfg(test)]
             pty_output_messages_drained: 0,
             notification_watcher_handles: std::collections::HashMap::new(),
-            ratchet_restarted_peers: std::collections::HashSet::new(),
             pending_reconnects: std::collections::HashMap::new(),
             reconnect_generation: 0,
             vapid_keys: None,
