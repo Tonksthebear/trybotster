@@ -13,6 +13,7 @@ local M = {}
 local PIPELINE_UPDATE_FIELDS = {
     name = true,
     description = true,
+    merge_policy = true,
 }
 
 local STEP_UPDATE_FIELDS = {
@@ -79,6 +80,16 @@ local function with_transaction(fn)
     return db:execute(function()
         return fn()
     end)
+end
+
+local function normalize_merge_policy(value)
+    if util.is_blank(value) then
+        return "direct"
+    end
+    if value ~= "direct" and value ~= "pr" then
+        error("merge_policy must be direct or pr")
+    end
+    return value
 end
 
 local function publish_entity(entity_key, row)
@@ -627,6 +638,9 @@ function M.update_pipeline(pipeline_id, attrs)
     if not has_fields(set) then
         return pipeline
     end
+    if set.merge_policy ~= nil then
+        set.merge_policy = normalize_merge_policy(set.merge_policy)
+    end
     set.updated_at = util.now()
     db.pipelines:update{ where = { id = pipeline_id }, set = set }
     publish_entity("pipeline", M.get_pipeline(pipeline_id))
@@ -699,6 +713,7 @@ function M.create_pipeline(attrs)
         id = attrs.id,
         name = attrs.name,
         description = attrs.description or "",
+        merge_policy = normalize_merge_policy(attrs.merge_policy),
         created_at = now,
         updated_at = now,
     }
