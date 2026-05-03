@@ -84,11 +84,11 @@ pub(crate) fn run_event_loop(
     // Extract receivers from Hub so select! can borrow them independently
     // of &mut hub in match arms. The poll_* fallback methods handle None
     // gracefully (early return).
-    let mut pty_input_rx = hub.pty_input_rx.take();
-    let mut file_input_rx = hub.file_input_rx.take();
-    let mut webrtc_signal_rx = hub.webrtc_outgoing_signal_rx.take();
-    let mut webrtc_pty_output_rx = hub.webrtc_pty_output_rx.take();
-    let mut stream_frame_rx = hub.stream_frame_rx.take();
+    let mut pty_input_rx = hub.webrtc.take_pty_input_rx();
+    let mut file_input_rx = hub.webrtc.take_file_input_rx();
+    let mut webrtc_signal_rx = hub.webrtc.take_outgoing_signal_rx();
+    let mut webrtc_pty_output_rx = hub.webrtc.take_pty_output_rx();
+    let mut stream_frame_rx = hub.webrtc.take_stream_frame_rx();
     let mut worktree_result_rx = hub.worktree_result_rx.take();
     let mut tui_request_rx = hub.tui_request_rx.take();
     let mut hub_event_rx = hub.hub_event_rx.take();
@@ -274,11 +274,11 @@ pub(crate) fn run_event_loop(
     cleanup_handle.abort();
 
     // Restore receivers for clean shutdown (Hub.drop may need them)
-    hub.pty_input_rx = pty_input_rx;
-    hub.file_input_rx = file_input_rx;
-    hub.webrtc_outgoing_signal_rx = webrtc_signal_rx;
-    hub.webrtc_pty_output_rx = webrtc_pty_output_rx;
-    hub.stream_frame_rx = stream_frame_rx;
+    hub.webrtc.restore_pty_input_rx(pty_input_rx);
+    hub.webrtc.restore_file_input_rx(file_input_rx);
+    hub.webrtc.restore_outgoing_signal_rx(webrtc_signal_rx);
+    hub.webrtc.restore_pty_output_rx(webrtc_pty_output_rx);
+    hub.webrtc.restore_stream_frame_rx(stream_frame_rx);
     hub.worktree_result_rx = worktree_result_rx;
     hub.tui_request_rx = tui_request_rx;
     hub.hub_event_rx = hub_event_rx;
