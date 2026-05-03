@@ -1103,15 +1103,19 @@ impl TransportAdapter for WebRtcTransportAdapter {
             TransportIngress::Json(value) => {
                 ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(value))
             }
+            TransportIngress::Binary(data) => {
+                ClientWorkerMessage::ControlFrame(ClientControlFrame::Binary(data))
+            }
             TransportIngress::Health(health) => ClientWorkerMessage::Health(health),
         }
     }
 
     fn client_to_egress(&self, message: ClientWorkerMessage) -> Option<TransportEgress> {
         match message {
-            ClientWorkerMessage::TerminalBytes { data, .. } => {
+            ClientWorkerMessage::TerminalBytes { session_uuid, data } => {
                 Some(TransportEgress::TerminalBytes {
                     subscription_id: self.client_id.to_string(),
+                    session_uuid,
                     data,
                 })
             }

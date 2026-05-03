@@ -1,5 +1,50 @@
 # Project Pipelines Verification
 
+## 2026-05-02 TUI/Socket Client Worker Transport Verification
+
+Scope:
+
+- TUI and local socket terminal streams moved onto the transport-neutral
+  `ClientWorker` data plane.
+- Lossless typed egress for PTY bytes, scrollback metadata, process exit, JSON
+  control frames, and plugin binary frames.
+- Hub-owned attach/detach lifecycle driven by worker hub-control messages.
+- Cold-turkey removal of covered TUI/socket direct terminal delivery paths.
+
+Commands and results:
+
+```bash
+cd cli && ./test.sh --unit -- worker
+# 38 passed; 0 failed
+
+cd cli && ./test.sh --unit -- server_comms
+# 39 passed; 0 failed
+
+cd cli && ./test.sh --unit -- socket
+# 74 passed; 0 failed
+
+cd cli && ./test.sh --unit -- tui_bridge
+# 10 passed; 0 failed
+
+cd cli && ./test.sh --unit
+# 1478 passed; 0 failed; 1 ignored
+```
+
+Notes:
+
+- CLI verification used `cli/test.sh`, not raw `cargo test`, so
+  `BOTSTER_ENV=test` was set for all Rust/Lua/TUI slices.
+- The socket-worker live-output parity test now passes under the standard
+  focused filters with default test concurrency; it is not dependent on
+  `--test-threads=1`.
+- Merge-agent verification was rerun after integrating `origin/main`, including
+  the WebRTC client-worker transport adapter changes already on main.
+- Static boundary checks confirmed `cli/src/worker/client.rs` has no concrete
+  socket, TUI bridge, or WebRTC imports. Remaining `send_frame` matches are
+  outside the covered TUI/local-socket terminal forwarder path.
+- No browser UI surface was changed. `tmp/tailwind_plus_preview` was absent in
+  this worktree, and no Catalyst/Elements comparison was required.
+
 ## 2026-05-02 Plugin Entity End-to-End Verification
 
 Scope:
