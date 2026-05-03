@@ -122,6 +122,23 @@ local function edit_pipeline_fields(pipeline, state)
     if description_error then
         table.insert(children, ui.text{ text = description_error, size = "xs", tone = "danger" })
     end
+    table.insert(children, ui.select{
+        id = "pipeline-" .. pipeline.id .. "-merge-policy",
+        label = "Merge policy",
+        value = pipeline.merge_policy or "direct",
+        options = {
+            { value = "direct", label = "Merge directly to main" },
+            { value = "pr", label = "Open PR with Botster MCP" },
+        },
+        on_change = view.field_action("project_pipelines.update_pipeline_field", {
+            pipeline_id = pipeline.id,
+            field = "merge_policy",
+        }),
+    })
+    local merge_policy_error = feedback_error(state, pipeline.id, "merge_policy")
+    if merge_policy_error then
+        table.insert(children, ui.text{ text = merge_policy_error, size = "xs", tone = "danger" })
+    end
     return view.panel{
         ui.stack{ direction = "vertical", gap = "3", children = children },
     }
