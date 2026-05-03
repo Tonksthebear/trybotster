@@ -112,7 +112,7 @@ plugin binary, and raw input traffic cross the client-worker boundary before a
 TUI or socket adapter encodes them. WebRTC production traffic enters the
 transport adapter boundary through `worker::webrtc::WebRtcPeerRegistry` and
 `WebRtcTransportRunner`; the adapter converts decoded ingress into
-`ClientWorkerMessage` before hub policy handles the legacy Lua routing surface.
+`ClientWorkerMessage` before hub policy handles the current Lua routing surface.
 
 ## WebRTC Transport Adapter
 
@@ -123,6 +123,12 @@ and summarized cleanup policy. WebRTC peer connection state, offer generation,
 pending ICE queues, per-peer bounded send queues, DataChannel liveness pings,
 unknown-peer burst coalescing, backpressure recovery tracking, and peer cleanup
 bookkeeping stay inside the registry.
+
+The registry also owns the WebRTC data-plane queue receivers. Production code
+starts registry queue forwarders that translate PTY input, file input, outgoing
+signals, PTY output, and stream frames into typed `HubEvent` variants. Hub code
+may handle those typed events, but must not lease, take, restore, or poll raw
+WebRTC receivers.
 
 The Hub must not recover the old escape hatch by reaching into a channel map or
 `WebRtcSender` directly. New WebRTC work should add a typed registry method or
@@ -158,12 +164,12 @@ WebRTC transport summaries cross back to the Hub through typed
 the Rails relay boundary because those values are already serialized Olm
 envelopes. Do not let that exception spread to new adapter control surfaces.
 
-Crypto ownership is split by lifecycle phase. DataChannel encrypt/decrypt
-failure tracking and ratchet-delivery transport are adapter/registry concerns.
-The Hub still generates fresh ratchet bundles and, for now, performs
-handshake-time SDP answer encryption before emitting `TransportSignalReady`;
-that is a known follow-up boundary, not permission to move hot-path
-DataChannel crypto back into Hub code.
+Crypto ownership is split by lifecycle phase. SDP answer encryption,
+DataChannel encrypt/decrypt failure tracking, ratchet-trigger dedupe, and
+ratchet-delivery transport are adapter/registry concerns. The Hub still
+generates fresh ratchet bundles because that mutates trusted crypto policy, then
+queues the bytes through `WebRtcPeerRegistry` instead of sending through a
+`WebRtcSender` directly.
 
 Regression coverage for this boundary should stay focused on the failure modes
 that motivated the migration: a DataChannel closing after `Connected`, stale
