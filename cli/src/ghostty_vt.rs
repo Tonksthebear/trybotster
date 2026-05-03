@@ -1989,6 +1989,40 @@ mod tests {
     }
 
     #[test]
+    fn noisy_pty_replay_preserves_terminal_screen_fidelity() {
+        let mut baseline = Terminal::new(80, 24, 1000).expect("terminal creation failed");
+        let mut replayed = Terminal::new(80, 24, 1000).expect("terminal creation failed");
+        let chunks = [
+            b"\x1b]2;botster replay\x07".as_slice(),
+            b"first line\r\n".as_slice(),
+            b"\x1b[31mred\x1b[0m normal\r\n".as_slice(),
+            b"\x1b[?25l\x1b[?25h".as_slice(),
+            b"\x1b]7;file://localhost/private/tmp\x07".as_slice(),
+            b"after noisy osc\r\n".as_slice(),
+        ];
+
+        baseline.write(&chunks.concat());
+        for chunk in chunks {
+            replayed.write(chunk);
+        }
+
+        assert_eq!(
+            replayed.format_plain().expect("replayed plain screen"),
+            baseline.format_plain().expect("baseline plain screen")
+        );
+
+        let snapshot = replayed.snapshot_export().expect("snapshot export");
+        let mut restored = Terminal::new(80, 24, 1000).expect("terminal creation failed");
+        restored
+            .snapshot_import(&snapshot)
+            .expect("snapshot import");
+        assert_eq!(
+            restored.format_plain().expect("restored plain screen"),
+            baseline.format_plain().expect("baseline plain screen")
+        );
+    }
+
+    #[test]
     fn styled_text_produces_sgr_in_vt_format() {
         let mut term = Terminal::new(80, 24, 0).expect("terminal creation failed");
 

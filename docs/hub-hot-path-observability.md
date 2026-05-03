@@ -63,6 +63,9 @@ delivery to reduce hub event volume; WebRTC and other legacy PTY output queues
 still use the existing drain-batch span. Snapshot byte preparation has moved
 behind `worker::session_io` helpers, but the stable `snapshot.rpc_get` and
 `snapshot.gzip_queue` span names remain unchanged for operator playbooks.
+Backpressure recovery snapshot delivery records the same gzip queue span and
+the `snapshot.backpressure_recovery.*` counter family so recovery paths remain
+visible even when normal hot PTY delivery is congested.
 
 ## Counters
 
@@ -172,6 +175,19 @@ counters/spans/slow-sample bounding, unknown-peer burst rate limiting and
 peer-prefix caps, PTY output batch metrics, and session-I/O worker output
 coalescing. Snapshot
 preparation and session-scoped paste-file writes have focused worker unit
-coverage. Queue/counter paths and manifest write-storm rate limiting are not
-exhaustively unit-tested; use manual log verification or add focused tests when
-changing those paths.
+coverage.
+
+Workerized data-plane recovery tests now embed minimal reproductions of observed
+Botster daemon log failure shapes: 1001 noisy PTY frames with OSC traffic,
+`pty_osc.cursor` volume bursts over the 30s guardrail window, session-reader
+EOF cycles, WebRTC reconnect/backpressure churn, and slow-client recovery
+snapshot delivery. The hub-side replay test records `session_io_batch` handler
+timing through `HubEventMetrics` and asserts the maximum handler time stays
+under the existing hot-subhandler budget with no slow samples. This is the
+preferred regression shape for future changes to session I/O batching, OSC
+guardrails, WebRTC recovery routing, or snapshot gzip queueing.
+
+Queue/counter paths and manifest write-storm rate limiting are not exhaustively
+unit-tested; use manual log verification or add focused tests when changing
+those paths. The current full CLI unit verification for the data-plane load and
+recovery slice passed with `1484 passed; 0 failed; 1 ignored`.
