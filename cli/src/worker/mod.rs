@@ -227,19 +227,56 @@ mod tests {
             SessionIoRequest::GetScreen {
                 request_id: "req-2".to_string(),
             },
+            SessionIoRequest::PasteFile {
+                request_id: "req-3".to_string(),
+                filename: "screenshot.png".to_string(),
+                data: b"png".to_vec(),
+            },
+            SessionIoRequest::PrepareSnapshot {
+                request_id: "req-4".to_string(),
+                snapshot: vec![1, 2, 3],
+                recovery: false,
+            },
         ];
 
-        let event = SessionIoEvent::ProcessExited {
-            session_uuid: "sess-1".to_string(),
-            exit_code: None,
-        };
+        let events = [
+            format!(
+                "{:?}",
+                SessionIoEvent::ProcessExited {
+                    session_uuid: "sess-1".to_string(),
+                    exit_code: None,
+                }
+            ),
+            format!(
+                "{:?}",
+                SessionIoEvent::PasteFileFailed {
+                    request_id: "req-3".to_string(),
+                    session_uuid: "sess-1".to_string(),
+                    reason: super::session_io::PasteFileErrorReason::Inject,
+                    detail: "closed".to_string(),
+                }
+            ),
+            format!(
+                "{:?}",
+                SessionIoEvent::PreparedSnapshot {
+                    request_id: "req-4".to_string(),
+                    session_uuid: "sess-1".to_string(),
+                    uncompressed_len: 3,
+                    payload: vec![0x02, 1, 2, 3],
+                    recovery: false,
+                }
+            ),
+        ];
 
         for request in requests {
             let rendered = format!("{request:?}");
             assert!(!rendered.contains("WebRtc"));
             assert!(!rendered.contains("Browser"));
         }
-        assert!(format!("{event:?}").contains("ProcessExited"));
+        for rendered in events {
+            assert!(!rendered.contains("WebRtc"));
+            assert!(!rendered.contains("Browser"));
+        }
     }
 
     #[test]

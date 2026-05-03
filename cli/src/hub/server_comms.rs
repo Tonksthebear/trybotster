@@ -1840,6 +1840,7 @@ impl Hub {
                 }
 
                 // Real process exit or non-session-backed: normal handling.
+                self.cleanup_paste_files(&session_uuid);
                 if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
                     session_handle.pty().notify_process_exited(exit_code);
                 }
@@ -2159,69 +2160,47 @@ impl Hub {
 
     /// Handle a file transfer from browser (image paste/drop via WebRTC).
     ///
-    /// Writes the file to a temp path and injects the path as text into the
-    /// target PTY, so agent CLIs see a local file path.
+    /// Hub policy authorizes the target session here; session I/O owns the
+    /// file write and path injection data plane.
     pub fn handle_file_input(&mut self, file: crate::channel::webrtc::FileInputIncoming) {
-        use std::io::Write;
-
-        // Determine file extension from filename
-        let ext = std::path::Path::new(&file.filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("png");
-
-        // Hash content for dedup filename
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            file.data.hash(&mut hasher);
-            format!("{:016x}", hasher.finish())
+        let Some(session_handle) = self.handle_cache.get_session(&file.session_uuid) else {
+            log::warn!(
+                "[FILE-INPUT] Dropping paste for missing session {}",
+                file.session_uuid
+            );
+            return;
         };
 
-        let path = std::path::PathBuf::from(format!("/tmp/botster-paste-{hash}.{ext}"));
-
-        // Write file
-        match std::fs::File::create(&path) {
-            Ok(mut f) => {
-                if let Err(e) = f.write_all(&file.data) {
-                    log::error!("[FILE-INPUT] Failed to write paste file: {e}");
-                    return;
-                }
+        match crate::worker::session_io::write_paste_file(
+            &file.session_uuid,
+            &file.filename,
+            &file.data,
+            |input| session_handle.pty().write_input_direct(input),
+        ) {
+            Ok(write) => {
+                log::info!(
+                    "[FILE-INPUT] Wrote {} bytes to {} (session={})",
+                    write.bytes,
+                    write.path.display(),
+                    file.session_uuid,
+                );
+                self.paste_files
+                    .entry(file.session_uuid)
+                    .or_default()
+                    .push(write.path);
             }
-            Err(e) => {
-                log::error!("[FILE-INPUT] Failed to create paste file: {e}");
-                return;
-            }
-        }
-
-        log::info!(
-            "[FILE-INPUT] Wrote {} bytes to {} (session={})",
-            file.data.len(),
-            path.display(),
-            file.session_uuid,
-        );
-
-        // Track for cleanup + inject path into PTY
-        if let Some(session_handle) = self.handle_cache.get_session(&file.session_uuid) {
-            let agent_handle = session_handle;
-            self.paste_files
-                .entry(agent_handle.label().to_string())
-                .or_default()
-                .push(path.clone());
-
-            let path_with_space = format!("{} ", path.display());
-            if let Err(e) = agent_handle
-                .pty()
-                .write_input_direct(path_with_space.as_bytes())
-            {
-                log::error!("[FILE-INPUT] Failed to inject path into PTY: {e}");
+            Err((reason, detail)) => {
+                log::error!(
+                    "[FILE-INPUT] Paste failed for session {} reason={reason:?}: {detail}",
+                    file.session_uuid
+                );
             }
         }
     }
 
     /// Clean up paste files for a closed session.
-    pub fn cleanup_paste_files(&mut self, label: &str) {
-        if let Some(files) = self.paste_files.remove(label) {
+    pub fn cleanup_paste_files(&mut self, session_uuid: &str) {
+        if let Some(files) = self.paste_files.remove(session_uuid) {
             for path in &files {
                 if let Err(e) = std::fs::remove_file(path) {
                     log::warn!(
@@ -2232,7 +2211,7 @@ impl Hub {
             }
             if !files.is_empty() {
                 log::info!(
-                    "[FILE-INPUT] Cleaned up {} paste file(s) for {label}",
+                    "[FILE-INPUT] Cleaned up {} paste file(s) for {session_uuid}",
                     files.len()
                 );
             }
@@ -4145,42 +4124,18 @@ impl Hub {
             return true;
         }
 
-        let gzip_started = Instant::now();
-        // Pre-gzip the snapshot so the plaintext on the wire is small enough
-        // to survive Olm encryption and SCTP's negotiated 16 MB max message
-        // size. For large scrollback sessions the raw snapshot can exceed that
-        // limit and get dropped silently in the send pipeline.
-        // send_pty_raw detects the gzip magic (1f 8b) and forwards it as a
-        // compressed frame without re-compressing.
-        let uncompressed_len = snapshot.len();
-        let mut plain = Vec::with_capacity(1 + uncompressed_len);
-        plain.push(0x02);
-        plain.extend(snapshot);
-
-        let raw_message = match {
-            use flate2::write::GzEncoder;
-            use flate2::Compression;
-            use std::io::Write;
-            let mut encoder = GzEncoder::new(
-                Vec::with_capacity(uncompressed_len / 4),
-                Compression::fast(),
-            );
-            encoder.write_all(&plain).and_then(|()| encoder.finish())
-        } {
-            Ok(gzipped) => gzipped,
-            Err(e) => {
-                log::warn!(
-                    "[Lua] Snapshot gzip failed for session {}, sending uncompressed: {}",
-                    session_uuid,
-                    e
-                );
-                plain
-            }
+        // Pre-gzip and queue preparation live in the session I/O data plane.
+        // The hub keeps only transport routing and backpressure policy here.
+        let (gzip_started, Some(prepared)) =
+            crate::worker::session_io::timed_prepare_snapshot_payload(&snapshot)
+        else {
+            metrics.record_counter("snapshot.empty", 1);
+            return true;
         };
         metrics.record_span_with_threshold(
             "snapshot.gzip_queue",
             gzip_started.elapsed(),
-            uncompressed_len + raw_message.len(),
+            prepared.uncompressed_len + prepared.payload.len(),
             Hub::SNAPSHOT_SLOW,
             session_uuid,
         );
@@ -4188,14 +4143,14 @@ impl Hub {
         log::debug!(
             "[Lua] Sending snapshot for session {} ({} bytes raw, {} bytes on wire)",
             session_uuid,
-            uncompressed_len,
-            raw_message.len()
+            prepared.uncompressed_len,
+            prepared.payload.len()
         );
 
         match output_tx.try_send(WebRtcPtyOutput {
             subscription_id: subscription_id.to_string(),
             browser_identity: peer_id.to_string(),
-            data: raw_message,
+            data: prepared.payload,
             session_uuid: session_uuid.to_string(),
         }) {
             Ok(()) => true,
@@ -4381,17 +4336,25 @@ impl Hub {
         subscription_id: &str,
         snapshot: &[u8],
     ) {
-        // Single message: [0x02 prefix][snapshot bytes]
-        // WebRTC SCTP handles message fragmentation automatically.
-        let mut raw_message = Vec::with_capacity(1 + snapshot.len());
-        raw_message.push(0x02);
-        raw_message.extend(snapshot);
+        let (gzip_started, Some(prepared)) =
+            crate::worker::session_io::timed_prepare_snapshot_payload(snapshot)
+        else {
+            metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
+            return;
+        };
+        metrics.record_span_with_threshold(
+            "snapshot.gzip_queue",
+            gzip_started.elapsed(),
+            prepared.uncompressed_len + prepared.payload.len(),
+            Hub::SNAPSHOT_SLOW,
+            "backpressure_recovery",
+        );
 
         // try_send to avoid blocking; if still full, the snapshot
         // is best-effort — live stream will eventually resync.
         match peer_tx.try_send(super::WebRtcSendItem::Pty {
             subscription_id: subscription_id.to_string(),
-            data: raw_message,
+            data: prepared.payload,
         }) {
             Ok(()) => metrics.record_counter("snapshot.backpressure_recovery.sent", 1),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
