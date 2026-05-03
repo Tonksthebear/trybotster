@@ -57,6 +57,88 @@ pub struct WorkerBackpressure {
     pub client_id: Option<ClientId>,
 }
 
+/// WebRTC transport connection mode summarized for hub policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportConnectionMode {
+    /// Mode is not known yet.
+    Unknown,
+    /// Peer appears directly connected.
+    Direct,
+    /// Peer appears to be using a relay path.
+    Relayed,
+}
+
+/// WebRTC transport disconnect/failure reason summarized by the adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportDisconnectReason {
+    /// DataChannel closed.
+    DataChannelClose,
+    /// DataChannel errored.
+    DataChannelError,
+    /// Peer connection never finished connecting.
+    ConnectionTimeout,
+    /// A send timed out.
+    SendTimeout,
+    /// Liveness probes were missed.
+    MissedLivenessProbes,
+    /// A newer peer generation replaced this one.
+    ReplacedByNewPeer,
+    /// Browser or hub explicitly disconnected.
+    ExplicitDisconnect,
+    /// Hub shutdown closed the transport.
+    Shutdown,
+}
+
+/// WebRTC peer lifecycle state summarized by the adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportPeerState {
+    /// Peer setup has started.
+    Connecting {
+        /// Monotonic offer/reconnect generation.
+        generation: u64,
+    },
+    /// DataChannel is open and ready.
+    Connected {
+        /// Monotonic offer/reconnect generation.
+        generation: u64,
+        /// Connection mode diagnostics.
+        mode: TransportConnectionMode,
+    },
+    /// Peer disconnected.
+    Disconnected {
+        /// Monotonic offer/reconnect generation.
+        generation: u64,
+        /// Disconnect reason.
+        reason: TransportDisconnectReason,
+    },
+    /// Peer setup failed.
+    Failed {
+        /// Monotonic offer/reconnect generation.
+        generation: u64,
+        /// Failure reason.
+        reason: TransportDisconnectReason,
+    },
+}
+
+/// Opaque signaling envelope ready for Rails relay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportSignal {
+    /// ICE candidate envelope.
+    Ice {
+        /// Target browser identity.
+        browser_identity: String,
+        /// Already-serialized Olm envelope for ActionCable relay.
+        envelope: serde_json::Value,
+    },
+    /// SDP answer envelope.
+    Answer {
+        /// Target browser identity.
+        browser_identity: String,
+        /// Already-serialized Olm envelope for ActionCable relay.
+        envelope: serde_json::Value,
+    },
+}
+
 /// Requests that cross into the hub-owned orchestration boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HubControlMessage {
@@ -80,6 +162,36 @@ pub enum HubControlMessage {
     },
     /// A bounded worker queue reached capacity or rejected a message.
     Backpressure(WorkerBackpressure),
+    /// A transport adapter reported bounded-queue pressure.
+    TransportBackpressure {
+        /// Request origin.
+        origin: HubControlOrigin,
+        /// Backpressure details.
+        pressure: WorkerBackpressure,
+    },
+    /// A WebRTC peer lifecycle state changed.
+    TransportPeerStateChanged {
+        /// Client represented by this peer.
+        client_id: ClientId,
+        /// Browser identity for the peer.
+        browser_identity: String,
+        /// New peer state.
+        state: TransportPeerState,
+    },
+    /// A WebRTC signaling envelope is ready for Rails relay.
+    TransportSignalReady {
+        /// Client represented by this peer.
+        client_id: ClientId,
+        /// Signal to relay.
+        signal: TransportSignal,
+    },
+    /// Adapter requests a fresh ratchet bundle from hub policy.
+    TransportRatchetRestartRequested {
+        /// Client represented by this peer.
+        client_id: ClientId,
+        /// Browser identity for the peer.
+        browser_identity: String,
+    },
     /// A session process lifecycle state changed.
     SessionLifecycle {
         /// Session whose lifecycle changed.
