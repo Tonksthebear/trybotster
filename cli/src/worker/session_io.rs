@@ -138,3 +138,12 @@ pub enum SessionIoEvent {
         exit_code: Option<i32>,
     },
 }
+
+/// Compact hub-bound batch emitted by a session I/O worker.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionIoBatch {
+    /// Session that produced this batch.
+    pub session_uuid: SessionUuid,
+    /// Coalesced raw terminal bytes. Byte order is preserved.
+    pub output: Option<Vec<u8>>,
+}
