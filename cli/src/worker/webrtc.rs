@@ -798,6 +798,29 @@ impl WebRtcPeerRegistry {
         Some(tx)
     }
 
+    #[cfg(test)]
+    pub(crate) fn install_test_recovery_sender(
+        &mut self,
+        browser_identity: &str,
+        runtime: &tokio::runtime::Runtime,
+    ) -> tokio::sync::mpsc::Receiver<WebRtcAdapterCommand> {
+        if let Some(old) = self.send_tasks.remove(browser_identity) {
+            old.task.abort();
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(PEER_SEND_CHANNEL_CAPACITY);
+        let task = runtime.spawn(async {});
+        self.send_tasks.insert(
+            browser_identity.to_string(),
+            PeerSendState {
+                tx,
+                dead: Arc::new(AtomicBool::new(false)),
+                task,
+            },
+        );
+        rx
+    }
+
     pub(crate) fn spawn_peer_sender(
         &mut self,
         browser_identity: &str,
