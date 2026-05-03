@@ -933,7 +933,11 @@ mod tests {
 
     #[tokio::test]
     async fn browser_and_tui_clients_use_the_same_worker_path() {
-        for client_id in [ClientId::Tui, ClientId::browser("browser-identity")] {
+        for client_id in [
+            ClientId::Tui,
+            ClientId::Socket("socket-identity".to_string()),
+            ClientId::browser("browser-identity"),
+        ] {
             let (handle, mut hub_rx, mut outbound_rx, _session_rx) =
                 spawn_worker(client_id.clone(), 8);
 

@@ -506,6 +506,54 @@ mod tests {
     }
 
     #[test]
+    fn noisy_log_replay_preserves_order_and_bounds_hub_batches() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (_event_rx, _response_rx, mut hub_rx, alive) = spawn_test_worker(reader);
+
+        let mut payload = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..=1000 {
+            let chunk = format!("\x1b]2;botster replay {i}\x07frame-{i:04}\r\n");
+            expected.extend_from_slice(chunk.as_bytes());
+            payload.extend_from_slice(&encode_frame(FRAME_PTY_OUTPUT, chunk.as_bytes()));
+        }
+
+        writer.write_all(&payload).expect("write noisy replay");
+        writer.shutdown(Shutdown::Both).expect("shutdown writer");
+
+        for _ in 0..100 {
+            if !alive.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut batches = Vec::new();
+        let mut exits = 0;
+        while let Ok(event) = hub_rx.try_recv() {
+            match event {
+                HubEvent::SessionIoBatch(batch) => {
+                    batches.push(batch.output.expect("output batch"));
+                }
+                HubEvent::SessionProcessExited { exit_code, .. } => {
+                    assert_eq!(exit_code, None);
+                    exits += 1;
+                }
+                other => panic!("unexpected hub event: {other:?}"),
+            }
+        }
+
+        let replayed = batches.concat();
+        assert_eq!(replayed, expected);
+        assert!(
+            batches.len() <= 64,
+            "1001 observed-log-shaped frames should cross the hub in bounded batches, got {}",
+            batches.len()
+        );
+        assert_eq!(exits, 1);
+    }
+
+    #[test]
     fn coalesces_output_until_sixteen_frames_or_32k() {
         let mut by_frame = SessionIoCoalescer::default();
         for _ in 0..15 {
