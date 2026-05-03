@@ -107,6 +107,234 @@ impl Hub {
         );
     }
 
+    fn spawn_tui_client_worker_adapter(
+        &self,
+        session_uuid: String,
+        pty_handle: crate::hub::agent_handle::PtyHandle,
+        output_tx: tokio::sync::mpsc::UnboundedSender<crate::client::TuiOutput>,
+    ) -> crate::worker::client::ClientWorkerHandle {
+        use crate::worker::client::{ClientWorker, ClientWorkerConfig};
+        use crate::worker::hub_control::HUB_CONTROL_QUEUE;
+        use crate::worker::session_io::SessionIoRequest;
+        use crate::worker::transport::{TransportEgress, TuiTransportAdapter};
+
+        let (hub_control_tx, mut hub_control_rx) =
+            tokio::sync::mpsc::channel(HUB_CONTROL_QUEUE.capacity);
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<TransportEgress>(4096);
+        let (session_io_tx, mut session_io_rx) =
+            tokio::sync::mpsc::channel(crate::worker::session_io::SESSION_IO_WORKER_QUEUE.capacity);
+        let wake_fd = self.tui_wake_fd;
+        let mut session_io_txs = std::collections::HashMap::new();
+        session_io_txs.insert(session_uuid, session_io_tx);
+        let hub_event_tx = self.hub_event_tx.clone();
+
+        tokio::spawn(async move {
+            while let Some(message) = hub_control_rx.recv().await {
+                let _ = hub_event_tx.send(super::events::HubEvent::ClientWorkerControl(message));
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(request) = session_io_rx.recv().await {
+                if let SessionIoRequest::PtyInput { data } = request {
+                    if let Err(e) = pty_handle.write_input_direct(&data) {
+                        log::error!("[Lua-TUI] Worker PTY write failed: {e}");
+                    }
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(egress) = outbound_rx.recv().await {
+                let Some(output) = TuiTransportAdapter::egress_to_output(egress) else {
+                    continue;
+                };
+                if output_tx.send(output).is_err() {
+                    break;
+                }
+                if let Some(fd) = wake_fd {
+                    super::wake_tui_pipe(fd);
+                }
+            }
+        });
+
+        let mut config = ClientWorkerConfig::new(
+            crate::client::ClientId::Tui,
+            hub_control_tx,
+            outbound_tx,
+            session_io_txs,
+        );
+        config.outbound =
+            crate::worker::BoundedQueueConfig::new("worker.client.tui.outbound", 4096);
+        ClientWorker::start(config)
+    }
+
+    fn spawn_tui_control_worker_adapter(
+        &self,
+        output_tx: tokio::sync::mpsc::UnboundedSender<crate::client::TuiOutput>,
+    ) -> crate::worker::client::ClientWorkerHandle {
+        use crate::worker::client::{ClientWorker, ClientWorkerConfig};
+        use crate::worker::hub_control::HUB_CONTROL_QUEUE;
+        use crate::worker::transport::{TransportEgress, TuiTransportAdapter};
+
+        let (hub_control_tx, mut hub_control_rx) =
+            tokio::sync::mpsc::channel(HUB_CONTROL_QUEUE.capacity);
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<TransportEgress>(4096);
+        let hub_event_tx = self.hub_event_tx.clone();
+        let wake_fd = self.tui_wake_fd;
+
+        tokio::spawn(async move {
+            while let Some(message) = hub_control_rx.recv().await {
+                let _ = hub_event_tx.send(super::events::HubEvent::ClientWorkerControl(message));
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(egress) = outbound_rx.recv().await {
+                let Some(output) = TuiTransportAdapter::egress_to_output(egress) else {
+                    continue;
+                };
+                if output_tx.send(output).is_err() {
+                    break;
+                }
+                if let Some(fd) = wake_fd {
+                    super::wake_tui_pipe(fd);
+                }
+            }
+        });
+
+        let mut config = ClientWorkerConfig::new(
+            crate::client::ClientId::Tui,
+            hub_control_tx,
+            outbound_tx,
+            std::collections::HashMap::new(),
+        );
+        config.outbound =
+            crate::worker::BoundedQueueConfig::new("worker.client.tui.outbound", 4096);
+        ClientWorker::start(config)
+    }
+
+    fn spawn_socket_client_worker_adapter(
+        &self,
+        client_id: String,
+        session_uuid: String,
+        pty_handle: crate::hub::agent_handle::PtyHandle,
+        frame_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> crate::worker::client::ClientWorkerHandle {
+        use crate::worker::client::{ClientWorker, ClientWorkerConfig};
+        use crate::worker::hub_control::HUB_CONTROL_QUEUE;
+        use crate::worker::session_io::SessionIoRequest;
+        use crate::worker::transport::{SocketFrameAdapter, TransportEgress};
+
+        let (hub_control_tx, mut hub_control_rx) =
+            tokio::sync::mpsc::channel(HUB_CONTROL_QUEUE.capacity);
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<TransportEgress>(512);
+        let (session_io_tx, mut session_io_rx) =
+            tokio::sync::mpsc::channel(crate::worker::session_io::SESSION_IO_WORKER_QUEUE.capacity);
+        let mut session_io_txs = std::collections::HashMap::new();
+        session_io_txs.insert(session_uuid, session_io_tx);
+        let hub_event_tx = self.hub_event_tx.clone();
+        let hub_control_event_tx = self.hub_event_tx.clone();
+        let disconnect_client_id = client_id.clone();
+
+        tokio::spawn(async move {
+            while let Some(message) = hub_control_rx.recv().await {
+                let _ = hub_control_event_tx
+                    .send(super::events::HubEvent::ClientWorkerControl(message));
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(request) = session_io_rx.recv().await {
+                if let SessionIoRequest::PtyInput { data } = request {
+                    if let Err(e) = pty_handle.write_input_direct(&data) {
+                        log::error!("[Lua-Socket] Worker PTY write failed: {e}");
+                    }
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(egress) = outbound_rx.recv().await {
+                let Some(frame) = SocketFrameAdapter::egress_to_frame(egress) else {
+                    continue;
+                };
+                match frame_tx.try_send(frame.encode()) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        log::warn!(
+                            "[Lua-Socket] Adapter writer queue full for {}, forcing reconnect",
+                            disconnect_client_id
+                        );
+                        let _ =
+                            hub_event_tx.send(super::events::HubEvent::SocketClientDisconnected {
+                                client_id: disconnect_client_id.clone(),
+                            });
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        });
+
+        ClientWorker::start(ClientWorkerConfig::new(
+            crate::client::ClientId::Socket(client_id),
+            hub_control_tx,
+            outbound_tx,
+            session_io_txs,
+        ))
+    }
+
+    fn spawn_socket_control_worker_adapter(
+        &self,
+        client_id: String,
+        frame_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> crate::worker::client::ClientWorkerHandle {
+        use crate::worker::client::{ClientWorker, ClientWorkerConfig};
+        use crate::worker::hub_control::HUB_CONTROL_QUEUE;
+        use crate::worker::transport::{SocketFrameAdapter, TransportEgress};
+
+        let (hub_control_tx, mut hub_control_rx) =
+            tokio::sync::mpsc::channel(HUB_CONTROL_QUEUE.capacity);
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<TransportEgress>(512);
+        let hub_event_tx = self.hub_event_tx.clone();
+        let hub_control_event_tx = self.hub_event_tx.clone();
+        let disconnect_client_id = client_id.clone();
+
+        tokio::spawn(async move {
+            while let Some(message) = hub_control_rx.recv().await {
+                let _ = hub_control_event_tx
+                    .send(super::events::HubEvent::ClientWorkerControl(message));
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(egress) = outbound_rx.recv().await {
+                let Some(frame) = SocketFrameAdapter::egress_to_frame(egress) else {
+                    continue;
+                };
+                match frame_tx.try_send(frame.encode()) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        let _ =
+                            hub_event_tx.send(super::events::HubEvent::SocketClientDisconnected {
+                                client_id: disconnect_client_id.clone(),
+                            });
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        });
+
+        ClientWorker::start(ClientWorkerConfig::new(
+            crate::client::ClientId::Socket(client_id),
+            hub_control_tx,
+            outbound_tx,
+            std::collections::HashMap::new(),
+        ))
+    }
+
     fn handle_transport_control_message(
         &mut self,
         message: crate::worker::hub_control::HubControlMessage,
@@ -679,6 +907,59 @@ impl Hub {
         }
     }
 
+    fn handle_client_worker_control(
+        &mut self,
+        message: crate::worker::hub_control::HubControlMessage,
+    ) {
+        use crate::client::ClientId;
+        use crate::worker::hub_control::HubControlMessage;
+
+        match message {
+            HubControlMessage::AttachClient {
+                client_id,
+                session_uuid,
+                ..
+            } => {
+                let forwarder_key = match &client_id {
+                    ClientId::Tui => format!("tui:{session_uuid}"),
+                    ClientId::Socket(client_id) => format!("{client_id}:{session_uuid}"),
+                    ClientId::Browser(_) | ClientId::Internal => return,
+                };
+                self.register_terminal_forwarder_peer(
+                    &forwarder_key,
+                    &session_uuid,
+                    &client_id.to_string(),
+                );
+            }
+            HubControlMessage::DetachClient {
+                client_id,
+                session_uuid,
+                ..
+            } => {
+                let forwarder_key = match client_id {
+                    ClientId::Tui => format!("tui:{session_uuid}"),
+                    ClientId::Socket(client_id) => format!("{client_id}:{session_uuid}"),
+                    ClientId::Browser(_) | ClientId::Internal => return,
+                };
+                self.stop_lua_pty_forwarder(&forwarder_key);
+            }
+            HubControlMessage::Backpressure(backpressure) => {
+                log::warn!("[ClientWorker] Backpressure: {backpressure:?}");
+            }
+            HubControlMessage::Reconnect { .. }
+            | HubControlMessage::SessionLifecycle { .. }
+            | HubControlMessage::Shutdown { .. } => {
+                log::trace!("[ClientWorker] Hub-control request: {message:?}");
+            }
+            HubControlMessage::TransportBackpressure { .. }
+            | HubControlMessage::TransportPeerStateChanged { .. }
+            | HubControlMessage::TransportSignalReady { .. }
+            | HubControlMessage::TransportRatchetRestartRequested { .. } => {
+                self.handle_transport_control_message(message);
+            }
+        }
+    }
+
     /// Legacy polling entrypoint — calls all poll functions + flush.
     ///
     /// Only available in tests. Production uses `run_event_loop()` which drives
@@ -702,7 +983,19 @@ impl Hub {
         self.poll_lua_action_cable_channels();
         self.poll_webrtc_peer_messages();
         self.poll_user_file_watches();
+        self.poll_hub_events();
         self.process_pending_terminal_attaches();
+    }
+
+    #[cfg(test)]
+    fn poll_hub_events(&mut self) {
+        let Some(ref mut rx) = self.hub_event_rx else {
+            return;
+        };
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        for event in events {
+            self.handle_hub_event(event);
+        }
     }
 
     /// Legacy periodic maintenance (test-only fallback).
@@ -783,6 +1076,9 @@ impl Hub {
                 if let Some(output) = batch.output {
                     self.handle_observed_pty_output(batch.session_uuid, output);
                 }
+            }
+            HubEvent::ClientWorkerControl(message) => {
+                self.handle_client_worker_control(message);
             }
             HubEvent::TimerFired { timer_id } => {
                 self.record_volume_guardrail("timer_fired.count", "timer_fired.volume_burst");
@@ -1119,6 +1415,8 @@ impl Hub {
                 }
                 self.unregister_terminal_client_peer(&client_id, true);
                 let client_prefix = format!("{client_id}:");
+                self.terminal_client_workers
+                    .retain(|key, _| !key.starts_with(&client_prefix));
                 self.pty_forwarders.retain(|key, task| {
                     if key.starts_with(&client_prefix) {
                         task.abort();
@@ -1197,10 +1495,24 @@ impl Hub {
                 self.learn_terminal_probe_replies(&session_uuid, &client_id, &data);
                 self.lua.notify_pty_input(&session_uuid);
 
-                if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
-                    if let Err(e) = session_handle.pty().write_input_direct(&data) {
-                        log::error!("[Socket] PTY write failed for {}: {e}", client_id);
+                let forwarder_key = format!("{client_id}:{session_uuid}");
+                if let Some(worker) = self.terminal_client_workers.get(&forwarder_key) {
+                    let ingress = crate::worker::transport::SocketFrameAdapter::frame_to_ingress(
+                        crate::socket::framing::Frame::PtyInput {
+                            session_uuid: session_uuid.clone(),
+                            data,
+                        },
+                    )
+                    .expect("PtyInput frame maps to worker ingress");
+                    let adapter = crate::worker::transport::SocketFrameAdapter::new(client_id);
+                    let message = crate::worker::transport::TransportAdapter::ingress_to_client(
+                        &adapter, ingress,
+                    );
+                    if let Err(e) = worker.try_send(message) {
+                        log::warn!("[Socket] Worker input queue rejected {forwarder_key}: {e}");
                     }
+                } else {
+                    log::warn!("[Socket] No workerized terminal subscription for {forwarder_key}");
                 }
             }
             HubEvent::SocketSend(send_req) => {
@@ -2090,13 +2402,24 @@ impl Hub {
             }
             TuiRequest::PtyInput { session_uuid, data } => {
                 self.lua.notify_pty_input(&session_uuid);
-                if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
-                    if let Err(e) = session_handle.pty().write_input_direct(&data) {
-                        log::error!("[PTY-INPUT] Write failed: {e}");
+                let forwarder_key = format!("tui:{session_uuid}");
+                if let Some(worker) = self.terminal_client_workers.get(&forwarder_key) {
+                    let ingress = crate::worker::transport::TuiTransportAdapter::request_to_ingress(
+                        TuiRequest::PtyInput {
+                            session_uuid: session_uuid.clone(),
+                            data,
+                        },
+                    );
+                    let adapter = crate::worker::transport::TuiTransportAdapter::new();
+                    let message = crate::worker::transport::TransportAdapter::ingress_to_client(
+                        &adapter, ingress,
+                    );
+                    if let Err(e) = worker.try_send(message) {
+                        log::warn!("[PTY-INPUT] Worker input queue rejected {forwarder_key}: {e}");
                     }
                 } else {
                     log::warn!(
-                        "[PTY-INPUT] No session for UUID {} (cache has {} agents)",
+                        "[PTY-INPUT] No workerized terminal subscription for UUID {} (cache has {} agents)",
                         session_uuid,
                         self.handle_cache.len()
                     );
@@ -3571,47 +3894,6 @@ impl Hub {
         }
     }
 
-    fn send_tui_terminal_attach_state(
-        &self,
-        subscription_id: &str,
-        session_uuid: &str,
-        state: &str,
-    ) {
-        let Some(output_tx) = self.tui_output_tx.clone() else {
-            return;
-        };
-        Self::push_tui_terminal_attach_state(
-            &output_tx,
-            self.tui_wake_fd,
-            subscription_id,
-            session_uuid,
-            state,
-        );
-    }
-
-    fn send_socket_terminal_attach_state(
-        &self,
-        client_id: &str,
-        subscription_id: &str,
-        session_uuid: &str,
-        state: &str,
-    ) {
-        let Some(frame_tx) = self
-            .socket_clients
-            .get(client_id)
-            .map(crate::socket::client_conn::SocketClientConn::frame_sender)
-        else {
-            return;
-        };
-        Self::push_socket_terminal_attach_state(
-            &frame_tx,
-            client_id,
-            subscription_id,
-            session_uuid,
-            state,
-        );
-    }
-
     fn terminal_attach_state_payload(
         subscription_id: &str,
         session_uuid: &str,
@@ -3625,49 +3907,22 @@ impl Hub {
         })
     }
 
-    fn push_tui_terminal_attach_state(
-        output_tx: &tokio::sync::mpsc::UnboundedSender<crate::client::TuiOutput>,
-        wake_fd: Option<std::os::unix::io::RawFd>,
+    fn send_worker_terminal_attach_state(
+        worker: &crate::worker::client::ClientWorkerHandle,
         subscription_id: &str,
         session_uuid: &str,
         state: &str,
     ) {
         let payload = Self::terminal_attach_state_payload(subscription_id, session_uuid, state);
-        if output_tx
-            .send(crate::client::TuiOutput::Message(payload))
-            .is_ok()
-        {
-            if let Some(fd) = wake_fd {
-                super::wake_tui_pipe(fd);
-            }
-        }
-    }
-
-    fn push_socket_terminal_attach_state(
-        frame_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-        client_id: &str,
-        subscription_id: &str,
-        session_uuid: &str,
-        state: &str,
-    ) {
-        let payload = Self::terminal_attach_state_payload(subscription_id, session_uuid, state);
-        let frame = crate::socket::framing::Frame::Json(payload);
-        match frame_tx.try_send(frame.encode()) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                log::warn!(
-                    "[Lua-Socket] Outbound queue full while sending terminal_attach='{}' for {}",
-                    state,
-                    client_id
-                );
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                log::trace!(
-                    "[Lua-Socket] Frame channel closed before terminal_attach='{}' for {}",
-                    state,
-                    client_id
-                );
-            }
+        if let Err(e) = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+            crate::worker::client::ClientControlFrame::Json(payload),
+        )) {
+            log::warn!(
+                "[ClientWorker] Failed to queue terminal_attach state '{}' for {}: {}",
+                state,
+                session_uuid,
+                e
+            );
         }
     }
 
@@ -4298,7 +4553,6 @@ impl Hub {
                 continue;
             };
             if self.try_attach_pending_terminal_request(&intent.request) {
-                self.send_pending_terminal_attach_state(&intent.request, "attached");
             } else {
                 // Session may have disappeared between lookup and attach attempt.
                 self.pending_terminal_attaches.insert(key, intent);
@@ -4311,6 +4565,7 @@ impl Hub {
             };
             intent.request.deactivate();
             self.send_pending_terminal_attach_state(&intent.request, "not_found");
+            self.terminal_client_workers.remove(&key);
         }
     }
 
@@ -4342,15 +4597,26 @@ impl Hub {
                 );
             }
             PendingTerminalAttachRequest::Tui(req) => {
-                self.send_tui_terminal_attach_state(&req.subscription_id, &req.session_uuid, state);
+                let forwarder_key = format!("tui:{}", req.session_uuid);
+                if let Some(worker) = self.terminal_client_workers.get(&forwarder_key) {
+                    Self::send_worker_terminal_attach_state(
+                        worker,
+                        &req.subscription_id,
+                        &req.session_uuid,
+                        state,
+                    );
+                }
             }
             PendingTerminalAttachRequest::Socket(req) => {
-                self.send_socket_terminal_attach_state(
-                    &req.client_id,
-                    &req.subscription_id,
-                    &req.session_uuid,
-                    state,
-                );
+                let forwarder_key = format!("{}:{}", req.client_id, req.session_uuid);
+                if let Some(worker) = self.terminal_client_workers.get(&forwarder_key) {
+                    Self::send_worker_terminal_attach_state(
+                        worker,
+                        &req.subscription_id,
+                        &req.session_uuid,
+                        state,
+                    );
+                }
             }
         }
     }
@@ -4412,25 +4678,25 @@ impl Hub {
         let forwarder_key = format!("tui:{}", req.session_uuid);
 
         if self.try_attach_tui_terminal_forwarder(&req) {
-            self.send_tui_terminal_attach_state(
-                &req.subscription_id,
-                &req.session_uuid,
-                "attached",
-            );
             return;
         }
 
+        if let Some(output_tx) = self.tui_output_tx.clone() {
+            let _guard = self.tokio_runtime.enter();
+            let worker = self.spawn_tui_control_worker_adapter(output_tx);
+            Self::send_worker_terminal_attach_state(
+                &worker,
+                &req.subscription_id,
+                &req.session_uuid,
+                "pending",
+            );
+            self.terminal_client_workers
+                .insert(forwarder_key.clone(), worker);
+        }
         self.replace_pending_terminal_attach(
             &forwarder_key,
             PendingTerminalAttachRequest::Tui(req),
         );
-        if let Some(PendingTerminalAttach {
-            request: PendingTerminalAttachRequest::Tui(req),
-            ..
-        }) = self.pending_terminal_attaches.get(&forwarder_key)
-        {
-            self.send_tui_terminal_attach_state(&req.subscription_id, &req.session_uuid, "pending");
-        }
     }
 
     /// Try to attach a TUI PTY forwarder immediately.
@@ -4440,8 +4706,6 @@ impl Hub {
         &mut self,
         req: &crate::lua::primitives::CreateTuiForwarderRequest,
     ) -> bool {
-        use crate::client::TuiOutput;
-
         let forwarder_key = format!("tui:{}", req.session_uuid);
 
         // Check if session exists
@@ -4459,6 +4723,7 @@ impl Hub {
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
             self.unregister_terminal_forwarder_peer(&forwarder_key, false);
+            self.terminal_client_workers.remove(&forwarder_key);
             log::debug!(
                 "[Lua-TUI] Aborted existing PTY forwarder for {}",
                 forwarder_key
@@ -4469,21 +4734,39 @@ impl Hub {
         // the forwarder task so this handler never blocks the Hub event loop.
         let pty_for_snapshot = pty_handle.clone();
 
-        let sink = output_tx;
         let session_uuid = req.session_uuid.clone();
         let subscription_id = req.subscription_id.clone();
         let target_rows = req.rows;
         let target_cols = req.cols;
         let active_flag = Arc::clone(&req.active_flag);
-        let wake_fd = self.tui_wake_fd;
         let _guard = self.tokio_runtime.enter();
+        let worker = self.spawn_tui_client_worker_adapter(
+            req.session_uuid.clone(),
+            pty_handle.clone(),
+            output_tx,
+        );
+        self.terminal_client_workers
+            .insert(forwarder_key.clone(), worker.clone());
+        Self::send_worker_terminal_attach_state(
+            &worker,
+            &req.subscription_id,
+            &req.session_uuid,
+            "attached",
+        );
         let task = tokio::spawn(async move {
             use crate::agent::pty::PtyEvent;
+            use crate::worker::client::{ClientControlFrame, ClientWorkerMessage};
 
             log::info!(
                 "[Lua-TUI] Started PTY forwarder for session {}",
                 session_uuid
             );
+            let _ = worker
+                .send(ClientWorkerMessage::SubscribeSession {
+                    session_uuid: session_uuid.clone(),
+                    subscription_id: subscription_id.clone(),
+                })
+                .await;
 
             let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, mut pty_rx) =
                 match tokio::task::spawn_blocking(move || {
@@ -4544,13 +4827,14 @@ impl Hub {
                         "[Lua-TUI] Session RPC died before snapshot for {}; sending ProcessExited",
                         session_uuid
                     );
-                    let _ = sink.send(TuiOutput::ProcessExited {
-                        session_uuid: session_uuid.clone(),
-                        exit_code: None,
-                    });
-                    if let Some(fd) = wake_fd {
-                        super::wake_tui_pipe(fd);
-                    }
+                    let _ = worker
+                        .send(ClientWorkerMessage::ControlFrame(
+                            ClientControlFrame::ProcessExited {
+                                session_uuid: session_uuid.clone(),
+                                exit_code: None,
+                            },
+                        ))
+                        .await;
                     return;
                 }
                 SnapshotAttachState::Reconnecting => {
@@ -4558,13 +4842,16 @@ impl Hub {
                         "[Lua-TUI] Session '{}' snapshot unavailable — reconnect pending",
                         &session_uuid[..session_uuid.len().min(16)]
                     );
-                    Self::push_tui_terminal_attach_state(
-                        &sink,
-                        wake_fd,
-                        &subscription_id,
-                        &session_uuid,
-                        "reconnecting",
-                    );
+                    let _ = worker
+                        .send(ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(
+                            serde_json::json!({
+                                "type": "terminal_attach",
+                                "subscriptionId": subscription_id,
+                                "session_uuid": session_uuid,
+                                "state": "reconnecting",
+                            }),
+                        )))
+                        .await;
                 }
             }
 
@@ -4574,21 +4861,21 @@ impl Hub {
                     snapshot.len(),
                     session_uuid
                 );
-                if sink
-                    .send(TuiOutput::Scrollback {
-                        session_uuid: session_uuid.clone(),
-                        rows: snapshot_rows,
-                        cols: snapshot_cols,
-                        data: snapshot,
-                        kitty_enabled,
-                    })
+                if worker
+                    .send(ClientWorkerMessage::ControlFrame(
+                        ClientControlFrame::Scrollback {
+                            session_uuid: session_uuid.clone(),
+                            rows: snapshot_rows,
+                            cols: snapshot_cols,
+                            data: snapshot,
+                            kitty_enabled,
+                        },
+                    ))
+                    .await
                     .is_err()
                 {
                     log::trace!("[Lua-TUI] Output channel closed before snapshot sent");
                     return;
-                }
-                if let Some(fd) = wake_fd {
-                    super::wake_tui_pipe(fd);
                 }
             }
 
@@ -4631,18 +4918,18 @@ impl Hub {
                                 Err(_) => break,
                             }
                         }
-                        if sink
-                            .send(TuiOutput::OutputBatch {
-                                session_uuid: session_uuid.clone(),
-                                chunks,
-                            })
-                            .is_err()
-                        {
-                            log::trace!("[Lua-TUI] Output channel closed, stopping forwarder");
-                            break;
-                        }
-                        if let Some(fd) = wake_fd {
-                            super::wake_tui_pipe(fd);
+                        for chunk in chunks {
+                            if worker
+                                .send(ClientWorkerMessage::TerminalBytes {
+                                    session_uuid: session_uuid.clone(),
+                                    data: chunk,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                log::trace!("[Lua-TUI] Worker channel closed, stopping forwarder");
+                                break;
+                            }
                         }
 
                         // Process all stashed non-output events that were consumed
@@ -4656,34 +4943,37 @@ impl Hub {
                                         "[Lua-TUI] PTY process exited (code={:?}) for session {} (stashed)",
                                         exit_code, session_uuid
                                     );
-                                    let _ = sink.send(TuiOutput::ProcessExited {
-                                        session_uuid: session_uuid.clone(),
-                                        exit_code,
-                                    });
-                                    if let Some(fd) = wake_fd {
-                                        super::wake_tui_pipe(fd);
-                                    }
+                                    let _ = worker
+                                        .send(ClientWorkerMessage::ControlFrame(
+                                            ClientControlFrame::ProcessExited {
+                                                session_uuid: session_uuid.clone(),
+                                                exit_code,
+                                            },
+                                        ))
+                                        .await;
                                     should_break = true;
                                 }
                                 PtyEvent::KittyChanged(enabled) => {
-                                    let _ = sink.send(TuiOutput::Message(serde_json::json!({
-                                        "type": "kitty_changed",
-                                        "enabled": enabled,
-                                        "session_uuid": session_uuid,
-                                    })));
-                                    if let Some(fd) = wake_fd {
-                                        super::wake_tui_pipe(fd);
-                                    }
+                                    let _ = worker
+                                        .send(ClientWorkerMessage::ControlFrame(
+                                            ClientControlFrame::Json(serde_json::json!({
+                                                "type": "kitty_changed",
+                                                "enabled": enabled,
+                                                "session_uuid": session_uuid,
+                                            })),
+                                        ))
+                                        .await;
                                 }
                                 PtyEvent::FocusReportingChanged(enabled) => {
-                                    let _ = sink.send(TuiOutput::Message(serde_json::json!({
-                                        "type": "focus_reporting_changed",
-                                        "enabled": enabled,
-                                        "session_uuid": session_uuid,
-                                    })));
-                                    if let Some(fd) = wake_fd {
-                                        super::wake_tui_pipe(fd);
-                                    }
+                                    let _ = worker
+                                        .send(ClientWorkerMessage::ControlFrame(
+                                            ClientControlFrame::Json(serde_json::json!({
+                                                "type": "focus_reporting_changed",
+                                                "enabled": enabled,
+                                                "session_uuid": session_uuid,
+                                            })),
+                                        ))
+                                        .await;
                                 }
                                 PtyEvent::Output(_) => unreachable!("output handled above"),
                                 _ => {} // Resized, Notification, etc. — not forwarded to TUI
@@ -4699,34 +4989,37 @@ impl Hub {
                             exit_code,
                             session_uuid
                         );
-                        let _ = sink.send(TuiOutput::ProcessExited {
-                            session_uuid: session_uuid.clone(),
-                            exit_code,
-                        });
-                        if let Some(fd) = wake_fd {
-                            super::wake_tui_pipe(fd);
-                        }
+                        let _ = worker
+                            .send(ClientWorkerMessage::ControlFrame(
+                                ClientControlFrame::ProcessExited {
+                                    session_uuid: session_uuid.clone(),
+                                    exit_code,
+                                },
+                            ))
+                            .await;
                         break;
                     }
                     Ok(PtyEvent::KittyChanged(enabled)) => {
-                        let _ = sink.send(TuiOutput::Message(serde_json::json!({
-                            "type": "kitty_changed",
-                            "enabled": enabled,
-                            "session_uuid": session_uuid,
-                        })));
-                        if let Some(fd) = wake_fd {
-                            super::wake_tui_pipe(fd);
-                        }
+                        let _ = worker
+                            .send(ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(
+                                serde_json::json!({
+                                    "type": "kitty_changed",
+                                    "enabled": enabled,
+                                    "session_uuid": session_uuid,
+                                }),
+                            )))
+                            .await;
                     }
                     Ok(PtyEvent::FocusReportingChanged(enabled)) => {
-                        let _ = sink.send(TuiOutput::Message(serde_json::json!({
-                            "type": "focus_reporting_changed",
-                            "enabled": enabled,
-                            "session_uuid": session_uuid,
-                        })));
-                        if let Some(fd) = wake_fd {
-                            super::wake_tui_pipe(fd);
-                        }
+                        let _ = worker
+                            .send(ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(
+                                serde_json::json!({
+                                    "type": "focus_reporting_changed",
+                                    "enabled": enabled,
+                                    "session_uuid": session_uuid,
+                                }),
+                            )))
+                            .await;
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -4754,7 +5047,6 @@ impl Hub {
             );
         });
 
-        self.register_terminal_forwarder_peer(&forwarder_key, &req.session_uuid, "tui");
         self.pty_forwarders.insert(forwarder_key, task);
         true
     }
@@ -4770,31 +5062,29 @@ impl Hub {
         let forwarder_key = format!("{}:{}", req.client_id, req.session_uuid);
 
         if self.try_attach_socket_terminal_forwarder(&req) {
-            self.send_socket_terminal_attach_state(
-                &req.client_id,
-                &req.subscription_id,
-                &req.session_uuid,
-                "attached",
-            );
             return;
         }
 
-        self.replace_pending_terminal_attach(
-            &forwarder_key,
-            PendingTerminalAttachRequest::Socket(req),
-        );
-        if let Some(PendingTerminalAttach {
-            request: PendingTerminalAttachRequest::Socket(req),
-            ..
-        }) = self.pending_terminal_attaches.get(&forwarder_key)
+        if let Some(frame_tx) = self
+            .socket_clients
+            .get(&req.client_id)
+            .map(crate::socket::client_conn::SocketClientConn::frame_sender)
         {
-            self.send_socket_terminal_attach_state(
-                &req.client_id,
+            let _guard = self.tokio_runtime.enter();
+            let worker = self.spawn_socket_control_worker_adapter(req.client_id.clone(), frame_tx);
+            Self::send_worker_terminal_attach_state(
+                &worker,
                 &req.subscription_id,
                 &req.session_uuid,
                 "pending",
             );
+            self.terminal_client_workers
+                .insert(forwarder_key.clone(), worker);
         }
+        self.replace_pending_terminal_attach(
+            &forwarder_key,
+            PendingTerminalAttachRequest::Socket(req),
+        );
     }
 
     /// Try to attach a socket PTY forwarder immediately.
@@ -4804,8 +5094,6 @@ impl Hub {
         &mut self,
         req: &crate::lua::primitives::CreateSocketForwarderRequest,
     ) -> bool {
-        use crate::socket::framing::Frame;
-
         let forwarder_key = format!("{}:{}", req.client_id, req.session_uuid);
 
         let Some(session_handle) = self.handle_cache.get_session(&req.session_uuid) else {
@@ -4826,6 +5114,7 @@ impl Hub {
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
             self.unregister_terminal_forwarder_peer(&forwarder_key, false);
+            self.terminal_client_workers.remove(&forwarder_key);
             log::debug!(
                 "[Lua-Socket] Aborted existing PTY forwarder for {}",
                 forwarder_key
@@ -4844,17 +5133,37 @@ impl Hub {
         let target_cols = req.cols;
         let active_flag = Arc::clone(&req.active_flag);
         let client_id = req.client_id.clone();
-        let hub_event_tx = self.hub_event_tx.clone();
 
         let _guard = self.tokio_runtime.enter();
+        let worker = self.spawn_socket_client_worker_adapter(
+            client_id.clone(),
+            req.session_uuid.clone(),
+            pty_handle.clone(),
+            frame_tx.clone(),
+        );
+        self.terminal_client_workers
+            .insert(forwarder_key.clone(), worker.clone());
+        Self::send_worker_terminal_attach_state(
+            &worker,
+            &req.subscription_id,
+            &req.session_uuid,
+            "attached",
+        );
         let task = tokio::spawn(async move {
             use crate::agent::pty::PtyEvent;
+            use crate::worker::client::{ClientControlFrame, ClientWorkerMessage};
 
             log::info!(
                 "[Lua-Socket] Started PTY forwarder for {} session {}",
                 client_id,
                 session_uuid
             );
+            let _ = worker
+                .send(ClientWorkerMessage::SubscribeSession {
+                    session_uuid: session_uuid.clone(),
+                    subscription_id: subscription_id.clone(),
+                })
+                .await;
             let mut query_filter_buffer = Vec::new();
 
             let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, mut pty_rx) =
@@ -4919,11 +5228,14 @@ impl Hub {
                         client_id,
                         session_uuid
                     );
-                    let frame = Frame::ProcessExited {
-                        session_uuid: session_uuid.clone(),
-                        exit_code: None,
-                    };
-                    let _ = frame_tx.try_send(frame.encode());
+                    let _ = worker
+                        .send(ClientWorkerMessage::ControlFrame(
+                            ClientControlFrame::ProcessExited {
+                                session_uuid: session_uuid.clone(),
+                                exit_code: None,
+                            },
+                        ))
+                        .await;
                     return;
                 }
                 SnapshotAttachState::Reconnecting => {
@@ -4931,41 +5243,35 @@ impl Hub {
                         "[Lua-Socket] Session '{}' snapshot unavailable — reconnect pending",
                         &session_uuid[..session_uuid.len().min(16)]
                     );
-                    Self::push_socket_terminal_attach_state(
-                        &frame_tx,
-                        &client_id,
-                        &subscription_id,
-                        &session_uuid,
-                        "reconnecting",
-                    );
+                    let _ = worker
+                        .send(ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(
+                            serde_json::json!({
+                                "type": "terminal_attach",
+                                "subscriptionId": subscription_id,
+                                "session_uuid": session_uuid,
+                                "state": "reconnecting",
+                            }),
+                        )))
+                        .await;
                 }
             }
 
             if attach_state != SnapshotAttachState::Reconnecting {
-                let frame = Frame::Scrollback {
-                    session_uuid: session_uuid.clone(),
-                    rows: snapshot_rows,
-                    cols: snapshot_cols,
-                    kitty_enabled,
-                    data: snapshot,
-                };
-                match frame_tx.try_send(frame.encode()) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        log::warn!(
-                            "[Lua-Socket] Outbound queue full for {}, forcing reconnect",
-                            client_id
-                        );
-                        let _ =
-                            hub_event_tx.send(super::events::HubEvent::SocketClientDisconnected {
-                                client_id: client_id.clone(),
-                            });
-                        return;
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        log::trace!("[Lua-Socket] Frame channel closed before snapshot sent");
-                        return;
-                    }
+                if worker
+                    .send(ClientWorkerMessage::ControlFrame(
+                        ClientControlFrame::Scrollback {
+                            session_uuid: session_uuid.clone(),
+                            rows: snapshot_rows,
+                            cols: snapshot_cols,
+                            kitty_enabled,
+                            data: snapshot,
+                        },
+                    ))
+                    .await
+                    .is_err()
+                {
+                    log::trace!("[Lua-Socket] Worker channel closed before snapshot sent");
+                    return;
                 }
             }
 
@@ -5001,30 +5307,16 @@ impl Hub {
                             continue;
                         }
 
-                        let frame = Frame::PtyOutput {
-                            session_uuid: session_uuid.clone(),
-                            data: filtered,
-                        };
-                        match frame_tx.try_send(frame.encode()) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                log::warn!(
-                                    "[Lua-Socket] Outbound queue full for {}, forcing reconnect",
-                                    client_id
-                                );
-                                let _ = hub_event_tx.send(
-                                    super::events::HubEvent::SocketClientDisconnected {
-                                        client_id: client_id.clone(),
-                                    },
-                                );
-                                break;
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                log::trace!(
-                                    "[Lua-Socket] Frame channel closed, stopping forwarder"
-                                );
-                                break;
-                            }
+                        if worker
+                            .send(ClientWorkerMessage::TerminalBytes {
+                                session_uuid: session_uuid.clone(),
+                                data: filtered,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            log::trace!("[Lua-Socket] Worker channel closed, stopping forwarder");
+                            break;
                         }
                     }
                     Ok(PtyEvent::ProcessExited { exit_code }) => {
@@ -5034,28 +5326,37 @@ impl Hub {
                             client_id,
                             session_uuid
                         );
-                        let frame = Frame::ProcessExited {
-                            session_uuid: session_uuid.clone(),
-                            exit_code,
-                        };
-                        let _ = frame_tx.try_send(frame.encode());
+                        let _ = worker
+                            .send(ClientWorkerMessage::ControlFrame(
+                                ClientControlFrame::ProcessExited {
+                                    session_uuid: session_uuid.clone(),
+                                    exit_code,
+                                },
+                            ))
+                            .await;
                         break;
                     }
                     Ok(PtyEvent::KittyChanged(enabled)) => {
-                        let frame = Frame::Json(serde_json::json!({
-                            "type": "kitty_changed",
-                            "enabled": enabled,
-                            "session_uuid": session_uuid,
-                        }));
-                        let _ = frame_tx.try_send(frame.encode());
+                        let _ = worker
+                            .send(ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(
+                                serde_json::json!({
+                                    "type": "kitty_changed",
+                                    "enabled": enabled,
+                                    "session_uuid": session_uuid,
+                                }),
+                            )))
+                            .await;
                     }
                     Ok(PtyEvent::FocusReportingChanged(enabled)) => {
-                        let frame = Frame::Json(serde_json::json!({
-                            "type": "focus_reporting_changed",
-                            "enabled": enabled,
-                            "session_uuid": session_uuid,
-                        }));
-                        let _ = frame_tx.try_send(frame.encode());
+                        let _ = worker
+                            .send(ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(
+                                serde_json::json!({
+                                    "type": "focus_reporting_changed",
+                                    "enabled": enabled,
+                                    "session_uuid": session_uuid,
+                                }),
+                            )))
+                            .await;
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -5088,7 +5389,6 @@ impl Hub {
             );
         });
 
-        self.register_terminal_forwarder_peer(&forwarder_key, &req.session_uuid, &req.client_id);
         self.pty_forwarders.insert(forwarder_key, task);
         true
     }
@@ -5101,6 +5401,7 @@ impl Hub {
         if let Some(task) = self.pty_forwarders.remove(forwarder_id) {
             task.abort();
             self.unregister_terminal_forwarder_peer(forwarder_id, true);
+            self.terminal_client_workers.remove(forwarder_id);
             log::debug!("[Lua] Stopped PTY forwarder {}", forwarder_id);
         }
     }
@@ -7692,6 +7993,110 @@ mod tests {
         assert!(
             hub.pty_forwarders.contains_key(&key),
             "socket forwarder should start after prerequisites are available"
+        );
+    }
+
+    #[test]
+    fn test_tui_worker_handle_registered_and_removed_with_forwarder() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-tui-worker-lifecycle";
+        let key = format!("tui:{session_uuid}");
+
+        hub.handle_cache
+            .add_session(test_session_handle(session_uuid));
+
+        let req = crate::lua::primitives::CreateTuiForwarderRequest {
+            session_uuid: session_uuid.to_string(),
+            subscription_id: format!("tui:{session_uuid}"),
+            active_flag: Arc::new(Mutex::new(true)),
+            rows: 24,
+            cols: 80,
+        };
+        hub.create_lua_tui_pty_forwarder(req);
+        hub.tick();
+
+        assert!(
+            hub.terminal_client_workers.contains_key(&key),
+            "TUI forwarder should register a ClientWorker handle"
+        );
+        assert!(
+            hub.pty_forwarders.contains_key(&key),
+            "TUI forwarder task should be tracked by the hub"
+        );
+
+        hub.stop_lua_pty_forwarder(&key);
+
+        assert!(
+            !hub.terminal_client_workers.contains_key(&key),
+            "stopping the forwarder should remove the ClientWorker handle"
+        );
+        assert!(
+            !hub.pty_forwarders.contains_key(&key),
+            "stopping the forwarder should remove the task"
+        );
+    }
+
+    #[test]
+    fn test_socket_workerized_live_output_reaches_socket_frame() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-socket-worker-output".to_string();
+        let client_id = "socket:worker-output".to_string();
+        let key = format!("{client_id}:{session_uuid}");
+
+        let session = test_session_handle(&session_uuid);
+        let event_tx = session.pty().event_tx_clone();
+        hub.handle_cache.add_session(session);
+        let mut client_stream = register_test_socket_client(&mut hub, &client_id);
+
+        let req = crate::lua::primitives::CreateSocketForwarderRequest {
+            client_id,
+            session_uuid: session_uuid.to_string(),
+            subscription_id: format!("socket:{session_uuid}"),
+            active_flag: Arc::new(Mutex::new(true)),
+            rows: 24,
+            cols: 80,
+        };
+        hub.create_lua_socket_pty_forwarder(req);
+        hub.tick();
+
+        assert!(
+            hub.terminal_client_workers.contains_key(&key),
+            "socket forwarder should register a ClientWorker handle"
+        );
+
+        let subscribed = hub.tokio_runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if event_tx.receiver_count() > 0 {
+                    break true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        assert!(
+            subscribed,
+            "socket forwarder should subscribe to PTY output before test emits live bytes"
+        );
+
+        let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(b"worker-live".to_vec()));
+
+        let mut found = false;
+        for _ in 0..4 {
+            if matches!(
+                read_test_socket_frame(&mut client_stream),
+                Frame::PtyOutput { session_uuid: ref frame_session, ref data }
+                    if frame_session == &session_uuid && data == b"worker-live"
+            ) {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "live socket PTY output should flow through worker egress"
         );
     }
 

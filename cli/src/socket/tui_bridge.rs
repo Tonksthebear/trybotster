@@ -672,6 +672,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bridge_binary_hub_to_tui() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (handle, mut channels, server_read, mut server_write, shutdown) =
+            setup_bridge(&tmp, "binary_h2t.sock").await;
+
+        let frame = Frame::Binary(vec![0, 1, 2, 255]);
+        server_write.write_all(&frame.encode()).await.unwrap();
+
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(2), channels.output_rx.recv())
+                .await
+                .expect("Timed out")
+                .expect("Channel closed");
+
+        match output {
+            TuiOutput::Binary(data) => assert_eq!(data, vec![0, 1, 2, 255]),
+            other => panic!("Expected TuiOutput::Binary, got: {other:?}"),
+        }
+
+        teardown(handle, channels, shutdown, server_read, server_write).await;
+    }
+
+    #[tokio::test]
     async fn test_bridge_hub_disconnect_signals_shutdown() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (handle, _channels, server_read, server_write, shutdown) =
