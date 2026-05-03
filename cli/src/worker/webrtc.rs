@@ -14,6 +14,7 @@ use crate::channel::Channel;
 use crate::client::ClientId;
 
 use super::client::{ClientControlFrame, ClientWorkerMessage};
+use super::hub_control::HubControlMessage;
 use super::transport::{TransportAdapter, TransportEgress, TransportIngress};
 
 /// Capacity for PTY output messages queued from forwarder tasks.
@@ -160,6 +161,83 @@ pub(crate) struct BackpressureRecoveryEntry {
     pub(crate) last_drop: Instant,
 }
 
+#[derive(Debug)]
+pub(crate) struct WebRtcOfferRequest {
+    pub(crate) browser_identity: String,
+    pub(crate) sdp: String,
+    pub(crate) hub_id: String,
+    pub(crate) server_url: String,
+    pub(crate) api_key: String,
+    pub(crate) crypto_service: crate::relay::CryptoService,
+    pub(crate) outgoing_signal_tx:
+        tokio::sync::mpsc::Sender<crate::channel::webrtc::OutgoingSignal>,
+    pub(crate) stream_frame_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::StreamIncoming>,
+    pub(crate) hub_event_tx: crate::hub::events::HubEventTx,
+    pub(crate) pty_input_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::PtyInputIncoming>,
+    pub(crate) file_input_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::FileInputIncoming>,
+}
+
+#[derive(Debug)]
+pub(crate) struct WebRtcOfferStart {
+    pub(crate) browser_identity: String,
+    pub(crate) sdp: String,
+    pub(crate) generation: u64,
+    pub(crate) channel: crate::channel::WebRtcChannel,
+    pub(crate) crypto_service: crate::relay::CryptoService,
+}
+
+#[derive(Debug)]
+pub(crate) struct WebRtcOfferCompletion {
+    pub(crate) browser_identity: String,
+    pub(crate) generation: u64,
+    pub(crate) channel: crate::channel::WebRtcChannel,
+    pub(crate) encrypted_answer: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
+pub(crate) enum WebRtcOfferCompletionOutcome {
+    AnswerReady {
+        browser_identity: String,
+        generation: u64,
+        envelope: serde_json::Value,
+        queued_ice: Vec<(u64, serde_json::Value)>,
+    },
+    StaleDropped {
+        browser_identity: String,
+        completed_generation: u64,
+        current_generation: u64,
+    },
+    FailedCleaned {
+        browser_identity: String,
+        generation: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum WebRtcIngressOutcome {
+    PongQueued,
+    PongObserved,
+    TerminalColorProfile(serde_json::Value),
+    LuaMessage(serde_json::Value),
+    ClientWorker(ClientWorkerMessage),
+    ParseFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WebRtcRecoverySnapshotRequest {
+    pub(crate) request_id: String,
+    pub(crate) browser_identity: String,
+    pub(crate) session_uuid: String,
+    pub(crate) subscription_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WebRtcRecoverySnapshotResult {
+    Snapshot(Vec<u8>),
+    Empty,
+    Failed,
+}
+
 /// Adapter-owned per-peer WebRTC registry.
 #[derive(Debug)]
 pub(crate) struct WebRtcPeerRegistry {
@@ -172,6 +250,7 @@ pub(crate) struct WebRtcPeerRegistry {
     pending_closes: HashMap<String, tokio::sync::watch::Receiver<bool>>,
     offer_generation: HashMap<String, u64>,
     pending_ice_candidates: HashMap<String, Vec<(u64, serde_json::Value)>>,
+    ratchet_restarted_peers: HashSet<String>,
     pty_output_tx: tokio::sync::mpsc::Sender<crate::hub::WebRtcPtyOutput>,
     pty_output_rx: Option<tokio::sync::mpsc::Receiver<crate::hub::WebRtcPtyOutput>>,
     backpressure_recovery: HashMap<String, BackpressureRecoveryEntry>,
@@ -183,14 +262,14 @@ pub(crate) struct WebRtcPeerRegistry {
     pty_input_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::PtyInputIncoming>,
     file_input_rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::FileInputIncoming>>,
     file_input_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::FileInputIncoming>,
+    queue_forwarders: Vec<tokio::task::JoinHandle<()>>,
     runners: HashMap<String, WebRtcTransportRunner>,
 }
 
-/// Async peer runner ownership marker.
+/// Async peer runner ownership marker for WebRTC transport mechanics.
 ///
-/// The production hub creates and drives runners through `WebRtcPeerRegistry`;
-/// this struct keeps runner-scoped dependencies explicit as the registry
-/// absorbs the remaining peer lifecycle methods.
+/// The registry creates runners for connected peers. Hub policy receives typed
+/// summaries and keeps orchestration decisions outside the data-plane owner.
 #[derive(Debug, Clone)]
 pub(crate) struct WebRtcTransportRunner {
     pub(crate) client_id: ClientId,
@@ -227,6 +306,134 @@ impl WebRtcTransportRunner {
         );
         self.adapter.ingress_to_client(ingress)
     }
+
+    pub(crate) fn handle_plaintext_payload(&self, payload: &[u8]) -> WebRtcIngressOutcome {
+        let msg = match serde_json::from_slice::<serde_json::Value>(payload) {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!("[WebRTC-MSG] JSON parse failed: {error}");
+                return WebRtcIngressOutcome::ParseFailed;
+            }
+        };
+
+        let msg_type = msg.get("type").and_then(|t| t.as_str());
+        let ingress = match msg_type {
+            Some("dc_ping") => TransportIngress::DcPing,
+            Some("dc_pong") => TransportIngress::DcPong,
+            Some("focus_changed") => {
+                let session_uuid = msg
+                    .get("session_uuid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let focused = msg
+                    .get("focused")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                TransportIngress::FocusChanged {
+                    session_uuid,
+                    focused,
+                }
+            }
+            _ => TransportIngress::BoundaryJson(msg),
+        };
+
+        let client_message = self.ingress_to_client(ingress);
+        let msg = match client_message {
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::BoundaryJson(value)) => value,
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPong) => {
+                let pong = serde_json::to_vec(&crate::worker::transport::egress_dc_pong())
+                    .expect("static JSON serialization cannot fail");
+                if self
+                    .command_tx
+                    .try_send(WebRtcAdapterCommand::Json { data: pong })
+                    .is_err()
+                {
+                    log::debug!(
+                        "[WebRTC] Failed to queue dc_pong for {}",
+                        &self.browser_identity[..self.browser_identity.len().min(8)]
+                    );
+                }
+                return WebRtcIngressOutcome::PongQueued;
+            }
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPongReceived) => {
+                return WebRtcIngressOutcome::PongObserved;
+            }
+            other => return WebRtcIngressOutcome::ClientWorker(other),
+        };
+
+        match msg.get("type").and_then(|t| t.as_str()) {
+            Some("terminal_color_profile") => WebRtcIngressOutcome::TerminalColorProfile(msg),
+            _ => WebRtcIngressOutcome::LuaMessage(msg),
+        }
+    }
+
+    pub(crate) async fn negotiate_offer(start: WebRtcOfferStart) -> WebRtcOfferCompletion {
+        let WebRtcOfferStart {
+            browser_identity,
+            sdp,
+            generation,
+            channel,
+            crypto_service,
+        } = start;
+        let started_at = Instant::now();
+        let olm_key = crate::relay::extract_olm_key(&browser_identity).to_string();
+        let encrypted_answer = match channel.handle_sdp_offer(&sdp, &browser_identity).await {
+            Ok(answer_sdp) => {
+                log::info!(
+                    "[WebRTC] Created answer for {} in {}ms",
+                    &browser_identity[..browser_identity.len().min(12)],
+                    started_at.elapsed().as_millis()
+                );
+                let answer_payload = serde_json::json!({
+                    "type": "answer",
+                    "sdp": answer_sdp,
+                });
+                let plaintext = serde_json::to_vec(&answer_payload).unwrap_or_default();
+                match crypto_service.lock() {
+                    Ok(mut guard) => match guard.encrypt(&plaintext, &olm_key) {
+                        Ok(envelope) => match serde_json::to_value(&envelope) {
+                            Ok(value) => Some(value),
+                            Err(error) => {
+                                log::error!(
+                                    "[WebRTC] Failed to serialize answer envelope: {error}"
+                                );
+                                None
+                            }
+                        },
+                        Err(error) => {
+                            log::error!(
+                                "[WebRTC] Failed to encrypt answer after {}ms: {error}",
+                                started_at.elapsed().as_millis()
+                            );
+                            None
+                        }
+                    },
+                    Err(error) => {
+                        log::error!(
+                            "[WebRTC] Crypto mutex poisoned after {}ms: {error}",
+                            started_at.elapsed().as_millis()
+                        );
+                        None
+                    }
+                }
+            }
+            Err(error) => {
+                log::error!(
+                    "[WebRTC] Failed to handle offer after {}ms: {error}",
+                    started_at.elapsed().as_millis()
+                );
+                None
+            }
+        };
+
+        WebRtcOfferCompletion {
+            browser_identity,
+            generation,
+            channel,
+            encrypted_answer,
+        }
+    }
 }
 
 impl WebRtcPeerRegistry {
@@ -254,6 +461,7 @@ impl WebRtcPeerRegistry {
             pending_closes: HashMap::new(),
             offer_generation: HashMap::new(),
             pending_ice_candidates: HashMap::new(),
+            ratchet_restarted_peers: HashSet::new(),
             pty_output_tx,
             pty_output_rx: Some(pty_output_rx),
             backpressure_recovery: HashMap::new(),
@@ -265,6 +473,7 @@ impl WebRtcPeerRegistry {
             pty_input_tx,
             file_input_rx: Some(file_input_rx),
             file_input_tx,
+            queue_forwarders: Vec::new(),
             runners: HashMap::new(),
         }
     }
@@ -297,65 +506,135 @@ impl WebRtcPeerRegistry {
         self.file_input_tx.clone()
     }
 
-    pub(crate) fn take_pty_input_rx(
+    pub(crate) fn start_queue_forwarders(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        hub_event_tx: crate::hub::events::HubEventTx,
+    ) {
+        if !self.queue_forwarders.is_empty() {
+            return;
+        }
+
+        if let Some(mut rx) = self.pty_input_rx.take() {
+            let tx = hub_event_tx.clone();
+            self.queue_forwarders.push(runtime.spawn(async move {
+                while let Some(input) = rx.recv().await {
+                    if tx
+                        .send(crate::hub::events::HubEvent::WebRtcPtyInput(input))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+        if let Some(mut rx) = self.file_input_rx.take() {
+            let tx = hub_event_tx.clone();
+            self.queue_forwarders.push(runtime.spawn(async move {
+                while let Some(file) = rx.recv().await {
+                    if tx
+                        .send(crate::hub::events::HubEvent::WebRtcFileInput(file))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+        if let Some(mut rx) = self.outgoing_signal_rx.take() {
+            let tx = hub_event_tx.clone();
+            self.queue_forwarders.push(runtime.spawn(async move {
+                while let Some(signal) = rx.recv().await {
+                    if tx
+                        .send(crate::hub::events::HubEvent::WebRtcOutgoingSignal(signal))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+        if let Some(mut rx) = self.pty_output_rx.take() {
+            let tx = hub_event_tx.clone();
+            self.queue_forwarders.push(runtime.spawn(async move {
+                while let Some(output) = rx.recv().await {
+                    if tx
+                        .send(crate::hub::events::HubEvent::WebRtcPtyOutput(output))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+        if let Some(mut rx) = self.stream_frame_rx.take() {
+            self.queue_forwarders.push(runtime.spawn(async move {
+                while let Some(frame) = rx.recv().await {
+                    if hub_event_tx
+                        .send(crate::hub::events::HubEvent::WebRtcStreamFrame(frame))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lease_pty_input_receiver_for_test(
         &mut self,
     ) -> Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::PtyInputIncoming>> {
         self.pty_input_rx.take()
     }
 
-    pub(crate) fn restore_pty_input_rx(
+    #[cfg(test)]
+    pub(crate) fn return_pty_input_receiver_for_test(
         &mut self,
         rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::PtyInputIncoming>>,
     ) {
         self.pty_input_rx = rx;
     }
 
-    pub(crate) fn take_file_input_rx(
-        &mut self,
-    ) -> Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::FileInputIncoming>> {
-        self.file_input_rx.take()
-    }
-
-    pub(crate) fn restore_file_input_rx(
-        &mut self,
-        rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::FileInputIncoming>>,
-    ) {
-        self.file_input_rx = rx;
-    }
-
-    pub(crate) fn take_outgoing_signal_rx(
+    #[cfg(test)]
+    pub(crate) fn lease_outgoing_signal_receiver_for_test(
         &mut self,
     ) -> Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::OutgoingSignal>> {
         self.outgoing_signal_rx.take()
     }
 
-    pub(crate) fn restore_outgoing_signal_rx(
+    #[cfg(test)]
+    pub(crate) fn return_outgoing_signal_receiver_for_test(
         &mut self,
         rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::OutgoingSignal>>,
     ) {
         self.outgoing_signal_rx = rx;
     }
 
-    pub(crate) fn take_pty_output_rx(
+    #[cfg(test)]
+    pub(crate) fn lease_pty_output_receiver_for_test(
         &mut self,
     ) -> Option<tokio::sync::mpsc::Receiver<crate::hub::WebRtcPtyOutput>> {
         self.pty_output_rx.take()
     }
 
-    pub(crate) fn restore_pty_output_rx(
+    #[cfg(test)]
+    pub(crate) fn return_pty_output_receiver_for_test(
         &mut self,
         rx: Option<tokio::sync::mpsc::Receiver<crate::hub::WebRtcPtyOutput>>,
     ) {
         self.pty_output_rx = rx;
     }
 
-    pub(crate) fn take_stream_frame_rx(
+    #[cfg(test)]
+    pub(crate) fn lease_stream_frame_receiver_for_test(
         &mut self,
     ) -> Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::StreamIncoming>> {
         self.stream_frame_rx.take()
     }
 
-    pub(crate) fn restore_stream_frame_rx(
+    #[cfg(test)]
+    pub(crate) fn return_stream_frame_receiver_for_test(
         &mut self,
         rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::StreamIncoming>>,
     ) {
@@ -388,28 +667,42 @@ impl WebRtcPeerRegistry {
         self.channels.contains_key(browser_identity)
     }
 
-    pub(crate) fn remove_channel(
+    pub(crate) fn mark_data_channel_open(
         &mut self,
         browser_identity: &str,
-    ) -> Option<crate::channel::WebRtcChannel> {
-        self.channels.remove(browser_identity)
+        generation: u64,
+    ) -> Option<HubControlMessage> {
+        if !self.channels.contains_key(browser_identity) {
+            return None;
+        }
+        self.connected_at
+            .insert(browser_identity.to_string(), Instant::now());
+        Some(HubControlMessage::TransportPeerStateChanged {
+            client_id: ClientId::browser(browser_identity.to_string()),
+            browser_identity: browser_identity.to_string(),
+            state: super::hub_control::TransportPeerState::Connected {
+                generation,
+                mode: super::hub_control::TransportConnectionMode::Unknown,
+            },
+        })
     }
 
-    pub(crate) fn insert_channel(
+    pub(crate) fn mark_data_channel_closed(
         &mut self,
-        browser_identity: String,
-        channel: crate::channel::WebRtcChannel,
-    ) -> Option<crate::channel::WebRtcChannel> {
-        self.channels.insert(browser_identity, channel)
-    }
-
-    pub(crate) fn mark_connecting(&mut self, browser_identity: String) {
-        self.connection_started
-            .insert(browser_identity, Instant::now());
-    }
-
-    pub(crate) fn mark_connected(&mut self, browser_identity: String) {
-        self.connected_at.insert(browser_identity, Instant::now());
+        browser_identity: &str,
+        generation: u64,
+        reason: super::hub_control::TransportDisconnectReason,
+        runtime: &tokio::runtime::Runtime,
+    ) -> Option<(TransportCleanup, HubControlMessage)> {
+        let cleanup = self.cleanup_peer_transport(browser_identity, runtime)?;
+        Some((
+            cleanup,
+            HubControlMessage::TransportPeerStateChanged {
+                client_id: ClientId::browser(browser_identity.to_string()),
+                browser_identity: browser_identity.to_string(),
+                state: super::hub_control::TransportPeerState::Disconnected { generation, reason },
+            },
+        ))
     }
 
     pub(crate) fn same_device_channels(&self, browser_identity: &str) -> Vec<String> {
@@ -423,11 +716,27 @@ impl WebRtcPeerRegistry {
             .collect()
     }
 
-    pub(crate) fn take_pending_close_for_olm(
+    pub(crate) fn wait_for_replaced_peer_close(
         &mut self,
         olm_key: &str,
-    ) -> Option<tokio::sync::watch::Receiver<bool>> {
-        self.pending_closes.remove(olm_key)
+        timeout: Duration,
+        runtime: &tokio::runtime::Runtime,
+    ) -> ReplacedPeerCloseWait {
+        let Some(mut close_rx) = self.pending_closes.remove(olm_key) else {
+            return ReplacedPeerCloseWait::NoPendingClose;
+        };
+        if *close_rx.borrow() {
+            return ReplacedPeerCloseWait::AlreadyClosed;
+        }
+        let wait_result = tokio::task::block_in_place(|| {
+            runtime
+                .block_on(async { tokio::time::timeout(timeout, close_rx.wait_for(|v| *v)).await })
+        });
+        match wait_result {
+            Ok(Ok(_)) => ReplacedPeerCloseWait::Closed,
+            Ok(Err(_)) => ReplacedPeerCloseWait::ClosedChannelDropped,
+            Err(_) => ReplacedPeerCloseWait::TimedOut,
+        }
     }
 
     pub(crate) fn next_offer_generation(&mut self, browser_identity: &str) -> u64 {
@@ -444,6 +753,100 @@ impl WebRtcPeerRegistry {
             .get(browser_identity)
             .copied()
             .unwrap_or(0)
+    }
+
+    pub(crate) fn start_offer(
+        &mut self,
+        request: WebRtcOfferRequest,
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<WebRtcOfferStart, crate::channel::ChannelError> {
+        use crate::channel::{ChannelConfig, WebRtcChannel};
+
+        let generation = self.next_offer_generation(&request.browser_identity);
+        let builder = WebRtcChannel::builder()
+            .server_url(&request.server_url)
+            .api_key(&request.api_key)
+            .signal_tx(request.outgoing_signal_tx)
+            .stream_frame_tx(request.stream_frame_tx)
+            .hub_event_tx(request.hub_event_tx)
+            .crypto_service(Arc::clone(&request.crypto_service))
+            .pty_input_tx(request.pty_input_tx)
+            .file_input_tx(request.file_input_tx);
+
+        let mut channel = builder.build();
+        let config = ChannelConfig {
+            channel_name: "WebRtcChannel".to_string(),
+            hub_id: request.hub_id,
+            browser_identity: Some(request.browser_identity.clone()),
+            encrypt: true,
+            compression_threshold: Some(4096),
+            cli_subscription: false,
+        };
+
+        tokio::task::block_in_place(|| runtime.block_on(channel.connect(config)))?;
+        self.connection_started
+            .insert(request.browser_identity.clone(), Instant::now());
+
+        Ok(WebRtcOfferStart {
+            browser_identity: request.browser_identity,
+            sdp: request.sdp,
+            generation,
+            channel,
+            crypto_service: request.crypto_service,
+        })
+    }
+
+    pub(crate) fn complete_offer(
+        &mut self,
+        completion: WebRtcOfferCompletion,
+        runtime: &tokio::runtime::Runtime,
+    ) -> WebRtcOfferCompletionOutcome {
+        let WebRtcOfferCompletion {
+            browser_identity,
+            generation,
+            mut channel,
+            encrypted_answer,
+        } = completion;
+        let current_generation = self.current_offer_generation(&browser_identity);
+        if generation != current_generation {
+            let stale_browser_identity = browser_identity.clone();
+            runtime.spawn(async move {
+                channel.disconnect().await;
+            });
+            return WebRtcOfferCompletionOutcome::StaleDropped {
+                browser_identity: stale_browser_identity,
+                completed_generation: generation,
+                current_generation,
+            };
+        }
+
+        let Some(envelope) = encrypted_answer else {
+            self.clear_offer_state(&browser_identity);
+            let failed_browser_identity = browser_identity.clone();
+            runtime.spawn(async move {
+                channel.disconnect().await;
+            });
+            return WebRtcOfferCompletionOutcome::FailedCleaned {
+                browser_identity: failed_browser_identity,
+                generation,
+            };
+        };
+
+        if let Some(mut replaced) = self.channels.insert(browser_identity.clone(), channel) {
+            runtime.spawn(async move {
+                replaced.disconnect().await;
+            });
+        }
+        let queued_ice = self
+            .pending_ice_candidates
+            .remove(&browser_identity)
+            .unwrap_or_default();
+        WebRtcOfferCompletionOutcome::AnswerReady {
+            browser_identity,
+            generation,
+            envelope,
+            queued_ice,
+        }
     }
 
     pub(crate) fn clear_offer_state(&mut self, browser_identity: &str) {
@@ -472,6 +875,44 @@ impl WebRtcPeerRegistry {
             queue.drain(..dropped);
         }
         Some(queue.len())
+    }
+
+    pub(crate) fn queue_or_apply_ice(
+        &mut self,
+        browser_identity: &str,
+        candidate: serde_json::Value,
+        max_queued: usize,
+        runtime: &tokio::runtime::Runtime,
+    ) -> QueueOrApplyIceOutcome {
+        let candidate_str = candidate
+            .get("candidate")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        if candidate_str.is_empty() {
+            return QueueOrApplyIceOutcome::IgnoredEmpty;
+        }
+
+        let sdp_mid = candidate.get("sdpMid").and_then(|m| m.as_str());
+        let sdp_mline_index = candidate
+            .get("sdpMLineIndex")
+            .and_then(|i| i.as_u64())
+            .map(|i| i as u16);
+
+        if let Some(result) = self.apply_browser_ice_candidate(
+            browser_identity,
+            candidate_str,
+            sdp_mid,
+            sdp_mline_index,
+            runtime,
+        ) {
+            return QueueOrApplyIceOutcome::Applied(result);
+        }
+
+        self.queue_ice_for_current_generation(browser_identity, candidate, max_queued)
+            .map_or(
+                QueueOrApplyIceOutcome::UnknownBrowser,
+                QueueOrApplyIceOutcome::Queued,
+            )
     }
 
     pub(crate) fn drain_pending_ice(
@@ -531,7 +972,7 @@ impl WebRtcPeerRegistry {
         }))
     }
 
-    pub(crate) fn apply_pending_ice_candidates<F>(
+    pub(crate) fn apply_queued_ice_for_offer<F>(
         &self,
         browser_identity: &str,
         offer_generation: u64,
@@ -634,6 +1075,35 @@ impl WebRtcPeerRegistry {
             .collect()
     }
 
+    pub(crate) fn record_decrypt_failure(
+        &mut self,
+        browser_identity: &str,
+    ) -> Option<HubControlMessage> {
+        let olm_key = crate::relay::extract_olm_key(browser_identity).to_string();
+        let tab_id = browser_identity
+            .split_once(':')
+            .map(|(_, id)| id.to_string());
+        let already_restarted = self.ratchet_restarted_peers.contains(&olm_key)
+            || tab_id
+                .as_ref()
+                .is_some_and(|id| self.ratchet_restarted_peers.contains(id));
+        if already_restarted {
+            return None;
+        }
+        self.ratchet_restarted_peers.insert(olm_key);
+        if let Some(id) = tab_id {
+            self.ratchet_restarted_peers.insert(id);
+        }
+        Some(HubControlMessage::TransportRatchetRestartRequested {
+            client_id: ClientId::browser(browser_identity.to_string()),
+            browser_identity: browser_identity.to_string(),
+        })
+    }
+
+    pub(crate) fn clear_ratchet_restart_dedupe(&mut self) {
+        self.ratchet_restarted_peers.clear();
+    }
+
     pub(crate) fn take_opened_peers(&self) -> Vec<String> {
         self.channels
             .iter()
@@ -643,17 +1113,28 @@ impl WebRtcPeerRegistry {
             .collect()
     }
 
-    pub(crate) fn ingress_to_client(
+    pub(crate) fn handle_plaintext_payload(
         &self,
         browser_identity: &str,
-        ingress: TransportIngress,
-    ) -> ClientWorkerMessage {
+        payload: &[u8],
+    ) -> WebRtcIngressOutcome {
         self.runners.get(browser_identity).map_or_else(
             || {
-                WebRtcTransportAdapter::new(ClientId::browser(browser_identity.to_string()))
-                    .ingress_to_client(ingress.clone())
+                WebRtcTransportRunner::new(
+                    ClientId::browser(browser_identity.to_string()),
+                    browser_identity.to_string(),
+                    self.current_offer_generation(browser_identity),
+                    self.send_tasks
+                        .get(browser_identity)
+                        .map(|state| state.tx.clone())
+                        .unwrap_or_else(|| {
+                            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                            tx
+                        }),
+                )
+                .handle_plaintext_payload(payload)
             },
-            |runner| runner.ingress_to_client(ingress.clone()),
+            |runner| runner.handle_plaintext_payload(payload),
         )
     }
 
@@ -769,33 +1250,110 @@ impl WebRtcPeerRegistry {
         self.backpressure_recovery.insert(key, entry);
     }
 
-    pub(crate) fn cooled_backpressure_recoveries(
+    pub(crate) fn drain_recovery_requests(
         &self,
         now: Instant,
-    ) -> Vec<(String, BackpressureRecoveryEntry)> {
+    ) -> Vec<WebRtcRecoverySnapshotRequest> {
         self.backpressure_recovery
             .iter()
             .filter(|(_, entry)| {
                 now.duration_since(entry.last_drop) >= BACKPRESSURE_SNAPSHOT_COOLDOWN
             })
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(key, entry)| WebRtcRecoverySnapshotRequest {
+                request_id: key.clone(),
+                browser_identity: entry.browser_identity.clone(),
+                session_uuid: entry.session_uuid.clone(),
+                subscription_id: entry.subscription_id.clone(),
+            })
             .collect()
     }
 
-    pub(crate) fn take_recovery_sender(
+    pub(crate) fn complete_recovery_snapshot(
         &mut self,
-        key: &str,
-        browser_identity: &str,
-    ) -> Option<tokio::sync::mpsc::Sender<WebRtcAdapterCommand>> {
-        let peer_state = self.send_tasks.get(browser_identity)?;
-        if peer_state.dead.load(std::sync::atomic::Ordering::Relaxed)
-            || peer_state.tx.capacity() == 0
-        {
-            return None;
+        request: WebRtcRecoverySnapshotRequest,
+        result: WebRtcRecoverySnapshotResult,
+        metrics: &crate::hub::events::HubEventMetrics,
+    ) -> WebRtcRecoveryDispatchOutcome {
+        let Some(peer_state) = self.send_tasks.get(&request.browser_identity) else {
+            return WebRtcRecoveryDispatchOutcome::PeerUnavailable;
+        };
+        if peer_state.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return WebRtcRecoveryDispatchOutcome::PeerUnavailable;
         }
-        let tx = peer_state.tx.clone();
-        self.backpressure_recovery.remove(key);
-        Some(tx)
+
+        let WebRtcRecoverySnapshotResult::Snapshot(snapshot) = result else {
+            match result {
+                WebRtcRecoverySnapshotResult::Empty => {
+                    metrics.record_counter("snapshot.backpressure_recovery.empty", 1)
+                }
+                WebRtcRecoverySnapshotResult::Failed => {
+                    metrics.record_counter("snapshot.backpressure_recovery.failed", 1)
+                }
+                WebRtcRecoverySnapshotResult::Snapshot(_) => unreachable!(),
+            }
+            self.backpressure_recovery.remove(&request.request_id);
+            return WebRtcRecoveryDispatchOutcome::NoPayload;
+        };
+
+        let (gzip_started, Some(prepared)) =
+            crate::worker::session_io::timed_prepare_snapshot_payload(&snapshot)
+        else {
+            metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
+            self.backpressure_recovery.remove(&request.request_id);
+            return WebRtcRecoveryDispatchOutcome::NoPayload;
+        };
+        metrics.record_span_with_threshold(
+            "snapshot.gzip_queue",
+            gzip_started.elapsed(),
+            prepared.uncompressed_len + prepared.payload.len(),
+            Duration::from_millis(100),
+            "backpressure_recovery",
+        );
+
+        match peer_state.tx.try_send(WebRtcAdapterCommand::Pty {
+            subscription_id: request.subscription_id,
+            data: prepared.payload,
+        }) {
+            Ok(()) => {
+                metrics.record_counter("snapshot.backpressure_recovery.sent", 1);
+                self.backpressure_recovery.remove(&request.request_id);
+                WebRtcRecoveryDispatchOutcome::Queued
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                metrics.record_counter("snapshot.queue_full", 1);
+                metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
+                WebRtcRecoveryDispatchOutcome::StillCongested
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                metrics.record_counter("snapshot.queue_closed", 1);
+                metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
+                self.backpressure_recovery.remove(&request.request_id);
+                WebRtcRecoveryDispatchOutcome::PeerUnavailable
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_recovery_sender(
+        &mut self,
+        browser_identity: &str,
+        runtime: &tokio::runtime::Runtime,
+    ) -> tokio::sync::mpsc::Receiver<WebRtcAdapterCommand> {
+        if let Some(old) = self.send_tasks.remove(browser_identity) {
+            old.task.abort();
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(PEER_SEND_CHANNEL_CAPACITY);
+        let task = runtime.spawn(async {});
+        self.send_tasks.insert(
+            browser_identity.to_string(),
+            PeerSendState {
+                tx,
+                dead: Arc::new(AtomicBool::new(false)),
+                task,
+            },
+        );
+        rx
     }
 
     pub(crate) fn spawn_peer_sender(
@@ -1020,10 +1578,14 @@ impl WebRtcPeerRegistry {
         for (_id, task) in self.ping_tasks.drain() {
             task.abort();
         }
+        for task in self.queue_forwarders.drain(..) {
+            task.abort();
+        }
 
         self.connection_started.clear();
         self.connected_at.clear();
         self.pending_ice_candidates.clear();
+        self.ratchet_restarted_peers.clear();
         self.pending_closes.clear();
         self.offer_generation.clear();
         self.backpressure_recovery.clear();
@@ -1034,6 +1596,31 @@ impl WebRtcPeerRegistry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TransportCleanup {
     pub(crate) connected_age: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplacedPeerCloseWait {
+    NoPendingClose,
+    AlreadyClosed,
+    Closed,
+    ClosedChannelDropped,
+    TimedOut,
+}
+
+#[derive(Debug)]
+pub(crate) enum QueueOrApplyIceOutcome {
+    Applied(Result<(), crate::channel::ChannelError>),
+    Queued(usize),
+    IgnoredEmpty,
+    UnknownBrowser,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebRtcRecoveryDispatchOutcome {
+    Queued,
+    StillCongested,
+    PeerUnavailable,
+    NoPayload,
 }
 
 /// Execute a single queued WebRTC send command.
@@ -1082,32 +1669,7 @@ impl TransportAdapter for WebRtcTransportAdapter {
     }
 
     fn ingress_to_client(&self, ingress: TransportIngress) -> ClientWorkerMessage {
-        match ingress {
-            TransportIngress::Subscribe {
-                session_uuid,
-                subscription_id,
-            } => ClientWorkerMessage::SubscribeSession {
-                session_uuid,
-                subscription_id,
-            },
-            TransportIngress::Unsubscribe {
-                session_uuid,
-                subscription_id,
-            } => ClientWorkerMessage::UnsubscribeSession {
-                session_uuid,
-                subscription_id,
-            },
-            TransportIngress::TerminalInput { session_uuid, data } => {
-                ClientWorkerMessage::SessionInput { session_uuid, data }
-            }
-            TransportIngress::Json(value) => {
-                ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(value))
-            }
-            TransportIngress::Binary(data) => {
-                ClientWorkerMessage::ControlFrame(ClientControlFrame::Binary(data))
-            }
-            TransportIngress::Health(health) => ClientWorkerMessage::Health(health),
-        }
+        crate::worker::transport::ingress_to_client_message(ingress)
     }
 
     fn client_to_egress(&self, message: ClientWorkerMessage) -> Option<TransportEgress> {
@@ -1119,8 +1681,11 @@ impl TransportAdapter for WebRtcTransportAdapter {
                     data,
                 })
             }
-            ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(value)) => {
-                Some(TransportEgress::Control(value))
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPong) => {
+                Some(TransportEgress::DcPong)
+            }
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::BoundaryJson(value)) => {
+                Some(TransportEgress::BoundaryJson(value))
             }
             ClientWorkerMessage::Shutdown { reason } => Some(TransportEgress::Close { reason }),
             _ => None,
@@ -1131,6 +1696,13 @@ impl TransportAdapter for WebRtcTransportAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_channel() -> crate::channel::WebRtcChannel {
+        crate::channel::WebRtcChannel::builder()
+            .server_url("https://example.test")
+            .api_key("test-key")
+            .build()
+    }
 
     #[test]
     fn registry_uses_bounded_queues() {
@@ -1171,6 +1743,46 @@ mod tests {
             message,
             ClientWorkerMessage::SessionInput { ref session_uuid, ref data }
                 if session_uuid == "sess-1" && data == b"abc"
+        ));
+    }
+
+    #[test]
+    fn adapter_classifies_webrtc_heartbeat_frames_as_typed_controls() {
+        let adapter = WebRtcTransportAdapter::new(ClientId::Browser("browser-1".to_string()));
+
+        let ping = adapter.ingress_to_client(TransportIngress::DcPing);
+        assert!(matches!(
+            ping,
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPong)
+        ));
+
+        let pong = adapter.ingress_to_client(TransportIngress::DcPong);
+        assert!(matches!(
+            pong,
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPongReceived)
+        ));
+
+        let egress = adapter.client_to_egress(ClientWorkerMessage::ControlFrame(
+            ClientControlFrame::DcPong,
+        ));
+        assert!(matches!(egress, Some(TransportEgress::DcPong)));
+    }
+
+    #[test]
+    fn adapter_classifies_webrtc_focus_changed_as_typed_control() {
+        let adapter = WebRtcTransportAdapter::new(ClientId::Browser("browser-1".to_string()));
+
+        let message = adapter.ingress_to_client(TransportIngress::FocusChanged {
+            session_uuid: "sess-1".to_string(),
+            focused: true,
+        });
+
+        assert!(matches!(
+            message,
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::FocusChanged {
+                session_uuid,
+                focused: true,
+            }) if session_uuid == "sess-1"
         ));
     }
 
@@ -1300,22 +1912,365 @@ mod tests {
             },
         );
 
+        assert_eq!(registry.drain_recovery_requests(Instant::now()).len(), 1);
+        let request = registry
+            .drain_recovery_requests(Instant::now())
+            .into_iter()
+            .find(|request| request.request_id == key)
+            .expect("request");
+        let metrics = crate::hub::events::HubEventMetrics::default();
         assert_eq!(
-            registry
-                .cooled_backpressure_recoveries(Instant::now())
-                .len(),
-            1
+            registry.complete_recovery_snapshot(
+                request,
+                WebRtcRecoverySnapshotResult::Snapshot(b"snapshot".to_vec()),
+                &metrics,
+            ),
+            WebRtcRecoveryDispatchOutcome::Queued
         );
-        assert!(registry
-            .take_recovery_sender(&key, browser_identity)
-            .is_some());
-        assert!(registry
-            .cooled_backpressure_recoveries(Instant::now())
-            .is_empty());
+        assert!(registry.drain_recovery_requests(Instant::now()).is_empty());
 
         registry.clear_offer_state(browser_identity);
         assert_eq!(registry.current_offer_generation(browser_identity), 0);
         assert!(registry.drain_pending_ice(browser_identity).is_none());
+    }
+
+    #[test]
+    fn decrypt_failure_ratchet_trigger_deduplicates_by_olm_key_and_tab_id() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let first = registry.record_decrypt_failure("olm-key:tab-1");
+        assert!(matches!(
+            first,
+            Some(HubControlMessage::TransportRatchetRestartRequested {
+                ref browser_identity,
+                ..
+            }) if browser_identity == "olm-key:tab-1"
+        ));
+
+        assert!(registry.record_decrypt_failure("olm-key:tab-2").is_none());
+        assert!(registry
+            .record_decrypt_failure("different-olm:tab-1")
+            .is_none());
+
+        registry.clear_ratchet_restart_dedupe();
+        assert!(registry
+            .record_decrypt_failure("different-olm:tab-1")
+            .is_some());
+    }
+
+    #[test]
+    fn bounded_replacement_close_wait_times_out_without_blocking_indefinitely() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        registry.pending_closes.insert("olm-key".to_string(), rx);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let started = Instant::now();
+
+        let result =
+            registry.wait_for_replaced_peer_close("olm-key", Duration::from_millis(100), &runtime);
+
+        assert_eq!(result, ReplacedPeerCloseWait::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let stale_identity = "olm-key:old-tab";
+        let generation = registry.next_offer_generation(stale_identity);
+        registry
+            .channels
+            .insert(stale_identity.to_string(), test_channel());
+        let (_cleanup, disconnected) = registry
+            .mark_data_channel_closed(
+                stale_identity,
+                generation,
+                super::super::hub_control::TransportDisconnectReason::ReplacedByNewPeer,
+                &runtime,
+            )
+            .expect("replacement cleanup summary");
+        assert!(matches!(
+            disconnected,
+            HubControlMessage::TransportPeerStateChanged {
+                state: super::super::hub_control::TransportPeerState::Disconnected {
+                    reason: super::super::hub_control::TransportDisconnectReason::ReplacedByNewPeer,
+                    ..
+                },
+                ..
+            }
+        ));
+        let replacement_generation = registry.next_offer_generation("olm-key:new-tab");
+        assert_eq!(replacement_generation, 1);
+    }
+
+    #[test]
+    fn data_channel_close_after_connected_returns_one_cleanup_summary() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let generation = registry.next_offer_generation(browser_identity);
+        registry
+            .channels
+            .insert(browser_identity.to_string(), test_channel());
+        let (send_tx, _send_rx) = tokio::sync::mpsc::channel(1);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let send_task = runtime.spawn(async {});
+        registry.send_tasks.insert(
+            browser_identity.to_string(),
+            PeerSendState {
+                tx: send_tx,
+                dead: Arc::new(AtomicBool::new(false)),
+                task: send_task,
+            },
+        );
+        let ping_task = runtime.spawn(async {});
+        registry
+            .ping_tasks
+            .insert(browser_identity.to_string(), ping_task);
+        registry.record_backpressure_recovery(
+            format!("{browser_identity}:sess-1"),
+            BackpressureRecoveryEntry {
+                browser_identity: browser_identity.to_string(),
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-1".to_string(),
+                last_drop: Instant::now() - BACKPRESSURE_SNAPSHOT_COOLDOWN,
+            },
+        );
+
+        let opened = registry
+            .mark_data_channel_open(browser_identity, generation)
+            .expect("open summary");
+        assert!(matches!(
+            opened,
+            HubControlMessage::TransportPeerStateChanged {
+                state: super::super::hub_control::TransportPeerState::Connected { generation: g, .. },
+                ..
+            } if g == generation
+        ));
+
+        let (_cleanup, closed) = registry
+            .mark_data_channel_closed(
+                browser_identity,
+                generation,
+                super::super::hub_control::TransportDisconnectReason::DataChannelClose,
+                &runtime,
+            )
+            .expect("close summary");
+        assert!(matches!(
+            closed,
+            HubControlMessage::TransportPeerStateChanged {
+                state: super::super::hub_control::TransportPeerState::Disconnected {
+                    generation: g,
+                    reason: super::super::hub_control::TransportDisconnectReason::DataChannelClose,
+                },
+                ..
+            } if g == generation
+        ));
+        assert!(!registry.send_tasks.contains_key(browser_identity));
+        assert!(!registry.ping_tasks.contains_key(browser_identity));
+        assert!(registry
+            .backpressure_recovery
+            .values()
+            .all(|entry| entry.browser_identity != browser_identity));
+        assert!(registry
+            .mark_data_channel_closed(
+                browser_identity,
+                generation,
+                super::super::hub_control::TransportDisconnectReason::DataChannelClose,
+                &runtime,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn quick_successive_offers_drop_stale_completion_and_accept_current() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let first_generation = registry.next_offer_generation(browser_identity);
+        let second_generation = registry.next_offer_generation(browser_identity);
+        assert_eq!(first_generation, 1);
+        assert_eq!(second_generation, 2);
+
+        let first_channel = test_channel();
+        let mut first_close = first_channel.close_receiver();
+        let stale = registry.complete_offer(
+            WebRtcOfferCompletion {
+                browser_identity: browser_identity.to_string(),
+                generation: first_generation,
+                channel: first_channel,
+                encrypted_answer: Some(serde_json::json!({"t": 1, "c": "stale"})),
+            },
+            &runtime,
+        );
+        assert!(matches!(
+            stale,
+            WebRtcOfferCompletionOutcome::StaleDropped {
+                completed_generation: 1,
+                current_generation: 2,
+                ..
+            }
+        ));
+
+        let current = registry.complete_offer(
+            WebRtcOfferCompletion {
+                browser_identity: browser_identity.to_string(),
+                generation: second_generation,
+                channel: test_channel(),
+                encrypted_answer: Some(serde_json::json!({"t": 1, "c": "current"})),
+            },
+            &runtime,
+        );
+        assert!(matches!(
+            current,
+            WebRtcOfferCompletionOutcome::AnswerReady {
+                generation: 2,
+                envelope,
+                queued_ice,
+                ..
+            } if envelope == serde_json::json!({"t": 1, "c": "current"}) && queued_ice.is_empty()
+        ));
+        assert!(registry.channels.contains_key(browser_identity));
+
+        let _ = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(250), first_close.wait_for(|v| *v)).await
+        });
+    }
+
+    #[test]
+    fn recovery_snapshot_dispatch_keeps_congested_request_queued() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let key = format!("{browser_identity}:sess-1");
+        registry.record_backpressure_recovery(
+            key.clone(),
+            BackpressureRecoveryEntry {
+                browser_identity: browser_identity.to_string(),
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-1".to_string(),
+                last_drop: Instant::now() - BACKPRESSURE_SNAPSHOT_COOLDOWN,
+            },
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(WebRtcAdapterCommand::Json { data: vec![b'{'] })
+            .expect("fill queue");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let task = runtime.spawn(async {});
+        registry.send_tasks.insert(
+            browser_identity.to_string(),
+            PeerSendState {
+                tx,
+                dead: Arc::new(AtomicBool::new(false)),
+                task,
+            },
+        );
+
+        let request = registry
+            .drain_recovery_requests(Instant::now())
+            .into_iter()
+            .find(|request| request.request_id == key)
+            .expect("request");
+        let metrics = crate::hub::events::HubEventMetrics::default();
+        assert_eq!(
+            registry.complete_recovery_snapshot(
+                request,
+                WebRtcRecoverySnapshotResult::Snapshot(b"snapshot".to_vec()),
+                &metrics,
+            ),
+            WebRtcRecoveryDispatchOutcome::StillCongested
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.queue_full"], 1);
+        assert_eq!(
+            snapshot.counters["snapshot.backpressure_recovery.failed"],
+            1
+        );
+        assert_eq!(registry.drain_recovery_requests(Instant::now()).len(), 1);
+    }
+
+    #[test]
+    fn recovery_snapshot_dispatch_closed_peer_counts_failed_and_removes_request() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let key = format!("{browser_identity}:sess-1");
+        registry.record_backpressure_recovery(
+            key.clone(),
+            BackpressureRecoveryEntry {
+                browser_identity: browser_identity.to_string(),
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-1".to_string(),
+                last_drop: Instant::now() - BACKPRESSURE_SNAPSHOT_COOLDOWN,
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let task = runtime.spawn(async {});
+        registry.send_tasks.insert(
+            browser_identity.to_string(),
+            PeerSendState {
+                tx,
+                dead: Arc::new(AtomicBool::new(false)),
+                task,
+            },
+        );
+
+        let request = registry
+            .drain_recovery_requests(Instant::now())
+            .into_iter()
+            .find(|request| request.request_id == key)
+            .expect("request");
+        let metrics = crate::hub::events::HubEventMetrics::default();
+        assert_eq!(
+            registry.complete_recovery_snapshot(
+                request,
+                WebRtcRecoverySnapshotResult::Snapshot(b"snapshot".to_vec()),
+                &metrics,
+            ),
+            WebRtcRecoveryDispatchOutcome::PeerUnavailable
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.queue_closed"], 1);
+        assert_eq!(
+            snapshot.counters["snapshot.backpressure_recovery.failed"],
+            1
+        );
+        assert!(registry.drain_recovery_requests(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn recovery_snapshot_dispatch_empty_result_counts_empty_and_removes_request() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let key = format!("{browser_identity}:sess-1");
+        registry.record_backpressure_recovery(
+            key.clone(),
+            BackpressureRecoveryEntry {
+                browser_identity: browser_identity.to_string(),
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-1".to_string(),
+                last_drop: Instant::now() - BACKPRESSURE_SNAPSHOT_COOLDOWN,
+            },
+        );
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _rx = registry.install_test_recovery_sender(browser_identity, &runtime);
+        let request = registry
+            .drain_recovery_requests(Instant::now())
+            .into_iter()
+            .find(|request| request.request_id == key)
+            .expect("request");
+        let metrics = crate::hub::events::HubEventMetrics::default();
+        assert_eq!(
+            registry.complete_recovery_snapshot(
+                request,
+                WebRtcRecoverySnapshotResult::Empty,
+                &metrics,
+            ),
+            WebRtcRecoveryDispatchOutcome::NoPayload
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.backpressure_recovery.empty"], 1);
+        assert!(!snapshot
+            .counters
+            .contains_key("snapshot.backpressure_recovery.sent"));
+        assert!(registry.drain_recovery_requests(Instant::now()).is_empty());
     }
 
     #[test]

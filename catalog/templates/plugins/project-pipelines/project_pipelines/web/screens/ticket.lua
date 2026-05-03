@@ -477,28 +477,27 @@ local function merge_controls(ticket, ctx)
         return {}
     end
     local merge_events = repo.ticket_events(ticket.id, "ticket.merge_requested", 1)
+    local failed_events = repo.ticket_events(ticket.id, "ticket.merge_request_failed", 1)
+    local pipeline = repo.get_pipeline(run.pipeline_id) or {}
+    local merge_policy = pipeline.merge_policy or "direct"
+    local policy_label = merge_policy == "pr" and "PR via Botster MCP" or "direct merge to main"
     local children = {
         view.panel{
             ui.stack{ direction = "vertical", gap = "2", children = {
                 view.row{
-                    view.badge("ready to merge", "success"),
-                    ui.text{ text = "Final signoff is complete.", size = "sm", weight = "semibold" },
+                    view.badge(#failed_events > 0 and "merge blocked" or (#merge_events > 0 and "merge running" or "merge queued"), #failed_events > 0 and "danger" or "success"),
+                    ui.text{ text = "Merge policy: " .. policy_label, size = "sm", weight = "semibold" },
                 },
-                ui.text{ text = "Approve a merge agent to perform the repo-specific merge or PR path. The ticket closes only after merge confirmation is recorded.", size = "sm", tone = "muted" },
-                ui.button{
-                    id = "ticket-" .. ticket.id .. "-request-merge",
-                    label = #merge_events > 0 and "Merge requested" or "Approve merge",
-                    icon = "arrow-path",
-                    variant = "solid",
-                    tone = "accent",
-                    action = ui.action("project_pipelines.request_merge", { ticket_id = ticket.id }),
-                },
+                ui.text{ text = "Completed runs automatically spawn a merge acceptance agent. The ticket closes only after merge confirmation is recorded.", size = "sm", tone = "muted" },
             } },
         },
     }
     if #merge_events > 0 then
         local payload = util.decode(merge_events[1].payload, {})
         table.insert(children, ui.text{ text = payload.session_uuid and ("Merge agent running: " .. payload.session_uuid) or "Merge agent has been requested.", size = "sm", tone = "muted" })
+    elseif #failed_events > 0 then
+        local payload = util.decode(failed_events[1].payload, {})
+        table.insert(children, ui.text{ text = "Automatic merge request failed: " .. tostring(payload.error or "unknown error"), size = "sm", tone = "danger" })
     end
     return children
 end
@@ -548,14 +547,7 @@ function M.render(view_state, ctx)
     local header_actions = {}
     if ticket.status ~= "closed" and latest_run and latest_run.status == "done" then
         local merge_events = repo.ticket_events(ticket.id, "ticket.merge_requested", 1)
-        table.insert(header_actions, ui.button{
-            id = "ticket-" .. ticket.id .. "-header-request-merge",
-            label = #merge_events > 0 and "Merge requested" or "Approve merge",
-            icon = "arrow-path",
-            variant = "solid",
-            tone = "accent",
-            action = ui.action("project_pipelines.request_merge", { ticket_id = ticket.id }),
-        })
+        table.insert(header_actions, view.badge(#merge_events > 0 and "merge running" or "merge queued", #merge_events > 0 and "accent" or "muted"))
     elseif ticket.status ~= "closed" then
         table.insert(header_actions, ui.button{
             id = "ticket-" .. ticket.id .. "-close",

@@ -169,32 +169,7 @@ mod tests {
         }
 
         fn ingress_to_client(&self, ingress: TransportIngress) -> ClientWorkerMessage {
-            match ingress {
-                TransportIngress::Subscribe {
-                    session_uuid,
-                    subscription_id,
-                } => ClientWorkerMessage::SubscribeSession {
-                    session_uuid,
-                    subscription_id,
-                },
-                TransportIngress::TerminalInput { session_uuid, data } => {
-                    ClientWorkerMessage::SessionInput { session_uuid, data }
-                }
-                TransportIngress::Health(health) => ClientWorkerMessage::Health(health),
-                TransportIngress::Unsubscribe {
-                    session_uuid,
-                    subscription_id,
-                } => ClientWorkerMessage::UnsubscribeSession {
-                    session_uuid,
-                    subscription_id,
-                },
-                TransportIngress::Json(value) => {
-                    ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(value))
-                }
-                TransportIngress::Binary(data) => {
-                    ClientWorkerMessage::ControlFrame(ClientControlFrame::Binary(data))
-                }
-            }
+            super::transport::ingress_to_client_message(ingress)
         }
 
         fn client_to_egress(&self, message: ClientWorkerMessage) -> Option<TransportEgress> {
