@@ -4381,7 +4381,6 @@ impl Hub {
                                 &session_uuid[..session_uuid.len().min(8)],
                                 e
                             );
-                            metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
                             let _ =
                                 hub_event_tx
                                     .send(super::events::HubEvent::WebRtcRecoverySnapshotReady {
@@ -4401,7 +4400,6 @@ impl Hub {
                     );
 
                     if snapshot.is_empty() {
-                        metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
                         let _ = hub_event_tx.send(
                             super::events::HubEvent::WebRtcRecoverySnapshotReady {
                                 request: request_for_task.clone(),
@@ -4448,7 +4446,6 @@ impl Hub {
                             &session_uuid[..session_uuid.len().min(8)],
                             e
                         );
-                        metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
                         let _ = hub_event_tx.send(
                             super::events::HubEvent::WebRtcRecoverySnapshotReady {
                                 request: request_for_task.clone(),
@@ -4467,7 +4464,6 @@ impl Hub {
                 );
 
                 if snapshot.is_empty() {
-                    metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
                     let _ =
                         hub_event_tx.send(super::events::HubEvent::WebRtcRecoverySnapshotReady {
                             request: request_for_task.clone(),
@@ -7016,6 +7012,74 @@ mod tests {
         test_local_session_handle_with_seed(session_uuid, b"cached-local-output\n")
     }
 
+    fn test_session_handle_with_rpc_snapshot(
+        session_uuid: &str,
+        snapshot: Vec<u8>,
+    ) -> (SessionHandle, PathBuf, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let socket_path = std::env::temp_dir().join(format!("{session_uuid}.sock"));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind fake session socket");
+        let thread_session_uuid = session_uuid.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fake session");
+            let metadata = crate::session::protocol::SessionMetadata {
+                session_uuid: thread_session_uuid,
+                pid: std::process::id(),
+                rows: 24,
+                cols: 80,
+                last_output_at: 0,
+                mode_flags: crate::session::protocol::ModeFlags::default(),
+            };
+            crate::session::protocol::handshake_session(&mut stream, &metadata)
+                .expect("fake session handshake");
+
+            let mut decoder = crate::session::protocol::FrameDecoder::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut buf).expect("read fake session frame");
+                if n == 0 {
+                    return;
+                }
+                for frame in decoder.feed(&buf[..n]) {
+                    if frame.frame_type == crate::session::protocol::FRAME_GET_SNAPSHOT {
+                        stream
+                            .write_all(&crate::session::protocol::encode_frame(
+                                crate::session::protocol::FRAME_SNAPSHOT,
+                                &snapshot,
+                            ))
+                            .expect("write fake session snapshot");
+                        stream.flush().expect("flush fake session snapshot");
+                        return;
+                    }
+                }
+            }
+        });
+
+        let conn = crate::session::connection::SessionConnection::connect(&socket_path)
+            .expect("connect fake session");
+        let pty = PtyHandle::new_with_session(
+            tokio::sync::broadcast::channel(64).0,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(Mutex::new(Some(conn))),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            24,
+            80,
+        );
+
+        (
+            SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty),
+            socket_path,
+            server,
+        )
+    }
+
     // Legacy probe tests removed during the session-process migration.
     // Terminal probe caching is now exercised via session-process paths.
 
@@ -7447,6 +7511,160 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.counters["snapshot.backpressure_recovery.sent"], 1);
         assert!(snapshot.spans.contains_key("snapshot.gzip_queue"));
+    }
+
+    #[test]
+    fn test_backpressure_recovery_empty_snapshot_counts_empty() {
+        let metrics = crate::hub::events::HubEventMetrics::default();
+        let (peer_tx, mut peer_rx) = tokio::sync::mpsc::channel(1);
+
+        Hub::send_snapshot_to_peer(&metrics, &peer_tx, "sub-recovery", &[]);
+
+        assert!(peer_rx.try_recv().is_err());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.backpressure_recovery.empty"], 1);
+        assert!(!snapshot
+            .counters
+            .contains_key("snapshot.backpressure_recovery.sent"));
+    }
+
+    #[test]
+    fn test_backpressure_recovery_full_peer_channel_counts_failed_and_queue_full() {
+        let metrics = crate::hub::events::HubEventMetrics::default();
+        let (peer_tx, _peer_rx) = tokio::sync::mpsc::channel(1);
+        peer_tx
+            .try_send(crate::worker::webrtc::WebRtcAdapterCommand::Json {
+                data: b"occupy bounded channel".to_vec(),
+            })
+            .expect("prefill peer channel");
+
+        Hub::send_snapshot_to_peer(
+            &metrics,
+            &peer_tx,
+            "sub-recovery",
+            b"recovery snapshot bytes",
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.queue_full"], 1);
+        assert_eq!(
+            snapshot.counters["snapshot.backpressure_recovery.failed"],
+            1
+        );
+    }
+
+    #[test]
+    fn test_backpressure_recovery_closed_peer_channel_counts_failed_and_queue_closed() {
+        let metrics = crate::hub::events::HubEventMetrics::default();
+        let (peer_tx, peer_rx) = tokio::sync::mpsc::channel(1);
+        drop(peer_rx);
+
+        Hub::send_snapshot_to_peer(
+            &metrics,
+            &peer_tx,
+            "sub-recovery",
+            b"recovery snapshot bytes",
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.queue_closed"], 1);
+        assert_eq!(
+            snapshot.counters["snapshot.backpressure_recovery.failed"],
+            1
+        );
+    }
+
+    #[test]
+    fn test_backpressure_recovery_cooldown_dispatches_rpc_snapshot_to_peer_sender() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = unique_session_uuid("sess-recovery-rpc");
+        let browser_identity = "browser-recovery-rpc";
+        let subscription_id = "sub-recovery-rpc";
+        let (session, socket_path, server) = test_session_handle_with_rpc_snapshot(
+            &session_uuid,
+            b"session-process recovery snapshot".to_vec(),
+        );
+        hub.handle_cache.add_session(session);
+        let mut peer_rx = hub
+            .webrtc
+            .install_test_recovery_sender(browser_identity, &hub.tokio_runtime);
+        let key = format!("{browser_identity}:{session_uuid}");
+        hub.webrtc.record_backpressure_recovery(
+            key,
+            crate::worker::webrtc::BackpressureRecoveryEntry {
+                browser_identity: browser_identity.to_string(),
+                session_uuid: session_uuid.clone(),
+                subscription_id: subscription_id.to_string(),
+                last_drop: Instant::now() - crate::worker::webrtc::BACKPRESSURE_SNAPSHOT_COOLDOWN,
+            },
+        );
+
+        hub.dispatch_webrtc_recovery_snapshot_requests();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let command = loop {
+            hub.tick();
+            if let Ok(command) = peer_rx.try_recv() {
+                break command;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for recovery snapshot"
+            );
+            hub.tokio_runtime.block_on(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            });
+        };
+        match command {
+            crate::worker::webrtc::WebRtcAdapterCommand::Pty {
+                subscription_id: actual_subscription_id,
+                data,
+            } => {
+                assert_eq!(actual_subscription_id, subscription_id);
+                assert!(data.starts_with(&[0x1f, 0x8b]));
+            }
+            other => panic!("expected PTY recovery command, got {other:?}"),
+        }
+
+        let metrics = hub.hub_event_metrics.snapshot();
+        assert_eq!(metrics.counters["snapshot.backpressure_recovery.sent"], 1);
+        assert!(metrics.spans.contains_key("snapshot.rpc_get"));
+        assert!(metrics.spans.contains_key("snapshot.gzip_queue"));
+
+        server.join().expect("fake session server joins");
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[test]
+    fn test_backpressure_recovery_missing_session_counts_failed_without_dispatch() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-recovery-missing";
+        let browser_identity = "browser-recovery-missing";
+        let mut peer_rx = hub
+            .webrtc
+            .install_test_recovery_sender(browser_identity, &hub.tokio_runtime);
+        let key = format!("{browser_identity}:{session_uuid}");
+        hub.webrtc.record_backpressure_recovery(
+            key,
+            crate::worker::webrtc::BackpressureRecoveryEntry {
+                browser_identity: browser_identity.to_string(),
+                session_uuid: session_uuid.to_string(),
+                subscription_id: "sub-recovery-missing".to_string(),
+                last_drop: Instant::now() - crate::worker::webrtc::BACKPRESSURE_SNAPSHOT_COOLDOWN,
+            },
+        );
+
+        hub.dispatch_webrtc_recovery_snapshot_requests();
+
+        assert!(peer_rx.try_recv().is_err());
+        let metrics = hub.hub_event_metrics.snapshot();
+        assert!(!metrics
+            .counters
+            .contains_key("snapshot.backpressure_recovery.sent"));
+        assert!(!metrics
+            .counters
+            .contains_key("snapshot.backpressure_recovery.empty"));
+        assert_eq!(metrics.counters["snapshot.backpressure_recovery.failed"], 1);
     }
 
     fn test_forwarder_request(

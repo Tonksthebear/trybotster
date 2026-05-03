@@ -1320,15 +1320,40 @@ impl WebRtcPeerRegistry {
                 WebRtcRecoveryDispatchOutcome::Queued
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                metrics.record_counter("snapshot.queue_full", 1);
                 metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
                 WebRtcRecoveryDispatchOutcome::StillCongested
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                metrics.record_counter("snapshot.queue_closed", 1);
                 metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
                 self.backpressure_recovery.remove(&request.request_id);
                 WebRtcRecoveryDispatchOutcome::PeerUnavailable
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_recovery_sender(
+        &mut self,
+        browser_identity: &str,
+        runtime: &tokio::runtime::Runtime,
+    ) -> tokio::sync::mpsc::Receiver<WebRtcAdapterCommand> {
+        if let Some(old) = self.send_tasks.remove(browser_identity) {
+            old.task.abort();
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(PEER_SEND_CHANNEL_CAPACITY);
+        let task = runtime.spawn(async {});
+        self.send_tasks.insert(
+            browser_identity.to_string(),
+            PeerSendState {
+                tx,
+                dead: Arc::new(AtomicBool::new(false)),
+                task,
+            },
+        );
+        rx
     }
 
     pub(crate) fn spawn_peer_sender(
@@ -2149,7 +2174,103 @@ mod tests {
             ),
             WebRtcRecoveryDispatchOutcome::StillCongested
         );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.queue_full"], 1);
+        assert_eq!(
+            snapshot.counters["snapshot.backpressure_recovery.failed"],
+            1
+        );
         assert_eq!(registry.drain_recovery_requests(Instant::now()).len(), 1);
+    }
+
+    #[test]
+    fn recovery_snapshot_dispatch_closed_peer_counts_failed_and_removes_request() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let key = format!("{browser_identity}:sess-1");
+        registry.record_backpressure_recovery(
+            key.clone(),
+            BackpressureRecoveryEntry {
+                browser_identity: browser_identity.to_string(),
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-1".to_string(),
+                last_drop: Instant::now() - BACKPRESSURE_SNAPSHOT_COOLDOWN,
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let task = runtime.spawn(async {});
+        registry.send_tasks.insert(
+            browser_identity.to_string(),
+            PeerSendState {
+                tx,
+                dead: Arc::new(AtomicBool::new(false)),
+                task,
+            },
+        );
+
+        let request = registry
+            .drain_recovery_requests(Instant::now())
+            .into_iter()
+            .find(|request| request.request_id == key)
+            .expect("request");
+        let metrics = crate::hub::events::HubEventMetrics::default();
+        assert_eq!(
+            registry.complete_recovery_snapshot(
+                request,
+                WebRtcRecoverySnapshotResult::Snapshot(b"snapshot".to_vec()),
+                &metrics,
+            ),
+            WebRtcRecoveryDispatchOutcome::PeerUnavailable
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.queue_closed"], 1);
+        assert_eq!(
+            snapshot.counters["snapshot.backpressure_recovery.failed"],
+            1
+        );
+        assert!(registry.drain_recovery_requests(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn recovery_snapshot_dispatch_empty_result_counts_empty_and_removes_request() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let key = format!("{browser_identity}:sess-1");
+        registry.record_backpressure_recovery(
+            key.clone(),
+            BackpressureRecoveryEntry {
+                browser_identity: browser_identity.to_string(),
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-1".to_string(),
+                last_drop: Instant::now() - BACKPRESSURE_SNAPSHOT_COOLDOWN,
+            },
+        );
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _rx = registry.install_test_recovery_sender(browser_identity, &runtime);
+        let request = registry
+            .drain_recovery_requests(Instant::now())
+            .into_iter()
+            .find(|request| request.request_id == key)
+            .expect("request");
+        let metrics = crate::hub::events::HubEventMetrics::default();
+        assert_eq!(
+            registry.complete_recovery_snapshot(
+                request,
+                WebRtcRecoverySnapshotResult::Empty,
+                &metrics,
+            ),
+            WebRtcRecoveryDispatchOutcome::NoPayload
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.backpressure_recovery.empty"], 1);
+        assert!(!snapshot
+            .counters
+            .contains_key("snapshot.backpressure_recovery.sent"));
+        assert!(registry.drain_recovery_requests(Instant::now()).is_empty());
     }
 
     #[test]
