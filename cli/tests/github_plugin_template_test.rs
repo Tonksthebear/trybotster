@@ -125,8 +125,8 @@ fn project_pipelines_dynamic_state_uses_plugin_entities_not_forced_tree_refreshe
         .expect("read project pipelines engine");
     let entities = std::fs::read_to_string(root.join("project_pipelines/entities.lua"))
         .expect("read project pipelines entities");
-    let readme = std::fs::read_to_string(root.join("README.md"))
-        .expect("read project pipelines readme");
+    let readme =
+        std::fs::read_to_string(root.join("README.md")).expect("read project pipelines readme");
 
     assert!(
         !engine.contains("broadcast_ui_tree_snapshots")
@@ -158,7 +158,53 @@ fn project_pipelines_dynamic_state_uses_plugin_entities_not_forced_tree_refreshe
 }
 
 #[test]
-fn project_pipelines_entities_register_snapshot_and_delta_publish() {
+fn project_pipelines_detail_bind_lists_use_entity_store_paths() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/project-pipelines/project_pipelines/web/screens");
+    let project = std::fs::read_to_string(root.join("project.lua")).expect("read project screen");
+    let home = std::fs::read_to_string(root.join("home.lua")).expect("read home screen");
+
+    for (label, source, screen) in [
+        (
+            "home projects",
+            r#"source = "/project-pipelines.project""#,
+            &home,
+        ),
+        (
+            "home tickets",
+            r#"source = "/project-pipelines.ticket""#,
+            &home,
+        ),
+        (
+            "home pipelines",
+            r#"source = "/project-pipelines.pipeline""#,
+            &home,
+        ),
+        (
+            "project timeline tickets",
+            r#"source = "/project-pipelines.ticket""#,
+            &project,
+        ),
+    ] {
+        assert!(
+            screen.contains(source),
+            "{label} should bind dynamic rows from plugin entity stores"
+        );
+    }
+    assert!(
+        project.contains(r#"where = { project_id = project_id }"#),
+        "project ticket timeline should filter the entity stream with bind_list where"
+    );
+    assert!(
+        !project.contains(r#""-timeline-ticket-" .. ticket.id"#),
+        "bind_list item templates must not capture repo-local ticket variables before entity bindings resolve"
+    );
+}
+
+#[test]
+fn project_pipelines_entity_publish_snapshots_and_deltas_use_plugin_entity_frames() {
     let plugin_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -186,13 +232,13 @@ fn project_pipelines_entities_register_snapshot_and_delta_publish() {
               get = function()
                 return {
                   entity_snapshot = function(_self, entity_type, items, opts)
-                    frames[#frames + 1] = { type = "snapshot", entity_type = entity_type, items = items, owner_plugin = opts.owner_plugin }
+                    frames[#frames + 1] = { type = "entity_snapshot", entity_type = entity_type, items = items, owner_plugin = opts.owner_plugin }
                   end,
                   entity_upsert = function(_self, entity_type, entity, opts)
-                    frames[#frames + 1] = { type = "upsert", entity_type = entity_type, entity = entity, owner_plugin = opts.owner_plugin }
+                    frames[#frames + 1] = { type = "entity_upsert", entity_type = entity_type, entity = entity, owner_plugin = opts.owner_plugin }
                   end,
                   entity_remove = function(_self, entity_type, id, opts)
-                    frames[#frames + 1] = { type = "remove", entity_type = entity_type, id = id, owner_plugin = opts.owner_plugin }
+                    frames[#frames + 1] = { type = "entity_remove", entity_type = entity_type, id = id, owner_plugin = opts.owner_plugin }
                   end,
                 }
               end,
@@ -241,11 +287,7 @@ fn project_pipelines_entities_register_snapshot_and_delta_publish() {
 
             local entities = require("project_pipelines.entities")
             entities.register()
-            entities.snapshot(entities.types.ticket)
-            entities.snapshot(entities.types.run_step)
-            entities.snapshot(entities.types.gate_result)
-            entities.snapshot(entities.types.artifact)
-            entities.snapshot(entities.types.event)
+            entities.publish_snapshots()
             entities.upsert(entities.types.run_step, rows_by_name.run_steps[1])
             entities.upsert(entities.types.run_step, { id = 123, run_id = "run-1" })
             entities.remove(entities.types.run_step, "run-step-1")
@@ -262,28 +304,100 @@ fn project_pipelines_entities_register_snapshot_and_delta_publish() {
         .expect("project pipelines entities result json");
 
     assert_eq!(result["registrations"].as_array().unwrap().len(), 15);
-    assert!(
-        result["registrations"].as_array().unwrap().iter().all(|registration| {
+    assert!(result["registrations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|registration| {
             registration["id_field"] == json!("id")
                 && registration["owner_plugin"] == json!("project-pipelines")
-        })
-    );
+        }));
 
     let frames = result["frames"].as_array().unwrap();
-    assert_eq!(frames[0]["type"], json!("snapshot"));
-    assert_eq!(frames[0]["entity_type"], json!("project-pipelines.ticket"));
-    assert_eq!(frames[0]["items"].as_array().unwrap().len(), 2);
-    assert_eq!(frames[0]["items"][1]["id"], json!("ticket-2"));
-    assert_eq!(frames[0]["items"][1]["project_id"], json!("project-1"));
-    assert_eq!(frames[1]["entity_type"], json!("project-pipelines.run_step"));
-    assert_eq!(frames[1]["items"][0]["name"], json!("Implement"));
-    assert_eq!(frames[1]["items"][0]["ticket_id"], json!("ticket-1"));
-    assert_eq!(frames[2]["items"][0]["evidence"]["summary"], json!("ok"));
-    assert_eq!(frames[3]["items"][0]["payload"]["a"], json!(1));
-    assert_eq!(frames[4]["items"][0]["payload"]["gate_id"], json!("gate-1"));
-    assert_eq!(frames[5]["type"], json!("upsert"));
-    assert_eq!(frames[6]["type"], json!("remove"));
-    assert_eq!(frames.len(), 7, "non-string id upsert should be dropped");
+    assert_eq!(
+        frames.len(),
+        17,
+        "15 snapshots + upsert + remove; non-string id upsert should be dropped"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame["owner_plugin"] == json!("project-pipelines")),
+        "every Project Pipelines entity frame must carry owner_plugin"
+    );
+
+    let snapshots: Vec<&JsonValue> = frames
+        .iter()
+        .filter(|frame| frame["type"] == json!("entity_snapshot"))
+        .collect();
+    assert_eq!(
+        snapshots.len(),
+        15,
+        "publish_snapshots should publish every registered entity family"
+    );
+    assert!(snapshots.iter().all(|frame| {
+        frame["entity_type"]
+            .as_str()
+            .is_some_and(|entity_type| entity_type.starts_with("project-pipelines."))
+    }));
+
+    let ticket_snapshot = snapshots
+        .iter()
+        .find(|frame| frame["entity_type"] == json!("project-pipelines.ticket"))
+        .expect("ticket snapshot");
+    assert_eq!(ticket_snapshot["items"].as_array().unwrap().len(), 2);
+    assert_eq!(ticket_snapshot["items"][1]["id"], json!("ticket-2"));
+    assert_eq!(
+        ticket_snapshot["items"][1]["project_id"],
+        json!("project-1")
+    );
+
+    let run_step_snapshot = snapshots
+        .iter()
+        .find(|frame| frame["entity_type"] == json!("project-pipelines.run_step"))
+        .expect("run step snapshot");
+    assert_eq!(run_step_snapshot["items"][0]["name"], json!("Implement"));
+    assert_eq!(
+        run_step_snapshot["items"][0]["ticket_id"],
+        json!("ticket-1")
+    );
+
+    let gate_result_snapshot = snapshots
+        .iter()
+        .find(|frame| frame["entity_type"] == json!("project-pipelines.gate_result"))
+        .expect("gate result snapshot");
+    assert_eq!(
+        gate_result_snapshot["items"][0]["evidence"]["summary"],
+        json!("ok")
+    );
+
+    let artifact_snapshot = snapshots
+        .iter()
+        .find(|frame| frame["entity_type"] == json!("project-pipelines.artifact"))
+        .expect("artifact snapshot");
+    assert_eq!(artifact_snapshot["items"][0]["payload"]["a"], json!(1));
+
+    let event_snapshot = snapshots
+        .iter()
+        .find(|frame| frame["entity_type"] == json!("project-pipelines.event"))
+        .expect("event snapshot");
+    assert_eq!(
+        event_snapshot["items"][0]["payload"]["gate_id"],
+        json!("gate-1")
+    );
+
+    assert_eq!(frames[15]["type"], json!("entity_upsert"));
+    assert_eq!(
+        frames[15]["entity_type"],
+        json!("project-pipelines.run_step")
+    );
+    assert_eq!(frames[15]["entity"]["id"], json!("run-step-1"));
+    assert_eq!(frames[16]["type"], json!("entity_remove"));
+    assert_eq!(
+        frames[16]["entity_type"],
+        json!("project-pipelines.run_step")
+    );
+    assert_eq!(frames[16]["id"], json!("run-step-1"));
 }
 
 #[test]
