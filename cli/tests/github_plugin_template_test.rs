@@ -169,8 +169,7 @@ fn project_pipelines_automates_merge_from_pipeline_policy() {
         .expect("read project pipelines repo");
     let engine = std::fs::read_to_string(root.join("project_pipelines/engine.lua"))
         .expect("read project pipelines engine");
-    let mcp =
-        std::fs::read_to_string(root.join("project_pipelines/mcp.lua")).expect("read mcp");
+    let mcp = std::fs::read_to_string(root.join("project_pipelines/mcp.lua")).expect("read mcp");
     let pipeline_screen =
         std::fs::read_to_string(root.join("project_pipelines/web/screens/pipelines.lua"))
             .expect("read pipeline screen");
