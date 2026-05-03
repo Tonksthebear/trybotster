@@ -6,7 +6,7 @@
 -- @version 1.0.0
 
 local db = plugin.db{
-    version = 4,
+    version = 5,
     models = {
         tickets = {
             id = { "text", required = true, primary = true },
@@ -44,6 +44,7 @@ local db = plugin.db{
             id = { "text", required = true, primary = true },
             name = { "text", required = true },
             description = { "text" },
+            merge_policy = { "text" },
             created_at = { "integer", required = true },
             updated_at = { "integer", required = true },
         },
