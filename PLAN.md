@@ -1,437 +1,478 @@
-# Plan: Move WebRTC Onto Client Worker Transport Adapter
+# Plan: Complete WebRTC Transport Ownership Migration Out Of Hub
 
-Ticket: `ticket_1777747015_303075` - Move WebRTC Onto Client Worker Transport Adapter.
+Ticket: `ticket_1777787330_803169` - Complete WebRTC transport ownership migration out of Hub.
 
-## Goal
+## Intent
 
-Move browser WebRTC peer lifecycle and the DataChannel hot path out of the Hub
-control loop and behind a concrete ClientWorker transport adapter. The Hub must
-remain responsible for auth, pairing, signaling coordination, capability
-issuance, attach/detach/reconnect/shutdown policy, and summarized typed
-transport events.
+Finish the follow-up migration left by the workerized WebRTC project. The Hub
+must stop owning WebRTC data-plane lifecycle, crypto, ratchet trigger
+detection, stale-offer bookkeeping, receiver polling, and backpressure recovery
+dispatch. Those responsibilities move into typed
+`WebRtcPeerRegistry` / `WebRtcTransportRunner` APIs.
 
-This is a cold-turkey data-plane migration for WebRTC. Do not ship both
-hub-resident and adapter-resident WebRTC send/lifecycle paths live at the same
-time. The ambiguity itself is the risk here: split ownership between Hub maps
-and adapter state is exactly what causes stale peers, duplicate reconnect
-decisions, and send-to-unknown-peer noise.
+The Hub remains the central orchestrator. It keeps auth, pairing, Rails
+signaling coordination, capability issuance, Lua callbacks, terminal attach
+policy, session authorization, and summarized transport event handling. It
+should receive typed results and requests from the WebRTC transport boundary,
+not reach into per-peer channels, sender queues, generation maps, or raw
+transport receivers.
+
+This is a cold-turkey ownership cleanup. Do not preserve parallel Hub-owned and
+registry-owned paths for the same WebRTC responsibility.
 
 ## Hard Constraints
 
-- Hub is the central orchestrator. Workers and adapters request policy changes
-  through typed messages; they do not mutate Hub registries directly.
-- Client workers own transport-neutral stream state. Browser, TUI, and socket
-  clients must continue to share the same worker contract shape.
-- Rails ActionCable channels remain opaque relays. `HubSignalingChannel` and
-  `HubCommandChannel` must not inspect decrypted signaling content.
-- WebRTC signaling continues through the existing Lua primitive into one Rust
-  hub router. The Hub validates pairing/auth/capability context, then delegates
-  async peer work to the adapter runner.
-- Olm encryption remains mandatory. Use the existing `CryptoService =
-  Arc<Mutex<VodozemacCrypto>>` path from `cli/src/relay/crypto_service.rs` and
-  `cli/src/relay/olm_crypto.rs`; no plaintext DataChannel fallback.
-- Hot-path queues must be bounded, deterministic, and report typed
-  `WorkerBackpressure`.
-- CLI tests must use `cd cli && ./test.sh ...`, never raw `cargo test`.
-- No UI work is planned. `tmp/tailwind_plus_preview` is absent in this
-  worktree. If browser UI becomes necessary later, use existing React/Vite
-  Catalyst components and `IconGlyph`, not raw HTML, unicode glyphs, or new
-  styling primitives.
+- Repo instructions require vault bootstrap and CLI tests through
+  `cd cli && ./test.sh ...`, not raw `cargo test`.
+- Vault convention: Hub is the central orchestrator, workers/adapters own
+  data-plane mechanics and report typed summaries back to Hub.
+- Vault convention: cold-turkey migrations eliminate ambiguous dual paths.
+- `docs/worker-actor-contracts.md` already says `WebRtcPeerRegistry` is the
+  only holder of per-browser `WebRtcChannel` instances. The implementation must
+  match that claim or the claim must be narrowed exactly.
+- Rails/browser UI is not in scope. No Catalyst, Elements, Hotwire, or
+  `tmp/tailwind_plus_preview` work is needed unless implementation unexpectedly
+  changes browser UI.
 
-## Current Ownership To Move
+## Coordination
 
-Move or replace these Hub-owned WebRTC data-plane fields and methods:
+Sibling ticket: `ticket_1777787620_100658` - Wire browser WebRTC traffic
+through ClientWorker instead of adapter-only conversion.
 
-- [cli/src/hub/mod.rs](cli/src/hub/mod.rs)
-  - `webrtc_channels: HashMap<String, WebRtcChannel>`
-  - `webrtc_send_tasks: HashMap<String, PeerSendState>`
-  - `dc_ping_tasks`
-  - `webrtc_pending_closes`
-  - `webrtc_offer_generation`
-  - `webrtc_pending_ice_candidates`
-  - `webrtc_pty_output_tx/rx`
-  - `stream_frame_tx/rx`, `pty_input_tx/rx`, `file_input_tx/rx`
-  - `webrtc_backpressure_recovery`
-- [cli/src/hub/server_comms.rs](cli/src/hub/server_comms.rs)
-  - `cleanup_disconnected_webrtc_channels`
-  - `cleanup_webrtc_channel`
-  - `spawn_peer_send_task`, `try_send_to_peer`, `send_webrtc_raw`
-  - `spawn_dc_ping_task`
-  - WebRTC portions of `handle_webrtc_offer`, `WebRtcOfferCompleted`,
-    `handle_webrtc_pty_output_batch`, `poll_webrtc_pty_output`,
-    `handle_pty_input`, stream-frame polling, and file-input polling.
-- [cli/src/channel/webrtc.rs](cli/src/channel/webrtc.rs)
-  - Keep reusable WebRTC primitives, but extract adapter-runner friendly APIs
-    from `WebRtcChannel`/`WebRtcSender` instead of keeping Hub-owned maps and
-    send tasks.
+Shared touch points:
 
-## Adapter Shape
+- `cli/src/worker/webrtc.rs`
+  - `WebRtcTransportRunner`
+  - `WebRtcTransportAdapter`
+  - `WebRtcPeerRegistry::ingress_to_client`
+- `cli/src/worker/client.rs`
+  - `ClientWorkerMessage`
+  - `ClientControlFrame`
+  - browser subscribe/input/control routing once the sibling ticket lands
+- `cli/src/worker/transport.rs`
+  - `TransportIngress`
+  - `TransportEgress`
+- `cli/src/worker/hub_control.rs`
+  - `TransportPeerStateChanged`
+  - `TransportSignalReady`
+  - `TransportBackpressure`
+  - `TransportRatchetRestartRequested`
 
-Add a concrete adapter runner, not async methods on the existing sync trait.
+Contract that survives either merge order:
 
-Files:
+- This ticket owns WebRTC peer lifecycle, offer/answer, generation, pending
+  ICE, ratchet trigger, queue, and recovery ownership boundaries.
+- `ticket_1777787620_100658` owns routing browser application traffic through
+  long-lived `ClientWorker` mailboxes.
+- This ticket must not add a second browser-worker routing path. Where a
+  message is ready for ClientWorker but the sibling ticket has not landed, keep
+  the existing Hub/Lua dispatch as an explicitly named temporary caller of the
+  typed `WebRtcTransportRunner` ingress result. Do not add new raw JSON or
+  per-peer sender maps in Hub.
+- After both tickets land, WebRTC ingress should flow:
 
-- Add `cli/src/worker/webrtc.rs`.
-- Export it from `cli/src/worker/mod.rs`.
-- Extend `cli/src/worker/transport.rs` only for typed frame variants if needed;
-  do not make the existing `TransportAdapter` trait async.
+```text
+DataChannel -> WebRtcChannel -> WebRtcPeerRegistry/WebRtcTransportRunner
+  -> WebRtcTransportAdapter -> ClientWorkerMessage -> ClientWorker -> Hub policy/Lua as needed
+```
 
-Types:
+## Current Ownership To Remove
 
-- `WebRtcTransportAdapter`
-  - Implements the existing synchronous `TransportAdapter`.
-  - Converts decoded transport frames into `ClientWorkerMessage`.
-  - Converts `TransportEgress` into adapter-local `WebRtcAdapterCommand`
-    values, not direct socket sends.
-- `WebRtcTransportRunner`
-  - Owns async peer state for one browser identity.
-  - Spawned by Hub after auth/pairing/capability checks.
-  - Holds `ClientWorkerHandle`, `CryptoService`, signaling relay sender,
-    bounded outbound command receiver, and WebRTC channel state.
-- `WebRtcPeerRegistry`
-  - Adapter-owned registry keyed by browser identity.
-  - Replaces Hub's `webrtc_channels`, `webrtc_send_tasks`,
-    `dc_ping_tasks`, `webrtc_pending_closes`, offer generation, and pending ICE
-    maps.
-  - Exposes typed methods to Hub for `offer`, `ice`, `disconnect`, and
-    `shutdown_peer`.
+Remove or replace these Hub-owned WebRTC data-plane symbols:
 
-Channel wiring:
+- `cli/src/hub/server_comms.rs`
+  - `handle_webrtc_offer`
+  - `HubEvent::WebRtcOfferCompleted` handling that owns generation checks and a
+    returned `WebRtcChannel`
+  - `handle_webrtc_message`
+  - `try_ratchet_restart`
+  - `send_ratchet_restart` transport delivery logic
+  - `poll_webrtc_peer_messages`
+  - `send_backpressure_recovery_snapshots`
+  - WebRTC receiver polling with `take_pty_input_rx` / `restore_pty_input_rx`
+  - WebRTC receiver polling with `take_stream_frame_rx` /
+    `restore_stream_frame_rx`
+  - WebRTC receiver polling with `take_pty_output_rx` /
+    `restore_pty_output_rx`
+  - WebRTC receiver polling with `take_outgoing_signal_rx` /
+    `restore_outgoing_signal_rx`
+- `cli/src/hub/run.rs`
+  - long-lived raw WebRTC receiver ownership taken from `hub.webrtc` at run
+    startup and restored at shutdown.
+- `cli/src/hub/events.rs`
+  - `HubEvent::WebRtcOfferCompleted` carrying `WebRtcChannel` back to Hub.
+- `cli/src/worker/webrtc.rs`
+  - public `take_*_rx` / `restore_*_rx` production APIs that make Hub the
+    receiver owner.
+  - scaffold comments saying registry/runner owns production lifecycle before
+    the code actually does.
+- `docs/worker-actor-contracts.md`
+  - any claim stronger than the landed code.
 
-- Browser DataChannel ingress -> `WebRtcTransportRunner` decrypts/decodes ->
-  `WebRtcTransportAdapter::ingress_to_client` ->
-  `ClientWorkerHandle.try_send`.
-- ClientWorker egress -> bounded adapter command queue ->
-  `WebRtcTransportRunner` encrypts/compresses/sends on DataChannel.
-- Adapter summary events -> `HubControlMessage` through
-  `hub_control_tx`.
-- Signaling relay output -> existing ActionCable command channel path.
+## Seven Drift Items
 
-The existing sync `TransportAdapter` remains a pure conversion boundary. The
-async runner owns peer connection lifecycle, ICE callbacks, DataChannel events,
-queue draining, crypto, liveness probes, and cleanup.
+### 1. Offer Generation And Answer Encryption
 
-## Typed Hub-Control Surface
+Decision: move.
 
-Extend [cli/src/worker/hub_control.rs](cli/src/worker/hub_control.rs) with
-typed WebRTC summaries. Avoid new `serde_json::Value` control surfaces.
+Current Hub ownership:
 
-Add:
+- `Hub::handle_webrtc_offer` builds `WebRtcChannel`, inserts/removes it from
+  `self.webrtc`, increments generation, spawns negotiation, encrypts the
+  answer, and sends `HubEvent::WebRtcOfferCompleted`.
+- `HubEvent::WebRtcOfferCompleted` carries `WebRtcChannel` back into Hub for
+  stale generation checks and re-insertion.
 
-- `TransportPeerState`
-  - `Connecting { generation: u64 }`
-  - `Connected { generation: u64, mode: TransportConnectionMode }`
-  - `Disconnected { generation: u64, reason: TransportDisconnectReason }`
-  - `Failed { generation: u64, reason: TransportDisconnectReason }`
-- `TransportConnectionMode`
-  - `Unknown`
-  - `Direct`
-  - `Relayed`
-- `TransportDisconnectReason`
-  - `DataChannelClose`
-  - `DataChannelError`
-  - `ConnectionTimeout`
-  - `SendTimeout`
-  - `MissedLivenessProbes`
-  - `ReplacedByNewPeer`
-  - `ExplicitDisconnect`
-  - `Shutdown`
-- `TransportSignal`
-  - `Ice { browser_identity: String, envelope: serde_json::Value }`
-  - `Answer { browser_identity: String, envelope: serde_json::Value }`
-  Signaling envelopes stay opaque because they are already serialized
-  `OlmEnvelope` values for Rails relay.
+Destination:
 
-Add `HubControlMessage` variants:
+- Add `WebRtcPeerRegistry::start_offer(WebRtcOfferRequest) ->
+  WebRtcOfferStart`.
+- Add `WebRtcPeerRegistry::complete_offer(WebRtcOfferCompletion) ->
+  WebRtcOfferCompletionOutcome`.
+- Add `WebRtcTransportRunner::negotiate_offer(...)` for async SDP answer
+  generation and answer encryption.
+- Store the in-flight channel inside registry state keyed by
+  `{browser_identity, generation}`. Hub must not remove or reinsert channels.
 
-- `TransportPeerStateChanged { client_id, browser_identity, state }`
-- `TransportSignalReady { client_id, signal }`
-- `TransportBackpressure { origin, pressure }`
-- `TransportRatchetRestartRequested { client_id, browser_identity }`
+Typed return surface:
 
-Keep existing `AttachClient`, `DetachClient`, `Backpressure`, `Reconnect`, and
-`Shutdown` for hub policy. The Hub may translate adapter summaries into Lua
-callbacks and browser-visible status events, but new worker-to-hub surfaces must
-be typed.
+- `HubControlMessage::TransportPeerStateChanged` for connecting/failed states.
+- `HubControlMessage::TransportSignalReady` with
+  `TransportSignal::Answer { browser_identity, envelope }` once encrypted.
 
-## Crypto Ownership
+Implementation detail:
 
-The adapter runner owns crypto operations for its peer.
+- Pass the existing `CryptoService` handle into the offer request so answer
+  encryption happens in worker/webrtc, not Hub.
+- `serde_json::Value` remains allowed only inside `TransportSignal::Answer`
+  because it is the already serialized Olm relay envelope.
 
-- `WebRtcTransportRunner` holds `CryptoService` cloned from
-  `hub.browser.crypto_service`.
-- Signaling:
-  - Incoming offer/ICE envelopes are decrypted before peer state machine work.
-  - Answer/ICE relay envelopes are encrypted by the runner and emitted as
-    `TransportSignalReady`.
-- DataChannel:
-  - `encrypt_binary` / `decrypt_binary` move into the adapter runner path.
-  - Keep content bytes and wire constants from
-    `cli/src/relay/olm_crypto.rs`: `CONTENT_MSG`, `CONTENT_PTY`,
-    `CONTENT_STREAM`, `CONTENT_FILE`, `CONTENT_FILE_CHUNK`.
-- Identity trust:
-  - Continue deriving the peer Olm key from browser identity with
-    `extract_olm_key`.
-  - Do not accept a DataChannel message from a browser identity whose Olm key
-    does not match the paired/trusted identity.
-- Ratchet restart:
-  - Preserve `MSG_TYPE_BUNDLE_REFRESH` type 2 bundle refresh.
-  - Adapter sends bundle refresh over the DataChannel when Hub policy requests
-    a fresh bundle or when decrypt failure thresholds require restart.
-  - Hub keeps authority for capability issuance and fresh-bundle generation;
-    adapter owns transport delivery of the resulting bundle bytes.
+### 2. Decrypt-Failure Ratchet Trigger Detection
 
-## Queue And Backpressure Policy
+Decision: move trigger/dedup; keep fresh bundle generation in Hub policy.
 
-Use bounded queues only.
+Current Hub ownership:
 
-- ClientWorker mailbox: existing `CLIENT_WORKER_QUEUE` capacity `1024`.
-- Adapter command queue: existing `TRANSPORT_ADAPTER_QUEUE` capacity `512`.
-- Per-peer outbound send queue: keep current capacity `256`
-  (`PEER_SEND_CHANNEL_CAPACITY`) unless tests show it is too small.
-- Inbound PTY frames from browser: capacity `2048`.
-- Inbound stream frames: capacity `1024`.
-- Inbound file transfers: capacity `128`.
+- `Hub::poll_webrtc_peer_messages` receives `ChannelError::DecryptionFailed`.
+- `Hub::try_ratchet_restart` deduplicates by Olm key/tab id.
+- `Hub::send_ratchet_restart` both generates bundle bytes and queues
+  DataChannel delivery.
 
-Frame policy:
+Destination:
 
-- Terminal output (`CONTENT_PTY` output): `try_send`; drop on full and emit
-  `WorkerBackpressure` with `client_id`, `session_uuid`, source, and capacity.
-  Hub schedules one coalesced recovery snapshot per `{browser_identity,
-  session_uuid}` after cooldown.
-- Snapshots and process/control frames: reliable within bounded queue. If queue
-  is full, emit `TransportBackpressure` and request reconnect instead of silent
-  loss.
-- Close/shutdown frames: best effort, then force runner cleanup and emit
-  `TransportPeerStateChanged::Disconnected`.
-- Stream frames: bounded `try_send`; drop data frames on full, but close/error
-  frames prefer reconnect/cleanup.
-- File input: reject/drop on full with typed backpressure; never block Hub.
+- Add `WebRtcPeerRegistry::record_decrypt_failure(browser_identity) ->
+  Option<TransportRatchetRestartRequested>`.
+- Move Olm-key/tab-id dedup state from Hub into registry.
+- Keep bundle generation in Hub because it mutates trusted crypto policy.
+- Add `WebRtcPeerRegistry::queue_bundle_refresh(browser_identity, bundle_bytes)`
+  for DataChannel delivery.
 
-Dead-peer detection:
+Typed return surface:
 
-- Send timeout: current `PEER_SEND_TIMEOUT` of 2 seconds marks peer dead and
-  emits `Disconnected { reason: SendTimeout }`.
-- Liveness probes: adapter sends `dc_ping` every 10 seconds. Three missed
-  pongs or 30 seconds without liveness emits
-  `Disconnected { reason: MissedLivenessProbes }`.
-- DataChannel close/error immediately emits `DataChannelClose` or
-  `DataChannelError` and starts cleanup.
+- `HubControlMessage::TransportRatchetRestartRequested`.
+- Hub handles that by generating the bundle and emitting ActionCable relay as
+  before, then queues the DataChannel bundle through the registry method.
 
-## Failure Modes Addressed
+### 3. DataChannel Close/Open Lifecycle Summaries
 
-### DataChannel closes after successful connect
+Decision: move.
 
-Current risk: Hub records a peer as connected, then DataChannel close/error
-cleanup races with send queues and Lua peer callbacks. The Hub may continue
-to queue work to a peer whose DataChannel is already gone.
+Current Hub ownership:
 
-Mitigation:
+- Hub cleanup paths infer connection state from channel maps and call Lua
+  callbacks while send tasks may still own per-peer state.
 
-- Adapter runner is the sole owner of DataChannel open/close/error handlers.
-- Connected state is emitted only after DataChannel open, not merely ICE state.
-- Close/error drops the adapter outbound sender, marks generation disconnected,
-  aborts per-peer tasks, and emits exactly one typed disconnect summary.
-- Hub cleanup becomes idempotent policy handling of the summary, not a second
-  owner of socket state.
+Destination:
 
-Regression tests:
+- `WebRtcTransportRunner` owns DataChannel open/close/error events.
+- `WebRtcPeerRegistry::mark_data_channel_open(browser_identity, generation)`.
+- `WebRtcPeerRegistry::mark_data_channel_closed(browser_identity, generation,
+  reason)`.
+- Registry aborts peer send/ping tasks, drops queues, records close waiters,
+  and returns one cleanup summary.
 
-- Adapter unit test: DataChannel close after `Connected` emits one
-  `TransportPeerStateChanged::Disconnected(DataChannelClose)` and rejects
-  later sends without unknown-peer logs.
-- Hub unit/static test: no Hub send path can enqueue into `WebRtcSender`
-  directly after migration.
+Typed return surface:
 
-### Reconnect bursts
+- `HubControlMessage::TransportPeerStateChanged` with:
+  - `Connected { generation, mode }`
+  - `Disconnected { generation, reason: DataChannelClose | DataChannelError |
+    SendTimeout | ReplacedByNewPeer | ExplicitDisconnect }`
 
-Current risk: stale offer completions, pending ICE, close-complete waits, and
-browser reconnect attempts are coordinated by multiple Hub maps and periodic
-cleanup, creating bursty replacement behavior.
+Hub may translate those summaries to Lua `peer_connected` /
+`peer_disconnected` callbacks. Hub must not own DataChannel event handlers.
 
-Mitigation:
+### 4. Stale Offer Completion Rejection
 
-- `WebRtcPeerRegistry` owns reconnect generation per browser identity.
-- Every offer, answer completion, ICE candidate, and peer event carries the
-  generation; stale completions and ICE are dropped.
-- Previous connection close-complete waiting moves into the registry before a
-  replacement runner starts.
-- Direct-to-relay churn fallback stays in the adapter runner.
+Decision: move.
 
-Regression tests:
+Current Hub ownership:
 
-- Two offers in quick succession: first async completion is ignored, second
-  owns the peer.
-- ICE that arrives during offer setup is queued and drained only for the
-  current generation.
-- Replacement waits for close completion or bounded timeout before new runner
-  creation.
+- `HubEvent::WebRtcOfferCompleted` branch checks
+  `self.webrtc.current_offer_generation`, disconnects stale channels, and
+  clears offer state on failure.
 
-### Send-to-unknown-peer noise
+Destination:
 
-Current risk: Hub `try_send_to_peer` sees no `PeerSendState` and logs repeated
-unknown-peer bursts while stale Lua/control paths continue sending after peer
-cleanup.
+- `WebRtcPeerRegistry::complete_offer` checks generation and owns stale channel
+  disconnect.
+- Stale completion returns `WebRtcOfferCompletionOutcome::StaleDropped`.
+- Failed completion returns `WebRtcOfferCompletionOutcome::FailedCleaned`.
 
-Mitigation:
+Typed return surface:
 
-- Hub no longer sends directly to per-peer WebRTC channels.
-- Adapter registry owns peer lookup and returns typed `Disconnected` or
-  `SendRejected` state to ClientWorker/Hub without repeated Hub log noise.
-- Unknown/disconnected sends are coalesced per `{browser_identity, reason}`
-  window and surfaced as metrics, not unbounded warnings.
+- No Hub event should carry a `WebRtcChannel`.
+- Hub receives either no-op stale summary for metrics/logging or a typed failed
+  peer state summary.
 
-Regression tests:
+### 5. Pending ICE Generation Gating
 
-- After peer cleanup, repeated sends emit at most one coalesced metric/log in
-  the window and do not call DataChannel send.
-- Hub static check confirms `try_send_to_peer`/`webrtc_send_tasks` are removed
-  or no longer used by WebRTC.
+Decision: move.
 
-## Cleanup And Leak Prevention
+Current Hub ownership:
 
-`WebRtcPeerRegistry` becomes the owner of stale peer cleanup.
+- Hub drains pending ICE from registry after answer emission and calls
+  `self.webrtc.apply_pending_ice_candidates(...)`.
+- Hub logs stale queued candidate drops.
 
-- Replace `cleanup_disconnected_webrtc_channels()` with registry cleanup:
-  - scan adapter runners on a timer/tick owned by the adapter registry;
-  - disconnect peers stuck in `Connecting` longer than 30 seconds;
-  - call `PeerConnection::close`;
-  - abort send, ping, offer, stream, and file tasks;
-  - prune completed pending-close receivers every scan.
-- Hub receives `TransportPeerStateChanged::Disconnected` and performs policy
-  cleanup:
-  - unregister terminal client peer;
-  - drop pending terminal attach intents;
-  - abort subscription/forwarder state owned by Hub if any remains;
-  - notify Lua peer-disconnected exactly once.
-- Add a static check that `webrtc_channels`, `webrtc_send_tasks`,
-  `dc_ping_tasks`, and `webrtc_pending_closes` no longer live on `Hub`.
+Destination:
 
-## Browser Contract
+- `WebRtcPeerRegistry::queue_or_apply_ice(browser_identity, candidate)` handles
+  current-generation tagging and max queue length.
+- `WebRtcPeerRegistry::apply_queued_ice_for_offer(browser_identity,
+  offer_generation)` applies only matching generation candidates after answer
+  emission.
 
-Default expectation: browser-visible wire and events remain byte-identical.
+Typed return surface:
 
-No browser JS files should need functional changes if the migration is correct:
+- ICE relay remains `TransportSignalReady::Ice`.
+- ICE apply failures are registry-owned diagnostics/metrics, not Hub channel
+  access.
 
-- `app/frontend/lib/workers/bridge.js`
-- `app/frontend/lib/transport/hub_peer_connection.js`
-- `app/frontend/lib/transport/hub_peer_lifecycle.js`
-- `app/frontend/lib/transport/hub_channel_protocol.js`
-- `app/frontend/lib/transport/hub_signaling_client.js`
-- `app/frontend/lib/connections/hub_route.js`
-- `app/frontend/components/hub/SidebarConnectionStatus.jsx`
-- `app/frontend/components/hub/ConnectionOverlay.jsx`
+Invariant:
 
-Preserve:
+- Preserve existing browser answer-first behavior: send answer before applying
+  queued ICE so slow or invalid candidates cannot delay answer relay.
 
-- ActionCable signaling envelope shape.
-- DataChannel content frame bytes.
-- `terminal_{session_uuid}` subscription IDs.
-- `connection:state`, `connection:mode`, `connection:stalled`,
-  `signaling:state`, `subscription:*`, `session:*`, `stream:frame`, and
-  push-related events.
+### 6. Recovery Snapshot Dispatch Boundaries
 
-If implementation discovers a necessary browser-visible delta, stop and update
-this plan before coding the UI/browser change. Keep existing wire naming; do
-not introduce "v2" branding for this migration.
+Decision: move dispatch mechanics; Hub supplies authorized session snapshots.
+
+Current Hub ownership:
+
+- `Hub::send_backpressure_recovery_snapshots` drains registry recovery entries,
+  takes per-peer senders, fetches session snapshots, prepares gzip payloads,
+  sends directly to peer queue, and records sent/empty/failed counters.
+
+Destination:
+
+- Registry owns recovery entry cooldown, peer sender capacity checks, sender
+  retention, and final `WebRtcAdapterCommand::Pty` dispatch.
+- Add `WebRtcPeerRegistry::drain_recovery_requests(now) ->
+  Vec<WebRtcRecoverySnapshotRequest>`.
+- Add `WebRtcPeerRegistry::complete_recovery_snapshot(request_id,
+  WebRtcRecoverySnapshotPayload)` for successful/empty/failed provider results.
+- Add `WebRtcTransportRunner::prepare_recovery_payload(snapshot)` or a
+  registry helper using existing `worker::session_io::timed_prepare_snapshot_payload`.
+
+Hub role:
+
+- Hub validates session ownership and supplies snapshot bytes via a narrow
+  callback/request response because `handle_cache` and session policy remain
+  Hub-owned.
+- Hub does not take peer senders or send recovery payloads directly.
+
+Typed return surface:
+
+- Existing `HubControlMessage::TransportBackpressure` for queue pressure.
+- Add or reuse a typed request shape such as
+  `HubControlMessage::TransportBackpressure { pressure }` plus registry-local
+  recovery request queue. Do not encode recovery snapshot requests as raw JSON.
+
+Queue decisions:
+
+- `WEBRTC_PTY_OUTPUT_QUEUE_CAPACITY`: 2048.
+- `WEBRTC_OUTGOING_SIGNAL_QUEUE_CAPACITY`: 512.
+- `WEBRTC_STREAM_FRAME_QUEUE_CAPACITY`: 1024.
+- `WEBRTC_PTY_INPUT_QUEUE_CAPACITY`: 2048.
+- `WEBRTC_FILE_INPUT_QUEUE_CAPACITY`: 128.
+- `PEER_SEND_CHANNEL_CAPACITY`: 256.
+- `PEER_SEND_TIMEOUT`: 2 seconds.
+- `BACKPRESSURE_SNAPSHOT_COOLDOWN`: 500 ms.
+
+### 7. Misleading Scaffold-Only Ownership Claims
+
+Decision: replace with exact post-migration wording.
+
+Claims to update:
+
+- `docs/worker-actor-contracts.md`
+  - Current wording says `WebRtcPeerRegistry` is the only holder of
+    per-browser `WebRtcChannel` instances and that DataChannel crypto is
+    adapter/registry concern.
+  - After this ticket, keep this as canonical only if implemented. If any
+    handshake exception remains, replace the crypto paragraph with:
+
+```text
+Handshake-time SDP answer encryption remains Hub-owned only if the Hub never
+owns a WebRtcChannel, generation map, pending ICE queue, or DataChannel sender.
+All DataChannel crypto, ratchet trigger detection, peer lifecycle, pending ICE
+application, and recovery dispatch are WebRtcPeerRegistry/WebRtcTransportRunner
+responsibilities.
+```
+
+- `cli/src/worker/webrtc.rs`
+  - Replace “production hub creates and drives runners” comments once registry
+    owns offer completion and lifecycle.
+  - Remove or narrow comments implying production traffic enters runner if
+    `ticket_1777787620_100658` has not landed.
+- `PLAN.md`
+  - This file replaces the stale prior-ticket plan and is the authoritative
+    plan for `ticket_1777787330_803169`.
 
 ## File-Level Implementation Sequence
 
-1. Worker contract extensions
-   - Edit `cli/src/worker/hub_control.rs` for typed transport summaries.
-   - Edit `cli/src/worker/transport.rs` only if `TransportIngress` or
-     `TransportEgress` needs additional typed frame variants.
-   - Keep `cli/src/worker/client.rs` transport-neutral.
+1. Add typed request/outcome structs in `cli/src/worker/webrtc.rs`:
+   - `WebRtcOfferRequest`
+   - `WebRtcOfferStart`
+   - `WebRtcOfferCompletion`
+   - `WebRtcOfferCompletionOutcome`
+   - `WebRtcIngressOutcome`
+   - `WebRtcRecoverySnapshotRequest`
+   - `WebRtcRecoverySnapshotResult`
+2. Move offer channel creation from `Hub::handle_webrtc_offer` into
+   `WebRtcPeerRegistry::start_offer`.
+3. Move bounded replacement close wait into registry:
+   `WebRtcPeerRegistry::wait_for_replaced_peer_close(olm_key, 100ms)`.
+   This method must never block the Hub event loop longer than the bounded
+   wait.
+4. Move async SDP negotiation and answer encryption into
+   `WebRtcTransportRunner::negotiate_offer`.
+5. Replace `HubEvent::WebRtcOfferCompleted { channel, ... }` with either:
+   - `HubEvent::WebRtcOfferCompleted { browser_identity, offer_generation,
+     encrypted_answer }` plus registry-owned completion, or
+   - a direct `HubControlMessage::TransportSignalReady` result from the
+     registry task.
+   Preferred: direct typed transport control result with no Hub event carrying
+   offer state.
+6. Move stale completion and failure cleanup into
+   `WebRtcPeerRegistry::complete_offer`.
+7. Replace Hub ICE queue/drain/apply calls with
+   `WebRtcPeerRegistry::queue_or_apply_ice` and
+   `apply_queued_ice_for_offer`.
+8. Move `handle_webrtc_message` JSON parse and adapter conversion into
+   `WebRtcTransportRunner::handle_plaintext_payload` returning
+   `WebRtcIngressOutcome`:
+   - `PongQueued`
+   - `TerminalColorProfile(serde_json::Value)`
+   - `LuaMessage(serde_json::Value)`
+   - `ClientWorker(ClientWorkerMessage)`
+   - `RatchetRestartRequested`
+   Hub may still call Lua or terminal color profile handlers from the typed
+   outcome.
+9. Move ratchet trigger dedup into registry. Keep Hub bundle generation but
+   queue DataChannel bundle refresh via registry.
+10. Move backpressure recovery dispatch mechanics into registry. Hub supplies
+    session snapshot bytes only through a typed request/result boundary.
+11. Replace production `take_*_rx` / `restore_*_rx` use with registry-owned
+    forwarding/drain methods:
+    - `drain_pty_inputs`
+    - `drain_file_inputs`
+    - `drain_stream_frames`
+    - `drain_outgoing_signals`
+    - `drain_pty_outputs`
+    These may internally own receivers but must not expose receiver ownership
+    to Hub. Existing cfg(test) helpers can remain only if named test-only.
+12. Update docs/comments listed above.
+13. Remove stale Hub methods or reduce them to policy wrappers with names that
+    do not claim transport ownership.
 
-2. WebRTC adapter module
-   - Add `cli/src/worker/webrtc.rs`.
-   - Implement `WebRtcTransportAdapter`, `WebRtcTransportRunner`, and
-     `WebRtcPeerRegistry`.
-   - Reuse `WebRtcChannel`/`WebRtcSender` helpers where possible; extract
-     helper functions from `cli/src/channel/webrtc.rs` only when they become
-     reusable by the runner.
+## Regression Tests
 
-3. Crypto and wire reuse
-   - Reference `cli/src/relay/crypto_service.rs` and
-     `cli/src/relay/olm_crypto.rs` directly.
-   - Keep type 2 `MSG_TYPE_BUNDLE_REFRESH` intact.
-   - Move DataChannel encrypt/decrypt calls into the adapter runner.
+Add focused tests primarily in `cli/src/worker/webrtc.rs` under `#[cfg(test)]`.
+Use `cli/src/hub/server_comms.rs` tests only for Hub policy translation.
 
-4. Hub integration
-   - Edit `cli/src/hub/mod.rs` to replace WebRTC maps with one registry handle.
-   - Edit `cli/src/hub/server_comms.rs` so signaling handlers delegate to the
-     registry and consume typed hub-control summaries.
-   - Keep auth, pairing, capability, Lua callback, and ActionCable relay
-     policy in Hub.
+Required tests:
 
-5. Remove old paths
-   - Delete or fully disconnect old Hub send-task and cleanup functions:
-     `spawn_peer_send_task`, `try_send_to_peer`, `send_webrtc_raw`,
-     `cleanup_disconnected_webrtc_channels`, and direct
-     `webrtc_channels` access.
-   - Remove stale fields from `Hub`.
+- DataChannel close after Connected
+  - Arrange a registry peer marked `Connected`.
+  - Simulate DataChannel close for the same generation.
+  - Assert one `TransportPeerStateChanged::Disconnected` summary with
+    `DataChannelClose`.
+  - Assert peer send task/ping task/recovery entries are removed.
+  - Assert duplicate close for same generation is ignored.
+- Quick successive offers with stale completion rejection
+  - Start offer generation 1, then generation 2 for same browser.
+  - Complete generation 1 after generation 2 starts.
+  - Assert stale completion is dropped, old channel is disconnected, and no
+    answer signal is emitted.
+  - Complete generation 2 and assert answer signal is emitted once.
+- Bounded replacement close wait
+  - Register stale same-device peer with a pending close receiver that does not
+    resolve.
+  - Start replacement offer.
+  - Assert elapsed wait is bounded to the configured 100 ms window plus test
+    tolerance.
+  - Assert replacement proceeds and stale peer cleanup reason is
+    `ReplacedByNewPeer`.
 
-6. Tests and docs
-   - Add focused Rust tests beside `cli/src/worker/webrtc.rs`.
-   - Update existing `cli/src/hub/server_comms.rs` tests for the new boundary.
-   - Update any worker contract docs if present.
+Additional tests:
 
-## Verification Commands
+- Pending ICE generation gating drops old-generation queued candidates and
+  applies only current-generation candidates after answer emission.
+- Decrypt failure ratchet trigger deduplicates by Olm key and tab id and emits
+  only one `TransportRatchetRestartRequested`.
+- Backpressure recovery dispatch:
+  - cooled entry with full peer queue remains queued or records failed without
+    Hub direct send
+  - empty snapshot records `snapshot.backpressure_recovery.empty`
+  - successful snapshot queues one `WebRtcAdapterCommand::Pty`
+- Ingress handling returns typed outcomes for `dc_ping`, `dc_pong`,
+  `terminal_color_profile`, Lua JSON fallback, and decrypt-failure restart.
 
-Run focused CLI tests through the wrapper:
+## Verification
+
+Run CLI tests through the wrapper:
 
 ```bash
 cd cli && ./test.sh --unit worker
 cd cli && ./test.sh --unit webrtc
+cd cli && ./test.sh --unit server_comms
+```
+
+If touched code crosses hub runtime wiring, also run:
+
+```bash
 cd cli && ./test.sh --unit hub
 ```
 
-If `cli/test.sh` does not support those filters exactly, use the nearest
-supported filter and record the exact command in the implementation report.
-
-Run static checks proving the old Hub-owned data path is gone:
+Static ownership checks after implementation:
 
 ```bash
-rg -n "webrtc_channels|webrtc_send_tasks|dc_ping_tasks|webrtc_pending_closes" cli/src/hub
-rg -n "spawn_peer_send_task|try_send_to_peer|send_webrtc_raw|cleanup_disconnected_webrtc_channels" cli/src/hub
-rg -n "WebRtcSender|send_pty_raw|send_stream_raw|send_bundle_refresh" cli/src/hub
-rg -n "TransportPeerStateChanged|TransportSignalReady|TransportRatchetRestartRequested|WebRtcTransportRunner|WebRtcPeerRegistry" cli/src
-rg -n "self\\.webrtc\\.channel\\(|\\.channel_ids\\(|pub\\(crate\\) fn channel\\(|fn channel_ids\\(" cli/src/hub cli/src/worker/webrtc.rs
+rg -n "fn handle_webrtc_offer|WebRtcOfferCompleted|fn handle_webrtc_message|fn try_ratchet_restart|fn send_ratchet_restart|fn poll_webrtc_peer_messages|fn send_backpressure_recovery_snapshots" cli/src/hub
+rg -n "take_.*_rx|restore_.*_rx" cli/src/hub cli/src/hub/run.rs
+rg -n "webrtc_pending_ice_candidates|webrtc_offer_generation|webrtc_backpressure_recovery" cli/src/hub
+rg -n "remove_channel\\(|insert_channel\\(|take_pending_close_for_olm\\(|apply_pending_ice_candidates\\(" cli/src/hub
 ```
 
-`WebRtcTransportRunner` and `WebRtcTransportAdapter` must also compile without
-dead-code warnings in the filtered test output; warning-free `./test.sh --unit
-worker`/`webrtc` output is part of the implementation evidence.
+Expected result: no matches in Hub-owned production code. If a test-only match
+remains, it must be behind `#[cfg(test)]` and named as a test helper, not a
+production ownership path.
 
-Run browser compatibility tests only if browser-visible events or frame shapes
-change:
+Wire protocol check:
 
-```bash
-npx vitest run app/frontend/test/hub-peer-connection-peer-lost.test.js
-npx vitest run app/frontend/test/hub-signaling-client.test.js
-npx vitest run app/frontend/test/hub-connection-status.test.js
-npx vitest run app/frontend/test/sidebar-connection-status.test.jsx
-```
+- `docs/webrtc-protocol.md` should not need changes because browser wire frames
+  stay unchanged.
+- Rails channel/system tests are not required unless the ActionCable envelope
+  shape changes. This plan preserves the envelope shape.
 
-Rails channel behavior should remain unchanged. If signaling payload shape
-changes unexpectedly, run:
+## Done Criteria
 
-```bash
-bin/rails test test/channels/hub_signaling_channel_test.rb
-bin/rails test test/controllers/hubs/webrtc_controller_test.rb
-```
-
-## Acceptance Checklist
-
-- WebRTC peer lifecycle, ICE, DataChannel open/close/error, crypto
-  encrypt/decrypt, liveness probes, outbound queue, backpressure, and
-  dead-peer detection are adapter-owned.
-- Hub no longer owns per-peer WebRTC channel/send-task/close maps.
-- Hub receives typed summaries and keeps auth/pairing/signaling/capability
-  policy.
-- Rails ActionCable relay remains opaque.
-- Browser wire/events stay byte-identical, or a deliberate contract update is
-  documented before implementation.
-- The three named failure modes have regression coverage.
-- All hot-path queues are bounded and report deterministic typed
-  backpressure.
+- `PLAN.md` is this ticket's plan and no stale prior-ticket plan remains.
+- Hub no longer owns the seven drift items above.
+- Registry/runner APIs own lifecycle, crypto handoff, ratchet trigger, pending
+  ICE, close/open summaries, receiver drains, and recovery dispatch.
+- Hub receives typed summaries/requests and keeps policy authority only.
+- Regression tests cover the three ticket-required scenarios.
+- Static `rg` checks prove removed Hub symbols and raw receiver ownership are
+  gone from production Hub code.
+- Docs/comments no longer claim aspirational worker ownership ahead of code.
