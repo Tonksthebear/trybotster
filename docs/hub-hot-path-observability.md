@@ -59,8 +59,10 @@ and gzip/queue spans are slow at 100ms. Manifest writes are slow at 10ms.
 
 Session-process PTY output now reaches the hub as
 `HubEvent::SessionIoBatch`. The worker coalesces durable-session output before
-delivery to reduce hub event volume; WebRTC and other legacy PTY output queues
-still use the existing drain-batch span. Snapshot byte preparation has moved
+delivery to reduce hub event volume. WebRTC transport queues are owned by
+`WebRtcPeerRegistry` forwarders and enter the hub as typed `HubEvent`
+variants; hub-side PTY output handling still uses the existing drain-batch
+span. Snapshot byte preparation has moved
 behind `worker::session_io` helpers, but the stable `snapshot.rpc_get` and
 `snapshot.gzip_queue` span names remain unchanged for operator playbooks.
 Backpressure recovery snapshot delivery records the same gzip queue span and
@@ -182,8 +184,8 @@ Botster daemon log failure shapes: 1001 noisy PTY frames with OSC traffic,
 `pty_osc.cursor` volume bursts over the 30s guardrail window, session-reader
 EOF cycles, WebRTC reconnect/backpressure churn, and slow-client recovery
 snapshot delivery. The hub-side replay test records `session_io_batch` handler
-timing through `HubEventMetrics` and asserts the maximum handler time stays
-under the existing hot-subhandler budget with no slow samples. This is the
+timing through `HubEventMetrics` and asserts p99 handler time stays under the
+existing hot-subhandler budget with no slow samples. This is the
 preferred regression shape for future changes to session I/O batching, OSC
 guardrails, WebRTC recovery routing, or snapshot gzip queueing.
 
