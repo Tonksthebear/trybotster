@@ -159,7 +159,7 @@ mod tests {
                     subscription_id,
                 },
                 TransportIngress::TerminalInput { session_uuid, data } => {
-                    ClientWorkerMessage::TerminalBytes { session_uuid, data }
+                    ClientWorkerMessage::SessionInput { session_uuid, data }
                 }
                 TransportIngress::Health(health) => ClientWorkerMessage::Health(health),
                 TransportIngress::Unsubscribe {
