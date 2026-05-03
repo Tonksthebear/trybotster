@@ -5,8 +5,13 @@
 //! or future transport. Transport-specific encoding and send mechanics belong
 //! behind `TransportAdapter`.
 
+use std::collections::HashMap;
+
 use crate::client::ClientId;
 
+use super::hub_control::{HubControlMessage, HubControlOrigin, WorkerBackpressure};
+use super::session_io::SessionIoRequest;
+use super::transport::TransportEgress;
 use super::{BoundedQueueConfig, RequestId, SessionUuid, SubscriptionId};
 
 /// Default bounded mailbox config for client-worker input.
@@ -86,6 +91,13 @@ pub enum ClientWorkerMessage {
         /// Raw terminal bytes.
         data: Vec<u8>,
     },
+    /// Raw terminal input from the client to a subscribed session.
+    SessionInput {
+        /// Session that should receive the bytes.
+        session_uuid: SessionUuid,
+        /// Raw PTY input bytes.
+        data: Vec<u8>,
+    },
     /// Control frame for a subscribed session or client.
     ControlFrame(ClientControlFrame),
     /// Client transport health changed.
@@ -102,6 +114,13 @@ pub enum ClientWorkerMessage {
         /// Request identifier.
         request_id: RequestId,
     },
+    /// Wrap a message with the reconnect generation it was observed under.
+    WithGeneration {
+        /// Client reconnect generation associated with this delivery.
+        generation: u64,
+        /// Message to process when the generation is current.
+        message: Box<ClientWorkerMessage>,
+    },
     /// Shut down this client worker.
     Shutdown {
         /// Human-readable reason for diagnostics.
@@ -116,4 +135,726 @@ pub struct ClientWorkerHandle {
     pub client_id: ClientId,
     /// Bounded mailbox sender.
     pub tx: tokio::sync::mpsc::Sender<ClientWorkerMessage>,
+}
+
+impl ClientWorkerHandle {
+    /// Enqueue a message for this client worker.
+    pub async fn send(
+        &self,
+        message: ClientWorkerMessage,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<ClientWorkerMessage>> {
+        self.tx.send(message).await
+    }
+
+    /// Try to enqueue a message without waiting on a full mailbox.
+    pub fn try_send(
+        &self,
+        message: ClientWorkerMessage,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<ClientWorkerMessage>> {
+        self.tx.try_send(message)
+    }
+}
+
+/// Runtime dependencies for a transport-neutral client worker.
+#[derive(Debug)]
+pub struct ClientWorkerConfig {
+    /// Client identity represented by the worker.
+    pub client_id: ClientId,
+    /// Hub-control mailbox for orchestration requests.
+    pub hub_control_tx: tokio::sync::mpsc::Sender<HubControlMessage>,
+    /// Transport egress mailbox owned by the adapter layer.
+    pub outbound_tx: tokio::sync::mpsc::Sender<TransportEgress>,
+    /// Session-I/O request mailboxes keyed by session UUID.
+    pub session_io_txs: HashMap<SessionUuid, tokio::sync::mpsc::Sender<SessionIoRequest>>,
+    /// Bounded mailbox config for this worker.
+    pub mailbox: BoundedQueueConfig,
+    /// Diagnostics label and capacity for the outbound transport queue.
+    pub outbound: BoundedQueueConfig,
+}
+
+impl ClientWorkerConfig {
+    /// Construct a config with the default client-worker mailbox and transport queue metadata.
+    #[must_use]
+    pub fn new(
+        client_id: ClientId,
+        hub_control_tx: tokio::sync::mpsc::Sender<HubControlMessage>,
+        outbound_tx: tokio::sync::mpsc::Sender<TransportEgress>,
+        session_io_txs: HashMap<SessionUuid, tokio::sync::mpsc::Sender<SessionIoRequest>>,
+    ) -> Self {
+        Self {
+            client_id,
+            hub_control_tx,
+            outbound_tx,
+            session_io_txs,
+            mailbox: CLIENT_WORKER_QUEUE,
+            outbound: BoundedQueueConfig::new("worker.client.outbound", 512),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryKind {
+    Terminal,
+    Control,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientSubscription {
+    subscription_id: SubscriptionId,
+}
+
+/// Client-worker delivery counters for slow-client policy diagnostics.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientWorkerStats {
+    /// Terminal frames accepted by the transport egress queue.
+    pub terminal_frames_sent: u64,
+    /// Terminal frames dropped because the transport egress queue was full.
+    pub terminal_frames_dropped: u64,
+    /// Backpressure notices emitted to hub control.
+    pub backpressure_events: u64,
+}
+
+/// Transport-neutral client worker runtime.
+#[derive(Debug)]
+pub struct ClientWorker {
+    client_id: ClientId,
+    hub_control_tx: tokio::sync::mpsc::Sender<HubControlMessage>,
+    outbound_tx: tokio::sync::mpsc::Sender<TransportEgress>,
+    session_io_txs: HashMap<SessionUuid, tokio::sync::mpsc::Sender<SessionIoRequest>>,
+    subscriptions: HashMap<SessionUuid, ClientSubscription>,
+    health: ClientConnectionHealth,
+    generation: u64,
+    outbound: BoundedQueueConfig,
+    stats: ClientWorkerStats,
+}
+
+impl ClientWorker {
+    /// Spawn a client worker and return the mailbox handle future hub code can own.
+    #[must_use]
+    pub fn start(config: ClientWorkerConfig) -> ClientWorkerHandle {
+        let capacity = config.mailbox.capacity;
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+        let client_id = config.client_id.clone();
+
+        tokio::spawn(async move {
+            let worker = Self::new(config);
+            worker.run(rx).await;
+        });
+
+        ClientWorkerHandle { client_id, tx }
+    }
+
+    fn new(config: ClientWorkerConfig) -> Self {
+        Self {
+            client_id: config.client_id,
+            hub_control_tx: config.hub_control_tx,
+            outbound_tx: config.outbound_tx,
+            session_io_txs: config.session_io_txs,
+            subscriptions: HashMap::new(),
+            health: ClientConnectionHealth::Ready,
+            generation: 0,
+            outbound: config.outbound,
+            stats: ClientWorkerStats::default(),
+        }
+    }
+
+    async fn run(mut self, mut rx: tokio::sync::mpsc::Receiver<ClientWorkerMessage>) {
+        while let Some(message) = rx.recv().await {
+            let should_stop = self.handle_message(message).await;
+            if should_stop {
+                break;
+            }
+        }
+    }
+
+    async fn handle_message(&mut self, message: ClientWorkerMessage) -> bool {
+        let message = match message {
+            ClientWorkerMessage::WithGeneration {
+                generation,
+                message,
+            } => {
+                if generation < self.generation {
+                    return false;
+                }
+
+                *message
+            }
+            message => message,
+        };
+
+        match message {
+            ClientWorkerMessage::SubscribeSession {
+                session_uuid,
+                subscription_id,
+            } => {
+                self.subscribe(session_uuid, subscription_id).await;
+                false
+            }
+            ClientWorkerMessage::UnsubscribeSession {
+                session_uuid,
+                subscription_id,
+            } => {
+                self.unsubscribe(session_uuid, subscription_id).await;
+                false
+            }
+            ClientWorkerMessage::TerminalBytes { session_uuid, data } => {
+                self.deliver_terminal_bytes(session_uuid, data).await;
+                false
+            }
+            ClientWorkerMessage::SessionInput { session_uuid, data } => {
+                self.route_session_input(session_uuid, data).await;
+                false
+            }
+            ClientWorkerMessage::ControlFrame(frame) => {
+                self.deliver_control_frame(frame).await;
+                false
+            }
+            ClientWorkerMessage::Health(health) => {
+                self.update_health(health).await;
+                false
+            }
+            ClientWorkerMessage::Backpressure { source, capacity } => {
+                self.report_backpressure(source, capacity, None).await;
+                false
+            }
+            ClientWorkerMessage::Ping { request_id } => {
+                self.deliver_control(
+                    serde_json::json!({
+                        "type": "pong",
+                        "request_id": request_id,
+                    }),
+                    None,
+                    DeliveryKind::Control,
+                )
+                .await;
+                false
+            }
+            ClientWorkerMessage::WithGeneration { .. } => {
+                unreachable!("generation wrapper handled before dispatch")
+            }
+            ClientWorkerMessage::Shutdown { reason } => {
+                let _ = self
+                    .outbound_tx
+                    .send(TransportEgress::Close {
+                        reason: reason.clone(),
+                    })
+                    .await;
+                self.send_hub_control(HubControlMessage::Shutdown {
+                    origin: HubControlOrigin::Client(self.client_id.clone()),
+                    reason,
+                })
+                .await;
+                true
+            }
+        }
+    }
+
+    async fn subscribe(&mut self, session_uuid: SessionUuid, subscription_id: SubscriptionId) {
+        self.subscriptions.insert(
+            session_uuid.clone(),
+            ClientSubscription {
+                subscription_id: subscription_id.clone(),
+            },
+        );
+
+        self.send_hub_control(HubControlMessage::AttachClient {
+            client_id: self.client_id.clone(),
+            session_uuid,
+            subscription_id,
+        })
+        .await;
+    }
+
+    async fn unsubscribe(&mut self, session_uuid: SessionUuid, subscription_id: SubscriptionId) {
+        let should_detach = self
+            .subscriptions
+            .get(&session_uuid)
+            .is_some_and(|subscription| subscription.subscription_id == subscription_id);
+
+        if !should_detach {
+            return;
+        }
+
+        self.subscriptions.remove(&session_uuid);
+        self.send_hub_control(HubControlMessage::DetachClient {
+            client_id: self.client_id.clone(),
+            session_uuid,
+            subscription_id,
+        })
+        .await;
+    }
+
+    async fn deliver_terminal_bytes(&mut self, session_uuid: SessionUuid, data: Vec<u8>) {
+        let Some(subscription) = self.subscriptions.get(&session_uuid) else {
+            return;
+        };
+
+        if !matches!(self.health, ClientConnectionHealth::Ready) {
+            return;
+        }
+
+        let egress = TransportEgress::TerminalBytes {
+            subscription_id: subscription.subscription_id.clone(),
+            data,
+        };
+        self.try_deliver_egress(egress, Some(session_uuid), DeliveryKind::Terminal)
+            .await;
+    }
+
+    async fn route_session_input(&mut self, session_uuid: SessionUuid, data: Vec<u8>) {
+        if !self.subscriptions.contains_key(&session_uuid) {
+            return;
+        }
+
+        let Some(tx) = self.session_io_txs.get(&session_uuid).cloned() else {
+            return;
+        };
+
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+            tx.try_send(SessionIoRequest::PtyInput { data })
+        {
+            self.report_backpressure(
+                super::session_io::SESSION_IO_WORKER_QUEUE.name,
+                super::session_io::SESSION_IO_WORKER_QUEUE.capacity,
+                Some(session_uuid),
+            )
+            .await;
+        }
+    }
+
+    async fn deliver_control_frame(&mut self, frame: ClientControlFrame) {
+        match frame {
+            ClientControlFrame::Snapshot {
+                session_uuid,
+                payload,
+            } => {
+                if !self.subscriptions.contains_key(&session_uuid) {
+                    return;
+                }
+                let scoped_session_uuid = session_uuid.clone();
+                self.deliver_control(
+                    serde_json::json!({
+                        "type": "snapshot",
+                        "session_uuid": session_uuid,
+                        "payload": payload,
+                    }),
+                    Some(scoped_session_uuid),
+                    DeliveryKind::Control,
+                )
+                .await;
+            }
+            ClientControlFrame::ModeChanged { session_uuid, mode } => {
+                if !self.subscriptions.contains_key(&session_uuid) {
+                    return;
+                }
+                let scoped_session_uuid = session_uuid.clone();
+                self.deliver_control(
+                    serde_json::json!({
+                        "type": "mode_changed",
+                        "session_uuid": session_uuid,
+                        "mode": mode,
+                    }),
+                    Some(scoped_session_uuid),
+                    DeliveryKind::Control,
+                )
+                .await;
+            }
+            ClientControlFrame::ProcessExited {
+                session_uuid,
+                exit_code,
+            } => {
+                if !self.subscriptions.contains_key(&session_uuid) {
+                    return;
+                }
+                let scoped_session_uuid = session_uuid.clone();
+                self.deliver_control(
+                    serde_json::json!({
+                        "type": "process_exited",
+                        "session_uuid": session_uuid,
+                        "exit_code": exit_code,
+                    }),
+                    Some(scoped_session_uuid),
+                    DeliveryKind::Control,
+                )
+                .await;
+            }
+            ClientControlFrame::Json(value) => {
+                self.deliver_control(value, None, DeliveryKind::Control)
+                    .await;
+            }
+        }
+    }
+
+    async fn deliver_control(
+        &mut self,
+        value: serde_json::Value,
+        session_uuid: Option<SessionUuid>,
+        kind: DeliveryKind,
+    ) {
+        if !matches!(self.health, ClientConnectionHealth::Ready) {
+            return;
+        }
+
+        self.try_deliver_egress(TransportEgress::Control(value), session_uuid, kind)
+            .await;
+    }
+
+    async fn try_deliver_egress(
+        &mut self,
+        egress: TransportEgress,
+        session_uuid: Option<SessionUuid>,
+        kind: DeliveryKind,
+    ) {
+        match self.outbound_tx.try_send(egress) {
+            Ok(()) => {
+                if matches!(kind, DeliveryKind::Terminal) {
+                    self.stats.terminal_frames_sent += 1;
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                if matches!(kind, DeliveryKind::Terminal) {
+                    self.stats.terminal_frames_dropped += 1;
+                }
+                let source = match kind {
+                    DeliveryKind::Terminal => self.outbound.name,
+                    DeliveryKind::Control => "worker.client.outbound.control",
+                };
+                self.report_backpressure(source, self.outbound.capacity, session_uuid)
+                    .await;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.update_health(ClientConnectionHealth::Disconnected {
+                    reason: "transport egress closed".to_string(),
+                })
+                .await;
+            }
+        }
+    }
+
+    async fn update_health(&mut self, health: ClientConnectionHealth) {
+        match &health {
+            ClientConnectionHealth::Reconnecting { generation } => {
+                if *generation > self.generation {
+                    self.generation = *generation;
+                }
+                self.send_hub_control(HubControlMessage::Reconnect {
+                    origin: HubControlOrigin::Client(self.client_id.clone()),
+                    session_uuid: None,
+                    generation: self.generation,
+                })
+                .await;
+            }
+            ClientConnectionHealth::Backpressured { source } => {
+                self.report_backpressure(source, self.outbound.capacity, None)
+                    .await;
+            }
+            ClientConnectionHealth::Ready | ClientConnectionHealth::Disconnected { .. } => {}
+        }
+
+        self.health = health;
+    }
+
+    async fn report_backpressure(
+        &mut self,
+        source: &'static str,
+        capacity: usize,
+        session_uuid: Option<SessionUuid>,
+    ) {
+        self.stats.backpressure_events += 1;
+        self.send_hub_control(HubControlMessage::Backpressure(WorkerBackpressure {
+            source,
+            capacity,
+            session_uuid,
+            client_id: Some(self.client_id.clone()),
+        }))
+        .await;
+    }
+
+    async fn send_hub_control(&self, message: HubControlMessage) {
+        let _ = self.hub_control_tx.send(message).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type WorkerHarness = (
+        ClientWorkerHandle,
+        tokio::sync::mpsc::Receiver<HubControlMessage>,
+        tokio::sync::mpsc::Receiver<TransportEgress>,
+        tokio::sync::mpsc::Receiver<SessionIoRequest>,
+    );
+
+    fn spawn_worker(client_id: ClientId, outbound_capacity: usize) -> WorkerHarness {
+        let (hub_control_tx, hub_control_rx) = tokio::sync::mpsc::channel(16);
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(outbound_capacity);
+        let (session_io_tx, session_io_rx) = tokio::sync::mpsc::channel(1);
+        let mut session_io_txs = HashMap::new();
+        session_io_txs.insert("sess-1".to_string(), session_io_tx);
+
+        let mut config =
+            ClientWorkerConfig::new(client_id, hub_control_tx, outbound_tx, session_io_txs);
+        config.outbound = BoundedQueueConfig::new("test.outbound", outbound_capacity);
+
+        (
+            ClientWorker::start(config),
+            hub_control_rx,
+            outbound_rx,
+            session_io_rx,
+        )
+    }
+
+    async fn recv_hub(
+        rx: &mut tokio::sync::mpsc::Receiver<HubControlMessage>,
+    ) -> HubControlMessage {
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for hub control")
+            .expect("hub control closed")
+    }
+
+    async fn recv_egress(rx: &mut tokio::sync::mpsc::Receiver<TransportEgress>) -> TransportEgress {
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timed out waiting for egress")
+            .expect("egress closed")
+    }
+
+    async fn subscribe(handle: &ClientWorkerHandle) {
+        handle
+            .send(ClientWorkerMessage::SubscribeSession {
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-1".to_string(),
+            })
+            .await
+            .expect("send subscribe");
+    }
+
+    #[tokio::test]
+    async fn subscribe_unsubscribe_emit_hub_control_and_gate_terminal_delivery() {
+        let (handle, mut hub_rx, mut outbound_rx, _session_rx) = spawn_worker(ClientId::Tui, 8);
+
+        handle
+            .send(ClientWorkerMessage::TerminalBytes {
+                session_uuid: "sess-1".to_string(),
+                data: b"before".to_vec(),
+            })
+            .await
+            .expect("send terminal before subscribe");
+        assert!(outbound_rx.try_recv().is_err());
+
+        subscribe(&handle).await;
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::AttachClient {
+                client_id: ClientId::Tui,
+                session_uuid,
+                subscription_id,
+            } if session_uuid == "sess-1" && subscription_id == "sub-1"
+        ));
+
+        handle
+            .send(ClientWorkerMessage::TerminalBytes {
+                session_uuid: "sess-1".to_string(),
+                data: b"after".to_vec(),
+            })
+            .await
+            .expect("send terminal after subscribe");
+        assert!(matches!(
+            recv_egress(&mut outbound_rx).await,
+            TransportEgress::TerminalBytes {
+                subscription_id,
+                data,
+            } if subscription_id == "sub-1" && data == b"after"
+        ));
+
+        handle
+            .send(ClientWorkerMessage::UnsubscribeSession {
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-1".to_string(),
+            })
+            .await
+            .expect("send unsubscribe");
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::DetachClient {
+                client_id: ClientId::Tui,
+                session_uuid,
+                subscription_id,
+            } if session_uuid == "sess-1" && subscription_id == "sub-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_input_routes_to_attached_session_io_worker_only_when_subscribed() {
+        let (handle, mut hub_rx, _outbound_rx, mut session_rx) =
+            spawn_worker(ClientId::browser("browser-identity"), 8);
+
+        handle
+            .send(ClientWorkerMessage::SessionInput {
+                session_uuid: "sess-1".to_string(),
+                data: b"ignored".to_vec(),
+            })
+            .await
+            .expect("send input before subscribe");
+        assert!(session_rx.try_recv().is_err());
+
+        subscribe(&handle).await;
+        let _ = recv_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::SessionInput {
+                session_uuid: "sess-1".to_string(),
+                data: b"ls\n".to_vec(),
+            })
+            .await
+            .expect("send subscribed input");
+
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), session_rx.recv())
+                .await
+                .expect("timed out waiting for session input")
+                .expect("session io closed"),
+            SessionIoRequest::PtyInput { data } if data == b"ls\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn slow_outbound_terminal_delivery_reports_backpressure_with_routing_context() {
+        let (handle, mut hub_rx, _outbound_rx, _session_rx) = spawn_worker(ClientId::Tui, 1);
+
+        subscribe(&handle).await;
+        let _ = recv_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::TerminalBytes {
+                session_uuid: "sess-1".to_string(),
+                data: b"first".to_vec(),
+            })
+            .await
+            .expect("send first terminal frame");
+        handle
+            .send(ClientWorkerMessage::TerminalBytes {
+                session_uuid: "sess-1".to_string(),
+                data: b"second".to_vec(),
+            })
+            .await
+            .expect("send second terminal frame");
+
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::Backpressure(WorkerBackpressure {
+                source: "test.outbound",
+                capacity: 1,
+                session_uuid: Some(session_uuid),
+                client_id: Some(ClientId::Tui),
+            }) if session_uuid == "sess-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconnect_generation_drops_stale_wrapped_deliveries() {
+        let (handle, mut hub_rx, mut outbound_rx, _session_rx) = spawn_worker(ClientId::Tui, 8);
+
+        subscribe(&handle).await;
+        let _ = recv_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::Health(
+                ClientConnectionHealth::Reconnecting { generation: 2 },
+            ))
+            .await
+            .expect("send reconnect health");
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::Reconnect {
+                origin: HubControlOrigin::Client(ClientId::Tui),
+                generation: 2,
+                ..
+            }
+        ));
+
+        handle
+            .send(ClientWorkerMessage::Health(ClientConnectionHealth::Ready))
+            .await
+            .expect("send ready health");
+        handle
+            .send(ClientWorkerMessage::WithGeneration {
+                generation: 1,
+                message: Box::new(ClientWorkerMessage::TerminalBytes {
+                    session_uuid: "sess-1".to_string(),
+                    data: b"stale".to_vec(),
+                }),
+            })
+            .await
+            .expect("send stale frame");
+        assert!(outbound_rx.try_recv().is_err());
+
+        handle
+            .send(ClientWorkerMessage::WithGeneration {
+                generation: 2,
+                message: Box::new(ClientWorkerMessage::TerminalBytes {
+                    session_uuid: "sess-1".to_string(),
+                    data: b"fresh".to_vec(),
+                }),
+            })
+            .await
+            .expect("send fresh frame");
+        assert!(matches!(
+            recv_egress(&mut outbound_rx).await,
+            TransportEgress::TerminalBytes { data, .. } if data == b"fresh"
+        ));
+    }
+
+    #[tokio::test]
+    async fn ping_replies_with_transport_neutral_pong_control_frame() {
+        let (handle, _hub_rx, mut outbound_rx, _session_rx) =
+            spawn_worker(ClientId::Socket("socket-1".to_string()), 8);
+
+        handle
+            .send(ClientWorkerMessage::Ping {
+                request_id: "req-1".to_string(),
+            })
+            .await
+            .expect("send ping");
+
+        assert!(matches!(
+            recv_egress(&mut outbound_rx).await,
+            TransportEgress::Control(value)
+                if value["type"] == "pong" && value["request_id"] == "req-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn browser_and_tui_clients_use_the_same_worker_path() {
+        for client_id in [ClientId::Tui, ClientId::browser("browser-identity")] {
+            let (handle, mut hub_rx, mut outbound_rx, _session_rx) =
+                spawn_worker(client_id.clone(), 8);
+
+            subscribe(&handle).await;
+            assert!(matches!(
+                recv_hub(&mut hub_rx).await,
+                HubControlMessage::AttachClient {
+                    client_id: attached_client_id,
+                    ..
+                } if attached_client_id == client_id
+            ));
+
+            handle
+                .send(ClientWorkerMessage::TerminalBytes {
+                    session_uuid: "sess-1".to_string(),
+                    data: b"x".to_vec(),
+                })
+                .await
+                .expect("send terminal bytes");
+            assert!(matches!(
+                recv_egress(&mut outbound_rx).await,
+                TransportEgress::TerminalBytes {
+                    subscription_id,
+                    data,
+                } if subscription_id == "sub-1" && data == b"x"
+            ));
+        }
+    }
 }
