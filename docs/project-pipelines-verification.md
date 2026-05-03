@@ -15,19 +15,19 @@ Commands and results:
 
 ```bash
 cd cli && ./test.sh --unit -- worker
-# 29 passed; 0 failed
+# 38 passed; 0 failed
 
 cd cli && ./test.sh --unit -- server_comms
 # 39 passed; 0 failed
 
 cd cli && ./test.sh --unit -- socket
-# passed after rerun; first run hit an unrelated hub::daemon socket-cleanup flake
+# 74 passed; 0 failed
 
 cd cli && ./test.sh --unit -- tui_bridge
 # 10 passed; 0 failed
 
 cd cli && ./test.sh --unit
-# 1469 passed; 0 failed; 1 ignored
+# 1478 passed; 0 failed; 1 ignored
 ```
 
 Notes:
@@ -37,6 +37,8 @@ Notes:
 - The socket-worker live-output parity test now passes under the standard
   focused filters with default test concurrency; it is not dependent on
   `--test-threads=1`.
+- Merge-agent verification was rerun after integrating `origin/main`, including
+  the WebRTC client-worker transport adapter changes already on main.
 - Static boundary checks confirmed `cli/src/worker/client.rs` has no concrete
   socket, TUI bridge, or WebRTC imports. Remaining `send_frame` matches are
   outside the covered TUI/local-socket terminal forwarder path.

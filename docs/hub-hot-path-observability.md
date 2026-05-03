@@ -51,7 +51,7 @@ The most useful span names are:
 | `cleanup.webrtc_scan` | periodic WebRTC channel cleanup scan |
 | `cleanup.webrtc_channel` | cleanup of one WebRTC channel |
 | `snapshot.rpc_get` | blocking terminal snapshot retrieval |
-| `snapshot.gzip_queue` | snapshot gzip and queue preparation |
+| `snapshot.gzip_queue` | snapshot gzip and queue preparation, emitted while the session I/O data-plane helper prepares transport bytes |
 | `manifest.write` | hub runtime manifest write from hub-owned call sites |
 
 Hot socket/WebRTC subhandlers and cleanup scans are slow at 50ms. Snapshot RPC
@@ -60,7 +60,9 @@ and gzip/queue spans are slow at 100ms. Manifest writes are slow at 10ms.
 Session-process PTY output now reaches the hub as
 `HubEvent::SessionIoBatch`. The worker coalesces durable-session output before
 delivery to reduce hub event volume; WebRTC and other legacy PTY output queues
-still use the existing drain-batch span.
+still use the existing drain-batch span. Snapshot byte preparation has moved
+behind `worker::session_io` helpers, but the stable `snapshot.rpc_get` and
+`snapshot.gzip_queue` span names remain unchanged for operator playbooks.
 
 ## Counters
 
@@ -164,10 +166,12 @@ cd cli
 ```
 
 The original instrumentation slice was verified with `1437 passed; 0 failed; 1
-ignored`. The session-I/O worker slice was verified with `1456 passed; 0
-failed; 1 ignored`. Direct tests cover `HubEventMetrics` counters/spans/slow
-sample bounding, unknown-peer burst rate limiting and peer-prefix caps, PTY
-output batch metrics, and session-I/O worker output coalescing. Snapshot
-counter paths and manifest write-storm rate limiting are not directly
-unit-tested yet; use manual log verification or add focused tests when changing
-those paths.
+ignored`. The session-I/O worker paste/snapshot slice was verified with `1465
+passed; 0 failed; 1 ignored`. Direct tests cover `HubEventMetrics`
+counters/spans/slow-sample bounding, unknown-peer burst rate limiting and
+peer-prefix caps, PTY output batch metrics, and session-I/O worker output
+coalescing. Snapshot
+preparation and session-scoped paste-file writes have focused worker unit
+coverage. Queue/counter paths and manifest write-storm rate limiting are not
+exhaustively unit-tested; use manual log verification or add focused tests when
+changing those paths.

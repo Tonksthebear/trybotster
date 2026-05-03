@@ -1706,6 +1706,11 @@ impl WebRtcSender {
     ///
     /// Same logic as [`WebRtcChannel::send_to`] but for the extracted handle.
     pub async fn send_json(&self, payload: &[u8]) -> Result<(), ChannelError> {
+        self.send_message_raw(payload).await
+    }
+
+    /// Send a raw `CONTENT_MSG` payload via encrypted DataChannel.
+    pub async fn send_message_raw(&self, payload: &[u8]) -> Result<(), ChannelError> {
         let pc_guard = self.peer_connection.lock().await;
         let pc = pc_guard
             .as_ref()

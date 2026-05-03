@@ -62,17 +62,11 @@ use reqwest::blocking::Client;
 
 use sha2::{Digest, Sha256};
 
-use crate::channel::Channel;
 use crate::config::Config;
 use crate::device::Device;
 use crate::lua::primitives::SharedServerId;
 use crate::lua::LuaRuntime;
 
-const WEBRTC_PTY_OUTPUT_QUEUE_CAPACITY: usize = 2048;
-const WEBRTC_OUTGOING_SIGNAL_QUEUE_CAPACITY: usize = 512;
-const WEBRTC_STREAM_FRAME_QUEUE_CAPACITY: usize = 1024;
-const WEBRTC_PTY_INPUT_QUEUE_CAPACITY: usize = 2048;
-const WEBRTC_FILE_INPUT_QUEUE_CAPACITY: usize = 128;
 const WORKTREE_RESULT_QUEUE_CAPACITY: usize = 256;
 
 /// Queued PTY output message for WebRTC delivery.
@@ -153,106 +147,6 @@ pub struct PtyNotificationEvent {
     pub notification: crate::agent::AgentNotification,
 }
 
-/// Item queued for a per-peer async send task.
-///
-/// The Hub event loop pushes these into a bounded `mpsc` channel instead of
-/// calling `block_in_place`. A dedicated `tokio::spawn` task per peer drains
-/// the channel and performs the actual async DataChannel send with timeout.
-#[derive(Debug)]
-pub(crate) enum WebRtcSendItem {
-    /// PTY output (hot path): subscription_id + raw data.
-    Pty {
-        /// Subscription ID for browser-side routing.
-        subscription_id: String,
-        /// Raw PTY data (already prefixed with 0x01 for terminal output).
-        data: Vec<u8>,
-    },
-    /// JSON control message from Lua `webrtc.send()`.
-    Json {
-        /// Serialized JSON bytes.
-        data: Vec<u8>,
-    },
-    /// Binary message from Lua `webrtc.send_binary()`.
-    Binary {
-        /// Raw binary data.
-        data: Vec<u8>,
-    },
-    /// Stream multiplexer frame.
-    Stream {
-        /// Frame type byte.
-        frame_type: u8,
-        /// Stream identifier.
-        stream_id: u16,
-        /// Frame payload.
-        payload: Vec<u8>,
-    },
-    /// Bundle refresh (ratchet restart, unencrypted).
-    BundleRefresh {
-        /// 161-byte DeviceKeyBundle.
-        bundle_bytes: Vec<u8>,
-    },
-}
-
-/// Per-peer send task state stored in the Hub.
-///
-/// When a WebRTC DataChannel opens, the Hub creates one of these per browser
-/// identity. The bounded sender feeds items to a spawned async task that
-/// performs the actual `send_pty_raw` / `send_to` calls with timeout.
-/// Dropping the sender causes the task to exit naturally.
-pub(crate) struct PeerSendState {
-    /// Bounded channel sender for queuing send items.
-    pub tx: tokio::sync::mpsc::Sender<WebRtcSendItem>,
-    /// Set to `true` when the send task detects a dead peer (timeout/error).
-    /// The event loop checks this to skip further sends (circuit breaker).
-    pub dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Handle for the spawned send task (aborted on cleanup).
-    pub task: tokio::task::JoinHandle<()>,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct PeerBurstState {
-    entries: std::collections::VecDeque<(String, Instant)>,
-    warned: std::collections::HashSet<String>,
-}
-
-impl PeerBurstState {
-    pub(crate) const WINDOW: Duration = Duration::from_secs(30);
-    pub(crate) const THRESHOLD: usize = 10;
-    pub(crate) const PEER_CAP: usize = 16;
-
-    pub(crate) fn record(&mut self, peer_id: &str, now: Instant) -> Option<(String, usize)> {
-        let prefix = peer_id.chars().take(24).collect::<String>();
-        while self
-            .entries
-            .front()
-            .is_some_and(|(_, at)| now.duration_since(*at) > Self::WINDOW)
-        {
-            if let Some((old_prefix, _)) = self.entries.pop_front() {
-                if !self.entries.iter().any(|(p, _)| p == &old_prefix) {
-                    self.warned.remove(&old_prefix);
-                }
-            }
-        }
-
-        let distinct = self
-            .entries
-            .iter()
-            .map(|(p, _)| p)
-            .collect::<std::collections::HashSet<_>>();
-        if distinct.len() >= Self::PEER_CAP && !distinct.contains(&prefix) {
-            return None;
-        }
-
-        self.entries.push_back((prefix.clone(), now));
-        let count = self.entries.iter().filter(|(p, _)| p == &prefix).count();
-        if count >= Self::THRESHOLD && self.warned.insert(prefix.clone()) {
-            Some((prefix, count))
-        } else {
-            None
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct VolumeBurstState {
     entries: std::collections::VecDeque<(&'static str, Instant)>,
@@ -283,60 +177,6 @@ impl VolumeBurstState {
             None
         }
     }
-}
-
-impl std::fmt::Debug for PeerSendState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PeerSendState")
-            .field(
-                "dead",
-                &self.dead.load(std::sync::atomic::Ordering::Relaxed),
-            )
-            .finish_non_exhaustive()
-    }
-}
-
-/// Capacity of the per-peer send channel.
-///
-/// 256 items provides enough buffering for bursty PTY output while bounding
-/// memory usage (~1MB per peer at ~4KB per PTY chunk). When full, the event
-/// loop drops the oldest item (same behavior as the previous bounded channel).
-const PEER_SEND_CHANNEL_CAPACITY: usize = 256;
-
-/// Timeout for individual DataChannel sends in per-peer tasks.
-///
-/// Dead peers cause SCTP retransmit backpressure that can block `send_data()`
-/// for 60+ seconds. This timeout ensures the send task marks the peer as dead
-/// rather than blocking indefinitely.
-const PEER_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Maximum pending observer notifications before oldest are dropped.
-///
-/// Cooldown before sending a backpressure-recovery snapshot.
-///
-/// After the per-peer send channel drops PTY frames, we wait this long
-/// for the burst to subside before sending a fresh snapshot. This avoids
-/// sending large snapshots into a still-congested channel.
-const BACKPRESSURE_SNAPSHOT_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// Result of attempting to queue a PTY frame for WebRTC delivery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WebRtcSendOutcome {
-    /// Frame queued successfully.
-    Sent,
-    /// Per-peer channel full — frame was dropped (peer is slow).
-    Backpressure,
-    /// Peer is dead or disconnected — no send task available.
-    Dead,
-}
-
-/// Entry tracking a peer+session that needs a backpressure-recovery snapshot.
-#[derive(Debug, Clone)]
-struct BackpressureRecoveryEntry {
-    browser_identity: String,
-    session_uuid: String,
-    subscription_id: String,
-    last_drop: Instant,
 }
 
 /// Generate a stable hub_identifier from a repo path.
@@ -434,88 +274,16 @@ pub struct Hub {
     /// Browser connection state and communication.
     pub browser: crate::relay::BrowserState,
 
-    // === WebRTC Channels ===
-    /// WebRTC peer connections indexed by browser identity.
-    ///
-    /// Each browser that connects via WebRTC gets its own peer connection.
-    /// The connection persists to keep the DataChannel alive.
-    pub webrtc_channels: std::collections::HashMap<String, crate::channel::WebRtcChannel>,
-
-    /// Tracks when WebRTC connections were initiated.
-    ///
-    /// Used to timeout connections stuck in "Connecting" state (e.g., ICE
-    /// negotiation that never completes due to network issues).
-    /// Connections that don't reach "Connected" within the bounded cleanup
-    /// window are removed so retries do not require a manual refresh.
-    webrtc_connection_started: std::collections::HashMap<String, Instant>,
-    /// Time a DataChannel reached Connected/open state, for close-after-connect diagnostics.
-    webrtc_connected_at: std::collections::HashMap<String, Instant>,
-
-    /// Per-peer async send tasks, keyed by browser identity.
-    ///
-    /// Each entry has a bounded channel sender + a spawned task that drains
-    /// items and performs the actual async DataChannel send. Created when
-    /// `DcOpened` fires; dropped when the peer disconnects.
-    pub(crate) webrtc_send_tasks: std::collections::HashMap<String, PeerSendState>,
-    /// Bounded unknown-peer send burst guardrail state.
-    unknown_peer_bursts: std::sync::Mutex<PeerBurstState>,
+    /// Adapter-owned WebRTC peer registry.
+    pub(crate) webrtc: crate::worker::webrtc::WebRtcPeerRegistry,
     /// Bounded OSC/timer volume guardrail state.
     volume_bursts: std::sync::Mutex<VolumeBurstState>,
-
-    /// Periodic DataChannel ping tasks, keyed by browser identity.
-    ///
-    /// Each task sends `{ "type": "dc_ping" }` every 10 seconds through the
-    /// peer's send channel. The browser responds with `dc_pong`; if pongs
-    /// stop arriving, the browser detects the dead connection and reconnects.
-    /// Aborted when the peer disconnects (cleanup_webrtc_channel).
-    dc_ping_tasks: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
-
-    /// Pending close notifications keyed by Olm identity key.
-    ///
-    /// When a WebRTC channel is cleaned up, its `close_complete` watch receiver
-    /// is stored here. Before creating a replacement channel for the same device,
-    /// the offer handler awaits `wait_for(|v| *v)` (with timeout) to ensure old
-    /// sockets are released first, preventing fd exhaustion from rapid reconnection
-    /// cycles. Using `watch` instead of `Notify` avoids the race where the close
-    /// signal fires before anyone is waiting.
-    webrtc_pending_closes: std::collections::HashMap<String, tokio::sync::watch::Receiver<bool>>,
-
-    /// Monotonic offer generation per browser identity.
-    ///
-    /// Each new WebRTC offer increments the browser's generation. Async
-    /// `WebRtcOfferCompleted` events include the generation they started with,
-    /// allowing the hub to discard stale completions instead of re-inserting
-    /// outdated channels.
-    webrtc_offer_generation: std::collections::HashMap<String, u64>,
-
-    /// ICE candidates that arrived before the peer channel was re-attached.
-    ///
-    /// During async offer negotiation the channel is temporarily removed from
-    /// `webrtc_channels`. Remote ICE can arrive in that window; queue it here
-    /// and drain after `WebRtcOfferCompleted` to avoid dropping connectivity.
-    webrtc_pending_ice_candidates: std::collections::HashMap<String, Vec<(u64, serde_json::Value)>>,
-
-    /// Sender for PTY output messages from forwarder tasks.
-    ///
-    /// Forwarder tasks send PTY output here; main loop drains and sends via WebRTC.
-    pub webrtc_pty_output_tx: tokio::sync::mpsc::Sender<WebRtcPtyOutput>,
-    /// Receiver for PTY output messages.
-    ///
-    /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
-    pub webrtc_pty_output_rx: Option<tokio::sync::mpsc::Receiver<WebRtcPtyOutput>>,
 
     /// Active PTY forwarder task handles for cleanup on unsubscribe.
     ///
     /// Maps subscriptionId -> JoinHandle for the forwarder task.
     pty_forwarders: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
 
-    /// Pending backpressure-recovery snapshots.
-    ///
-    /// When PTY frames are dropped due to per-peer channel backpressure,
-    /// we record the affected session here. After a cooldown, `tick_periodic`
-    /// sends a fresh snapshot to resync the browser's terminal parser.
-    /// Key: `{browser_identity}:{session_uuid}`.
-    webrtc_backpressure_recovery: std::collections::HashMap<String, BackpressureRecoveryEntry>,
     /// Pending terminal attach intents waiting for session registration.
     ///
     /// Keyed by forwarder ID (`{peer_id}:{session_uuid}` / `tui:{session_uuid}` /
@@ -557,41 +325,10 @@ pub struct Hub {
     /// Used to ensure OSC color queries are only forwarded to the active
     /// client terminal, avoiding duplicate auto-replies from passive clients.
     active_terminal_peers: Arc<Mutex<std::collections::HashMap<String, String>>>,
-    /// Sender for outgoing WebRTC signals (ICE candidates) from async callbacks.
-    ///
-    /// Cloned for each new WebRTC channel. The async `on_ice_candidate` callback
-    /// encrypts the candidate and sends it here. `poll_outgoing_signals()` drains
-    /// the receiver and relays via `ChannelHandle::perform("signal", ...)`.
-    pub webrtc_outgoing_signal_tx:
-        tokio::sync::mpsc::Sender<crate::channel::webrtc::OutgoingSignal>,
-    /// Receiver for outgoing WebRTC signals. Drained in `tick()`.
-    ///
-    /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
-    webrtc_outgoing_signal_rx:
-        Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::OutgoingSignal>>,
-
     /// TCP stream multiplexers per browser identity for preview tunneling.
     stream_muxes: std::collections::HashMap<String, crate::relay::stream_mux::StreamMultiplexer>,
-    /// Receiver for incoming stream frames from WebRTC DataChannels.
-    ///
-    /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
-    stream_frame_rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::StreamIncoming>>,
-    /// Sender for incoming stream frames (cloned into each WebRtcChannel).
-    pub stream_frame_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::StreamIncoming>,
-    /// Receiver for binary PTY input from WebRTC DataChannels (bypasses JSON/Lua).
-    ///
-    /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
-    pty_input_rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::PtyInputIncoming>>,
-    /// Sender for binary PTY input (cloned into each WebRtcChannel).
-    pub pty_input_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::PtyInputIncoming>,
-    /// Receiver for file transfers from browser via WebRTC DataChannels.
-    ///
-    /// Wrapped in `Option` so the event loop can extract it for `tokio::select!`.
-    file_input_rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::FileInputIncoming>>,
-    /// Sender for file transfers (cloned into each WebRtcChannel).
-    pub file_input_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::FileInputIncoming>,
-    /// Temp files from browser paste/drop, keyed by agent session key.
-    /// Cleaned up when the agent is closed.
+    /// Temp files from browser paste/drop, keyed by session UUID.
+    /// Cleaned up when the session is closed or the hub exits.
     paste_files: std::collections::HashMap<String, Vec<std::path::PathBuf>>,
 
     // === Handle Cache ===
@@ -767,21 +504,7 @@ impl Hub {
 
         // Create handle cache for thread-safe agent handle access
         let handle_cache = Arc::new(handle_cache::HandleCache::new());
-        // Create channel for WebRTC PTY output from forwarder tasks
-        let (webrtc_pty_output_tx, webrtc_pty_output_rx) =
-            tokio::sync::mpsc::channel(WEBRTC_PTY_OUTPUT_QUEUE_CAPACITY);
-        // Create channel for outgoing WebRTC signals (ICE candidates from async callbacks)
-        let (webrtc_outgoing_signal_tx, webrtc_outgoing_signal_rx) =
-            tokio::sync::mpsc::channel(WEBRTC_OUTGOING_SIGNAL_QUEUE_CAPACITY);
-        // Create channel for incoming stream multiplexer frames from WebRTC DataChannels
-        let (stream_frame_tx, stream_frame_rx) =
-            tokio::sync::mpsc::channel(WEBRTC_STREAM_FRAME_QUEUE_CAPACITY);
-        // Create channel for binary PTY input from WebRTC DataChannels
-        let (pty_input_tx, pty_input_rx) =
-            tokio::sync::mpsc::channel(WEBRTC_PTY_INPUT_QUEUE_CAPACITY);
-        // Create channel for file transfers from browser via WebRTC DataChannels
-        let (file_input_tx, file_input_rx) =
-            tokio::sync::mpsc::channel(WEBRTC_FILE_INPUT_QUEUE_CAPACITY);
+        let webrtc = crate::worker::webrtc::WebRtcPeerRegistry::new();
         // Create channel for async worktree creation results
         let (worktree_result_tx, worktree_result_rx) =
             tokio::sync::mpsc::channel(WORKTREE_RESULT_QUEUE_CAPACITY);
@@ -811,20 +534,9 @@ impl Hub {
             exec_restart: false,
             browser: crate::relay::BrowserState::default(),
             handle_cache,
-            webrtc_channels: std::collections::HashMap::new(),
-            webrtc_connection_started: std::collections::HashMap::new(),
-            webrtc_connected_at: std::collections::HashMap::new(),
-            webrtc_send_tasks: std::collections::HashMap::new(),
-            unknown_peer_bursts: std::sync::Mutex::new(PeerBurstState::default()),
+            webrtc,
             volume_bursts: std::sync::Mutex::new(VolumeBurstState::default()),
-            dc_ping_tasks: std::collections::HashMap::new(),
-            webrtc_pending_closes: std::collections::HashMap::new(),
-            webrtc_offer_generation: std::collections::HashMap::new(),
-            webrtc_pending_ice_candidates: std::collections::HashMap::new(),
-            webrtc_pty_output_tx,
-            webrtc_pty_output_rx: Some(webrtc_pty_output_rx),
             pty_forwarders: std::collections::HashMap::new(),
-            webrtc_backpressure_recovery: std::collections::HashMap::new(),
             pending_terminal_attaches: std::collections::HashMap::new(),
             terminal_profiles: terminal_profile::TerminalProfileStore::default(),
             shared_color_cache: std::sync::Arc::new(std::sync::Mutex::new(
@@ -834,15 +546,7 @@ impl Hub {
             terminal_session_peers: std::collections::HashMap::new(),
             terminal_forwarder_peers: std::collections::HashMap::new(),
             active_terminal_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            webrtc_outgoing_signal_tx,
-            webrtc_outgoing_signal_rx: Some(webrtc_outgoing_signal_rx),
             stream_muxes: std::collections::HashMap::new(),
-            stream_frame_rx: Some(stream_frame_rx),
-            stream_frame_tx,
-            pty_input_rx: Some(pty_input_rx),
-            pty_input_tx,
-            file_input_rx: Some(file_input_rx),
-            file_input_tx,
             paste_files: std::collections::HashMap::new(),
             lua,
             lua_ac_connections: std::collections::HashMap::new(),
@@ -1360,21 +1064,7 @@ impl Hub {
             mux.close_all();
         }
 
-        // Shut down per-peer send tasks (dropping sender causes task exit)
-        for (_id, state) in self.webrtc_send_tasks.drain() {
-            drop(state.tx);
-            state.task.abort();
-        }
-
-        // Disconnect all WebRTC channels (fire-and-forget to avoid deadlock)
-        for (_id, mut channel) in self.webrtc_channels.drain() {
-            self.tokio_runtime.spawn(async move {
-                channel.disconnect().await;
-            });
-        }
-        self.webrtc_connection_started.clear();
-        self.webrtc_connected_at.clear();
-        self.webrtc_pending_ice_candidates.clear();
+        self.webrtc.shutdown(&self.tokio_runtime);
 
         // Notify server of shutdown (skip in offline mode)
         if !crate::env::is_offline() {
