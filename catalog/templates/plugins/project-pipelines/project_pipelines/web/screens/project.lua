@@ -159,7 +159,7 @@ local function timeline_nodes(project_id, ctx)
                 view.row{
                     view.badge(ui.bind("@/target_label"), "accent"),
                     ui.button{
-                        id = "project-" .. project_id .. "-timeline-ticket-" .. ticket.id,
+                        id = ui.bind("@/id"),
                         label = "Open",
                         icon = "arrow-right",
                         variant = "ghost",
