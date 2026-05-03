@@ -2,7 +2,8 @@
 
 Botster's workerized runtime boundary starts with typed Rust contracts. Some
 contracts are scaffolding for later slices; the session I/O worker is now the
-production read path for durable session-process PTY output.
+production read path for durable session-process PTY output, and WebRTC peer
+state now lives behind the client transport adapter boundary.
 
 ## Ownership
 
@@ -24,10 +25,10 @@ Session I/O code and session processes must not import browser or WebRTC
 concepts.
 
 Session I/O workers mirror the current per-session process protocol. They carry
-PTY input, resize, snapshot, mode flags, plain screen, color profile, structured
-terminal events, and process-exit messages as Rust actor messages. The Unix
-socket wire protocol in `cli/src/session/protocol.rs` remains the durable
-process boundary.
+PTY input, resize, snapshot, mode flags, plain screen, color profile, authorized
+file paste/drop payloads, prepared snapshot payloads, structured terminal
+events, and process-exit messages as Rust actor messages. The Unix socket wire
+protocol in `cli/src/session/protocol.rs` remains the durable process boundary.
 
 ## Session I/O Worker Runtime
 
@@ -41,6 +42,27 @@ still owns writes and synchronous RPC methods, while the worker decodes every
 socket frame and routes snapshot, screen, mode-flags, and other control
 responses back to the existing `response_rx` channel. This avoids socket read
 contention without moving hub orchestration policy into the worker.
+
+File paste/drop data-plane mechanics live in `worker::session_io`. The hub
+still authorizes the target session and transport capabilities, then passes the
+already-authorized filename and bytes to the session I/O helper. Paste temp
+paths are session-scoped and resolve in this order: session manifest
+`worktree_path` under `.botster/pastes/<session_uuid>`, Botster data dir under
+`pastes/<session_uuid>`, then the OS temp dir under
+`botster/pastes/<session_uuid>`. Cleanup is keyed by session UUID, never label,
+and runs on real process exit plus hub drop.
+
+Snapshot payload preparation also lives in the session I/O data-plane contract.
+The hub remains responsible for deciding when a snapshot is needed and where it
+should be routed. `request_id` is an opaque correlation key scoped to the
+session; callers use it to map prepared output back to peer/subscription or Lua
+refresh state. Browser identities and WebRTC structs do not enter the worker
+contract.
+
+The paste and prepared-snapshot request/event variants define the mailbox
+contract for the next production-wiring slice. Today the production hub calls
+the `worker::session_io` helpers directly, so the data-plane byte/path logic is
+already centralized while mailbox send/receive ownership remains scaffolding.
 
 PTY output crosses into the hub as `HubEvent::SessionIoBatch`, not one hub
 event per `FRAME_PTY_OUTPUT`. The worker preserves byte order while coalescing
@@ -87,7 +109,68 @@ production-wired through this actor: hub-owned Lua attach requests still decide
 when a session exists, when pending attach intents resolve, and when forwarder
 tasks are cleaned up, but snapshot, live PTY output, process-exit, JSON control,
 plugin binary, and raw input traffic cross the client-worker boundary before a
-TUI or socket adapter encodes them.
+TUI or socket adapter encodes them. WebRTC production traffic enters the
+transport adapter boundary through `worker::webrtc::WebRtcPeerRegistry` and
+`WebRtcTransportRunner`; the adapter converts decoded ingress into
+`ClientWorkerMessage` before hub policy handles the legacy Lua routing surface.
+
+## WebRTC Transport Adapter
+
+`WebRtcPeerRegistry` is the only holder of per-browser `WebRtcChannel`
+instances. The Hub owns one registry handle and keeps auth, pairing,
+capability, Rails relay coordination, Lua callbacks, terminal attach policy,
+and summarized cleanup policy. WebRTC peer connection state, offer generation,
+pending ICE queues, per-peer bounded send queues, DataChannel liveness pings,
+unknown-peer burst coalescing, backpressure recovery tracking, and peer cleanup
+bookkeeping stay inside the registry.
+
+The Hub must not recover the old escape hatch by reaching into a channel map or
+`WebRtcSender` directly. New WebRTC work should add a typed registry method or
+a typed adapter command instead. The expected production path is:
+
+```text
+browser DataChannel
+  -> WebRtcChannel decrypt/decode
+  -> WebRtcPeerRegistry
+  -> WebRtcTransportRunner
+  -> WebRtcTransportAdapter
+  -> ClientWorkerMessage
+  -> Hub-owned policy / Lua routing
+```
+
+Outbound WebRTC delivery follows the reverse ownership boundary. Hub policy
+produces transport-neutral work or WebRTC adapter commands, then queues them
+through `WebRtcPeerRegistry::queue_command` or the narrower PTY helpers. The
+registry owns the bounded per-peer command channel and the async send task that
+serializes PTY, JSON, stream, binary, and bundle-refresh frames onto the
+DataChannel. Binary adapter commands must use the raw DataChannel send helper;
+JSON helpers are only for JSON frames.
+
+WebRTC transport summaries cross back to the Hub through typed
+`HubControlMessage` variants:
+
+- `TransportPeerStateChanged`
+- `TransportSignalReady`
+- `TransportBackpressure`
+- `TransportRatchetRestartRequested`
+
+`TransportSignal` envelopes intentionally carry `serde_json::Value` only at
+the Rails relay boundary because those values are already serialized Olm
+envelopes. Do not let that exception spread to new adapter control surfaces.
+
+Crypto ownership is split by lifecycle phase. DataChannel encrypt/decrypt
+failure tracking and ratchet-delivery transport are adapter/registry concerns.
+The Hub still generates fresh ratchet bundles and, for now, performs
+handshake-time SDP answer encryption before emitting `TransportSignalReady`;
+that is a known follow-up boundary, not permission to move hot-path
+DataChannel crypto back into Hub code.
+
+Regression coverage for this boundary should stay focused on the failure modes
+that motivated the migration: a DataChannel closing after `Connected`, stale
+offer completions during reconnect bursts, generation-scoped pending ICE, close
+replacement waits, and coalesced send-to-unknown-peer noise. Use the repository
+test wrapper, for example `cd cli && ./test.sh --unit worker`, rather than raw
+`cargo test`.
 
 The first client-worker runtime accepts the session I/O sender map at start
 time. Production hub wiring that creates or tears down session I/O workers while
