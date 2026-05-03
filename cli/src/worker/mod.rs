@@ -10,6 +10,7 @@ pub mod hub_control;
 pub mod session_io;
 pub(crate) mod session_io_runtime;
 pub mod transport;
+pub(crate) mod webrtc;
 
 /// Stable identifier for a Botster session.
 pub type SessionUuid = String;
@@ -50,8 +51,8 @@ mod tests {
         CLIENT_WORKER_QUEUE,
     };
     use super::hub_control::{
-        HubControlMessage, HubControlOrigin, SessionLifecycleState, WorkerBackpressure,
-        HUB_CONTROL_QUEUE,
+        HubControlMessage, HubControlOrigin, SessionLifecycleState, TransportConnectionMode,
+        TransportPeerState, TransportSignal, WorkerBackpressure, HUB_CONTROL_QUEUE,
     };
     use super::session_io::{SessionIoEvent, SessionIoRequest, SESSION_IO_WORKER_QUEUE};
     use super::transport::{
@@ -96,11 +97,28 @@ mod tests {
             origin: HubControlOrigin::Internal,
             reason: "test".to_string(),
         };
+        let peer_state = HubControlMessage::TransportPeerStateChanged {
+            client_id: ClientId::browser("browser-1"),
+            browser_identity: "browser-1".to_string(),
+            state: TransportPeerState::Connected {
+                generation: 2,
+                mode: TransportConnectionMode::Unknown,
+            },
+        };
+        let signal = HubControlMessage::TransportSignalReady {
+            client_id: ClientId::browser("browser-1"),
+            signal: TransportSignal::Answer {
+                browser_identity: "browser-1".to_string(),
+                envelope: serde_json::json!({ "t": 1 }),
+            },
+        };
 
         assert!(format!("{attach:?}").contains("AttachClient"));
         assert!(format!("{lifecycle:?}").contains("Reconnecting"));
         assert!(format!("{pressure:?}").contains("worker.client"));
         assert!(format!("{shutdown:?}").contains("Shutdown"));
+        assert!(format!("{peer_state:?}").contains("TransportPeerStateChanged"));
+        assert!(format!("{signal:?}").contains("TransportSignalReady"));
     }
 
     #[test]
