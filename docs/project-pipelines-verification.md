@@ -1,5 +1,91 @@
 # Project Pipelines Verification
 
+## 2026-05-02 Plugin Entity End-to-End Verification
+
+Scope:
+
+- Plugin entity subscribe-time snapshots and targeted deltas.
+- Browser and TUI consumption of the same entity stream.
+- Row-scoped `ui_action_result` pending feedback cleanup.
+- Cold-turkey removal of Project Pipelines dynamic-list dependency on forced
+  `ui_tree_snapshot` refresh helpers.
+
+Commands and results:
+
+```bash
+cd cli && ./test.sh --unit -- ui_contract
+# 196 passed; 0 failed
+
+cd cli && ./test.sh --integration -- project_pipelines
+# 4 passed; 0 failed
+
+cd cli && ./test.sh --integration -- emits_entity
+# 3 passed; 0 failed
+
+cd cli && ./test.sh --integration -- send_snapshots_to
+# 2 passed; 0 failed
+
+cd cli && ./test.sh --integration -- table_renders_rows_from_plugin_entity_bind
+# 1 passed; 0 failed
+
+cd cli && ./test.sh --integration -- ui_action_dispatch_emits_correlated_success_result
+# 1 passed; 0 failed
+
+npm test -- app/frontend/test/entity-stores.test.js app/frontend/test/binding.test.ts app/frontend/test/ui-action-result-frame.test.js app/frontend/test/ui-tree.test.jsx
+# 4 files passed; 58 tests passed; 0 failed
+
+rg -n "broadcast_ui_tree_snapshots|send_ui_tree_snapshots" catalog/templates/plugins/project-pipelines cli/src app/frontend
+# no matches
+
+rg -n "ui\.bind_list|ui\.bind\(\"/project-pipelines" catalog/templates/plugins/project-pipelines/project_pipelines/web
+# Project Pipelines home and project screens bind dynamic rows to /project-pipelines.* entity stores
+```
+
+Notes:
+
+- CLI verification used `cli/test.sh`, not raw `cargo test`, so
+  `BOTSTER_ENV=test` was set for all Rust/Lua/TUI slices.
+- No Rails API or model files were touched, so Rails tests were not applicable.
+- No visible UI surface was changed. `tmp/tailwind_plus_preview` was absent in
+  this worktree, and no Catalyst/Elements comparison was required.
+
+## 2026-05-02 Plugin Entity Documentation Verification
+
+Scope:
+
+- Plugin-owned entity architecture documentation.
+- Lua primitive reference and UI contract docs.
+- Project Pipelines authoring guide and entity-backed UI case study.
+
+Static checks performed:
+
+```bash
+rg -n "entity_snapshot|entity_upsert|entity_patch|entity_remove|bind_list|ui_action_result|action_request_id" docs cli/src/ui_contract catalog/templates/plugins/project-pipelines
+rg -n "browser-only|plugin-specific list snapshot|template cloning|legacy|v1|v2|ui_tree_snapshot" docs cli/src/ui_contract catalog/templates/plugins/project-pipelines
+rg -n "lib.entity_broadcast|entity_snapshot|ui.bind_list|action.result" catalog/templates/plugins/project-pipelines cli/lua
+```
+
+Results:
+
+- Required entity, binding, and action lifecycle terms appear in the new
+  canonical guide plus Lua, UI contract, web runtime, and Project Pipelines docs.
+- Any remaining `legacy` matches are implementation cleanup identifiers such as
+  `pipeline.legacy_prune_checked`, not a documented plugin UI compatibility
+  mode.
+- `ui_tree_snapshot` matches should describe presentation/control structure,
+  not a durable plugin model-state channel.
+- All documented paths for this pass were present:
+  `docs/plugin-entities.md`, `docs/lua/primitives.md`,
+  `docs/lua/session-actions.md`, `cli/src/ui_contract/README.md`,
+  `docs/specs/cross-client-ui-primitives.md`,
+  `docs/specs/web-ui-primitives-runtime.md`,
+  `catalog/templates/plugins/project-pipelines/README.md`,
+  `docs/project-pipelines-verification.md`, `README.md`, and
+  `docs/lua-architecture-vision.md`.
+
+Project Pipelines remains the reference plugin for entity-backed dynamic state
+and generic action lifecycle feedback.
+
 ## 2026-05-01 Dependency And Merge Polish
 
 Manual verification was run against the live `~/.botster-dev/plugins/project-pipelines` plugin after reloading the plugin and layout.

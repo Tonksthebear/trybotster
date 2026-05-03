@@ -246,9 +246,7 @@ fn plugin_entity_type_rejects_cross_plugin_ownership_conflict() {
     hijack.set("owner_plugin", "kanban").unwrap();
     let all: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
     hijack.set("all", all).unwrap();
-    let err = register
-        .call::<()>(("other.board", hijack))
-        .unwrap_err();
+    let err = register.call::<()>(("other.board", hijack)).unwrap_err();
     assert!(err.to_string().contains("namespace"), "{err}");
 }
 
@@ -516,7 +514,9 @@ fn plugin_snapshot_drops_items_without_string_id() {
     client.set("send", send).unwrap();
 
     let send_snapshots_to: Function = eb.get("send_snapshots_to").unwrap();
-    send_snapshots_to.call::<()>((client, "sub-plugin")).unwrap();
+    send_snapshots_to
+        .call::<()>((client, "sub-plugin"))
+        .unwrap();
 
     let frames = frames_as_json(&lua, &captured);
     assert_eq!(frames.len(), 1);

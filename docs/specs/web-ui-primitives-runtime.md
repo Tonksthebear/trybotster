@@ -2,11 +2,12 @@
 
 ## Goal
 
-Replace the old web-client-side "template cloning plus Stimulus reconciliation" approach for live operator surfaces with a Rails-owned React/Catalyst runtime that renders trusted Botster primitives from structured data.
+Define the Rails-owned React/Catalyst runtime that renders trusted Botster
+primitives from structured data.
 
-This spec is the web renderer application of the shared contract in [cross-client-ui-primitives.md](cross-client-ui-primitives.md). The cross-client spec owns primitive names, shared action semantics, and renderer-neutral state ownership rules. This document only defines the web-specific rollout and the phase-1 adapter boundary.
+This spec is the web renderer application of the shared contract in [cross-client-ui-primitives.md](cross-client-ui-primitives.md). The cross-client spec owns primitive names, shared action semantics, and renderer-neutral state ownership rules. This document defines the web runtime boundary and the internal workspace/session adapter.
 
-Adaptive viewport behavior is specified separately in [adaptive-ui-viewport-and-presentation.md](adaptive-ui-viewport-and-presentation.md). That viewport-aware work is a phase-2 follow-on for the web runtime, not part of the initial phase-1 React island.
+Adaptive viewport behavior is specified separately in [adaptive-ui-viewport-and-presentation.md](adaptive-ui-viewport-and-presentation.md). That viewport-aware work extends the web runtime without changing the entity-backed plugin UI model.
 
 This is the web equivalent of the TUI model:
 
@@ -57,7 +58,9 @@ attributes and styling still owned by the applicable UI layer.
 
 ## Problem
 
-The current `agent_list_controller.js` now owns too much application logic:
+Live operator surfaces need normalized state and structured primitive rendering.
+Controller-driven DOM mutation concentrates too much application logic in the
+browser layer:
 
 - websocket-driven state
 - workspace grouping
@@ -65,7 +68,6 @@ The current `agent_list_controller.js` now owns too much application logic:
 - per-row activity derivation
 - session action lifecycle
 - duplicate row rendering in sidebar and main panel
-- manual DOM reconciliation through cloned templates and `data-*` mutation
 
 That is the wrong shape for Stimulus. The next runtime must render from normalized state instead of progressively mutating the DOM.
 
@@ -77,10 +79,12 @@ That is the wrong shape for Stimulus. The next runtime must render from normaliz
 - Zustand owns local UI state plus hub-pushed entity collections
 - Rails owns the primitive/component registry
 - hub/Lua does not send HTML, CSS, or JavaScript
-- phase 1 stays state-first, not tree-first
-- Botster composites exist for phase 1, but they are runtime-owned, not Lua-public
+- workspace/session composites are runtime-owned, not Lua-public
+- Lua-authored plugin surfaces use shared primitives plus generic entity bindings
 
-That last point matters: phase 1 proves the React island using the existing hub state feed. It does not simultaneously ship a generic schema renderer for arbitrary Lua-authored web trees.
+That last point matters: workspace/session composites encode product-specific
+Botster behavior. Plugin authors should use the generic primitive and binding
+contract instead of depending on those internal composites.
 
 ## Versioning
 
@@ -90,11 +94,11 @@ Rules:
 
 - `current` additions must be backward-compatible
 - removing props or changing action payload semantics requires a new contract
-- phase-1 implementation may keep adapter code internal as long as the contracts below remain stable
+- workspace/session implementation may keep adapter code internal as long as the contracts below remain stable
 
-## Phase 1 Boundary
+## Current Boundary
 
-Phase 1 originally covered only the agent/workspace UI:
+The first runtime boundary covered the agent/workspace UI:
 
 - sidebar workspace tree
 - main hub workspace list
@@ -102,16 +106,19 @@ Phase 1 originally covered only the agent/workspace UI:
 - session action indicator and error state
 - row actions menu
 
-Later phases move the remaining frontend surfaces onto the same runtime. The React/Catalyst direction explicitly does not include:
+The React/Catalyst direction explicitly does not include:
 
 - Turbo/Stimulus compatibility paths for hub-owned UI
 - server-rendered HTML fragments for live hub surfaces
 - duplicate client renderers for the same hub-owned surface
 - connection-code cards in plugin/layout surfaces; pairing URLs are requested and shown only by the React `Share` modal
 - request caches implemented in Zustand
-- arbitrary user-authored web client composition
+- arbitrary user-authored web client composition outside trusted Lua primitive
+  trees and the shared binding grammar
 
-Settings/forms remain Rails-authenticated React/Catalyst surfaces until a shared Lua form contract exists.
+Settings/forms remain Rails-authenticated React/Catalyst surfaces. Lua-authored
+plugin surfaces use the shared form primitives when they need entity-backed
+plugin forms.
 
 ## Client State Ownership
 
@@ -125,14 +132,14 @@ Rules:
 
 - Components do not call ad hoc `fetch()` for cacheable remote data. Add a query in `app/frontend/lib/queries.js`.
 - Components do not add getter-style request caches to hub sessions. The hub session may expose transport commands; React Query owns request lifecycle, dedupe, stale state, and invalidation.
-- Settings mutations that change agent/accessory config invalidate the matching React Query keys instead of forcing a legacy hub cache refresh.
+- Settings mutations that change agent/accessory config invalidate the matching React Query keys instead of forcing a hub cache refresh.
 - Loading UI must describe unknown/pending state as loading. Empty or "not configured" states render only after the query resolves successfully.
 - Hub UI uses the single shared hub connection acquired through `hub-bridge`; React is not a privileged second client and must use the same wire-format events and collections as other clients.
 - Plugin-owned durable state must use the generic entity path. Unknown
   namespaced entity types such as `project-pipelines.ticket` are accepted by
   the browser entity store registry with `id` as the record key; Project
   Pipelines and other plugins must not add plugin-specific Zustand stores,
-  hooks, reducers, or browser-only snapshots for that state.
+  hooks, reducers, or client-local snapshots for that state.
 - Browser consumers that need plugin entity data should use the generic
   selectors in `app/frontend/lib/entity-selectors.js`:
   `selectEntityList({ entityType, hubId? })`,
@@ -145,7 +152,7 @@ Rules:
 
 There are three separate contracts in `current`.
 
-### 1. Hub transport contract for phase 1
+### 1. Hub transport contract
 
 The hub continues to send the existing state-oriented payloads. The React island normalizes them locally.
 
@@ -153,11 +160,13 @@ The hub continues to send the existing state-oriented payloads. The React island
 
 Rails defines the stable web primitive inventory and prop schemas. This is the future Lua-facing surface area.
 
-### 3. Internal phase-1 composites
+### 3. Internal workspace/session composites
 
-The first React island uses Botster-specific composites for the workspace/session surface. These are stable within the Rails runtime, but are not public to Lua in phase 1.
+The workspace/session surface uses Botster-specific composites inside the Rails
+runtime. Lua-authored plugin surfaces use the public primitive set and generic
+entity bindings instead.
 
-## Phase 1 Transport Contract
+## Workspace Transport Contract
 
 The React island should adapt the current hub payload, not invent a second transport.
 
@@ -281,7 +290,7 @@ Deferred from `current`:
 
 The public registry uses these shared scalar types.
 
-`Density` in this web runtime spec is a phase-1 surface variant for shared workspace and session components. It is intentionally separate from the shared cross-client `UiInteractionDensity` token defined in [cross-client-ui-primitives.md](cross-client-ui-primitives.md).
+`Density` in this web runtime spec is a workspace/session surface variant. It is intentionally separate from the shared cross-client `UiInteractionDensity` token defined in [cross-client-ui-primitives.md](cross-client-ui-primitives.md).
 
 ```ts
 type Space = "0" | "1" | "2" | "3" | "4" | "6"
@@ -306,7 +315,7 @@ type ActionBinding = {
 }
 ```
 
-`Density` in this web runtime spec is a phase-1 surface variant for shared workspace/session components. It is intentionally separate from the shared cross-client `UiInteractionDensity` token defined in [cross-client-ui-primitives.md](cross-client-ui-primitives.md).
+`Density` in this web runtime spec is a workspace/session surface variant. It is intentionally separate from the shared cross-client `UiInteractionDensity` token defined in [cross-client-ui-primitives.md](cross-client-ui-primitives.md).
 
 ## Lua-Public Primitive Props
 
@@ -492,7 +501,7 @@ type IconButtonProps = {
 
 ```ts
 type TreeProps = {
-  // Web-only phase-1 surface variant, not the shared interaction-density token.
+  // Web-only workspace/session surface variant, not the shared interaction-density token.
   density: Density
   children: Node[]
 }
@@ -513,9 +522,11 @@ type TreeItemProps = {
 }
 ```
 
-## Internal Phase-1 Composite Contract
+## Internal Workspace/Session Composite Contract
 
-These composites are runtime-owned in `current`. They are stable enough to build the React island, but they are not exposed to Lua until the state-first migration has landed cleanly.
+These composites are runtime-owned in `current`. They are not exposed to Lua;
+Lua-authored plugin surfaces should use shared primitives, `ui.bind`, and
+`ui.bind_list`.
 
 ### `WorkspaceList`
 
@@ -634,11 +645,12 @@ Emits:
 - `botster.session.move.request` with `{ sessionId, sessionUuid }`
 - `botster.session.delete.request` with `{ sessionId, sessionUuid, inWorktree }`
 
-## Action Contract
+## Workspace/Session Action Contract
 
-These action ids are the only user-intent events the phase-1 composites may emit.
+These action ids are the only user-intent events the workspace/session
+composites may emit.
 
-| Action id | Payload | Phase-1 adapter behavior |
+| Action id | Payload | Adapter behavior |
 |---|---|---|
 | `botster.workspace.toggle` | `{ workspaceId }` | local UI state only |
 | `botster.workspace.rename.request` | `{ workspaceId, currentName }` | open rename UI, then call `hub.renameWorkspace` |
@@ -652,7 +664,8 @@ Rules:
 
 - action ids are semantic Botster events, not DOM event names
 - local UI actions and hub-routed actions share one action envelope shape
-- phase 1 may still open Rails-owned modals or prompts for rename, move, and delete
+- workspace/session composites may still open Rails-owned modals or prompts for
+  rename, move, and delete
 
 ## Density Model
 
@@ -665,7 +678,7 @@ Allowed densities in `current`:
 
 Any variant beyond those two is out of scope for `current`.
 
-## Why Composites Stay Internal In Phase 1
+## Why Workspace/Session Composites Stay Internal
 
 `WorkspaceGroup`, `SessionRow`, and the preview/menu composites encode a lot of current product behavior:
 
@@ -675,23 +688,24 @@ Any variant beyond those two is out of scope for `current`.
 - session action state mapping
 - action availability rules
 
-That behavior is still moving. Freezing it into the Lua contract before the React island lands would lock Botster into premature APIs. The public `current` Lua surface should therefore stop at primitives, while phase 1 uses internal composites as the migration bridge.
+That behavior is product-specific. Freezing it into the Lua contract would lock
+Botster into premature APIs. The public Lua surface stops at shared primitives,
+entity bindings, and generic action feedback, while these composites remain an
+internal Rails runtime detail.
 
-## Acceptance Criteria For Phase 1
+## Acceptance Criteria For Workspace/Session Runtime
 
-- the agent/workspace UI no longer depends on cloned HTML templates for row rendering
 - sidebar and main panel share the same row/group logic with density variants
 - session action indicator, action error state, and actions menu render from normalized state
 - hub transport remains structured state, not HTML
 - Rails continues to own the page shell and primitive registry
 - the action vocabulary above is sufficient to reproduce the current session/workspace behavior
 
-## Immediate Implementation Sequence
+## Lua-Authored Plugin Surface Path
 
-1. Build the React island adapter around `AgentWorkspaceSurfaceInput`
-2. Normalize state into `AgentWorkspaceStore`
-3. Implement the internal composites above in `sidebar` and `panel` densities
-4. Map the action ids above onto the existing hub transport methods
-5. Remove template cloning from `agent_list_controller.js`
-
-The next contract after this one is not "more React." It is a separate spec for when the Lua-authored node tree becomes public beyond the internal phase-1 adapter.
+Plugin surfaces publish durable state as generic entity frames, render stable
+Lua primitive trees, bind data with `$bind` and `ui.bind_list`, and return
+generic `ui_action_result` frames for submitters. Project Pipelines is the
+reference plugin for this model. New plugin UI should extend that path, not add
+plugin-specific browser stores, renderer-specific pending state, or duplicate
+client renderers.

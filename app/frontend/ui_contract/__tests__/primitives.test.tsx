@@ -325,6 +325,43 @@ describe('ui_contract registry — action primitives', () => {
     expect(onAction).not.toHaveBeenCalled()
   })
 
+  it('buttons with the same action id keep pending state scoped by node id', () => {
+    beginUiActionLifecycle({
+      actionId: 'workflow.question.answer',
+      targetSurface: 'project_pipelines',
+      sourceKey: 'question-1-answer',
+    })
+
+    renderTree(
+      {
+        type: 'stack',
+        props: { direction: 'vertical' },
+        children: [
+          {
+            type: 'button',
+            id: 'question-1-answer',
+            props: {
+              label: 'Answer first',
+              action: { id: 'workflow.question.answer', payload: { questionId: '1' } },
+            },
+          },
+          {
+            type: 'button',
+            id: 'question-2-answer',
+            props: {
+              label: 'Answer second',
+              action: { id: 'workflow.question.answer', payload: { questionId: '2' } },
+            },
+          },
+        ],
+      },
+      { targetSurface: 'project_pipelines' },
+    )
+
+    expect(screen.getByRole('button', { name: 'Answer first' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Answer second' })).not.toBeDisabled()
+  })
+
   it('button action waits for required controls in the nearest form scope', () => {
     const onAction = vi.fn()
     renderTree(

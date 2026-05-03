@@ -142,6 +142,14 @@ When a run returns to an existing step agent, Project Pipelines sends both a str
 
 The `Pipelines` surface shows tickets, runs, pipeline definitions, selected agent per step, reviews, findings, artifacts, recent events, questions, and plugin-owned sessions. When any question is open, the workspace plugin nav entry for Pipelines shows a notification marker.
 
+### Plugin Entity Case Study
+
+Project Pipelines is the reference plugin for Botster's entity-backed UI model.
+`project_pipelines/entities.lua` registers every dynamic workflow record family
+under the `project-pipelines.*` namespace, publishes subscribe-time baselines
+with `publish_snapshots()`, and exposes targeted `upsert` / `remove` helpers so
+repo mutators can update clients after persistence changes.
+
 Dynamic state is published as plugin-owned entities:
 
 - `/project-pipelines.ticket`
@@ -176,6 +184,56 @@ pipeline entity, because the editor mutates individual step and gate fields and
 detail screens need row-level handoff updates. Snapshot publishing is reserved
 for registration/recovery paths; mutators publish targeted entity deltas instead
 of forcing fresh `ui_tree_snapshot` frames for data-only changes.
+
+Stable submitter `id` values are required in repeated rows so the generic
+`ui_action` lifecycle can scope pending, success, and error feedback to the
+clicked control. `project_pipelines/web/actions.lua` returns `action.HANDLED`
+for draft/local updates and `action.result{ message = ..., navigate = ... }` or
+`action.result{ ok = false, error = ... }` for submitters that need visible
+feedback.
+
+### GUI Implementation Contract
+
+Project Pipelines is a Botster Lua plugin surface rendered through the shared
+`ui_contract`, not a Rails ERB, Turbo, Hotwire, or Elements surface. Author UI
+in `project_pipelines/web/*.lua` with shared primitives and let the browser
+render those nodes through `app/frontend/ui_contract/registry.tsx` and the
+existing Catalyst components in `app/frontend/components/catalyst/*`.
+
+For visible controls, use the public Lua primitives instead of plugin-specific
+browser components:
+
+- Forms use `ui.form`, `ui.text_input`, `ui.textarea`, `ui.select`, and
+  `ui.checkbox`; the web renderer supplies Catalyst inputs and native
+  validation.
+- Actions use `ui.button` or `ui.icon_button` with semantic `icon` names, so
+  `IconGlyph` remains the single icon path. Do not inline SVG or add bespoke
+  icon renderers.
+- Submitters in repeated rows must carry stable node `id` values so the generic
+  `ui_action` lifecycle can scope pending and result feedback to the clicked
+  button.
+- Dynamic collections publish plugin-owned entity records and bind with
+  `ui.bind` or `ui.bind_list` from sources such as `/project-pipelines.ticket`.
+  Publish filterable record supersets rather than per-view browser stores.
+- Detail rows use `ui.bind_list{ where = { ... } }` for filtered children when
+  they need dynamic entity-backed rows. Keep `ui_tree_snapshot` for route
+  scaffolding, current-path controls, and other presentation structure.
+
+Before restyling visible Catalyst primitives, inspect `tmp/tailwind_plus_preview`
+if it exists in the worktree. If the directory is absent, use the vendored
+Catalyst primitives and existing `ui_contract` registry styles as the design
+source. State binding, entity projections, and action lifecycle work should not
+invent Tailwind or Elements patterns just because no preview directory exists.
+
+The overview's dynamic Projects, Tickets, Recent Runs, and Pipeline Definitions
+sections render from plugin-owned entities through shared UI primitives:
+Tickets and Pipeline Definitions use `ui.list` / `ui.list_item`, Projects use
+`ui.tree` / `ui.tree_item`, and Recent Runs uses `ui.table` with rows bound from
+`/project-pipelines.run`. Keep these collections entity-backed; mutators that
+only change collection data should publish entity snapshots or deltas instead
+of forcing a fresh `ui_tree_snapshot`. Detail screens render presentation
+snapshots for route scaffolding and controls, but dynamic model rows are
+entity-backed through `ui.bind` / `ui.bind_list`.
 
 Routes:
 
