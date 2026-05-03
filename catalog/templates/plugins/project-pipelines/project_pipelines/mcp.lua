@@ -334,6 +334,7 @@ function M.register()
                 id = { type = "string" },
                 name = { type = "string" },
                 description = { type = "string" },
+                merge_policy = { type = "string", enum = { "direct", "pr" } },
                 steps = { type = "array", items = step_schema },
             },
             required = { "id", "name", "steps" },
@@ -343,13 +344,14 @@ function M.register()
     end)
 
     tool("project_pipelines_update_pipeline", {
-        description = "Update a pipeline definition's name or description.",
+        description = "Update a pipeline definition's name, description, or merge policy.",
         input_schema = {
             type = "object",
             properties = {
                 pipeline_id = { type = "string" },
                 name = { type = "string" },
                 description = { type = "string" },
+                merge_policy = { type = "string", enum = { "direct", "pr" } },
             },
             required = { "pipeline_id" },
         },
@@ -357,6 +359,7 @@ function M.register()
         local fields = {}
         if params.name ~= nil then fields.name = params.name end
         if params.description ~= nil then fields.description = params.description end
+        if params.merge_policy ~= nil then fields.merge_policy = params.merge_policy end
         return sync_ok(repo.update_pipeline(params.pipeline_id, fields))
     end)
 

@@ -457,12 +457,18 @@ function M.request_merge(params, context)
     if not run or run.status ~= "done" then
         error("ticket must have a completed latest run before merge")
     end
+    local pipeline = repo.get_pipeline(run.pipeline_id) or {}
+    local merge_policy = pipeline.merge_policy or "direct"
+    if merge_policy ~= "direct" and merge_policy ~= "pr" then
+        merge_policy = "direct"
+    end
     for _, event in ipairs(repo.ticket_events(ticket.id, "ticket.merge_requested", 5)) do
         local payload = util.decode(event.payload, {})
         if payload.session_uuid and Agent.get(payload.session_uuid) then
             return {
                 ticket = ticket,
                 run = run,
+                merge_policy = merge_policy,
                 agent = Agent.get(payload.session_uuid):info(),
                 request_id = payload.request_id,
                 status = "already_requested",
@@ -474,13 +480,18 @@ function M.request_merge(params, context)
         "You are the Project Pipelines merge agent.",
         "Ticket: " .. ticket.title,
         "Run: " .. run.id,
+        "Merge policy: " .. merge_policy,
         "You are the final acceptance gate, not just a Git operator. Re-read the ticket title, ticket description, latest run context, final signoff, review findings, artifacts, branch diff, tests, docs, and merge target before merging.",
         "Judge the work against the intent and meaning of the ticket, not only the literal checklist. If the ticket asked for a new architecture, replacement, or cleanup, verify the old architecture, dead paths, deprecated code, stale docs, stale tests, compatibility shims, and contradictory examples are removed or explicitly human-waived.",
         "All actionable review findings must be resolved or explicitly human-waived before merge. Do not accept 'acceptable workaround', 'future follow-up', 'not necessary', or similar reasoning from an agent unless you agree it is outside the ticket intent or a human has waived it through Project Pipelines questions.",
         "Be proactive about the affected surface area. Confirm the implementation is wired into the actual runtime paths, not merely added beside the old behavior.",
         "Use the repo's conventions for merge strategy and verification.",
-        "If this repo expects a PR instead of a direct merge, create or update the PR only through the Botster MCP PR tools. Do not use gh, hub, direct GitHub API calls, browser automation, or manual web UI actions for PR creation or PR updates.",
-        "If the Botster MCP PR tools are unavailable, ask a human question and wait instead of creating the PR another way.",
+        merge_policy == "pr"
+            and "This pipeline requires a PR. Create or update the PR only through the Botster MCP PR tools. Do not merge directly. Do not use gh, hub, direct GitHub API calls, browser automation, or manual web UI actions for PR creation or PR updates."
+            or "This pipeline requires a direct merge to main. If the acceptance check passes, merge according to the repo's direct-merge convention and do not open a PR.",
+        merge_policy == "pr"
+            and "If the Botster MCP PR tools are unavailable, ask a human question and wait instead of creating the PR another way."
+            or "If direct merge is blocked by conflicts or repo state, add a blocker artifact or ask a human question and wait.",
         "If there are conflicts, incomplete intent coverage, ignored findings, dead/deprecated code, unwired implementation, stale documentation, stale tests, or verification failures, do not merge. Add a project_pipelines_add_artifact blocker summary with exact files, lines when available, and verification attempted; ask a human question only when a waiver or product decision is genuinely needed.",
         "Do not accept pre-existing failures unless you prove with exact evidence they are unrelated to this ticket.",
         "After a successful merge or PR creation, add a project_pipelines_add_artifact summary with the merge commit or PR URL.",
@@ -517,10 +528,10 @@ function M.request_merge(params, context)
     repo.append_event("ticket.merge_requested", {
         run_id = run.id,
         ticket_id = ticket.id,
-        payload = { request_id = request_id, session_uuid = session_uuid, strategy = params.strategy or "agent" },
+        payload = { request_id = request_id, session_uuid = session_uuid, strategy = params.strategy or "agent", merge_policy = merge_policy },
     })
     refresh_surfaces(context)
-    return { ticket = ticket, run = run, agent = created, request_id = request_id }
+    return { ticket = ticket, run = run, merge_policy = merge_policy, agent = created, request_id = request_id }
 end
 
 function M.close_ticket(ticket_id, attrs)
@@ -626,7 +637,18 @@ function M.activate_step(run, step)
     if not step then
         repo.update_run(run.id, { status = "done", current_step_id = nil, current_run_step_id = nil })
         repo.append_event("run.completed", { run_id = run.id, ticket_id = run.ticket_id, payload = {} })
-        return { ok = true, status = "done" }
+        local merge_ok, merge_result = pcall(function()
+            return M.request_merge({ ticket_id = run.ticket_id }, {})
+        end)
+        if not merge_ok then
+            repo.append_event("ticket.merge_request_failed", {
+                run_id = run.id,
+                ticket_id = run.ticket_id,
+                payload = { error = tostring(merge_result) },
+            })
+            return { ok = true, status = "done", merge_error = tostring(merge_result) }
+        end
+        return { ok = true, status = "done", merge = merge_result }
     end
 
     local now = util.now()

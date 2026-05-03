@@ -14,7 +14,7 @@ local drafts = {}
 local feedback = {}
 
 local ALLOWED_FIELDS = {
-    pipeline = { name = true, description = true },
+    pipeline = { name = true, description = true, merge_policy = true },
     step = {
         name = true,
         prompt = true,
