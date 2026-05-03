@@ -7254,6 +7254,65 @@ mod tests {
     }
 
     #[test]
+    fn test_noisy_session_io_replay_keeps_hot_handler_latency_bounded() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-noisy-replay";
+        hub.handle_cache
+            .add_session(test_local_session_handle(session_uuid));
+
+        let mut max_elapsed = std::time::Duration::ZERO;
+        for i in 0..=1000 {
+            let data = format!("\x1b]2;botster replay {i}\x07payload-{i:04}\r\n").into_bytes();
+            let event = crate::hub::events::HubEvent::SessionIoBatch(
+                crate::worker::session_io::SessionIoBatch {
+                    session_uuid: session_uuid.to_string(),
+                    output: Some(data),
+                },
+            );
+            let started = Instant::now();
+            hub.handle_hub_event(event);
+            let elapsed = started.elapsed();
+            max_elapsed = max_elapsed.max(elapsed);
+            hub.hub_event_metrics
+                .record_handler_time("session_io_batch", elapsed);
+        }
+
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert_eq!(snapshot.counters["pty_output.messages"], 1001);
+        assert!(snapshot.counters["pty_output.bytes"] > 32_000);
+        let session_io = snapshot
+            .by_type
+            .get("session_io_batch")
+            .expect("session_io_batch handler metrics");
+        assert_eq!(
+            session_io.handler_time_max_ns,
+            max_elapsed.as_nanos() as u64
+        );
+        assert!(
+            max_elapsed < Hub::HOT_SUBHANDLER_SLOW,
+            "observed-log-shaped SessionIoBatch replay exceeded hot-path budget: {max_elapsed:?}"
+        );
+        assert!(snapshot.slow_samples.is_empty());
+    }
+
+    #[test]
+    fn test_pty_osc_cursor_volume_burst_guardrail_matches_observed_logs() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+
+        for i in 0..=crate::hub::VolumeBurstState::THRESHOLD {
+            hub.handle_hub_event(crate::hub::events::HubEvent::PtyOscEvent {
+                session_uuid: "sess-osc-replay".to_string(),
+                session_name: "test-agent".to_string(),
+                event: crate::agent::pty::PtyEvent::cursor_visibility_changed(i % 2 == 0),
+            });
+        }
+
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert_eq!(snapshot.counters["pty_osc.cursor"], 1001);
+        assert_eq!(snapshot.counters["pty_osc.volume_burst"], 1);
+    }
+
+    #[test]
     fn test_inactive_webrtc_forwarder_strips_probe_queries() {
         let (mut hub, _request_tx, _output_rx) = e2e_hub();
         let session_uuid = "sess-filter-inactive-webrtc";
@@ -7397,7 +7456,29 @@ mod tests {
         );
     }
 
-    // test_backpressure_recovery_fetches_snapshot removed during the migration.
+    #[test]
+    fn test_backpressure_recovery_fetches_broker_snapshot_replacement_sends_prepared_payload() {
+        let metrics = crate::hub::events::HubEventMetrics::default();
+        let (peer_tx, mut peer_rx) = tokio::sync::mpsc::channel(1);
+        let snapshot = b"broker-backed recovery snapshot bytes";
+
+        Hub::send_snapshot_to_peer(&metrics, &peer_tx, "sub-recovery", snapshot);
+
+        match peer_rx.try_recv().expect("recovery snapshot command") {
+            crate::worker::webrtc::WebRtcAdapterCommand::Pty {
+                subscription_id,
+                data,
+            } => {
+                assert_eq!(subscription_id, "sub-recovery");
+                assert!(data.starts_with(&[0x1f, 0x8b]));
+            }
+            other => panic!("expected PTY recovery command, got {other:?}"),
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.backpressure_recovery.sent"], 1);
+        assert!(snapshot.spans.contains_key("snapshot.gzip_queue"));
+    }
 
     fn test_forwarder_request(
         peer_id: &str,

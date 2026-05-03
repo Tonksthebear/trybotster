@@ -129,6 +129,15 @@ Browser client (restty WASM, different platform):
 
 After initial sync, both clients receive raw PTY bytes via broadcast and process them through their own ghostty parser — staying in sync from that point forward.
 
+Noisy replay verification now covers this invariant through the Rust
+`ghostty_vt` wrapper: representative OSC title/CWD, SGR, cursor-visibility, and
+plain PTY chunks are written both as one concatenated stream and as separate
+worker-style chunks, then compared with `format_plain()`. The same test exports
+and imports a binary terminal snapshot and compares the restored screen state to
+the baseline. Future terminal-fidelity regression tests should continue to use
+the libghostty-vt parser and binary snapshot APIs rather than reimplementing VT
+parsing in Rust test helpers.
+
 ## Prior Art
 
 ### zmx (github.com/neurosnap/zmx)
