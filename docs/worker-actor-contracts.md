@@ -107,7 +107,7 @@ mailboxes, and forwards subscribed session output/control frames to the
 transport egress queue. TUI and local socket terminal streams are now
 production-wired through this actor: hub-owned Lua attach requests still decide
 when a session exists, when pending attach intents resolve, and when forwarder
-tasks are cleaned up, but snapshot, live PTY output, process-exit, JSON control,
+tasks are cleaned up, but snapshot, live PTY output, process-exit, typed control,
 plugin binary, and raw input traffic cross the client-worker boundary before a
 TUI or socket adapter encodes them. WebRTC production traffic enters the
 transport adapter boundary through `worker::webrtc::WebRtcPeerRegistry` and
@@ -191,7 +191,34 @@ Reconnect generation is tracked by the client worker. Frames wrapped with an
 older generation are dropped before delivery, and reconnect health emits a
 typed `HubControlMessage::Reconnect` so hub policy stays centralized. `Ping`
 has an explicit observability response: the worker emits a transport-neutral
-`TransportEgress::Control` pong with the original request ID.
+`TransportEgress::Pong { request_id }` with the original request ID.
+
+Stable Botster-owned controls use typed variants at the worker contract. JSON
+is reserved for boundary payloads whose shape is owned by Lua, plugins, or relay
+protocols rather than the Rust worker contract. The canonical typed control set
+includes:
+
+- `ClientControlFrame::Pong` and `TransportEgress::Pong`
+- `ClientControlFrame::TerminalAttach` and `TransportEgress::TerminalAttach`
+- `ClientControlFrame::Snapshot` and `TransportEgress::Snapshot`
+- `ClientControlFrame::ModeChanged` and `TransportEgress::ModeChanged`
+- `ClientControlFrame::KittyChanged` and `TransportEgress::KittyChanged`
+- `ClientControlFrame::FocusReportingChanged` and
+  `TransportEgress::FocusReportingChanged`
+- `ClientControlFrame::FocusChanged`, `TransportIngress::FocusChanged`, and
+  `TransportEgress::FocusChanged`
+- `ClientControlFrame::DcPong` and `TransportEgress::DcPong` for outbound
+  heartbeat replies
+- `ClientControlFrame::DcPongReceived` and `TransportIngress::DcPong` for
+  inbound heartbeat acknowledgements, which are observations and must not echo
+  back to the transport
+- `ClientControlFrame::Scrollback`, `TransportEgress::Scrollback`,
+  `ClientControlFrame::ProcessExited`, and `TransportEgress::ProcessExited`
+
+`ClientControlFrame::BoundaryJson` and `TransportEgress::BoundaryJson` are
+allowed only after a site is classified as a Lua/plugin/relay boundary. They
+are not fallback paths for stable Botster-owned messages that happen to encode
+as JSON on a socket, TUI, or WebRTC wire.
 
 `TransportEgress` carries binary terminal payloads as typed frames, not JSON
 shims. `TerminalBytes`, `Scrollback`, and `ProcessExited` all include the
@@ -255,10 +282,14 @@ hello/hello_ack protocol negotiation, quit interception, reconnect retries,
 stale request draining, synthetic `bridge_reconnected` events, and wake-pipe
 writes are adapter or bridge responsibilities, not client-worker policy.
 
-Resize, focus, terminal color profile, and other JSON hub commands continue
-through the existing Lua/hub JSON path unless they have an explicit typed worker
-message. The terminal data plane for TUI/local socket clients is workerized;
-generic control-plane JSON remains hub-owned for this slice.
+Resize, terminal color profile, and other JSON hub commands continue through
+the existing Lua/hub JSON path unless they have an explicit typed worker
+message. Focus changes do have a typed worker message:
+`TransportIngress::FocusChanged` maps to `ClientControlFrame::FocusChanged`
+before hub policy updates active terminal peer state. The terminal data plane
+for TUI/local socket clients is workerized; generic control-plane JSON remains
+hub-owned for this slice, but stable worker-owned control messages must not use
+generic JSON fallbacks.
 
 ## Session Process Boundary
 

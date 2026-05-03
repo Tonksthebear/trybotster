@@ -1082,32 +1082,7 @@ impl TransportAdapter for WebRtcTransportAdapter {
     }
 
     fn ingress_to_client(&self, ingress: TransportIngress) -> ClientWorkerMessage {
-        match ingress {
-            TransportIngress::Subscribe {
-                session_uuid,
-                subscription_id,
-            } => ClientWorkerMessage::SubscribeSession {
-                session_uuid,
-                subscription_id,
-            },
-            TransportIngress::Unsubscribe {
-                session_uuid,
-                subscription_id,
-            } => ClientWorkerMessage::UnsubscribeSession {
-                session_uuid,
-                subscription_id,
-            },
-            TransportIngress::TerminalInput { session_uuid, data } => {
-                ClientWorkerMessage::SessionInput { session_uuid, data }
-            }
-            TransportIngress::Json(value) => {
-                ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(value))
-            }
-            TransportIngress::Binary(data) => {
-                ClientWorkerMessage::ControlFrame(ClientControlFrame::Binary(data))
-            }
-            TransportIngress::Health(health) => ClientWorkerMessage::Health(health),
-        }
+        crate::worker::transport::ingress_to_client_message(ingress)
     }
 
     fn client_to_egress(&self, message: ClientWorkerMessage) -> Option<TransportEgress> {
@@ -1119,8 +1094,11 @@ impl TransportAdapter for WebRtcTransportAdapter {
                     data,
                 })
             }
-            ClientWorkerMessage::ControlFrame(ClientControlFrame::Json(value)) => {
-                Some(TransportEgress::Control(value))
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPong) => {
+                Some(TransportEgress::DcPong)
+            }
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::BoundaryJson(value)) => {
+                Some(TransportEgress::BoundaryJson(value))
             }
             ClientWorkerMessage::Shutdown { reason } => Some(TransportEgress::Close { reason }),
             _ => None,
@@ -1171,6 +1149,46 @@ mod tests {
             message,
             ClientWorkerMessage::SessionInput { ref session_uuid, ref data }
                 if session_uuid == "sess-1" && data == b"abc"
+        ));
+    }
+
+    #[test]
+    fn adapter_classifies_webrtc_heartbeat_frames_as_typed_controls() {
+        let adapter = WebRtcTransportAdapter::new(ClientId::Browser("browser-1".to_string()));
+
+        let ping = adapter.ingress_to_client(TransportIngress::DcPing);
+        assert!(matches!(
+            ping,
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPong)
+        ));
+
+        let pong = adapter.ingress_to_client(TransportIngress::DcPong);
+        assert!(matches!(
+            pong,
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPongReceived)
+        ));
+
+        let egress = adapter.client_to_egress(ClientWorkerMessage::ControlFrame(
+            ClientControlFrame::DcPong,
+        ));
+        assert!(matches!(egress, Some(TransportEgress::DcPong)));
+    }
+
+    #[test]
+    fn adapter_classifies_webrtc_focus_changed_as_typed_control() {
+        let adapter = WebRtcTransportAdapter::new(ClientId::Browser("browser-1".to_string()));
+
+        let message = adapter.ingress_to_client(TransportIngress::FocusChanged {
+            session_uuid: "sess-1".to_string(),
+            focused: true,
+        });
+
+        assert!(matches!(
+            message,
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::FocusChanged {
+                session_uuid,
+                focused: true,
+            }) if session_uuid == "sess-1"
         ));
     }
 
