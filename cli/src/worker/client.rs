@@ -49,6 +49,19 @@ pub enum ClientControlFrame {
         /// Opaque snapshot bytes owned by terminal/session code.
         payload: Vec<u8>,
     },
+    /// Initial or recovery scrollback snapshot with terminal metadata.
+    Scrollback {
+        /// Session the snapshot belongs to.
+        session_uuid: SessionUuid,
+        /// Authoritative row count used to produce the snapshot.
+        rows: u16,
+        /// Authoritative column count used to produce the snapshot.
+        cols: u16,
+        /// Whether kitty keyboard mode is enabled in the inner PTY.
+        kitty_enabled: bool,
+        /// Opaque snapshot bytes owned by terminal/session code.
+        data: Vec<u8>,
+    },
     /// Terminal mode flags changed.
     ModeChanged {
         /// Session whose mode changed.
@@ -65,6 +78,8 @@ pub enum ClientControlFrame {
     },
     /// Transport-neutral JSON control payload from hub-owned policy.
     Json(serde_json::Value),
+    /// Plugin-level binary payload outside PTY routing.
+    Binary(Vec<u8>),
 }
 
 /// Messages accepted by a client worker.
@@ -395,6 +410,7 @@ impl ClientWorker {
 
         let egress = TransportEgress::TerminalBytes {
             subscription_id: subscription.subscription_id.clone(),
+            session_uuid: session_uuid.clone(),
             data,
         };
         self.try_deliver_egress(egress, Some(session_uuid), DeliveryKind::Terminal)
@@ -459,27 +475,51 @@ impl ClientWorker {
                 )
                 .await;
             }
+            ClientControlFrame::Scrollback {
+                session_uuid,
+                rows,
+                cols,
+                kitty_enabled,
+                data,
+            } => {
+                let Some(subscription) = self.subscriptions.get(&session_uuid) else {
+                    return;
+                };
+                let egress = TransportEgress::Scrollback {
+                    subscription_id: subscription.subscription_id.clone(),
+                    session_uuid: session_uuid.clone(),
+                    rows,
+                    cols,
+                    kitty_enabled,
+                    data,
+                };
+                self.try_deliver_egress(egress, Some(session_uuid), DeliveryKind::Control)
+                    .await;
+            }
             ClientControlFrame::ProcessExited {
                 session_uuid,
                 exit_code,
             } => {
-                if !self.subscriptions.contains_key(&session_uuid) {
+                let Some(subscription) = self.subscriptions.get(&session_uuid) else {
                     return;
-                }
-                let scoped_session_uuid = session_uuid.clone();
-                self.deliver_control(
-                    serde_json::json!({
-                        "type": "process_exited",
-                        "session_uuid": session_uuid,
-                        "exit_code": exit_code,
-                    }),
-                    Some(scoped_session_uuid),
-                    DeliveryKind::Control,
-                )
-                .await;
+                };
+                let egress = TransportEgress::ProcessExited {
+                    subscription_id: subscription.subscription_id.clone(),
+                    session_uuid: session_uuid.clone(),
+                    exit_code,
+                };
+                self.try_deliver_egress(egress, Some(session_uuid), DeliveryKind::Control)
+                    .await;
             }
             ClientControlFrame::Json(value) => {
                 self.deliver_control(value, None, DeliveryKind::Control)
+                    .await;
+            }
+            ClientControlFrame::Binary(data) => {
+                if !matches!(self.health, ClientConnectionHealth::Ready) {
+                    return;
+                }
+                self.try_deliver_egress(TransportEgress::Binary(data), None, DeliveryKind::Control)
                     .await;
             }
         }
@@ -666,6 +706,7 @@ mod tests {
             TransportEgress::TerminalBytes {
                 subscription_id,
                 data,
+                ..
             } if subscription_id == "sub-1" && data == b"after"
         ));
 
@@ -827,6 +868,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_scrollback_process_exit_and_binary_egress_are_lossless() {
+        let (handle, mut hub_rx, mut outbound_rx, _session_rx) =
+            spawn_worker(ClientId::Socket("socket-1".to_string()), 8);
+
+        subscribe(&handle).await;
+        let _ = recv_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::ControlFrame(
+                ClientControlFrame::Scrollback {
+                    session_uuid: "sess-1".to_string(),
+                    rows: 33,
+                    cols: 101,
+                    kitty_enabled: true,
+                    data: vec![0, 1, 2, 255],
+                },
+            ))
+            .await
+            .expect("send scrollback");
+        assert!(matches!(
+            recv_egress(&mut outbound_rx).await,
+            TransportEgress::Scrollback {
+                subscription_id,
+                session_uuid,
+                rows: 33,
+                cols: 101,
+                kitty_enabled: true,
+                data,
+            } if subscription_id == "sub-1"
+                && session_uuid == "sess-1"
+                && data == vec![0, 1, 2, 255]
+        ));
+
+        handle
+            .send(ClientWorkerMessage::ControlFrame(
+                ClientControlFrame::ProcessExited {
+                    session_uuid: "sess-1".to_string(),
+                    exit_code: Some(7),
+                },
+            ))
+            .await
+            .expect("send process exit");
+        assert!(matches!(
+            recv_egress(&mut outbound_rx).await,
+            TransportEgress::ProcessExited {
+                subscription_id,
+                session_uuid,
+                exit_code: Some(7),
+            } if subscription_id == "sub-1" && session_uuid == "sess-1"
+        ));
+
+        handle
+            .send(ClientWorkerMessage::ControlFrame(
+                ClientControlFrame::Binary(vec![9, 8, 7]),
+            ))
+            .await
+            .expect("send binary");
+        assert!(matches!(
+            recv_egress(&mut outbound_rx).await,
+            TransportEgress::Binary(data) if data == vec![9, 8, 7]
+        ));
+    }
+
+    #[tokio::test]
     async fn browser_and_tui_clients_use_the_same_worker_path() {
         for client_id in [ClientId::Tui, ClientId::browser("browser-identity")] {
             let (handle, mut hub_rx, mut outbound_rx, _session_rx) =
@@ -853,6 +958,7 @@ mod tests {
                 TransportEgress::TerminalBytes {
                     subscription_id,
                     data,
+                    ..
                 } if subscription_id == "sub-1" && data == b"x"
             ));
         }

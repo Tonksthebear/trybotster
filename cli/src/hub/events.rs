@@ -87,6 +87,9 @@ pub(crate) enum HubEvent {
     /// session protocol's original frame boundaries.
     SessionIoBatch(crate::worker::session_io::SessionIoBatch),
 
+    /// Client-worker request that needs hub-owned orchestration state.
+    ClientWorkerControl(crate::worker::hub_control::HubControlMessage),
+
     /// WebRTC DataChannel has opened for a browser peer.
     ///
     /// Sent from the `on_data_channel` callback. Triggers `peer_connected`
@@ -426,6 +429,7 @@ impl HubEvent {
             Self::PtyProcessExited { .. } => "pty_process_exited",
             Self::PtyOutputObserved { .. } => "pty_output_observed",
             Self::SessionIoBatch(_) => "session_io_batch",
+            Self::ClientWorkerControl(_) => "client_worker_control",
             Self::DcOpened { .. } => "dc_opened",
             Self::WebRtcIngressBackpressure { .. } => "webrtc_ingress_backpressure",
             Self::TimerFired { .. } => "timer_fired",
