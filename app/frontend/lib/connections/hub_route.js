@@ -366,6 +366,9 @@ export class HubRoute {
       bridge.on("connection:state", (event) => {
         if (event.hubId !== hubId) return;
         if (event.state === "connected") {
+          if (Number.isFinite(event.peerReadyMs) && localStorage.getItem("botster:debug:webrtcTiming") === "1") {
+            console.warn(`[HubRoute] WebRTC peer ready for hub ${hubId} in ${event.peerReadyMs}ms`);
+          }
           this.#clearReconnectTimer();
           this.#peerHealthDirty = false;
           if (event.mode) this.#setConnectionMode(event.mode);

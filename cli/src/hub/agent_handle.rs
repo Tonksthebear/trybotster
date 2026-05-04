@@ -345,6 +345,40 @@ impl PtyHandle {
         }
     }
 
+    /// Create a session-process-backed PTY handle whose snapshot RPC returns a
+    /// fixed payload. Used by attach latency tests that need the production
+    /// session-backed branch without a live session process socket.
+    #[must_use]
+    #[cfg(test)]
+    pub fn new_with_session_snapshot(
+        event_tx: broadcast::Sender<PtyEvent>,
+        kitty_enabled: Arc<AtomicBool>,
+        cursor_visible: Arc<AtomicBool>,
+        resize_pending: Arc<AtomicBool>,
+        port: Option<u16>,
+        session_connection: crate::session::connection::SharedSessionConnection,
+        last_output_at: Arc<AtomicU64>,
+        last_human_input_ms: Arc<std::sync::atomic::AtomicI64>,
+        initial_rows: u16,
+        initial_cols: u16,
+        snapshot: Vec<u8>,
+    ) -> Self {
+        let mut handle = Self::new_with_session(
+            event_tx,
+            kitty_enabled,
+            cursor_visible,
+            resize_pending,
+            port,
+            session_connection,
+            last_output_at,
+            last_human_input_ms,
+            initial_rows,
+            initial_cols,
+        );
+        handle.snapshot_override = Some(snapshot);
+        handle
+    }
+
     /// Whether this handle is session-process-backed.
     #[must_use]
     pub fn is_session_backed(&self) -> bool {

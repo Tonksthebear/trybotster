@@ -134,6 +134,24 @@ describe("HubPeerConnection peer lost transitions", () => {
     return events.filter((event) => event.state === "disconnected")
   }
 
+  function connectedEvents() {
+    return events.filter((event) => event.state === "connected")
+  }
+
+  it("emits peer-ready timing when the data channel opens", async () => {
+    const pc = await connectPeer()
+
+    pc.dataChannel.onopen()
+
+    expect(connectedEvents()).toHaveLength(1)
+    expect(connectedEvents()[0]).toMatchObject({
+      hubId: "hub-1",
+      state: "connected",
+      peerReadyMs: expect.any(Number),
+    })
+    expect(connectedEvents()[0].peerReadyMs).toBeGreaterThanOrEqual(0)
+  })
+
   it("emits one datachannel_close event and tears down peer timers", async () => {
     const pc = await connectPeer()
     const dc = pc.dataChannel
