@@ -8,8 +8,8 @@
 use crate::client::{ClientId, TuiOutput, TuiRequest};
 use crate::socket::framing::Frame;
 
-use super::client::ClientWorkerMessage;
-use super::{BoundedQueueConfig, SessionUuid, SubscriptionId};
+use super::client::{ClientControlFrame, ClientWorkerMessage, TerminalAttachState};
+use super::{BoundedQueueConfig, RequestId, SessionUuid, SubscriptionId};
 
 /// Default bounded mailbox config for transport-adapter input.
 pub const TRANSPORT_ADAPTER_QUEUE: BoundedQueueConfig =
@@ -39,8 +39,19 @@ pub enum TransportIngress {
         /// Raw input bytes.
         data: Vec<u8>,
     },
-    /// Client sent a transport-neutral JSON command.
-    Json(serde_json::Value),
+    /// Client focus state changed.
+    FocusChanged {
+        /// Session whose focus changed.
+        session_uuid: SessionUuid,
+        /// Whether the client is focused.
+        focused: bool,
+    },
+    /// WebRTC data-channel ping heartbeat.
+    DcPing,
+    /// WebRTC data-channel pong heartbeat.
+    DcPong,
+    /// Client sent JSON whose shape is owned by Lua/plugin/relay code.
+    BoundaryJson(serde_json::Value),
     /// Client sent plugin-level binary data outside PTY routing.
     Binary(Vec<u8>),
     /// Transport reported a health change.
@@ -83,8 +94,59 @@ pub enum TransportEgress {
         /// Exit code when available.
         exit_code: Option<i32>,
     },
-    /// Generic control message for the client.
-    Control(serde_json::Value),
+    /// Request/response correlation pong.
+    Pong {
+        /// Request identifier from the ping.
+        request_id: RequestId,
+    },
+    /// Terminal attach state.
+    TerminalAttach {
+        /// Transport-local subscription identifier.
+        subscription_id: SubscriptionId,
+        /// Session whose attach state changed.
+        session_uuid: SessionUuid,
+        /// Known attach state.
+        state: TerminalAttachState,
+    },
+    /// Initial or recovery snapshot for a session.
+    Snapshot {
+        /// Session the snapshot belongs to.
+        session_uuid: SessionUuid,
+        /// Opaque snapshot bytes.
+        payload: Vec<u8>,
+    },
+    /// Terminal mode flags changed.
+    ModeChanged {
+        /// Session whose mode changed.
+        session_uuid: SessionUuid,
+        /// Sparse mode update.
+        mode: crate::session::protocol::ModeChanged,
+    },
+    /// Kitty keyboard mode changed.
+    KittyChanged {
+        /// Session whose mode changed.
+        session_uuid: SessionUuid,
+        /// Whether kitty keyboard mode is enabled.
+        enabled: bool,
+    },
+    /// Focus reporting mode changed.
+    FocusReportingChanged {
+        /// Session whose mode changed.
+        session_uuid: SessionUuid,
+        /// Whether focus reporting is enabled.
+        enabled: bool,
+    },
+    /// Client focus state changed.
+    FocusChanged {
+        /// Session whose focus changed.
+        session_uuid: SessionUuid,
+        /// Whether the client is focused.
+        focused: bool,
+    },
+    /// WebRTC data-channel pong heartbeat.
+    DcPong,
+    /// Boundary JSON whose shape is owned by Lua/plugin/relay code.
+    BoundaryJson(serde_json::Value),
     /// Plugin-level binary data outside PTY routing.
     Binary(Vec<u8>),
     /// Close the transport.
@@ -148,7 +210,9 @@ impl SocketFrameAdapter {
                         subscription_id,
                     })
                 }
-                _ => Some(TransportIngress::Json(value)),
+                Some("dc_ping") => Some(TransportIngress::DcPing),
+                Some("dc_pong") => Some(TransportIngress::DcPong),
+                _ => Some(TransportIngress::BoundaryJson(value)),
             },
             Frame::PtyInput { session_uuid, data } => {
                 Some(TransportIngress::TerminalInput { session_uuid, data })
@@ -189,7 +253,40 @@ impl SocketFrameAdapter {
                 session_uuid,
                 exit_code,
             }),
-            TransportEgress::Control(value) => Some(Frame::Json(value)),
+            TransportEgress::Pong { request_id } => Some(Frame::Json(egress_pong(request_id))),
+            TransportEgress::TerminalAttach {
+                subscription_id,
+                session_uuid,
+                state,
+            } => Some(Frame::Json(egress_terminal_attach(
+                subscription_id,
+                session_uuid,
+                state,
+            ))),
+            TransportEgress::Snapshot {
+                session_uuid,
+                payload,
+            } => Some(Frame::Json(egress_snapshot(session_uuid, payload))),
+            TransportEgress::ModeChanged { session_uuid, mode } => {
+                Some(Frame::Json(egress_mode_changed(session_uuid, mode)))
+            }
+            TransportEgress::KittyChanged {
+                session_uuid,
+                enabled,
+            } => Some(Frame::Json(egress_kitty_changed(session_uuid, enabled))),
+            TransportEgress::FocusReportingChanged {
+                session_uuid,
+                enabled,
+            } => Some(Frame::Json(egress_focus_reporting_changed(
+                session_uuid,
+                enabled,
+            ))),
+            TransportEgress::FocusChanged {
+                session_uuid,
+                focused,
+            } => Some(Frame::Json(egress_focus_changed(session_uuid, focused))),
+            TransportEgress::DcPong => Some(Frame::Json(egress_dc_pong())),
+            TransportEgress::BoundaryJson(value) => Some(Frame::Json(value)),
             TransportEgress::Binary(data) => Some(Frame::Binary(data)),
             TransportEgress::Close { .. } => None,
         }
@@ -229,18 +326,17 @@ impl TuiTransportAdapter {
     #[must_use]
     pub fn request_to_ingress(request: TuiRequest) -> TransportIngress {
         match request {
-            TuiRequest::LuaMessage(value) => TransportIngress::Json(value),
+            TuiRequest::LuaMessage(value) => TransportIngress::BoundaryJson(value),
             TuiRequest::PtyInput { session_uuid, data } => {
                 TransportIngress::TerminalInput { session_uuid, data }
             }
             TuiRequest::FocusChanged {
                 session_uuid,
                 focused,
-            } => TransportIngress::Json(serde_json::json!({
-                "type": "focus_changed",
-                "session_uuid": session_uuid,
-                "focused": focused,
-            })),
+            } => TransportIngress::FocusChanged {
+                session_uuid,
+                focused,
+            },
         }
     }
 
@@ -273,7 +369,48 @@ impl TuiTransportAdapter {
                 session_uuid,
                 exit_code,
             }),
-            TransportEgress::Control(value) => Some(TuiOutput::Message(value)),
+            TransportEgress::Pong { request_id } => {
+                Some(TuiOutput::Message(egress_pong(request_id)))
+            }
+            TransportEgress::TerminalAttach {
+                subscription_id,
+                session_uuid,
+                state,
+            } => Some(TuiOutput::Message(egress_terminal_attach(
+                subscription_id,
+                session_uuid,
+                state,
+            ))),
+            TransportEgress::Snapshot {
+                session_uuid,
+                payload,
+            } => Some(TuiOutput::Message(egress_snapshot(session_uuid, payload))),
+            TransportEgress::ModeChanged { session_uuid, mode } => {
+                Some(TuiOutput::Message(egress_mode_changed(session_uuid, mode)))
+            }
+            TransportEgress::KittyChanged {
+                session_uuid,
+                enabled,
+            } => Some(TuiOutput::Message(egress_kitty_changed(
+                session_uuid,
+                enabled,
+            ))),
+            TransportEgress::FocusReportingChanged {
+                session_uuid,
+                enabled,
+            } => Some(TuiOutput::Message(egress_focus_reporting_changed(
+                session_uuid,
+                enabled,
+            ))),
+            TransportEgress::FocusChanged {
+                session_uuid,
+                focused,
+            } => Some(TuiOutput::Message(egress_focus_changed(
+                session_uuid,
+                focused,
+            ))),
+            TransportEgress::DcPong => Some(TuiOutput::Message(egress_dc_pong())),
+            TransportEgress::BoundaryJson(value) => Some(TuiOutput::Message(value)),
             TransportEgress::Binary(data) => Some(TuiOutput::Binary(data)),
             TransportEgress::Close { .. } => None,
         }
@@ -294,7 +431,7 @@ impl TransportAdapter for TuiTransportAdapter {
     }
 }
 
-fn ingress_to_client_message(ingress: TransportIngress) -> ClientWorkerMessage {
+pub(crate) fn ingress_to_client_message(ingress: TransportIngress) -> ClientWorkerMessage {
     match ingress {
         TransportIngress::Subscribe {
             session_uuid,
@@ -313,8 +450,19 @@ fn ingress_to_client_message(ingress: TransportIngress) -> ClientWorkerMessage {
         TransportIngress::TerminalInput { session_uuid, data } => {
             ClientWorkerMessage::SessionInput { session_uuid, data }
         }
-        TransportIngress::Json(value) => {
-            ClientWorkerMessage::ControlFrame(super::client::ClientControlFrame::Json(value))
+        TransportIngress::FocusChanged {
+            session_uuid,
+            focused,
+        } => ClientWorkerMessage::ControlFrame(ClientControlFrame::FocusChanged {
+            session_uuid,
+            focused,
+        }),
+        TransportIngress::DcPing => ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPong),
+        TransportIngress::DcPong => {
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPongReceived)
+        }
+        TransportIngress::BoundaryJson(value) => {
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::BoundaryJson(value))
         }
         TransportIngress::Binary(data) => {
             ClientWorkerMessage::ControlFrame(super::client::ClientControlFrame::Binary(data))
@@ -336,13 +484,61 @@ fn client_message_to_egress(
                 data,
             })
         }
-        ClientWorkerMessage::ControlFrame(super::client::ClientControlFrame::Json(value)) => {
-            Some(TransportEgress::Control(value))
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::Pong { request_id }) => {
+            Some(TransportEgress::Pong { request_id })
         }
-        ClientWorkerMessage::ControlFrame(super::client::ClientControlFrame::Binary(data)) => {
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::TerminalAttach {
+            subscription_id: frame_subscription_id,
+            session_uuid,
+            state,
+        }) => Some(TransportEgress::TerminalAttach {
+            subscription_id: frame_subscription_id,
+            session_uuid,
+            state,
+        }),
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::Snapshot {
+            session_uuid,
+            payload,
+        }) => Some(TransportEgress::Snapshot {
+            session_uuid,
+            payload,
+        }),
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::ModeChanged {
+            session_uuid,
+            mode,
+        }) => Some(TransportEgress::ModeChanged { session_uuid, mode }),
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::KittyChanged {
+            session_uuid,
+            enabled,
+        }) => Some(TransportEgress::KittyChanged {
+            session_uuid,
+            enabled,
+        }),
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::FocusReportingChanged {
+            session_uuid,
+            enabled,
+        }) => Some(TransportEgress::FocusReportingChanged {
+            session_uuid,
+            enabled,
+        }),
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::FocusChanged {
+            session_uuid,
+            focused,
+        }) => Some(TransportEgress::FocusChanged {
+            session_uuid,
+            focused,
+        }),
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPong) => {
+            Some(TransportEgress::DcPong)
+        }
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPongReceived) => None,
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::BoundaryJson(value)) => {
+            Some(TransportEgress::BoundaryJson(value))
+        }
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::Binary(data)) => {
             Some(TransportEgress::Binary(data))
         }
-        ClientWorkerMessage::ControlFrame(super::client::ClientControlFrame::Scrollback {
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::Scrollback {
             session_uuid,
             rows,
             cols,
@@ -356,7 +552,7 @@ fn client_message_to_egress(
             kitty_enabled,
             data,
         }),
-        ClientWorkerMessage::ControlFrame(super::client::ClientControlFrame::ProcessExited {
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::ProcessExited {
             session_uuid,
             exit_code,
         }) => Some(TransportEgress::ProcessExited {
@@ -367,6 +563,84 @@ fn client_message_to_egress(
         ClientWorkerMessage::Shutdown { reason } => Some(TransportEgress::Close { reason }),
         _ => None,
     }
+}
+
+#[must_use]
+pub(crate) fn egress_pong(request_id: RequestId) -> serde_json::Value {
+    serde_json::json!({
+        "type": "pong",
+        "request_id": request_id,
+    })
+}
+
+#[must_use]
+pub(crate) fn egress_terminal_attach(
+    subscription_id: SubscriptionId,
+    session_uuid: SessionUuid,
+    state: TerminalAttachState,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "terminal_attach",
+        "subscriptionId": subscription_id,
+        "session_uuid": session_uuid,
+        "state": state.as_str(),
+    })
+}
+
+#[must_use]
+pub(crate) fn egress_snapshot(session_uuid: SessionUuid, payload: Vec<u8>) -> serde_json::Value {
+    serde_json::json!({
+        "type": "snapshot",
+        "session_uuid": session_uuid,
+        "payload": payload,
+    })
+}
+
+#[must_use]
+pub(crate) fn egress_mode_changed(
+    session_uuid: SessionUuid,
+    mode: crate::session::protocol::ModeChanged,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "mode_changed",
+        "session_uuid": session_uuid,
+        "mode": mode,
+    })
+}
+
+#[must_use]
+pub(crate) fn egress_kitty_changed(session_uuid: SessionUuid, enabled: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": "kitty_changed",
+        "enabled": enabled,
+        "session_uuid": session_uuid,
+    })
+}
+
+#[must_use]
+pub(crate) fn egress_focus_reporting_changed(
+    session_uuid: SessionUuid,
+    enabled: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "focus_reporting_changed",
+        "enabled": enabled,
+        "session_uuid": session_uuid,
+    })
+}
+
+#[must_use]
+pub(crate) fn egress_focus_changed(session_uuid: SessionUuid, focused: bool) -> serde_json::Value {
+    serde_json::json!({
+        "type": "focus_changed",
+        "session_uuid": session_uuid,
+        "focused": focused,
+    })
+}
+
+#[must_use]
+pub(crate) fn egress_dc_pong() -> serde_json::Value {
+    serde_json::json!({ "type": "dc_pong" })
 }
 
 #[cfg(test)]
@@ -433,6 +707,86 @@ mod tests {
     }
 
     #[test]
+    fn socket_adapter_encodes_typed_control_egress_losslessly() {
+        let pong = SocketFrameAdapter::egress_to_frame(TransportEgress::Pong {
+            request_id: "req-1".to_string(),
+        })
+        .expect("pong frame");
+        assert!(matches!(
+            pong,
+            Frame::Json(value) if value == serde_json::json!({
+                "type": "pong",
+                "request_id": "req-1",
+            })
+        ));
+
+        let attach = SocketFrameAdapter::egress_to_frame(TransportEgress::TerminalAttach {
+            subscription_id: "socket:sess-1".to_string(),
+            session_uuid: "sess-1".to_string(),
+            state: TerminalAttachState::Reconnecting,
+        })
+        .expect("terminal attach frame");
+        assert!(matches!(
+            attach,
+            Frame::Json(value) if value == serde_json::json!({
+                "type": "terminal_attach",
+                "subscriptionId": "socket:sess-1",
+                "session_uuid": "sess-1",
+                "state": "reconnecting",
+            })
+        ));
+
+        let kitty = SocketFrameAdapter::egress_to_frame(TransportEgress::KittyChanged {
+            session_uuid: "sess-1".to_string(),
+            enabled: true,
+        })
+        .expect("kitty frame");
+        assert!(matches!(
+            kitty,
+            Frame::Json(value) if value == serde_json::json!({
+                "type": "kitty_changed",
+                "enabled": true,
+                "session_uuid": "sess-1",
+            })
+        ));
+
+        let focus = SocketFrameAdapter::egress_to_frame(TransportEgress::FocusReportingChanged {
+            session_uuid: "sess-1".to_string(),
+            enabled: false,
+        })
+        .expect("focus reporting frame");
+        assert!(matches!(
+            focus,
+            Frame::Json(value) if value == serde_json::json!({
+                "type": "focus_reporting_changed",
+                "enabled": false,
+                "session_uuid": "sess-1",
+            })
+        ));
+
+        let dc_pong =
+            SocketFrameAdapter::egress_to_frame(TransportEgress::DcPong).expect("dc pong frame");
+        assert!(matches!(
+            dc_pong,
+            Frame::Json(value) if value == egress_dc_pong()
+        ));
+    }
+
+    #[test]
+    fn socket_adapter_decodes_known_json_controls_to_typed_ingress() {
+        assert!(matches!(
+            SocketFrameAdapter::frame_to_ingress(Frame::Json(
+                serde_json::json!({ "type": "dc_ping" })
+            )),
+            Some(TransportIngress::DcPing)
+        ));
+        assert!(matches!(
+            SocketFrameAdapter::frame_to_ingress(Frame::Json(egress_dc_pong())),
+            Some(TransportIngress::DcPong)
+        ));
+    }
+
+    #[test]
     fn tui_adapter_preserves_output_metadata() {
         let output = TuiTransportAdapter::egress_to_output(TransportEgress::Scrollback {
             subscription_id: "tui:sess-1".to_string(),
@@ -454,6 +808,71 @@ mod tests {
                 data,
             } if session_uuid == "sess-1" && data == b"snapshot"
         ));
+    }
+
+    #[test]
+    fn tui_adapter_maps_focus_ingress_to_typed_frame() {
+        let ingress = TuiTransportAdapter::request_to_ingress(TuiRequest::FocusChanged {
+            session_uuid: "sess-1".to_string(),
+            focused: true,
+        });
+
+        assert!(matches!(
+            ingress,
+            TransportIngress::FocusChanged {
+                ref session_uuid,
+                focused: true,
+            } if session_uuid == "sess-1"
+        ));
+
+        let adapter = TuiTransportAdapter::new();
+        assert!(matches!(
+            adapter.ingress_to_client(ingress),
+            ClientWorkerMessage::ControlFrame(ClientControlFrame::FocusChanged {
+                session_uuid,
+                focused: true,
+            }) if session_uuid == "sess-1"
+        ));
+    }
+
+    #[test]
+    fn typed_snapshot_mode_and_boundary_json_encode_to_existing_json_outputs() {
+        let snapshot = TuiTransportAdapter::egress_to_output(TransportEgress::Snapshot {
+            session_uuid: "sess-1".to_string(),
+            payload: b"abc".to_vec(),
+        })
+        .expect("snapshot output");
+        assert!(matches!(
+            snapshot,
+            TuiOutput::Message(value) if value == serde_json::json!({
+                "type": "snapshot",
+                "session_uuid": "sess-1",
+                "payload": [97, 98, 99],
+            })
+        ));
+
+        let mode = TuiTransportAdapter::egress_to_output(TransportEgress::ModeChanged {
+            session_uuid: "sess-1".to_string(),
+            mode: crate::session::protocol::ModeChanged {
+                kitty_enabled: Some(true),
+                ..Default::default()
+            },
+        })
+        .expect("mode output");
+        assert!(matches!(
+            mode,
+            TuiOutput::Message(value) if value == serde_json::json!({
+                "type": "mode_changed",
+                "session_uuid": "sess-1",
+                "mode": { "kitty_enabled": true },
+            })
+        ));
+
+        let boundary = serde_json::json!({ "plugin": "defined" });
+        let output =
+            TuiTransportAdapter::egress_to_output(TransportEgress::BoundaryJson(boundary.clone()))
+                .expect("boundary output");
+        assert!(matches!(output, TuiOutput::Message(value) if value == boundary));
     }
 }
 

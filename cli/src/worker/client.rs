@@ -39,9 +39,84 @@ pub enum ClientConnectionHealth {
     },
 }
 
+/// Known terminal attach states sent to clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalAttachState {
+    /// Terminal is attached or the snapshot/stream will follow.
+    Attached,
+    /// Terminal exists but its backing process is reconnecting.
+    Reconnecting,
+    /// Terminal could not be found.
+    NotFound,
+}
+
+impl TerminalAttachState {
+    /// Return the wire value used by existing clients.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attached => "attached",
+            Self::Reconnecting => "reconnecting",
+            Self::NotFound => "not_found",
+        }
+    }
+}
+
+impl TryFrom<&str> for TerminalAttachState {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "attached" => Ok(Self::Attached),
+            "reconnecting" => Ok(Self::Reconnecting),
+            "not_found" => Ok(Self::NotFound),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Control frame emitted by the session/hub side toward a client worker.
 #[derive(Debug, Clone)]
 pub enum ClientControlFrame {
+    /// Request/response correlation pong.
+    Pong {
+        /// Request identifier from the ping.
+        request_id: RequestId,
+    },
+    /// Terminal attach state for a subscription.
+    TerminalAttach {
+        /// Transport-local subscription identifier.
+        subscription_id: SubscriptionId,
+        /// Session whose attach state changed.
+        session_uuid: SessionUuid,
+        /// Known attach state.
+        state: TerminalAttachState,
+    },
+    /// Kitty keyboard mode changed.
+    KittyChanged {
+        /// Session whose mode changed.
+        session_uuid: SessionUuid,
+        /// Whether kitty keyboard mode is enabled.
+        enabled: bool,
+    },
+    /// Focus reporting mode changed.
+    FocusReportingChanged {
+        /// Session whose mode changed.
+        session_uuid: SessionUuid,
+        /// Whether focus reporting is enabled.
+        enabled: bool,
+    },
+    /// Client focus state changed.
+    FocusChanged {
+        /// Session whose focus changed.
+        session_uuid: SessionUuid,
+        /// Whether the client is focused.
+        focused: bool,
+    },
+    /// WebRTC data-channel pong heartbeat.
+    DcPong,
+    /// WebRTC data-channel pong heartbeat was received.
+    DcPongReceived,
     /// Initial or recovery snapshot for a session.
     Snapshot {
         /// Session the snapshot belongs to.
@@ -76,8 +151,8 @@ pub enum ClientControlFrame {
         /// Exit code when available.
         exit_code: Option<i32>,
     },
-    /// Transport-neutral JSON control payload from hub-owned policy.
-    Json(serde_json::Value),
+    /// Boundary JSON whose shape is owned by Lua/plugin/relay code.
+    BoundaryJson(serde_json::Value),
     /// Plugin-level binary payload outside PTY routing.
     Binary(Vec<u8>),
 }
@@ -353,11 +428,11 @@ impl ClientWorker {
                 false
             }
             ClientWorkerMessage::Ping { request_id } => {
-                self.deliver_control(
-                    serde_json::json!({
-                        "type": "pong",
-                        "request_id": request_id,
-                    }),
+                if !matches!(self.health, ClientConnectionHealth::Ready) {
+                    return false;
+                }
+                self.try_deliver_egress(
+                    TransportEgress::Pong { request_id },
                     None,
                     DeliveryKind::Control,
                 )
@@ -500,7 +575,91 @@ impl ClientWorker {
     }
 
     async fn deliver_control_frame(&mut self, frame: ClientControlFrame) {
+        if !matches!(self.health, ClientConnectionHealth::Ready) {
+            return;
+        }
+
         match frame {
+            ClientControlFrame::Pong { request_id } => {
+                self.try_deliver_egress(
+                    TransportEgress::Pong { request_id },
+                    None,
+                    DeliveryKind::Control,
+                )
+                .await;
+            }
+            ClientControlFrame::TerminalAttach {
+                subscription_id,
+                session_uuid,
+                state,
+            } => {
+                self.try_deliver_egress(
+                    TransportEgress::TerminalAttach {
+                        subscription_id,
+                        session_uuid: session_uuid.clone(),
+                        state,
+                    },
+                    Some(session_uuid),
+                    DeliveryKind::Control,
+                )
+                .await;
+            }
+            ClientControlFrame::KittyChanged {
+                session_uuid,
+                enabled,
+            } => {
+                if !self.subscriptions.contains_key(&session_uuid) {
+                    return;
+                }
+                self.try_deliver_egress(
+                    TransportEgress::KittyChanged {
+                        session_uuid: session_uuid.clone(),
+                        enabled,
+                    },
+                    Some(session_uuid),
+                    DeliveryKind::Control,
+                )
+                .await;
+            }
+            ClientControlFrame::FocusReportingChanged {
+                session_uuid,
+                enabled,
+            } => {
+                if !self.subscriptions.contains_key(&session_uuid) {
+                    return;
+                }
+                self.try_deliver_egress(
+                    TransportEgress::FocusReportingChanged {
+                        session_uuid: session_uuid.clone(),
+                        enabled,
+                    },
+                    Some(session_uuid),
+                    DeliveryKind::Control,
+                )
+                .await;
+            }
+            ClientControlFrame::FocusChanged {
+                session_uuid,
+                focused,
+            } => {
+                if !self.subscriptions.contains_key(&session_uuid) {
+                    return;
+                }
+                self.try_deliver_egress(
+                    TransportEgress::FocusChanged {
+                        session_uuid: session_uuid.clone(),
+                        focused,
+                    },
+                    Some(session_uuid),
+                    DeliveryKind::Control,
+                )
+                .await;
+            }
+            ClientControlFrame::DcPong => {
+                self.try_deliver_egress(TransportEgress::DcPong, None, DeliveryKind::Control)
+                    .await;
+            }
+            ClientControlFrame::DcPongReceived => {}
             ClientControlFrame::Snapshot {
                 session_uuid,
                 payload,
@@ -508,14 +667,12 @@ impl ClientWorker {
                 if !self.subscriptions.contains_key(&session_uuid) {
                     return;
                 }
-                let scoped_session_uuid = session_uuid.clone();
-                self.deliver_control(
-                    serde_json::json!({
-                        "type": "snapshot",
-                        "session_uuid": session_uuid,
-                        "payload": payload,
-                    }),
-                    Some(scoped_session_uuid),
+                self.try_deliver_egress(
+                    TransportEgress::Snapshot {
+                        session_uuid: session_uuid.clone(),
+                        payload,
+                    },
+                    Some(session_uuid),
                     DeliveryKind::Control,
                 )
                 .await;
@@ -524,14 +681,12 @@ impl ClientWorker {
                 if !self.subscriptions.contains_key(&session_uuid) {
                     return;
                 }
-                let scoped_session_uuid = session_uuid.clone();
-                self.deliver_control(
-                    serde_json::json!({
-                        "type": "mode_changed",
-                        "session_uuid": session_uuid,
-                        "mode": mode,
-                    }),
-                    Some(scoped_session_uuid),
+                self.try_deliver_egress(
+                    TransportEgress::ModeChanged {
+                        session_uuid: session_uuid.clone(),
+                        mode,
+                    },
+                    Some(session_uuid),
                     DeliveryKind::Control,
                 )
                 .await;
@@ -572,32 +727,19 @@ impl ClientWorker {
                 self.try_deliver_egress(egress, Some(session_uuid), DeliveryKind::Control)
                     .await;
             }
-            ClientControlFrame::Json(value) => {
-                self.deliver_control(value, None, DeliveryKind::Control)
-                    .await;
+            ClientControlFrame::BoundaryJson(value) => {
+                self.try_deliver_egress(
+                    TransportEgress::BoundaryJson(value),
+                    None,
+                    DeliveryKind::Control,
+                )
+                .await;
             }
             ClientControlFrame::Binary(data) => {
-                if !matches!(self.health, ClientConnectionHealth::Ready) {
-                    return;
-                }
                 self.try_deliver_egress(TransportEgress::Binary(data), None, DeliveryKind::Control)
                     .await;
             }
         }
-    }
-
-    async fn deliver_control(
-        &mut self,
-        value: serde_json::Value,
-        session_uuid: Option<SessionUuid>,
-        kind: DeliveryKind,
-    ) {
-        if !matches!(self.health, ClientConnectionHealth::Ready) {
-            return;
-        }
-
-        self.try_deliver_egress(TransportEgress::Control(value), session_uuid, kind)
-            .await;
     }
 
     async fn try_deliver_egress(
@@ -1139,9 +1281,42 @@ mod tests {
 
         assert!(matches!(
             recv_egress(&mut outbound_rx).await,
-            TransportEgress::Control(value)
-                if value["type"] == "pong" && value["request_id"] == "req-1"
+            TransportEgress::Pong { request_id } if request_id == "req-1"
         ));
+    }
+
+    #[tokio::test]
+    async fn control_frames_are_gated_when_transport_is_not_ready() {
+        let (handle, mut hub_rx, mut outbound_rx, _session_rx) =
+            spawn_worker(ClientId::Socket("socket-1".to_string()), 8);
+
+        subscribe(&handle).await;
+        let _ = recv_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::Health(
+                ClientConnectionHealth::Reconnecting { generation: 1 },
+            ))
+            .await
+            .expect("send reconnecting health");
+        let _ = recv_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::ControlFrame(
+                ClientControlFrame::KittyChanged {
+                    session_uuid: "sess-1".to_string(),
+                    enabled: true,
+                },
+            ))
+            .await
+            .expect("send typed control");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), outbound_rx.recv())
+                .await
+                .is_err(),
+            "control egress should stay gated while reconnecting"
+        );
     }
 
     #[tokio::test]

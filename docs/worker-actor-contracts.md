@@ -38,31 +38,33 @@ Unix socket and exits with that connection; reconnect creates a fresh
 `SessionConnection` and a fresh worker after the hub's generation checks pass.
 
 The worker keeps the session process protocol unchanged. `SessionConnection`
-still owns writes and synchronous RPC methods, while the worker decodes every
-socket frame and routes snapshot, screen, mode-flags, and other control
-responses back to the existing `response_rx` channel. This avoids socket read
-contention without moving hub orchestration policy into the worker.
+still owns synchronous RPC methods, while the worker decodes every socket frame
+and routes snapshot, screen, mode-flags, and other control responses back to the
+existing `response_rx` channel. A companion request processor owns bounded
+`SessionIoRequest` mailbox work such as PTY input, paste path injection, and
+prepared snapshot payloads. This avoids socket read contention without moving
+hub orchestration policy into the worker.
 
-File paste/drop data-plane mechanics live in `worker::session_io`. The hub
-still authorizes the target session and transport capabilities, then passes the
-already-authorized filename and bytes to the session I/O helper. Paste temp
-paths are session-scoped and resolve in this order: session manifest
+File paste/drop data-plane mechanics live in `worker::session_io` behind the
+per-session `SessionIoRequest` mailbox. The hub still authorizes the target
+session and transport capabilities, then enqueues the already-authorized
+filename and bytes as `SessionIoRequest::PasteFile`. The Session I/O worker
+writes the file, injects the resulting path into the PTY, and reports
+`SessionIoEvent::PasteFileWritten` or `SessionIoEvent::PasteFileFailed` back
+through `HubEvent::SessionIo`. Paste temp paths are session-scoped and resolve
+in this order: session manifest
 `worktree_path` under `.botster/pastes/<session_uuid>`, Botster data dir under
 `pastes/<session_uuid>`, then the OS temp dir under
 `botster/pastes/<session_uuid>`. Cleanup is keyed by session UUID, never label,
 and runs on real process exit plus hub drop.
 
-Snapshot payload preparation also lives in the session I/O data-plane contract.
-The hub remains responsible for deciding when a snapshot is needed and where it
-should be routed. `request_id` is an opaque correlation key scoped to the
-session; callers use it to map prepared output back to peer/subscription or Lua
-refresh state. Browser identities and WebRTC structs do not enter the worker
-contract.
-
-The paste and prepared-snapshot request/event variants define the mailbox
-contract for the next production-wiring slice. Today the production hub calls
-the `worker::session_io` helpers directly, so the data-plane byte/path logic is
-already centralized while mailbox send/receive ownership remains scaffolding.
+Snapshot payload preparation also lives behind the session I/O mailbox. The hub
+remains responsible for deciding when a snapshot is needed and where it should
+be routed, but the worker owns snapshot prefixing and gzip preparation through
+`SessionIoRequest::PrepareSnapshot` and `SessionIoEvent::PreparedSnapshot`.
+`request_id` is an opaque correlation key scoped to the session; callers use it
+to map prepared output back to peer/subscription or Lua refresh state. Browser
+identities and WebRTC structs do not enter the worker contract.
 
 PTY output crosses into the hub as `HubEvent::SessionIoBatch`, not one hub
 event per `FRAME_PTY_OUTPUT`. The worker preserves byte order while coalescing
@@ -107,12 +109,12 @@ mailboxes, and forwards subscribed session output/control frames to the
 transport egress queue. TUI and local socket terminal streams are now
 production-wired through this actor: hub-owned Lua attach requests still decide
 when a session exists, when pending attach intents resolve, and when forwarder
-tasks are cleaned up, but snapshot, live PTY output, process-exit, JSON control,
+tasks are cleaned up, but snapshot, live PTY output, process-exit, typed control,
 plugin binary, and raw input traffic cross the client-worker boundary before a
 TUI or socket adapter encodes them. WebRTC production traffic enters the
 transport adapter boundary through `worker::webrtc::WebRtcPeerRegistry` and
 `WebRtcTransportRunner`; the adapter converts decoded ingress into
-`ClientWorkerMessage` before hub policy handles the legacy Lua routing surface.
+`ClientWorkerMessage` before hub policy handles the current Lua routing surface.
 
 ## WebRTC Transport Adapter
 
@@ -123,6 +125,12 @@ and summarized cleanup policy. WebRTC peer connection state, offer generation,
 pending ICE queues, per-peer bounded send queues, DataChannel liveness pings,
 unknown-peer burst coalescing, backpressure recovery tracking, and peer cleanup
 bookkeeping stay inside the registry.
+
+The registry also owns the WebRTC data-plane queue receivers. Production code
+starts registry queue forwarders that translate PTY input, file input, outgoing
+signals, PTY output, and stream frames into typed `HubEvent` variants. Hub code
+may handle those typed events, but must not lease, take, restore, or poll raw
+WebRTC receivers.
 
 The Hub must not recover the old escape hatch by reaching into a channel map or
 `WebRtcSender` directly. New WebRTC work should add a typed registry method or
@@ -158,12 +166,12 @@ WebRTC transport summaries cross back to the Hub through typed
 the Rails relay boundary because those values are already serialized Olm
 envelopes. Do not let that exception spread to new adapter control surfaces.
 
-Crypto ownership is split by lifecycle phase. DataChannel encrypt/decrypt
-failure tracking and ratchet-delivery transport are adapter/registry concerns.
-The Hub still generates fresh ratchet bundles and, for now, performs
-handshake-time SDP answer encryption before emitting `TransportSignalReady`;
-that is a known follow-up boundary, not permission to move hot-path
-DataChannel crypto back into Hub code.
+Crypto ownership is split by lifecycle phase. SDP answer encryption,
+DataChannel encrypt/decrypt failure tracking, ratchet-trigger dedupe, and
+ratchet-delivery transport are adapter/registry concerns. The Hub still
+generates fresh ratchet bundles because that mutates trusted crypto policy, then
+queues the bytes through `WebRtcPeerRegistry` instead of sending through a
+`WebRtcSender` directly.
 
 Regression coverage for this boundary should stay focused on the failure modes
 that motivated the migration: a DataChannel closing after `Connected`, stale
@@ -194,7 +202,34 @@ Reconnect generation is tracked by the client worker. Frames wrapped with an
 older generation are dropped before delivery, and reconnect health emits a
 typed `HubControlMessage::Reconnect` so hub policy stays centralized. `Ping`
 has an explicit observability response: the worker emits a transport-neutral
-`TransportEgress::Control` pong with the original request ID.
+`TransportEgress::Pong { request_id }` with the original request ID.
+
+Stable Botster-owned controls use typed variants at the worker contract. JSON
+is reserved for boundary payloads whose shape is owned by Lua, plugins, or relay
+protocols rather than the Rust worker contract. The canonical typed control set
+includes:
+
+- `ClientControlFrame::Pong` and `TransportEgress::Pong`
+- `ClientControlFrame::TerminalAttach` and `TransportEgress::TerminalAttach`
+- `ClientControlFrame::Snapshot` and `TransportEgress::Snapshot`
+- `ClientControlFrame::ModeChanged` and `TransportEgress::ModeChanged`
+- `ClientControlFrame::KittyChanged` and `TransportEgress::KittyChanged`
+- `ClientControlFrame::FocusReportingChanged` and
+  `TransportEgress::FocusReportingChanged`
+- `ClientControlFrame::FocusChanged`, `TransportIngress::FocusChanged`, and
+  `TransportEgress::FocusChanged`
+- `ClientControlFrame::DcPong` and `TransportEgress::DcPong` for outbound
+  heartbeat replies
+- `ClientControlFrame::DcPongReceived` and `TransportIngress::DcPong` for
+  inbound heartbeat acknowledgements, which are observations and must not echo
+  back to the transport
+- `ClientControlFrame::Scrollback`, `TransportEgress::Scrollback`,
+  `ClientControlFrame::ProcessExited`, and `TransportEgress::ProcessExited`
+
+`ClientControlFrame::BoundaryJson` and `TransportEgress::BoundaryJson` are
+allowed only after a site is classified as a Lua/plugin/relay boundary. They
+are not fallback paths for stable Botster-owned messages that happen to encode
+as JSON on a socket, TUI, or WebRTC wire.
 
 `TransportEgress` carries binary terminal payloads as typed frames, not JSON
 shims. `TerminalBytes`, `Scrollback`, and `ProcessExited` all include the
@@ -260,10 +295,14 @@ hello/hello_ack protocol negotiation, quit interception, reconnect retries,
 stale request draining, synthetic `bridge_reconnected` events, and wake-pipe
 writes are adapter or bridge responsibilities, not client-worker policy.
 
-Resize, focus, terminal color profile, and other JSON hub commands continue
-through the existing Lua/hub JSON path unless they have an explicit typed worker
-message. The terminal data plane for TUI/local socket clients is workerized;
-generic control-plane JSON remains hub-owned for this slice.
+Resize, terminal color profile, and other JSON hub commands continue through
+the existing Lua/hub JSON path unless they have an explicit typed worker
+message. Focus changes do have a typed worker message:
+`TransportIngress::FocusChanged` maps to `ClientControlFrame::FocusChanged`
+before hub policy updates active terminal peer state. The terminal data plane
+for TUI/local socket clients is workerized; generic control-plane JSON remains
+hub-owned for this slice, but stable worker-owned control messages must not use
+generic JSON fallbacks.
 
 ## Session Process Boundary
 

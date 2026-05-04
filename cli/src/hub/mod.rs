@@ -239,6 +239,27 @@ pub(crate) struct ReconnectState {
     pub in_flight: bool,
 }
 
+pub(crate) const SESSION_IO_SNAPSHOT_PENDING_TTL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+pub(crate) struct PendingSessionIoSnapshot {
+    pub session_uuid: String,
+    pub started_at: std::time::Instant,
+    pub target: PendingSessionIoSnapshotTarget,
+}
+
+pub(crate) enum PendingSessionIoSnapshotTarget {
+    WebRtcOutput {
+        peer_id: String,
+        subscription_id: String,
+        forwarder_key: Option<String>,
+        active_flag: Option<std::sync::Arc<std::sync::Mutex<bool>>>,
+    },
+    WebRtcPeerRecovery {
+        request: crate::worker::webrtc::WebRtcRecoverySnapshotRequest,
+    },
+}
+
 /// Central orchestrator that owns all hub state and runs the event loop.
 pub struct Hub {
     // === Core State ===
@@ -331,6 +352,9 @@ pub struct Hub {
     /// Cleaned up when the session is closed or the hub exits.
     paste_files: std::collections::HashMap<String, Vec<std::path::PathBuf>>,
 
+    /// Hub-owned correlation for prepared SessionIoWorker snapshots.
+    pending_session_io_snapshots: std::collections::HashMap<String, PendingSessionIoSnapshot>,
+
     // === Handle Cache ===
     /// Thread-safe cache of session handles for non-blocking client access.
     ///
@@ -377,7 +401,6 @@ pub struct Hub {
 
     /// Tracks peers that received a ratchet restart during the current cleanup window.
     /// Cleared every `CleanupTick` (5s) to coalesce decrypt failure storms.
-    ratchet_restarted_peers: std::collections::HashSet<String>,
 
     /// Sessions with dead reader threads awaiting background reconnect.
     ///
@@ -548,6 +571,7 @@ impl Hub {
             active_terminal_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             stream_muxes: std::collections::HashMap::new(),
             paste_files: std::collections::HashMap::new(),
+            pending_session_io_snapshots: std::collections::HashMap::new(),
             lua,
             lua_ac_connections: std::collections::HashMap::new(),
             lua_ac_channels: std::collections::HashMap::new(),
@@ -557,7 +581,6 @@ impl Hub {
             #[cfg(test)]
             pty_output_messages_drained: 0,
             notification_watcher_handles: std::collections::HashMap::new(),
-            ratchet_restarted_peers: std::collections::HashSet::new(),
             pending_reconnects: std::collections::HashMap::new(),
             reconnect_generation: 0,
             vapid_keys: None,

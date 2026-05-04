@@ -87,6 +87,18 @@ pub(crate) enum HubEvent {
     /// session protocol's original frame boundaries.
     SessionIoBatch(crate::worker::session_io::SessionIoBatch),
 
+    /// Session-I/O worker result for non-output mailbox requests.
+    SessionIo(crate::worker::session_io::SessionIoEvent),
+
+    /// Drop a Hub-owned pending session-I/O snapshot request.
+    ///
+    /// Spawned Hub tasks emit this when a snapshot request was reserved in the
+    /// pending map but no worker mailbox request was accepted.
+    DropPendingSessionIoSnapshot {
+        /// Pending snapshot request ID.
+        request_id: String,
+    },
+
     /// Client-worker request that needs hub-owned orchestration state.
     ClientWorkerControl(crate::worker::hub_control::HubControlMessage),
 
@@ -141,6 +153,21 @@ pub(crate) enum HubEvent {
         /// Decrypted message payload bytes.
         payload: Vec<u8>,
     },
+
+    /// Binary PTY input frame from a WebRTC registry-owned queue forwarder.
+    WebRtcPtyInput(crate::channel::webrtc::PtyInputIncoming),
+
+    /// Browser file-transfer frame from a WebRTC registry-owned queue forwarder.
+    WebRtcFileInput(crate::channel::webrtc::FileInputIncoming),
+
+    /// Outgoing signaling envelope from a WebRTC registry-owned queue forwarder.
+    WebRtcOutgoingSignal(crate::channel::webrtc::OutgoingSignal),
+
+    /// PTY output delivery request from a WebRTC registry-owned queue forwarder.
+    WebRtcPtyOutput(crate::hub::WebRtcPtyOutput),
+
+    /// Stream multiplexer frame from a WebRTC registry-owned queue forwarder.
+    WebRtcStreamFrame(crate::channel::webrtc::StreamIncoming),
 
     /// User file watch event from a blocking forwarder task.
     ///
@@ -395,20 +422,17 @@ pub(crate) enum HubEvent {
         result: Result<(), String>,
     },
 
-    /// Async WebRTC offer handling completed — SDP answer is ready.
+    /// Async WebRTC offer negotiation completed.
     ///
-    /// Sent by the spawned task in `handle_webrtc_offer` after ICE config
-    /// fetch, SDP negotiation, and answer encryption complete. The main loop
-    /// re-inserts the channel and relays the encrypted answer via Lua.
-    WebRtcOfferCompleted {
-        /// Browser identity for channel re-insertion and signal routing.
-        browser_identity: String,
-        /// Offer generation captured when async processing started.
-        offer_generation: u64,
-        /// The WebRTC channel to re-insert into the HashMap.
-        channel: crate::channel::WebRtcChannel,
-        /// Encrypted answer envelope, ready for Lua relay. `None` on failure.
-        encrypted_answer: Option<serde_json::Value>,
+    /// Sent by the spawned runner after SDP negotiation and answer encryption.
+    /// The WebRTC registry owns stale generation checks, channel retention, and
+    /// cleanup when this completion returns to the hub thread.
+    WebRtcOfferNegotiated(crate::worker::webrtc::WebRtcOfferCompletion),
+
+    /// Hub-owned snapshot provider finished a WebRTC recovery request.
+    WebRtcRecoverySnapshotReady {
+        request: crate::worker::webrtc::WebRtcRecoverySnapshotRequest,
+        result: crate::worker::webrtc::WebRtcRecoverySnapshotResult,
     },
 }
 
@@ -429,12 +453,19 @@ impl HubEvent {
             Self::PtyProcessExited { .. } => "pty_process_exited",
             Self::PtyOutputObserved { .. } => "pty_output_observed",
             Self::SessionIoBatch(_) => "session_io_batch",
+            Self::SessionIo(_) => "session_io",
+            Self::DropPendingSessionIoSnapshot { .. } => "drop_pending_session_io_snapshot",
             Self::ClientWorkerControl(_) => "client_worker_control",
             Self::DcOpened { .. } => "dc_opened",
             Self::WebRtcIngressBackpressure { .. } => "webrtc_ingress_backpressure",
             Self::TimerFired { .. } => "timer_fired",
             Self::AcChannelMessage { .. } => "ac_channel_message",
             Self::WebRtcMessage { .. } => "webrtc_message",
+            Self::WebRtcPtyInput(_) => "webrtc_pty_input",
+            Self::WebRtcFileInput(_) => "webrtc_file_input",
+            Self::WebRtcOutgoingSignal(_) => "webrtc_outgoing_signal",
+            Self::WebRtcPtyOutput(_) => "webrtc_pty_output",
+            Self::WebRtcStreamFrame(_) => "webrtc_stream_frame",
             Self::UserFileWatch { .. } => "user_file_watch",
             Self::CleanupTick => "cleanup_tick",
             Self::WebRtcSend(_) => "webrtc_send",
@@ -463,7 +494,8 @@ impl HubEvent {
             Self::SessionReconnectReady { .. } => "session_reconnect_ready",
             Self::SessionUnregistered { .. } => "session_unregistered",
             Self::WorktreeDeleteCompleted { .. } => "worktree_delete_completed",
-            Self::WebRtcOfferCompleted { .. } => "webrtc_offer_completed",
+            Self::WebRtcOfferNegotiated(_) => "webrtc_offer_negotiated",
+            Self::WebRtcRecoverySnapshotReady { .. } => "webrtc_recovery_snapshot_ready",
         }
     }
 
@@ -475,6 +507,16 @@ impl HubEvent {
                 browser_identity,
                 payload,
             } => BASE + browser_identity.len() + payload.len(),
+            Self::WebRtcPtyInput(input) => BASE + input.session_uuid.len() + input.data.len(),
+            Self::WebRtcFileInput(file) => {
+                BASE + file.session_uuid.len() + file.filename.len() + file.data.len()
+            }
+            Self::WebRtcPtyOutput(output) => {
+                BASE + output.browser_identity.len() + output.session_uuid.len() + output.data.len()
+            }
+            Self::WebRtcStreamFrame(frame) => {
+                BASE + frame.browser_identity.len() + frame.payload.len()
+            }
             Self::SocketPtyInput {
                 client_id, data, ..
             } => BASE + client_id.len() + data.len(),
