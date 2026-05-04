@@ -7254,6 +7254,98 @@ mod tests {
     }
 
     #[test]
+    fn test_session_io_batch_notifies_lua_pty_output_observers_in_byte_order() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-worker-batch-lua";
+
+        hub.handle_cache
+            .add_session(test_local_session_handle(session_uuid));
+
+        hub.lua
+            .lua()
+            .load(
+                r#"
+                _test_pty_output_chunks = {}
+                hooks.on("pty_output", "test.session_io_batch_order", function(ctx, data)
+                    table.insert(_test_pty_output_chunks, {
+                        session_uuid = ctx.session_uuid,
+                        data = data,
+                        len = #data,
+                    })
+                end)
+                "#,
+            )
+            .exec()
+            .expect("register test pty_output observer");
+
+        let chunks = [
+            b"coalesced-one-".to_vec(),
+            b"two-and-three-".to_vec(),
+            b"four".to_vec(),
+        ];
+        let expected = chunks.concat();
+
+        for chunk in chunks {
+            hub.handle_hub_event(crate::hub::events::HubEvent::SessionIoBatch(
+                crate::worker::session_io::SessionIoBatch {
+                    session_uuid: session_uuid.to_string(),
+                    output: Some(chunk),
+                },
+            ));
+        }
+
+        let observed: String = hub
+            .lua
+            .lua()
+            .load(
+                r#"
+                local out = {}
+                for _, chunk in ipairs(_test_pty_output_chunks) do
+                    table.insert(out, chunk.data)
+                end
+                return table.concat(out)
+                "#,
+            )
+            .eval()
+            .expect("read observed pty output bytes");
+        let observed_total: usize = hub
+            .lua
+            .lua()
+            .load(
+                r#"
+                local total = 0
+                for _, chunk in ipairs(_test_pty_output_chunks) do
+                    total = total + chunk.len
+                end
+                return total
+                "#,
+            )
+            .eval()
+            .expect("read observed pty output byte count");
+        let observed_count: usize = hub
+            .lua
+            .lua()
+            .load("return #_test_pty_output_chunks")
+            .eval()
+            .expect("read observed pty output chunk count");
+        let observed_session_uuid: String = hub
+            .lua
+            .lua()
+            .load("return _test_pty_output_chunks[1].session_uuid")
+            .eval()
+            .expect("read observed pty output context");
+
+        assert_eq!(observed.as_bytes(), expected.as_slice());
+        assert_eq!(observed_total, expected.len());
+        assert_eq!(observed_count, 3);
+        assert_eq!(observed_session_uuid, session_uuid);
+
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert_eq!(snapshot.counters["pty_output.messages"], 3);
+        assert_eq!(snapshot.counters["pty_output.bytes"], expected.len() as u64);
+    }
+
+    #[test]
     fn test_noisy_session_io_replay_keeps_hot_handler_latency_bounded() {
         let (mut hub, _request_tx, _output_rx) = e2e_hub();
         let session_uuid = "sess-noisy-replay";
