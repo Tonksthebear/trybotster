@@ -1072,6 +1072,12 @@ impl Hub {
                 self.stop_lua_pty_forwarder(&forwarder_key);
             }
             HubControlMessage::Backpressure(backpressure) => {
+                self.hub_event_metrics
+                    .record_counter("client_worker.backpressure", 1);
+                if backpressure.source == "worker.client.session_io_missing" {
+                    self.hub_event_metrics
+                        .record_counter("client_worker.session_io_missing", 1);
+                }
                 log::warn!("[ClientWorker] Backpressure: {backpressure:?}");
             }
             HubControlMessage::Reconnect { .. }
@@ -4362,21 +4368,6 @@ impl Hub {
         }
     }
 
-    fn should_force_snapshot_redraw(
-        pty_handle: &crate::hub::agent_handle::PtyHandle,
-        target_rows: u16,
-        target_cols: u16,
-    ) -> bool {
-        if pty_handle.dims() != (target_rows, target_cols) {
-            return false;
-        }
-
-        pty_handle
-            .get_mode_flags()
-            .map(|flags| flags.alt_screen)
-            .unwrap_or(false)
-    }
-
     /// Try to attach a terminal forwarder immediately.
     ///
     /// Returns `true` when attached, `false` when the session is not yet
@@ -4469,25 +4460,7 @@ impl Hub {
             let rpc_started = Instant::now();
             let (snapshot, mut pty_rx) = match tokio::task::spawn_blocking(move || {
                 if pty_for_snapshot.is_session_backed() {
-                    if Self::should_force_snapshot_redraw(
-                        &pty_for_snapshot,
-                        target_rows,
-                        target_cols,
-                    ) {
-                        // Force a redraw pulse for full-screen TUIs. Resizing to the
-                        // same dimensions often does not trigger a redraw path.
-                        // Normal-screen sessions keep real scrollback in the primary
-                        // buffer, so bouncing them by one column can reflow and
-                        // inflate restored history on resume.
-                        let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
-                        pty_for_snapshot.resize_direct(target_rows, bounce_cols);
-                        std::thread::sleep(std::time::Duration::from_millis(25));
-                    }
                     pty_for_snapshot.resize_direct(target_rows, target_cols);
-                    // Sessions redraw asynchronously after SIGWINCH.
-                    // Let a short settle window pass so the binary snapshot
-                    // includes the post-resize redraw.
-                    std::thread::sleep(std::time::Duration::from_millis(125));
                 }
                 let (snapshot, _kitty_enabled, _rows, _cols, pty_rx) =
                     pty_for_snapshot.snapshot_and_subscribe();
@@ -4707,13 +4680,7 @@ impl Hub {
             let rpc_started = Instant::now();
             let snapshot = match tokio::task::spawn_blocking(move || {
                 if pty_handle.is_session_backed() {
-                    if Self::should_force_snapshot_redraw(&pty_handle, target_rows, target_cols) {
-                        let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
-                        pty_handle.resize_direct(target_rows, bounce_cols);
-                        std::thread::sleep(std::time::Duration::from_millis(25));
-                    }
                     pty_handle.resize_direct(target_rows, target_cols);
-                    std::thread::sleep(std::time::Duration::from_millis(125));
                 }
                 pty_handle.get_snapshot()
             })
@@ -5218,17 +5185,7 @@ impl Hub {
             let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, mut pty_rx) =
                 match tokio::task::spawn_blocking(move || {
                     if pty_for_snapshot.is_session_backed() {
-                        if Self::should_force_snapshot_redraw(
-                            &pty_for_snapshot,
-                            target_rows,
-                            target_cols,
-                        ) {
-                            let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
-                            pty_for_snapshot.resize_direct(target_rows, bounce_cols);
-                            std::thread::sleep(std::time::Duration::from_millis(25));
-                        }
                         pty_for_snapshot.resize_direct(target_rows, target_cols);
-                        std::thread::sleep(std::time::Duration::from_millis(125));
                     }
                     pty_for_snapshot.snapshot_and_subscribe()
                 })
@@ -7023,7 +6980,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use crate::client::{TuiOutput, TuiRequest};
+    use crate::client::{ClientId, TuiOutput, TuiRequest};
     use crate::config::Config;
     use crate::hub::agent_handle::{PtyHandle, SessionHandle, SessionType};
     use crate::hub::{Hub, PendingTerminalAttachRequest};
@@ -7206,11 +7163,6 @@ mod tests {
         );
         hub.socket_clients.insert(client_id.to_string(), conn);
         client_stream
-    }
-
-    fn read_test_socket_frame(stream: &mut tokio::net::UnixStream) -> Frame {
-        read_test_socket_frame_matching(stream, Duration::from_secs(2), |_| true)
-            .expect("timed out waiting for socket frame")
     }
 
     fn read_test_socket_frame_matching<F>(
@@ -9145,6 +9097,46 @@ mod tests {
     }
 
     #[test]
+    fn test_terminal_attach_snapshot_paths_have_no_fixed_sleep_settle_windows() {
+        let source = include_str!("server_comms.rs");
+        for function in [
+            "create_lua_pty_forwarder",
+            "refresh_lua_terminal_snapshot",
+            "spawn_terminal_client_forwarder_runtime",
+        ] {
+            let body = function_body(source, function);
+            assert!(
+                !body.contains("thread::sleep"),
+                "{function} must not use fixed sleep windows on the first-attach snapshot path"
+            );
+            assert!(
+                !body.contains("from_millis(125)"),
+                "{function} must not reintroduce the former 125ms attach delay"
+            );
+        }
+    }
+
+    #[test]
+    fn test_missing_session_io_sender_control_records_observable_metric() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+
+        hub.handle_client_worker_control(
+            crate::worker::hub_control::HubControlMessage::Backpressure(
+                crate::worker::hub_control::WorkerBackpressure {
+                    source: "worker.client.session_io_missing",
+                    capacity: 0,
+                    session_uuid: Some("sess-missing-sender".to_string()),
+                    client_id: Some(ClientId::Tui),
+                },
+            ),
+        );
+
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert_eq!(snapshot.counters["client_worker.backpressure"], 1);
+        assert_eq!(snapshot.counters["client_worker.session_io_missing"], 1);
+    }
+
+    #[test]
     fn test_socket_workerized_live_output_reaches_socket_frame() {
         let (mut hub, _request_tx, _output_rx) = e2e_hub();
         let session_uuid = "sess-socket-worker-output".to_string();
@@ -9625,9 +9617,7 @@ mod tests {
         };
         hub.create_lua_socket_pty_forwarder(req);
 
-        let first = read_test_socket_frame(&mut client_stream);
-        let second = read_test_socket_frame(&mut client_stream);
-        let frames = vec![first, second];
+        let frames = read_test_socket_frames(&mut client_stream, 4, Duration::from_secs(5));
 
         assert!(
             frames.iter().any(|frame| matches!(
