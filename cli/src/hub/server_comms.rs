@@ -20,9 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::hub::actions::{self, HubAction};
-use crate::hub::{
-    registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest, WebRtcPtyOutput,
-};
+use crate::hub::{registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest};
 use crate::notifications::push::send_push_direct;
 use base64::Engine;
 
@@ -353,8 +351,6 @@ impl Hub {
         let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<TransportEgress>(4096);
         let hub_control_event_tx = self.hub_event_tx.clone();
         let hub_event_tx = self.hub_event_tx.clone();
-        let output_tx = self.webrtc.pty_output_tx();
-        let metrics = Arc::clone(&self.hub_event_metrics);
         let peer_id = browser_identity.clone();
 
         tokio::spawn(async move {
@@ -366,95 +362,14 @@ impl Hub {
 
         tokio::spawn(async move {
             while let Some(egress) = outbound_rx.recv().await {
-                match egress {
-                    TransportEgress::TerminalBytes {
-                        subscription_id,
-                        session_uuid,
-                        data,
-                    } => {
-                        match output_tx.try_send(WebRtcPtyOutput {
-                            subscription_id,
-                            browser_identity: peer_id.clone(),
-                            data,
-                            session_uuid,
-                        }) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                log::warn!(
-                                    "[WebRTC] Worker PTY output queue full for {}; forcing reconnect",
-                                    &peer_id[..peer_id.len().min(8)]
-                                );
-                                let _ = hub_event_tx.send(
-                                    super::events::HubEvent::WebRtcIngressBackpressure {
-                                        browser_identity: peer_id.clone(),
-                                        source: "pty_output_queue_full",
-                                    },
-                                );
-                                break;
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
-                        }
-                    }
-                    TransportEgress::Scrollback {
-                        subscription_id,
-                        session_uuid,
-                        data,
-                        ..
-                    } => {
-                        match output_tx.try_send(WebRtcPtyOutput {
-                            subscription_id,
-                            browser_identity: peer_id.clone(),
-                            data,
-                            session_uuid,
-                        }) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                metrics.record_counter("snapshot.queue_full", 1);
-                                let _ = hub_event_tx.send(
-                                    super::events::HubEvent::WebRtcIngressBackpressure {
-                                        browser_identity: peer_id.clone(),
-                                        source: "pty_output_snapshot_queue_full",
-                                    },
-                                );
-                                break;
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
-                        }
-                    }
-                    TransportEgress::ProcessExited {
-                        subscription_id,
-                        session_uuid,
-                        ..
-                    } => {
-                        let _ = hub_event_tx.send(super::events::HubEvent::WebRtcSend(
-                            crate::lua::primitives::WebRtcSendRequest::Json {
-                                peer_id: peer_id.clone(),
-                                data: serde_json::json!({
-                                    "type": "process_exited",
-                                    "subscriptionId": subscription_id,
-                                    "session_uuid": session_uuid,
-                                }),
-                            },
-                        ));
-                    }
-                    TransportEgress::BoundaryJson(value) => {
-                        let _ = hub_event_tx.send(super::events::HubEvent::WebRtcSend(
-                            crate::lua::primitives::WebRtcSendRequest::Json {
-                                peer_id: peer_id.clone(),
-                                data: value,
-                            },
-                        ));
-                    }
-                    TransportEgress::Binary(data) => {
-                        let _ = hub_event_tx.send(super::events::HubEvent::WebRtcSend(
-                            crate::lua::primitives::WebRtcSendRequest::Binary {
-                                peer_id: peer_id.clone(),
-                                data,
-                            },
-                        ));
-                    }
-                    TransportEgress::Close { .. } => break,
-                    _ => {}
+                if hub_event_tx
+                    .send(super::events::HubEvent::WebRtcClientWorkerEgress {
+                        browser_identity: peer_id.clone(),
+                        egress,
+                    })
+                    .is_err()
+                {
+                    break;
                 }
             }
         });
@@ -1110,12 +1025,30 @@ impl Hub {
             HubControlMessage::AttachClient {
                 client_id,
                 session_uuid,
-                ..
+                subscription_id,
             } => {
                 let forwarder_key = match &client_id {
                     ClientId::Tui => format!("tui:{session_uuid}"),
                     ClientId::Socket(client_id) => format!("{client_id}:{session_uuid}"),
-                    ClientId::Browser(_) | ClientId::Internal => return,
+                    ClientId::Browser(browser_identity) => {
+                        let forwarder_key = format!("{browser_identity}:{session_uuid}");
+                        let (rows, cols) = self
+                            .browser_terminal_attach_sizes
+                            .remove(&forwarder_key)
+                            .unwrap_or((24, 80));
+                        let req = crate::lua::CreateForwarderRequest {
+                            peer_id: browser_identity.clone(),
+                            session_uuid: session_uuid.clone(),
+                            prefix: Some(vec![0x01]),
+                            subscription_id,
+                            rows,
+                            cols,
+                            active_flag: Arc::new(std::sync::Mutex::new(true)),
+                        };
+                        self.create_lua_pty_forwarder(req);
+                        return;
+                    }
+                    ClientId::Internal => return,
                 };
                 self.register_terminal_forwarder_peer(
                     &forwarder_key,
@@ -1131,7 +1064,10 @@ impl Hub {
                 let forwarder_key = match client_id {
                     ClientId::Tui => format!("tui:{session_uuid}"),
                     ClientId::Socket(client_id) => format!("{client_id}:{session_uuid}"),
-                    ClientId::Browser(_) | ClientId::Internal => return,
+                    ClientId::Browser(browser_identity) => {
+                        format!("{browser_identity}:{session_uuid}")
+                    }
+                    ClientId::Internal => return,
                 };
                 self.stop_lua_pty_forwarder(&forwarder_key);
             }
@@ -1161,7 +1097,6 @@ impl Hub {
         self.poll_tui_requests();
         self.poll_pty_input();
         self.poll_outgoing_webrtc_signals();
-        self.poll_webrtc_pty_output();
         self.poll_stream_frames_incoming();
         self.poll_worktree_results();
         self.tick_periodic();
@@ -1392,8 +1327,11 @@ impl Hub {
             HubEvent::WebRtcOutgoingSignal(signal) => {
                 self.handle_webrtc_signal(signal);
             }
-            HubEvent::WebRtcPtyOutput(output) => {
-                self.process_single_pty_output(output);
+            HubEvent::WebRtcClientWorkerEgress {
+                browser_identity,
+                egress,
+            } => {
+                self.process_webrtc_client_worker_egress(&browser_identity, egress);
             }
             HubEvent::WebRtcStreamFrame(frame) => {
                 self.handle_stream_frame(frame);
@@ -1551,6 +1489,9 @@ impl Hub {
                 ) {
                     // Spawn per-peer send task so DataChannel sends run off the event loop.
                     self.spawn_webrtc_peer_sender(&browser_identity);
+                    let worker = self.spawn_webrtc_client_worker_adapter(browser_identity.clone());
+                    self.browser_client_workers
+                        .insert(browser_identity.clone(), worker);
 
                     self.spawn_dc_ping_task(&browser_identity);
                     if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
@@ -2520,6 +2461,12 @@ impl Hub {
                 for key in worker_keys {
                     self.remove_terminal_client_worker(&key, &session_uuid, "Session");
                 }
+                for worker in self.browser_client_workers.values() {
+                    Self::unregister_worker_session_io_sender(worker, &session_uuid, "Session");
+                }
+                let suffix = format!(":{session_uuid}");
+                self.browser_terminal_attach_sizes
+                    .retain(|key, _| !key.ends_with(&suffix));
                 if let Ok(mut active) = self.active_terminal_peers.lock() {
                     active.remove(&session_uuid);
                 }
@@ -2675,8 +2622,7 @@ impl Hub {
         );
         self.lua.notify_pty_input(&input.session_uuid);
 
-        let forwarder_key = format!("{}:{}", input.browser_identity, input.session_uuid);
-        if let Some(worker) = self.terminal_client_workers.get(&forwarder_key) {
+        if let Some(worker) = self.browser_client_workers.get(&input.browser_identity) {
             let message = crate::worker::transport::ingress_to_client_message(
                 crate::worker::transport::TransportIngress::TerminalInput {
                     session_uuid: input.session_uuid,
@@ -2684,10 +2630,16 @@ impl Hub {
                 },
             );
             if let Err(e) = worker.try_send(message) {
-                log::warn!("[WebRTC] Worker input queue rejected {forwarder_key}: {e}");
+                log::warn!(
+                    "[WebRTC] Browser worker input queue rejected for {}: {e}",
+                    &input.browser_identity[..input.browser_identity.len().min(8)]
+                );
             }
         } else {
-            log::warn!("[WebRTC] No workerized terminal subscription for {forwarder_key}");
+            log::warn!(
+                "[WebRTC] No browser worker for {}",
+                &input.browser_identity[..input.browser_identity.len().min(8)]
+            );
         }
     }
 
@@ -2884,17 +2836,31 @@ impl Hub {
         match pending.target {
             super::PendingSessionIoSnapshotTarget::WebRtcOutput {
                 peer_id,
-                subscription_id,
+                rows,
+                cols,
+                kitty_enabled,
                 forwarder_key,
                 active_flag,
             } => {
-                let output_tx = self.webrtc.pty_output_tx();
-                match output_tx.try_send(WebRtcPtyOutput {
-                    subscription_id,
-                    browser_identity: peer_id.clone(),
-                    data: payload,
-                    session_uuid,
-                }) {
+                let Some(worker) = self.browser_client_workers.get(&peer_id) else {
+                    self.hub_event_metrics
+                        .record_counter("snapshot.worker_missing", 1);
+                    log::warn!(
+                        "[WebRTC] Dropping prepared snapshot for missing browser worker {}",
+                        &peer_id[..peer_id.len().min(8)]
+                    );
+                    return;
+                };
+                let message = crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    crate::worker::client::ClientControlFrame::Scrollback {
+                        session_uuid,
+                        rows,
+                        cols,
+                        kitty_enabled,
+                        data: payload,
+                    },
+                );
+                match worker.try_send(message) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         self.hub_event_metrics
@@ -2910,7 +2876,7 @@ impl Hub {
                         let _ = self.hub_event_tx.send(
                             super::events::HubEvent::WebRtcIngressBackpressure {
                                 browser_identity: peer_id,
-                                source: "pty_output_snapshot_queue_full",
+                                source: "worker_snapshot_queue_full",
                             },
                         );
                     }
@@ -3198,41 +3164,6 @@ impl Hub {
         }
     }
 
-    /// Drain and process WebRTC PTY output in a batch.
-    ///
-    /// Called from the event loop when the `select!` branch fires. The first
-    /// message is passed explicitly because `recv().await` already consumed it
-    /// from the channel. It is processed directly before draining the remaining
-    /// buffered messages to preserve FIFO ordering — re-injecting via `send()`
-    /// would place it at the back of the queue, reordering the byte stream.
-    #[cfg(test)]
-    pub fn handle_webrtc_pty_output_batch(
-        &mut self,
-        first: WebRtcPtyOutput,
-        rx: &mut Option<tokio::sync::mpsc::Receiver<WebRtcPtyOutput>>,
-    ) {
-        let started = Instant::now();
-        let queued = rx.as_ref().map_or(0, tokio::sync::mpsc::Receiver::len);
-        let first_len = first.data.len();
-        self.hub_event_metrics
-            .record_high_water("pty_output.batch_hwm", (queued + 1) as u64);
-        // Process the first message directly to preserve ordering.
-        self.process_single_pty_output(first);
-
-        // Temporarily put the receiver back into self for poll_webrtc_pty_output
-        self.webrtc.return_pty_output_receiver_for_test(rx.take());
-        self.poll_webrtc_pty_output();
-        // Extract it back out
-        *rx = self.webrtc.lease_pty_output_receiver_for_test();
-        self.hub_event_metrics.record_span_with_threshold(
-            "pty_output.drain_batch",
-            started.elapsed(),
-            first_len,
-            Self::HOT_SUBHANDLER_SLOW,
-            "select",
-        );
-    }
-
     /// Poll user file watches created by `watch.directory()` in Lua.
     ///
     /// Production uses `HubEvent::UserFileWatch` from blocking forwarder tasks.
@@ -3440,6 +3371,9 @@ impl Hub {
             );
             // Spawn per-peer send task (same as production DcOpened handler)
             self.spawn_webrtc_peer_sender(&browser_identity);
+            let worker = self.spawn_webrtc_client_worker_adapter(browser_identity.clone());
+            self.browser_client_workers
+                .insert(browser_identity.clone(), worker);
             if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
                 log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
             }
@@ -3565,11 +3499,10 @@ impl Hub {
         };
         self.hub_event_metrics.record_counter(reason_counter, 1);
         self.cleanup_pending_session_io_snapshots_for_peer(browser_identity);
-        // Guard against duplicate cleanup calls (e.g. handle_webrtc_send and
-        // poll_webrtc_pty_output both detecting the same dead channel in the
-        // same tick). If the channel is already gone this is a no-op — we must
-        // not fire peer_disconnected a second time or the browser JS state
-        // machine will enter an unrecoverable state and stop reconnecting.
+        // Guard against duplicate cleanup calls. If the channel is already gone
+        // this is a no-op — we must not fire peer_disconnected a second time or
+        // the browser JS state machine will enter an unrecoverable state and
+        // stop reconnecting.
         let disconnect_reason = match reason {
             "timeout" => crate::worker::hub_control::TransportDisconnectReason::ConnectionTimeout,
             "send_failed" => crate::worker::hub_control::TransportDisconnectReason::SendTimeout,
@@ -3627,6 +3560,13 @@ impl Hub {
         // Abort any PTY forwarders for this browser.
         // Forwarder keys are "{peer_id}:{session_uuid}" where peer_id = browser_identity
         let peer_prefix = format!("{browser_identity}:");
+        if let Some(worker) = self.browser_client_workers.remove(browser_identity) {
+            let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::Shutdown {
+                reason: reason.to_string(),
+            });
+        }
+        self.browser_terminal_attach_sizes
+            .retain(|key, _| !key.starts_with(&peer_prefix));
         self.pty_forwarders.retain(|key, task| {
             if key.starts_with(&peer_prefix) {
                 task.abort();
@@ -3698,20 +3638,6 @@ impl Hub {
                 );
                 return;
             }
-            crate::worker::webrtc::WebRtcIngressOutcome::PongQueued => {
-                self.record_hot_span(
-                    "webrtc_message.parse_json",
-                    parse_started,
-                    payload.len(),
-                    browser_identity,
-                );
-                self.record_hot_span(
-                    "webrtc_message.dc_ping",
-                    Instant::now(),
-                    payload.len(),
-                    browser_identity,
-                );
-            }
             crate::worker::webrtc::WebRtcIngressOutcome::PongObserved => {
                 self.record_hot_span(
                     "webrtc_message.parse_json",
@@ -3768,7 +3694,7 @@ impl Hub {
                     payload.len(),
                     browser_identity,
                 );
-                match other {
+                match &other {
                     crate::worker::client::ClientWorkerMessage::ControlFrame(
                         crate::worker::client::ClientControlFrame::FocusChanged {
                             session_uuid,
@@ -3777,9 +3703,9 @@ impl Hub {
                     ) => {
                         let started = Instant::now();
                         if !session_uuid.is_empty() {
-                            self.set_active_terminal_peer(&session_uuid, browser_identity, focused);
+                            self.set_active_terminal_peer(session_uuid, browser_identity, *focused);
                             self.lua
-                                .set_pty_focused(&session_uuid, browser_identity, focused);
+                                .set_pty_focused(session_uuid, browser_identity, *focused);
                         }
                         self.record_hot_span(
                             "webrtc_message.focus_changed",
@@ -3788,13 +3714,53 @@ impl Hub {
                             browser_identity,
                         );
                     }
-                    other => {
-                        log::debug!(
-                            "[WebRTC-MSG] Adapter converted inbound message for {} into non-JSON client message: {:?}",
+                    crate::worker::client::ClientWorkerMessage::SubscribeSession {
+                        session_uuid,
+                        subscription_id,
+                    } => {
+                        let value = serde_json::from_slice::<serde_json::Value>(payload).ok();
+                        let rows = value
+                            .as_ref()
+                            .and_then(|v| v.pointer("/params/rows"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(24)
+                            .clamp(1, u16::MAX as u64) as u16;
+                        let cols = value
+                            .as_ref()
+                            .and_then(|v| v.pointer("/params/cols"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(80)
+                            .clamp(1, u16::MAX as u64) as u16;
+                        self.browser_terminal_attach_sizes
+                            .insert(format!("{browser_identity}:{session_uuid}"), (rows, cols));
+                        let ack = crate::worker::client::ClientWorkerMessage::ControlFrame(
+                            crate::worker::client::ClientControlFrame::BoundaryJson(
+                                serde_json::json!({
+                                    "type": "subscribed",
+                                    "subscriptionId": subscription_id,
+                                }),
+                            ),
+                        );
+                        if let Some(worker) = self.browser_client_workers.get(browser_identity) {
+                            let _ = worker.try_send(ack);
+                        }
+                    }
+                    _ => {}
+                }
+
+                if let Some(worker) = self.browser_client_workers.get(browser_identity) {
+                    if let Err(e) = worker.try_send(other) {
+                        log::warn!(
+                            "[WebRTC-MSG] Browser worker queue rejected inbound message for {}: {}",
                             &browser_identity[..browser_identity.len().min(8)],
-                            other
+                            e
                         );
                     }
+                } else {
+                    log::warn!(
+                        "[WebRTC-MSG] No browser worker for {}; dropping client-worker message",
+                        &browser_identity[..browser_identity.len().min(8)]
+                    );
                 }
             }
         }
@@ -4428,7 +4394,6 @@ impl Hub {
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
             self.unregister_terminal_forwarder_peer(&forwarder_key, false);
-            self.remove_terminal_client_worker(&forwarder_key, &req.session_uuid, "WebRTC");
             log::debug!("[Lua] Aborted existing PTY forwarder for {}", forwarder_key);
         }
 
@@ -4460,7 +4425,9 @@ impl Hub {
                     started_at: Instant::now(),
                     target: super::PendingSessionIoSnapshotTarget::WebRtcOutput {
                         peer_id: peer_id.clone(),
-                        subscription_id: subscription_id.clone(),
+                        rows: target_rows,
+                        cols: target_cols,
+                        kitty_enabled: pty_handle.kitty_enabled(),
                         forwarder_key: Some(forwarder_key.clone()),
                         active_flag: Some(active_flag.clone()),
                     },
@@ -4474,15 +4441,19 @@ impl Hub {
         };
 
         let _guard = self.tokio_runtime.enter();
-        let worker = self.spawn_webrtc_client_worker_adapter(peer_id.clone());
+        let Some(worker) = self.browser_client_workers.get(&peer_id).cloned() else {
+            log::warn!(
+                "[WebRTC] Cannot attach terminal for peer {} without browser worker",
+                &peer_id[..peer_id.len().min(8)]
+            );
+            return false;
+        };
         Self::register_worker_session_io_sender(
             &worker,
             &req.session_uuid,
             pty_handle.clone(),
             "WebRTC",
         );
-        self.terminal_client_workers
-            .insert(forwarder_key.clone(), worker.clone());
         let task = tokio::spawn(async move {
             use crate::agent::pty::PtyEvent;
             use crate::worker::client::{ClientControlFrame, ClientWorkerMessage};
@@ -4492,12 +4463,6 @@ impl Hub {
                 &peer_id[..peer_id.len().min(8)],
                 session_uuid
             );
-            let _ = worker
-                .send(ClientWorkerMessage::SubscribeSession {
-                    session_uuid: session_uuid.clone(),
-                    subscription_id: subscription_id.clone(),
-                })
-                .await;
             let mut query_filter_buffer = Vec::new();
             let mut dumped_live_chunks = 0usize;
 
@@ -4709,7 +4674,6 @@ impl Hub {
         let pty_for_prepare = pty_handle.clone();
         let hub_event_tx = self.hub_event_tx.clone();
         let peer_id = req.peer_id.clone();
-        let subscription_id = req.subscription_id.clone();
         let session_uuid = req.session_uuid.clone();
         let target_rows = req.rows;
         let target_cols = req.cols;
@@ -4723,7 +4687,9 @@ impl Hub {
                     started_at: Instant::now(),
                     target: super::PendingSessionIoSnapshotTarget::WebRtcOutput {
                         peer_id,
-                        subscription_id,
+                        rows: target_rows,
+                        cols: target_cols,
+                        kitty_enabled: pty_handle.kitty_enabled(),
                         forwarder_key: None,
                         active_flag: None,
                     },
@@ -5773,7 +5739,15 @@ impl Hub {
                 .rsplit_once(':')
                 .map_or(forwarder_id, |(_, session_uuid)| session_uuid)
                 .to_string();
-            self.remove_terminal_client_worker(forwarder_id, &session_uuid, "Lua");
+            if let Some((browser_identity, _)) = forwarder_id.rsplit_once(':') {
+                if let Some(worker) = self.browser_client_workers.get(browser_identity) {
+                    Self::unregister_worker_session_io_sender(worker, &session_uuid, "WebRTC");
+                } else {
+                    self.remove_terminal_client_worker(forwarder_id, &session_uuid, "Lua");
+                }
+            } else {
+                self.remove_terminal_client_worker(forwarder_id, &session_uuid, "Lua");
+            }
             log::debug!("[Lua] Stopped PTY forwarder {}", forwarder_id);
         }
     }
@@ -5793,11 +5767,7 @@ impl Hub {
         let inputs: Vec<_> = std::iter::from_fn(|| rx_ref.try_recv().ok()).collect();
         self.webrtc.return_pty_input_receiver_for_test(rx);
         for input in inputs {
-            if let Some(session_handle) = self.handle_cache.get_session(&input.session_uuid) {
-                if let Err(e) = session_handle.pty().write_input_direct(&input.data) {
-                    log::error!("[PTY-INPUT] Write failed: {e}");
-                }
-            }
+            self.handle_pty_input(input);
         }
     }
 
@@ -5867,26 +5837,99 @@ impl Hub {
         }
     }
 
-    /// Queue raw PTY bytes for async delivery to a WebRTC peer.
-    ///
-    /// Non-blocking: pushes a [`WebRtcSendItem::Pty`] into the per-peer send
-    /// channel. The actual compress → encrypt → DataChannel send happens in
-    /// the spawned per-peer task.
-    ///
-    /// Returns `false` if the peer has no send task (not connected) or the
-    /// send task has marked the peer as dead (circuit breaker).
-    fn queue_webrtc_pty_frame(
-        &self,
-        subscription_id: &str,
+    fn process_webrtc_client_worker_egress(
+        &mut self,
         browser_identity: &str,
+        egress: crate::worker::transport::TransportEgress,
+    ) {
+        use crate::worker::transport::TransportEgress;
+
+        let egress = match egress {
+            TransportEgress::TerminalBytes {
+                subscription_id,
+                session_uuid,
+                data,
+            } => {
+                let Some(data) =
+                    self.apply_webrtc_pty_output_hooks(browser_identity, &session_uuid, data)
+                else {
+                    return;
+                };
+                TransportEgress::TerminalBytes {
+                    subscription_id,
+                    session_uuid,
+                    data,
+                }
+            }
+            TransportEgress::Scrollback {
+                subscription_id,
+                session_uuid,
+                rows,
+                cols,
+                kitty_enabled,
+                data,
+            } => {
+                let Some(data) =
+                    self.apply_webrtc_pty_output_hooks(browser_identity, &session_uuid, data)
+                else {
+                    return;
+                };
+                TransportEgress::Scrollback {
+                    subscription_id,
+                    session_uuid,
+                    rows,
+                    cols,
+                    kitty_enabled,
+                    data,
+                }
+            }
+            other => other,
+        };
+
+        let Some(command) =
+            crate::worker::webrtc::WebRtcTransportAdapter::egress_to_command(egress)
+        else {
+            return;
+        };
+        self.queue_webrtc_peer_command(browser_identity, command);
+    }
+
+    fn apply_webrtc_pty_output_hooks(
+        &mut self,
+        browser_identity: &str,
+        session_uuid: &str,
         data: Vec<u8>,
-    ) -> crate::worker::webrtc::WebRtcSendOutcome {
-        self.webrtc.queue_pty_frame(
-            subscription_id,
-            browser_identity,
-            data,
-            &self.hub_event_metrics,
-        )
+    ) -> Option<Vec<u8>> {
+        use crate::lua::primitives::PtyOutputContext;
+
+        self.hub_event_metrics
+            .record_counter("pty_output.messages", 1);
+        self.hub_event_metrics
+            .record_counter("pty_output.bytes", data.len() as u64);
+
+        let ctx = PtyOutputContext {
+            session_uuid: session_uuid.to_string(),
+            peer_id: browser_identity.to_string(),
+        };
+
+        let final_data = if self.lua.has_interceptors("pty_output") {
+            match self.lua.call_pty_output_interceptors(&ctx, &data) {
+                Ok(Some(transformed)) => transformed,
+                Ok(None) => return None,
+                Err(e) => {
+                    log::warn!("PTY interceptor error: {}", e);
+                    data
+                }
+            }
+        } else {
+            data
+        };
+
+        if self.lua.has_observers("pty_output") {
+            self.lua.notify_pty_output_observers(&ctx, &final_data);
+        }
+
+        Some(final_data)
     }
 
     /// Queue a send item for a peer via the per-peer send channel.
@@ -5924,181 +5967,6 @@ impl Hub {
     fn spawn_dc_ping_task(&mut self, browser_identity: &str) {
         self.webrtc
             .spawn_liveness_probe(browser_identity, &self.tokio_runtime);
-    }
-
-    /// Process a single PTY output message: run interceptors, send via WebRTC,
-    /// and notify observers inline.
-    fn process_single_pty_output(&mut self, msg: WebRtcPtyOutput) {
-        use crate::lua::primitives::PtyOutputContext;
-
-        #[cfg(test)]
-        {
-            self.pty_output_messages_drained += 1;
-        }
-        self.hub_event_metrics
-            .record_counter("pty_output.messages", 1);
-        self.hub_event_metrics
-            .record_counter("pty_output.bytes", msg.data.len() as u64);
-
-        let ctx = PtyOutputContext {
-            session_uuid: msg.session_uuid.clone(),
-            peer_id: msg.browser_identity.clone(),
-        };
-
-        let final_data = if self.lua.has_interceptors("pty_output") {
-            match self.lua.call_pty_output_interceptors(&ctx, &msg.data) {
-                Ok(Some(transformed)) => transformed,
-                Ok(None) => return,
-                Err(e) => {
-                    log::warn!("PTY interceptor error: {}", e);
-                    msg.data
-                }
-            }
-        } else {
-            msg.data
-        };
-
-        match self.queue_webrtc_pty_frame(
-            &msg.subscription_id,
-            &msg.browser_identity,
-            final_data.clone(),
-        ) {
-            crate::worker::webrtc::WebRtcSendOutcome::Sent => {}
-            crate::worker::webrtc::WebRtcSendOutcome::Backpressure => {
-                let key = format!("{}:{}", msg.browser_identity, msg.session_uuid);
-                self.webrtc.record_backpressure_recovery(
-                    key,
-                    crate::worker::webrtc::BackpressureRecoveryEntry {
-                        browser_identity: msg.browser_identity.clone(),
-                        session_uuid: msg.session_uuid.clone(),
-                        subscription_id: msg.subscription_id.clone(),
-                        last_drop: Instant::now(),
-                    },
-                );
-            }
-            crate::worker::webrtc::WebRtcSendOutcome::Dead => {
-                log::warn!(
-                    "[WebRTC] DataChannel not open for {}, cleaning up dead channel",
-                    &msg.browser_identity[..msg.browser_identity.len().min(8)]
-                );
-                // Immediate cleanup instead of waiting for CleanupTick.
-                self.cleanup_webrtc_peer(&msg.browser_identity, "send_failed");
-                return;
-            }
-        }
-
-        if self.lua.has_observers("pty_output") {
-            self.lua.notify_pty_output_observers(&ctx, &final_data);
-        }
-    }
-
-    /// Uses a circuit breaker: if a send fails because the DataChannel is not
-    /// open, all remaining messages for that peer are skipped (prevents the
-    /// tick loop from being starved by hundreds of failed `block_on` calls).
-    #[cfg(test)]
-    fn poll_webrtc_pty_output(&mut self) {
-        use crate::lua::primitives::PtyOutputContext;
-
-        /// Max messages to process per tick to keep the event loop responsive.
-        const DRAIN_BUDGET: usize = 256;
-
-        // Drain pending PTY output messages (budget-limited)
-        let mut rx = self.webrtc.lease_pty_output_receiver_for_test();
-        let Some(ref mut rx_ref) = rx else {
-            return;
-        };
-        let messages: Vec<WebRtcPtyOutput> = std::iter::from_fn(|| rx_ref.try_recv().ok())
-            .take(DRAIN_BUDGET)
-            .collect();
-        self.webrtc.return_pty_output_receiver_for_test(rx);
-        let drained_len = messages.len();
-        let drained_bytes: usize = messages.iter().map(|msg| msg.data.len()).sum();
-        self.hub_event_metrics
-            .record_counter("pty_output.messages", drained_len as u64);
-        self.hub_event_metrics
-            .record_counter("pty_output.bytes", drained_bytes as u64);
-        self.hub_event_metrics
-            .record_high_water("pty_output.batch_hwm", drained_len as u64);
-
-        // Track how many messages were drained for regression testing.
-        #[cfg(test)]
-        {
-            self.pty_output_messages_drained += messages.len();
-        }
-
-        let has_interceptors = self.lua.has_interceptors("pty_output");
-        let has_observers = self.lua.has_observers("pty_output");
-
-        // Circuit breaker: peers whose DataChannel is dead (skip further sends)
-        let mut dead_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for msg in messages {
-            // Skip peers with dead DataChannels
-            if dead_peers.contains(&msg.browser_identity) {
-                continue;
-            }
-
-            let ctx = PtyOutputContext {
-                session_uuid: msg.session_uuid.clone(),
-                peer_id: msg.browser_identity.clone(),
-            };
-
-            // Interceptors: sync, opt-in blocking, can transform or drop
-            let final_data = if has_interceptors {
-                match self.lua.call_pty_output_interceptors(&ctx, &msg.data) {
-                    Ok(Some(transformed)) => transformed,
-                    Ok(None) => continue, // Dropped by interceptor
-                    Err(e) => {
-                        log::warn!("PTY interceptor error: {}", e);
-                        msg.data // Fallback to original on error
-                    }
-                }
-            } else {
-                msg.data
-            };
-
-            // Fast path: send to browser immediately
-            match self.queue_webrtc_pty_frame(
-                &msg.subscription_id,
-                &msg.browser_identity,
-                final_data.clone(),
-            ) {
-                crate::worker::webrtc::WebRtcSendOutcome::Sent => {}
-                crate::worker::webrtc::WebRtcSendOutcome::Backpressure => {
-                    let key = format!("{}:{}", msg.browser_identity, msg.session_uuid);
-                    self.webrtc.record_backpressure_recovery(
-                        key,
-                        crate::worker::webrtc::BackpressureRecoveryEntry {
-                            browser_identity: msg.browser_identity.clone(),
-                            session_uuid: msg.session_uuid.clone(),
-                            subscription_id: msg.subscription_id.clone(),
-                            last_drop: Instant::now(),
-                        },
-                    );
-                }
-                crate::worker::webrtc::WebRtcSendOutcome::Dead => {
-                    log::warn!(
-                        "[WebRTC] DataChannel not open for {}, skipping remaining PTY output this tick",
-                        &msg.browser_identity[..msg.browser_identity.len().min(8)]
-                    );
-                    dead_peers.insert(msg.browser_identity.clone());
-                    continue;
-                }
-            }
-
-            // Observers: fire inline — the idle detection hook is cheap
-            // (hash lookup + timer reset). No reason to defer.
-            if has_observers {
-                self.lua.notify_pty_output_observers(&ctx, &final_data);
-            }
-        }
-
-        // Immediately clean up dead peers instead of waiting for the 5-second
-        // CleanupTick. This prevents fd exhaustion from accumulating stale
-        // WebRTC channels that are already known to be dead.
-        for dead_id in &dead_peers {
-            self.cleanup_webrtc_peer(dead_id, "send_failed");
-        }
     }
 
     // === TUI via Lua (Hub-side Processing) ===
@@ -7800,6 +7668,12 @@ mod tests {
             "terminal_empty_snapshot",
         );
         req.rows = 23;
+        let _command_rx = install_test_browser_worker(
+            &mut hub,
+            "browser-empty-snapshot",
+            session_uuid,
+            "terminal_empty_snapshot",
+        );
 
         assert!(hub.try_attach_terminal_forwarder(&req));
         assert_eq!(hub.pending_session_io_snapshots.len(), 1);
@@ -7841,7 +7715,9 @@ mod tests {
                 started_at: Instant::now(),
                 target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput {
                     peer_id: "browser-cleanup".to_string(),
-                    subscription_id: "sub-cleanup".to_string(),
+                    rows: 24,
+                    cols: 80,
+                    kitty_enabled: false,
                     forwarder_key: Some(
                         "browser-cleanup:sess-snapshot-enqueue-cleanup".to_string()
                     ),
@@ -7871,9 +7747,11 @@ mod tests {
     }
 
     #[test]
-    fn test_prepared_snapshot_routes_to_webrtc_output_with_metrics() {
+    fn test_prepared_snapshot_routes_through_browser_worker_with_metrics() {
         let (mut hub, _request_tx, _output_rx) = e2e_hub();
         let request_id = "snapshot-output-test".to_string();
+        let mut command_rx =
+            install_test_browser_worker(&mut hub, "browser-output", "sess-output", "sub-output");
         hub.insert_pending_session_io_snapshot(
             request_id.clone(),
             crate::hub::PendingSessionIoSnapshot {
@@ -7881,7 +7759,9 @@ mod tests {
                 started_at: Instant::now(),
                 target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput {
                     peer_id: "browser-output".to_string(),
-                    subscription_id: "sub-output".to_string(),
+                    rows: 24,
+                    cols: 80,
+                    kitty_enabled: false,
                     forwarder_key: None,
                     active_flag: None,
                 },
@@ -7897,17 +7777,9 @@ mod tests {
                 recovery: false,
             },
         );
-
-        let mut rx = hub
-            .webrtc
-            .lease_pty_output_receiver_for_test()
-            .expect("pty output rx");
-        let output = rx.try_recv().expect("prepared snapshot output");
-        hub.webrtc.return_pty_output_receiver_for_test(Some(rx));
-        assert_eq!(output.subscription_id, "sub-output");
-        assert_eq!(output.browser_identity, "browser-output");
-        assert_eq!(output.session_uuid, "sess-output");
-        assert!(output.data.starts_with(&[0x1f, 0x8b]));
+        let (subscription_id, data) = recv_next_webrtc_pty_command(&mut hub, &mut command_rx, 0x1f);
+        assert_eq!(subscription_id, "sub-output");
+        assert!(data.starts_with(&[0x1f, 0x8b]));
 
         let snapshot = hub.hub_event_metrics.snapshot();
         assert!(snapshot.spans.contains_key("snapshot.gzip_queue"));
@@ -7924,7 +7796,9 @@ mod tests {
                 started_at: Instant::now(),
                 target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput {
                     peer_id: "browser-a".to_string(),
-                    subscription_id: "sub-a".to_string(),
+                    rows: 24,
+                    cols: 80,
+                    kitty_enabled: false,
                     forwarder_key: Some("browser-a:sess-a".to_string()),
                     active_flag: None,
                 },
@@ -7937,7 +7811,9 @@ mod tests {
                 started_at: Instant::now(),
                 target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput {
                     peer_id: "browser-b".to_string(),
-                    subscription_id: "sub-b".to_string(),
+                    rows: 24,
+                    cols: 80,
+                    kitty_enabled: false,
                     forwarder_key: Some("browser-b:sess-b".to_string()),
                     active_flag: None,
                 },
@@ -7979,7 +7855,9 @@ mod tests {
                     - Duration::from_secs(1),
                 target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput {
                     peer_id: "browser-stale".to_string(),
-                    subscription_id: "sub-stale".to_string(),
+                    rows: 24,
+                    cols: 80,
+                    kitty_enabled: false,
                     forwarder_key: None,
                     active_flag: None,
                 },
@@ -8157,6 +8035,8 @@ mod tests {
         let session = test_session_handle(session_uuid);
         let event_tx = session.pty().event_tx_clone();
         hub.handle_cache.add_session(session);
+        let mut command_rx =
+            install_test_browser_worker(&mut hub, "browser-a", session_uuid, "terminal_sub");
 
         assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
             "browser-a",
@@ -8175,8 +8055,9 @@ mod tests {
             b"before\x1b]11;?\x07after".to_vec(),
         ));
 
-        let output = recv_next_live_webrtc_output(&mut hub);
-        assert_eq!(output.data, b"\x01beforeafter");
+        let (_subscription_id, data) =
+            recv_next_webrtc_pty_command(&mut hub, &mut command_rx, 0x01);
+        assert_eq!(data, b"\x01beforeafter");
     }
 
     #[test]
@@ -8186,6 +8067,8 @@ mod tests {
         let session = test_session_handle(session_uuid);
         let event_tx = session.pty().event_tx_clone();
         hub.handle_cache.add_session(session);
+        let mut command_rx =
+            install_test_browser_worker(&mut hub, "browser-a", session_uuid, "terminal_sub");
 
         assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
             "browser-a",
@@ -8202,8 +8085,56 @@ mod tests {
             b"\x1b]11;?\x07after".to_vec(),
         ));
 
-        let output = recv_next_live_webrtc_output(&mut hub);
-        assert_eq!(output.data, b"\x01\x1b]11;?\x07after");
+        let (_subscription_id, data) =
+            recv_next_webrtc_pty_command(&mut hub, &mut command_rx, 0x01);
+        assert_eq!(data, b"\x01\x1b]11;?\x07after");
+    }
+
+    #[test]
+    fn test_webrtc_worker_live_output_runs_per_browser_pty_hooks() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-webrtc-live-hooks";
+        let session = test_session_handle(session_uuid);
+        let event_tx = session.pty().event_tx_clone();
+        hub.handle_cache.add_session(session);
+        let mut command_rx =
+            install_test_browser_worker(&mut hub, "browser-hooks", session_uuid, "terminal_hooks");
+
+        hub.lua
+            .lua()
+            .load(
+                r#"
+                _test_webrtc_pty_hook_peer = nil
+                hooks.intercept("pty_output", "test.webrtc_worker_live", function(ctx, data)
+                    _test_webrtc_pty_hook_peer = ctx.peer_id
+                    return data .. "-hooked"
+                end)
+                "#,
+            )
+            .exec()
+            .expect("register test pty_output interceptor");
+
+        assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
+            "browser-hooks",
+            session_uuid,
+            "terminal_hooks"
+        )));
+        hub.tokio_runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(b"live".to_vec()));
+
+        let (_subscription_id, data) =
+            recv_next_webrtc_pty_command(&mut hub, &mut command_rx, 0x01);
+        assert_eq!(data, b"\x01live-hooked");
+        let observed_peer: String = hub
+            .lua
+            .lua()
+            .load("return _test_webrtc_pty_hook_peer")
+            .eval()
+            .expect("read pty hook peer");
+        assert_eq!(observed_peer, "browser-hooks");
     }
 
     #[test]
@@ -8414,6 +8345,95 @@ mod tests {
         }
     }
 
+    fn install_test_browser_worker(
+        hub: &mut Hub,
+        peer_id: &str,
+        session_uuid: &str,
+        subscription_id: &str,
+    ) -> tokio::sync::mpsc::Receiver<crate::worker::webrtc::WebRtcAdapterCommand> {
+        let command_rx = hub
+            .webrtc
+            .install_test_recovery_sender(peer_id, &hub.tokio_runtime);
+        let (hub_control_tx, _hub_control_rx) =
+            tokio::sync::mpsc::channel(crate::worker::hub_control::HUB_CONTROL_QUEUE.capacity);
+        let (outbound_tx, mut outbound_rx) =
+            tokio::sync::mpsc::channel::<crate::worker::transport::TransportEgress>(4096);
+        let hub_event_tx = hub.hub_event_tx.clone();
+        let browser_identity = peer_id.to_string();
+        let _guard = hub.tokio_runtime.enter();
+        tokio::spawn(async move {
+            while let Some(egress) = outbound_rx.recv().await {
+                if hub_event_tx
+                    .send(crate::hub::events::HubEvent::WebRtcClientWorkerEgress {
+                        browser_identity: browser_identity.clone(),
+                        egress,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut config = crate::worker::client::ClientWorkerConfig::new(
+            crate::client::ClientId::browser(peer_id.to_string()),
+            hub_control_tx,
+            outbound_tx,
+            std::collections::HashMap::new(),
+        );
+        config.outbound =
+            crate::worker::BoundedQueueConfig::new("worker.client.webrtc.test.outbound", 4096);
+        let worker = crate::worker::client::ClientWorker::start(config);
+        let _ = worker.try_send(
+            crate::worker::client::ClientWorkerMessage::SubscribeSession {
+                session_uuid: session_uuid.to_string(),
+                subscription_id: subscription_id.to_string(),
+            },
+        );
+        hub.browser_client_workers
+            .insert(peer_id.to_string(), worker);
+        command_rx
+    }
+
+    fn install_test_browser_worker_unsubscribed(
+        hub: &mut Hub,
+        peer_id: &str,
+    ) -> tokio::sync::mpsc::Receiver<crate::worker::webrtc::WebRtcAdapterCommand> {
+        let command_rx = hub
+            .webrtc
+            .install_test_recovery_sender(peer_id, &hub.tokio_runtime);
+        let _guard = hub.tokio_runtime.enter();
+        let worker = hub.spawn_webrtc_client_worker_adapter(peer_id.to_string());
+        hub.browser_client_workers
+            .insert(peer_id.to_string(), worker);
+        command_rx
+    }
+
+    fn recv_next_webrtc_pty_command(
+        hub: &mut Hub,
+        rx: &mut tokio::sync::mpsc::Receiver<crate::worker::webrtc::WebRtcAdapterCommand>,
+        prefix: u8,
+    ) -> (String, Vec<u8>) {
+        for _ in 0..20 {
+            hub.tokio_runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            });
+            hub.poll_hub_events();
+            while let Ok(command) = rx.try_recv() {
+                if let crate::worker::webrtc::WebRtcAdapterCommand::Pty {
+                    subscription_id,
+                    data,
+                } = command
+                {
+                    if data.first() == Some(&prefix) {
+                        return (subscription_id, data);
+                    }
+                }
+            }
+        }
+
+        panic!("expected WebRTC PTY command with prefix {prefix:#x}");
+    }
+
     /// Drains all pending `TuiOutput::Message` JSON values from the output
     /// channel, ignoring non-Message variants.
     fn drain_messages(
@@ -8426,32 +8446,6 @@ mod tests {
             }
         }
         messages
-    }
-
-    fn recv_next_live_webrtc_output(hub: &mut Hub) -> super::WebRtcPtyOutput {
-        recv_next_webrtc_output_with_prefix(hub, 0x01)
-    }
-
-    fn recv_next_webrtc_output_with_prefix(hub: &mut Hub, prefix: u8) -> super::WebRtcPtyOutput {
-        for _ in 0..20 {
-            hub.tokio_runtime.block_on(async {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            });
-
-            let mut rx = hub.webrtc.lease_pty_output_receiver_for_test();
-            let Some(ref mut rx_ref) = rx else {
-                panic!("webrtc output rx");
-            };
-            while let Ok(output) = rx_ref.try_recv() {
-                if output.data.first() == Some(&prefix) {
-                    hub.webrtc.return_pty_output_receiver_for_test(rx);
-                    return output;
-                }
-            }
-            hub.webrtc.return_pty_output_receiver_for_test(rx);
-        }
-
-        panic!("expected webrtc PTY output with prefix {prefix:#x}");
     }
 
     /// TUI subscribe triggers state broadcasts through real Lua handlers.
@@ -8594,116 +8588,6 @@ mod tests {
         // by real Lua handlers via json_to_lua()
     }
 
-    /// Regression test: `select!` consumes the first message via `recv().await`.
-    ///
-    /// Before the fix, `handle_webrtc_pty_output_batch` did not accept the
-    /// first message — the `select!` arm used `Some(_)` which silently
-    /// discarded it. Since `poll_webrtc_pty_output` then calls `try_recv()`
-    /// to drain remaining messages, single-message arrivals (typical for
-    /// interactive terminal output) were ALL dropped.
-    ///
-    /// This test simulates the exact `select!` sequence:
-    /// 1. Send one message (PTY forwarder)
-    /// 2. `recv()` consumes it (select! wake-up)
-    /// 3. Pass consumed message to `handle_webrtc_pty_output_batch`
-    /// 4. Verify the message was processed (not dropped)
-    #[test]
-    fn test_pty_output_first_message_not_dropped_by_select() {
-        let (mut hub, _request_tx, _output_rx) = e2e_hub();
-
-        assert_eq!(
-            hub.pty_output_messages_drained, 0,
-            "Counter should start at zero"
-        );
-
-        // Craft a PTY output message (prefix 0x01 = terminal data)
-        let msg = super::WebRtcPtyOutput {
-            subscription_id: "sub_test".to_string(),
-            browser_identity: "test-browser-identity".to_string(),
-            data: vec![0x01, 0x41, 0x42, 0x43], // "ABC"
-            session_uuid: "sess-test".to_string(),
-        };
-
-        // Step 1: PTY forwarder sends output
-        hub.webrtc.pty_output_tx().try_send(msg).unwrap();
-
-        // Step 2: Extract rx (as run_event_loop does before select!)
-        let mut rx = hub.webrtc.lease_pty_output_receiver_for_test();
-
-        // Step 3: recv() consumes the first message (as select! does)
-        let first = rx
-            .as_mut()
-            .unwrap()
-            .try_recv()
-            .expect("Should have one message");
-
-        // Channel is now empty — the old code lost `first` here
-        assert!(
-            rx.as_mut().unwrap().try_recv().is_err(),
-            "Channel should be empty after recv"
-        );
-
-        // Step 4: Call batch handler with the consumed first message
-        hub.handle_webrtc_pty_output_batch(first, &mut rx);
-
-        // Step 5: Verify the message was actually processed
-        assert_eq!(
-            hub.pty_output_messages_drained, 1,
-            "The first message must be processed directly, not dropped"
-        );
-
-        // Restore rx for clean drop
-        hub.webrtc.return_pty_output_receiver_for_test(rx);
-    }
-
-    /// Verify multiple PTY output messages in a batch are all processed.
-    ///
-    /// When several messages arrive before the `select!` branch fires, only
-    /// the first is consumed by `recv().await` — the rest are drained by
-    /// `try_recv()`. This test ensures all messages are accounted for.
-    #[test]
-    fn test_pty_output_batch_processes_all_messages() {
-        let (mut hub, _request_tx, _output_rx) = e2e_hub();
-
-        // Send 5 messages
-        for i in 0..5u8 {
-            hub.webrtc
-                .pty_output_tx()
-                .try_send(super::WebRtcPtyOutput {
-                    subscription_id: "sub_test".to_string(),
-                    browser_identity: "test-browser-identity".to_string(),
-                    data: vec![0x01, 0x41 + i],
-                    session_uuid: "sess-test".to_string(),
-                })
-                .unwrap();
-        }
-
-        let mut rx = hub.webrtc.lease_pty_output_receiver_for_test();
-
-        // select! consumes the first
-        let first = rx
-            .as_mut()
-            .unwrap()
-            .try_recv()
-            .expect("Should have messages");
-
-        // 4 remain in the channel
-        hub.handle_webrtc_pty_output_batch(first, &mut rx);
-
-        // All 5 should have been processed (1 direct + 4 drained)
-        assert_eq!(
-            hub.pty_output_messages_drained, 5,
-            "All messages in the batch must be processed"
-        );
-        let snapshot = hub.hub_event_metrics.snapshot();
-        assert_eq!(snapshot.counters["pty_output.messages"], 5);
-        assert_eq!(snapshot.counters["pty_output.bytes"], 10);
-        assert_eq!(snapshot.counters["pty_output.batch_hwm"], 5);
-        assert!(snapshot.spans.contains_key("pty_output.drain_batch"));
-
-        hub.webrtc.return_pty_output_receiver_for_test(rx);
-    }
-
     #[test]
     fn test_unknown_peer_burst_guardrail_is_bounded_and_rate_limited() {
         let (hub, _request_tx, _output_rx) = e2e_hub();
@@ -8753,6 +8637,12 @@ mod tests {
 
         hub.handle_cache
             .add_session(test_session_handle("sess-attach"));
+        let _command_rx = install_test_browser_worker(
+            &mut hub,
+            "peer-attach",
+            "sess-attach",
+            "terminal_sess-attach",
+        );
         hub.tick();
 
         assert!(
@@ -8764,8 +8654,8 @@ mod tests {
             "forwarder should start after session registration"
         );
         assert!(
-            hub.terminal_client_workers.contains_key(&key),
-            "WebRTC forwarder should register a ClientWorker handle"
+            hub.browser_client_workers.contains_key("peer-attach"),
+            "WebRTC peer should register a browser ClientWorker handle"
         );
     }
 
@@ -8777,6 +8667,8 @@ mod tests {
 
         hub.handle_cache
             .add_session(test_session_handle(session_uuid));
+        let _command_rx =
+            install_test_browser_worker(&mut hub, "browser-worker", session_uuid, "terminal_sub");
 
         assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
             "browser-worker",
@@ -8784,20 +8676,80 @@ mod tests {
             "terminal_sub"
         )));
         assert!(
-            hub.terminal_client_workers.contains_key(&key),
-            "WebRTC forwarder should register a ClientWorker handle"
+            hub.browser_client_workers.contains_key("browser-worker"),
+            "WebRTC peer should register a browser ClientWorker handle"
         );
 
         hub.stop_lua_pty_forwarder(&key);
 
         assert!(
-            !hub.terminal_client_workers.contains_key(&key),
-            "stopping WebRTC forwarder should remove the ClientWorker handle"
+            hub.browser_client_workers.contains_key("browser-worker"),
+            "stopping one WebRTC forwarder should keep the peer-level ClientWorker handle"
         );
         assert!(
             !hub.pty_forwarders.contains_key(&key),
             "stopping WebRTC forwarder should remove the task"
         );
+    }
+
+    #[test]
+    fn test_webrtc_terminal_subscribe_routes_attach_through_browser_worker() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let browser_identity = "browser-subscribe-worker";
+        let session_uuid = "sess-webrtc-subscribe-worker";
+        let forwarder_key = format!("{browser_identity}:{session_uuid}");
+
+        hub.handle_cache
+            .add_session(test_session_handle(session_uuid));
+        let mut command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
+
+        let payload = serde_json::json!({
+            "type": "subscribe",
+            "channel": "terminal",
+            "subscriptionId": "terminal_sub_worker",
+            "params": {
+                "session_uuid": session_uuid,
+                "rows": 33,
+                "cols": 120,
+            }
+        });
+        hub.process_webrtc_plaintext_payload(browser_identity, payload.to_string().as_bytes());
+
+        hub.tokio_runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        hub.poll_hub_events();
+
+        assert!(
+            hub.pty_forwarders.contains_key(&forwarder_key),
+            "browser subscribe should attach through the peer-level ClientWorker"
+        );
+
+        let mut saw_subscribed_ack = false;
+        for _ in 0..20 {
+            hub.tokio_runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            });
+            hub.poll_hub_events();
+            while let Ok(command) = command_rx.try_recv() {
+                if matches!(
+                    command,
+                    crate::worker::webrtc::WebRtcAdapterCommand::Json { data }
+                        if serde_json::from_slice::<serde_json::Value>(&data)
+                            .ok()
+                            .and_then(|value| value.get("type").and_then(|v| v.as_str()).map(str::to_owned))
+                            .as_deref()
+                            == Some("subscribed")
+                ) {
+                    saw_subscribed_ack = true;
+                    break;
+                }
+            }
+            if saw_subscribed_ack {
+                break;
+            }
+        }
+        assert!(saw_subscribed_ack, "expected subscribed ack");
     }
 
     #[test]
@@ -8809,14 +8761,16 @@ mod tests {
 
         hub.handle_cache
             .add_session(test_session_handle(session_uuid));
+        let _command_rx =
+            install_test_browser_worker(&mut hub, browser_identity, session_uuid, "terminal_sub");
         assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
             browser_identity,
             session_uuid,
             "terminal_sub"
         )));
         assert!(
-            hub.terminal_client_workers.contains_key(&key),
-            "WebRTC forwarder should register a ClientWorker handle"
+            hub.browser_client_workers.contains_key(browser_identity),
+            "WebRTC peer should register a browser ClientWorker handle"
         );
 
         let channel = crate::channel::WebRtcChannel::builder()
@@ -8847,8 +8801,8 @@ mod tests {
         hub.cleanup_webrtc_peer(browser_identity, "disconnected");
 
         assert!(
-            !hub.terminal_client_workers.contains_key(&key),
-            "WebRTC peer cleanup should remove the ClientWorker handle"
+            !hub.browser_client_workers.contains_key(browser_identity),
+            "WebRTC peer cleanup should remove the browser ClientWorker handle"
         );
         assert!(
             !hub.pty_forwarders.contains_key(&key),
