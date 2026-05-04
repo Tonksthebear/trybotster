@@ -9,6 +9,7 @@
  *   - disconnected - Channel closed
  *   - stateChange - { state, prevState, error }
  *   - error - { reason, message }
+ *   - terminalAttach - { state, session_uuid }
  *   - output - PTY output data (Uint8Array for raw, string for scrollback)
  *
  * Flow:
@@ -109,6 +110,16 @@ export class TerminalConnection extends HubRoute {
           reason: "pty_error",
           message: message.error || "PTY error",
         });
+        break;
+
+      case "terminal_attach":
+        this.emit("terminalAttach", message);
+        if (message.state === "not_ready") {
+          this.emit("error", {
+            reason: "terminal_not_ready",
+            message: "Terminal session is not ready for input yet. Reconnecting session I/O...",
+          });
+        }
         break;
 
       default:
@@ -228,6 +239,10 @@ export class TerminalConnection extends HubRoute {
 
   onError(callback) {
     return this.on("error", callback);
+  }
+
+  onTerminalAttach(callback) {
+    return this.on("terminalAttach", callback);
   }
 
   onSnapshotStart(callback) {

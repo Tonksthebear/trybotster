@@ -16,6 +16,7 @@ use super::{BoundedQueueConfig, RequestId, SessionUuid, SubscriptionId};
 
 /// Default bounded mailbox config for client-worker input.
 pub const CLIENT_WORKER_QUEUE: BoundedQueueConfig = BoundedQueueConfig::new("worker.client", 1024);
+const CLIENT_SESSION_IO_MISSING_SOURCE: &str = "worker.client.session_io_missing";
 
 /// Health reported for a connected client transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,8 @@ pub enum TerminalAttachState {
     Attached,
     /// Terminal exists but its backing process is reconnecting.
     Reconnecting,
+    /// Terminal subscription exists but the session data plane is not ready.
+    NotReady,
     /// Terminal could not be found.
     NotFound,
 }
@@ -57,6 +60,7 @@ impl TerminalAttachState {
         match self {
             Self::Attached => "attached",
             Self::Reconnecting => "reconnecting",
+            Self::NotReady => "not_ready",
             Self::NotFound => "not_found",
         }
     }
@@ -69,6 +73,7 @@ impl TryFrom<&str> for TerminalAttachState {
         match value {
             "attached" => Ok(Self::Attached),
             "reconnecting" => Ok(Self::Reconnecting),
+            "not_ready" => Ok(Self::NotReady),
             "not_found" => Ok(Self::NotFound),
             _ => Err(()),
         }
@@ -550,11 +555,31 @@ impl ClientWorker {
     }
 
     async fn route_session_input(&mut self, session_uuid: SessionUuid, data: Vec<u8>) {
-        if !self.subscriptions.contains_key(&session_uuid) {
+        let Some(subscription_id) = self
+            .subscriptions
+            .get(&session_uuid)
+            .map(|subscription| subscription.subscription_id.clone())
+        else {
             return;
-        }
+        };
 
         let Some(tx) = self.session_io_txs.get(&session_uuid).cloned() else {
+            log::warn!(
+                "[ClientWorker] PTY input for subscribed session {} dropped because session I/O sender is not ready",
+                session_uuid
+            );
+            self.try_deliver_egress(
+                TransportEgress::TerminalAttach {
+                    subscription_id,
+                    session_uuid: session_uuid.clone(),
+                    state: TerminalAttachState::NotReady,
+                },
+                Some(session_uuid.clone()),
+                DeliveryKind::Control,
+            )
+            .await;
+            self.report_backpressure(CLIENT_SESSION_IO_MISSING_SOURCE, 0, Some(session_uuid))
+                .await;
             return;
         };
 
@@ -1021,6 +1046,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribed_input_without_session_io_sender_emits_not_ready() {
+        let (handle, mut hub_rx, mut outbound_rx, mut seeded_session_rx) =
+            spawn_worker(ClientId::browser("browser-identity"), 8);
+
+        handle
+            .send(ClientWorkerMessage::SubscribeSession {
+                session_uuid: "sess-missing-sender".to_string(),
+                subscription_id: "sub-missing-sender".to_string(),
+            })
+            .await
+            .expect("subscribe missing sender");
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::AttachClient {
+                session_uuid,
+                subscription_id,
+                ..
+            } if session_uuid == "sess-missing-sender"
+                && subscription_id == "sub-missing-sender"
+        ));
+
+        handle
+            .send(ClientWorkerMessage::SessionInput {
+                session_uuid: "sess-missing-sender".to_string(),
+                data: b"typed-before-registration".to_vec(),
+            })
+            .await
+            .expect("send input without sender");
+
+        assert!(seeded_session_rx.try_recv().is_err());
+        assert!(matches!(
+            recv_egress(&mut outbound_rx).await,
+            TransportEgress::TerminalAttach {
+                subscription_id,
+                session_uuid,
+                state: TerminalAttachState::NotReady,
+            } if subscription_id == "sub-missing-sender" && session_uuid == "sess-missing-sender"
+        ));
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::Backpressure(WorkerBackpressure {
+                source: CLIENT_SESSION_IO_MISSING_SOURCE,
+                capacity: 0,
+                session_uuid: Some(session_uuid),
+                client_id: Some(ClientId::Browser(browser_identity)),
+            }) if session_uuid == "sess-missing-sender" && browser_identity == "browser-identity"
+        ));
+    }
+
+    #[tokio::test]
     async fn unregister_session_io_sender_detaches_active_subscription() {
         let (handle, mut hub_rx, _outbound_rx, mut session_rx) = spawn_worker(ClientId::Tui, 8);
 
@@ -1053,8 +1128,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_session_io_sender_is_removed_without_backpressure() {
-        let (handle, mut hub_rx, _outbound_rx, _session_rx) = spawn_worker(ClientId::Tui, 8);
+    async fn closed_session_io_sender_is_removed_then_next_input_is_not_ready() {
+        let (handle, mut hub_rx, mut outbound_rx, _session_rx) = spawn_worker(ClientId::Tui, 8);
         let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
         drop(closed_rx);
 
@@ -1090,7 +1165,23 @@ mod tests {
             })
             .await
             .expect("route after stale sender removal");
-        assert_no_hub(&mut hub_rx).await;
+        assert!(matches!(
+            recv_egress(&mut outbound_rx).await,
+            TransportEgress::TerminalAttach {
+                subscription_id,
+                session_uuid,
+                state: TerminalAttachState::NotReady,
+            } if subscription_id == "sub-closed" && session_uuid == "sess-closed"
+        ));
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::Backpressure(WorkerBackpressure {
+                source: CLIENT_SESSION_IO_MISSING_SOURCE,
+                capacity: 0,
+                session_uuid: Some(session_uuid),
+                client_id: Some(ClientId::Tui),
+            }) if session_uuid == "sess-closed"
+        ));
     }
 
     #[tokio::test]
