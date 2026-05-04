@@ -1035,6 +1035,7 @@ impl WebRtcPeerRegistry {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn poll_received_messages(
         &self,
         runtime: &tokio::runtime::Runtime,

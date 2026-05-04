@@ -1,9 +1,13 @@
 # Worker Actor Contracts
 
-Botster's workerized runtime boundary starts with typed Rust contracts. Some
-contracts are scaffolding for later slices; the session I/O worker is now the
-production read path for durable session-process PTY output, and WebRTC peer
-state now lives behind the client transport adapter boundary.
+Botster's workerized runtime boundary starts with typed Rust contracts. The
+session I/O worker is the production read path for durable session-process PTY
+output and the executable mailbox for session-scoped PTY input, paste/drop
+writes, snapshot preparation, resize, mode/screen queries, color profile
+updates, and shutdown requests. WebRTC peer/channel state lives behind
+`WebRtcPeerRegistry`; browser terminal controls that have stable Botster-owned
+shapes cross the transport adapter into `ClientWorkerMessage`, while Lua,
+plugin, and relay-owned JSON remains an explicit boundary exception.
 
 ## Ownership
 
@@ -24,11 +28,13 @@ TUI adapter, socket adapter, or future adapter converts its local framing into
 Session I/O code and session processes must not import browser or WebRTC
 concepts.
 
-Session I/O workers mirror the current per-session process protocol. They carry
-PTY input, resize, snapshot, mode flags, plain screen, color profile, authorized
-file paste/drop payloads, prepared snapshot payloads, structured terminal
-events, and process-exit messages as Rust actor messages. The Unix socket wire
-protocol in `cli/src/session/protocol.rs` remains the durable process boundary.
+Session I/O workers mirror the current per-session process protocol. The
+current production mailbox work is PTY input, resize, snapshot requests,
+mode-flag requests, plain-screen requests, color profile updates, authorized
+file paste/drop payloads, prepared snapshot payloads, and clean shutdown
+requests. The worker emits structured terminal events and process-exit messages
+back to the hub. The Unix socket wire protocol in `cli/src/session/protocol.rs`
+remains the durable process boundary.
 
 ## Session I/O Worker Runtime
 
@@ -101,6 +107,14 @@ encoding and delivery details; the client worker owns client-scoped stream
 state; the session I/O worker owns session-scoped PTY interaction; the hub owns
 orchestration state and lifecycle policy.
 
+That diagram is the terminal data-plane contract, not a promise that every
+WebRTC JSON message enters the client worker. Hub-owned policy and synchronous
+compatibility work still exists where the hub must decide routing, capability,
+Lua callbacks, or legacy RPC response correlation. Browser terminal
+subscribe/unsubscribe/focus and binary PTY/file frames are the workerized path;
+terminal color profile messages and unknown JSON are deliberately classified as
+Lua/plugin/relay boundary traffic until they have stable typed worker frames.
+
 `worker::client::ClientWorker::start` is the executable core for this boundary.
 It creates a bounded client mailbox, records subscriptions by session UUID,
 emits hub-owned attach/detach/reconnect/shutdown/backpressure requests, routes
@@ -111,10 +125,12 @@ production-wired through this actor: hub-owned Lua attach requests still decide
 when a session exists, when pending attach intents resolve, and when forwarder
 tasks are cleaned up, but snapshot, live PTY output, process-exit, typed control,
 plugin binary, and raw input traffic cross the client-worker boundary before a
-TUI or socket adapter encodes them. WebRTC production traffic enters the
-transport adapter boundary through `worker::webrtc::WebRtcPeerRegistry` and
-`WebRtcTransportRunner`; the adapter converts decoded ingress into
-`ClientWorkerMessage` before hub policy handles the current Lua routing surface.
+TUI or socket adapter encodes them. WebRTC production terminal control traffic
+enters the transport adapter boundary through
+`worker::webrtc::WebRtcPeerRegistry` and `WebRtcTransportRunner`; the adapter
+converts subscribe, unsubscribe, focus-change, heartbeat, PTY input, and file
+input ingress into typed worker or typed hub events before hub policy handles
+routing and Lua exceptions.
 
 ## WebRTC Transport Adapter
 
@@ -166,12 +182,17 @@ WebRTC transport summaries cross back to the Hub through typed
 the Rails relay boundary because those values are already serialized Olm
 envelopes. Do not let that exception spread to new adapter control surfaces.
 
-Crypto ownership is split by lifecycle phase. SDP answer encryption,
-DataChannel encrypt/decrypt failure tracking, ratchet-trigger dedupe, and
-ratchet-delivery transport are adapter/registry concerns. The Hub still
-generates fresh ratchet bundles because that mutates trusted crypto policy, then
-queues the bytes through `WebRtcPeerRegistry` instead of sending through a
-`WebRtcSender` directly.
+Crypto ownership is split by lifecycle phase. WebRTC offer mechanics run behind
+`WebRtcPeerRegistry` / `WebRtcTransportRunner`, but handshake-time SDP answer
+encryption is still hub-triggered because hub policy owns the authenticated
+browser identity and crypto service. The hub starts negotiation with validated
+policy inputs, `WebRtcTransportRunner::negotiate_offer` creates and encrypts
+the answer, and completion returns as a typed hub event. DataChannel
+encrypt/decrypt failure tracking, ratchet-trigger dedupe, and ratchet-delivery
+transport are adapter/registry concerns. The Hub still generates fresh ratchet
+bundles because that mutates trusted crypto policy, then queues the bytes
+through `WebRtcPeerRegistry` instead of sending through a `WebRtcSender`
+directly.
 
 Regression coverage for this boundary should stay focused on the failure modes
 that motivated the migration: a DataChannel closing after `Connected`, stale
@@ -295,14 +316,18 @@ hello/hello_ack protocol negotiation, quit interception, reconnect retries,
 stale request draining, synthetic `bridge_reconnected` events, and wake-pipe
 writes are adapter or bridge responsibilities, not client-worker policy.
 
-Resize, terminal color profile, and other JSON hub commands continue through
-the existing Lua/hub JSON path unless they have an explicit typed worker
-message. Focus changes do have a typed worker message:
+Resize has an executable `SessionIoRequest` mailbox path. Terminal color
+profile and other WebRTC JSON hub commands continue through the existing
+Lua/hub JSON path unless they have an explicit typed worker message. Focus
+changes do have a typed worker message:
 `TransportIngress::FocusChanged` maps to `ClientControlFrame::FocusChanged`
 before hub policy updates active terminal peer state. The terminal data plane
 for TUI/local socket clients is workerized; generic control-plane JSON remains
 hub-owned for this slice, but stable worker-owned control messages must not use
-generic JSON fallbacks.
+generic JSON fallbacks. JSON remains limited to Lua/plugin/relay boundaries and
+the documented WebRTC subscribe acknowledgement bridge; new stable Botster-owned
+controls need typed `TransportIngress`, `ClientWorkerMessage`, and
+`TransportEgress` variants instead of `BoundaryJson`.
 
 ## Session Process Boundary
 
