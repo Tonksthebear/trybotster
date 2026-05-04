@@ -211,7 +211,7 @@ function M.register()
             local ok, result = pcall(engine.start_run, {
                 ticket_id = payload.ticket_id,
                 pipeline_id = payload.pipeline_id,
-                workspace_name = payload.workspace_name or "Pipelines",
+                workspace_name = payload.workspace_name,
             })
             refresh(ctx)
             if not ok then

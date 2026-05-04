@@ -211,6 +211,13 @@ fn project_pipelines_automates_merge_from_pipeline_policy() {
         "MCP role prompts should preserve discipline and production-path expectations"
     );
     assert!(
+        engine.contains("local function ticket_workspace_name")
+            && engine.contains("Pipeline - ")
+            && engine.contains("workspace_name = params.workspace_name or ticket_workspace_name(ticket, params.ticket_id)")
+            && engine.contains("workspace_name = run.workspace_name or ticket_workspace_name(ticket, run.id)"),
+        "pipeline agents should default into a ticket-named workspace while preserving run workspace reuse"
+    );
+    assert!(
         pipeline_screen.contains("Merge policy")
             && pipeline_screen.contains("Merge directly to main")
             && pipeline_screen.contains("Open PR with Botster MCP"),
