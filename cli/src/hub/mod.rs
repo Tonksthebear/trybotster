@@ -251,7 +251,9 @@ pub(crate) struct PendingSessionIoSnapshot {
 pub(crate) enum PendingSessionIoSnapshotTarget {
     WebRtcOutput {
         peer_id: String,
-        subscription_id: String,
+        rows: u16,
+        cols: u16,
+        kitty_enabled: bool,
         forwarder_key: Option<String>,
         active_flag: Option<std::sync::Arc<std::sync::Mutex<bool>>>,
     },
@@ -434,6 +436,11 @@ pub struct Hub {
     /// Workerized terminal clients, keyed by terminal forwarder id.
     terminal_client_workers:
         std::collections::HashMap<String, crate::worker::client::ClientWorkerHandle>,
+    /// Workerized browser clients, keyed by WebRTC browser identity.
+    browser_client_workers:
+        std::collections::HashMap<String, crate::worker::client::ClientWorkerHandle>,
+    /// Browser terminal dimensions captured at subscribe time for worker attach policy.
+    browser_terminal_attach_sizes: std::collections::HashMap<String, (u16, u16)>,
 
     // === TUI via Lua (Hub-side Processing) ===
     /// Sender for TUI output messages to TuiRunner.
@@ -589,6 +596,8 @@ impl Hub {
             socket_server: None,
             socket_clients: std::collections::HashMap::new(),
             terminal_client_workers: std::collections::HashMap::new(),
+            browser_client_workers: std::collections::HashMap::new(),
+            browser_terminal_attach_sizes: std::collections::HashMap::new(),
             tui_output_tx: None,
             tui_wake_fd: None,
             tui_request_rx: None,

@@ -215,7 +215,6 @@ pub(crate) enum WebRtcOfferCompletionOutcome {
 
 #[derive(Debug, Clone)]
 pub(crate) enum WebRtcIngressOutcome {
-    PongQueued,
     PongObserved,
     TerminalColorProfile(serde_json::Value),
     LuaMessage(serde_json::Value),
@@ -324,6 +323,52 @@ impl WebRtcTransportRunner {
         let ingress = match msg_type {
             Some("dc_ping") => TransportIngress::DcPing,
             Some("dc_pong") => TransportIngress::DcPong,
+            Some("subscribe")
+                if msg.get("channel").and_then(|v| v.as_str()) == Some("terminal") =>
+            {
+                let Some(session_uuid) = msg
+                    .pointer("/params/session_uuid")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+                else {
+                    return WebRtcIngressOutcome::LuaMessage(msg);
+                };
+                let subscription_id = msg
+                    .get("subscriptionId")
+                    .or_else(|| msg.get("subscription_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&session_uuid)
+                    .to_string();
+                TransportIngress::Subscribe {
+                    session_uuid,
+                    subscription_id,
+                }
+            }
+            Some("unsubscribe") => {
+                let subscription_id = msg
+                    .get("subscriptionId")
+                    .or_else(|| msg.get("subscription_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let session_uuid = msg
+                    .get("session_uuid")
+                    .or_else(|| msg.pointer("/params/session_uuid"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        subscription_id
+                            .strip_prefix("terminal_")
+                            .map(ToString::to_string)
+                    });
+                let Some(session_uuid) = session_uuid else {
+                    return WebRtcIngressOutcome::LuaMessage(msg);
+                };
+                TransportIngress::Unsubscribe {
+                    session_uuid,
+                    subscription_id,
+                }
+            }
             Some("focus_changed") => {
                 let session_uuid = msg
                     .get("session_uuid")
@@ -346,19 +391,9 @@ impl WebRtcTransportRunner {
         let msg = match client_message {
             ClientWorkerMessage::ControlFrame(ClientControlFrame::BoundaryJson(value)) => value,
             ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPong) => {
-                let pong = serde_json::to_vec(&crate::worker::transport::egress_dc_pong())
-                    .expect("static JSON serialization cannot fail");
-                if self
-                    .command_tx
-                    .try_send(WebRtcAdapterCommand::Json { data: pong })
-                    .is_err()
-                {
-                    log::debug!(
-                        "[WebRTC] Failed to queue dc_pong for {}",
-                        &self.browser_identity[..self.browser_identity.len().min(8)]
-                    );
-                }
-                return WebRtcIngressOutcome::PongQueued;
+                return WebRtcIngressOutcome::ClientWorker(ClientWorkerMessage::ControlFrame(
+                    ClientControlFrame::DcPong,
+                ));
             }
             ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPongReceived) => {
                 return WebRtcIngressOutcome::PongObserved;
@@ -1673,6 +1708,67 @@ impl WebRtcTransportAdapter {
     #[must_use]
     pub(crate) fn new(client_id: ClientId) -> Self {
         Self { client_id }
+    }
+
+    #[must_use]
+    pub(crate) fn egress_to_command(egress: TransportEgress) -> Option<WebRtcAdapterCommand> {
+        match egress {
+            TransportEgress::TerminalBytes {
+                subscription_id,
+                data,
+                ..
+            }
+            | TransportEgress::Scrollback {
+                subscription_id,
+                data,
+                ..
+            } => Some(WebRtcAdapterCommand::Pty {
+                subscription_id,
+                data,
+            }),
+            TransportEgress::ProcessExited {
+                subscription_id,
+                session_uuid,
+                ..
+            } => serde_json::to_vec(&serde_json::json!({
+                "type": "process_exited",
+                "subscriptionId": subscription_id,
+                "session_uuid": session_uuid,
+            }))
+            .ok()
+            .map(|data| WebRtcAdapterCommand::Json { data }),
+            TransportEgress::Pong { request_id } => {
+                serde_json::to_vec(&crate::worker::transport::egress_pong(request_id))
+                    .ok()
+                    .map(|data| WebRtcAdapterCommand::Json { data })
+            }
+            TransportEgress::TerminalAttach {
+                subscription_id,
+                session_uuid,
+                state,
+            } => serde_json::to_vec(&crate::worker::transport::egress_terminal_attach(
+                subscription_id,
+                session_uuid,
+                state,
+            ))
+            .ok()
+            .map(|data| WebRtcAdapterCommand::Json { data }),
+            TransportEgress::DcPong => {
+                serde_json::to_vec(&crate::worker::transport::egress_dc_pong())
+                    .ok()
+                    .map(|data| WebRtcAdapterCommand::Json { data })
+            }
+            TransportEgress::BoundaryJson(value) => serde_json::to_vec(&value)
+                .ok()
+                .map(|data| WebRtcAdapterCommand::Json { data }),
+            TransportEgress::Binary(data) => Some(WebRtcAdapterCommand::Binary { data }),
+            TransportEgress::Snapshot { .. }
+            | TransportEgress::ModeChanged { .. }
+            | TransportEgress::KittyChanged { .. }
+            | TransportEgress::FocusReportingChanged { .. }
+            | TransportEgress::FocusChanged { .. }
+            | TransportEgress::Close { .. } => None,
+        }
     }
 }
 
