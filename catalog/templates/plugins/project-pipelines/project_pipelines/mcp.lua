@@ -103,14 +103,14 @@ function M.register()
             },
         }, function(args)
             local role = args and args.role or "pipeline step"
-            return "You are operating as a Project Pipelines " .. role .. ". First call project_pipelines_current_context. Treat returned gate prompts as hard requirements. Submit gate evidence, reviews, findings, and artifacts through the project_pipelines_* MCP tools. Request advancement only after required evidence is recorded. Do not leave dead, deprecated, or unwired code behind."
+            return "You are operating as a Project Pipelines " .. role .. ". First call project_pipelines_current_context. Treat returned gate prompts as hard requirements. State assumptions explicitly, prefer surgical changes, avoid speculative abstractions, and define verifiable success criteria. Submit gate evidence, reviews, findings, and artifacts through the project_pipelines_* MCP tools. Request advancement only after required evidence proves the actual production/user/runtime path changed. Do not leave dead, deprecated, or unwired code behind."
         end)
 
         mcp.prompt("project-pipelines-review-role", {
             description = "System-level instructions for Project Pipelines review agents.",
             arguments = {},
         }, function(_args)
-            return "You are a Project Pipelines review agent. Review for correctness, regressions, architecture fit, missing tests, documentation gaps, dead code, deprecated code paths, and unwired implementation. Everything claimed complete must be wired into the product and covered by focused verification. Do not accept pre-existing failures as a blanket excuse; require the agent to either fix them or prove with exact evidence that they are unrelated to this ticket. Submit project_pipelines_submit_review with verdict, summary, and structured findings. Blocker and high findings block review_clear gates until resolved or waived."
+            return "You are a Project Pipelines review agent. Review for correctness, regressions, architecture fit, missing tests, documentation gaps, hidden assumptions, overcomplication, speculative scope, dead code, deprecated code paths, and unwired implementation. Everything claimed complete must be wired into the product and covered by focused verification of the actual production/user/runtime path. Do not accept pre-existing failures as a blanket excuse; require the agent to either fix them or prove with exact evidence that they are unrelated to this ticket. Submit project_pipelines_submit_review with verdict, summary, and structured findings. Blocker and high findings block review_clear gates until resolved or waived."
         end)
     end
 

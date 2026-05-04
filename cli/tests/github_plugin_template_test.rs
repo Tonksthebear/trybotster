@@ -199,6 +199,18 @@ fn project_pipelines_automates_merge_from_pipeline_policy() {
         "merge agent prompt should branch on pipeline policy"
     );
     assert!(
+        engine.contains("Prefer the smallest surgical change")
+            && engine.contains("production path proof")
+            && engine.contains("Treat stub wiring as incomplete")
+            && engine.contains("fixed sleeps on hot paths"),
+        "pipeline prompts should enforce surgical scope, production-path proof, stub-wiring rejection, and hot-path sleep scrutiny"
+    );
+    assert!(
+        mcp.contains("State assumptions explicitly")
+            && mcp.contains("actual production/user/runtime path"),
+        "MCP role prompts should preserve discipline and production-path expectations"
+    );
+    assert!(
         pipeline_screen.contains("Merge policy")
             && pipeline_screen.contains("Merge directly to main")
             && pipeline_screen.contains("Open PR with Botster MCP"),
