@@ -4,7 +4,7 @@
 //! It preserves the session-process wire protocol while coalescing hot-path
 //! output before crossing back into the hub event loop.
 
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,12 +17,16 @@ use crate::agent::notification::AgentNotification;
 use crate::agent::pty::{PromptMark, PtyEvent};
 use crate::hub::events::{HubEvent, HubEventTx};
 use crate::session::protocol::{
-    Frame, FrameDecoder, ModeChanged, NotificationPayload, PromptMarkPayload, FRAME_BELL,
-    FRAME_CWD_CHANGED, FRAME_MODE_CHANGED, FRAME_NOTIFICATION, FRAME_PROCESS_EXITED,
-    FRAME_PROMPT_MARK, FRAME_PTY_OUTPUT, FRAME_TITLE_CHANGED,
+    encode_empty, encode_frame, encode_json, Frame, FrameDecoder, ModeChanged, NotificationPayload,
+    PromptMarkPayload, FRAME_BELL, FRAME_CWD_CHANGED, FRAME_GET_MODE_FLAGS, FRAME_GET_SCREEN,
+    FRAME_GET_SNAPSHOT, FRAME_MODE_CHANGED, FRAME_NOTIFICATION, FRAME_PROCESS_EXITED,
+    FRAME_PROMPT_MARK, FRAME_PTY_INPUT, FRAME_PTY_OUTPUT, FRAME_RESIZE, FRAME_SET_COLOR_PROFILE,
+    FRAME_SHUTDOWN, FRAME_TITLE_CHANGED,
 };
 
-use super::session_io::SessionIoBatch;
+use super::session_io::{
+    prepare_snapshot_payload, write_paste_file, SessionIoBatch, SessionIoEvent, SessionIoRequest,
+};
 
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 const MAX_OUTPUT_FRAMES: usize = 16;
@@ -30,6 +34,8 @@ const MAX_BATCH_AGE: Duration = Duration::from_millis(4);
 
 pub(crate) struct SessionIoWorkerConfig {
     pub stream: UnixStream,
+    pub write_stream: UnixStream,
+    pub request_rx: Option<tokio::sync::mpsc::Receiver<SessionIoRequest>>,
     pub session_uuid: String,
     pub event_tx: broadcast::Sender<PtyEvent>,
     pub kitty_enabled: Arc<AtomicBool>,
@@ -43,28 +49,202 @@ pub(crate) struct SessionIoWorkerConfig {
 
 pub(crate) struct SessionIoWorkerHandle {
     _join: std::thread::JoinHandle<()>,
+    _request_join: std::thread::JoinHandle<()>,
 }
 
 pub(crate) struct SessionIoWorker;
 
 impl SessionIoWorker {
-    pub(crate) fn spawn(config: SessionIoWorkerConfig) -> Result<SessionIoWorkerHandle> {
+    pub(crate) fn spawn(mut config: SessionIoWorkerConfig) -> Result<SessionIoWorkerHandle> {
         let thread_name = format!(
             "session-io-{}",
             &config.session_uuid[..config.session_uuid.len().min(16)]
         );
+        let request_config = SessionIoRequestProcessorConfig {
+            stream: config
+                .write_stream
+                .try_clone()
+                .context("dup session socket for request processor thread")?,
+            request_rx: config
+                .request_rx
+                .take()
+                .context("session I/O request receiver missing")?,
+            session_uuid: config.session_uuid.clone(),
+            hub_event_tx: config.hub_event_tx.clone(),
+            reader_alive: Arc::clone(&config.reader_alive),
+        };
+        let request_thread_name = format!(
+            "session-io-requests-{}",
+            &config.session_uuid[..config.session_uuid.len().min(16)]
+        );
+        let request_join = std::thread::Builder::new()
+            .name(request_thread_name)
+            .spawn(move || run_request_processor(request_config))
+            .context("spawn session I/O request processor thread")?;
+
         let join = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || run_worker(config))
             .context("spawn session I/O worker thread")?;
 
-        Ok(SessionIoWorkerHandle { _join: join })
+        Ok(SessionIoWorkerHandle {
+            _join: join,
+            _request_join: request_join,
+        })
     }
 }
 
 fn run_worker(config: SessionIoWorkerConfig) {
     let mut runtime = SessionIoRuntime::new(config);
     runtime.run();
+}
+
+struct SessionIoRequestProcessorConfig {
+    stream: UnixStream,
+    request_rx: tokio::sync::mpsc::Receiver<SessionIoRequest>,
+    session_uuid: String,
+    hub_event_tx: HubEventTx,
+    reader_alive: Arc<AtomicBool>,
+}
+
+fn run_request_processor(config: SessionIoRequestProcessorConfig) {
+    let mut processor = SessionIoRequestProcessor {
+        stream: config.stream,
+        request_rx: config.request_rx,
+        session_uuid: config.session_uuid,
+        hub_event_tx: config.hub_event_tx,
+        reader_alive: config.reader_alive,
+    };
+    processor.run();
+}
+
+struct SessionIoRequestProcessor {
+    stream: UnixStream,
+    request_rx: tokio::sync::mpsc::Receiver<SessionIoRequest>,
+    session_uuid: String,
+    hub_event_tx: HubEventTx,
+    reader_alive: Arc<AtomicBool>,
+}
+
+impl SessionIoRequestProcessor {
+    fn run(&mut self) {
+        while let Some(request) = self.request_rx.blocking_recv() {
+            if !self.reader_alive.load(Ordering::Acquire) {
+                break;
+            }
+            self.handle_request(request);
+        }
+    }
+
+    fn handle_request(&mut self, request: SessionIoRequest) {
+        match request {
+            SessionIoRequest::PtyInput { data } => {
+                if let Err(e) = self.write_frame(encode_frame(FRAME_PTY_INPUT, &data)) {
+                    log::warn!("[session-io] PTY input request failed: {e}");
+                }
+            }
+            SessionIoRequest::Resize { rows, cols } => {
+                match encode_json(
+                    FRAME_RESIZE,
+                    &serde_json::json!({ "rows": rows, "cols": cols }),
+                )
+                .and_then(|frame| self.write_frame(frame).map_err(anyhow::Error::from))
+                {
+                    Ok(()) => {}
+                    Err(e) => log::warn!("[session-io] resize request failed: {e}"),
+                }
+            }
+            SessionIoRequest::GetSnapshot { .. } => {
+                if let Err(e) = self.write_frame(encode_empty(FRAME_GET_SNAPSHOT)) {
+                    log::warn!("[session-io] snapshot RPC request failed: {e}");
+                }
+            }
+            SessionIoRequest::PasteFile {
+                request_id,
+                filename,
+                data,
+            } => {
+                let session_uuid = self.session_uuid.clone();
+                match write_paste_file(&session_uuid, &filename, &data, |input| {
+                    self.write_frame(encode_frame(FRAME_PTY_INPUT, input))
+                        .map_err(|e| e.to_string())
+                }) {
+                    Ok(write) => {
+                        let _ = self.hub_event_tx.send(HubEvent::SessionIo(
+                            SessionIoEvent::PasteFileWritten {
+                                request_id,
+                                session_uuid: self.session_uuid.clone(),
+                                path: write.path,
+                                bytes: write.bytes,
+                            },
+                        ));
+                    }
+                    Err((reason, detail)) => {
+                        let _ = self.hub_event_tx.send(HubEvent::SessionIo(
+                            SessionIoEvent::PasteFileFailed {
+                                request_id,
+                                session_uuid: self.session_uuid.clone(),
+                                reason,
+                                detail,
+                            },
+                        ));
+                    }
+                }
+            }
+            SessionIoRequest::PrepareSnapshot {
+                request_id,
+                snapshot,
+                recovery,
+            } => {
+                let event = if let Some(prepared) = prepare_snapshot_payload(&snapshot) {
+                    SessionIoEvent::PreparedSnapshot {
+                        request_id,
+                        session_uuid: self.session_uuid.clone(),
+                        uncompressed_len: prepared.uncompressed_len,
+                        payload: prepared.payload,
+                        recovery,
+                    }
+                } else {
+                    SessionIoEvent::PreparedSnapshot {
+                        request_id,
+                        session_uuid: self.session_uuid.clone(),
+                        uncompressed_len: 0,
+                        payload: Vec::new(),
+                        recovery,
+                    }
+                };
+                let _ = self.hub_event_tx.send(HubEvent::SessionIo(event));
+            }
+            SessionIoRequest::GetModeFlags { .. } => {
+                if let Err(e) = self.write_frame(encode_empty(FRAME_GET_MODE_FLAGS)) {
+                    log::warn!("[session-io] mode-flags RPC request failed: {e}");
+                }
+            }
+            SessionIoRequest::GetScreen { .. } => {
+                if let Err(e) = self.write_frame(encode_empty(FRAME_GET_SCREEN)) {
+                    log::warn!("[session-io] screen RPC request failed: {e}");
+                }
+            }
+            SessionIoRequest::SetColorProfile(profile) => {
+                match encode_json(FRAME_SET_COLOR_PROFILE, &profile)
+                    .and_then(|frame| self.write_frame(frame).map_err(anyhow::Error::from))
+                {
+                    Ok(()) => {}
+                    Err(e) => log::warn!("[session-io] color-profile request failed: {e}"),
+                }
+            }
+            SessionIoRequest::Shutdown { .. } => {
+                if let Err(e) = self.write_frame(encode_empty(FRAME_SHUTDOWN)) {
+                    log::warn!("[session-io] shutdown request failed: {e}");
+                }
+            }
+        }
+    }
+
+    fn write_frame(&mut self, frame: Vec<u8>) -> std::io::Result<()> {
+        self.stream.write_all(&frame)?;
+        self.stream.flush()
+    }
 }
 
 struct SessionIoRuntime {
@@ -431,15 +611,32 @@ fn now_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::future::Future;
     use std::net::Shutdown;
     use std::sync::mpsc;
     use tokio::sync::mpsc as tokio_mpsc;
 
     use super::*;
-    use crate::session::protocol::{
-        encode_frame, encode_json, FRAME_GET_SCREEN, FRAME_MODE_FLAGS, FRAME_SCREEN,
-    };
+    use crate::session::protocol::{FRAME_MODE_FLAGS, FRAME_SCREEN};
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const TEST_EVENT_TIMEOUT: Duration = Duration::from_millis(500);
+
+    fn block_on_with_timeout<F, T>(future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                tokio::time::timeout(TEST_EVENT_TIMEOUT, future)
+                    .await
+                    .expect("timed out waiting for worker event")
+            })
+    }
 
     fn spawn_test_worker(
         reader: UnixStream,
@@ -449,13 +646,31 @@ mod tests {
         tokio_mpsc::UnboundedReceiver<HubEvent>,
         Arc<AtomicBool>,
     ) {
+        let (_request_tx, event_rx, response_rx, hub_rx, alive) =
+            spawn_test_worker_with_requests(reader);
+        (event_rx, response_rx, hub_rx, alive)
+    }
+
+    fn spawn_test_worker_with_requests(
+        reader: UnixStream,
+    ) -> (
+        tokio_mpsc::Sender<SessionIoRequest>,
+        broadcast::Receiver<PtyEvent>,
+        mpsc::Receiver<Frame>,
+        tokio_mpsc::UnboundedReceiver<HubEvent>,
+        Arc<AtomicBool>,
+    ) {
         let (event_tx, event_rx) = broadcast::channel(32);
         let (response_tx, response_rx) = mpsc::channel();
         let (hub_tx, hub_rx) = tokio_mpsc::unbounded_channel();
+        let (request_tx, request_rx) = tokio_mpsc::channel(32);
         let alive = Arc::new(AtomicBool::new(true));
+        let write_stream = reader.try_clone().expect("clone request stream");
 
         SessionIoWorker::spawn(SessionIoWorkerConfig {
             stream: reader,
+            write_stream,
+            request_rx: Some(request_rx),
             session_uuid: "sess-test-io".to_string(),
             event_tx,
             kitty_enabled: Arc::new(AtomicBool::new(false)),
@@ -468,17 +683,49 @@ mod tests {
         })
         .expect("spawn worker");
 
-        (event_rx, response_rx, hub_rx, alive)
+        (request_tx, event_rx, response_rx, hub_rx, alive)
+    }
+
+    fn recv_pty_event(rx: &mut broadcast::Receiver<PtyEvent>) -> PtyEvent {
+        block_on_with_timeout(async { rx.recv().await.expect("receive pty event from worker") })
     }
 
     fn recv_output(rx: &mut broadcast::Receiver<PtyEvent>) -> Vec<u8> {
-        match rx
-            .blocking_recv()
-            .expect("receive output event from worker")
-        {
+        match recv_pty_event(rx) {
             PtyEvent::Output(data) => data,
             other => panic!("expected output, got {other:?}"),
         }
+    }
+
+    fn recv_hub_event(rx: &mut tokio_mpsc::UnboundedReceiver<HubEvent>) -> HubEvent {
+        block_on_with_timeout(async { rx.recv().await.expect("receive hub event") })
+    }
+
+    fn recv_session_io_batch(rx: &mut tokio_mpsc::UnboundedReceiver<HubEvent>) -> Vec<u8> {
+        loop {
+            match recv_hub_event(rx) {
+                HubEvent::SessionIoBatch(batch) => return batch.output.expect("output batch"),
+                other => panic!("expected session I/O batch, got {other:?}"),
+            }
+        }
+    }
+
+    fn assert_no_hub_event(rx: &mut tokio_mpsc::UnboundedReceiver<HubEvent>) {
+        assert!(
+            rx.try_recv().is_err(),
+            "unexpected extra hub event after ordered boundary"
+        );
+    }
+
+    fn wait_for_reader_stop(alive: &AtomicBool) {
+        let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+        while alive.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            !alive.load(Ordering::Acquire),
+            "reader did not stop within {TEST_EVENT_TIMEOUT:?}"
+        );
     }
 
     #[test]
@@ -494,15 +741,133 @@ mod tests {
         writer.shutdown(Shutdown::Both).expect("shutdown writer");
 
         assert_eq!(recv_output(&mut event_rx), b"onetwothree");
+        assert_eq!(recv_session_io_batch(&mut hub_rx), b"onetwothree");
+    }
 
-        let mut batches = Vec::new();
-        while let Ok(event) = hub_rx.try_recv() {
-            if let HubEvent::SessionIoBatch(batch) = event {
-                batches.push(batch.output.expect("output batch"));
-            }
+    #[test]
+    fn output_age_flushes_under_four_ms_rule_without_eof_or_size_threshold() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+
+        let mut payload = Vec::new();
+        for chunk in [b"age-".as_slice(), b"flush".as_slice()] {
+            payload.extend_from_slice(&encode_frame(FRAME_PTY_OUTPUT, chunk));
         }
+        writer.write_all(&payload).expect("write frames");
 
-        assert_eq!(batches, vec![b"onetwothree".to_vec()]);
+        assert_eq!(recv_output(&mut event_rx), b"age-flush");
+        assert_eq!(recv_session_io_batch(&mut hub_rx), b"age-flush");
+    }
+
+    #[test]
+    fn output_thresholds_flush_without_waiting_for_eof() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+
+        let mut frame_threshold_payload = Vec::new();
+        for _ in 0..MAX_OUTPUT_FRAMES {
+            frame_threshold_payload.extend_from_slice(&encode_frame(FRAME_PTY_OUTPUT, b"f"));
+        }
+        writer
+            .write_all(&frame_threshold_payload)
+            .expect("write frame-threshold burst");
+        assert_eq!(recv_output(&mut event_rx), vec![b'f'; MAX_OUTPUT_FRAMES]);
+        assert_eq!(
+            recv_session_io_batch(&mut hub_rx),
+            vec![b'f'; MAX_OUTPUT_FRAMES]
+        );
+
+        let byte_threshold_payload = vec![b'x'; MAX_OUTPUT_BYTES];
+        writer
+            .write_all(&encode_frame(FRAME_PTY_OUTPUT, &byte_threshold_payload))
+            .expect("write byte-threshold frame");
+        assert_eq!(recv_output(&mut event_rx), byte_threshold_payload);
+        assert_eq!(recv_session_io_batch(&mut hub_rx), byte_threshold_payload);
+    }
+
+    #[test]
+    fn request_processor_emits_prepared_snapshot_event() {
+        let (_writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, mut hub_rx, _alive) =
+            spawn_test_worker_with_requests(reader);
+
+        request_tx
+            .blocking_send(SessionIoRequest::PrepareSnapshot {
+                request_id: "snapshot-req".to_string(),
+                snapshot: vec![b'x'; 4096],
+                recovery: true,
+            })
+            .expect("send prepare snapshot");
+
+        match hub_rx.blocking_recv().expect("prepared snapshot event") {
+            HubEvent::SessionIo(SessionIoEvent::PreparedSnapshot {
+                request_id,
+                session_uuid,
+                uncompressed_len,
+                payload,
+                recovery,
+            }) => {
+                assert_eq!(request_id, "snapshot-req");
+                assert_eq!(session_uuid, "sess-test-io");
+                assert_eq!(uncompressed_len, 4096);
+                assert!(payload.starts_with(&[0x1f, 0x8b]));
+                assert!(recovery);
+            }
+            other => panic!("expected prepared snapshot event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_processor_emits_paste_file_written_event() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let worktree = temp.path().join("worktree");
+        let manifest_dir = temp
+            .path()
+            .join("workspaces")
+            .join("ws")
+            .join("sessions")
+            .join("sess-test-io");
+        std::fs::create_dir_all(&manifest_dir).expect("manifest dir");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::write(
+            manifest_dir.join("manifest.json"),
+            serde_json::json!({ "worktree_path": worktree })
+                .to_string()
+                .as_bytes(),
+        )
+        .expect("manifest");
+        std::env::set_var("BOTSTER_CONFIG_DIR", temp.path());
+
+        let (_writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, mut hub_rx, _alive) =
+            spawn_test_worker_with_requests(reader);
+
+        request_tx
+            .blocking_send(SessionIoRequest::PasteFile {
+                request_id: "paste-req".to_string(),
+                filename: "screen.PNG".to_string(),
+                data: b"image".to_vec(),
+            })
+            .expect("send paste request");
+
+        match hub_rx.blocking_recv().expect("paste event") {
+            HubEvent::SessionIo(SessionIoEvent::PasteFileWritten {
+                request_id,
+                session_uuid,
+                path,
+                bytes,
+            }) => {
+                assert_eq!(request_id, "paste-req");
+                assert_eq!(session_uuid, "sess-test-io");
+                assert_eq!(bytes, 5);
+                assert!(path.to_string_lossy().contains("sess-test-io"));
+                assert_eq!(std::fs::read(&path).expect("paste file"), b"image");
+                let _ = std::fs::remove_file(path);
+            }
+            other => panic!("expected paste written event, got {other:?}"),
+        }
+        std::env::remove_var("BOTSTER_CONFIG_DIR");
     }
 
     #[test]
@@ -612,6 +977,52 @@ mod tests {
     }
 
     #[test]
+    fn output_flushes_before_bell_notification() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+
+        let mut payload = encode_frame(FRAME_PTY_OUTPUT, b"before-bell");
+        payload.extend_from_slice(&encode_frame(FRAME_BELL, b""));
+        writer.write_all(&payload).expect("write frames");
+
+        assert_eq!(recv_output(&mut event_rx), b"before-bell");
+        assert_eq!(recv_session_io_batch(&mut hub_rx), b"before-bell");
+        match recv_pty_event(&mut event_rx) {
+            PtyEvent::Notification(AgentNotification::Bell) => {}
+            other => panic!("expected bell notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_flushes_before_osc_notification() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+
+        let mut payload = encode_frame(FRAME_PTY_OUTPUT, b"before-notification");
+        payload.extend_from_slice(
+            &encode_json(
+                FRAME_NOTIFICATION,
+                &NotificationPayload {
+                    title: "Build".to_string(),
+                    body: "done".to_string(),
+                },
+            )
+            .expect("notification frame"),
+        );
+        writer.write_all(&payload).expect("write frames");
+
+        assert_eq!(recv_output(&mut event_rx), b"before-notification");
+        assert_eq!(recv_session_io_batch(&mut hub_rx), b"before-notification");
+        match recv_pty_event(&mut event_rx) {
+            PtyEvent::Notification(AgentNotification::Osc777 { title, body }) => {
+                assert_eq!(title, "Build");
+                assert_eq!(body, "done");
+            }
+            other => panic!("expected OSC notification, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn mode_changed_coalesces_sparse_fields_last_value_wins() {
         let (mut writer, reader) = UnixStream::pair().expect("unix pair");
         let (mut event_rx, _response_rx, _hub_rx, _alive) = spawn_test_worker(reader);
@@ -670,6 +1081,29 @@ mod tests {
         }
 
         assert_eq!(exits, vec![Some(0)]);
+    }
+
+    #[test]
+    fn output_flushes_before_process_exit_and_eof_does_not_duplicate_exit() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (mut event_rx, _response_rx, mut hub_rx, alive) = spawn_test_worker(reader);
+
+        let mut payload = encode_frame(FRAME_PTY_OUTPUT, b"before-exit");
+        payload.extend_from_slice(
+            &encode_json(FRAME_PROCESS_EXITED, &serde_json::json!({ "exit_code": 7 }))
+                .expect("encode exit frame"),
+        );
+        writer.write_all(&payload).expect("write frames");
+        writer.shutdown(Shutdown::Both).expect("shutdown writer");
+
+        assert_eq!(recv_output(&mut event_rx), b"before-exit");
+        assert_eq!(recv_session_io_batch(&mut hub_rx), b"before-exit");
+        match recv_hub_event(&mut hub_rx) {
+            HubEvent::SessionProcessExited { exit_code, .. } => assert_eq!(exit_code, Some(7)),
+            other => panic!("expected process exit, got {other:?}"),
+        }
+        wait_for_reader_stop(&alive);
+        assert_no_hub_event(&mut hub_rx);
     }
 
     #[test]

@@ -155,7 +155,7 @@ pub struct ModeFlags {
 ///
 /// Only changed fields are present (None = unchanged). This avoids the hub
 /// needing to re-parse PTY output to detect mode transitions.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModeChanged {
     /// Kitty keyboard protocol toggled.
     #[serde(skip_serializing_if = "Option::is_none")]

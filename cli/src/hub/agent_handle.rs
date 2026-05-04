@@ -232,6 +232,10 @@ pub struct PtyHandle {
     ///
     /// Routes I/O through the session process socket.
     session_connection: Option<crate::session::connection::SharedSessionConnection>,
+
+    /// Test-only snapshot payload used by hub forwarder regression tests.
+    #[cfg(test)]
+    snapshot_override: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for PtyHandle {
@@ -275,6 +279,32 @@ impl PtyHandle {
             last_output_at: Arc::new(AtomicU64::new(0)),
             port,
             session_connection: None,
+            snapshot_override: None,
+        }
+    }
+
+    /// Create a local PTY handle whose snapshot RPC returns a fixed payload.
+    #[must_use]
+    #[cfg(test)]
+    pub fn new_with_snapshot(
+        event_tx: broadcast::Sender<PtyEvent>,
+        shared_state: Arc<Mutex<SharedPtyState>>,
+        kitty_enabled: Arc<AtomicBool>,
+        cursor_visible: Arc<AtomicBool>,
+        resize_pending: Arc<AtomicBool>,
+        port: Option<u16>,
+        snapshot: Vec<u8>,
+    ) -> Self {
+        Self {
+            event_tx,
+            shared_state,
+            kitty_enabled,
+            cursor_visible,
+            resize_pending,
+            last_output_at: Arc::new(AtomicU64::new(0)),
+            port,
+            session_connection: None,
+            snapshot_override: Some(snapshot),
         }
     }
 
@@ -310,6 +340,8 @@ impl PtyHandle {
             last_output_at,
             port,
             session_connection: Some(session_connection),
+            #[cfg(test)]
+            snapshot_override: None,
         }
     }
 
@@ -425,6 +457,11 @@ impl PtyHandle {
     /// Clients import it via `terminal.snapshot_import()`.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {
+        #[cfg(test)]
+        if let Some(snapshot) = &self.snapshot_override {
+            return snapshot.clone();
+        }
+
         if let Some(ref conn) = self.session_connection {
             if let Ok(mut guard) = conn.lock() {
                 if let Some(session) = guard.as_mut() {
@@ -481,6 +518,26 @@ impl PtyHandle {
         session
             .set_color_profile(colors)
             .map_err(|e| format!("Failed to set session color profile: {e:#}"))
+    }
+
+    /// Enqueue a typed request for the session I/O worker mailbox.
+    pub fn enqueue_session_io_request(
+        &self,
+        request: crate::worker::session_io::SessionIoRequest,
+    ) -> Result<(), crate::session::connection::SessionIoRequestEnqueueError> {
+        let Some(ref conn) = self.session_connection else {
+            return Err(
+                crate::session::connection::SessionIoRequestEnqueueError::ConnectionMissing,
+            );
+        };
+
+        let guard = conn.lock().map_err(|_| {
+            crate::session::connection::SessionIoRequestEnqueueError::ConnectionLockPoisoned
+        })?;
+        let session = guard
+            .as_ref()
+            .ok_or(crate::session::connection::SessionIoRequestEnqueueError::ConnectionMissing)?;
+        session.enqueue_session_io_request(request)
     }
 
     // =========================================================================
