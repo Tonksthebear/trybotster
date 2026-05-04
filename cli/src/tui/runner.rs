@@ -1708,6 +1708,23 @@ where
                 session_uuid,
                 state
             );
+            if state == "not_ready" {
+                let session_label = if session_uuid.len() > 8 {
+                    &session_uuid[..8]
+                } else {
+                    session_uuid
+                };
+                self.error_message = Some(format!(
+                    "Terminal session {session_label} is not ready for input yet. Reconnecting session I/O..."
+                ));
+                self.mode = "error".to_string();
+                if let Some(lua) = layout_lua {
+                    if let Err(err) = lua.exec("_tui_state.mode = 'error'") {
+                        log::warn!("[TUI] failed to sync not_ready mode to Lua: {err}");
+                    }
+                }
+                self.dirty = true;
+            }
             return;
         }
 
@@ -4343,6 +4360,33 @@ mod tests {
             0,
             "entity envelopes should not maintain a second Lua entity cache"
         );
+    }
+
+    #[test]
+    fn terminal_attach_not_ready_renders_error_mode() {
+        let (mut runner, _request_rx) = create_test_runner();
+        let lua = make_test_layout_with_keybindings();
+
+        runner.dispatch_hub_event(
+            serde_json::json!({
+                "type": "terminal_attach",
+                "session_uuid": "sess-not-ready-12345",
+                "state": "not_ready"
+            }),
+            Some(&lua),
+        );
+
+        assert_eq!(runner.mode, "error");
+        assert_eq!(lua.eval_string("return _tui_state.mode").unwrap(), "error");
+        assert!(
+            runner
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sess-not"),
+            "error message should identify the not-ready session"
+        );
+        assert!(runner.dirty);
     }
 
     /// Verifies scrollback event clears parser before processing snapshot.

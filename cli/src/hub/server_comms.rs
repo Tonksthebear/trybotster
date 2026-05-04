@@ -1072,6 +1072,12 @@ impl Hub {
                 self.stop_lua_pty_forwarder(&forwarder_key);
             }
             HubControlMessage::Backpressure(backpressure) => {
+                self.hub_event_metrics
+                    .record_counter("client_worker.backpressure", 1);
+                if backpressure.source == "worker.client.session_io_missing" {
+                    self.hub_event_metrics
+                        .record_counter("client_worker.session_io_missing", 1);
+                }
                 log::warn!("[ClientWorker] Backpressure: {backpressure:?}");
             }
             HubControlMessage::Reconnect { .. }
@@ -1489,6 +1495,15 @@ impl Hub {
                 ) {
                     // Spawn per-peer send task so DataChannel sends run off the event loop.
                     self.spawn_webrtc_peer_sender(&browser_identity);
+                    self.queue_webrtc_peer_command(
+                        &browser_identity,
+                        crate::worker::webrtc::WebRtcAdapterCommand::Json {
+                            data: serde_json::to_vec(&serde_json::json!({
+                                "type": "dc_ready",
+                            }))
+                            .expect("static JSON serialization cannot fail"),
+                        },
+                    );
                     let worker = self.spawn_webrtc_client_worker_adapter(browser_identity.clone());
                     self.browser_client_workers
                         .insert(browser_identity.clone(), worker);
@@ -4362,21 +4377,6 @@ impl Hub {
         }
     }
 
-    fn should_force_snapshot_redraw(
-        pty_handle: &crate::hub::agent_handle::PtyHandle,
-        target_rows: u16,
-        target_cols: u16,
-    ) -> bool {
-        if pty_handle.dims() != (target_rows, target_cols) {
-            return false;
-        }
-
-        pty_handle
-            .get_mode_flags()
-            .map(|flags| flags.alt_screen)
-            .unwrap_or(false)
-    }
-
     /// Try to attach a terminal forwarder immediately.
     ///
     /// Returns `true` when attached, `false` when the session is not yet
@@ -4469,25 +4469,7 @@ impl Hub {
             let rpc_started = Instant::now();
             let (snapshot, mut pty_rx) = match tokio::task::spawn_blocking(move || {
                 if pty_for_snapshot.is_session_backed() {
-                    if Self::should_force_snapshot_redraw(
-                        &pty_for_snapshot,
-                        target_rows,
-                        target_cols,
-                    ) {
-                        // Force a redraw pulse for full-screen TUIs. Resizing to the
-                        // same dimensions often does not trigger a redraw path.
-                        // Normal-screen sessions keep real scrollback in the primary
-                        // buffer, so bouncing them by one column can reflow and
-                        // inflate restored history on resume.
-                        let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
-                        pty_for_snapshot.resize_direct(target_rows, bounce_cols);
-                        std::thread::sleep(std::time::Duration::from_millis(25));
-                    }
                     pty_for_snapshot.resize_direct(target_rows, target_cols);
-                    // Sessions redraw asynchronously after SIGWINCH.
-                    // Let a short settle window pass so the binary snapshot
-                    // includes the post-resize redraw.
-                    std::thread::sleep(std::time::Duration::from_millis(125));
                 }
                 let (snapshot, _kitty_enabled, _rows, _cols, pty_rx) =
                     pty_for_snapshot.snapshot_and_subscribe();
@@ -4707,13 +4689,7 @@ impl Hub {
             let rpc_started = Instant::now();
             let snapshot = match tokio::task::spawn_blocking(move || {
                 if pty_handle.is_session_backed() {
-                    if Self::should_force_snapshot_redraw(&pty_handle, target_rows, target_cols) {
-                        let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
-                        pty_handle.resize_direct(target_rows, bounce_cols);
-                        std::thread::sleep(std::time::Duration::from_millis(25));
-                    }
                     pty_handle.resize_direct(target_rows, target_cols);
-                    std::thread::sleep(std::time::Duration::from_millis(125));
                 }
                 pty_handle.get_snapshot()
             })
@@ -5218,17 +5194,7 @@ impl Hub {
             let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, mut pty_rx) =
                 match tokio::task::spawn_blocking(move || {
                     if pty_for_snapshot.is_session_backed() {
-                        if Self::should_force_snapshot_redraw(
-                            &pty_for_snapshot,
-                            target_rows,
-                            target_cols,
-                        ) {
-                            let bounce_cols = if target_cols > 1 { target_cols - 1 } else { 2 };
-                            pty_for_snapshot.resize_direct(target_rows, bounce_cols);
-                            std::thread::sleep(std::time::Duration::from_millis(25));
-                        }
                         pty_for_snapshot.resize_direct(target_rows, target_cols);
-                        std::thread::sleep(std::time::Duration::from_millis(125));
                     }
                     pty_for_snapshot.snapshot_and_subscribe()
                 })
@@ -7023,7 +6989,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use crate::client::{TuiOutput, TuiRequest};
+    use crate::client::{ClientId, TuiOutput, TuiRequest};
     use crate::config::Config;
     use crate::hub::agent_handle::{PtyHandle, SessionHandle, SessionType};
     use crate::hub::{Hub, PendingTerminalAttachRequest};
@@ -7158,6 +7124,32 @@ mod tests {
         SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
     }
 
+    fn test_session_backed_handle_with_snapshot_override(
+        session_uuid: &str,
+        snapshot: Vec<u8>,
+    ) -> SessionHandle {
+        let (session_io_tx, _session_io_rx) =
+            tokio::sync::mpsc::channel::<crate::worker::session_io::SessionIoRequest>(8);
+        let conn = crate::session::connection::SessionConnection::test_with_session_io_sender(
+            session_io_tx,
+        );
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let pty = PtyHandle::new_with_session_snapshot(
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(Mutex::new(Some(conn))),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            24,
+            80,
+            snapshot,
+        );
+        SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
+    }
+
     fn unique_session_uuid(prefix: &str) -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -7206,11 +7198,6 @@ mod tests {
         );
         hub.socket_clients.insert(client_id.to_string(), conn);
         client_stream
-    }
-
-    fn read_test_socket_frame(stream: &mut tokio::net::UnixStream) -> Frame {
-        read_test_socket_frame_matching(stream, Duration::from_secs(2), |_| true)
-            .expect("timed out waiting for socket frame")
     }
 
     fn read_test_socket_frame_matching<F>(
@@ -9145,6 +9132,46 @@ mod tests {
     }
 
     #[test]
+    fn test_terminal_attach_snapshot_paths_have_no_fixed_sleep_settle_windows() {
+        let source = include_str!("server_comms.rs");
+        for function in [
+            "create_lua_pty_forwarder",
+            "refresh_lua_terminal_snapshot",
+            "spawn_terminal_client_forwarder_runtime",
+        ] {
+            let body = function_body(source, function);
+            assert!(
+                !body.contains("thread::sleep"),
+                "{function} must not use fixed sleep windows on the first-attach snapshot path"
+            );
+            assert!(
+                !body.contains("from_millis(125)"),
+                "{function} must not reintroduce the former 125ms attach delay"
+            );
+        }
+    }
+
+    #[test]
+    fn test_missing_session_io_sender_control_records_observable_metric() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+
+        hub.handle_client_worker_control(
+            crate::worker::hub_control::HubControlMessage::Backpressure(
+                crate::worker::hub_control::WorkerBackpressure {
+                    source: "worker.client.session_io_missing",
+                    capacity: 0,
+                    session_uuid: Some("sess-missing-sender".to_string()),
+                    client_id: Some(ClientId::Tui),
+                },
+            ),
+        );
+
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert_eq!(snapshot.counters["client_worker.backpressure"], 1);
+        assert_eq!(snapshot.counters["client_worker.session_io_missing"], 1);
+    }
+
+    #[test]
     fn test_socket_workerized_live_output_reaches_socket_frame() {
         let (mut hub, _request_tx, _output_rx) = e2e_hub();
         let session_uuid = "sess-socket-worker-output".to_string();
@@ -9274,6 +9301,83 @@ mod tests {
             tui_scrollback,
             (24, 80, snapshot, false),
             "both transports should receive the same non-empty snapshot metadata and payload"
+        );
+    }
+
+    #[test]
+    fn test_tui_first_scrollback_latency_budget_session_backed() {
+        let (mut hub, _request_tx, mut output_rx) = e2e_hub();
+        let snapshot: Vec<u8> = (0..500)
+            .map(|idx| format!("scrollback line {idx:03}\r\n"))
+            .collect::<String>()
+            .into_bytes();
+        let mut elapsed_ms = Vec::new();
+
+        for idx in 0..40 {
+            let session_uuid = unique_session_uuid(&format!("sess-tui-latency-{idx}"));
+            register_live_session_identity(&session_uuid);
+
+            hub.handle_cache
+                .add_session(test_session_backed_handle_with_snapshot_override(
+                    &session_uuid,
+                    snapshot.clone(),
+                ));
+
+            let started = Instant::now();
+            hub.create_lua_tui_pty_forwarder(crate::lua::primitives::CreateTuiForwarderRequest {
+                session_uuid: session_uuid.clone(),
+                subscription_id: format!("tui:{session_uuid}"),
+                active_flag: Arc::new(Mutex::new(true)),
+                rows: 24,
+                cols: 80,
+            });
+
+            let received = shared_test_runtime().block_on(async {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                while tokio::time::Instant::now() < deadline {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if let Ok(Some(TuiOutput::Scrollback {
+                        session_uuid: frame_session,
+                        data,
+                        ..
+                    })) = tokio::time::timeout(
+                        remaining.min(Duration::from_millis(50)),
+                        output_rx.recv(),
+                    )
+                    .await
+                    {
+                        if frame_session == session_uuid {
+                            return Some(data);
+                        }
+                    }
+                }
+                None
+            });
+
+            let elapsed = started.elapsed();
+            assert_eq!(
+                received.as_deref(),
+                Some(snapshot.as_slice()),
+                "TUI first scrollback should deliver the live session snapshot"
+            );
+            elapsed_ms.push(elapsed.as_secs_f64() * 1000.0);
+            cleanup_live_session_identity(&session_uuid);
+        }
+
+        elapsed_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p95 = elapsed_ms[((elapsed_ms.len() as f64 * 0.95).ceil() as usize).saturating_sub(1)];
+        let p99 = elapsed_ms[((elapsed_ms.len() as f64 * 0.99).ceil() as usize).saturating_sub(1)];
+
+        assert!(
+            p95 < 250.0,
+            "TUI first scrollback p95 {p95:.2}ms must stay under 250ms; samples={elapsed_ms:?}"
+        );
+        assert!(
+            p99 < 500.0,
+            "TUI first scrollback p99 {p99:.2}ms must stay under 500ms; samples={elapsed_ms:?}"
+        );
+        eprintln!(
+            "TUI first scrollback timing p95={p95:.2}ms p99={p99:.2}ms samples={elapsed_ms:?}"
         );
     }
 
@@ -9625,9 +9729,7 @@ mod tests {
         };
         hub.create_lua_socket_pty_forwarder(req);
 
-        let first = read_test_socket_frame(&mut client_stream);
-        let second = read_test_socket_frame(&mut client_stream);
-        let frames = vec![first, second];
+        let frames = read_test_socket_frames(&mut client_stream, 4, Duration::from_secs(5));
 
         assert!(
             frames.iter().any(|frame| matches!(
