@@ -163,9 +163,6 @@ pub(crate) enum HubEvent {
     /// Outgoing signaling envelope from a WebRTC registry-owned queue forwarder.
     WebRtcOutgoingSignal(crate::channel::webrtc::OutgoingSignal),
 
-    /// PTY output delivery request from a WebRTC registry-owned queue forwarder.
-    WebRtcPtyOutput(crate::hub::WebRtcPtyOutput),
-
     /// Transport egress produced by a browser ClientWorker.
     WebRtcClientWorkerEgress {
         /// Browser identity key for the peer that owns the worker.
@@ -472,7 +469,6 @@ impl HubEvent {
             Self::WebRtcPtyInput(_) => "webrtc_pty_input",
             Self::WebRtcFileInput(_) => "webrtc_file_input",
             Self::WebRtcOutgoingSignal(_) => "webrtc_outgoing_signal",
-            Self::WebRtcPtyOutput(_) => "webrtc_pty_output",
             Self::WebRtcClientWorkerEgress { .. } => "webrtc_client_worker_egress",
             Self::WebRtcStreamFrame(_) => "webrtc_stream_frame",
             Self::UserFileWatch { .. } => "user_file_watch",
@@ -519,9 +515,6 @@ impl HubEvent {
             Self::WebRtcPtyInput(input) => BASE + input.session_uuid.len() + input.data.len(),
             Self::WebRtcFileInput(file) => {
                 BASE + file.session_uuid.len() + file.filename.len() + file.data.len()
-            }
-            Self::WebRtcPtyOutput(output) => {
-                BASE + output.browser_identity.len() + output.session_uuid.len() + output.data.len()
             }
             Self::WebRtcClientWorkerEgress {
                 browser_identity,

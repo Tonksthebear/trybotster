@@ -20,9 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::hub::actions::{self, HubAction};
-use crate::hub::{
-    registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest, WebRtcPtyOutput,
-};
+use crate::hub::{registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest};
 use crate::notifications::push::send_push_direct;
 use base64::Engine;
 
@@ -1099,7 +1097,6 @@ impl Hub {
         self.poll_tui_requests();
         self.poll_pty_input();
         self.poll_outgoing_webrtc_signals();
-        self.poll_webrtc_pty_output();
         self.poll_stream_frames_incoming();
         self.poll_worktree_results();
         self.tick_periodic();
@@ -1329,9 +1326,6 @@ impl Hub {
             }
             HubEvent::WebRtcOutgoingSignal(signal) => {
                 self.handle_webrtc_signal(signal);
-            }
-            HubEvent::WebRtcPtyOutput(output) => {
-                self.process_single_pty_output(output);
             }
             HubEvent::WebRtcClientWorkerEgress {
                 browser_identity,
@@ -3170,41 +3164,6 @@ impl Hub {
         }
     }
 
-    /// Drain and process WebRTC PTY output in a batch.
-    ///
-    /// Called from the event loop when the `select!` branch fires. The first
-    /// message is passed explicitly because `recv().await` already consumed it
-    /// from the channel. It is processed directly before draining the remaining
-    /// buffered messages to preserve FIFO ordering — re-injecting via `send()`
-    /// would place it at the back of the queue, reordering the byte stream.
-    #[cfg(test)]
-    pub fn handle_webrtc_pty_output_batch(
-        &mut self,
-        first: WebRtcPtyOutput,
-        rx: &mut Option<tokio::sync::mpsc::Receiver<WebRtcPtyOutput>>,
-    ) {
-        let started = Instant::now();
-        let queued = rx.as_ref().map_or(0, tokio::sync::mpsc::Receiver::len);
-        let first_len = first.data.len();
-        self.hub_event_metrics
-            .record_high_water("pty_output.batch_hwm", (queued + 1) as u64);
-        // Process the first message directly to preserve ordering.
-        self.process_single_pty_output(first);
-
-        // Temporarily put the receiver back into self for poll_webrtc_pty_output
-        self.webrtc.return_pty_output_receiver_for_test(rx.take());
-        self.poll_webrtc_pty_output();
-        // Extract it back out
-        *rx = self.webrtc.lease_pty_output_receiver_for_test();
-        self.hub_event_metrics.record_span_with_threshold(
-            "pty_output.drain_batch",
-            started.elapsed(),
-            first_len,
-            Self::HOT_SUBHANDLER_SLOW,
-            "select",
-        );
-    }
-
     /// Poll user file watches created by `watch.directory()` in Lua.
     ///
     /// Production uses `HubEvent::UserFileWatch` from blocking forwarder tasks.
@@ -3540,11 +3499,10 @@ impl Hub {
         };
         self.hub_event_metrics.record_counter(reason_counter, 1);
         self.cleanup_pending_session_io_snapshots_for_peer(browser_identity);
-        // Guard against duplicate cleanup calls (e.g. handle_webrtc_send and
-        // poll_webrtc_pty_output both detecting the same dead channel in the
-        // same tick). If the channel is already gone this is a no-op — we must
-        // not fire peer_disconnected a second time or the browser JS state
-        // machine will enter an unrecoverable state and stop reconnecting.
+        // Guard against duplicate cleanup calls. If the channel is already gone
+        // this is a no-op — we must not fire peer_disconnected a second time or
+        // the browser JS state machine will enter an unrecoverable state and
+        // stop reconnecting.
         let disconnect_reason = match reason {
             "timeout" => crate::worker::hub_control::TransportDisconnectReason::ConnectionTimeout,
             "send_failed" => crate::worker::hub_control::TransportDisconnectReason::SendTimeout,
@@ -5879,28 +5837,6 @@ impl Hub {
         }
     }
 
-    /// Queue raw PTY bytes for async delivery to a WebRTC peer.
-    ///
-    /// Non-blocking: pushes a [`WebRtcSendItem::Pty`] into the per-peer send
-    /// channel. The actual compress → encrypt → DataChannel send happens in
-    /// the spawned per-peer task.
-    ///
-    /// Returns `false` if the peer has no send task (not connected) or the
-    /// send task has marked the peer as dead (circuit breaker).
-    fn queue_webrtc_pty_frame(
-        &self,
-        subscription_id: &str,
-        browser_identity: &str,
-        data: Vec<u8>,
-    ) -> crate::worker::webrtc::WebRtcSendOutcome {
-        self.webrtc.queue_pty_frame(
-            subscription_id,
-            browser_identity,
-            data,
-            &self.hub_event_metrics,
-        )
-    }
-
     fn process_webrtc_client_worker_egress(
         &mut self,
         browser_identity: &str,
@@ -6031,181 +5967,6 @@ impl Hub {
     fn spawn_dc_ping_task(&mut self, browser_identity: &str) {
         self.webrtc
             .spawn_liveness_probe(browser_identity, &self.tokio_runtime);
-    }
-
-    /// Process a single PTY output message: run interceptors, send via WebRTC,
-    /// and notify observers inline.
-    fn process_single_pty_output(&mut self, msg: WebRtcPtyOutput) {
-        use crate::lua::primitives::PtyOutputContext;
-
-        #[cfg(test)]
-        {
-            self.pty_output_messages_drained += 1;
-        }
-        self.hub_event_metrics
-            .record_counter("pty_output.messages", 1);
-        self.hub_event_metrics
-            .record_counter("pty_output.bytes", msg.data.len() as u64);
-
-        let ctx = PtyOutputContext {
-            session_uuid: msg.session_uuid.clone(),
-            peer_id: msg.browser_identity.clone(),
-        };
-
-        let final_data = if self.lua.has_interceptors("pty_output") {
-            match self.lua.call_pty_output_interceptors(&ctx, &msg.data) {
-                Ok(Some(transformed)) => transformed,
-                Ok(None) => return,
-                Err(e) => {
-                    log::warn!("PTY interceptor error: {}", e);
-                    msg.data
-                }
-            }
-        } else {
-            msg.data
-        };
-
-        match self.queue_webrtc_pty_frame(
-            &msg.subscription_id,
-            &msg.browser_identity,
-            final_data.clone(),
-        ) {
-            crate::worker::webrtc::WebRtcSendOutcome::Sent => {}
-            crate::worker::webrtc::WebRtcSendOutcome::Backpressure => {
-                let key = format!("{}:{}", msg.browser_identity, msg.session_uuid);
-                self.webrtc.record_backpressure_recovery(
-                    key,
-                    crate::worker::webrtc::BackpressureRecoveryEntry {
-                        browser_identity: msg.browser_identity.clone(),
-                        session_uuid: msg.session_uuid.clone(),
-                        subscription_id: msg.subscription_id.clone(),
-                        last_drop: Instant::now(),
-                    },
-                );
-            }
-            crate::worker::webrtc::WebRtcSendOutcome::Dead => {
-                log::warn!(
-                    "[WebRTC] DataChannel not open for {}, cleaning up dead channel",
-                    &msg.browser_identity[..msg.browser_identity.len().min(8)]
-                );
-                // Immediate cleanup instead of waiting for CleanupTick.
-                self.cleanup_webrtc_peer(&msg.browser_identity, "send_failed");
-                return;
-            }
-        }
-
-        if self.lua.has_observers("pty_output") {
-            self.lua.notify_pty_output_observers(&ctx, &final_data);
-        }
-    }
-
-    /// Uses a circuit breaker: if a send fails because the DataChannel is not
-    /// open, all remaining messages for that peer are skipped (prevents the
-    /// tick loop from being starved by hundreds of failed `block_on` calls).
-    #[cfg(test)]
-    fn poll_webrtc_pty_output(&mut self) {
-        use crate::lua::primitives::PtyOutputContext;
-
-        /// Max messages to process per tick to keep the event loop responsive.
-        const DRAIN_BUDGET: usize = 256;
-
-        // Drain pending PTY output messages (budget-limited)
-        let mut rx = self.webrtc.lease_pty_output_receiver_for_test();
-        let Some(ref mut rx_ref) = rx else {
-            return;
-        };
-        let messages: Vec<WebRtcPtyOutput> = std::iter::from_fn(|| rx_ref.try_recv().ok())
-            .take(DRAIN_BUDGET)
-            .collect();
-        self.webrtc.return_pty_output_receiver_for_test(rx);
-        let drained_len = messages.len();
-        let drained_bytes: usize = messages.iter().map(|msg| msg.data.len()).sum();
-        self.hub_event_metrics
-            .record_counter("pty_output.messages", drained_len as u64);
-        self.hub_event_metrics
-            .record_counter("pty_output.bytes", drained_bytes as u64);
-        self.hub_event_metrics
-            .record_high_water("pty_output.batch_hwm", drained_len as u64);
-
-        // Track how many messages were drained for regression testing.
-        #[cfg(test)]
-        {
-            self.pty_output_messages_drained += messages.len();
-        }
-
-        let has_interceptors = self.lua.has_interceptors("pty_output");
-        let has_observers = self.lua.has_observers("pty_output");
-
-        // Circuit breaker: peers whose DataChannel is dead (skip further sends)
-        let mut dead_peers: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        for msg in messages {
-            // Skip peers with dead DataChannels
-            if dead_peers.contains(&msg.browser_identity) {
-                continue;
-            }
-
-            let ctx = PtyOutputContext {
-                session_uuid: msg.session_uuid.clone(),
-                peer_id: msg.browser_identity.clone(),
-            };
-
-            // Interceptors: sync, opt-in blocking, can transform or drop
-            let final_data = if has_interceptors {
-                match self.lua.call_pty_output_interceptors(&ctx, &msg.data) {
-                    Ok(Some(transformed)) => transformed,
-                    Ok(None) => continue, // Dropped by interceptor
-                    Err(e) => {
-                        log::warn!("PTY interceptor error: {}", e);
-                        msg.data // Fallback to original on error
-                    }
-                }
-            } else {
-                msg.data
-            };
-
-            // Fast path: send to browser immediately
-            match self.queue_webrtc_pty_frame(
-                &msg.subscription_id,
-                &msg.browser_identity,
-                final_data.clone(),
-            ) {
-                crate::worker::webrtc::WebRtcSendOutcome::Sent => {}
-                crate::worker::webrtc::WebRtcSendOutcome::Backpressure => {
-                    let key = format!("{}:{}", msg.browser_identity, msg.session_uuid);
-                    self.webrtc.record_backpressure_recovery(
-                        key,
-                        crate::worker::webrtc::BackpressureRecoveryEntry {
-                            browser_identity: msg.browser_identity.clone(),
-                            session_uuid: msg.session_uuid.clone(),
-                            subscription_id: msg.subscription_id.clone(),
-                            last_drop: Instant::now(),
-                        },
-                    );
-                }
-                crate::worker::webrtc::WebRtcSendOutcome::Dead => {
-                    log::warn!(
-                        "[WebRTC] DataChannel not open for {}, skipping remaining PTY output this tick",
-                        &msg.browser_identity[..msg.browser_identity.len().min(8)]
-                    );
-                    dead_peers.insert(msg.browser_identity.clone());
-                    continue;
-                }
-            }
-
-            // Observers: fire inline — the idle detection hook is cheap
-            // (hash lookup + timer reset). No reason to defer.
-            if has_observers {
-                self.lua.notify_pty_output_observers(&ctx, &final_data);
-            }
-        }
-
-        // Immediately clean up dead peers instead of waiting for the 5-second
-        // CleanupTick. This prevents fd exhaustion from accumulating stale
-        // WebRTC channels that are already known to be dead.
-        for dead_id in &dead_peers {
-            self.cleanup_webrtc_peer(dead_id, "send_failed");
-        }
     }
 
     // === TUI via Lua (Hub-side Processing) ===
@@ -8019,16 +7780,6 @@ mod tests {
         let (subscription_id, data) = recv_next_webrtc_pty_command(&mut hub, &mut command_rx, 0x1f);
         assert_eq!(subscription_id, "sub-output");
         assert!(data.starts_with(&[0x1f, 0x8b]));
-        let mut legacy_rx = hub
-            .webrtc
-            .lease_pty_output_receiver_for_test()
-            .expect("pty output rx");
-        assert!(
-            legacy_rx.try_recv().is_err(),
-            "prepared snapshot must not re-enter WebRtcPtyOutput"
-        );
-        hub.webrtc
-            .return_pty_output_receiver_for_test(Some(legacy_rx));
 
         let snapshot = hub.hub_event_metrics.snapshot();
         assert!(snapshot.spans.contains_key("snapshot.gzip_queue"));
@@ -8835,116 +8586,6 @@ mod tests {
 
         // If we get here without panic, null fields were handled correctly
         // by real Lua handlers via json_to_lua()
-    }
-
-    /// Regression test: `select!` consumes the first message via `recv().await`.
-    ///
-    /// Before the fix, `handle_webrtc_pty_output_batch` did not accept the
-    /// first message — the `select!` arm used `Some(_)` which silently
-    /// discarded it. Since `poll_webrtc_pty_output` then calls `try_recv()`
-    /// to drain remaining messages, single-message arrivals (typical for
-    /// interactive terminal output) were ALL dropped.
-    ///
-    /// This test simulates the exact `select!` sequence:
-    /// 1. Send one message (PTY forwarder)
-    /// 2. `recv()` consumes it (select! wake-up)
-    /// 3. Pass consumed message to `handle_webrtc_pty_output_batch`
-    /// 4. Verify the message was processed (not dropped)
-    #[test]
-    fn test_pty_output_first_message_not_dropped_by_select() {
-        let (mut hub, _request_tx, _output_rx) = e2e_hub();
-
-        assert_eq!(
-            hub.pty_output_messages_drained, 0,
-            "Counter should start at zero"
-        );
-
-        // Craft a PTY output message (prefix 0x01 = terminal data)
-        let msg = super::WebRtcPtyOutput {
-            subscription_id: "sub_test".to_string(),
-            browser_identity: "test-browser-identity".to_string(),
-            data: vec![0x01, 0x41, 0x42, 0x43], // "ABC"
-            session_uuid: "sess-test".to_string(),
-        };
-
-        // Step 1: PTY forwarder sends output
-        hub.webrtc.pty_output_tx().try_send(msg).unwrap();
-
-        // Step 2: Extract rx (as run_event_loop does before select!)
-        let mut rx = hub.webrtc.lease_pty_output_receiver_for_test();
-
-        // Step 3: recv() consumes the first message (as select! does)
-        let first = rx
-            .as_mut()
-            .unwrap()
-            .try_recv()
-            .expect("Should have one message");
-
-        // Channel is now empty — the old code lost `first` here
-        assert!(
-            rx.as_mut().unwrap().try_recv().is_err(),
-            "Channel should be empty after recv"
-        );
-
-        // Step 4: Call batch handler with the consumed first message
-        hub.handle_webrtc_pty_output_batch(first, &mut rx);
-
-        // Step 5: Verify the message was actually processed
-        assert_eq!(
-            hub.pty_output_messages_drained, 1,
-            "The first message must be processed directly, not dropped"
-        );
-
-        // Restore rx for clean drop
-        hub.webrtc.return_pty_output_receiver_for_test(rx);
-    }
-
-    /// Verify multiple PTY output messages in a batch are all processed.
-    ///
-    /// When several messages arrive before the `select!` branch fires, only
-    /// the first is consumed by `recv().await` — the rest are drained by
-    /// `try_recv()`. This test ensures all messages are accounted for.
-    #[test]
-    fn test_pty_output_batch_processes_all_messages() {
-        let (mut hub, _request_tx, _output_rx) = e2e_hub();
-
-        // Send 5 messages
-        for i in 0..5u8 {
-            hub.webrtc
-                .pty_output_tx()
-                .try_send(super::WebRtcPtyOutput {
-                    subscription_id: "sub_test".to_string(),
-                    browser_identity: "test-browser-identity".to_string(),
-                    data: vec![0x01, 0x41 + i],
-                    session_uuid: "sess-test".to_string(),
-                })
-                .unwrap();
-        }
-
-        let mut rx = hub.webrtc.lease_pty_output_receiver_for_test();
-
-        // select! consumes the first
-        let first = rx
-            .as_mut()
-            .unwrap()
-            .try_recv()
-            .expect("Should have messages");
-
-        // 4 remain in the channel
-        hub.handle_webrtc_pty_output_batch(first, &mut rx);
-
-        // All 5 should have been processed (1 direct + 4 drained)
-        assert_eq!(
-            hub.pty_output_messages_drained, 5,
-            "All messages in the batch must be processed"
-        );
-        let snapshot = hub.hub_event_metrics.snapshot();
-        assert_eq!(snapshot.counters["pty_output.messages"], 5);
-        assert_eq!(snapshot.counters["pty_output.bytes"], 10);
-        assert_eq!(snapshot.counters["pty_output.batch_hwm"], 5);
-        assert!(snapshot.spans.contains_key("pty_output.drain_batch"));
-
-        hub.webrtc.return_pty_output_receiver_for_test(rx);
     }
 
     #[test]
