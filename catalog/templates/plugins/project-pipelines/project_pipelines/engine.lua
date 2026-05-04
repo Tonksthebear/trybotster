@@ -38,6 +38,18 @@ local function ticket_branch_for(ticket, fallback)
     return "project-pipelines/" .. base
 end
 
+local function ticket_workspace_name(ticket, fallback)
+    local title = ticket and ticket.title or fallback or "Ticket"
+    title = tostring(title):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    if util.is_blank(title) then
+        title = tostring(ticket and ticket.id or fallback or "Ticket")
+    end
+    if #title > 64 then
+        title = title:sub(1, 61):gsub("%s+$", "") .. "..."
+    end
+    return "Pipeline - " .. title
+end
+
 local M = {}
 
 function M.register_entities()
@@ -284,7 +296,7 @@ local function spawn_step_agent(run, step)
             target_id = run.target_id,
             target_path = run.target_path,
             workspace_id = run.workspace_id,
-            workspace_name = run.workspace_name or "Pipelines",
+            workspace_name = run.workspace_name or ticket_workspace_name(ticket, run.id),
             label = step.name .. " - " .. (ticket and ticket.title or run.id),
             prompt = role_prompt,
             metadata = {
@@ -380,7 +392,7 @@ function M.ask_agent(params, context)
             target_id = resolved.ticket.target_id,
             target_path = resolved.ticket.target_path,
             workspace_id = resolved.run and resolved.run.workspace_id or params.workspace_id,
-            workspace_name = params.workspace_name or (resolved.run and resolved.run.workspace_name) or "Project Management",
+            workspace_name = params.workspace_name or (resolved.run and resolved.run.workspace_name) or ticket_workspace_name(resolved.ticket, question.id),
             label = "Question - " .. resolved.ticket.title,
             prompt = prompt,
             metadata = {
@@ -516,7 +528,7 @@ function M.request_merge(params, context)
             target_id = run.target_id or ticket.target_id,
             target_path = run.target_path or ticket.target_path,
             workspace_id = run.workspace_id or params.workspace_id,
-            workspace_name = params.workspace_name or run.workspace_name or "Project Management",
+            workspace_name = params.workspace_name or run.workspace_name or ticket_workspace_name(ticket, run.id),
             label = "Merge - " .. ticket.title,
             prompt = prompt,
             metadata = {
@@ -744,7 +756,7 @@ function M.start_run(params)
         target_id = params.target_id or ticket.target_id,
         target_path = params.target_path or ticket.target_path,
         workspace_id = params.workspace_id,
-        workspace_name = params.workspace_name,
+        workspace_name = params.workspace_name or ticket_workspace_name(ticket, params.ticket_id),
     }
     local first_step = repo.next_step(run)
     local activation = M.activate_step(run, first_step)

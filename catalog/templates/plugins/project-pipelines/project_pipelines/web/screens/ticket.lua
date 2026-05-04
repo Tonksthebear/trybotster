@@ -106,7 +106,6 @@ local function pipeline_start_controls(ticket, ctx)
                             action = ui.action("project_pipelines.start_ticket_pipeline", {
                                 ticket_id = ticket.id,
                                 pipeline_id = pipeline.id,
-                                workspace_name = "Pipelines",
                             }),
                         },
                     },
