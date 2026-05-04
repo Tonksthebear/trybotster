@@ -96,6 +96,7 @@ class WorkerBridge {
       webrtcTransport.on("connection:stalled", (data) => this.#dispatchEvent({ event: "connection:stalled", ...data }))
       webrtcTransport.on("subscription:message", (data) => this.#dispatchEvent({ event: "subscription:message", ...data }))
       webrtcTransport.on("subscription:confirmed", (data) => this.#dispatchEvent({ event: "subscription:confirmed", ...data }))
+      webrtcTransport.on("subscription:ready", (data) => this.#dispatchEvent({ event: "subscription:ready", ...data }))
       webrtcTransport.on("health", (data) => this.#dispatchEvent({ event: "health", ...data }))
       webrtcTransport.on("browser:state", (data) => this.#dispatchEvent({ event: "browser:state", ...data }))
       webrtcTransport.on("session:invalid", (data) => this.#dispatchEvent({ event: "session:invalid", ...data }))

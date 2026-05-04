@@ -195,6 +195,8 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     )
 
     @cli = start_cli(@hub, temp_dir: preserved_temp_dir)
+    visit current_url
+
     assert_sidebar_connection_status(browser: "connected", wait: 30)
     assert_sidebar_connection_status(hub: "online", wait: 30)
     assert_sidebar_webrtc_connected(wait: 30)
@@ -296,8 +298,11 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
 
   def assert_browser_peer_ready_budget!(label, p95_budget_ms:, p99_budget_ms:)
     samples = []
+    timing_logs = []
     wait_until?(timeout: 5, poll: 0.2) do
-      samples.concat(browser_peer_ready_timings_ms)
+      logs = browser_webrtc_timing_logs
+      timing_logs.concat(logs)
+      samples.concat(browser_peer_ready_timings_ms(logs))
       samples.any?
     end
 
@@ -307,19 +312,24 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     p95 = percentile(samples, 0.95)
     p99 = percentile(samples, 0.99)
 
-    puts "Browser WebRTC #{label} peer-ready timing p95=#{p95}ms p99=#{p99}ms samples=#{samples.inspect}"
+    puts "Browser WebRTC #{label} timing logs: #{timing_logs.map(&:message).inspect}"
+    puts "Browser WebRTC #{label} subscribe-ready timing p95=#{p95}ms p99=#{p99}ms samples=#{samples.inspect}"
 
-    if samples.length >= 20
-      assert_operator p95, :<, p95_budget_ms,
-        "Browser WebRTC #{label} p95 #{p95}ms must stay under #{p95_budget_ms}ms"
-    end
+    assert_operator p95, :<, p95_budget_ms,
+      "Browser WebRTC #{label} p95 #{p95}ms must stay under #{p95_budget_ms}ms"
     assert_operator p99, :<, p99_budget_ms,
       "Browser WebRTC #{label} p99 #{p99}ms must stay under #{p99_budget_ms}ms"
   end
 
-  def browser_peer_ready_timings_ms
-    page.driver.browser.logs.get(:browser).filter_map do |log|
-      match = log.message.match(/peer ready for hub .* in (\d+)ms/i)
+  def browser_webrtc_timing_logs
+    page.driver.browser.logs.get(:browser).select do |log|
+      log.message.include?("[HubRoute] WebRTC")
+    end
+  end
+
+  def browser_peer_ready_timings_ms(logs)
+    logs.filter_map do |log|
+      match = log.message.match(/\[HubRoute\] WebRTC subscribe ready for hub .* in (\d+)ms/)
       match[1].to_i if match
     end
   end
