@@ -68,6 +68,7 @@ class HubPeerConnection {
   #peerConnectPromises = new Map()
   #bundleRefreshPromises = new Map()
   #dataMessageChains = new Map()
+  #serverReadyWaiters = new Map()
   #eventListeners = new Map()
   #subscriptionListeners = new Map()
   #subscriptionIdCounter = 0
@@ -88,6 +89,7 @@ class HubPeerConnection {
         createSession: (hubId, bundle, browserIdentity) =>
           bridge.createSession(String(hubId), bundle, browserIdentity),
         decryptBinary: (hubId, raw) => bridge.decryptBinary(String(hubId), raw),
+        markServerReady: (hubId) => this.#markServerReady(hubId),
       },
       constants: {
         CONTENT_MSG,
@@ -208,6 +210,7 @@ class HubPeerConnection {
       peerSetupTimer: null,
       peerSetupStartedAt: 0,
       offerSentAt: null,
+      serverReady: false,
       recentDirectDisconnects: [],
       forceRelayUntil: 0,
       signalingConnected: true,
@@ -388,6 +391,8 @@ class HubPeerConnection {
     if (conn.dataChannel?.readyState !== "open") {
       await this.#channelProtocol.waitForDataChannel(conn.dataChannel)
     }
+    await this.#waitForServerReady(hubId, conn)
+    const subscribeStartedAt = performance.now()
 
     if (!encryptedBinary) {
       console.error("[WebRTCTransport] subscribe called without encrypted payload")
@@ -396,7 +401,9 @@ class HubPeerConnection {
 
     conn.dataChannel.send(encryptedBinary.buffer)
     await this.#channelProtocol.waitForSubscriptionConfirmed(subscriptionId)
+    const subscribeReadyMs = Math.round(performance.now() - subscribeStartedAt)
     this.#emit("subscription:confirmed", { subscriptionId })
+    this.#emit("subscription:ready", { hubId, subscriptionId, subscribeReadyMs })
 
     return { subscriptionId }
   }
@@ -642,6 +649,7 @@ class HubPeerConnection {
       let peerReadyMs = null
       if (conn) {
         conn.state = TransportState.CONNECTED
+        conn.serverReady = false
         const timingStartedAt = conn.offerSentAt ?? conn.peerSetupStartedAt
         if (timingStartedAt != null) {
           peerReadyMs = Math.round(performance.now() - timingStartedAt)
@@ -669,6 +677,44 @@ class HubPeerConnection {
     dataChannel.onmessage = (event) => {
       this.#enqueueDataChannelMessage(hubId, event.data)
     }
+  }
+
+  #markServerReady(hubId) {
+    const conn = this.#connections.get(hubId)
+    if (conn) {
+      conn.serverReady = true
+    }
+
+    const waiters = this.#serverReadyWaiters.get(hubId) || []
+    this.#serverReadyWaiters.delete(hubId)
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer)
+      waiter.resolve()
+    }
+
+    this.#emit("connection:server-ready", { hubId })
+  }
+
+  #waitForServerReady(hubId, conn, timeoutMs = 3000) {
+    if (conn.serverReady) return Promise.resolve()
+
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        resolve,
+        timer: setTimeout(() => {
+          const waiters = this.#serverReadyWaiters.get(hubId) || []
+          this.#serverReadyWaiters.set(
+            hubId,
+            waiters.filter((entry) => entry !== waiter),
+          )
+          reject(new Error(`DataChannel server ready timeout for hub ${hubId}`))
+        }, timeoutMs),
+      }
+
+      const waiters = this.#serverReadyWaiters.get(hubId) || []
+      waiters.push(waiter)
+      this.#serverReadyWaiters.set(hubId, waiters)
+    })
   }
 
   #enqueueDataChannelMessage(hubId, data) {

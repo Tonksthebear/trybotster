@@ -26,9 +26,10 @@ Date: 2026-05-04
 - `app/frontend/lib/connections/terminal_connection.js`
   - Handles `terminal_attach` frames, emits `terminalAttach`, and surfaces `not_ready` via the existing `error` event as `terminal_not_ready`.
 - `app/frontend/lib/transport/hub_peer_connection.js`
-  - Carries WebRTC offer-to-data-channel-open timing on the `connection:state` event so browser system tests can verify real first-connect/reconnect timing.
+  - Carries WebRTC offer-to-data-channel-open timing on the `connection:state` event.
+  - Waits for the hub-side DataChannel ready marker before measuring subscribe-ready timing, then emits `subscription:ready` after the worker-routed subscribed ack arrives.
 - `app/frontend/lib/connections/hub_route.js`
-  - Emits a page-visible browser timing log for the WebRTC peer-ready span consumed by system tests.
+  - Emits page-visible browser timing logs for peer-ready and subscribe-ready spans consumed by system tests.
 - `app/frontend/test/terminal-connection.test.js`
   - Covers browser-side `terminal_attach` `not_ready` error emission.
 - `docs/diagnostics/workerized-web-tui-connection-repair.md`
@@ -72,15 +73,15 @@ Results:
 - Focused TUI first scrollback timing budget test passed: p95=0.13ms, p99=0.33ms over 40 session-backed samples with 500 lines of scrollback.
 - Focused `terminal_attach` tests passed: 4 passed.
 - Focused `attach_reconnecting` tests passed: 2 passed.
-- Focused frontend tests passed: 2 files, 11 tests.
+- Focused frontend tests passed: 2 files, 12 tests.
 - Full CLI unit suite passed after the returned-finding fixes: 1532 passed, 0 failed, 1 ignored, finished in 185.16s.
 - `cargo build --bin botster` passed. It emitted one existing warning about unused WebRTC registry methods.
 - Browser/WebRTC production-path evidence:
   - Test databases were missing in the worktree, so `bin/rails db:create` was run and created the development/test, queue, and cable databases.
   - `bin/rails db:migrate` then completed successfully.
   - `config/credentials/test.key` was copied from the canonical repo into this worktree per human instruction and is ignored by git.
-  - The targeted system test `bin/rails test test/system/webrtc_connection_test.rb -i 'browser establishes WebRTC connection with CLI'` passed: 1 run, 9 assertions, 0 failures, 0 errors, 0 skips. It recorded `Browser WebRTC first-connect peer-ready timing p95=180ms p99=180ms samples=[180]`.
-  - The targeted reconnect system test `bin/rails test test/system/webrtc_connection_test.rb -i 'browser reconnects after hub reboot with preserved keys'` passed: 1 run, 11 assertions, 0 failures, 0 errors, 0 skips. It recorded `Browser WebRTC reconnect peer-ready timing p95=180ms p99=180ms samples=[180]`.
+  - The targeted system test `bin/rails test test/system/webrtc_connection_test.rb -i 'browser establishes WebRTC connection with CLI'` passed after the returned finding fix: 1 run, 11 assertions, 0 failures, 0 errors, 0 skips. It recorded peer-ready 785ms and `Browser WebRTC first-connect subscribe-ready timing p95=394ms p99=394ms samples=[394]`.
+  - The targeted reconnect system test `bin/rails test test/system/webrtc_connection_test.rb -i 'browser reconnects after hub reboot with preserved keys'` passed after the returned finding fix: 1 run, 13 assertions, 0 failures, 0 errors, 0 skips. It recorded peer-ready 787ms and `Browser WebRTC reconnect subscribe-ready timing p95=396ms p99=396ms samples=[396]`.
 - Non-offline headless hub smoke:
   - First sandboxed `start --headless` failed because the sandbox could not write `~/.botster-dev/.../hub.lock`.
   - Escalated `BOTSTER_ENV=test ./target/debug/botster start --headless` succeeded and logged `Hub ready. Waiting for connections...`.
@@ -107,10 +108,14 @@ Measured p95/p99 budget table:
 | Path | Budget | Observed | Evidence |
 | --- | --- | --- | --- |
 | TUI first scrollback | p95 < 250ms, p99 < 500ms | p95=0.13ms, p99=0.33ms, 40 samples | `./test.sh --unit -- test_tui_first_scrollback_latency_budget_session_backed -- --nocapture` |
-| Browser first connect | p95 < 750ms, p99 < 1500ms | p95=180ms, p99=180ms, 1 real headless-browser sample | `bin/rails test test/system/webrtc_connection_test.rb -i 'browser establishes WebRTC connection with CLI'` |
-| Browser reconnect | p95 < 1000ms, p99 < 2000ms | p95=180ms, p99=180ms, 1 real headless-browser sample | `bin/rails test test/system/webrtc_connection_test.rb -i 'browser reconnects after hub reboot with preserved keys'` |
+| Browser first connect | p95 < 750ms, p99 < 1500ms | p95=394ms, p99=394ms, 1 real headless-browser sample | `bin/rails test test/system/webrtc_connection_test.rb -i 'browser establishes WebRTC connection with CLI'` |
+| Browser reconnect | p95 < 1000ms, p99 < 2000ms | p95=396ms, p99=396ms, 1 real headless-browser sample | `bin/rails test test/system/webrtc_connection_test.rb -i 'browser reconnects after hub reboot with preserved keys'` |
 
-Browser timings are measured from encrypted WebRTC offer send to data-channel open on the real headless Chrome path. The TUI timing harness uses the production session-backed attach branch with a test-only snapshot override so it exercises the live-session path without requiring an external PTY process.
+Browser peer-ready timings are measured from encrypted WebRTC offer send to browser DataChannel open. The pass/fail browser budget is measured after the hub has also processed DataChannel open and sent the `dc_ready` transport marker: hub-side DataChannel ready to encrypted subscribe send to worker-routed subscribed ack. This keeps terminal subscribe ownership in `ClientWorker` while excluding the WebRTC handshake and hub open-event scheduling from the post-handshake subscribe budget.
+
+The returned verifier finding exposed an important measurement bug. Earlier subscribe-ready samples around 1083-1231ms started at `HubRoute` before the browser DataChannel was open; the logs showed `subscribe start` before `peer ready`, so the metric included WebRTC/hub readiness wait. The corrected implementation starts the budget timer inside `HubPeerConnection.subscribe()` only after browser DataChannel open and hub `dc_ready`. The system test now always enforces p95, even with one sample.
+
+The TUI timing harness uses the production session-backed attach branch with a test-only snapshot override so it exercises the live-session path without requiring an external PTY process.
 
 Observed command durations:
 

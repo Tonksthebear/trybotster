@@ -201,6 +201,11 @@ export class HubChannelProtocol {
       return
     }
 
+    if (msg.type === "dc_ready") {
+      this.#callbacks.markServerReady(hubId)
+      return
+    }
+
     if (msg.type === "vapid_pub") {
       this.#callbacks.emit("push:vapid_key", { hubId, key: msg.key })
       return

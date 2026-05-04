@@ -1495,6 +1495,15 @@ impl Hub {
                 ) {
                     // Spawn per-peer send task so DataChannel sends run off the event loop.
                     self.spawn_webrtc_peer_sender(&browser_identity);
+                    self.queue_webrtc_peer_command(
+                        &browser_identity,
+                        crate::worker::webrtc::WebRtcAdapterCommand::Json {
+                            data: serde_json::to_vec(&serde_json::json!({
+                                "type": "dc_ready",
+                            }))
+                            .expect("static JSON serialization cannot fail"),
+                        },
+                    );
                     let worker = self.spawn_webrtc_client_worker_adapter(browser_identity.clone());
                     self.browser_client_workers
                         .insert(browser_identity.clone(), worker);

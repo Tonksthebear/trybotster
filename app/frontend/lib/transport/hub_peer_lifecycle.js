@@ -30,6 +30,7 @@ export class HubPeerLifecycle {
     console.debug(`[WebRTCTransport] Creating peer connection for hub ${hubId}`)
     conn.peerSetupStartedAt = performance.now()
     conn.offerSentAt = null
+    conn.serverReady = false
 
     const iceConfig = await this.#callbacks.getIceConfig(hubId, conn)
     console.debug(
@@ -142,8 +143,8 @@ export class HubPeerLifecycle {
       type: "offer",
       sdp: offer.sdp,
     })
-    subscription.perform("signal", { envelope })
     conn.offerSentAt = performance.now()
+    subscription.perform("signal", { envelope })
     console.debug(
       `[WebRTCTransport] Offer sent for hub ${hubId} in ${Math.round(conn.offerSentAt - conn.peerSetupStartedAt)}ms`,
     )

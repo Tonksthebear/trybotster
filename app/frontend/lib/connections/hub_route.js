@@ -397,6 +397,13 @@ export class HubRoute {
         if (event.hubId !== hubId) return;
         this.#setConnectionMode(event.mode || ConnectionMode.UNKNOWN);
       }),
+      bridge.on("subscription:ready", (event) => {
+        if (event.hubId !== hubId) return;
+        if (event.subscriptionId !== this.subscriptionId) return;
+        if (Number.isFinite(event.subscribeReadyMs) && localStorage.getItem("botster:debug:webrtcTiming") === "1") {
+          console.warn(`[HubRoute] WebRTC subscribe ready for hub ${hubId} in ${event.subscribeReadyMs}ms`);
+        }
+      }),
       bridge.on("session:invalid", (event) => {
         if (event.hubId !== hubId) return;
         this.errorCode = "session_invalid";
@@ -660,6 +667,9 @@ export class HubRoute {
 
     this.subscriptionId = this.computeSubscriptionId();
     this.#setupSubscriptionListeners();
+    if (localStorage.getItem("botster:debug:webrtcTiming") === "1") {
+      console.warn(`[HubRoute] WebRTC subscribe start for hub ${this.getHubId()}`);
+    }
 
     this.#subscriptionPending = bridge.send("subscribe", {
       hubId: this.getHubId(),
