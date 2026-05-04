@@ -181,11 +181,14 @@ selection, and browser/TUI/socket parity through the same `ClientWorker` path.
 These tests assert preserved byte order, bounded hub batch volume, stale
 generation drops, and typed recovery state cleanup at the worker boundary.
 
-The first client-worker runtime accepts the session I/O sender map at start
-time. Production hub wiring that creates or tears down session I/O workers while
-a client worker stays alive should add explicit attach/detach messages for
-those senders before relying on long-lived client workers for dynamic session
-sets.
+`ClientWorkerConfig::session_io_txs` is only an initial seed path. Production
+browser/TUI/socket terminal attach wiring registers per-session
+`SessionIoRequest` senders with `ClientWorkerMessage::RegisterSessionIoSender`
+before `SubscribeSession`, and detaches them with
+`UnregisterSessionIoSender` when a forwarder stops, a WebRTC peer disconnects,
+a session unregisters, or a process exits. The worker removes closed senders on
+input delivery failures so stale session I/O channels do not keep accepting
+client input.
 
 Reconnect generation is tracked by the client worker. Frames wrapped with an
 older generation are dropped before delivery, and reconnect health emits a
@@ -206,10 +209,12 @@ Subscription cleanup remains a hub policy boundary. `ProcessExited` control
 frames are delivered only to subscribed clients; the client worker does not
 auto-unsubscribe after delivery. The hub should send the matching
 `UnsubscribeSession` or detach request when process lifecycle policy says the
-client stream is over. If a client subscribes to the same session UUID with a
-new subscription ID, the worker emits a fresh `AttachClient`; hub routing policy
-must treat that as replacement or the worker should grow an explicit
-old-subscription detach before production traffic depends on this path.
+client stream is over. `UnregisterSessionIoSender` is the canonical dynamic
+cleanup request because the worker owns the active subscription ID and can emit
+the matching `DetachClient`. If a client subscribes to the same session UUID
+with the same subscription ID, the worker treats it as a no-op. If the
+subscription ID changes, the worker emits `DetachClient` for the old ID before
+emitting `AttachClient` for the replacement.
 
 ## Bounded Queues
 
