@@ -87,6 +87,18 @@ pub(crate) enum HubEvent {
     /// session protocol's original frame boundaries.
     SessionIoBatch(crate::worker::session_io::SessionIoBatch),
 
+    /// Session-I/O worker result for non-output mailbox requests.
+    SessionIo(crate::worker::session_io::SessionIoEvent),
+
+    /// Drop a Hub-owned pending session-I/O snapshot request.
+    ///
+    /// Spawned Hub tasks emit this when a snapshot request was reserved in the
+    /// pending map but no worker mailbox request was accepted.
+    DropPendingSessionIoSnapshot {
+        /// Pending snapshot request ID.
+        request_id: String,
+    },
+
     /// Client-worker request that needs hub-owned orchestration state.
     ClientWorkerControl(crate::worker::hub_control::HubControlMessage),
 
@@ -441,6 +453,8 @@ impl HubEvent {
             Self::PtyProcessExited { .. } => "pty_process_exited",
             Self::PtyOutputObserved { .. } => "pty_output_observed",
             Self::SessionIoBatch(_) => "session_io_batch",
+            Self::SessionIo(_) => "session_io",
+            Self::DropPendingSessionIoSnapshot { .. } => "drop_pending_session_io_snapshot",
             Self::ClientWorkerControl(_) => "client_worker_control",
             Self::DcOpened { .. } => "dc_opened",
             Self::WebRtcIngressBackpressure { .. } => "webrtc_ingress_backpressure",

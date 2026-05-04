@@ -234,6 +234,10 @@ pub(crate) struct WebRtcRecoverySnapshotRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WebRtcRecoverySnapshotResult {
     Snapshot(Vec<u8>),
+    PreparedSnapshot {
+        uncompressed_len: usize,
+        payload: Vec<u8>,
+    },
     Empty,
     Failed,
 }
@@ -1281,38 +1285,47 @@ impl WebRtcPeerRegistry {
             return WebRtcRecoveryDispatchOutcome::PeerUnavailable;
         }
 
-        let WebRtcRecoverySnapshotResult::Snapshot(snapshot) = result else {
-            match result {
-                WebRtcRecoverySnapshotResult::Empty => {
-                    metrics.record_counter("snapshot.backpressure_recovery.empty", 1)
+        let payload = match result {
+            WebRtcRecoverySnapshotResult::PreparedSnapshot { payload, .. } => {
+                if payload.is_empty() {
+                    metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
+                    self.backpressure_recovery.remove(&request.request_id);
+                    return WebRtcRecoveryDispatchOutcome::NoPayload;
                 }
-                WebRtcRecoverySnapshotResult::Failed => {
-                    metrics.record_counter("snapshot.backpressure_recovery.failed", 1)
-                }
-                WebRtcRecoverySnapshotResult::Snapshot(_) => unreachable!(),
+                payload
             }
-            self.backpressure_recovery.remove(&request.request_id);
-            return WebRtcRecoveryDispatchOutcome::NoPayload;
+            WebRtcRecoverySnapshotResult::Snapshot(snapshot) => {
+                let gzip_started = Instant::now();
+                let Some(prepared) = crate::worker::session_io::prepare_snapshot_payload(&snapshot)
+                else {
+                    metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
+                    self.backpressure_recovery.remove(&request.request_id);
+                    return WebRtcRecoveryDispatchOutcome::NoPayload;
+                };
+                metrics.record_span_with_threshold(
+                    "snapshot.gzip_queue",
+                    gzip_started.elapsed(),
+                    prepared.uncompressed_len + prepared.payload.len(),
+                    Duration::from_millis(100),
+                    "backpressure_recovery",
+                );
+                prepared.payload
+            }
+            WebRtcRecoverySnapshotResult::Empty => {
+                metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
+                self.backpressure_recovery.remove(&request.request_id);
+                return WebRtcRecoveryDispatchOutcome::NoPayload;
+            }
+            WebRtcRecoverySnapshotResult::Failed => {
+                metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
+                self.backpressure_recovery.remove(&request.request_id);
+                return WebRtcRecoveryDispatchOutcome::NoPayload;
+            }
         };
-
-        let (gzip_started, Some(prepared)) =
-            crate::worker::session_io::timed_prepare_snapshot_payload(&snapshot)
-        else {
-            metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
-            self.backpressure_recovery.remove(&request.request_id);
-            return WebRtcRecoveryDispatchOutcome::NoPayload;
-        };
-        metrics.record_span_with_threshold(
-            "snapshot.gzip_queue",
-            gzip_started.elapsed(),
-            prepared.uncompressed_len + prepared.payload.len(),
-            Duration::from_millis(100),
-            "backpressure_recovery",
-        );
 
         match peer_state.tx.try_send(WebRtcAdapterCommand::Pty {
             subscription_id: request.subscription_id,
-            data: prepared.payload,
+            data: payload,
         }) {
             Ok(()) => {
                 metrics.record_counter("snapshot.backpressure_recovery.sent", 1);

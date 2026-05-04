@@ -8,7 +8,6 @@
 
 use super::{BoundedQueueConfig, RequestId, SessionUuid};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 /// Default bounded mailbox config for session-I/O worker input.
 pub const SESSION_IO_WORKER_QUEUE: BoundedQueueConfig =
@@ -336,14 +335,6 @@ pub(crate) fn prepare_snapshot_payload(snapshot: &[u8]) -> Option<PreparedSnapsh
         uncompressed_len,
         payload,
     })
-}
-
-/// Helper for measuring snapshot preparation without duplicating timing code.
-pub(crate) fn timed_prepare_snapshot_payload(
-    snapshot: &[u8],
-) -> (Instant, Option<PreparedSnapshot>) {
-    let started = Instant::now();
-    (started, prepare_snapshot_payload(snapshot))
 }
 
 fn paste_filename(filename: &str, data: &[u8]) -> String {
