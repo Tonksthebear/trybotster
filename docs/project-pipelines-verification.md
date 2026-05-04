@@ -17,13 +17,13 @@ cd cli && ./test.sh --unit -- session_io_runtime
 # 16 passed; 0 failed
 
 cd cli && ./test.sh --unit -- server_comms
-# 43 passed; 0 failed
+# 55 passed; 0 failed
 
 cd cli && ./test.sh --unit -- worker
-# 45 passed; 0 failed
+# 60 passed; 0 failed
 
 cd cli && ./test.sh --unit
-# 1490 passed; 0 failed; 1 ignored
+# 1516 passed; 0 failed; 1 ignored
 
 rg -n "sleep\\(Duration::from_millis|thread::sleep|tokio::time::sleep" cli/src/worker/session_io_runtime.rs cli/src/hub/server_comms.rs
 # Remaining session_io_runtime sleep matches are sibling tests intentionally
