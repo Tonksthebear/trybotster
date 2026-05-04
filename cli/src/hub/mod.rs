@@ -69,22 +69,6 @@ use crate::lua::LuaRuntime;
 
 const WORKTREE_RESULT_QUEUE_CAPACITY: usize = 256;
 
-/// Queued PTY output message for WebRTC delivery.
-///
-/// Spawned forwarder tasks queue these messages; the main loop drains and sends.
-/// Includes context for hook processing.
-#[derive(Debug)]
-pub struct WebRtcPtyOutput {
-    /// Subscription ID for routing on the browser side.
-    pub subscription_id: String,
-    /// Browser identity for encryption.
-    pub browser_identity: String,
-    /// Raw PTY data (already prefixed with 0x01 for terminal output).
-    pub data: Vec<u8>,
-    /// Session UUID for hook context.
-    pub session_uuid: String,
-}
-
 /// Pending terminal attach request across all client transports.
 #[derive(Debug, Clone)]
 pub(crate) enum PendingTerminalAttachRequest {
@@ -390,14 +374,6 @@ pub struct Hub {
     #[cfg(test)]
     pty_notification_queue: std::sync::Arc<std::sync::Mutex<Vec<PtyNotificationEvent>>>,
 
-    /// Count of PTY output messages processed by `poll_webrtc_pty_output`.
-    ///
-    /// Incremented for each message drained from the channel, regardless of
-    /// whether the WebRTC send succeeds. Used by regression tests to verify
-    /// that messages are not silently dropped by the `select!` pattern.
-    #[cfg(test)]
-    pub(crate) pty_output_messages_drained: usize,
-
     /// Handles for notification watcher tasks, keyed by "{session_uuid}:{session_name}".
     notification_watcher_handles: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
 
@@ -585,8 +561,6 @@ impl Hub {
             lua_hub_client_connections: std::collections::HashMap::new(),
             #[cfg(test)]
             pty_notification_queue: Arc::new(Mutex::new(Vec::new())),
-            #[cfg(test)]
-            pty_output_messages_drained: 0,
             notification_watcher_handles: std::collections::HashMap::new(),
             pending_reconnects: std::collections::HashMap::new(),
             reconnect_generation: 0,
