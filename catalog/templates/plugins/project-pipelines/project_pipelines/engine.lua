@@ -225,10 +225,14 @@ local function spawn_step_agent(run, step)
         "Ticket: " .. (ticket and ticket.title or run.ticket_id),
         "Role instructions: " .. (step.prompt or ""),
         "Use the project_pipelines_current_context MCP tool to inspect ticket, run, gates, reviews, artifacts, findings, questions, and question answers.",
+        "State assumptions explicitly in artifacts/reviews. If the ticket has multiple plausible meanings or you would need to ignore/waive part of it, ask a human question instead of choosing silently.",
+        "Prefer the smallest surgical change that satisfies the ticket intent. Do not add speculative abstractions, optional configurability, broad refactors, or adjacent cleanup unless the ticket requires them.",
+        "Define and preserve verifiable success criteria. Every changed line should trace to the ticket intent, a required convention, or cleanup made necessary by your own change.",
+        "Prove the actual runtime or user path changed. Evidence that code exists is not enough; identify where the production entry point uses the new behavior, or document why the ticket is intentionally scaffold-only.",
         "If you need human help, call project_pipelines_ask_human with a concise blocking question, then wait for a Project Pipelines notification and call project_pipelines_receive_question_answers.",
         "If you need another agent's opinion, call project_pipelines_ask_agent with the specific question and context you want reviewed, then wait for a Project Pipelines notification and call project_pipelines_receive_question_answers.",
         "When work is ready for advancement, submit the required gate evidence with project_pipelines_submit_gate, then call project_pipelines_request_step_advance.",
-        "If you are reviewing, check correctness, regressions, architecture fit, missing tests, documentation gaps, dead code, deprecated code paths, and unwired implementation. Do not accept pre-existing failures as a blanket excuse; require exact evidence that a failure is unrelated or send the work back. Call project_pipelines_submit_review with findings or approval.",
+        "If you are reviewing, check correctness, regressions, architecture fit, missing tests, documentation gaps, overcomplication, hidden assumptions, dead code, deprecated code paths, and unwired implementation. Do not accept pre-existing failures as a blanket excuse; require exact evidence that a failure is unrelated or send the work back. Call project_pipelines_submit_review with findings or approval.",
     }, "\n\n")
 
     if existing and existing.agent_session_uuid and Agent.get(existing.agent_session_uuid) then
@@ -483,6 +487,11 @@ function M.request_merge(params, context)
         "Merge policy: " .. merge_policy,
         "You are the final acceptance gate, not just a Git operator. Re-read the ticket title, ticket description, latest run context, final signoff, review findings, artifacts, branch diff, tests, docs, and merge target before merging.",
         "Judge the work against the intent and meaning of the ticket, not only the literal checklist. If the ticket asked for a new architecture, replacement, or cleanup, verify the old architecture, dead paths, deprecated code, stale docs, stale tests, compatibility shims, and contradictory examples are removed or explicitly human-waived.",
+        "Reject hidden assumptions, speculative scope, broad unrelated refactors, or overcomplicated implementation unless the ticket or a human-approved waiver justifies them.",
+        "Reject weak evidence. Success criteria must be explicit and verified; evidence must prove the actual production/user/runtime path uses the change, not merely that new helpers, modules, or tests exist.",
+        "For runtime, async, data-plane, control-plane, UI-routing, permission, or architecture migration work, require production path proof: entry point, actor/mailbox or controller/job/component path, fallback behavior, old direct path removed or test-fenced, and logs/tests/smoke evidence exercising the path.",
+        "Treat stub wiring as incomplete. A new mailbox, component, policy, or helper that immediately delegates to the old production path is not accepted unless the ticket explicitly says scaffold-only or a human waived it.",
+        "For hot attach/connect/snapshot/input paths, require explicit latency or race evidence when relevant. New or retained fixed sleeps on hot paths require measurement-backed justification.",
         "All actionable review findings must be resolved or explicitly human-waived before merge. Do not accept 'acceptable workaround', 'future follow-up', 'not necessary', or similar reasoning from an agent unless you agree it is outside the ticket intent or a human has waived it through Project Pipelines questions.",
         "Be proactive about the affected surface area. Confirm the implementation is wired into the actual runtime paths, not merely added beside the old behavior.",
         "Use the repo's conventions for merge strategy and verification.",

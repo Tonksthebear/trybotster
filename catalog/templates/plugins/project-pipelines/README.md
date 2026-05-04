@@ -259,6 +259,15 @@ removed/deprecated paths before merging. They should include `merge_commit`,
 `pr_url`, or `merge_summary` when calling `project_pipelines_close_ticket` with
 `merge_confirmed=true`.
 
+Every pipeline handoff should bias toward disciplined, verifiable work:
+assumptions are explicit, changes are surgical, speculative abstractions are
+rejected, and success criteria are proven before advancement. For runtime,
+async, permission, UI-routing, data-plane, control-plane, and architecture
+migration tickets, gate evidence must prove the actual production path uses the
+new behavior; code shape alone is not acceptance. Stub wiring that delegates
+back to the old production path is incomplete unless the ticket is explicitly
+scaffold-only or a human waiver is recorded.
+
 Tickets can optionally depend on other tickets. A ticket with open dependencies cannot start a pipeline run until each dependency ticket is closed. Project tickets remain visible from the project page; the sidebar ticket list shows standalone tickets only, plus notification badges when their associated sessions need attention.
 
 ## Persistence And Evolution
