@@ -207,7 +207,7 @@ class HubPeerConnection {
       iceConfigPromise: null,
       peerSetupTimer: null,
       peerSetupStartedAt: 0,
-      offerSentAt: 0,
+      offerSentAt: null,
       recentDirectDisconnects: [],
       forceRelayUntil: 0,
       signalingConnected: true,
@@ -639,17 +639,20 @@ class HubPeerConnection {
     dataChannel.onopen = () => {
       console.debug(`[WebRTCTransport] DataChannel open for hub ${hubId}`)
       const conn = this.#connections.get(hubId)
+      let peerReadyMs = null
       if (conn) {
         conn.state = TransportState.CONNECTED
-        if (conn.peerSetupStartedAt) {
+        const timingStartedAt = conn.offerSentAt ?? conn.peerSetupStartedAt
+        if (timingStartedAt != null) {
+          peerReadyMs = Math.round(performance.now() - timingStartedAt)
           console.debug(
-            `[WebRTCTransport] Peer ready for hub ${hubId} in ${Math.round(performance.now() - conn.peerSetupStartedAt)}ms`,
+            `[WebRTCTransport] Peer ready for hub ${hubId} in ${peerReadyMs}ms`,
           )
         }
       }
 
       const mode = conn?.mode
-      this.#emit("connection:state", { hubId, state: "connected", mode })
+      this.#emit("connection:state", { hubId, state: "connected", mode, peerReadyMs })
       if (mode) this.#emit("connection:mode", { hubId, mode })
     }
 

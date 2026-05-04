@@ -29,7 +29,7 @@ export class HubPeerLifecycle {
 
     console.debug(`[WebRTCTransport] Creating peer connection for hub ${hubId}`)
     conn.peerSetupStartedAt = performance.now()
-    conn.offerSentAt = 0
+    conn.offerSentAt = null
 
     const iceConfig = await this.#callbacks.getIceConfig(hubId, conn)
     console.debug(
@@ -254,7 +254,7 @@ export class HubPeerLifecycle {
     conn.nextFileTransferId = 0
     conn.lastStalledAt = 0
     conn.peerSetupStartedAt = 0
-    conn.offerSentAt = 0
+    conn.offerSentAt = null
   }
 
   cleanupPeer(hubId, _conn, reason) {

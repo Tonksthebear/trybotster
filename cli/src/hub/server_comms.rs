@@ -7115,6 +7115,32 @@ mod tests {
         SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
     }
 
+    fn test_session_backed_handle_with_snapshot_override(
+        session_uuid: &str,
+        snapshot: Vec<u8>,
+    ) -> SessionHandle {
+        let (session_io_tx, _session_io_rx) =
+            tokio::sync::mpsc::channel::<crate::worker::session_io::SessionIoRequest>(8);
+        let conn = crate::session::connection::SessionConnection::test_with_session_io_sender(
+            session_io_tx,
+        );
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let pty = PtyHandle::new_with_session_snapshot(
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(Mutex::new(Some(conn))),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            24,
+            80,
+            snapshot,
+        );
+        SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
+    }
+
     fn unique_session_uuid(prefix: &str) -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -9266,6 +9292,83 @@ mod tests {
             tui_scrollback,
             (24, 80, snapshot, false),
             "both transports should receive the same non-empty snapshot metadata and payload"
+        );
+    }
+
+    #[test]
+    fn test_tui_first_scrollback_latency_budget_session_backed() {
+        let (mut hub, _request_tx, mut output_rx) = e2e_hub();
+        let snapshot: Vec<u8> = (0..500)
+            .map(|idx| format!("scrollback line {idx:03}\r\n"))
+            .collect::<String>()
+            .into_bytes();
+        let mut elapsed_ms = Vec::new();
+
+        for idx in 0..40 {
+            let session_uuid = unique_session_uuid(&format!("sess-tui-latency-{idx}"));
+            register_live_session_identity(&session_uuid);
+
+            hub.handle_cache
+                .add_session(test_session_backed_handle_with_snapshot_override(
+                    &session_uuid,
+                    snapshot.clone(),
+                ));
+
+            let started = Instant::now();
+            hub.create_lua_tui_pty_forwarder(crate::lua::primitives::CreateTuiForwarderRequest {
+                session_uuid: session_uuid.clone(),
+                subscription_id: format!("tui:{session_uuid}"),
+                active_flag: Arc::new(Mutex::new(true)),
+                rows: 24,
+                cols: 80,
+            });
+
+            let received = shared_test_runtime().block_on(async {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                while tokio::time::Instant::now() < deadline {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if let Ok(Some(TuiOutput::Scrollback {
+                        session_uuid: frame_session,
+                        data,
+                        ..
+                    })) = tokio::time::timeout(
+                        remaining.min(Duration::from_millis(50)),
+                        output_rx.recv(),
+                    )
+                    .await
+                    {
+                        if frame_session == session_uuid {
+                            return Some(data);
+                        }
+                    }
+                }
+                None
+            });
+
+            let elapsed = started.elapsed();
+            assert_eq!(
+                received.as_deref(),
+                Some(snapshot.as_slice()),
+                "TUI first scrollback should deliver the live session snapshot"
+            );
+            elapsed_ms.push(elapsed.as_secs_f64() * 1000.0);
+            cleanup_live_session_identity(&session_uuid);
+        }
+
+        elapsed_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p95 = elapsed_ms[((elapsed_ms.len() as f64 * 0.95).ceil() as usize).saturating_sub(1)];
+        let p99 = elapsed_ms[((elapsed_ms.len() as f64 * 0.99).ceil() as usize).saturating_sub(1)];
+
+        assert!(
+            p95 < 250.0,
+            "TUI first scrollback p95 {p95:.2}ms must stay under 250ms; samples={elapsed_ms:?}"
+        );
+        assert!(
+            p99 < 500.0,
+            "TUI first scrollback p99 {p99:.2}ms must stay under 500ms; samples={elapsed_ms:?}"
+        );
+        eprintln!(
+            "TUI first scrollback timing p95={p95:.2}ms p99={p99:.2}ms samples={elapsed_ms:?}"
         );
     }
 
