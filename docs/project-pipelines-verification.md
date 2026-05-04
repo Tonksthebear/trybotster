@@ -1,5 +1,51 @@
 # Project Pipelines Verification
 
+## 2026-05-04 Workerized Session I/O Timing Regression Verification
+
+Scope:
+
+- Deterministic workerized `SessionIoRuntime` output coalescing tests.
+- Explicit 4 ms age-based flush, 16-frame flush, and 32 KiB flush coverage.
+- Bell, OSC notification, and process-exit ordered flush boundaries.
+- Lua `pty_output` observer byte-order and total-byte assertions for
+  `SessionIoBatch` coalesced chunks.
+
+Commands and results:
+
+```bash
+cd cli && ./test.sh --unit -- session_io_runtime
+# 16 passed; 0 failed
+
+cd cli && ./test.sh --unit -- server_comms
+# 55 passed; 0 failed
+
+cd cli && ./test.sh --unit -- worker
+# 60 passed; 0 failed
+
+cd cli && ./test.sh --unit
+# 1516 passed; 0 failed; 1 ignored
+
+rg -n "sleep\\(Duration::from_millis|thread::sleep|tokio::time::sleep" cli/src/worker/session_io_runtime.rs cli/src/hub/server_comms.rs
+# Remaining session_io_runtime sleep matches are sibling tests intentionally
+# left out of this ticket's scope per plan review; server_comms matches are
+# unrelated existing retry/backoff and async fixture waits.
+
+rg -n "pty_output|SessionIoBatch|FRAME_BELL|FRAME_NOTIFICATION|FRAME_PROCESS_EXITED|output_age_flushes|output_thresholds_flush|output_flushes_before" cli/src/worker/session_io_runtime.rs cli/src/hub/server_comms.rs
+# Confirmed new regression coverage is wired to the worker output thresholds,
+# structured frame boundaries, SessionIoBatch handling, and Lua pty_output hook.
+```
+
+Notes:
+
+- CLI verification used `cli/test.sh`, not raw `cargo test`, so
+  `BOTSTER_ENV=test` was set for all Rust/Lua slices.
+- The touched `coalesces_synthetic_output_burst_before_hub_delivery` test now
+  receives the hub batch through a bounded helper instead of draining after
+  writer shutdown with an immediate `try_recv`.
+- The explicit 4 ms test keeps the stream open and stays below the 16-frame and
+  32 KiB thresholds, so it exercises the age-triggered flush path without EOF.
+- No UI surface changed; `tmp/tailwind_plus_preview` was not applicable.
+
 ## 2026-05-02 TUI/Socket Client Worker Transport Verification
 
 Scope:
