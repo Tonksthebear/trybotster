@@ -17,8 +17,6 @@ use super::client::{ClientControlFrame, ClientWorkerMessage};
 use super::hub_control::HubControlMessage;
 use super::transport::{TransportAdapter, TransportEgress, TransportIngress};
 
-/// Capacity for PTY output messages queued from forwarder tasks.
-pub(crate) const WEBRTC_PTY_OUTPUT_QUEUE_CAPACITY: usize = 2048;
 /// Capacity for outgoing ActionCable signaling envelopes from WebRTC tasks.
 pub(crate) const WEBRTC_OUTGOING_SIGNAL_QUEUE_CAPACITY: usize = 512;
 /// Capacity for incoming stream multiplexer frames.
@@ -141,17 +139,6 @@ impl PeerBurstState {
     }
 }
 
-/// Result of attempting to queue a PTY frame for WebRTC delivery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WebRtcSendOutcome {
-    /// Frame queued successfully.
-    Sent,
-    /// Per-peer channel full; frame was dropped.
-    Backpressure,
-    /// Peer is dead or disconnected.
-    Dead,
-}
-
 /// Entry tracking a peer+session that needs a recovery snapshot.
 #[derive(Debug, Clone)]
 pub(crate) struct BackpressureRecoveryEntry {
@@ -215,7 +202,6 @@ pub(crate) enum WebRtcOfferCompletionOutcome {
 
 #[derive(Debug, Clone)]
 pub(crate) enum WebRtcIngressOutcome {
-    PongQueued,
     PongObserved,
     TerminalColorProfile(serde_json::Value),
     LuaMessage(serde_json::Value),
@@ -255,8 +241,6 @@ pub(crate) struct WebRtcPeerRegistry {
     offer_generation: HashMap<String, u64>,
     pending_ice_candidates: HashMap<String, Vec<(u64, serde_json::Value)>>,
     ratchet_restarted_peers: HashSet<String>,
-    pty_output_tx: tokio::sync::mpsc::Sender<crate::hub::WebRtcPtyOutput>,
-    pty_output_rx: Option<tokio::sync::mpsc::Receiver<crate::hub::WebRtcPtyOutput>>,
     backpressure_recovery: HashMap<String, BackpressureRecoveryEntry>,
     outgoing_signal_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::OutgoingSignal>,
     outgoing_signal_rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::OutgoingSignal>>,
@@ -324,6 +308,52 @@ impl WebRtcTransportRunner {
         let ingress = match msg_type {
             Some("dc_ping") => TransportIngress::DcPing,
             Some("dc_pong") => TransportIngress::DcPong,
+            Some("subscribe")
+                if msg.get("channel").and_then(|v| v.as_str()) == Some("terminal") =>
+            {
+                let Some(session_uuid) = msg
+                    .pointer("/params/session_uuid")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+                else {
+                    return WebRtcIngressOutcome::LuaMessage(msg);
+                };
+                let subscription_id = msg
+                    .get("subscriptionId")
+                    .or_else(|| msg.get("subscription_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&session_uuid)
+                    .to_string();
+                TransportIngress::Subscribe {
+                    session_uuid,
+                    subscription_id,
+                }
+            }
+            Some("unsubscribe") => {
+                let subscription_id = msg
+                    .get("subscriptionId")
+                    .or_else(|| msg.get("subscription_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let session_uuid = msg
+                    .get("session_uuid")
+                    .or_else(|| msg.pointer("/params/session_uuid"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        subscription_id
+                            .strip_prefix("terminal_")
+                            .map(ToString::to_string)
+                    });
+                let Some(session_uuid) = session_uuid else {
+                    return WebRtcIngressOutcome::LuaMessage(msg);
+                };
+                TransportIngress::Unsubscribe {
+                    session_uuid,
+                    subscription_id,
+                }
+            }
             Some("focus_changed") => {
                 let session_uuid = msg
                     .get("session_uuid")
@@ -346,19 +376,9 @@ impl WebRtcTransportRunner {
         let msg = match client_message {
             ClientWorkerMessage::ControlFrame(ClientControlFrame::BoundaryJson(value)) => value,
             ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPong) => {
-                let pong = serde_json::to_vec(&crate::worker::transport::egress_dc_pong())
-                    .expect("static JSON serialization cannot fail");
-                if self
-                    .command_tx
-                    .try_send(WebRtcAdapterCommand::Json { data: pong })
-                    .is_err()
-                {
-                    log::debug!(
-                        "[WebRTC] Failed to queue dc_pong for {}",
-                        &self.browser_identity[..self.browser_identity.len().min(8)]
-                    );
-                }
-                return WebRtcIngressOutcome::PongQueued;
+                return WebRtcIngressOutcome::ClientWorker(ClientWorkerMessage::ControlFrame(
+                    ClientControlFrame::DcPong,
+                ));
             }
             ClientWorkerMessage::ControlFrame(ClientControlFrame::DcPongReceived) => {
                 return WebRtcIngressOutcome::PongObserved;
@@ -444,8 +464,6 @@ impl WebRtcPeerRegistry {
     /// Build a registry with all hot-path queues bounded.
     #[must_use]
     pub(crate) fn new() -> Self {
-        let (pty_output_tx, pty_output_rx) =
-            tokio::sync::mpsc::channel(WEBRTC_PTY_OUTPUT_QUEUE_CAPACITY);
         let (outgoing_signal_tx, outgoing_signal_rx) =
             tokio::sync::mpsc::channel(WEBRTC_OUTGOING_SIGNAL_QUEUE_CAPACITY);
         let (stream_frame_tx, stream_frame_rx) =
@@ -466,8 +484,6 @@ impl WebRtcPeerRegistry {
             offer_generation: HashMap::new(),
             pending_ice_candidates: HashMap::new(),
             ratchet_restarted_peers: HashSet::new(),
-            pty_output_tx,
-            pty_output_rx: Some(pty_output_rx),
             backpressure_recovery: HashMap::new(),
             outgoing_signal_tx,
             outgoing_signal_rx: Some(outgoing_signal_rx),
@@ -480,10 +496,6 @@ impl WebRtcPeerRegistry {
             queue_forwarders: Vec::new(),
             runners: HashMap::new(),
         }
-    }
-
-    pub(crate) fn pty_output_tx(&self) -> tokio::sync::mpsc::Sender<crate::hub::WebRtcPtyOutput> {
-        self.pty_output_tx.clone()
     }
 
     pub(crate) fn outgoing_signal_tx(
@@ -558,19 +570,6 @@ impl WebRtcPeerRegistry {
                 }
             }));
         }
-        if let Some(mut rx) = self.pty_output_rx.take() {
-            let tx = hub_event_tx.clone();
-            self.queue_forwarders.push(runtime.spawn(async move {
-                while let Some(output) = rx.recv().await {
-                    if tx
-                        .send(crate::hub::events::HubEvent::WebRtcPtyOutput(output))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }));
-        }
         if let Some(mut rx) = self.stream_frame_rx.take() {
             self.queue_forwarders.push(runtime.spawn(async move {
                 while let Some(frame) = rx.recv().await {
@@ -613,21 +612,6 @@ impl WebRtcPeerRegistry {
         rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::OutgoingSignal>>,
     ) {
         self.outgoing_signal_rx = rx;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn lease_pty_output_receiver_for_test(
-        &mut self,
-    ) -> Option<tokio::sync::mpsc::Receiver<crate::hub::WebRtcPtyOutput>> {
-        self.pty_output_rx.take()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn return_pty_output_receiver_for_test(
-        &mut self,
-        rx: Option<tokio::sync::mpsc::Receiver<crate::hub::WebRtcPtyOutput>>,
-    ) {
-        self.pty_output_rx = rx;
     }
 
     #[cfg(test)]
@@ -1142,48 +1126,6 @@ impl WebRtcPeerRegistry {
         )
     }
 
-    pub(crate) fn queue_pty_frame(
-        &self,
-        subscription_id: &str,
-        browser_identity: &str,
-        data: Vec<u8>,
-        metrics: &crate::hub::events::HubEventMetrics,
-    ) -> WebRtcSendOutcome {
-        let Some(state) = self.send_tasks.get(browser_identity) else {
-            metrics.record_counter("webrtc_send.dead_peer", 1);
-            return WebRtcSendOutcome::Dead;
-        };
-
-        if state.dead.load(std::sync::atomic::Ordering::Relaxed) {
-            metrics.record_counter("webrtc_send.dead_peer", 1);
-            return WebRtcSendOutcome::Dead;
-        }
-
-        match state.tx.try_send(WebRtcAdapterCommand::Pty {
-            subscription_id: subscription_id.to_string(),
-            data,
-        }) {
-            Ok(()) => {
-                metrics.record_counter("webrtc_send.queued", 1);
-                WebRtcSendOutcome::Sent
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                metrics.record_counter("webrtc_send.full", 1);
-                log::warn!(
-                    "[WebRTC] Backpressure: send channel full for peer {}, dropping PTY frame for subscription {}",
-                    &browser_identity[..browser_identity.len().min(8)],
-                    &subscription_id[..subscription_id.len().min(20)]
-                );
-                WebRtcSendOutcome::Backpressure
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                metrics.record_counter("webrtc_send.closed", 1);
-                state.dead.store(true, std::sync::atomic::Ordering::Relaxed);
-                WebRtcSendOutcome::Dead
-            }
-        }
-    }
-
     pub(crate) fn queue_command(
         &self,
         peer_id: &str,
@@ -1674,6 +1616,67 @@ impl WebRtcTransportAdapter {
     pub(crate) fn new(client_id: ClientId) -> Self {
         Self { client_id }
     }
+
+    #[must_use]
+    pub(crate) fn egress_to_command(egress: TransportEgress) -> Option<WebRtcAdapterCommand> {
+        match egress {
+            TransportEgress::TerminalBytes {
+                subscription_id,
+                data,
+                ..
+            }
+            | TransportEgress::Scrollback {
+                subscription_id,
+                data,
+                ..
+            } => Some(WebRtcAdapterCommand::Pty {
+                subscription_id,
+                data,
+            }),
+            TransportEgress::ProcessExited {
+                subscription_id,
+                session_uuid,
+                ..
+            } => serde_json::to_vec(&serde_json::json!({
+                "type": "process_exited",
+                "subscriptionId": subscription_id,
+                "session_uuid": session_uuid,
+            }))
+            .ok()
+            .map(|data| WebRtcAdapterCommand::Json { data }),
+            TransportEgress::Pong { request_id } => {
+                serde_json::to_vec(&crate::worker::transport::egress_pong(request_id))
+                    .ok()
+                    .map(|data| WebRtcAdapterCommand::Json { data })
+            }
+            TransportEgress::TerminalAttach {
+                subscription_id,
+                session_uuid,
+                state,
+            } => serde_json::to_vec(&crate::worker::transport::egress_terminal_attach(
+                subscription_id,
+                session_uuid,
+                state,
+            ))
+            .ok()
+            .map(|data| WebRtcAdapterCommand::Json { data }),
+            TransportEgress::DcPong => {
+                serde_json::to_vec(&crate::worker::transport::egress_dc_pong())
+                    .ok()
+                    .map(|data| WebRtcAdapterCommand::Json { data })
+            }
+            TransportEgress::BoundaryJson(value) => serde_json::to_vec(&value)
+                .ok()
+                .map(|data| WebRtcAdapterCommand::Json { data }),
+            TransportEgress::Binary(data) => Some(WebRtcAdapterCommand::Binary { data }),
+            TransportEgress::Snapshot { .. }
+            | TransportEgress::ModeChanged { .. }
+            | TransportEgress::KittyChanged { .. }
+            | TransportEgress::FocusReportingChanged { .. }
+            | TransportEgress::FocusChanged { .. }
+            | TransportEgress::Close { .. } => None,
+        }
+    }
 }
 
 impl TransportAdapter for WebRtcTransportAdapter {
@@ -1721,10 +1724,6 @@ mod tests {
     fn registry_uses_bounded_queues() {
         let registry = WebRtcPeerRegistry::new();
 
-        assert_eq!(
-            registry.pty_output_tx.max_capacity(),
-            WEBRTC_PTY_OUTPUT_QUEUE_CAPACITY
-        );
         assert_eq!(
             registry.outgoing_signal_tx.max_capacity(),
             WEBRTC_OUTGOING_SIGNAL_QUEUE_CAPACITY
