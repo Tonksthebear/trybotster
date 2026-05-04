@@ -109,38 +109,21 @@ impl Hub {
 
     fn spawn_tui_client_worker_adapter(
         &self,
-        session_uuid: String,
-        pty_handle: crate::hub::agent_handle::PtyHandle,
         output_tx: tokio::sync::mpsc::UnboundedSender<crate::client::TuiOutput>,
     ) -> crate::worker::client::ClientWorkerHandle {
         use crate::worker::client::{ClientWorker, ClientWorkerConfig};
         use crate::worker::hub_control::HUB_CONTROL_QUEUE;
-        use crate::worker::session_io::SessionIoRequest;
         use crate::worker::transport::{TransportEgress, TuiTransportAdapter};
 
         let (hub_control_tx, mut hub_control_rx) =
             tokio::sync::mpsc::channel(HUB_CONTROL_QUEUE.capacity);
         let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<TransportEgress>(4096);
-        let (session_io_tx, mut session_io_rx) =
-            tokio::sync::mpsc::channel(crate::worker::session_io::SESSION_IO_WORKER_QUEUE.capacity);
         let wake_fd = self.tui_wake_fd;
-        let mut session_io_txs = std::collections::HashMap::new();
-        session_io_txs.insert(session_uuid, session_io_tx);
         let hub_event_tx = self.hub_event_tx.clone();
 
         tokio::spawn(async move {
             while let Some(message) = hub_control_rx.recv().await {
                 let _ = hub_event_tx.send(super::events::HubEvent::ClientWorkerControl(message));
-            }
-        });
-
-        tokio::spawn(async move {
-            while let Some(request) = session_io_rx.recv().await {
-                if let SessionIoRequest::PtyInput { data } = request {
-                    if let Err(e) = pty_handle.write_input_direct(&data) {
-                        log::error!("[Lua-TUI] Worker PTY write failed: {e}");
-                    }
-                }
             }
         });
 
@@ -162,7 +145,7 @@ impl Hub {
             crate::client::ClientId::Tui,
             hub_control_tx,
             outbound_tx,
-            session_io_txs,
+            std::collections::HashMap::new(),
         );
         config.outbound =
             crate::worker::BoundedQueueConfig::new("worker.client.tui.outbound", 4096);
@@ -217,22 +200,15 @@ impl Hub {
     fn spawn_socket_client_worker_adapter(
         &self,
         client_id: String,
-        session_uuid: String,
-        pty_handle: crate::hub::agent_handle::PtyHandle,
         frame_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     ) -> crate::worker::client::ClientWorkerHandle {
         use crate::worker::client::{ClientWorker, ClientWorkerConfig};
         use crate::worker::hub_control::HUB_CONTROL_QUEUE;
-        use crate::worker::session_io::SessionIoRequest;
         use crate::worker::transport::{SocketFrameAdapter, TransportEgress};
 
         let (hub_control_tx, mut hub_control_rx) =
             tokio::sync::mpsc::channel(HUB_CONTROL_QUEUE.capacity);
         let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<TransportEgress>(512);
-        let (session_io_tx, mut session_io_rx) =
-            tokio::sync::mpsc::channel(crate::worker::session_io::SESSION_IO_WORKER_QUEUE.capacity);
-        let mut session_io_txs = std::collections::HashMap::new();
-        session_io_txs.insert(session_uuid, session_io_tx);
         let hub_event_tx = self.hub_event_tx.clone();
         let hub_control_event_tx = self.hub_event_tx.clone();
         let disconnect_client_id = client_id.clone();
@@ -241,16 +217,6 @@ impl Hub {
             while let Some(message) = hub_control_rx.recv().await {
                 let _ = hub_control_event_tx
                     .send(super::events::HubEvent::ClientWorkerControl(message));
-            }
-        });
-
-        tokio::spawn(async move {
-            while let Some(request) = session_io_rx.recv().await {
-                if let SessionIoRequest::PtyInput { data } = request {
-                    if let Err(e) = pty_handle.write_input_direct(&data) {
-                        log::error!("[Lua-Socket] Worker PTY write failed: {e}");
-                    }
-                }
             }
         });
 
@@ -281,7 +247,7 @@ impl Hub {
             crate::client::ClientId::Socket(client_id),
             hub_control_tx,
             outbound_tx,
-            session_io_txs,
+            std::collections::HashMap::new(),
         ))
     }
 
@@ -333,6 +299,183 @@ impl Hub {
             outbound_tx,
             std::collections::HashMap::new(),
         ))
+    }
+
+    fn spawn_webrtc_client_worker_adapter(
+        &self,
+        browser_identity: String,
+    ) -> crate::worker::client::ClientWorkerHandle {
+        use crate::worker::client::{ClientWorker, ClientWorkerConfig};
+        use crate::worker::hub_control::HUB_CONTROL_QUEUE;
+        use crate::worker::transport::TransportEgress;
+
+        let (hub_control_tx, mut hub_control_rx) =
+            tokio::sync::mpsc::channel(HUB_CONTROL_QUEUE.capacity);
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<TransportEgress>(4096);
+        let hub_control_event_tx = self.hub_event_tx.clone();
+        let hub_event_tx = self.hub_event_tx.clone();
+        let output_tx = self.webrtc.pty_output_tx();
+        let metrics = Arc::clone(&self.hub_event_metrics);
+        let peer_id = browser_identity.clone();
+
+        tokio::spawn(async move {
+            while let Some(message) = hub_control_rx.recv().await {
+                let _ = hub_control_event_tx
+                    .send(super::events::HubEvent::ClientWorkerControl(message));
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(egress) = outbound_rx.recv().await {
+                match egress {
+                    TransportEgress::TerminalBytes {
+                        subscription_id,
+                        session_uuid,
+                        data,
+                    } => {
+                        match output_tx.try_send(WebRtcPtyOutput {
+                            subscription_id,
+                            browser_identity: peer_id.clone(),
+                            data,
+                            session_uuid,
+                        }) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                log::warn!(
+                                    "[WebRTC] Worker PTY output queue full for {}; forcing reconnect",
+                                    &peer_id[..peer_id.len().min(8)]
+                                );
+                                let _ = hub_event_tx.send(
+                                    super::events::HubEvent::WebRtcIngressBackpressure {
+                                        browser_identity: peer_id.clone(),
+                                        source: "pty_output_queue_full",
+                                    },
+                                );
+                                break;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                    TransportEgress::Scrollback {
+                        subscription_id,
+                        session_uuid,
+                        data,
+                        ..
+                    } => {
+                        if !Self::queue_webrtc_terminal_snapshot(
+                            &metrics,
+                            &output_tx,
+                            &hub_event_tx,
+                            &peer_id,
+                            &subscription_id,
+                            &session_uuid,
+                            data,
+                        ) {
+                            break;
+                        }
+                    }
+                    TransportEgress::ProcessExited {
+                        subscription_id,
+                        session_uuid,
+                        ..
+                    } => {
+                        let _ = hub_event_tx.send(super::events::HubEvent::WebRtcSend(
+                            crate::lua::primitives::WebRtcSendRequest::Json {
+                                peer_id: peer_id.clone(),
+                                data: serde_json::json!({
+                                    "type": "process_exited",
+                                    "subscriptionId": subscription_id,
+                                    "session_uuid": session_uuid,
+                                }),
+                            },
+                        ));
+                    }
+                    TransportEgress::Control(value) => {
+                        let _ = hub_event_tx.send(super::events::HubEvent::WebRtcSend(
+                            crate::lua::primitives::WebRtcSendRequest::Json {
+                                peer_id: peer_id.clone(),
+                                data: value,
+                            },
+                        ));
+                    }
+                    TransportEgress::Binary(data) => {
+                        let _ = hub_event_tx.send(super::events::HubEvent::WebRtcSend(
+                            crate::lua::primitives::WebRtcSendRequest::Binary {
+                                peer_id: peer_id.clone(),
+                                data,
+                            },
+                        ));
+                    }
+                    TransportEgress::Close { .. } => break,
+                }
+            }
+        });
+
+        let mut config = ClientWorkerConfig::new(
+            crate::client::ClientId::browser(browser_identity),
+            hub_control_tx,
+            outbound_tx,
+            std::collections::HashMap::new(),
+        );
+        config.outbound =
+            crate::worker::BoundedQueueConfig::new("worker.client.webrtc.outbound", 4096);
+        ClientWorker::start(config)
+    }
+
+    fn register_worker_session_io_sender(
+        worker: &crate::worker::client::ClientWorkerHandle,
+        session_uuid: &str,
+        pty_handle: crate::hub::agent_handle::PtyHandle,
+        label: &'static str,
+    ) {
+        use crate::worker::client::ClientWorkerMessage;
+        use crate::worker::session_io::SessionIoRequest;
+
+        let (session_io_tx, mut session_io_rx) =
+            tokio::sync::mpsc::channel(crate::worker::session_io::SESSION_IO_WORKER_QUEUE.capacity);
+        let session_uuid_for_task = session_uuid.to_string();
+        tokio::spawn(async move {
+            while let Some(request) = session_io_rx.recv().await {
+                if let SessionIoRequest::PtyInput { data } = request {
+                    if let Err(e) = pty_handle.write_input_direct(&data) {
+                        log::error!("[{label}] Worker PTY write failed: {e}");
+                    }
+                }
+            }
+            log::trace!("[{label}] Session I/O sender closed for {session_uuid_for_task}");
+        });
+
+        if let Err(e) = worker.try_send(ClientWorkerMessage::RegisterSessionIoSender {
+            session_uuid: session_uuid.to_string(),
+            tx: session_io_tx,
+        }) {
+            log::warn!("[{label}] Failed to register worker session I/O sender: {e}");
+        }
+    }
+
+    fn unregister_worker_session_io_sender(
+        worker: &crate::worker::client::ClientWorkerHandle,
+        session_uuid: &str,
+        label: &'static str,
+    ) {
+        if let Err(e) = worker.try_send(
+            crate::worker::client::ClientWorkerMessage::UnregisterSessionIoSender {
+                session_uuid: session_uuid.to_string(),
+            },
+        ) {
+            log::debug!("[{label}] Failed to unregister worker session I/O sender: {e}");
+        }
+    }
+
+    fn remove_terminal_client_worker(
+        &mut self,
+        forwarder_key: &str,
+        session_uuid: &str,
+        label: &'static str,
+    ) {
+        if let Some(worker) = self.terminal_client_workers.remove(forwarder_key) {
+            Self::unregister_worker_session_io_sender(&worker, session_uuid, label);
+        }
     }
 
     fn handle_transport_control_message(
@@ -1415,8 +1558,18 @@ impl Hub {
                 }
                 self.unregister_terminal_client_peer(&client_id, true);
                 let client_prefix = format!("{client_id}:");
-                self.terminal_client_workers
-                    .retain(|key, _| !key.starts_with(&client_prefix));
+                let worker_keys: Vec<String> = self
+                    .terminal_client_workers
+                    .keys()
+                    .filter(|key| key.starts_with(&client_prefix))
+                    .cloned()
+                    .collect();
+                for key in worker_keys {
+                    if let Some(session_uuid) = key.strip_prefix(&client_prefix).map(str::to_owned)
+                    {
+                        self.remove_terminal_client_worker(&key, &session_uuid, "Socket");
+                    }
+                }
                 self.pty_forwarders.retain(|key, task| {
                     if key.starts_with(&client_prefix) {
                         task.abort();
@@ -2286,6 +2439,16 @@ impl Hub {
                 self.terminal_session_peers.remove(&session_uuid);
                 self.terminal_forwarder_peers
                     .retain(|_, (tracked_session, _)| tracked_session != &session_uuid);
+                let suffix = format!(":{session_uuid}");
+                let worker_keys: Vec<String> = self
+                    .terminal_client_workers
+                    .keys()
+                    .filter(|key| key.ends_with(&suffix))
+                    .cloned()
+                    .collect();
+                for key in worker_keys {
+                    self.remove_terminal_client_worker(&key, &session_uuid, "Session");
+                }
                 if let Ok(mut active) = self.active_terminal_peers.lock() {
                     active.remove(&session_uuid);
                 }
@@ -2449,10 +2612,20 @@ impl Hub {
         );
         self.lua.notify_pty_input(&input.session_uuid);
 
-        if let Some(session_handle) = self.handle_cache.get_session(&input.session_uuid) {
-            if let Err(e) = session_handle.pty().write_input_direct(&input.data) {
-                log::error!("[PTY-INPUT] Write failed: {e}");
+        let forwarder_key = format!("{}:{}", input.browser_identity, input.session_uuid);
+        if let Some(worker) = self.terminal_client_workers.get(&forwarder_key) {
+            let message = self.webrtc.ingress_to_client(
+                &input.browser_identity,
+                crate::worker::transport::TransportIngress::TerminalInput {
+                    session_uuid: input.session_uuid,
+                    data: input.data,
+                },
+            );
+            if let Err(e) = worker.try_send(message) {
+                log::warn!("[WebRTC] Worker input queue rejected {forwarder_key}: {e}");
             }
+        } else {
+            log::warn!("[WebRTC] No workerized terminal subscription for {forwarder_key}");
         }
     }
 
@@ -3202,6 +3375,17 @@ impl Hub {
                 true
             }
         });
+        let worker_keys: Vec<String> = self
+            .terminal_client_workers
+            .keys()
+            .filter(|key| key.starts_with(&peer_prefix))
+            .cloned()
+            .collect();
+        for key in worker_keys {
+            if let Some(session_uuid) = key.strip_prefix(&peer_prefix).map(str::to_owned) {
+                self.remove_terminal_client_worker(&key, &session_uuid, "WebRTC");
+            }
+        }
         self.pending_terminal_attaches.retain(|key, intent| {
             if key.starts_with(&peer_prefix) {
                 intent.request.deactivate();
@@ -3977,6 +4161,7 @@ impl Hub {
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
             self.unregister_terminal_forwarder_peer(&forwarder_key, false);
+            self.remove_terminal_client_worker(&forwarder_key, &req.session_uuid, "WebRTC");
             log::debug!("[Lua] Aborted existing PTY forwarder for {}", forwarder_key);
         }
 
@@ -3986,8 +4171,6 @@ impl Hub {
         let pty_for_snapshot = pty_handle.clone();
 
         // Spawn forwarder task.
-        let output_tx = self.webrtc.pty_output_tx();
-        let hub_event_tx = self.hub_event_tx.clone();
         let peer_id = req.peer_id.clone();
         let session_uuid = req.session_uuid.clone();
         let target_rows = req.rows;
@@ -4001,14 +4184,30 @@ impl Hub {
         let subscription_id = req.subscription_id.clone();
 
         let _guard = self.tokio_runtime.enter();
+        let worker = self.spawn_webrtc_client_worker_adapter(peer_id.clone());
+        Self::register_worker_session_io_sender(
+            &worker,
+            &req.session_uuid,
+            pty_handle.clone(),
+            "WebRTC",
+        );
+        self.terminal_client_workers
+            .insert(forwarder_key.clone(), worker.clone());
         let task = tokio::spawn(async move {
             use crate::agent::pty::PtyEvent;
+            use crate::worker::client::{ClientControlFrame, ClientWorkerMessage};
 
             log::info!(
                 "[Lua] Started PTY forwarder for peer {} session {}",
                 &peer_id[..peer_id.len().min(8)],
                 session_uuid
             );
+            let _ = worker
+                .send(ClientWorkerMessage::SubscribeSession {
+                    session_uuid: session_uuid.clone(),
+                    subscription_id: subscription_id.clone(),
+                })
+                .await;
             let mut query_filter_buffer = Vec::new();
             let mut dumped_live_chunks = 0usize;
 
@@ -4078,15 +4277,19 @@ impl Hub {
                 Self::dump_restty_snapshot_fixture(&session_uuid, &snapshot);
             }
 
-            if !Self::queue_webrtc_terminal_snapshot(
-                &metrics,
-                &output_tx,
-                &hub_event_tx,
-                &peer_id,
-                &subscription_id,
-                &session_uuid,
-                snapshot,
-            ) {
+            if worker
+                .send(ClientWorkerMessage::ControlFrame(
+                    ClientControlFrame::Scrollback {
+                        session_uuid: session_uuid.clone(),
+                        rows: target_rows,
+                        cols: target_cols,
+                        kitty_enabled: false,
+                        data: snapshot,
+                    },
+                ))
+                .await
+                .is_err()
+            {
                 return;
             }
 
@@ -4132,35 +4335,20 @@ impl Hub {
                             dumped_live_chunks += 1;
                         }
 
-                        // Send raw bytes with prefix.
                         let mut raw_message = Vec::with_capacity(prefix.len() + filtered.len());
                         raw_message.extend(&prefix);
                         raw_message.extend(&filtered);
 
-                        match output_tx.try_send(WebRtcPtyOutput {
-                            subscription_id: subscription_id.clone(),
-                            browser_identity: peer_id.clone(),
-                            data: raw_message,
-                            session_uuid: session_uuid.clone(),
-                        }) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                log::warn!(
-                                    "[Lua] WebRTC PTY output queue full for {}; forcing reconnect",
-                                    &peer_id[..peer_id.len().min(8)]
-                                );
-                                let _ = hub_event_tx.send(
-                                    super::events::HubEvent::WebRtcIngressBackpressure {
-                                        browser_identity: peer_id.clone(),
-                                        source: "pty_output_queue_full",
-                                    },
-                                );
-                                break;
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                log::trace!("[Lua] PTY output queue closed, stopping forwarder");
-                                break;
-                            }
+                        if worker
+                            .send(ClientWorkerMessage::TerminalBytes {
+                                session_uuid: session_uuid.clone(),
+                                data: raw_message,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            log::trace!("[Lua] Worker channel closed, stopping forwarder");
+                            break;
                         }
                     }
                     Ok(PtyEvent::ProcessExited { exit_code }) => {
@@ -4169,6 +4357,19 @@ impl Hub {
                             exit_code,
                             session_uuid
                         );
+                        let _ = worker
+                            .send(ClientWorkerMessage::ControlFrame(
+                                ClientControlFrame::ProcessExited {
+                                    session_uuid: session_uuid.clone(),
+                                    exit_code,
+                                },
+                            ))
+                            .await;
+                        let _ = worker
+                            .send(ClientWorkerMessage::UnregisterSessionIoSender {
+                                session_uuid: session_uuid.clone(),
+                            })
+                            .await;
                         break;
                     }
                     Ok(_other_event) => {
@@ -4192,6 +4393,11 @@ impl Hub {
             *active_flag
                 .lock()
                 .expect("Forwarder active_flag mutex poisoned") = false;
+            let _ = worker
+                .send(ClientWorkerMessage::UnregisterSessionIoSender {
+                    session_uuid: session_uuid.clone(),
+                })
+                .await;
 
             log::info!(
                 "[Lua] Stopped PTY forwarder for peer {} session {}",
@@ -4565,7 +4771,8 @@ impl Hub {
             };
             intent.request.deactivate();
             self.send_pending_terminal_attach_state(&intent.request, "not_found");
-            self.terminal_client_workers.remove(&key);
+            let session_uuid = intent.request.session_uuid().to_string();
+            self.remove_terminal_client_worker(&key, &session_uuid, "PendingAttach");
         }
     }
 
@@ -4723,7 +4930,7 @@ impl Hub {
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
             self.unregister_terminal_forwarder_peer(&forwarder_key, false);
-            self.terminal_client_workers.remove(&forwarder_key);
+            self.remove_terminal_client_worker(&forwarder_key, &req.session_uuid, "Lua-TUI");
             log::debug!(
                 "[Lua-TUI] Aborted existing PTY forwarder for {}",
                 forwarder_key
@@ -4740,10 +4947,12 @@ impl Hub {
         let target_cols = req.cols;
         let active_flag = Arc::clone(&req.active_flag);
         let _guard = self.tokio_runtime.enter();
-        let worker = self.spawn_tui_client_worker_adapter(
-            req.session_uuid.clone(),
+        let worker = self.spawn_tui_client_worker_adapter(output_tx);
+        Self::register_worker_session_io_sender(
+            &worker,
+            &req.session_uuid,
             pty_handle.clone(),
-            output_tx,
+            "Lua-TUI",
         );
         self.terminal_client_workers
             .insert(forwarder_key.clone(), worker.clone());
@@ -4997,6 +5206,11 @@ impl Hub {
                                 },
                             ))
                             .await;
+                        let _ = worker
+                            .send(ClientWorkerMessage::UnregisterSessionIoSender {
+                                session_uuid: session_uuid.clone(),
+                            })
+                            .await;
                         break;
                     }
                     Ok(PtyEvent::KittyChanged(enabled)) => {
@@ -5040,6 +5254,11 @@ impl Hub {
             *active_flag
                 .lock()
                 .expect("Forwarder active_flag mutex poisoned") = false;
+            let _ = worker
+                .send(ClientWorkerMessage::UnregisterSessionIoSender {
+                    session_uuid: session_uuid.clone(),
+                })
+                .await;
 
             log::info!(
                 "[Lua-TUI] Stopped PTY forwarder for session {}",
@@ -5114,7 +5333,7 @@ impl Hub {
         if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
             old_task.abort();
             self.unregister_terminal_forwarder_peer(&forwarder_key, false);
-            self.terminal_client_workers.remove(&forwarder_key);
+            self.remove_terminal_client_worker(&forwarder_key, &req.session_uuid, "Lua-Socket");
             log::debug!(
                 "[Lua-Socket] Aborted existing PTY forwarder for {}",
                 forwarder_key
@@ -5135,11 +5354,12 @@ impl Hub {
         let client_id = req.client_id.clone();
 
         let _guard = self.tokio_runtime.enter();
-        let worker = self.spawn_socket_client_worker_adapter(
-            client_id.clone(),
-            req.session_uuid.clone(),
+        let worker = self.spawn_socket_client_worker_adapter(client_id.clone(), frame_tx.clone());
+        Self::register_worker_session_io_sender(
+            &worker,
+            &req.session_uuid,
             pty_handle.clone(),
-            frame_tx.clone(),
+            "Lua-Socket",
         );
         self.terminal_client_workers
             .insert(forwarder_key.clone(), worker.clone());
@@ -5334,6 +5554,11 @@ impl Hub {
                                 },
                             ))
                             .await;
+                        let _ = worker
+                            .send(ClientWorkerMessage::UnregisterSessionIoSender {
+                                session_uuid: session_uuid.clone(),
+                            })
+                            .await;
                         break;
                     }
                     Ok(PtyEvent::KittyChanged(enabled)) => {
@@ -5381,6 +5606,11 @@ impl Hub {
             *active_flag
                 .lock()
                 .expect("Forwarder active_flag mutex poisoned") = false;
+            let _ = worker
+                .send(ClientWorkerMessage::UnregisterSessionIoSender {
+                    session_uuid: session_uuid.clone(),
+                })
+                .await;
 
             log::info!(
                 "[Lua-Socket] Stopped PTY forwarder for {} session {}",
@@ -5401,7 +5631,11 @@ impl Hub {
         if let Some(task) = self.pty_forwarders.remove(forwarder_id) {
             task.abort();
             self.unregister_terminal_forwarder_peer(forwarder_id, true);
-            self.terminal_client_workers.remove(forwarder_id);
+            let session_uuid = forwarder_id
+                .rsplit_once(':')
+                .map_or(forwarder_id, |(_, session_uuid)| session_uuid)
+                .to_string();
+            self.remove_terminal_client_worker(forwarder_id, &session_uuid, "Lua");
             log::debug!("[Lua] Stopped PTY forwarder {}", forwarder_id);
         }
     }
@@ -7844,6 +8078,89 @@ mod tests {
         assert!(
             hub.pty_forwarders.contains_key(&key),
             "forwarder should start after session registration"
+        );
+        assert!(
+            hub.terminal_client_workers.contains_key(&key),
+            "WebRTC forwarder should register a ClientWorker handle"
+        );
+    }
+
+    #[test]
+    fn test_webrtc_worker_handle_registered_and_removed_with_forwarder() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-webrtc-worker-lifecycle";
+        let key = format!("browser-worker:{session_uuid}");
+
+        hub.handle_cache
+            .add_session(test_session_handle(session_uuid));
+
+        assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
+            "browser-worker",
+            session_uuid,
+            "terminal_sub"
+        )));
+        assert!(
+            hub.terminal_client_workers.contains_key(&key),
+            "WebRTC forwarder should register a ClientWorker handle"
+        );
+
+        hub.stop_lua_pty_forwarder(&key);
+
+        assert!(
+            !hub.terminal_client_workers.contains_key(&key),
+            "stopping WebRTC forwarder should remove the ClientWorker handle"
+        );
+        assert!(
+            !hub.pty_forwarders.contains_key(&key),
+            "stopping WebRTC forwarder should remove the task"
+        );
+    }
+
+    #[test]
+    fn test_webrtc_peer_cleanup_removes_terminal_client_worker() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let browser_identity = "browser-cleanup";
+        let session_uuid = "sess-webrtc-cleanup";
+        let key = format!("{browser_identity}:{session_uuid}");
+
+        hub.handle_cache
+            .add_session(test_session_handle(session_uuid));
+        assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
+            browser_identity,
+            session_uuid,
+            "terminal_sub"
+        )));
+        assert!(
+            hub.terminal_client_workers.contains_key(&key),
+            "WebRTC forwarder should register a ClientWorker handle"
+        );
+
+        let channel = crate::channel::WebRtcChannel::builder()
+            .server_url(hub.config.server_url.clone())
+            .api_key(hub.config.get_api_key().to_string())
+            .signal_tx(hub.webrtc.outgoing_signal_tx())
+            .stream_frame_tx(hub.webrtc.stream_frame_tx())
+            .pty_input_tx(hub.webrtc.pty_input_tx())
+            .file_input_tx(hub.webrtc.file_input_tx())
+            .crypto_service(
+                hub.browser
+                    .crypto_service
+                    .clone()
+                    .expect("crypto service required"),
+            )
+            .build();
+        hub.webrtc
+            .insert_channel(browser_identity.to_string(), channel);
+
+        hub.cleanup_webrtc_peer(browser_identity, "disconnected");
+
+        assert!(
+            !hub.terminal_client_workers.contains_key(&key),
+            "WebRTC peer cleanup should remove the ClientWorker handle"
+        );
+        assert!(
+            !hub.pty_forwarders.contains_key(&key),
+            "WebRTC peer cleanup should remove the PTY forwarder task"
         );
     }
 

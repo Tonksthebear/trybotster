@@ -85,6 +85,18 @@ pub enum ClientControlFrame {
 /// Messages accepted by a client worker.
 #[derive(Debug, Clone)]
 pub enum ClientWorkerMessage {
+    /// Register or replace the session-I/O request sender for a session.
+    RegisterSessionIoSender {
+        /// Session whose input should route through this sender.
+        session_uuid: SessionUuid,
+        /// Session-I/O request mailbox.
+        tx: tokio::sync::mpsc::Sender<SessionIoRequest>,
+    },
+    /// Remove the session-I/O sender for a session and detach any active subscription.
+    UnregisterSessionIoSender {
+        /// Session whose input sender is no longer valid.
+        session_uuid: SessionUuid,
+    },
     /// Subscribe this client to a session.
     SubscribeSession {
         /// Session to subscribe to.
@@ -305,6 +317,14 @@ impl ClientWorker {
                 self.subscribe(session_uuid, subscription_id).await;
                 false
             }
+            ClientWorkerMessage::RegisterSessionIoSender { session_uuid, tx } => {
+                self.register_session_io_sender(session_uuid, tx);
+                false
+            }
+            ClientWorkerMessage::UnregisterSessionIoSender { session_uuid } => {
+                self.unregister_session_io_sender(session_uuid).await;
+                false
+            }
             ClientWorkerMessage::UnsubscribeSession {
                 session_uuid,
                 subscription_id,
@@ -365,6 +385,21 @@ impl ClientWorker {
     }
 
     async fn subscribe(&mut self, session_uuid: SessionUuid, subscription_id: SubscriptionId) {
+        if let Some(existing) = self.subscriptions.get(&session_uuid) {
+            if existing.subscription_id == subscription_id {
+                return;
+            }
+
+            let old_subscription_id = existing.subscription_id.clone();
+            self.subscriptions.remove(&session_uuid);
+            self.send_hub_control(HubControlMessage::DetachClient {
+                client_id: self.client_id.clone(),
+                session_uuid: session_uuid.clone(),
+                subscription_id: old_subscription_id,
+            })
+            .await;
+        }
+
         self.subscriptions.insert(
             session_uuid.clone(),
             ClientSubscription {
@@ -376,6 +411,28 @@ impl ClientWorker {
             client_id: self.client_id.clone(),
             session_uuid,
             subscription_id,
+        })
+        .await;
+    }
+
+    fn register_session_io_sender(
+        &mut self,
+        session_uuid: SessionUuid,
+        tx: tokio::sync::mpsc::Sender<SessionIoRequest>,
+    ) {
+        self.session_io_txs.insert(session_uuid, tx);
+    }
+
+    async fn unregister_session_io_sender(&mut self, session_uuid: SessionUuid) {
+        self.session_io_txs.remove(&session_uuid);
+        let Some(subscription) = self.subscriptions.remove(&session_uuid) else {
+            return;
+        };
+
+        self.send_hub_control(HubControlMessage::DetachClient {
+            client_id: self.client_id.clone(),
+            session_uuid,
+            subscription_id: subscription.subscription_id,
         })
         .await;
     }
@@ -426,15 +483,19 @@ impl ClientWorker {
             return;
         };
 
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
-            tx.try_send(SessionIoRequest::PtyInput { data })
-        {
-            self.report_backpressure(
-                super::session_io::SESSION_IO_WORKER_QUEUE.name,
-                super::session_io::SESSION_IO_WORKER_QUEUE.capacity,
-                Some(session_uuid),
-            )
-            .await;
+        match tx.try_send(SessionIoRequest::PtyInput { data }) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.report_backpressure(
+                    super::session_io::SESSION_IO_WORKER_QUEUE.name,
+                    super::session_io::SESSION_IO_WORKER_QUEUE.capacity,
+                    Some(session_uuid),
+                )
+                .await;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.session_io_txs.remove(&session_uuid);
+            }
         }
     }
 
@@ -661,6 +722,15 @@ mod tests {
             .expect("egress closed")
     }
 
+    async fn assert_no_hub(rx: &mut tokio::sync::mpsc::Receiver<HubControlMessage>) {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "unexpected hub control message"
+        );
+    }
+
     async fn subscribe(handle: &ClientWorkerHandle) {
         handle
             .send(ClientWorkerMessage::SubscribeSession {
@@ -758,6 +828,213 @@ mod tests {
                 .expect("timed out waiting for session input")
                 .expect("session io closed"),
             SessionIoRequest::PtyInput { data } if data == b"ls\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn dynamic_session_io_sender_registration_routes_input() {
+        let (handle, mut hub_rx, _outbound_rx, mut seeded_session_rx) =
+            spawn_worker(ClientId::browser("browser-identity"), 8);
+        let (dynamic_tx, mut dynamic_rx) = tokio::sync::mpsc::channel(1);
+
+        handle
+            .send(ClientWorkerMessage::RegisterSessionIoSender {
+                session_uuid: "sess-2".to_string(),
+                tx: dynamic_tx,
+            })
+            .await
+            .expect("register dynamic session sender");
+        handle
+            .send(ClientWorkerMessage::SubscribeSession {
+                session_uuid: "sess-2".to_string(),
+                subscription_id: "sub-2".to_string(),
+            })
+            .await
+            .expect("subscribe dynamic session");
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::AttachClient {
+                session_uuid,
+                subscription_id,
+                ..
+            } if session_uuid == "sess-2" && subscription_id == "sub-2"
+        ));
+
+        handle
+            .send(ClientWorkerMessage::SessionInput {
+                session_uuid: "sess-2".to_string(),
+                data: b"dynamic\n".to_vec(),
+            })
+            .await
+            .expect("send dynamic input");
+
+        assert!(seeded_session_rx.try_recv().is_err());
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), dynamic_rx.recv())
+                .await
+                .expect("timed out waiting for dynamic input")
+                .expect("dynamic session io closed"),
+            SessionIoRequest::PtyInput { data } if data == b"dynamic\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn unregister_session_io_sender_detaches_active_subscription() {
+        let (handle, mut hub_rx, _outbound_rx, mut session_rx) = spawn_worker(ClientId::Tui, 8);
+
+        subscribe(&handle).await;
+        let _ = recv_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::UnregisterSessionIoSender {
+                session_uuid: "sess-1".to_string(),
+            })
+            .await
+            .expect("unregister session sender");
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::DetachClient {
+                session_uuid,
+                subscription_id,
+                ..
+            } if session_uuid == "sess-1" && subscription_id == "sub-1"
+        ));
+
+        handle
+            .send(ClientWorkerMessage::SessionInput {
+                session_uuid: "sess-1".to_string(),
+                data: b"ignored\n".to_vec(),
+            })
+            .await
+            .expect("send input after unregister");
+        assert!(session_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_session_io_sender_is_removed_without_backpressure() {
+        let (handle, mut hub_rx, _outbound_rx, _session_rx) = spawn_worker(ClientId::Tui, 8);
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        drop(closed_rx);
+
+        handle
+            .send(ClientWorkerMessage::RegisterSessionIoSender {
+                session_uuid: "sess-closed".to_string(),
+                tx: closed_tx,
+            })
+            .await
+            .expect("register closed sender");
+        handle
+            .send(ClientWorkerMessage::SubscribeSession {
+                session_uuid: "sess-closed".to_string(),
+                subscription_id: "sub-closed".to_string(),
+            })
+            .await
+            .expect("subscribe closed sender");
+        let _ = recv_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::SessionInput {
+                session_uuid: "sess-closed".to_string(),
+                data: b"first".to_vec(),
+            })
+            .await
+            .expect("route to closed sender");
+        assert_no_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::SessionInput {
+                session_uuid: "sess-closed".to_string(),
+                data: b"second".to_vec(),
+            })
+            .await
+            .expect("route after stale sender removal");
+        assert_no_hub(&mut hub_rx).await;
+    }
+
+    #[tokio::test]
+    async fn dynamic_session_io_sender_backpressure_keeps_session_context() {
+        let (handle, mut hub_rx, _outbound_rx, _session_rx) = spawn_worker(ClientId::Tui, 8);
+        let (blocked_tx, _blocked_rx) = tokio::sync::mpsc::channel(1);
+        blocked_tx
+            .try_send(SessionIoRequest::PtyInput {
+                data: b"held".to_vec(),
+            })
+            .expect("fill dynamic session queue");
+
+        handle
+            .send(ClientWorkerMessage::RegisterSessionIoSender {
+                session_uuid: "sess-dynamic".to_string(),
+                tx: blocked_tx,
+            })
+            .await
+            .expect("register blocked sender");
+        handle
+            .send(ClientWorkerMessage::SubscribeSession {
+                session_uuid: "sess-dynamic".to_string(),
+                subscription_id: "sub-dynamic".to_string(),
+            })
+            .await
+            .expect("subscribe dynamic session");
+        let _ = recv_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::SessionInput {
+                session_uuid: "sess-dynamic".to_string(),
+                data: b"blocked".to_vec(),
+            })
+            .await
+            .expect("send input to full dynamic sender");
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::Backpressure(WorkerBackpressure {
+                source,
+                capacity,
+                session_uuid: Some(session_uuid),
+                client_id: Some(ClientId::Tui),
+            }) if source == super::super::session_io::SESSION_IO_WORKER_QUEUE.name
+                && capacity == super::super::session_io::SESSION_IO_WORKER_QUEUE.capacity
+                && session_uuid == "sess-dynamic"
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_session_resubscribe_replaces_subscription_id() {
+        let (handle, mut hub_rx, _outbound_rx, _session_rx) = spawn_worker(ClientId::Tui, 8);
+
+        subscribe(&handle).await;
+        let _ = recv_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::SubscribeSession {
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-1".to_string(),
+            })
+            .await
+            .expect("same subscription");
+        assert_no_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::SubscribeSession {
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-2".to_string(),
+            })
+            .await
+            .expect("replacement subscription");
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::DetachClient {
+                session_uuid,
+                subscription_id,
+                ..
+            } if session_uuid == "sess-1" && subscription_id == "sub-1"
+        ));
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::AttachClient {
+                session_uuid,
+                subscription_id,
+                ..
+            } if session_uuid == "sess-1" && subscription_id == "sub-2"
         ));
     }
 
