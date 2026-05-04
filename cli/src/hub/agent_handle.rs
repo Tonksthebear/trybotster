@@ -483,6 +483,26 @@ impl PtyHandle {
             .map_err(|e| format!("Failed to set session color profile: {e:#}"))
     }
 
+    /// Enqueue a typed request for the session I/O worker mailbox.
+    pub fn enqueue_session_io_request(
+        &self,
+        request: crate::worker::session_io::SessionIoRequest,
+    ) -> Result<(), crate::session::connection::SessionIoRequestEnqueueError> {
+        let Some(ref conn) = self.session_connection else {
+            return Err(
+                crate::session::connection::SessionIoRequestEnqueueError::ConnectionMissing,
+            );
+        };
+
+        let guard = conn.lock().map_err(|_| {
+            crate::session::connection::SessionIoRequestEnqueueError::ConnectionLockPoisoned
+        })?;
+        let session = guard
+            .as_ref()
+            .ok_or(crate::session::connection::SessionIoRequestEnqueueError::ConnectionMissing)?;
+        session.enqueue_session_io_request(request)
+    }
+
     // =========================================================================
     // Direct Sync Methods - Immediate I/O without async channel
     // =========================================================================
