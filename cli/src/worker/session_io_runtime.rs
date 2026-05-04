@@ -692,17 +692,17 @@ mod tests {
 
         assert_eq!(recv_output(&mut event_rx), b"onetwothree");
 
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
         let mut batches = Vec::new();
-        for _ in 0..20 {
+        while batches.is_empty() && std::time::Instant::now() < deadline {
             while let Ok(event) = hub_rx.try_recv() {
                 if let HubEvent::SessionIoBatch(batch) = event {
                     batches.push(batch.output.expect("output batch"));
                 }
             }
-            if !batches.is_empty() {
-                break;
+            if batches.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            std::thread::sleep(Duration::from_millis(10));
         }
 
         assert_eq!(batches, vec![b"onetwothree".to_vec()]);

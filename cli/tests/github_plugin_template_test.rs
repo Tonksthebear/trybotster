@@ -158,6 +158,59 @@ fn project_pipelines_dynamic_state_uses_plugin_entities_not_forced_tree_refreshe
 }
 
 #[test]
+fn project_pipelines_automates_merge_from_pipeline_policy() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/project-pipelines");
+    let db = std::fs::read_to_string(root.join("project_pipelines/db.lua"))
+        .expect("read project pipelines db");
+    let repo = std::fs::read_to_string(root.join("project_pipelines/repo.lua"))
+        .expect("read project pipelines repo");
+    let engine = std::fs::read_to_string(root.join("project_pipelines/engine.lua"))
+        .expect("read project pipelines engine");
+    let mcp = std::fs::read_to_string(root.join("project_pipelines/mcp.lua")).expect("read mcp");
+    let pipeline_screen =
+        std::fs::read_to_string(root.join("project_pipelines/web/screens/pipelines.lua"))
+            .expect("read pipeline screen");
+    let ticket_screen =
+        std::fs::read_to_string(root.join("project_pipelines/web/screens/ticket.lua"))
+            .expect("read ticket screen");
+
+    assert!(
+        db.contains("merge_policy = { \"text\" }"),
+        "pipeline schema should persist merge_policy"
+    );
+    assert!(
+        repo.contains("merge_policy = true") && repo.contains("merge_policy must be direct or pr"),
+        "repo should allow and validate direct/pr merge policy"
+    );
+    assert!(
+        mcp.contains("merge_policy = { type = \"string\", enum = { \"direct\", \"pr\" } }"),
+        "MCP CRUD should expose direct/pr merge policy"
+    );
+    assert!(
+        engine.contains("return M.request_merge({ ticket_id = run.ticket_id }, {})"),
+        "completed runs should automatically request the merge agent"
+    );
+    assert!(
+        engine.contains("This pipeline requires a direct merge to main")
+            && engine.contains("This pipeline requires a PR"),
+        "merge agent prompt should branch on pipeline policy"
+    );
+    assert!(
+        pipeline_screen.contains("Merge policy")
+            && pipeline_screen.contains("Merge directly to main")
+            && pipeline_screen.contains("Open PR with Botster MCP"),
+        "pipeline editor should let users choose merge policy"
+    );
+    assert!(
+        !ticket_screen.contains("Approve merge"),
+        "ticket UI should not require a separate merge approval click"
+    );
+}
+
+#[test]
 fn project_pipelines_detail_bind_lists_use_entity_store_paths() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
