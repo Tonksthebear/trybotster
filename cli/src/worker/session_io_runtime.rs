@@ -431,6 +431,7 @@ fn now_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::io::Write;
     use std::net::Shutdown;
     use std::sync::mpsc;
@@ -440,6 +441,23 @@ mod tests {
     use crate::session::protocol::{
         encode_frame, encode_json, FRAME_GET_SCREEN, FRAME_MODE_FLAGS, FRAME_SCREEN,
     };
+
+    const TEST_EVENT_TIMEOUT: Duration = Duration::from_millis(500);
+
+    fn block_on_with_timeout<F, T>(future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                tokio::time::timeout(TEST_EVENT_TIMEOUT, future)
+                    .await
+                    .expect("timed out waiting for worker event")
+            })
+    }
 
     fn spawn_test_worker(
         reader: UnixStream,
@@ -471,14 +489,46 @@ mod tests {
         (event_rx, response_rx, hub_rx, alive)
     }
 
+    fn recv_pty_event(rx: &mut broadcast::Receiver<PtyEvent>) -> PtyEvent {
+        block_on_with_timeout(async { rx.recv().await.expect("receive pty event from worker") })
+    }
+
     fn recv_output(rx: &mut broadcast::Receiver<PtyEvent>) -> Vec<u8> {
-        match rx
-            .blocking_recv()
-            .expect("receive output event from worker")
-        {
+        match recv_pty_event(rx) {
             PtyEvent::Output(data) => data,
             other => panic!("expected output, got {other:?}"),
         }
+    }
+
+    fn recv_hub_event(rx: &mut tokio_mpsc::UnboundedReceiver<HubEvent>) -> HubEvent {
+        block_on_with_timeout(async { rx.recv().await.expect("receive hub event") })
+    }
+
+    fn recv_session_io_batch(rx: &mut tokio_mpsc::UnboundedReceiver<HubEvent>) -> Vec<u8> {
+        loop {
+            match recv_hub_event(rx) {
+                HubEvent::SessionIoBatch(batch) => return batch.output.expect("output batch"),
+                other => panic!("expected session I/O batch, got {other:?}"),
+            }
+        }
+    }
+
+    fn assert_no_hub_event(rx: &mut tokio_mpsc::UnboundedReceiver<HubEvent>) {
+        assert!(
+            rx.try_recv().is_err(),
+            "unexpected extra hub event after ordered boundary"
+        );
+    }
+
+    fn wait_for_reader_stop(alive: &AtomicBool) {
+        let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+        while alive.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            !alive.load(Ordering::Acquire),
+            "reader did not stop within {TEST_EVENT_TIMEOUT:?}"
+        );
     }
 
     #[test]
@@ -494,15 +544,48 @@ mod tests {
         writer.shutdown(Shutdown::Both).expect("shutdown writer");
 
         assert_eq!(recv_output(&mut event_rx), b"onetwothree");
+        assert_eq!(recv_session_io_batch(&mut hub_rx), b"onetwothree");
+    }
 
-        let mut batches = Vec::new();
-        while let Ok(event) = hub_rx.try_recv() {
-            if let HubEvent::SessionIoBatch(batch) = event {
-                batches.push(batch.output.expect("output batch"));
-            }
+    #[test]
+    fn output_age_flushes_under_four_ms_rule_without_eof_or_size_threshold() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+
+        let mut payload = Vec::new();
+        for chunk in [b"age-".as_slice(), b"flush".as_slice()] {
+            payload.extend_from_slice(&encode_frame(FRAME_PTY_OUTPUT, chunk));
         }
+        writer.write_all(&payload).expect("write frames");
 
-        assert_eq!(batches, vec![b"onetwothree".to_vec()]);
+        assert_eq!(recv_output(&mut event_rx), b"age-flush");
+        assert_eq!(recv_session_io_batch(&mut hub_rx), b"age-flush");
+    }
+
+    #[test]
+    fn output_thresholds_flush_without_waiting_for_eof() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+
+        let mut frame_threshold_payload = Vec::new();
+        for _ in 0..MAX_OUTPUT_FRAMES {
+            frame_threshold_payload.extend_from_slice(&encode_frame(FRAME_PTY_OUTPUT, b"f"));
+        }
+        writer
+            .write_all(&frame_threshold_payload)
+            .expect("write frame-threshold burst");
+        assert_eq!(recv_output(&mut event_rx), vec![b'f'; MAX_OUTPUT_FRAMES]);
+        assert_eq!(
+            recv_session_io_batch(&mut hub_rx),
+            vec![b'f'; MAX_OUTPUT_FRAMES]
+        );
+
+        let byte_threshold_payload = vec![b'x'; MAX_OUTPUT_BYTES];
+        writer
+            .write_all(&encode_frame(FRAME_PTY_OUTPUT, &byte_threshold_payload))
+            .expect("write byte-threshold frame");
+        assert_eq!(recv_output(&mut event_rx), byte_threshold_payload);
+        assert_eq!(recv_session_io_batch(&mut hub_rx), byte_threshold_payload);
     }
 
     #[test]
@@ -612,6 +695,52 @@ mod tests {
     }
 
     #[test]
+    fn output_flushes_before_bell_notification() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+
+        let mut payload = encode_frame(FRAME_PTY_OUTPUT, b"before-bell");
+        payload.extend_from_slice(&encode_frame(FRAME_BELL, b""));
+        writer.write_all(&payload).expect("write frames");
+
+        assert_eq!(recv_output(&mut event_rx), b"before-bell");
+        assert_eq!(recv_session_io_batch(&mut hub_rx), b"before-bell");
+        match recv_pty_event(&mut event_rx) {
+            PtyEvent::Notification(AgentNotification::Bell) => {}
+            other => panic!("expected bell notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_flushes_before_osc_notification() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+
+        let mut payload = encode_frame(FRAME_PTY_OUTPUT, b"before-notification");
+        payload.extend_from_slice(
+            &encode_json(
+                FRAME_NOTIFICATION,
+                &NotificationPayload {
+                    title: "Build".to_string(),
+                    body: "done".to_string(),
+                },
+            )
+            .expect("notification frame"),
+        );
+        writer.write_all(&payload).expect("write frames");
+
+        assert_eq!(recv_output(&mut event_rx), b"before-notification");
+        assert_eq!(recv_session_io_batch(&mut hub_rx), b"before-notification");
+        match recv_pty_event(&mut event_rx) {
+            PtyEvent::Notification(AgentNotification::Osc777 { title, body }) => {
+                assert_eq!(title, "Build");
+                assert_eq!(body, "done");
+            }
+            other => panic!("expected OSC notification, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn mode_changed_coalesces_sparse_fields_last_value_wins() {
         let (mut writer, reader) = UnixStream::pair().expect("unix pair");
         let (mut event_rx, _response_rx, _hub_rx, _alive) = spawn_test_worker(reader);
@@ -670,6 +799,29 @@ mod tests {
         }
 
         assert_eq!(exits, vec![Some(0)]);
+    }
+
+    #[test]
+    fn output_flushes_before_process_exit_and_eof_does_not_duplicate_exit() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (mut event_rx, _response_rx, mut hub_rx, alive) = spawn_test_worker(reader);
+
+        let mut payload = encode_frame(FRAME_PTY_OUTPUT, b"before-exit");
+        payload.extend_from_slice(
+            &encode_json(FRAME_PROCESS_EXITED, &serde_json::json!({ "exit_code": 7 }))
+                .expect("encode exit frame"),
+        );
+        writer.write_all(&payload).expect("write frames");
+        writer.shutdown(Shutdown::Both).expect("shutdown writer");
+
+        assert_eq!(recv_output(&mut event_rx), b"before-exit");
+        assert_eq!(recv_session_io_batch(&mut hub_rx), b"before-exit");
+        match recv_hub_event(&mut hub_rx) {
+            HubEvent::SessionProcessExited { exit_code, .. } => assert_eq!(exit_code, Some(7)),
+            other => panic!("expected process exit, got {other:?}"),
+        }
+        wait_for_reader_stop(&alive);
+        assert_no_hub_event(&mut hub_rx);
     }
 
     #[test]
