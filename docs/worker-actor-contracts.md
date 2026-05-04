@@ -38,31 +38,33 @@ Unix socket and exits with that connection; reconnect creates a fresh
 `SessionConnection` and a fresh worker after the hub's generation checks pass.
 
 The worker keeps the session process protocol unchanged. `SessionConnection`
-still owns writes and synchronous RPC methods, while the worker decodes every
-socket frame and routes snapshot, screen, mode-flags, and other control
-responses back to the existing `response_rx` channel. This avoids socket read
-contention without moving hub orchestration policy into the worker.
+still owns synchronous RPC methods, while the worker decodes every socket frame
+and routes snapshot, screen, mode-flags, and other control responses back to the
+existing `response_rx` channel. A companion request processor owns bounded
+`SessionIoRequest` mailbox work such as PTY input, paste path injection, and
+prepared snapshot payloads. This avoids socket read contention without moving
+hub orchestration policy into the worker.
 
-File paste/drop data-plane mechanics live in `worker::session_io`. The hub
-still authorizes the target session and transport capabilities, then passes the
-already-authorized filename and bytes to the session I/O helper. Paste temp
-paths are session-scoped and resolve in this order: session manifest
+File paste/drop data-plane mechanics live in `worker::session_io` behind the
+per-session `SessionIoRequest` mailbox. The hub still authorizes the target
+session and transport capabilities, then enqueues the already-authorized
+filename and bytes as `SessionIoRequest::PasteFile`. The Session I/O worker
+writes the file, injects the resulting path into the PTY, and reports
+`SessionIoEvent::PasteFileWritten` or `SessionIoEvent::PasteFileFailed` back
+through `HubEvent::SessionIo`. Paste temp paths are session-scoped and resolve
+in this order: session manifest
 `worktree_path` under `.botster/pastes/<session_uuid>`, Botster data dir under
 `pastes/<session_uuid>`, then the OS temp dir under
 `botster/pastes/<session_uuid>`. Cleanup is keyed by session UUID, never label,
 and runs on real process exit plus hub drop.
 
-Snapshot payload preparation also lives in the session I/O data-plane contract.
-The hub remains responsible for deciding when a snapshot is needed and where it
-should be routed. `request_id` is an opaque correlation key scoped to the
-session; callers use it to map prepared output back to peer/subscription or Lua
-refresh state. Browser identities and WebRTC structs do not enter the worker
-contract.
-
-The paste and prepared-snapshot request/event variants define the mailbox
-contract for the next production-wiring slice. Today the production hub calls
-the `worker::session_io` helpers directly, so the data-plane byte/path logic is
-already centralized while mailbox send/receive ownership remains scaffolding.
+Snapshot payload preparation also lives behind the session I/O mailbox. The hub
+remains responsible for deciding when a snapshot is needed and where it should
+be routed, but the worker owns snapshot prefixing and gzip preparation through
+`SessionIoRequest::PrepareSnapshot` and `SessionIoEvent::PreparedSnapshot`.
+`request_id` is an opaque correlation key scoped to the session; callers use it
+to map prepared output back to peer/subscription or Lua refresh state. Browser
+identities and WebRTC structs do not enter the worker contract.
 
 PTY output crosses into the hub as `HubEvent::SessionIoBatch`, not one hub
 event per `FRAME_PTY_OUTPUT`. The worker preserves byte order while coalescing
