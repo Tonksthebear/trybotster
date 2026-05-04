@@ -366,6 +366,9 @@ export class HubRoute {
       bridge.on("connection:state", (event) => {
         if (event.hubId !== hubId) return;
         if (event.state === "connected") {
+          if (Number.isFinite(event.peerReadyMs) && localStorage.getItem("botster:debug:webrtcTiming") === "1") {
+            console.warn(`[HubRoute] WebRTC peer ready for hub ${hubId} in ${event.peerReadyMs}ms`);
+          }
           this.#clearReconnectTimer();
           this.#peerHealthDirty = false;
           if (event.mode) this.#setConnectionMode(event.mode);
@@ -393,6 +396,13 @@ export class HubRoute {
       bridge.on("connection:mode", (event) => {
         if (event.hubId !== hubId) return;
         this.#setConnectionMode(event.mode || ConnectionMode.UNKNOWN);
+      }),
+      bridge.on("subscription:ready", (event) => {
+        if (event.hubId !== hubId) return;
+        if (event.subscriptionId !== this.subscriptionId) return;
+        if (Number.isFinite(event.subscribeReadyMs) && localStorage.getItem("botster:debug:webrtcTiming") === "1") {
+          console.warn(`[HubRoute] WebRTC subscribe ready for hub ${hubId} in ${event.subscribeReadyMs}ms`);
+        }
       }),
       bridge.on("session:invalid", (event) => {
         if (event.hubId !== hubId) return;
@@ -657,6 +667,9 @@ export class HubRoute {
 
     this.subscriptionId = this.computeSubscriptionId();
     this.#setupSubscriptionListeners();
+    if (localStorage.getItem("botster:debug:webrtcTiming") === "1") {
+      console.warn(`[HubRoute] WebRTC subscribe start for hub ${this.getHubId()}`);
+    }
 
     this.#subscriptionPending = bridge.send("subscribe", {
       hubId: this.getHubId(),

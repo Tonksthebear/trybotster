@@ -134,6 +134,62 @@ describe("HubPeerConnection peer lost transitions", () => {
     return events.filter((event) => event.state === "disconnected")
   }
 
+  function connectedEvents() {
+    return events.filter((event) => event.state === "connected")
+  }
+
+  function encodeControlMessage(message) {
+    const body = new TextEncoder().encode(JSON.stringify(message))
+    const plaintext = new Uint8Array(1 + body.length)
+    plaintext[0] = 0
+    plaintext.set(body, 1)
+    return plaintext
+  }
+
+  it("emits peer-ready timing when the data channel opens", async () => {
+    const pc = await connectPeer()
+
+    pc.dataChannel.onopen()
+
+    expect(connectedEvents()).toHaveLength(1)
+    expect(connectedEvents()[0]).toMatchObject({
+      hubId: "hub-1",
+      state: "connected",
+      peerReadyMs: expect.any(Number),
+    })
+    expect(connectedEvents()[0].peerReadyMs).toBeGreaterThanOrEqual(0)
+  })
+
+  it("emits subscription-ready timing after data channel subscribe ack", async () => {
+    const pc = await connectPeer()
+    const readyEvents = []
+    transport.on("subscription:ready", (event) => readyEvents.push(event))
+    pc.dataChannel.readyState = "open"
+
+    mocks.bridge.decryptBinary.mockResolvedValueOnce({
+      data: encodeControlMessage({ type: "dc_ready" }),
+    })
+    pc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+    await flushPromises()
+
+    const subscribe = transport.subscribe("hub-1", "terminal", {}, "sub-1", new Uint8Array([1, 2, 3]))
+    await flushPromises()
+
+    mocks.bridge.decryptBinary.mockResolvedValueOnce({
+      data: encodeControlMessage({ type: "subscribed", subscriptionId: "sub-1" }),
+    })
+    pc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+
+    await expect(subscribe).resolves.toEqual({ subscriptionId: "sub-1" })
+    expect(readyEvents).toHaveLength(1)
+    expect(readyEvents[0]).toMatchObject({
+      hubId: "hub-1",
+      subscriptionId: "sub-1",
+      subscribeReadyMs: expect.any(Number),
+    })
+    expect(readyEvents[0].subscribeReadyMs).toBeGreaterThanOrEqual(0)
+  })
+
   it("emits one datachannel_close event and tears down peer timers", async () => {
     const pc = await connectPeer()
     const dc = pc.dataChannel
