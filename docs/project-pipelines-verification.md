@@ -1,5 +1,47 @@
 # Project Pipelines Verification
 
+## 2026-05-04 Workerized Architecture Docs And Static Boundary Checks
+
+Scope:
+
+- `docs/worker-actor-contracts.md` aligned with production worker ownership
+  instead of aspirational full-worker claims.
+- WebRTC receiver ownership guarded by source-backed static tests: production
+  hub code must use registry forwarders and typed `HubEvent` variants, while
+  raw receiver polling/leasing stays `#[cfg(test)]`.
+- Browser WebRTC terminal subscribe/unsubscribe/focus ingress guarded so typed
+  terminal controls cross the browser `ClientWorker` boundary instead of
+  falling back to adapter-only or Lua routing.
+- Session I/O documentation guarded against claiming mailbox ownership for
+  `SessionIoRequest` variants unless the runtime has executable handling.
+- `BoundaryJson` guarded as a Lua/plugin/relay boundary exception, with the
+  current WebRTC subscribe acknowledgement bridge documented explicitly.
+
+Commands and results:
+
+```bash
+cd cli && ./test.sh --unit -- worker
+# 76 passed; 0 failed
+
+cd cli && ./test.sh --unit -- server_comms
+# 59 passed; 0 failed
+
+cd cli && ./test.sh --unit
+# 1531 passed; 0 failed; 1 ignored
+```
+
+Notes:
+
+- CLI verification used `cli/test.sh`, not raw `cargo test`, so
+  `BOTSTER_ENV=test` was set for all Rust/Lua slices.
+- Static boundary checks live in `worker::tests` and read the relevant source
+  and docs with `include_str!`, replacing brittle ad hoc field-name scans with
+  semantic ownership assertions.
+- `WebRtcPeerRegistry::poll_received_messages` is now test-only, matching its
+  only remaining hub usage under `poll_webrtc_peer_payloads_for_tests`.
+- No UI surface changed; `tmp/tailwind_plus_preview` and Catalyst/Elements
+  review were not applicable.
+
 ## 2026-05-04 Workerized Session I/O Timing Regression Verification
 
 Scope:

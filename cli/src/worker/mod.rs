@@ -281,4 +281,229 @@ mod tests {
 
         assert!(!config.is_bounded());
     }
+
+    #[test]
+    fn static_webrtc_receiver_access_stays_test_only_and_registry_owned() {
+        let webrtc = include_str!("webrtc.rs");
+        let server_comms = include_str!("../hub/server_comms.rs");
+
+        assert!(webrtc.contains("fn start_queue_forwarders"));
+        for event in [
+            "HubEvent::WebRtcPtyInput",
+            "HubEvent::WebRtcFileInput",
+            "HubEvent::WebRtcOutgoingSignal",
+            "HubEvent::WebRtcStreamFrame",
+        ] {
+            assert!(
+                webrtc.contains(event),
+                "WebRtcPeerRegistry forwarders must emit typed {event} events"
+            );
+        }
+
+        assert!(
+            preceding_cfg_test(webrtc, "fn poll_received_messages"),
+            "raw WebRTC receiver polling must remain a test-only helper"
+        );
+        for helper in [
+            "fn lease_pty_input_receiver_for_test",
+            "fn lease_outgoing_signal_receiver_for_test",
+            "fn lease_stream_frame_receiver_for_test",
+        ] {
+            assert!(
+                preceding_cfg_test(webrtc, helper),
+                "{helper} must remain cfg(test)"
+            );
+        }
+
+        for usage in [
+            "poll_received_messages(",
+            "lease_pty_input_receiver_for_test(",
+            "lease_outgoing_signal_receiver_for_test(",
+            "lease_stream_frame_receiver_for_test(",
+        ] {
+            assert!(
+                all_occurrences_in_cfg_test_functions(server_comms, usage),
+                "{usage} may only be used by cfg(test) hub polling helpers"
+            );
+        }
+    }
+
+    #[test]
+    fn static_browser_webrtc_ingress_crosses_client_worker_boundary() {
+        let webrtc = include_str!("webrtc.rs");
+        let server_comms = include_str!("../hub/server_comms.rs");
+
+        for typed_mapping in [
+            "Some(\"subscribe\")",
+            "TransportIngress::Subscribe",
+            "Some(\"unsubscribe\")",
+            "TransportIngress::Unsubscribe",
+            "Some(\"focus_changed\")",
+            "TransportIngress::FocusChanged",
+        ] {
+            assert!(
+                webrtc.contains(typed_mapping),
+                "WebRTC plaintext classification must keep {typed_mapping} typed"
+            );
+        }
+
+        let client_worker_branch = source_window(
+            server_comms,
+            "WebRtcIngressOutcome::ClientWorker(other)",
+            "fn call_lua_webrtc_message",
+        );
+        assert!(client_worker_branch.contains("browser_client_workers.get(browser_identity)"));
+        assert!(client_worker_branch.contains("worker.try_send(other)"));
+        assert!(
+            !client_worker_branch.contains("call_lua_webrtc_message(browser_identity, other"),
+            "typed browser terminal ingress must not fall back to Lua routing"
+        );
+
+        for bypass in [
+            "send_pty_raw",
+            "send_pty(",
+            "WebRtcAdapterCommand::Pty",
+            "WebRtcAdapterCommand::Binary",
+        ] {
+            assert!(
+                !source_window(
+                    server_comms,
+                    "fn process_webrtc_plaintext_payload",
+                    "fn call_lua_webrtc_message",
+                )
+                .contains(bypass),
+                "process_webrtc_plaintext_payload must not encode browser terminal traffic directly with {bypass}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_session_io_docs_only_claim_executable_mailbox_work() {
+        let docs = include_str!("../../../docs/worker-actor-contracts.md");
+        let session_io = include_str!("session_io.rs");
+        let runtime = include_str!("session_io_runtime.rs");
+
+        for variant in [
+            "PtyInput",
+            "Resize",
+            "GetSnapshot",
+            "PasteFile",
+            "PrepareSnapshot",
+            "GetModeFlags",
+            "GetScreen",
+            "SetColorProfile",
+            "Shutdown",
+        ] {
+            assert!(
+                session_io.contains(&format!("    {variant}")),
+                "SessionIoRequest::{variant} must exist in the contract"
+            );
+            assert!(
+                runtime.contains(&format!("SessionIoRequest::{variant}")),
+                "SessionIoRequest::{variant} must have executable runtime handling before docs claim worker ownership"
+            );
+        }
+
+        assert!(docs.contains("current production mailbox work"));
+        assert!(docs.contains("Hub-owned policy"));
+        assert!(docs.contains("synchronous"));
+        assert!(docs.contains("compatibility work"));
+        assert!(
+            !docs.contains("scaffold-only SessionIoRequest"),
+            "docs should not describe scaffold-only SessionIoRequest variants as production-owned"
+        );
+    }
+
+    #[test]
+    fn static_boundary_json_remains_lua_plugin_or_relay_boundary() {
+        let docs = include_str!("../../../docs/worker-actor-contracts.md");
+        let transport = include_str!("transport.rs");
+        let webrtc = include_str!("webrtc.rs");
+        let server_comms = include_str!("../hub/server_comms.rs");
+
+        assert!(docs.contains("JSON remains limited to Lua/plugin/relay boundaries"));
+        assert!(transport.contains("TransportIngress::BoundaryJson"));
+        assert!(transport.contains("ClientControlFrame::BoundaryJson"));
+        assert!(webrtc.contains("_ => TransportIngress::BoundaryJson(msg)"));
+
+        let stable_ingress = source_window(
+            transport,
+            "pub(crate) fn ingress_to_client_message",
+            "fn client_message_to_egress",
+        );
+        for typed in [
+            "TransportIngress::Subscribe",
+            "TransportIngress::Unsubscribe",
+            "TransportIngress::TerminalInput",
+            "TransportIngress::FocusChanged",
+            "TransportIngress::DcPing",
+            "TransportIngress::DcPong",
+        ] {
+            assert!(
+                stable_ingress.contains(typed),
+                "{typed} must stay typed before BoundaryJson fallback"
+            );
+        }
+
+        assert_eq!(
+            server_comms
+                .matches("ClientControlFrame::BoundaryJson")
+                .count(),
+            1,
+            "hub-side BoundaryJson should remain the documented subscribe ack exception"
+        );
+        assert!(server_comms.contains("\"type\": \"subscribed\""));
+    }
+
+    fn source_window<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_idx = source.find(start).expect("source start marker missing");
+        let after_start = &source[start_idx..];
+        let end_idx = after_start.find(end).unwrap_or(after_start.len());
+        &after_start[..end_idx]
+    }
+
+    fn preceding_cfg_test(source: &str, marker: &str) -> bool {
+        let marker_idx = source.find(marker).expect("source marker missing");
+        let prefix = &source[..marker_idx];
+        prefix
+            .lines()
+            .rev()
+            .take(4)
+            .any(|line| line.trim() == "#[cfg(test)]")
+    }
+
+    fn all_occurrences_in_cfg_test_functions(source: &str, needle: &str) -> bool {
+        let mut rest = source;
+        let mut offset = 0;
+        let mut found = false;
+
+        while let Some(relative_idx) = rest.find(needle) {
+            found = true;
+            let idx = offset + relative_idx;
+            if !inside_preceding_cfg_test_function(source, idx) {
+                return false;
+            }
+            let next = relative_idx + needle.len();
+            offset += next;
+            rest = &rest[next..];
+        }
+
+        found
+    }
+
+    fn inside_preceding_cfg_test_function(source: &str, idx: usize) -> bool {
+        let prefix = &source[..idx];
+        let Some(fn_idx) = prefix.rfind("\n    fn ") else {
+            return false;
+        };
+        prefix[fn_idx..]
+            .lines()
+            .take(4)
+            .any(|line| line.contains("_for_tests") || line.contains("poll_"))
+            && prefix[..fn_idx]
+                .lines()
+                .rev()
+                .take(4)
+                .any(|line| line.trim() == "#[cfg(test)]")
+    }
 }

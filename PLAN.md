@@ -1,155 +1,200 @@
-# Plan: Stabilize Workerized Data-Plane Timing And Regression Tests
+# Plan: Align Workerized Architecture Docs And Static Checks
 
-Ticket: `ticket_1777787368_138401` - Stabilize workerized data-plane timing
-and regression tests.
+Ticket: `ticket_1777787693_701304` - Align workerized architecture docs and
+static checks with production reality.
 
 ## Intent
 
-This ticket is a carry-forward verification cleanup for the workerized
-session-I/O data plane. The production architecture is already in place:
-`SessionIoWorker` reads session process frames, coalesces PTY output into
-`HubEvent::SessionIoBatch`, preserves ordered structured terminal events, and
-lets the hub remain the orchestration owner.
+This ticket is a post-migration alignment pass. Several workerization slices
+have landed, but the repo still needs the architecture documents and regression
+checks to describe the implementation that actually exists, not a stronger
+aspirational target.
 
-The work is to make that behavior provably deterministic. The existing
-coverage should stop relying on sleep-sensitive timing, should explicitly test
-the 4 ms time-based flush rule, should prove Bell/Notification/ProcessExit
-flush ordering around output, should prove Lua `pty_output` observers see
-coalesced batches without byte loss or reordering, and should include a small
-deterministic smoke/harness proving the 32 KiB / 4 ms / 16-frame thresholds do
-not create visible output latency.
+The work is to audit `docs/worker-actor-contracts.md`, any related verification
+notes, and the production Rust paths for WebRTC, client workers, and session I/O
+mailboxes. Then update the docs so they state the canonical runtime boundary
+precisely:
 
-This is not an architecture migration. No old production data path needs to be
-replaced. What must be removed or made impossible is the verification gap:
-tests that pass by sleeping long enough, tests that only assert one happy burst,
-or Lua observer coverage that does not prove total bytes and byte order for
-coalesced batches.
+- `WebRtcPeerRegistry` owns browser WebRTC peer/channel state and production
+  data-plane receiver forwarders.
+- `WebRtcTransportRunner` and `WebRtcTransportAdapter` classify browser
+  DataChannel JSON into typed `TransportIngress` / `ClientWorkerMessage` where
+  stable Botster-owned controls exist.
+- The hub still owns orchestration policy, Lua routing, auth/capability checks,
+  Rails relay coordination, and handshake-time encrypted answer generation.
+- Browser terminal subscribe/input/focus traffic must enter the browser
+  `ClientWorker`; stable browser terminal traffic must not bypass the worker
+  through an adapter-only or direct hub path.
+- Session paste and snapshot preparation are worker mailbox work only after hub
+  authorization/routing policy has selected the session and destination.
+
+This is an architecture cleanup, so the old behavior to remove or make
+impossible is ambiguity: docs that overclaim full worker ownership where the hub
+still intentionally owns policy or handshake exceptions, docs that describe
+scaffold-only request variants as production paths, and brittle text checks that
+only match old field names while allowing equivalent boundary violations under
+new names.
 
 ## Hard Constraints
 
 - Use `cd cli && ./test.sh ...` for CLI verification, not raw `cargo test`.
-- Keep the hub/client-worker/session-I/O ownership split documented in
-  `docs/worker-actor-contracts.md`.
-- Keep session-process wire protocol unchanged.
-- Keep coalescing thresholds unchanged unless a test exposes a real defect:
-  32 KiB buffered output, 16 output frames, 4 ms since first buffered output,
-  ordered structured event boundaries, EOF/desync/shutdown.
-- Do not move hub policy into `worker::session_io` to make tests easier.
+- Preserve the hub/client-worker/session-I/O ownership split from the vault:
+  hub is the central orchestrator; workers own transport-neutral stream or
+  session data-plane mechanics and request hub policy through typed messages.
+- Keep the cold-turkey migration posture for architectural ambiguity: remove or
+  rewrite misleading claims rather than preserving old and new wording side by
+  side.
+- Keep boundary exceptions explicit instead of hiding them. In particular,
+  handshake-time SDP answer encryption remains hub-triggered policy work today,
+  while the registry/runner owns the transport mechanics around it.
+- Do not introduce new gems, build steps, Node-only checks, or bespoke
+  framework abstractions. Static checks should live in Rust tests or simple repo
+  scripts already covered by `cli/test.sh`.
 - No UI work is planned. `tmp/tailwind_plus_preview` is absent in this
-  worktree. If UI work becomes necessary later, use existing React/Vite
-  Catalyst components and `IconGlyph`, not new styling primitives.
+  worktree, and no browser component changes are needed. If UI work unexpectedly
+  appears during implementation, use the existing React/Vite Catalyst components
+  and local `ui_contract` primitives instead of inventing controls or styling.
 
 ## Affected Surfaces
 
-- `cli/src/worker/session_io_runtime.rs`
-  - Main target for deterministic coalescer/runtime tests.
-  - Add or refine test helpers around synthetic encoded frames and hub/event
-    receivers.
-- `cli/src/hub/server_comms.rs`
-  - Add or tighten hub/Lua observer regression coverage for
-    `HubEvent::SessionIoBatch` and Lua `pty_output` observer behavior.
-- `docs/project-pipelines-verification.md`
-  - Record exact focused/full verification commands and results after
-    implementation.
 - `docs/worker-actor-contracts.md`
-  - Only update if implementation discovers a real contract clarification;
-    otherwise leave architecture docs unchanged.
+  - Main documentation target.
+  - Reconcile any overly strong production claims about
+    `WebRtcTransportRunner`, `ClientWorker`, paste/snapshot ownership, and raw
+    JSON escape hatches with current code.
+  - Keep intentional exceptions called out with mechanism and scope.
+
+- `docs/project-pipelines-verification.md`
+  - Add a dated verification entry with the exact focused/full checks and static
+    scan results after implementation.
+
+- `cli/src/worker/webrtc.rs`
+  - Production source for registry-owned receivers, `WebRtcTransportRunner`,
+    WebRTC ingress classification, and allowed `BoundaryJson` cases.
+  - Static tests should assert the shape of these boundaries without depending
+    on private field names alone.
+
+- `cli/src/worker/transport.rs`
+  - Production source for generic typed ingress/egress mapping and allowed
+    `BoundaryJson` conversions for Lua/plugin/relay boundaries.
+
+- `cli/src/worker/session_io.rs` and
+  `cli/src/worker/session_io_runtime.rs`
+  - Production source for mailbox variants and which variants are actually
+    executable worker work.
+  - Static checks should prevent scaffold-only variants from being documented as
+    production-owned if they still only return scaffold errors.
+
+- `cli/src/hub/server_comms.rs`
+  - Production source for hub-owned policy, browser worker registration,
+    WebRTC event handling, paste authorization, snapshot routing, and
+    handshake-time answer encryption.
+  - Static checks should distinguish allowed hub policy/relay exceptions from
+    forbidden transport receiver ownership or browser terminal bypasses.
+
+- `cli/src/worker/mod.rs` or a focused `cli/tests/...` integration-style test
+  if the check cannot live cleanly beside module tests.
+  - Preferred home for semantic static checks that read source files with
+    `include_str!` and assert boundary invariants.
 
 ## Implementation Sequence
 
-1. Make session-I/O runtime tests deterministic.
-   - Replace the sleep-sensitive wait in
-     `coalesces_synthetic_output_burst_before_hub_delivery` with a helper that
-     drains expected broadcast/hub events until the batch arrives or a bounded
-     timeout fails with captured context.
-   - Add a reusable test helper for writing encoded frames, shutting down the
-     writer when appropriate, and collecting `SessionIoBatch` / exit events
-     without arbitrary sleeps.
-   - Keep all input synthetic; do not depend on live daemon logs or `/tmp`.
+1. Audit current production behavior.
+   - Trace browser DataChannel ingress from
+     `WebRtcPeerRegistry::handle_plaintext_payload` through
+     `WebRtcTransportRunner`, `WebRtcTransportAdapter`,
+     `TransportIngress`, and `ClientWorkerMessage`.
+   - Trace WebRTC production receiver ownership through
+     `WebRtcPeerRegistry::start_queue_forwarders`.
+   - Trace hub-side exceptions in `server_comms.rs`: policy handling,
+     `process_webrtc_plaintext_payload`, Lua fallback routing, paste
+     authorization, snapshot routing, and `WebRtcTransportRunner::negotiate_offer`.
+   - Trace `SessionIoRequest` variants to separate production mailbox work
+     (`PtyInput`, `PasteFile`, `PrepareSnapshot`, shutdown/resize/color profile
+     if wired) from scaffold-only synchronous RPC mirrors if they still return
+     scaffold errors.
 
-2. Add explicit 4 ms flush coverage.
-   - Add a test that writes fewer than 16 frames and less than 32 KiB, keeps
-     the stream open, and verifies output flushes because the 4 ms age boundary
-     expires.
-   - Assert both broadcast `PtyEvent::Output` and hub
-     `HubEvent::SessionIoBatch` receive the same bytes in the same order.
-   - Avoid using a fragile exact elapsed assertion; the test should prove the
-     age-triggered path flushes without requiring frame-count/byte thresholds
-     or EOF.
+2. Rewrite docs to match actual runtime ownership.
+   - Update `docs/worker-actor-contracts.md` so every strong claim has a
+     matching production mechanism.
+   - Replace aspirational wording such as "all WebRTC production traffic flows
+     through ClientWorker" with the narrower true statement: browser terminal
+     subscribe/input/focus and typed terminal controls cross the client-worker
+     boundary, while Lua/plugin/relay JSON remains a documented boundary
+     exception.
+   - Keep the expected target path visible, but label any remaining bridge as
+     current production behavior rather than future scaffolding.
+   - Document handshake-time answer encryption as an intentional hub-triggered
+     exception if it remains implemented via
+     `WebRtcTransportRunner::negotiate_offer` spawned from hub policy.
 
-3. Add ordered structured-event boundary tests.
-   - Add Bell ordering: output before `FRAME_BELL` flushes before the bell
-     notification is observed.
-   - Add Notification ordering: output before `FRAME_NOTIFICATION` flushes
-     before the OSC notification event.
-   - Add ProcessExit ordering: output before `FRAME_PROCESS_EXITED` flushes
-     before `HubEvent::SessionProcessExited`, and EOF after process exit still
-     emits only one exit.
-   - Preserve the intended boundary rule: structured ordered events are not
-     coalesced behind later PTY bytes.
+3. Replace brittle static checks with semantic boundary tests.
+   - Add focused static tests that parse/read source text structurally enough to
+     assert relationships, not only deleted field names.
+   - WebRTC receiver ownership check:
+     assert production hub code does not call `lease_*_receiver_for_test`,
+     `poll_received_messages`, or raw WebRTC receiver `take()` paths outside
+     `#[cfg(test)]` test-driving helpers, and assert
+     `start_queue_forwarders` emits typed `HubEvent` variants.
+   - Browser client-worker ingress check:
+     assert browser subscribe/unsubscribe/focus classifications become
+     `ClientWorkerMessage` variants and `process_webrtc_plaintext_payload`
+     forwards `WebRtcIngressOutcome::ClientWorker` into
+     `browser_client_workers`.
+   - Adapter-only bypass check:
+     assert browser terminal PTY input/file input/snapshot delivery does not
+     directly encode/send terminal traffic from `server_comms.rs` without going
+     through `ClientWorkerMessage` or a documented Lua/relay boundary.
+   - Session-I/O mailbox check:
+     assert docs only claim production mailbox ownership for variants with real
+     runtime handling, and specifically catch scaffold-only
+     `SessionIoRequest` variants being documented as production-owned while
+     `session_io_runtime.rs` still returns scaffold errors.
+   - JSON escape-hatch check:
+     assert `BoundaryJson` usage is confined to transport adapter conversion
+     and Lua/plugin/relay boundary handling, not stable Botster-owned control
+     frames that already have typed variants.
 
-4. Add Lua `pty_output` observer byte-order and total-byte assertions.
-   - In `cli/src/hub/server_comms.rs`, register a test Lua observer for
-     `pty_output` or use the existing Lua test harness if one already exists.
-   - Feed multiple `HubEvent::SessionIoBatch` events with coalesced chunks
-     that represent several original PTY output frames.
-   - Assert Lua observes chunks in order and that concatenated observer bytes
-     exactly equal the original expected byte stream.
-   - Assert total observed byte count matches the sum of the coalesced batch
-     payloads.
+4. Remove or tighten misleading checks.
+   - Find any existing `rg`-style architecture checks in docs, tests, or
+     verification notes that only look for old fields such as removed receiver
+     names.
+   - Replace them with the new focused tests or update the verification command
+     list so future agents run the semantic checks rather than stale scans.
 
-5. Add deterministic latency smoke for threshold behavior.
-   - Add a focused test/harness that drives the three flush reasons:
-     16 frames, 32 KiB, and 4 ms age.
-   - Assert each path emits output promptly through the worker/hub event
-     channel under a bounded timeout.
-   - The point is not a benchmark; it is a regression guard that these
-     thresholds cannot silently hold visible output until EOF or a later
-     structured event.
+5. Verify with focused CLI checks.
+   - Run the smallest relevant filters first:
 
-6. Update verification docs.
-   - Append a dated entry to `docs/project-pipelines-verification.md` with the
-     exact commands and results.
-   - Include any remaining timing-sensitive test helper rationale if a sleep
-     remains unavoidable.
+     ```bash
+     cd cli && ./test.sh --unit -- worker
+     cd cli && ./test.sh --unit -- server_comms
+     ```
 
-## Verification
+   - Run any new focused static-check filter by name.
+   - Run full CLI unit verification before handoff:
 
-Focused CLI checks:
+     ```bash
+     cd cli && ./test.sh --unit
+     ```
 
-```bash
-cd cli && ./test.sh --unit -- session_io_runtime
-cd cli && ./test.sh --unit -- server_comms
-cd cli && ./test.sh --unit -- worker
-```
-
-Full CLI unit verification before handoff:
-
-```bash
-cd cli && ./test.sh --unit
-```
-
-Static checks:
-
-```bash
-rg -n "sleep\\(Duration::from_millis|thread::sleep|tokio::time::sleep" cli/src/worker/session_io_runtime.rs cli/src/hub/server_comms.rs
-rg -n "pty_output|SessionIoBatch|FRAME_BELL|FRAME_NOTIFICATION|FRAME_PROCESS_EXITED" cli/src/worker/session_io_runtime.rs cli/src/hub/server_comms.rs
-```
-
-Remaining sleeps in production snapshot-redraw code are out of scope. Any
-remaining test-only sleep in the touched tests must be justified or replaced.
+6. Record evidence.
+   - Add a dated entry to `docs/project-pipelines-verification.md` with command
+     output summaries.
+   - Include the static check names and the exceptions they intentionally allow.
+   - Note that no UI changed and that Catalyst/Elements/Tailwind preview review
+     was not applicable.
 
 ## Acceptance Checklist
 
-- `coalesces_synthetic_output_burst_before_hub_delivery` no longer depends on
-  arbitrary sleep/timing.
-- There is explicit coverage for age-based 4 ms flushing independent of EOF,
-  16-frame, and 32 KiB triggers.
-- Bell, notification, and process-exit ordered boundaries flush pending output
-  before the structured event.
-- Lua `pty_output` observers have byte-order and total-byte assertions for
-  coalesced batches.
-- A deterministic smoke/harness proves 32 KiB / 4 ms / 16-frame thresholds do
-  not hold visible output indefinitely.
-- Verification uses `cli/test.sh` and results are recorded in
+- `docs/worker-actor-contracts.md` describes the workerized architecture as it
+  exists in production, including hub-owned policy and handshake exceptions.
+- Any scaffold-only session-I/O request variants are either documented as
+  scaffold/currently-not-production or removed from production-ownership claims.
+- Browser terminal traffic cannot regress to bypassing the browser
+  `ClientWorker` without a failing static or behavioral test.
+- Hub code cannot reintroduce production raw WebRTC receiver leasing/polling
+  without a failing static test; test-only helpers remain clearly `#[cfg(test)]`.
+- Raw JSON escape hatches are limited to documented Lua/plugin/relay boundaries;
+  stable Botster-owned controls remain typed.
+- Verification uses `cli/test.sh`, and results are recorded in
   `docs/project-pipelines-verification.md`.
