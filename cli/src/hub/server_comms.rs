@@ -769,6 +769,7 @@ impl Hub {
     }
 
     fn unregister_terminal_forwarder_peer(&mut self, forwarder_id: &str, promote_next: bool) {
+        self.cleanup_pending_session_io_snapshots_for_forwarder(forwarder_id);
         let Some((session_uuid, peer_id)) = self.terminal_forwarder_peers.remove(forwarder_id)
         else {
             return;
@@ -1077,6 +1078,12 @@ impl Hub {
                     self.handle_observed_pty_output(batch.session_uuid, output);
                 }
             }
+            HubEvent::SessionIo(event) => {
+                self.handle_session_io_event(event);
+            }
+            HubEvent::DropPendingSessionIoSnapshot { request_id } => {
+                self.pending_session_io_snapshots.remove(&request_id);
+            }
             HubEvent::ClientWorkerControl(message) => {
                 self.handle_client_worker_control(message);
             }
@@ -1195,6 +1202,7 @@ impl Hub {
             HubEvent::CleanupTick => {
                 self.repair_missing_socket_path();
                 self.cleanup_webrtc_peer_registry();
+                self.cleanup_stale_session_io_snapshots();
                 self.poll_stream_frames_outgoing();
                 self.send_backpressure_recovery_snapshots();
                 self.ratchet_restarted_peers.clear();
@@ -2172,6 +2180,7 @@ impl Hub {
                 }
 
                 // Real process exit or non-session-backed: normal handling.
+                self.cleanup_pending_session_io_snapshots_for_session(&session_uuid);
                 self.cleanup_paste_files(&session_uuid);
                 if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
                     session_handle.pty().notify_process_exited(exit_code);
@@ -2282,6 +2291,8 @@ impl Hub {
             }
 
             HubEvent::SessionUnregistered { session_uuid } => {
+                self.cleanup_pending_session_io_snapshots_for_session(&session_uuid);
+                self.cleanup_paste_files(&session_uuid);
                 self.terminal_profiles.clear_session(&session_uuid);
                 self.terminal_session_peers.remove(&session_uuid);
                 self.terminal_forwarder_peers
@@ -2469,30 +2480,19 @@ impl Hub {
             return;
         };
 
-        match crate::worker::session_io::write_paste_file(
-            &file.session_uuid,
-            &file.filename,
-            &file.data,
-            |input| session_handle.pty().write_input_direct(input),
+        let request_id = Self::next_session_io_request_id("paste");
+        let session_uuid = file.session_uuid.clone();
+        if let Err(e) = session_handle.pty().enqueue_session_io_request(
+            crate::worker::session_io::SessionIoRequest::PasteFile {
+                request_id,
+                filename: file.filename,
+                data: file.data,
+            },
         ) {
-            Ok(write) => {
-                log::info!(
-                    "[FILE-INPUT] Wrote {} bytes to {} (session={})",
-                    write.bytes,
-                    write.path.display(),
-                    file.session_uuid,
-                );
-                self.paste_files
-                    .entry(file.session_uuid)
-                    .or_default()
-                    .push(write.path);
-            }
-            Err((reason, detail)) => {
-                log::error!(
-                    "[FILE-INPUT] Paste failed for session {} reason={reason:?}: {detail}",
-                    file.session_uuid
-                );
-            }
+            log::error!(
+                "[FILE-INPUT] Paste enqueue failed for session {} reason={e:?}",
+                session_uuid
+            );
         }
     }
 
@@ -2511,6 +2511,244 @@ impl Hub {
                 log::info!(
                     "[FILE-INPUT] Cleaned up {} paste file(s) for {session_uuid}",
                     files.len()
+                );
+            }
+        }
+    }
+
+    fn cleanup_pending_session_io_snapshots_for_session(&mut self, session_uuid: &str) {
+        self.pending_session_io_snapshots
+            .retain(|_, pending| pending.session_uuid != session_uuid);
+    }
+
+    fn cleanup_pending_session_io_snapshots_for_peer(&mut self, peer_id: &str) {
+        self.pending_session_io_snapshots
+            .retain(|_, pending| match &pending.target {
+                super::PendingSessionIoSnapshotTarget::WebRtcOutput { peer_id: owner, .. }
+                | super::PendingSessionIoSnapshotTarget::WebRtcPeerRecovery {
+                    peer_id: owner,
+                    ..
+                } => owner != peer_id,
+            });
+    }
+
+    fn cleanup_pending_session_io_snapshots_for_forwarder(&mut self, forwarder_id: &str) {
+        self.pending_session_io_snapshots
+            .retain(|_, pending| match &pending.target {
+                super::PendingSessionIoSnapshotTarget::WebRtcOutput { forwarder_key, .. } => {
+                    forwarder_key.as_deref() != Some(forwarder_id)
+                }
+                super::PendingSessionIoSnapshotTarget::WebRtcPeerRecovery { .. } => true,
+            });
+    }
+
+    fn next_session_io_request_id(prefix: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{prefix}-{nanos}")
+    }
+
+    fn handle_session_io_event(&mut self, event: crate::worker::session_io::SessionIoEvent) {
+        use crate::worker::session_io::SessionIoEvent;
+
+        match event {
+            SessionIoEvent::PasteFileWritten {
+                session_uuid,
+                path,
+                bytes,
+                ..
+            } => {
+                log::info!(
+                    "[FILE-INPUT] Wrote {} bytes to {} (session={})",
+                    bytes,
+                    path.display(),
+                    session_uuid,
+                );
+                self.paste_files.entry(session_uuid).or_default().push(path);
+            }
+            SessionIoEvent::PasteFileFailed {
+                session_uuid,
+                reason,
+                detail,
+                ..
+            } => {
+                log::error!(
+                    "[FILE-INPUT] Paste failed for session {} reason={reason:?}: {detail}",
+                    session_uuid
+                );
+            }
+            SessionIoEvent::PreparedSnapshot {
+                request_id,
+                session_uuid,
+                uncompressed_len,
+                payload,
+                recovery,
+            } => {
+                self.route_prepared_session_io_snapshot(
+                    request_id,
+                    session_uuid,
+                    uncompressed_len,
+                    payload,
+                    recovery,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn insert_pending_session_io_snapshot(
+        &mut self,
+        request_id: String,
+        pending: super::PendingSessionIoSnapshot,
+    ) -> bool {
+        if self.pending_session_io_snapshots.len()
+            >= crate::worker::session_io::SESSION_IO_WORKER_QUEUE.capacity
+        {
+            self.hub_event_metrics
+                .record_counter("snapshot.queue_full", 1);
+            log::warn!(
+                "[SessionIo] Snapshot pending map full; dropping request {} for session {}",
+                request_id,
+                pending.session_uuid
+            );
+            return false;
+        }
+
+        self.pending_session_io_snapshots
+            .insert(request_id, pending);
+        true
+    }
+
+    fn route_prepared_session_io_snapshot(
+        &mut self,
+        request_id: String,
+        session_uuid: String,
+        uncompressed_len: usize,
+        payload: Vec<u8>,
+        recovery: bool,
+    ) {
+        let Some(pending) = self.pending_session_io_snapshots.remove(&request_id) else {
+            log::debug!(
+                "[SessionIo] Dropping prepared snapshot for unknown request {} session {}",
+                request_id,
+                session_uuid
+            );
+            return;
+        };
+
+        if payload.is_empty() {
+            let counter = if recovery {
+                "snapshot.backpressure_recovery.empty"
+            } else {
+                "snapshot.empty"
+            };
+            self.hub_event_metrics.record_counter(counter, 1);
+            return;
+        }
+
+        self.hub_event_metrics.record_span_with_threshold(
+            "snapshot.gzip_queue",
+            pending.started_at.elapsed(),
+            uncompressed_len + payload.len(),
+            Hub::SNAPSHOT_SLOW,
+            &session_uuid,
+        );
+
+        match pending.target {
+            super::PendingSessionIoSnapshotTarget::WebRtcOutput {
+                peer_id,
+                subscription_id,
+                forwarder_key,
+                active_flag,
+            } => {
+                let output_tx = self.webrtc.pty_output_tx();
+                match output_tx.try_send(WebRtcPtyOutput {
+                    subscription_id,
+                    browser_identity: peer_id.clone(),
+                    data: payload,
+                    session_uuid,
+                }) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        self.hub_event_metrics
+                            .record_counter("snapshot.queue_full", 1);
+                        if let Some(flag) = active_flag {
+                            if let Ok(mut active) = flag.lock() {
+                                *active = false;
+                            }
+                        }
+                        if let Some(key) = forwarder_key {
+                            self.stop_lua_pty_forwarder(&key);
+                        }
+                        let _ = self.hub_event_tx.send(
+                            super::events::HubEvent::WebRtcIngressBackpressure {
+                                browser_identity: peer_id,
+                                source: "pty_output_snapshot_queue_full",
+                            },
+                        );
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        self.hub_event_metrics
+                            .record_counter("snapshot.queue_closed", 1);
+                        if let Some(flag) = active_flag {
+                            if let Ok(mut active) = flag.lock() {
+                                *active = false;
+                            }
+                        }
+                        if let Some(key) = forwarder_key {
+                            self.stop_lua_pty_forwarder(&key);
+                        }
+                    }
+                }
+            }
+            super::PendingSessionIoSnapshotTarget::WebRtcPeerRecovery {
+                subscription_id,
+                peer_tx,
+                ..
+            } => match peer_tx.try_send(crate::worker::webrtc::WebRtcAdapterCommand::Pty {
+                subscription_id,
+                data: payload,
+            }) {
+                Ok(()) => self
+                    .hub_event_metrics
+                    .record_counter("snapshot.backpressure_recovery.sent", 1),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    self.hub_event_metrics
+                        .record_counter("snapshot.queue_full", 1);
+                    self.hub_event_metrics
+                        .record_counter("snapshot.backpressure_recovery.failed", 1);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    self.hub_event_metrics
+                        .record_counter("snapshot.queue_closed", 1);
+                    self.hub_event_metrics
+                        .record_counter("snapshot.backpressure_recovery.failed", 1);
+                }
+            },
+        }
+    }
+
+    fn cleanup_stale_session_io_snapshots(&mut self) {
+        let now = Instant::now();
+        let stale: Vec<String> = self
+            .pending_session_io_snapshots
+            .iter()
+            .filter_map(|(request_id, pending)| {
+                (now.duration_since(pending.started_at) > super::SESSION_IO_SNAPSHOT_PENDING_TTL)
+                    .then(|| request_id.clone())
+            })
+            .collect();
+
+        for request_id in stale {
+            if let Some(pending) = self.pending_session_io_snapshots.remove(&request_id) {
+                self.hub_event_metrics
+                    .record_counter("snapshot.pending_stale_drop", 1);
+                log::warn!(
+                    "[SessionIo] Dropped stale prepared-snapshot request {} for session {}",
+                    request_id,
+                    pending.session_uuid
                 );
             }
         }
@@ -3143,6 +3381,7 @@ impl Hub {
             _ => "cleanup.webrtc.reason.other",
         };
         self.hub_event_metrics.record_counter(reason_counter, 1);
+        self.cleanup_pending_session_io_snapshots_for_peer(browser_identity);
         // Guard against duplicate cleanup calls (e.g. handle_webrtc_send and
         // poll_webrtc_pty_output both detecting the same dead channel in the
         // same tick). If the channel is already gone this is a no-op — we must
@@ -3984,6 +4223,7 @@ impl Hub {
         // Run it inside the spawned forwarder task so Hub event processing stays
         // responsive while attach state is being prepared.
         let pty_for_snapshot = pty_handle.clone();
+        let pty_for_prepare = pty_handle.clone();
 
         // Spawn forwarder task.
         let output_tx = self.webrtc.pty_output_tx();
@@ -3999,6 +4239,27 @@ impl Hub {
 
         // Use browser-provided subscription ID for message routing.
         let subscription_id = req.subscription_id.clone();
+        let snapshot_request_id = if pty_handle.is_session_backed() {
+            let request_id = Self::next_session_io_request_id("snapshot");
+            if !self.insert_pending_session_io_snapshot(
+                request_id.clone(),
+                super::PendingSessionIoSnapshot {
+                    session_uuid: session_uuid.clone(),
+                    started_at: Instant::now(),
+                    target: super::PendingSessionIoSnapshotTarget::WebRtcOutput {
+                        peer_id: peer_id.clone(),
+                        subscription_id: subscription_id.clone(),
+                        forwarder_key: Some(forwarder_key.clone()),
+                        active_flag: Some(active_flag.clone()),
+                    },
+                },
+            ) {
+                return false;
+            }
+            Some(request_id)
+        } else {
+            None
+        };
 
         let _guard = self.tokio_runtime.enter();
         let task = tokio::spawn(async move {
@@ -4080,10 +4341,9 @@ impl Hub {
 
             if !Self::queue_webrtc_terminal_snapshot(
                 &metrics,
-                &output_tx,
                 &hub_event_tx,
-                &peer_id,
-                &subscription_id,
+                &pty_for_prepare,
+                snapshot_request_id,
                 &session_uuid,
                 snapshot,
             ) {
@@ -4215,7 +4475,7 @@ impl Hub {
         };
 
         let pty_handle = session_handle.pty().clone();
-        let output_tx = self.webrtc.pty_output_tx();
+        let pty_for_prepare = pty_handle.clone();
         let hub_event_tx = self.hub_event_tx.clone();
         let peer_id = req.peer_id.clone();
         let subscription_id = req.subscription_id.clone();
@@ -4223,6 +4483,27 @@ impl Hub {
         let target_rows = req.rows;
         let target_cols = req.cols;
         let metrics = Arc::clone(&self.hub_event_metrics);
+        let snapshot_request_id = if pty_handle.is_session_backed() {
+            let request_id = Self::next_session_io_request_id("snapshot");
+            if !self.insert_pending_session_io_snapshot(
+                request_id.clone(),
+                super::PendingSessionIoSnapshot {
+                    session_uuid: session_uuid.clone(),
+                    started_at: Instant::now(),
+                    target: super::PendingSessionIoSnapshotTarget::WebRtcOutput {
+                        peer_id,
+                        subscription_id,
+                        forwarder_key: None,
+                        active_flag: None,
+                    },
+                },
+            ) {
+                return;
+            }
+            Some(request_id)
+        } else {
+            None
+        };
 
         let _guard = self.tokio_runtime.enter();
         tokio::spawn(async move {
@@ -4261,10 +4542,9 @@ impl Hub {
 
             Self::queue_webrtc_terminal_snapshot(
                 &metrics,
-                &output_tx,
                 &hub_event_tx,
-                &peer_id,
-                &subscription_id,
+                &pty_for_prepare,
+                snapshot_request_id,
                 &session_uuid,
                 snapshot,
             );
@@ -4273,63 +4553,85 @@ impl Hub {
 
     fn queue_webrtc_terminal_snapshot(
         metrics: &super::events::HubEventMetrics,
-        output_tx: &tokio::sync::mpsc::Sender<WebRtcPtyOutput>,
         hub_event_tx: &super::events::HubEventTx,
-        peer_id: &str,
-        subscription_id: &str,
+        pty_handle: &crate::hub::agent_handle::PtyHandle,
+        request_id: Option<String>,
         session_uuid: &str,
         snapshot: Vec<u8>,
     ) -> bool {
         if snapshot.is_empty() {
+            if let Some(request_id) = request_id {
+                let _ = hub_event_tx
+                    .send(super::events::HubEvent::DropPendingSessionIoSnapshot { request_id });
+            }
             metrics.record_counter("snapshot.empty", 1);
             return true;
         }
 
-        // Pre-gzip and queue preparation live in the session I/O data plane.
-        // The hub keeps only transport routing and backpressure policy here.
-        let (gzip_started, Some(prepared)) =
-            crate::worker::session_io::timed_prepare_snapshot_payload(&snapshot)
-        else {
-            metrics.record_counter("snapshot.empty", 1);
-            return true;
+        let Some(request_id) = request_id else {
+            log::warn!(
+                "[SessionIo] Non-session-backed snapshot for session {} cannot be prepared",
+                session_uuid
+            );
+            return false;
         };
-        metrics.record_span_with_threshold(
-            "snapshot.gzip_queue",
-            gzip_started.elapsed(),
-            prepared.uncompressed_len + prepared.payload.len(),
-            Hub::SNAPSHOT_SLOW,
-            session_uuid,
-        );
 
-        log::debug!(
-            "[Lua] Sending snapshot for session {} ({} bytes raw, {} bytes on wire)",
-            session_uuid,
-            prepared.uncompressed_len,
-            prepared.payload.len()
-        );
-
-        match output_tx.try_send(WebRtcPtyOutput {
-            subscription_id: subscription_id.to_string(),
-            browser_identity: peer_id.to_string(),
-            data: prepared.payload,
-            session_uuid: session_uuid.to_string(),
-        }) {
+        match pty_handle.enqueue_session_io_request(
+            crate::worker::session_io::SessionIoRequest::PrepareSnapshot {
+                request_id: request_id.clone(),
+                snapshot,
+                recovery: false,
+            },
+        ) {
             Ok(()) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                metrics.record_counter("snapshot.queue_full", 1);
+            Err(e) => {
+                if matches!(
+                    e,
+                    crate::session::connection::SessionIoRequestEnqueueError::MailboxFull
+                ) {
+                    metrics.record_counter("snapshot.queue_full", 1);
+                }
                 log::warn!(
-                    "[Lua] WebRTC PTY output queue full during snapshot send for {}",
-                    &peer_id[..peer_id.len().min(8)]
+                    "[SessionIo] Failed to enqueue snapshot prepare for session {}: {e:?}",
+                    session_uuid
                 );
-                let _ = hub_event_tx.send(super::events::HubEvent::WebRtcIngressBackpressure {
-                    browser_identity: peer_id.to_string(),
-                    source: "pty_output_snapshot_queue_full",
-                });
+                let _ = hub_event_tx
+                    .send(super::events::HubEvent::DropPendingSessionIoSnapshot { request_id });
                 false
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                metrics.record_counter("snapshot.queue_closed", 1);
-                log::trace!("[Lua] PTY output queue closed during snapshot send");
+        }
+    }
+
+    fn queue_backpressure_recovery_snapshot(
+        metrics: &super::events::HubEventMetrics,
+        hub_event_tx: &super::events::HubEventTx,
+        pty_handle: &crate::hub::agent_handle::PtyHandle,
+        request_id: String,
+        session_uuid: &str,
+        snapshot: Vec<u8>,
+    ) -> bool {
+        match pty_handle.enqueue_session_io_request(
+            crate::worker::session_io::SessionIoRequest::PrepareSnapshot {
+                request_id: request_id.clone(),
+                snapshot,
+                recovery: true,
+            },
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
+                if matches!(
+                    e,
+                    crate::session::connection::SessionIoRequestEnqueueError::MailboxFull
+                ) {
+                    metrics.record_counter("snapshot.queue_full", 1);
+                }
+                log::warn!(
+                    "[SessionIo] Failed to enqueue recovery snapshot prepare for session {}: {e:?}",
+                    session_uuid
+                );
+                let _ = hub_event_tx
+                    .send(super::events::HubEvent::DropPendingSessionIoSnapshot { request_id });
                 false
             }
         }
@@ -4375,6 +4677,23 @@ impl Hub {
                 let subscription_id = entry.subscription_id.clone();
                 let browser_identity = entry.browser_identity.clone();
                 let metrics = Arc::clone(&self.hub_event_metrics);
+                let pty_for_prepare = pty_handle.clone();
+                let hub_event_tx = self.hub_event_tx.clone();
+                let request_id = Self::next_session_io_request_id("snapshot-recovery");
+                if !self.insert_pending_session_io_snapshot(
+                    request_id.clone(),
+                    super::PendingSessionIoSnapshot {
+                        session_uuid: session_uuid.clone(),
+                        started_at: Instant::now(),
+                        target: super::PendingSessionIoSnapshotTarget::WebRtcPeerRecovery {
+                            peer_id: browser_identity.clone(),
+                            subscription_id: subscription_id.clone(),
+                            peer_tx: peer_tx.clone(),
+                        },
+                    },
+                ) {
+                    continue;
+                }
 
                 let _guard = self.tokio_runtime.enter();
                 tokio::spawn(async move {
@@ -4392,6 +4711,11 @@ impl Hub {
                                 e
                             );
                             metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
+                            let _ = hub_event_tx.send(
+                                super::events::HubEvent::DropPendingSessionIoSnapshot {
+                                    request_id: request_id.clone(),
+                                },
+                            );
                             return;
                         }
                     };
@@ -4405,6 +4729,11 @@ impl Hub {
 
                     if snapshot.is_empty() {
                         metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
+                        let _ = hub_event_tx.send(
+                            super::events::HubEvent::DropPendingSessionIoSnapshot {
+                                request_id: request_id.clone(),
+                            },
+                        );
                         return;
                     }
 
@@ -4415,98 +4744,22 @@ impl Hub {
                         &session_uuid[..session_uuid.len().min(8)]
                     );
 
-                    Self::send_snapshot_to_peer(&metrics, &peer_tx, &subscription_id, &snapshot);
+                    Self::queue_backpressure_recovery_snapshot(
+                        &metrics,
+                        &hub_event_tx,
+                        &pty_for_prepare,
+                        request_id,
+                        &session_uuid,
+                        snapshot,
+                    );
                 });
                 continue;
             }
 
-            // Snapshot via RPC — run on blocking thread to avoid stalling the event loop.
-            let pty_handle = session_handle.pty().clone();
-            let subscription_id = entry.subscription_id.clone();
-            let browser_identity = entry.browser_identity.clone();
-            let session_uuid = entry.session_uuid.clone();
-            let peer_tx = peer_tx.clone();
-            let metrics = Arc::clone(&self.hub_event_metrics);
-            tokio::spawn(async move {
-                let rpc_started = Instant::now();
-                let snapshot = match tokio::task::spawn_blocking(move || pty_handle.get_snapshot())
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!(
-                            "[WebRTC] Backpressure recovery snapshot task failed for session {}: {}",
-                            &session_uuid[..session_uuid.len().min(8)],
-                            e
-                        );
-                        metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
-                        return;
-                    }
-                };
-                metrics.record_span_with_threshold(
-                    "snapshot.rpc_get",
-                    rpc_started.elapsed(),
-                    snapshot.len(),
-                    Hub::SNAPSHOT_SLOW,
-                    &session_uuid,
-                );
-
-                if snapshot.is_empty() {
-                    metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
-                    return;
-                }
-
-                log::info!(
-                    "[WebRTC] Sending backpressure recovery snapshot ({} bytes) to {} for session {}",
-                    snapshot.len(),
-                    &browser_identity[..browser_identity.len().min(8)],
-                    &session_uuid[..session_uuid.len().min(8)]
-                );
-
-                Self::send_snapshot_to_peer(&metrics, &peer_tx, &subscription_id, &snapshot);
-            });
-        }
-    }
-
-    /// Send a snapshot directly through a per-peer channel.
-    ///
-    /// Bypasses the output queue to avoid re-triggering backpressure.
-    /// Used by both sync (cached) and async recovery paths.
-    fn send_snapshot_to_peer(
-        metrics: &super::events::HubEventMetrics,
-        peer_tx: &tokio::sync::mpsc::Sender<crate::worker::webrtc::WebRtcAdapterCommand>,
-        subscription_id: &str,
-        snapshot: &[u8],
-    ) {
-        let (gzip_started, Some(prepared)) =
-            crate::worker::session_io::timed_prepare_snapshot_payload(snapshot)
-        else {
-            metrics.record_counter("snapshot.backpressure_recovery.empty", 1);
-            return;
-        };
-        metrics.record_span_with_threshold(
-            "snapshot.gzip_queue",
-            gzip_started.elapsed(),
-            prepared.uncompressed_len + prepared.payload.len(),
-            Hub::SNAPSHOT_SLOW,
-            "backpressure_recovery",
-        );
-
-        // try_send to avoid blocking; if still full, the snapshot
-        // is best-effort — live stream will eventually resync.
-        match peer_tx.try_send(crate::worker::webrtc::WebRtcAdapterCommand::Pty {
-            subscription_id: subscription_id.to_string(),
-            data: prepared.payload,
-        }) {
-            Ok(()) => metrics.record_counter("snapshot.backpressure_recovery.sent", 1),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                metrics.record_counter("snapshot.queue_full", 1);
-                metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                metrics.record_counter("snapshot.queue_closed", 1);
-                metrics.record_counter("snapshot.backpressure_recovery.failed", 1);
-            }
+            log::debug!(
+                "[WebRTC] Skipping backpressure recovery for non-session-backed PTY {}",
+                entry.session_uuid
+            );
         }
     }
 
@@ -5395,6 +5648,7 @@ impl Hub {
 
     /// Stop a PTY forwarder by ID.
     fn stop_lua_pty_forwarder(&mut self, forwarder_id: &str) {
+        self.cleanup_pending_session_io_snapshots_for_forwarder(forwarder_id);
         if let Some(pending) = self.pending_terminal_attaches.remove(forwarder_id) {
             pending.request.deactivate();
         }
@@ -6975,6 +7229,49 @@ mod tests {
         SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
     }
 
+    fn test_session_backed_handle_with_mailbox(
+        session_uuid: &str,
+        session_io_tx: tokio::sync::mpsc::Sender<crate::worker::session_io::SessionIoRequest>,
+    ) -> SessionHandle {
+        let conn = crate::session::connection::SessionConnection::test_with_session_io_sender(
+            session_io_tx,
+        );
+        test_session_backed_handle_with_connection(session_uuid, conn)
+    }
+
+    fn test_session_backed_handle_with_mailbox_and_snapshot(
+        session_uuid: &str,
+        session_io_tx: tokio::sync::mpsc::Sender<crate::worker::session_io::SessionIoRequest>,
+        snapshot: Option<Vec<u8>>,
+    ) -> SessionHandle {
+        let conn =
+            crate::session::connection::SessionConnection::test_with_session_io_sender_and_snapshot(
+                session_io_tx,
+                snapshot,
+            );
+        test_session_backed_handle_with_connection(session_uuid, conn)
+    }
+
+    fn test_session_backed_handle_with_connection(
+        session_uuid: &str,
+        conn: crate::session::connection::SessionConnection,
+    ) -> SessionHandle {
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let pty = PtyHandle::new_with_session(
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(Mutex::new(Some(conn))),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            24,
+            80,
+        );
+        SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
+    }
+
     fn unique_session_uuid(prefix: &str) -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -7254,6 +7551,284 @@ mod tests {
     }
 
     #[test]
+    fn test_file_input_enqueues_paste_and_written_event_registers_cleanup() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-file-paste-mailbox";
+        let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(4);
+        hub.handle_cache
+            .add_session(test_session_backed_handle_with_mailbox(
+                session_uuid,
+                session_io_tx,
+            ));
+
+        hub.handle_file_input(crate::channel::webrtc::FileInputIncoming {
+            session_uuid: session_uuid.to_string(),
+            filename: "drop.PNG".to_string(),
+            data: b"image-bytes".to_vec(),
+        });
+
+        match session_io_rx.try_recv().expect("paste request") {
+            crate::worker::session_io::SessionIoRequest::PasteFile {
+                request_id,
+                filename,
+                data,
+            } => {
+                assert!(request_id.starts_with("paste-"));
+                assert_eq!(filename, "drop.PNG");
+                assert_eq!(data, b"image-bytes");
+                let path = std::path::PathBuf::from("/tmp/botster-paste-test.png");
+                hub.handle_session_io_event(
+                    crate::worker::session_io::SessionIoEvent::PasteFileWritten {
+                        request_id,
+                        session_uuid: session_uuid.to_string(),
+                        path: path.clone(),
+                        bytes: 11,
+                    },
+                );
+                assert_eq!(
+                    hub.paste_files.get(session_uuid).expect("paste cleanup"),
+                    &vec![path]
+                );
+            }
+            other => panic!("expected PasteFile request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_queue_webrtc_terminal_snapshot_returns_false_when_mailbox_full() {
+        let (hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-snapshot-mailbox-full";
+        let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(1);
+        session_io_tx
+            .try_send(crate::worker::session_io::SessionIoRequest::PtyInput {
+                data: b"queued".to_vec(),
+            })
+            .expect("fill mailbox");
+        let session = test_session_backed_handle_with_mailbox(session_uuid, session_io_tx);
+        let pty = session.pty().clone();
+        hub.handle_cache.add_session(session);
+
+        assert!(!Hub::queue_webrtc_terminal_snapshot(
+            &hub.hub_event_metrics,
+            &hub.hub_event_tx,
+            &pty,
+            Some("snapshot-full".to_string()),
+            session_uuid,
+            b"snapshot".to_vec(),
+        ));
+
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.queue_full"], 1);
+        assert!(matches!(
+            session_io_rx.try_recv().expect("filled request"),
+            crate::worker::session_io::SessionIoRequest::PtyInput { .. }
+        ));
+    }
+
+    #[test]
+    fn test_empty_initial_snapshot_cleans_pending_session_io_request() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-empty-initial-snapshot";
+        let (session_io_tx, _session_io_rx) = tokio::sync::mpsc::channel(4);
+        hub.handle_cache
+            .add_session(test_session_backed_handle_with_mailbox_and_snapshot(
+                session_uuid,
+                session_io_tx,
+                Some(Vec::new()),
+            ));
+        let mut req = test_forwarder_request(
+            "browser-empty-snapshot",
+            session_uuid,
+            "terminal_empty_snapshot",
+        );
+        req.rows = 23;
+
+        assert!(hub.try_attach_terminal_forwarder(&req));
+        assert_eq!(hub.pending_session_io_snapshots.len(), 1);
+
+        for _ in 0..20 {
+            hub.tokio_runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            });
+            hub.poll_hub_events();
+            if hub.pending_session_io_snapshots.is_empty() {
+                break;
+            }
+        }
+
+        assert!(hub.pending_session_io_snapshots.is_empty());
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.empty"], 1);
+        hub.stop_lua_pty_forwarder("browser-empty-snapshot:sess-empty-initial-snapshot");
+    }
+
+    #[test]
+    fn test_snapshot_enqueue_failure_cleans_existing_pending_request() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let session_uuid = "sess-snapshot-enqueue-cleanup";
+        let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(1);
+        session_io_tx
+            .try_send(crate::worker::session_io::SessionIoRequest::PtyInput {
+                data: b"queued".to_vec(),
+            })
+            .expect("fill mailbox");
+        let session = test_session_backed_handle_with_mailbox(session_uuid, session_io_tx);
+        let pty = session.pty().clone();
+        hub.handle_cache.add_session(session);
+        let request_id = "snapshot-cleanup-on-full".to_string();
+        assert!(hub.insert_pending_session_io_snapshot(
+            request_id.clone(),
+            crate::hub::PendingSessionIoSnapshot {
+                session_uuid: session_uuid.to_string(),
+                started_at: Instant::now(),
+                target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput {
+                    peer_id: "browser-cleanup".to_string(),
+                    subscription_id: "sub-cleanup".to_string(),
+                    forwarder_key: Some(
+                        "browser-cleanup:sess-snapshot-enqueue-cleanup".to_string()
+                    ),
+                    active_flag: None,
+                },
+            },
+        ));
+
+        assert!(!Hub::queue_webrtc_terminal_snapshot(
+            &hub.hub_event_metrics,
+            &hub.hub_event_tx,
+            &pty,
+            Some(request_id.clone()),
+            session_uuid,
+            b"snapshot".to_vec(),
+        ));
+        assert!(hub.pending_session_io_snapshots.contains_key(&request_id));
+
+        hub.poll_hub_events();
+        assert!(!hub.pending_session_io_snapshots.contains_key(&request_id));
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.queue_full"], 1);
+        assert!(matches!(
+            session_io_rx.try_recv().expect("filled request"),
+            crate::worker::session_io::SessionIoRequest::PtyInput { .. }
+        ));
+    }
+
+    #[test]
+    fn test_prepared_snapshot_routes_to_webrtc_output_with_metrics() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let request_id = "snapshot-output-test".to_string();
+        hub.insert_pending_session_io_snapshot(
+            request_id.clone(),
+            crate::hub::PendingSessionIoSnapshot {
+                session_uuid: "sess-output".to_string(),
+                started_at: Instant::now(),
+                target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput {
+                    peer_id: "browser-output".to_string(),
+                    subscription_id: "sub-output".to_string(),
+                    forwarder_key: None,
+                    active_flag: None,
+                },
+            },
+        );
+
+        hub.handle_session_io_event(
+            crate::worker::session_io::SessionIoEvent::PreparedSnapshot {
+                request_id,
+                session_uuid: "sess-output".to_string(),
+                uncompressed_len: 256,
+                payload: vec![0x1f, 0x8b, 0x08, 0x00],
+                recovery: false,
+            },
+        );
+
+        let mut rx = hub.webrtc.take_pty_output_rx().expect("pty output rx");
+        let output = rx.try_recv().expect("prepared snapshot output");
+        hub.webrtc.restore_pty_output_rx(Some(rx));
+        assert_eq!(output.subscription_id, "sub-output");
+        assert_eq!(output.browser_identity, "browser-output");
+        assert_eq!(output.session_uuid, "sess-output");
+        assert!(output.data.starts_with(&[0x1f, 0x8b]));
+
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert!(snapshot.spans.contains_key("snapshot.gzip_queue"));
+        assert!(hub.pending_session_io_snapshots.is_empty());
+    }
+
+    #[test]
+    fn test_pending_session_io_snapshot_cleanup_paths() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
+        let (peer_tx, _peer_rx) = tokio::sync::mpsc::channel(1);
+        hub.insert_pending_session_io_snapshot(
+            "by-peer".to_string(),
+            crate::hub::PendingSessionIoSnapshot {
+                session_uuid: "sess-a".to_string(),
+                started_at: Instant::now(),
+                target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput {
+                    peer_id: "browser-a".to_string(),
+                    subscription_id: "sub-a".to_string(),
+                    forwarder_key: Some("browser-a:sess-a".to_string()),
+                    active_flag: None,
+                },
+            },
+        );
+        hub.insert_pending_session_io_snapshot(
+            "by-forwarder".to_string(),
+            crate::hub::PendingSessionIoSnapshot {
+                session_uuid: "sess-b".to_string(),
+                started_at: Instant::now(),
+                target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput {
+                    peer_id: "browser-b".to_string(),
+                    subscription_id: "sub-b".to_string(),
+                    forwarder_key: Some("browser-b:sess-b".to_string()),
+                    active_flag: None,
+                },
+            },
+        );
+        hub.insert_pending_session_io_snapshot(
+            "by-session".to_string(),
+            crate::hub::PendingSessionIoSnapshot {
+                session_uuid: "sess-c".to_string(),
+                started_at: Instant::now(),
+                target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcPeerRecovery {
+                    peer_id: "browser-c".to_string(),
+                    subscription_id: "sub-c".to_string(),
+                    peer_tx,
+                },
+            },
+        );
+
+        hub.cleanup_pending_session_io_snapshots_for_peer("browser-a");
+        assert!(!hub.pending_session_io_snapshots.contains_key("by-peer"));
+        hub.cleanup_pending_session_io_snapshots_for_forwarder("browser-b:sess-b");
+        assert!(!hub
+            .pending_session_io_snapshots
+            .contains_key("by-forwarder"));
+        hub.handle_hub_event(crate::hub::events::HubEvent::SessionUnregistered {
+            session_uuid: "sess-c".to_string(),
+        });
+        assert!(!hub.pending_session_io_snapshots.contains_key("by-session"));
+
+        hub.insert_pending_session_io_snapshot(
+            "stale".to_string(),
+            crate::hub::PendingSessionIoSnapshot {
+                session_uuid: "sess-stale".to_string(),
+                started_at: Instant::now()
+                    - crate::hub::SESSION_IO_SNAPSHOT_PENDING_TTL
+                    - Duration::from_secs(1),
+                target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput {
+                    peer_id: "browser-stale".to_string(),
+                    subscription_id: "sub-stale".to_string(),
+                    forwarder_key: None,
+                    active_flag: None,
+                },
+            },
+        );
+        hub.cleanup_stale_session_io_snapshots();
+        assert!(!hub.pending_session_io_snapshots.contains_key("stale"));
+        let snapshot = hub.hub_event_metrics.snapshot();
+        assert_eq!(snapshot.counters["snapshot.pending_stale_drop"], 1);
+    }
+
+    #[test]
     fn test_noisy_session_io_replay_keeps_hot_handler_latency_bounded() {
         let (mut hub, _request_tx, _output_rx) = e2e_hub();
         let session_uuid = "sess-noisy-replay";
@@ -7457,12 +8032,32 @@ mod tests {
     }
 
     #[test]
-    fn test_backpressure_recovery_fetches_broker_snapshot_replacement_sends_prepared_payload() {
-        let metrics = crate::hub::events::HubEventMetrics::default();
+    fn test_backpressure_recovery_routes_prepared_snapshot_to_peer() {
+        let (mut hub, _request_tx, _output_rx) = e2e_hub();
         let (peer_tx, mut peer_rx) = tokio::sync::mpsc::channel(1);
-        let snapshot = b"broker-backed recovery snapshot bytes";
+        let request_id = "snapshot-recovery-test".to_string();
+        hub.insert_pending_session_io_snapshot(
+            request_id.clone(),
+            crate::hub::PendingSessionIoSnapshot {
+                session_uuid: "sess-recovery".to_string(),
+                started_at: Instant::now(),
+                target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcPeerRecovery {
+                    peer_id: "browser-recovery".to_string(),
+                    subscription_id: "sub-recovery".to_string(),
+                    peer_tx,
+                },
+            },
+        );
 
-        Hub::send_snapshot_to_peer(&metrics, &peer_tx, "sub-recovery", snapshot);
+        hub.handle_session_io_event(
+            crate::worker::session_io::SessionIoEvent::PreparedSnapshot {
+                request_id,
+                session_uuid: "sess-recovery".to_string(),
+                uncompressed_len: 128,
+                payload: vec![0x1f, 0x8b, 0x08],
+                recovery: true,
+            },
+        );
 
         match peer_rx.try_recv().expect("recovery snapshot command") {
             crate::worker::webrtc::WebRtcAdapterCommand::Pty {
@@ -7475,7 +8070,7 @@ mod tests {
             other => panic!("expected PTY recovery command, got {other:?}"),
         }
 
-        let snapshot = metrics.snapshot();
+        let snapshot = hub.hub_event_metrics.snapshot();
         assert_eq!(snapshot.counters["snapshot.backpressure_recovery.sent"], 1);
         assert!(snapshot.spans.contains_key("snapshot.gzip_queue"));
     }

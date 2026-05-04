@@ -22,6 +22,7 @@ use anyhow::{bail, Context, Result};
 use tokio::sync::broadcast;
 
 use crate::agent::pty::PtyEvent;
+use crate::worker::session_io::{SessionIoRequest, SESSION_IO_WORKER_QUEUE};
 use crate::worker::session_io_runtime::{SessionIoWorker, SessionIoWorkerConfig};
 
 use super::protocol::*;
@@ -43,6 +44,8 @@ pub struct SessionConnection {
     response_rx: Option<std::sync::mpsc::Receiver<Frame>>,
     /// Whether the session I/O worker is alive.
     reader_alive: Arc<AtomicBool>,
+    /// Mailbox for session I/O requests owned by the worker companion thread.
+    session_io_tx: Option<tokio::sync::mpsc::Sender<SessionIoRequest>>,
     /// Protocol version negotiated during handshake.
     pub protocol_version: u8,
     /// Session metadata received during handshake.
@@ -60,6 +63,50 @@ impl std::fmt::Debug for SessionConnection {
 }
 
 impl SessionConnection {
+    /// Build a test connection with an injected Session I/O mailbox.
+    #[cfg(test)]
+    pub(crate) fn test_with_session_io_sender(
+        session_io_tx: tokio::sync::mpsc::Sender<SessionIoRequest>,
+    ) -> Self {
+        Self::test_with_session_io_sender_and_snapshot(session_io_tx, None)
+    }
+
+    /// Build a test connection with an injected Session I/O mailbox and
+    /// optional snapshot response.
+    #[cfg(test)]
+    pub(crate) fn test_with_session_io_sender_and_snapshot(
+        session_io_tx: tokio::sync::mpsc::Sender<SessionIoRequest>,
+        snapshot: Option<Vec<u8>>,
+    ) -> Self {
+        let (stream, _peer) = UnixStream::pair().expect("test session connection pair");
+        let (response_tx, response_rx) = std::sync::mpsc::channel::<Frame>();
+        if let Some(payload) = snapshot {
+            response_tx
+                .send(Frame {
+                    frame_type: FRAME_SNAPSHOT,
+                    payload,
+                })
+                .expect("seed test snapshot response");
+        }
+        let reader_alive = Arc::new(AtomicBool::new(true));
+        Self {
+            stream,
+            decoder: FrameDecoder::new(),
+            response_rx: Some(response_rx),
+            reader_alive,
+            session_io_tx: Some(session_io_tx),
+            protocol_version: PROTOCOL_VERSION,
+            metadata: SessionMetadata {
+                session_uuid: "test-session".to_string(),
+                pid: std::process::id(),
+                rows: 24,
+                cols: 80,
+                last_output_at: 0,
+                mode_flags: ModeFlags::default(),
+            },
+        }
+    }
+
     /// Connect to a session process socket and perform handshake.
     pub fn connect(socket_path: &Path) -> Result<Self> {
         let mut stream = UnixStream::connect(socket_path)
@@ -75,6 +122,7 @@ impl SessionConnection {
             decoder: FrameDecoder::new(),
             response_rx: None,
             reader_alive: Arc::new(AtomicBool::new(false)),
+            session_io_tx: None,
             protocol_version: version,
             metadata,
         })
@@ -114,11 +162,20 @@ impl SessionConnection {
             .stream
             .try_clone()
             .context("dup session socket for reader")?;
+        let write_stream = self
+            .stream
+            .try_clone()
+            .context("dup session socket for request processor")?;
+        let (session_io_tx, request_rx) =
+            tokio::sync::mpsc::channel(SESSION_IO_WORKER_QUEUE.capacity);
         let (response_tx, response_rx) = std::sync::mpsc::channel::<Frame>();
         self.response_rx = Some(response_rx);
+        self.session_io_tx = Some(session_io_tx);
         self.reader_alive.store(true, Ordering::Release);
         let _handle = SessionIoWorker::spawn(SessionIoWorkerConfig {
             stream: reader_stream,
+            write_stream,
+            request_rx: Some(request_rx),
             session_uuid,
             event_tx,
             kitty_enabled,
@@ -131,6 +188,32 @@ impl SessionConnection {
         })?;
 
         Ok(())
+    }
+
+    /// Enqueue a request for the session I/O worker companion mailbox.
+    pub fn enqueue_session_io_request(
+        &self,
+        request: SessionIoRequest,
+    ) -> Result<(), SessionIoRequestEnqueueError> {
+        if !self.has_reader() {
+            return Err(SessionIoRequestEnqueueError::ReaderMissing);
+        }
+        if !self.is_reader_alive() {
+            return Err(SessionIoRequestEnqueueError::ReaderClosed);
+        }
+        let Some(tx) = &self.session_io_tx else {
+            return Err(SessionIoRequestEnqueueError::MailboxMissing);
+        };
+
+        match tx.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Err(SessionIoRequestEnqueueError::MailboxFull)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(SessionIoRequestEnqueueError::MailboxClosed)
+            }
+        }
     }
 
     /// Whether the session I/O worker has been installed.
@@ -291,6 +374,25 @@ impl SessionConnection {
             }
         }
     }
+}
+
+/// Stable enqueue failures for hub policy and logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionIoRequestEnqueueError {
+    /// The session reader has not been installed yet.
+    ReaderMissing,
+    /// The session reader has exited.
+    ReaderClosed,
+    /// The request mailbox sender was not installed.
+    MailboxMissing,
+    /// The request mailbox receiver has closed.
+    MailboxClosed,
+    /// The request mailbox is at capacity.
+    MailboxFull,
+    /// The shared session connection is absent.
+    ConnectionMissing,
+    /// The shared session connection mutex is poisoned.
+    ConnectionLockPoisoned,
 }
 
 #[cfg(test)]
