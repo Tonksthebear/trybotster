@@ -81,14 +81,8 @@ pub(crate) fn run_event_loop(
     shutdown_flag: &AtomicBool,
     tui_shutdown: Option<&AtomicBool>,
 ) -> Result<()> {
-    // Extract receivers from Hub so select! can borrow them independently
-    // of &mut hub in match arms. The poll_* fallback methods handle None
-    // gracefully (early return).
-    let mut pty_input_rx = hub.webrtc.take_pty_input_rx();
-    let mut file_input_rx = hub.webrtc.take_file_input_rx();
-    let mut webrtc_signal_rx = hub.webrtc.take_outgoing_signal_rx();
-    let mut webrtc_pty_output_rx = hub.webrtc.take_pty_output_rx();
-    let mut stream_frame_rx = hub.webrtc.take_stream_frame_rx();
+    hub.webrtc
+        .start_queue_forwarders(&hub.tokio_runtime, hub.hub_event_tx.clone());
     let mut worktree_result_rx = hub.worktree_result_rx.take();
     let mut tui_request_rx = hub.tui_request_rx.take();
     let mut hub_event_rx = hub.hub_event_rx.take();
@@ -130,74 +124,6 @@ pub(crate) fn run_event_loop(
                     }
                 } => {
                     hub.handle_tui_request(req);
-                }
-
-                // Binary PTY input from browser (zero-overhead keystroke path)
-                Some(input) = async {
-                    match pty_input_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    hub.handle_pty_input(input);
-                    // Drain remaining in batch
-                    if let Some(ref mut rx) = pty_input_rx {
-                        while let Ok(more) = rx.try_recv() {
-                            hub.handle_pty_input(more);
-                        }
-                    }
-                }
-
-                // File transfer from browser (image paste/drop)
-                Some(file) = async {
-                    match file_input_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    hub.handle_file_input(file);
-                }
-
-                // WebRTC PTY output (highest volume — batch drain)
-                Some(first) = async {
-                    match webrtc_pty_output_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    hub.handle_webrtc_pty_output_batch(first, &mut webrtc_pty_output_rx);
-                }
-
-                // Outgoing WebRTC signals (ICE candidates)
-                Some(signal) = async {
-                    match webrtc_signal_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    hub.handle_webrtc_signal(signal);
-                    if let Some(ref mut rx) = webrtc_signal_rx {
-                        while let Ok(more) = rx.try_recv() {
-                            hub.handle_webrtc_signal(more);
-                        }
-                    }
-                }
-
-                // Incoming stream frames (preview tunneling)
-                Some(frame) = async {
-                    match stream_frame_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    hub.handle_stream_frame(frame);
-                    if let Some(ref mut rx) = stream_frame_rx {
-                        while let Ok(more) = rx.try_recv() {
-                            hub.handle_stream_frame(more);
-                        }
-                    }
-                    // Drain multiplexer output inline.
-                    hub.poll_stream_frames_outgoing();
                 }
 
                 // Worktree creation results
@@ -273,12 +199,6 @@ pub(crate) fn run_event_loop(
     // Stop the cleanup interval task.
     cleanup_handle.abort();
 
-    // Restore receivers for clean shutdown (Hub.drop may need them)
-    hub.webrtc.restore_pty_input_rx(pty_input_rx);
-    hub.webrtc.restore_file_input_rx(file_input_rx);
-    hub.webrtc.restore_outgoing_signal_rx(webrtc_signal_rx);
-    hub.webrtc.restore_pty_output_rx(webrtc_pty_output_rx);
-    hub.webrtc.restore_stream_frame_rx(stream_frame_rx);
     hub.worktree_result_rx = worktree_result_rx;
     hub.tui_request_rx = tui_request_rx;
     hub.hub_event_rx = hub_event_rx;
