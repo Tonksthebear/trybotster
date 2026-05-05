@@ -576,7 +576,7 @@ pub(super) fn test_socket_workerized_live_output_reaches_socket_frame() {
 }
 
 #[test]
-pub(super) fn test_shared_terminal_runtime_forwards_equivalent_scrollback_to_tui_and_socket() {
+pub(super) fn test_terminal_stream_forwards_equivalent_scrollback_to_tui_and_socket() {
     let (mut hub, _request_tx, mut output_rx) = e2e_hub();
     let session_uuid = "sess-shared-scrollback".to_string();
     let socket_client_id = "socket:shared-scrollback".to_string();
@@ -742,7 +742,7 @@ pub(super) fn test_tui_first_scrollback_latency_budget_session_backed() {
 }
 
 #[test]
-pub(super) fn test_shared_terminal_runtime_forwards_live_modes_and_exit_to_tui_and_socket() {
+pub(super) fn test_terminal_stream_forwards_live_modes_and_exit_to_tui_and_socket() {
     let (mut hub, _request_tx, mut output_rx) = e2e_hub();
     let session_uuid = "sess-shared-terminal-runtime".to_string();
     let socket_client_id = "socket:shared-runtime".to_string();
@@ -881,7 +881,7 @@ pub(super) fn test_shared_terminal_runtime_forwards_live_modes_and_exit_to_tui_a
 }
 
 #[test]
-pub(super) fn test_shared_terminal_runtime_continues_after_broadcast_lag_for_tui_and_socket() {
+pub(super) fn test_terminal_stream_continues_after_broadcast_lag_for_tui_and_socket() {
     let (mut hub, _request_tx, mut output_rx) = e2e_hub();
     let session_uuid = "sess-shared-lag".to_string();
     let socket_client_id = "socket:shared-lag".to_string();

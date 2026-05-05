@@ -428,7 +428,12 @@ mod tests {
         let server_comms = concat!(
             include_str!("../hub/server_comms.rs"),
             include_str!("../hub/server_comms/webrtc_transport.rs"),
-            include_str!("../hub/server_comms/terminal_runtime.rs")
+            include_str!("../hub/server_comms/terminal_attach.rs"),
+            include_str!("../hub/server_comms/terminal_snapshot.rs"),
+            include_str!("../hub/server_comms/terminal_stream.rs"),
+            include_str!("../hub/server_comms/terminal_clients.rs"),
+            include_str!("../hub/server_comms/terminal_client_adapters.rs"),
+            include_str!("../hub/server_comms/terminal_cleanup.rs")
         );
 
         assert!(docs.contains("JSON remains limited to Lua/plugin/relay boundaries"));

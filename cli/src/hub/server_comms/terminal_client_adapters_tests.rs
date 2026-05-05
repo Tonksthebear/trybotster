@@ -20,7 +20,7 @@ pub(super) fn test_missing_session_io_sender_control_records_observable_metric()
 
 #[test]
 pub(super) fn test_worker_session_io_registration_uses_real_session_io_mailbox() {
-    let source = include_str!("client_worker_adapters.rs");
+    let source = include_str!("terminal_client_adapters.rs");
     let body = function_body(source, "register_worker_session_io_sender");
     assert!(
         body.contains("pty_handle.session_io_sender()"),

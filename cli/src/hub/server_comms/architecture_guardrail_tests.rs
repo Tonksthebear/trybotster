@@ -1,8 +1,8 @@
 use super::test_support::*;
 
 #[test]
-pub(super) fn test_tui_and_socket_attach_handlers_delegate_to_shared_terminal_runtime() {
-    let source = include_str!("terminal_runtime.rs");
+pub(super) fn test_tui_and_socket_attach_handlers_delegate_to_terminal_stream_runtime() {
+    let source = include_str!("terminal_clients.rs");
     for function in [
         "create_lua_tui_pty_forwarder",
         "try_attach_tui_terminal_forwarder",
@@ -22,8 +22,8 @@ pub(super) fn test_tui_and_socket_attach_handlers_delegate_to_shared_terminal_ru
 }
 
 #[test]
-pub(super) fn test_shared_terminal_runtime_session_snapshots_use_session_io_mailbox() {
-    let source = include_str!("terminal_runtime.rs");
+pub(super) fn test_terminal_stream_session_snapshots_use_session_io_mailbox() {
+    let source = include_str!("terminal_stream.rs");
     let body = function_body(source, "spawn_terminal_client_forwarder_runtime");
     assert!(
         body.contains("SessionIoRequest::GetSnapshot"),
@@ -40,8 +40,9 @@ pub(super) fn test_shared_terminal_runtime_session_snapshots_use_session_io_mail
 #[test]
 pub(super) fn test_terminal_attach_snapshot_paths_have_no_fixed_sleep_settle_windows() {
     let source = concat!(
-        include_str!("terminal_runtime.rs"),
-        include_str!("session_io_bridge.rs")
+        include_str!("terminal_attach.rs"),
+        include_str!("terminal_snapshot.rs"),
+        include_str!("terminal_stream.rs")
     );
     for function in [
         "create_lua_pty_forwarder",

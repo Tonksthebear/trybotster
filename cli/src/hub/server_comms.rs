@@ -24,7 +24,6 @@ use crate::hub::{registration, Hub, PendingTerminalAttach, PendingTerminalAttach
 use crate::notifications::push::send_push_direct;
 use base64::Engine;
 
-mod client_worker_adapters;
 mod event_lua;
 mod event_maintenance;
 mod event_session;
@@ -37,8 +36,13 @@ mod push_notifications;
 mod server_lifecycle;
 mod session_io_bridge;
 mod session_reconnect;
+mod terminal_attach;
+mod terminal_cleanup;
+mod terminal_client_adapters;
+mod terminal_clients;
 mod terminal_profile;
-mod terminal_runtime;
+mod terminal_snapshot;
+mod terminal_stream;
 mod webrtc_transport;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,53 +79,6 @@ fn detect_running_target_dir(current_exe: &Path) -> Option<std::path::PathBuf> {
     let profile_dir = current_exe.parent()?;
     let target_dir = profile_dir.parent()?;
     (target_dir.file_name()? == "target").then(|| target_dir.to_path_buf())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SnapshotAttachState {
-    Ready,
-    Reconnecting,
-    Exited,
-}
-
-enum TerminalStreamFilter {
-    None,
-    StripOscQueriesWhenInactive {
-        active_terminal_peers: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
-        peer_id: String,
-    },
-}
-
-impl TerminalStreamFilter {
-    fn filter_chunk(
-        &self,
-        session_uuid: &str,
-        query_filter_buffer: &mut Vec<u8>,
-        data: Vec<u8>,
-    ) -> Vec<u8> {
-        match self {
-            Self::None => data,
-            Self::StripOscQueriesWhenInactive {
-                active_terminal_peers,
-                peer_id,
-            } => {
-                if active_terminal_peers
-                    .lock()
-                    .ok()
-                    .and_then(|active| active.get(session_uuid).cloned())
-                    .is_some_and(|active_peer| active_peer != peer_id.as_str())
-                {
-                    crate::hub::terminal_profile::strip_osc_queries_from_output(
-                        query_filter_buffer,
-                        &data,
-                    )
-                } else {
-                    query_filter_buffer.clear();
-                    data
-                }
-            }
-        }
-    }
 }
 
 impl Hub {
@@ -481,8 +438,6 @@ mod async_runtime_tests;
 #[cfg(test)]
 mod cargo_profile_tests;
 #[cfg(test)]
-mod client_worker_adapters_tests;
-#[cfg(test)]
 mod event_session_tests;
 #[cfg(test)]
 mod event_socket_terminal_tests;
@@ -499,7 +454,9 @@ mod session_reconnect_tests;
 #[cfg(test)]
 mod terminal_profile_tests;
 #[cfg(test)]
-mod terminal_runtime_tests;
+mod terminal_client_adapters_tests;
+#[cfg(test)]
+mod terminal_stream_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
