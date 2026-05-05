@@ -109,7 +109,7 @@ pub(super) fn test_queue_webrtc_terminal_snapshot_returns_false_when_mailbox_ful
 pub(super) fn test_empty_initial_snapshot_cleans_pending_session_io_request() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let session_uuid = "sess-empty-initial-snapshot";
-    let (session_io_tx, _session_io_rx) = tokio::sync::mpsc::channel(4);
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(4);
     hub.handle_cache
         .add_session(test_session_backed_handle_with_mailbox_and_snapshot(
             session_uuid,
@@ -131,6 +131,31 @@ pub(super) fn test_empty_initial_snapshot_cleans_pending_session_io_request() {
 
     assert!(hub.try_attach_terminal_forwarder(&req));
     assert_eq!(hub.pending_session_io_snapshots.len(), 1);
+
+    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize {
+                rows: 23,
+                cols: 80
+            }
+        )
+    });
+    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )
+    }) {
+        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
+        other => panic!("expected GetSnapshot request, got {other:?}"),
+    };
+
+    hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
+        request_id,
+        session_uuid: session_uuid.to_string(),
+        payload: Vec::new(),
+    });
 
     for _ in 0..20 {
         hub.tokio_runtime.block_on(async {
