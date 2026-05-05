@@ -211,12 +211,19 @@ function Client:handle_subscribe(msg)
         cols = params.cols or 80,
     }
 
-    -- Send subscription confirmation immediately
-    -- Browser waits for this before allowing input
-    self:send({
-        type = "subscribed",
-        subscriptionId = sub_id,
-    })
+    local function send_subscribed_ack()
+        self:send({
+            type = "subscribed",
+            subscriptionId = sub_id,
+        })
+    end
+
+    -- Terminal input must stay gated on subscription confirmation. Hub
+    -- subscriptions delay the ack until after baseline entity snapshots below
+    -- so browser readiness never races an empty entity store.
+    if channel ~= "hub" then
+        send_subscribed_ack()
+    end
 
     hooks.notify("client_subscribed", {
         peer_id = self.peer_id,
@@ -289,6 +296,8 @@ function Client:handle_subscribe(msg)
                 "send_ui_tree_snapshots failed for %s: %s",
                 self.peer_id:sub(1, 8), tostring(err)))
         end
+
+        send_subscribed_ack()
     elseif channel == "mcp" then
         -- MCP is pull-based: the client sends tools/list when ready.
         self.subscriptions[sub_id].caller_context = params.context or {}

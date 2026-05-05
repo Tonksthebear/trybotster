@@ -204,6 +204,7 @@ pub(crate) enum WebRtcOfferCompletionOutcome {
 pub(crate) enum WebRtcIngressOutcome {
     PongObserved,
     TerminalColorProfile(serde_json::Value),
+    UnsupportedTerminalControl { message_type: &'static str },
     LuaMessage(serde_json::Value),
     ClientWorker(ClientWorkerMessage),
     ParseFailed,
@@ -367,6 +368,58 @@ impl WebRtcTransportRunner {
                 TransportIngress::FocusChanged {
                     session_uuid,
                     focused,
+                }
+            }
+            Some("resize") => {
+                let Some(session_uuid) = msg
+                    .get("session_uuid")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+                else {
+                    return WebRtcIngressOutcome::UnsupportedTerminalControl {
+                        message_type: "resize",
+                    };
+                };
+                let rows = msg
+                    .get("rows")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(24)
+                    .clamp(1, u16::MAX as u64) as u16;
+                let cols = msg
+                    .get("cols")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(80)
+                    .clamp(1, u16::MAX as u64) as u16;
+                TransportIngress::TerminalResize {
+                    session_uuid,
+                    rows,
+                    cols,
+                }
+            }
+            Some("request_snapshot") => {
+                let Some(session_uuid) = msg
+                    .get("session_uuid")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+                else {
+                    return WebRtcIngressOutcome::UnsupportedTerminalControl {
+                        message_type: "request_snapshot",
+                    };
+                };
+                let rows = msg
+                    .get("rows")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(24)
+                    .clamp(1, u16::MAX as u64) as u16;
+                let cols = msg
+                    .get("cols")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(80)
+                    .clamp(1, u16::MAX as u64) as u16;
+                TransportIngress::RequestSnapshot {
+                    session_uuid,
+                    rows,
+                    cols,
                 }
             }
             _ => TransportIngress::BoundaryJson(msg),
@@ -1796,6 +1849,34 @@ mod tests {
                 session_uuid,
                 focused: true,
             }) if session_uuid == "sess-1"
+        ));
+    }
+
+    #[test]
+    fn terminal_resize_and_snapshot_without_session_uuid_do_not_fall_back_to_lua() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let runner = WebRtcTransportRunner::new(
+            ClientId::browser("browser-1"),
+            "browser-1".to_string(),
+            0,
+            tx,
+        );
+
+        let resize = runner.handle_plaintext_payload(br#"{"type":"resize","rows":30,"cols":100}"#);
+        assert!(matches!(
+            resize,
+            WebRtcIngressOutcome::UnsupportedTerminalControl {
+                message_type: "resize"
+            }
+        ));
+
+        let request_snapshot =
+            runner.handle_plaintext_payload(br#"{"type":"request_snapshot","rows":30,"cols":100}"#);
+        assert!(matches!(
+            request_snapshot,
+            WebRtcIngressOutcome::UnsupportedTerminalControl {
+                message_type: "request_snapshot"
+            }
         ));
     }
 

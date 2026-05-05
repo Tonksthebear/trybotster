@@ -446,6 +446,21 @@ impl Hub {
                 };
                 self.stop_lua_pty_forwarder(&forwarder_key);
             }
+            HubControlMessage::RequestSnapshot {
+                client_id: ClientId::Browser(browser_identity),
+                session_uuid,
+                subscription_id,
+                rows,
+                cols,
+            } => {
+                self.refresh_lua_terminal_snapshot(crate::lua::RefreshSnapshotRequest {
+                    peer_id: browser_identity,
+                    session_uuid,
+                    subscription_id,
+                    rows,
+                    cols,
+                });
+            }
             HubControlMessage::Backpressure(backpressure) => {
                 self.hub_event_metrics
                     .record_counter("client_worker.backpressure", 1);
@@ -457,6 +472,7 @@ impl Hub {
             }
             HubControlMessage::Reconnect { .. }
             | HubControlMessage::SessionLifecycle { .. }
+            | HubControlMessage::RequestSnapshot { .. }
             | HubControlMessage::Shutdown { .. } => {
                 log::trace!("[ClientWorker] Hub-control request: {message:?}");
             }

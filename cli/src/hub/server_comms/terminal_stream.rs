@@ -54,6 +54,7 @@ impl Hub {
         hub_event_tx: crate::hub::events::HubEventTx,
         log_prefix: &'static str,
         client_label: String,
+        output_prefix: Vec<u8>,
         filter: TerminalStreamFilter,
     ) -> tokio::task::JoinHandle<()> {
         let pty_for_snapshot = pty_handle.clone();
@@ -266,10 +267,19 @@ impl Hub {
                             if filtered.is_empty() {
                                 continue;
                             }
+                            let data = if output_prefix.is_empty() {
+                                filtered
+                            } else {
+                                let mut prefixed =
+                                    Vec::with_capacity(output_prefix.len() + filtered.len());
+                                prefixed.extend(&output_prefix);
+                                prefixed.extend(filtered);
+                                prefixed
+                            };
                             if worker
                                 .send(ClientWorkerMessage::TerminalBytes {
                                     session_uuid: session_uuid.clone(),
-                                    data: filtered,
+                                    data,
                                 })
                                 .await
                                 .is_err()

@@ -135,10 +135,7 @@ pub(super) fn test_empty_initial_snapshot_cleans_pending_session_io_request() {
     let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
         matches!(
             request,
-            crate::worker::session_io::SessionIoRequest::Resize {
-                rows: 23,
-                cols: 80
-            }
+            crate::worker::session_io::SessionIoRequest::Resize { rows: 23, cols: 80 }
         )
     });
     let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
