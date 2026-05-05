@@ -84,7 +84,6 @@ fn detect_running_target_dir(current_exe: &Path) -> Option<std::path::PathBuf> {
 impl Hub {
     /// How long a terminal attach intent can stay pending before `not_found`.
     const TERMINAL_ATTACH_NOT_FOUND_TIMEOUT: Duration = Duration::from_secs(10);
-    const RESTTY_FIXTURE_LIVE_CHUNK_LIMIT: usize = 8;
     const HOT_SUBHANDLER_SLOW: Duration = Duration::from_millis(50);
     const SNAPSHOT_SLOW: Duration = Duration::from_millis(100);
     const CLEANUP_SCAN_SLOW: Duration = Duration::from_millis(50);
@@ -452,9 +451,9 @@ mod session_io_bridge_tests;
 #[cfg(test)]
 mod session_reconnect_tests;
 #[cfg(test)]
-mod terminal_profile_tests;
-#[cfg(test)]
 mod terminal_client_adapters_tests;
+#[cfg(test)]
+mod terminal_profile_tests;
 #[cfg(test)]
 mod terminal_stream_tests;
 #[cfg(test)]

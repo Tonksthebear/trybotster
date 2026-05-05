@@ -17,6 +17,9 @@ use super::{BoundedQueueConfig, RequestId, SessionUuid, SubscriptionId};
 /// Default bounded mailbox config for client-worker input.
 pub const CLIENT_WORKER_QUEUE: BoundedQueueConfig = BoundedQueueConfig::new("worker.client", 1024);
 const CLIENT_SESSION_IO_MISSING_SOURCE: &str = "worker.client.session_io_missing";
+const CLIENT_SESSION_RESIZE_UNSUBSCRIBED_SOURCE: &str = "worker.client.session_resize_unsubscribed";
+const CLIENT_REQUEST_SNAPSHOT_UNSUBSCRIBED_SOURCE: &str =
+    "worker.client.request_snapshot_unsubscribed";
 
 /// Health reported for a connected client transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +207,24 @@ pub enum ClientWorkerMessage {
         session_uuid: SessionUuid,
         /// Raw PTY input bytes.
         data: Vec<u8>,
+    },
+    /// Resize a subscribed session through the SessionIoWorker mailbox.
+    SessionResize {
+        /// Session that should receive the resize.
+        session_uuid: SessionUuid,
+        /// Requested terminal rows.
+        rows: u16,
+        /// Requested terminal columns.
+        cols: u16,
+    },
+    /// Request a fresh snapshot for a subscribed session.
+    RequestSnapshot {
+        /// Session to snapshot.
+        session_uuid: SessionUuid,
+        /// Requested terminal rows.
+        rows: u16,
+        /// Requested terminal columns.
+        cols: u16,
     },
     /// Control frame for a subscribed session or client.
     ControlFrame(ClientControlFrame),
@@ -420,6 +441,23 @@ impl ClientWorker {
                 self.route_session_input(session_uuid, data).await;
                 false
             }
+            ClientWorkerMessage::SessionResize {
+                session_uuid,
+                rows,
+                cols,
+            } => {
+                self.route_session_resize(session_uuid, rows, cols).await;
+                false
+            }
+            ClientWorkerMessage::RequestSnapshot {
+                session_uuid,
+                rows,
+                cols,
+            } => {
+                self.request_session_snapshot(session_uuid, rows, cols)
+                    .await;
+                false
+            }
             ClientWorkerMessage::ControlFrame(frame) => {
                 self.deliver_control_frame(frame).await;
                 false
@@ -469,15 +507,6 @@ impl ClientWorker {
             if existing.subscription_id == subscription_id {
                 return;
             }
-
-            let old_subscription_id = existing.subscription_id.clone();
-            self.subscriptions.remove(&session_uuid);
-            self.send_hub_control(HubControlMessage::DetachClient {
-                client_id: self.client_id.clone(),
-                session_uuid: session_uuid.clone(),
-                subscription_id: old_subscription_id,
-            })
-            .await;
         }
 
         self.subscriptions.insert(
@@ -597,6 +626,78 @@ impl ClientWorker {
                 self.session_io_txs.remove(&session_uuid);
             }
         }
+    }
+
+    async fn route_session_resize(&mut self, session_uuid: SessionUuid, rows: u16, cols: u16) {
+        let Some(subscription_id) = self
+            .subscriptions
+            .get(&session_uuid)
+            .map(|subscription| subscription.subscription_id.clone())
+        else {
+            self.report_backpressure(
+                CLIENT_SESSION_RESIZE_UNSUBSCRIBED_SOURCE,
+                0,
+                Some(session_uuid),
+            )
+            .await;
+            return;
+        };
+
+        let Some(tx) = self.session_io_txs.get(&session_uuid).cloned() else {
+            self.try_deliver_egress(
+                TransportEgress::TerminalAttach {
+                    subscription_id,
+                    session_uuid: session_uuid.clone(),
+                    state: TerminalAttachState::NotReady,
+                },
+                Some(session_uuid.clone()),
+                DeliveryKind::Control,
+            )
+            .await;
+            self.report_backpressure(CLIENT_SESSION_IO_MISSING_SOURCE, 0, Some(session_uuid))
+                .await;
+            return;
+        };
+
+        match tx.try_send(SessionIoRequest::Resize { rows, cols }) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.report_backpressure(
+                    super::session_io::SESSION_IO_WORKER_QUEUE.name,
+                    super::session_io::SESSION_IO_WORKER_QUEUE.capacity,
+                    Some(session_uuid),
+                )
+                .await;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.session_io_txs.remove(&session_uuid);
+            }
+        }
+    }
+
+    async fn request_session_snapshot(&mut self, session_uuid: SessionUuid, rows: u16, cols: u16) {
+        let Some(subscription_id) = self
+            .subscriptions
+            .get(&session_uuid)
+            .map(|subscription| subscription.subscription_id.clone())
+        else {
+            self.report_backpressure(
+                CLIENT_REQUEST_SNAPSHOT_UNSUBSCRIBED_SOURCE,
+                0,
+                Some(session_uuid),
+            )
+            .await;
+            return;
+        };
+
+        self.send_hub_control(HubControlMessage::RequestSnapshot {
+            client_id: self.client_id.clone(),
+            session_uuid,
+            subscription_id,
+            rows,
+            cols,
+        })
+        .await;
     }
 
     async fn deliver_control_frame(&mut self, frame: ClientControlFrame) {
@@ -1096,6 +1197,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribed_resize_without_session_io_sender_emits_not_ready() {
+        let (handle, mut hub_rx, mut outbound_rx, mut seeded_session_rx) =
+            spawn_worker(ClientId::browser("browser-identity"), 8);
+
+        handle
+            .send(ClientWorkerMessage::SubscribeSession {
+                session_uuid: "sess-missing-resize-sender".to_string(),
+                subscription_id: "sub-missing-resize-sender".to_string(),
+            })
+            .await
+            .expect("subscribe missing resize sender");
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::AttachClient {
+                session_uuid,
+                subscription_id,
+                ..
+            } if session_uuid == "sess-missing-resize-sender"
+                && subscription_id == "sub-missing-resize-sender"
+        ));
+
+        handle
+            .send(ClientWorkerMessage::SessionResize {
+                session_uuid: "sess-missing-resize-sender".to_string(),
+                rows: 42,
+                cols: 150,
+            })
+            .await
+            .expect("send resize without sender");
+
+        assert!(seeded_session_rx.try_recv().is_err());
+        assert!(matches!(
+            recv_egress(&mut outbound_rx).await,
+            TransportEgress::TerminalAttach {
+                subscription_id,
+                session_uuid,
+                state: TerminalAttachState::NotReady,
+            } if subscription_id == "sub-missing-resize-sender"
+                && session_uuid == "sess-missing-resize-sender"
+        ));
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::Backpressure(WorkerBackpressure {
+                source: CLIENT_SESSION_IO_MISSING_SOURCE,
+                capacity: 0,
+                session_uuid: Some(session_uuid),
+                client_id: Some(ClientId::Browser(browser_identity)),
+            }) if session_uuid == "sess-missing-resize-sender"
+                && browser_identity == "browser-identity"
+        ));
+    }
+
+    #[tokio::test]
     async fn unregister_session_io_sender_detaches_active_subscription() {
         let (handle, mut hub_rx, _outbound_rx, mut session_rx) = spawn_worker(ClientId::Tui, 8);
 
@@ -1231,6 +1385,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_session_resize_backpressure_keeps_session_context() {
+        let (handle, mut hub_rx, _outbound_rx, _session_rx) =
+            spawn_worker(ClientId::browser("browser-identity"), 8);
+        let (blocked_tx, _blocked_rx) = tokio::sync::mpsc::channel(1);
+        blocked_tx
+            .try_send(SessionIoRequest::PtyInput {
+                data: b"held".to_vec(),
+            })
+            .expect("fill dynamic session queue");
+
+        handle
+            .send(ClientWorkerMessage::RegisterSessionIoSender {
+                session_uuid: "sess-resize-full".to_string(),
+                tx: blocked_tx,
+            })
+            .await
+            .expect("register blocked sender");
+        handle
+            .send(ClientWorkerMessage::SubscribeSession {
+                session_uuid: "sess-resize-full".to_string(),
+                subscription_id: "sub-resize-full".to_string(),
+            })
+            .await
+            .expect("subscribe dynamic session");
+        let _ = recv_hub(&mut hub_rx).await;
+
+        handle
+            .send(ClientWorkerMessage::SessionResize {
+                session_uuid: "sess-resize-full".to_string(),
+                rows: 43,
+                cols: 151,
+            })
+            .await
+            .expect("send resize to full sender");
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::Backpressure(WorkerBackpressure {
+                source,
+                capacity,
+                session_uuid: Some(session_uuid),
+                client_id: Some(ClientId::Browser(browser_identity)),
+            }) if source == super::super::session_io::SESSION_IO_WORKER_QUEUE.name
+                && capacity == super::super::session_io::SESSION_IO_WORKER_QUEUE.capacity
+                && session_uuid == "sess-resize-full"
+                && browser_identity == "browser-identity"
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_snapshot_without_subscription_records_observable_drop() {
+        let (handle, mut hub_rx, _outbound_rx, _session_rx) =
+            spawn_worker(ClientId::browser("browser-identity"), 8);
+
+        handle
+            .send(ClientWorkerMessage::RequestSnapshot {
+                session_uuid: "sess-unsubscribed-snapshot".to_string(),
+                rows: 24,
+                cols: 80,
+            })
+            .await
+            .expect("send request_snapshot before subscribe");
+
+        assert!(matches!(
+            recv_hub(&mut hub_rx).await,
+            HubControlMessage::Backpressure(WorkerBackpressure {
+                source: CLIENT_REQUEST_SNAPSHOT_UNSUBSCRIBED_SOURCE,
+                capacity: 0,
+                session_uuid: Some(session_uuid),
+                client_id: Some(ClientId::Browser(browser_identity)),
+            }) if session_uuid == "sess-unsubscribed-snapshot"
+                && browser_identity == "browser-identity"
+        ));
+    }
+
+    #[tokio::test]
     async fn same_session_resubscribe_replaces_subscription_id() {
         let (handle, mut hub_rx, _outbound_rx, _session_rx) = spawn_worker(ClientId::Tui, 8);
 
@@ -1255,20 +1484,13 @@ mod tests {
             .expect("replacement subscription");
         assert!(matches!(
             recv_hub(&mut hub_rx).await,
-            HubControlMessage::DetachClient {
-                session_uuid,
-                subscription_id,
-                ..
-            } if session_uuid == "sess-1" && subscription_id == "sub-1"
-        ));
-        assert!(matches!(
-            recv_hub(&mut hub_rx).await,
             HubControlMessage::AttachClient {
                 session_uuid,
                 subscription_id,
                 ..
             } if session_uuid == "sess-1" && subscription_id == "sub-2"
         ));
+        assert_no_hub(&mut hub_rx).await;
     }
 
     #[tokio::test]

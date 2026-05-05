@@ -1,3 +1,4 @@
+use super::terminal_stream::TerminalStreamFilter;
 use super::*;
 
 impl Hub {
@@ -84,12 +85,6 @@ impl Hub {
             log::debug!("[Lua] Aborted existing PTY forwarder for {}", forwarder_key);
         }
 
-        // Snapshot retrieval and subscription setup can block.
-        // Run it inside the spawned forwarder task so Hub event processing stays
-        // responsive while attach state is being prepared.
-        let pty_for_prepare = pty_handle.clone();
-
-        // Spawn forwarder task.
         let peer_id = req.peer_id.clone();
         let session_uuid = req.session_uuid.clone();
         let target_rows = req.rows;
@@ -97,10 +92,8 @@ impl Hub {
         let prefix = req.prefix.clone().unwrap_or_else(|| vec![0x01]);
         let active_flag = req.active_flag.clone();
         let active_terminal_peers = Arc::clone(&self.active_terminal_peers);
-        let metrics = Arc::clone(&self.hub_event_metrics);
         let hub_event_tx = self.hub_event_tx.clone();
 
-        // Use browser-provided subscription ID for message routing.
         let subscription_id = req.subscription_id.clone();
         let snapshot_request_id = if pty_handle.is_session_backed() {
             let request_id = Self::next_session_io_request_id("snapshot");
@@ -140,215 +133,24 @@ impl Hub {
             pty_handle.clone(),
             "WebRTC",
         );
-        let task = tokio::spawn(async move {
-            use crate::agent::pty::PtyEvent;
-            use crate::worker::client::{ClientControlFrame, ClientWorkerMessage};
-
-            log::info!(
-                "[Lua] Started PTY forwarder for peer {} session {}",
-                &peer_id[..peer_id.len().min(8)],
-                session_uuid
-            );
-            let mut query_filter_buffer = Vec::new();
-            let mut dumped_live_chunks = 0usize;
-
-            let mut pty_rx = if let Some(request_id) = snapshot_request_id {
-                let pty_rx = pty_handle.subscribe();
-                let resize_result = pty_handle.enqueue_session_io_request(
-                    crate::worker::session_io::SessionIoRequest::Resize {
-                        rows: target_rows,
-                        cols: target_cols,
-                    },
-                );
-                let snapshot_result = pty_handle.enqueue_session_io_request(
-                    crate::worker::session_io::SessionIoRequest::GetSnapshot {
-                        request_id: request_id.clone(),
-                    },
-                );
-                if resize_result.is_err() || snapshot_result.is_err() {
-                    log::warn!(
-                        "[Lua] Session I/O snapshot request failed for WebRTC session {}: resize={:?} snapshot={:?}",
-                        session_uuid,
-                        resize_result.err(),
-                        snapshot_result.err()
-                    );
-                    let _ = hub_event_tx.send(
-                        crate::hub::events::HubEvent::DropPendingSessionIoSnapshot { request_id },
-                    );
-                    return;
-                }
-                pty_rx
-            } else {
-                let rpc_started = Instant::now();
-                let (snapshot, pty_rx) = match tokio::task::spawn_blocking(move || {
-                    let (snapshot, _kitty_enabled, _rows, _cols, pty_rx) =
-                        pty_for_prepare.snapshot_and_subscribe();
-                    (snapshot, pty_rx)
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        log::warn!(
-                            "[Lua] Snapshot fetch task failed for session {}: {}",
-                            session_uuid,
-                            e
-                        );
-                        (Vec::new(), pty_handle.subscribe())
-                    }
-                };
-                metrics.record_span_with_threshold(
-                    "snapshot.rpc_get",
-                    rpc_started.elapsed(),
-                    snapshot.len(),
-                    Hub::SNAPSHOT_SLOW,
-                    &session_uuid,
-                );
-
-                log::debug!(
-                    "[Lua] Snapshot bytes for peer {} session {}: {}",
-                    &peer_id[..peer_id.len().min(8)],
-                    session_uuid,
-                    snapshot.len()
-                );
-
-                Self::reset_restty_fixture_capture(
-                    &session_uuid,
-                    &peer_id,
-                    &subscription_id,
-                    target_rows,
-                    target_cols,
-                    snapshot.len(),
-                );
-                if !snapshot.is_empty() {
-                    Self::dump_restty_snapshot_fixture(&session_uuid, &snapshot);
-                }
-
-                if !Self::queue_webrtc_terminal_snapshot(
-                    &metrics,
-                    &hub_event_tx,
-                    &pty_handle,
-                    None,
-                    &session_uuid,
-                    snapshot,
-                ) {
-                    return;
-                }
-                pty_rx
-            };
-
-            loop {
-                // Check if forwarder was stopped by Lua.
-                {
-                    let active = active_flag
-                        .lock()
-                        .expect("Forwarder active_flag mutex poisoned");
-                    if !*active {
-                        log::debug!("[Lua] PTY forwarder stopped by Lua");
-                        break;
-                    }
-                }
-
-                match pty_rx.recv().await {
-                    Ok(PtyEvent::Output(data)) => {
-                        let filtered = if active_terminal_peers
-                            .lock()
-                            .ok()
-                            .and_then(|active| active.get(&session_uuid).cloned())
-                            .is_some_and(|active_peer| active_peer != peer_id.as_str())
-                        {
-                            crate::hub::terminal_profile::strip_osc_queries_from_output(
-                                &mut query_filter_buffer,
-                                &data,
-                            )
-                        } else {
-                            query_filter_buffer.clear();
-                            data
-                        };
-
-                        if filtered.is_empty() {
-                            continue;
-                        }
-
-                        if dumped_live_chunks < Self::RESTTY_FIXTURE_LIVE_CHUNK_LIMIT {
-                            Self::dump_restty_live_fixture_chunk(
-                                &session_uuid,
-                                dumped_live_chunks,
-                                &filtered,
-                            );
-                            dumped_live_chunks += 1;
-                        }
-
-                        let mut raw_message = Vec::with_capacity(prefix.len() + filtered.len());
-                        raw_message.extend(&prefix);
-                        raw_message.extend(&filtered);
-
-                        if worker
-                            .send(ClientWorkerMessage::TerminalBytes {
-                                session_uuid: session_uuid.clone(),
-                                data: raw_message,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            log::trace!("[Lua] Worker channel closed, stopping forwarder");
-                            break;
-                        }
-                    }
-                    Ok(PtyEvent::ProcessExited { exit_code }) => {
-                        log::info!(
-                            "[Lua] PTY process exited (code={:?}) for session {}",
-                            exit_code,
-                            session_uuid
-                        );
-                        let _ = worker
-                            .send(ClientWorkerMessage::ControlFrame(
-                                ClientControlFrame::ProcessExited {
-                                    session_uuid: session_uuid.clone(),
-                                    exit_code,
-                                },
-                            ))
-                            .await;
-                        let _ = worker
-                            .send(ClientWorkerMessage::UnregisterSessionIoSender {
-                                session_uuid: session_uuid.clone(),
-                            })
-                            .await;
-                        break;
-                    }
-                    Ok(_other_event) => {
-                        // Ignore other events.
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        log::warn!(
-                            "[Lua] PTY forwarder lagged by {} events for session {}",
-                            n,
-                            session_uuid
-                        );
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        log::info!("[Lua] PTY channel closed for session {}", session_uuid);
-                        break;
-                    }
-                }
-            }
-
-            // Mark forwarder as inactive.
-            *active_flag
-                .lock()
-                .expect("Forwarder active_flag mutex poisoned") = false;
-            let _ = worker
-                .send(ClientWorkerMessage::UnregisterSessionIoSender {
-                    session_uuid: session_uuid.clone(),
-                })
-                .await;
-
-            log::info!(
-                "[Lua] Stopped PTY forwarder for peer {} session {}",
-                &peer_id[..peer_id.len().min(8)],
-                session_uuid
-            );
-        });
+        let task = Self::spawn_terminal_client_forwarder_runtime(
+            pty_handle,
+            worker,
+            session_uuid,
+            subscription_id,
+            target_rows,
+            target_cols,
+            active_flag,
+            snapshot_request_id,
+            hub_event_tx,
+            "WebRTC",
+            peer_id.clone(),
+            prefix,
+            TerminalStreamFilter::StripOscQueriesWhenInactive {
+                active_terminal_peers,
+                peer_id,
+            },
+        );
 
         self.register_terminal_forwarder_peer(&forwarder_key, &req.session_uuid, &req.peer_id);
         self.pty_forwarders.insert(forwarder_key, task);

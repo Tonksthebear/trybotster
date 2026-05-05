@@ -148,11 +148,12 @@ export class TerminalConnection extends HubRoute {
     // Keep local geometry in sync so requestSnapshot() sends current bounds.
     this.options.cols = cols;
     this.options.rows = rows;
-    return this.sendCommand("resize", { cols, rows });
+    return this.sendCommand("resize", { session_uuid: this.sessionUuid, cols, rows });
   }
 
   requestSnapshot() {
     return this.sendCommand("request_snapshot", {
+      session_uuid: this.sessionUuid,
       rows: this.options.rows,
       cols: this.options.cols,
     });

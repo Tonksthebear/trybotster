@@ -39,6 +39,24 @@ pub enum TransportIngress {
         /// Raw input bytes.
         data: Vec<u8>,
     },
+    /// Client requested a PTY resize.
+    TerminalResize {
+        /// Target session.
+        session_uuid: SessionUuid,
+        /// Requested terminal rows.
+        rows: u16,
+        /// Requested terminal columns.
+        cols: u16,
+    },
+    /// Client requested a fresh terminal snapshot.
+    RequestSnapshot {
+        /// Target session.
+        session_uuid: SessionUuid,
+        /// Requested terminal rows.
+        rows: u16,
+        /// Requested terminal columns.
+        cols: u16,
+    },
     /// Client focus state changed.
     FocusChanged {
         /// Session whose focus changed.
@@ -450,6 +468,24 @@ pub(crate) fn ingress_to_client_message(ingress: TransportIngress) -> ClientWork
         TransportIngress::TerminalInput { session_uuid, data } => {
             ClientWorkerMessage::SessionInput { session_uuid, data }
         }
+        TransportIngress::TerminalResize {
+            session_uuid,
+            rows,
+            cols,
+        } => ClientWorkerMessage::SessionResize {
+            session_uuid,
+            rows,
+            cols,
+        },
+        TransportIngress::RequestSnapshot {
+            session_uuid,
+            rows,
+            cols,
+        } => ClientWorkerMessage::RequestSnapshot {
+            session_uuid,
+            rows,
+            cols,
+        },
         TransportIngress::FocusChanged {
             session_uuid,
             focused,

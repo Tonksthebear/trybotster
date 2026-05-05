@@ -474,6 +474,29 @@ impl Hub {
                     browser_identity,
                 );
             }
+            crate::worker::webrtc::WebRtcIngressOutcome::UnsupportedTerminalControl {
+                message_type,
+            } => {
+                self.record_hot_span(
+                    "webrtc_message.parse_json",
+                    parse_started,
+                    payload.len(),
+                    browser_identity,
+                );
+                self.hub_event_metrics
+                    .record_counter("webrtc_message.unsupported_terminal_control", 1);
+                let _ = self.hub_event_tx.send(
+                    crate::hub::events::HubEvent::WebRtcIngressBackpressure {
+                        browser_identity: browser_identity.to_string(),
+                        source: "webrtc_terminal_missing_session_uuid",
+                    },
+                );
+                log::warn!(
+                    "[WebRTC-MSG] Dropped terminal {} without session_uuid from {}",
+                    message_type,
+                    &browser_identity[..browser_identity.len().min(8)]
+                );
+            }
             crate::worker::webrtc::WebRtcIngressOutcome::LuaMessage(msg) => {
                 self.record_hot_span(
                     "webrtc_message.parse_json",

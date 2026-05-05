@@ -116,6 +116,7 @@ impl Hub {
             hub_event_tx,
             "Lua-TUI",
             "tui".to_string(),
+            Vec::new(),
             TerminalStreamFilter::None,
         );
         self.pty_forwarders.insert(forwarder_key, task);
@@ -247,6 +248,7 @@ impl Hub {
             hub_event_tx,
             "Lua-Socket",
             client_id.clone(),
+            Vec::new(),
             TerminalStreamFilter::StripOscQueriesWhenInactive {
                 active_terminal_peers,
                 peer_id: client_id,

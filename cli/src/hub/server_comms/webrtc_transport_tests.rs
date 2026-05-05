@@ -1,5 +1,49 @@
 use super::test_support::*;
 
+fn drain_webrtc_json_commands(
+    hub: &mut Hub,
+    rx: &mut tokio::sync::mpsc::Receiver<crate::worker::webrtc::WebRtcAdapterCommand>,
+    max_frames: usize,
+) -> Vec<serde_json::Value> {
+    let mut frames = Vec::new();
+    for _ in 0..40 {
+        hub.tokio_runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+        hub.poll_hub_events();
+        while let Ok(command) = rx.try_recv() {
+            if let crate::worker::webrtc::WebRtcAdapterCommand::Json { data } = command {
+                frames.push(serde_json::from_slice(&data).expect("json command"));
+                if frames.len() >= max_frames {
+                    return frames;
+                }
+            }
+        }
+    }
+    frames
+}
+
+fn subscribe_browser_terminal(
+    hub: &mut Hub,
+    browser_identity: &str,
+    session_uuid: &str,
+    subscription_id: &str,
+    rows: u16,
+    cols: u16,
+) {
+    let payload = serde_json::json!({
+        "type": "subscribe",
+        "channel": "terminal",
+        "subscriptionId": subscription_id,
+        "params": {
+            "session_uuid": session_uuid,
+            "rows": rows,
+            "cols": cols,
+        }
+    });
+    hub.process_webrtc_plaintext_payload(browser_identity, payload.to_string().as_bytes());
+}
+
 #[test]
 pub(super) fn test_inactive_webrtc_forwarder_strips_probe_queries() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
@@ -211,6 +255,96 @@ pub(super) fn test_backpressure_recovery_missing_session_counts_failed_without_d
 }
 
 #[test]
+pub(super) fn test_session_backed_webrtc_recovery_snapshot_uses_session_io_get_snapshot() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-recovery-mailbox";
+    let session_uuid = "sess-recovery-mailbox";
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+    let _peer_rx = hub
+        .webrtc
+        .install_test_recovery_sender(browser_identity, &hub.tokio_runtime);
+
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
+    hub.webrtc.record_backpressure_recovery(
+        format!("{browser_identity}:{session_uuid}"),
+        crate::worker::webrtc::BackpressureRecoveryEntry {
+            browser_identity: browser_identity.to_string(),
+            session_uuid: session_uuid.to_string(),
+            subscription_id: "sub-recovery-mailbox".to_string(),
+            last_drop: Instant::now() - crate::worker::webrtc::BACKPRESSURE_SNAPSHOT_COOLDOWN,
+        },
+    );
+
+    hub.dispatch_webrtc_recovery_snapshot_requests();
+
+    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )
+    }) {
+        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
+        other => panic!("expected recovery GetSnapshot request, got {other:?}"),
+    };
+
+    hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
+        request_id: request_id.clone(),
+        session_uuid: session_uuid.to_string(),
+        payload: b"recovery-snapshot".to_vec(),
+    });
+
+    assert!(matches!(
+        recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::PrepareSnapshot {
+                request_id: observed,
+                recovery: true,
+                ..
+            } if observed == &request_id
+        )),
+        crate::worker::session_io::SessionIoRequest::PrepareSnapshot { .. }
+    ));
+}
+
+#[test]
+pub(super) fn test_webrtc_terminal_control_without_session_uuid_fails_closed_before_lua() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-missing-session-uuid";
+
+    let resize = serde_json::json!({
+        "type": "resize",
+        "rows": 30,
+        "cols": 100,
+    });
+    hub.process_webrtc_plaintext_payload(browser_identity, resize.to_string().as_bytes());
+
+    let snapshot = hub.hub_event_metrics.snapshot();
+    assert_eq!(
+        snapshot.counters["webrtc_message.unsupported_terminal_control"],
+        1,
+        "resize without session_uuid must fail closed instead of falling through Lua subscription state"
+    );
+
+    let request_snapshot = serde_json::json!({
+        "type": "request_snapshot",
+        "rows": 30,
+        "cols": 100,
+    });
+    hub.process_webrtc_plaintext_payload(browser_identity, request_snapshot.to_string().as_bytes());
+
+    let snapshot = hub.hub_event_metrics.snapshot();
+    assert_eq!(
+        snapshot.counters["webrtc_message.unsupported_terminal_control"],
+        2,
+        "request_snapshot without session_uuid must fail closed instead of falling through Lua subscription state"
+    );
+}
+
+#[test]
 pub(super) fn test_unknown_peer_burst_guardrail_is_bounded_and_rate_limited() {
     let (hub, _request_tx, _output_rx) = e2e_hub();
 
@@ -372,6 +506,375 @@ pub(super) fn test_webrtc_terminal_subscribe_routes_attach_through_browser_worke
         }
     }
     assert!(saw_subscribed_ack, "expected subscribed ack");
+}
+
+#[test]
+pub(super) fn test_webrtc_datachannel_open_delivers_entity_baseline_before_hub_subscribed() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-hub-baseline";
+    let mut command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
+
+    hub.lua
+        .call_peer_connected(browser_identity)
+        .expect("peer connected");
+    let payload = serde_json::json!({
+        "type": "subscribe",
+        "channel": "hub",
+        "subscriptionId": "hub_sub_baseline",
+        "params": {}
+    });
+    hub.process_webrtc_plaintext_payload(browser_identity, payload.to_string().as_bytes());
+
+    let frames = drain_webrtc_json_commands(&mut hub, &mut command_rx, 128);
+    let subscribed_idx = frames
+        .iter()
+        .position(|frame| frame.get("type").and_then(|v| v.as_str()) == Some("subscribed"))
+        .expect("hub subscribed ack");
+    let entity_types_before_ack: std::collections::BTreeSet<String> = frames[..subscribed_idx]
+        .iter()
+        .filter_map(|frame| {
+            (frame.get("type").and_then(|v| v.as_str()) == Some("entity_snapshot"))
+                .then(|| frame.get("entity_type").and_then(|v| v.as_str()))
+                .flatten()
+                .map(str::to_owned)
+        })
+        .collect();
+
+    for required in ["session", "workspace", "hub", "connection_code"] {
+        assert!(
+            entity_types_before_ack.contains(required),
+            "missing baseline entity_snapshot({required}) before subscribed ack; saw {frames:?}"
+        );
+    }
+}
+
+#[test]
+pub(super) fn test_webrtc_first_attach_queues_measured_resize_before_snapshot() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-first-attach-mailbox";
+    let session_uuid = "sess-first-attach-mailbox";
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
+    let _command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
+
+    let payload = serde_json::json!({
+        "type": "subscribe",
+        "channel": "terminal",
+        "subscriptionId": "terminal_first_attach",
+        "params": {
+            "session_uuid": session_uuid,
+            "rows": 37,
+            "cols": 132,
+        }
+    });
+    hub.process_webrtc_plaintext_payload(browser_identity, payload.to_string().as_bytes());
+
+    for _ in 0..20 {
+        hub.tokio_runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+        hub.poll_hub_events();
+        if !hub.pending_session_io_snapshots.is_empty() {
+            break;
+        }
+    }
+
+    assert!(matches!(
+        recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize {
+                rows: 37,
+                cols: 132
+            }
+        )),
+        crate::worker::session_io::SessionIoRequest::Resize { .. }
+    ));
+    assert!(matches!(
+        recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )),
+        crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+    ));
+}
+
+#[test]
+pub(super) fn test_webrtc_duplicate_subscribe_replaces_forwarder_and_preserves_latest_geometry() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-duplicate-subscribe";
+    let session_uuid = "sess-duplicate-subscribe";
+    let forwarder_key = format!("{browser_identity}:{session_uuid}");
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(16);
+
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
+    let mut command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
+
+    subscribe_browser_terminal(
+        &mut hub,
+        browser_identity,
+        session_uuid,
+        "terminal_old_geometry",
+        24,
+        80,
+    );
+    for _ in 0..20 {
+        hub.tokio_runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+        hub.poll_hub_events();
+        if !hub.pending_session_io_snapshots.is_empty() {
+            break;
+        }
+    }
+    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize { rows: 24, cols: 80 }
+        )
+    });
+    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )
+    });
+
+    subscribe_browser_terminal(
+        &mut hub,
+        browser_identity,
+        session_uuid,
+        "terminal_new_geometry",
+        44,
+        160,
+    );
+    for _ in 0..20 {
+        hub.tokio_runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+        hub.poll_hub_events();
+        if hub.pending_session_io_snapshots.len() >= 2
+            && hub.pty_forwarders.contains_key(&forwarder_key)
+        {
+            break;
+        }
+    }
+
+    assert!(
+        hub.pty_forwarders.contains_key(&forwarder_key),
+        "replacement forwarder should use the same browser/session key"
+    );
+    assert_eq!(
+        hub.pty_forwarders
+            .keys()
+            .filter(|key| key.ends_with(session_uuid))
+            .count(),
+        1,
+        "duplicate subscribe must not leave multiple forwarders"
+    );
+
+    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize {
+                rows: 44,
+                cols: 160
+            }
+        )
+    });
+    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )
+    }) {
+        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
+        other => panic!("expected GetSnapshot request, got {other:?}"),
+    };
+
+    hub.handle_session_io_event(
+        crate::worker::session_io::SessionIoEvent::PreparedSnapshot {
+            request_id,
+            session_uuid: session_uuid.to_string(),
+            uncompressed_len: 12,
+            payload: b"new-snapshot".to_vec(),
+            recovery: false,
+        },
+    );
+
+    let (subscription_id, data) = recv_next_webrtc_pty_command(&mut hub, &mut command_rx, b'n');
+    assert_eq!(subscription_id, "terminal_new_geometry");
+    assert_eq!(data, b"new-snapshot");
+    while let Ok(command) = command_rx.try_recv() {
+        if let crate::worker::webrtc::WebRtcAdapterCommand::Pty {
+            subscription_id, ..
+        } = command
+        {
+            assert_ne!(
+                subscription_id, "terminal_old_geometry",
+                "old subscription must not receive replacement scrollback"
+            );
+        }
+    }
+}
+
+#[test]
+pub(super) fn test_webrtc_request_snapshot_after_subscribe_uses_session_io_without_lua_subscription(
+) {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-refresh-mailbox";
+    let session_uuid = "sess-refresh-mailbox";
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
+    let _command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
+
+    let subscribe = serde_json::json!({
+        "type": "subscribe",
+        "channel": "terminal",
+        "subscriptionId": "terminal_refresh",
+        "params": {
+            "session_uuid": session_uuid,
+            "rows": 24,
+            "cols": 80,
+        }
+    });
+    hub.process_webrtc_plaintext_payload(browser_identity, subscribe.to_string().as_bytes());
+    for _ in 0..20 {
+        hub.tokio_runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+        hub.poll_hub_events();
+        if !hub.pending_session_io_snapshots.is_empty() {
+            break;
+        }
+    }
+    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize { .. }
+        )
+    });
+    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )
+    });
+
+    let refresh = serde_json::json!({
+        "type": "request_snapshot",
+        "session_uuid": session_uuid,
+        "rows": 41,
+        "cols": 144,
+    });
+    hub.process_webrtc_plaintext_payload(browser_identity, refresh.to_string().as_bytes());
+    for _ in 0..20 {
+        hub.tokio_runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+        hub.poll_hub_events();
+        if hub.pending_session_io_snapshots.len() >= 2 {
+            break;
+        }
+    }
+
+    assert!(matches!(
+        recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize {
+                rows: 41,
+                cols: 144
+            }
+        )),
+        crate::worker::session_io::SessionIoRequest::Resize { .. }
+    ));
+    assert!(matches!(
+        recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )),
+        crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+    ));
+}
+
+#[test]
+pub(super) fn test_webrtc_resize_after_subscribe_routes_through_session_io_mailbox() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-resize-mailbox";
+    let session_uuid = "sess-resize-mailbox";
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
+    let _command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
+
+    let subscribe = serde_json::json!({
+        "type": "subscribe",
+        "channel": "terminal",
+        "subscriptionId": "terminal_resize",
+        "params": {
+            "session_uuid": session_uuid,
+            "rows": 24,
+            "cols": 80,
+        }
+    });
+    hub.process_webrtc_plaintext_payload(browser_identity, subscribe.to_string().as_bytes());
+    for _ in 0..20 {
+        hub.tokio_runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+        hub.poll_hub_events();
+        if !hub.pending_session_io_snapshots.is_empty() {
+            break;
+        }
+    }
+    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize { .. }
+        )
+    });
+    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )
+    });
+
+    let resize = serde_json::json!({
+        "type": "resize",
+        "session_uuid": session_uuid,
+        "rows": 42,
+        "cols": 150,
+    });
+    hub.process_webrtc_plaintext_payload(browser_identity, resize.to_string().as_bytes());
+
+    assert!(matches!(
+        recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize {
+                rows: 42,
+                cols: 150
+            }
+        )),
+        crate::worker::session_io::SessionIoRequest::Resize { .. }
+    ));
 }
 
 #[test]

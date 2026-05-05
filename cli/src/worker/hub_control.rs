@@ -160,6 +160,19 @@ pub enum HubControlMessage {
         /// Transport-local subscription identifier.
         subscription_id: String,
     },
+    /// A subscribed client requests a fresh terminal snapshot.
+    RequestSnapshot {
+        /// Client requesting the snapshot.
+        client_id: ClientId,
+        /// Session to snapshot.
+        session_uuid: SessionUuid,
+        /// Transport-local subscription identifier.
+        subscription_id: String,
+        /// Requested terminal rows.
+        rows: u16,
+        /// Requested terminal columns.
+        cols: u16,
+    },
     /// A bounded worker queue reached capacity or rejected a message.
     Backpressure(WorkerBackpressure),
     /// A transport adapter reported bounded-queue pressure.
