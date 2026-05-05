@@ -103,6 +103,7 @@ impl Hub {
                 crate::hub::PendingSessionIoSnapshotTarget::WebRtcPeerRecovery { request } => {
                     request.browser_identity != peer_id
                 }
+                crate::hub::PendingSessionIoSnapshotTarget::TerminalClientInitial { .. } => true,
             });
     }
 
@@ -116,6 +117,10 @@ impl Hub {
                     forwarder_key, ..
                 } => forwarder_key.as_deref() != Some(forwarder_id),
                 crate::hub::PendingSessionIoSnapshotTarget::WebRtcPeerRecovery { .. } => true,
+                crate::hub::PendingSessionIoSnapshotTarget::TerminalClientInitial {
+                    forwarder_key,
+                    ..
+                } => forwarder_key != forwarder_id,
             });
     }
 
@@ -173,6 +178,13 @@ impl Hub {
                     payload,
                     recovery,
                 );
+            }
+            SessionIoEvent::Snapshot {
+                request_id,
+                session_uuid,
+                payload,
+            } => {
+                self.route_terminal_client_initial_snapshot(request_id, session_uuid, payload);
             }
             _ => {}
         }
@@ -307,6 +319,104 @@ impl Hub {
                     &self.hub_event_metrics,
                 );
             }
+            crate::hub::PendingSessionIoSnapshotTarget::TerminalClientInitial { .. } => {
+                log::debug!(
+                    "[SessionIo] Ignoring prepared snapshot for terminal-client initial request {} session {}",
+                    request_id,
+                    session_uuid
+                );
+            }
+        }
+    }
+
+    pub(super) fn route_terminal_client_initial_snapshot(
+        &mut self,
+        request_id: String,
+        session_uuid: String,
+        snapshot: Vec<u8>,
+    ) {
+        let Some(pending) = self.pending_session_io_snapshots.remove(&request_id) else {
+            log::debug!(
+                "[SessionIo] Dropping terminal snapshot for unknown request {} session {}",
+                request_id,
+                session_uuid
+            );
+            return;
+        };
+
+        let crate::hub::PendingSessionIoSnapshotTarget::TerminalClientInitial {
+            worker,
+            forwarder_key,
+            subscription_id,
+            rows,
+            cols,
+            kitty_enabled,
+            pty_handle,
+        } = pending.target
+        else {
+            self.pending_session_io_snapshots
+                .insert(request_id, pending);
+            return;
+        };
+
+        self.hub_event_metrics.record_span_with_threshold(
+            "snapshot.rpc_get",
+            pending.started_at.elapsed(),
+            snapshot.len(),
+            Hub::SNAPSHOT_SLOW,
+            &session_uuid,
+        );
+
+        let attach_state =
+            Self::classify_snapshot_attach_state(&pty_handle, &session_uuid, &snapshot);
+        match attach_state {
+            SnapshotAttachState::Ready => {}
+            SnapshotAttachState::Exited => {
+                log::warn!(
+                    "[SessionIo] Session RPC died before terminal snapshot for {}; sending ProcessExited",
+                    session_uuid
+                );
+                let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    crate::worker::client::ClientControlFrame::ProcessExited {
+                        session_uuid: session_uuid.clone(),
+                        exit_code: None,
+                    },
+                ));
+                let _ = worker.try_send(
+                    crate::worker::client::ClientWorkerMessage::UnregisterSessionIoSender {
+                        session_uuid,
+                    },
+                );
+                self.stop_lua_pty_forwarder(&forwarder_key);
+                return;
+            }
+            SnapshotAttachState::Reconnecting => {
+                let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    crate::worker::client::ClientControlFrame::TerminalAttach {
+                        subscription_id,
+                        session_uuid,
+                        state: crate::worker::client::TerminalAttachState::Reconnecting,
+                    },
+                ));
+                return;
+            }
+        }
+
+        if worker
+            .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::Scrollback {
+                    session_uuid: session_uuid.clone(),
+                    rows,
+                    cols,
+                    kitty_enabled,
+                    data: snapshot,
+                },
+            ))
+            .is_err()
+        {
+            self.hub_event_metrics
+                .record_counter("snapshot.queue_closed", 1);
+            self.stop_lua_pty_forwarder(&forwarder_key);
         }
     }
 
