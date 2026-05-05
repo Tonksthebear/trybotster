@@ -6,7 +6,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +42,7 @@ pub(crate) struct SessionIoWorkerConfig {
     pub cursor_visible: Arc<AtomicBool>,
     pub resize_pending: Arc<AtomicBool>,
     pub last_output_at: Arc<AtomicU64>,
+    pub last_human_input_ms: Arc<AtomicI64>,
     pub response_tx: std::sync::mpsc::Sender<Frame>,
     pub hub_event_tx: HubEventTx,
     pub reader_alive: Arc<AtomicBool>,
@@ -72,6 +73,7 @@ impl SessionIoWorker {
             session_uuid: config.session_uuid.clone(),
             hub_event_tx: config.hub_event_tx.clone(),
             reader_alive: Arc::clone(&config.reader_alive),
+            last_human_input_ms: Arc::clone(&config.last_human_input_ms),
         };
         let request_thread_name = format!(
             "session-io-requests-{}",
@@ -105,6 +107,7 @@ struct SessionIoRequestProcessorConfig {
     session_uuid: String,
     hub_event_tx: HubEventTx,
     reader_alive: Arc<AtomicBool>,
+    last_human_input_ms: Arc<AtomicI64>,
 }
 
 fn run_request_processor(config: SessionIoRequestProcessorConfig) {
@@ -114,6 +117,7 @@ fn run_request_processor(config: SessionIoRequestProcessorConfig) {
         session_uuid: config.session_uuid,
         hub_event_tx: config.hub_event_tx,
         reader_alive: config.reader_alive,
+        last_human_input_ms: config.last_human_input_ms,
     };
     processor.run();
 }
@@ -124,6 +128,7 @@ struct SessionIoRequestProcessor {
     session_uuid: String,
     hub_event_tx: HubEventTx,
     reader_alive: Arc<AtomicBool>,
+    last_human_input_ms: Arc<AtomicI64>,
 }
 
 impl SessionIoRequestProcessor {
@@ -139,6 +144,7 @@ impl SessionIoRequestProcessor {
     fn handle_request(&mut self, request: SessionIoRequest) {
         match request {
             SessionIoRequest::PtyInput { data } => {
+                Self::stamp_human_input(&self.last_human_input_ms, &data);
                 if let Err(e) = self.write_frame(encode_frame(FRAME_PTY_INPUT, &data)) {
                     log::warn!("[session-io] PTY input request failed: {e}");
                 }
@@ -239,6 +245,18 @@ impl SessionIoRequestProcessor {
                 }
             }
         }
+    }
+
+    fn stamp_human_input(last_human_input_ms: &AtomicI64, data: &[u8]) {
+        if data == b"\x1b[I" || data == b"\x1b[O" {
+            return;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        last_human_input_ms.store(now, Ordering::Relaxed);
     }
 
     fn write_frame(&mut self, frame: Vec<u8>) -> std::io::Result<()> {
@@ -677,6 +695,7 @@ mod tests {
             cursor_visible: Arc::new(AtomicBool::new(true)),
             resize_pending: Arc::new(AtomicBool::new(false)),
             last_output_at: Arc::new(AtomicU64::new(0)),
+            last_human_input_ms: Arc::new(AtomicI64::new(0)),
             response_tx,
             hub_event_tx: HubEventTx::from(hub_tx),
             reader_alive: Arc::clone(&alive),
