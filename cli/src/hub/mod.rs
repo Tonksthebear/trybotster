@@ -244,6 +244,15 @@ pub(crate) enum PendingSessionIoSnapshotTarget {
     WebRtcPeerRecovery {
         request: crate::worker::webrtc::WebRtcRecoverySnapshotRequest,
     },
+    TerminalClientInitial {
+        worker: crate::worker::client::ClientWorkerHandle,
+        forwarder_key: String,
+        subscription_id: String,
+        rows: u16,
+        cols: u16,
+        kitty_enabled: bool,
+        pty_handle: crate::hub::agent_handle::PtyHandle,
+    },
 }
 
 /// Central orchestrator that owns all hub state and runs the event loop.
