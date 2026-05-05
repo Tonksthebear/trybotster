@@ -1,6 +1,23 @@
 use super::*;
 
 impl Hub {
+    pub(super) fn handle_push_subscriptions_expired(&mut self, identities: Vec<String>) {
+        for identity in &identities {
+            self.push_subscriptions.remove(identity);
+            log::info!(
+                "[WebPush] Removed stale subscription for {}",
+                &identity[..identity.len().min(8)]
+            );
+        }
+        if !identities.is_empty() {
+            if let Err(e) =
+                crate::relay::persistence::save_push_subscriptions(&self.push_subscriptions)
+            {
+                log::error!("[WebPush] Failed to save push subscriptions after cleanup: {e}");
+            }
+        }
+    }
+
     pub(super) fn send_vapid_public_key(&mut self, browser_identity: &str) {
         let Some(ref vapid) = self.vapid_keys else {
             return;
