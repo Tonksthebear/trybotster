@@ -71,10 +71,7 @@ impl Hub {
         session_uuid: &str,
         snapshot: &[u8],
     ) -> SnapshotAttachState {
-        if !snapshot.is_empty()
-            || !pty_handle.is_session_backed()
-            || pty_handle.session_connection_alive()
-        {
+        if !snapshot.is_empty() || !pty_handle.is_session_backed() {
             return SnapshotAttachState::Ready;
         }
 
@@ -509,6 +506,8 @@ impl Hub {
         target_rows: u16,
         target_cols: u16,
         active_flag: Arc<std::sync::Mutex<bool>>,
+        snapshot_request_id: Option<String>,
+        hub_event_tx: crate::hub::events::HubEventTx,
         log_prefix: &'static str,
         client_label: String,
         filter: TerminalStreamFilter,
@@ -535,58 +534,38 @@ impl Hub {
                 .await;
             let mut query_filter_buffer = Vec::new();
 
-            let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, mut pty_rx) =
-                match tokio::task::spawn_blocking(move || {
-                    if pty_for_snapshot.is_session_backed() {
-                        pty_for_snapshot.resize_direct(target_rows, target_cols);
-                    }
-                    pty_for_snapshot.snapshot_and_subscribe()
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        log::warn!(
-                            "[{}] Snapshot fetch task failed for {} session {}: {}",
-                            log_prefix,
-                            client_label,
-                            session_uuid,
-                            e
-                        );
-                        (
-                            Vec::new(),
-                            false,
-                            target_rows,
-                            target_cols,
-                            pty_handle.subscribe(),
-                        )
-                    }
-                };
+            let mut pty_rx = if let Some(request_id) = snapshot_request_id {
+                let pty_rx = pty_handle.subscribe();
+                let resize_result = pty_handle.enqueue_session_io_request(
+                    crate::worker::session_io::SessionIoRequest::Resize {
+                        rows: target_rows,
+                        cols: target_cols,
+                    },
+                );
+                let snapshot_result = pty_handle.enqueue_session_io_request(
+                    crate::worker::session_io::SessionIoRequest::GetSnapshot {
+                        request_id: request_id.clone(),
+                    },
+                );
 
-            log::debug!(
-                "[{}] Snapshot bytes for {} session {}: {}",
-                log_prefix,
-                client_label,
-                session_uuid,
-                snapshot.len()
-            );
-
-            let attach_state =
-                Self::classify_snapshot_attach_state(&pty_handle, &session_uuid, &snapshot);
-            match attach_state {
-                SnapshotAttachState::Ready => {}
-                SnapshotAttachState::Exited => {
+                if resize_result.is_err() || snapshot_result.is_err() {
                     log::warn!(
-                        "[{}] Session RPC died before snapshot for {} session {}; sending ProcessExited",
+                        "[{}] Session I/O snapshot request failed for {} session {}: resize={:?} snapshot={:?}",
                         log_prefix,
                         client_label,
-                        session_uuid
+                        session_uuid,
+                        resize_result.err(),
+                        snapshot_result.err()
+                    );
+                    let _ = hub_event_tx.send(
+                        crate::hub::events::HubEvent::DropPendingSessionIoSnapshot { request_id },
                     );
                     let _ = worker
                         .send(ClientWorkerMessage::ControlFrame(
-                            ClientControlFrame::ProcessExited {
+                            ClientControlFrame::TerminalAttach {
+                                subscription_id: subscription_id.clone(),
                                 session_uuid: session_uuid.clone(),
-                                exit_code: None,
+                                state: TerminalAttachState::NotReady,
                             },
                         ))
                         .await;
@@ -597,49 +576,114 @@ impl Hub {
                         .await;
                     return;
                 }
-                SnapshotAttachState::Reconnecting => {
-                    log::info!(
-                        "[{}] Session '{}' snapshot unavailable - reconnect pending",
-                        log_prefix,
-                        &session_uuid[..session_uuid.len().min(16)]
-                    );
-                    let _ = worker
-                        .send(ClientWorkerMessage::ControlFrame(
-                            ClientControlFrame::TerminalAttach {
-                                subscription_id: subscription_id.clone(),
+
+                pty_rx
+            } else {
+                let (snapshot, kitty_enabled, snapshot_rows, snapshot_cols, pty_rx) =
+                    match tokio::task::spawn_blocking(move || {
+                        pty_for_snapshot.snapshot_and_subscribe()
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            log::warn!(
+                                "[{}] Snapshot fetch task failed for {} session {}: {}",
+                                log_prefix,
+                                client_label,
+                                session_uuid,
+                                e
+                            );
+                            (
+                                Vec::new(),
+                                false,
+                                target_rows,
+                                target_cols,
+                                pty_handle.subscribe(),
+                            )
+                        }
+                    };
+
+                log::debug!(
+                    "[{}] Snapshot bytes for {} session {}: {}",
+                    log_prefix,
+                    client_label,
+                    session_uuid,
+                    snapshot.len()
+                );
+
+                let attach_state =
+                    Self::classify_snapshot_attach_state(&pty_handle, &session_uuid, &snapshot);
+                match attach_state {
+                    SnapshotAttachState::Ready => {}
+                    SnapshotAttachState::Exited => {
+                        log::warn!(
+                            "[{}] Session RPC died before snapshot for {} session {}; sending ProcessExited",
+                            log_prefix,
+                            client_label,
+                            session_uuid
+                        );
+                        let _ = worker
+                            .send(ClientWorkerMessage::ControlFrame(
+                                ClientControlFrame::ProcessExited {
+                                    session_uuid: session_uuid.clone(),
+                                    exit_code: None,
+                                },
+                            ))
+                            .await;
+                        let _ = worker
+                            .send(ClientWorkerMessage::UnregisterSessionIoSender {
                                 session_uuid: session_uuid.clone(),
-                                state: TerminalAttachState::Reconnecting,
+                            })
+                            .await;
+                        return;
+                    }
+                    SnapshotAttachState::Reconnecting => {
+                        log::info!(
+                            "[{}] Session '{}' snapshot unavailable - reconnect pending",
+                            log_prefix,
+                            &session_uuid[..session_uuid.len().min(16)]
+                        );
+                        let _ = worker
+                            .send(ClientWorkerMessage::ControlFrame(
+                                ClientControlFrame::TerminalAttach {
+                                    subscription_id: subscription_id.clone(),
+                                    session_uuid: session_uuid.clone(),
+                                    state: TerminalAttachState::Reconnecting,
+                                },
+                            ))
+                            .await;
+                    }
+                }
+
+                if attach_state != SnapshotAttachState::Reconnecting
+                    && worker
+                        .send(ClientWorkerMessage::ControlFrame(
+                            ClientControlFrame::Scrollback {
+                                session_uuid: session_uuid.clone(),
+                                rows: snapshot_rows,
+                                cols: snapshot_cols,
+                                kitty_enabled,
+                                data: snapshot,
                             },
                         ))
-                        .await;
-                }
-            }
-
-            if attach_state != SnapshotAttachState::Reconnecting
-                && worker
-                    .send(ClientWorkerMessage::ControlFrame(
-                        ClientControlFrame::Scrollback {
+                        .await
+                        .is_err()
+                {
+                    log::trace!(
+                        "[{}] Worker channel closed before snapshot sent",
+                        log_prefix
+                    );
+                    let _ = worker
+                        .send(ClientWorkerMessage::UnregisterSessionIoSender {
                             session_uuid: session_uuid.clone(),
-                            rows: snapshot_rows,
-                            cols: snapshot_cols,
-                            kitty_enabled,
-                            data: snapshot,
-                        },
-                    ))
-                    .await
-                    .is_err()
-            {
-                log::trace!(
-                    "[{}] Worker channel closed before snapshot sent",
-                    log_prefix
-                );
-                let _ = worker
-                    .send(ClientWorkerMessage::UnregisterSessionIoSender {
-                        session_uuid: session_uuid.clone(),
-                    })
-                    .await;
-                return;
-            }
+                        })
+                        .await;
+                    return;
+                }
+
+                pty_rx
+            };
 
             loop {
                 {
@@ -899,6 +943,31 @@ impl Hub {
             &req.session_uuid,
             "attached",
         );
+        let snapshot_request_id = if pty_handle.is_session_backed() {
+            let request_id = Self::next_session_io_request_id("terminal-snapshot");
+            if !self.insert_pending_session_io_snapshot(
+                request_id.clone(),
+                crate::hub::PendingSessionIoSnapshot {
+                    session_uuid: req.session_uuid.clone(),
+                    started_at: Instant::now(),
+                    target: crate::hub::PendingSessionIoSnapshotTarget::TerminalClientInitial {
+                        worker: worker.clone(),
+                        forwarder_key: forwarder_key.clone(),
+                        subscription_id: req.subscription_id.clone(),
+                        rows: target_rows,
+                        cols: target_cols,
+                        kitty_enabled: pty_handle.kitty_enabled(),
+                        pty_handle: pty_handle.clone(),
+                    },
+                },
+            ) {
+                return false;
+            }
+            Some(request_id)
+        } else {
+            None
+        };
+        let hub_event_tx = self.hub_event_tx.clone();
         let task = Self::spawn_terminal_client_forwarder_runtime(
             pty_handle,
             worker,
@@ -907,6 +976,8 @@ impl Hub {
             target_rows,
             target_cols,
             active_flag,
+            snapshot_request_id,
+            hub_event_tx,
             "Lua-TUI",
             "tui".to_string(),
             TerminalStreamFilter::None,
@@ -1003,6 +1074,31 @@ impl Hub {
             &req.session_uuid,
             "attached",
         );
+        let snapshot_request_id = if pty_handle.is_session_backed() {
+            let request_id = Self::next_session_io_request_id("terminal-snapshot");
+            if !self.insert_pending_session_io_snapshot(
+                request_id.clone(),
+                crate::hub::PendingSessionIoSnapshot {
+                    session_uuid: req.session_uuid.clone(),
+                    started_at: Instant::now(),
+                    target: crate::hub::PendingSessionIoSnapshotTarget::TerminalClientInitial {
+                        worker: worker.clone(),
+                        forwarder_key: forwarder_key.clone(),
+                        subscription_id: req.subscription_id.clone(),
+                        rows: target_rows,
+                        cols: target_cols,
+                        kitty_enabled: pty_handle.kitty_enabled(),
+                        pty_handle: pty_handle.clone(),
+                    },
+                },
+            ) {
+                return false;
+            }
+            Some(request_id)
+        } else {
+            None
+        };
+        let hub_event_tx = self.hub_event_tx.clone();
         let task = Self::spawn_terminal_client_forwarder_runtime(
             pty_handle,
             worker,
@@ -1011,6 +1107,8 @@ impl Hub {
             target_rows,
             target_cols,
             active_flag,
+            snapshot_request_id,
+            hub_event_tx,
             "Lua-Socket",
             client_id.clone(),
             TerminalStreamFilter::StripOscQueriesWhenInactive {

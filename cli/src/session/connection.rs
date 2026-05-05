@@ -11,6 +11,7 @@
 //! RPCs (get_snapshot, get_screen, etc.) send their request on the write stream
 //! and receive the response via `response_rx`. No socket read contention.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -187,6 +188,7 @@ impl SessionConnection {
             response_tx,
             hub_event_tx,
             reader_alive: Arc::clone(&self.reader_alive),
+            pending_snapshot_requests: Arc::new(Mutex::new(VecDeque::new())),
         })?;
 
         Ok(())

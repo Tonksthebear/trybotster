@@ -221,31 +221,6 @@ pub(super) fn test_session_backed_handle_with_connection(
     SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
 }
 
-pub(super) fn test_session_backed_handle_with_snapshot_override(
-    session_uuid: &str,
-    snapshot: Vec<u8>,
-) -> SessionHandle {
-    let (session_io_tx, _session_io_rx) =
-        tokio::sync::mpsc::channel::<crate::worker::session_io::SessionIoRequest>(8);
-    let conn =
-        crate::session::connection::SessionConnection::test_with_session_io_sender(session_io_tx);
-    let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
-    let pty = PtyHandle::new_with_session_snapshot(
-        event_tx,
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
-        None,
-        Arc::new(Mutex::new(Some(conn))),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        24,
-        80,
-        snapshot,
-    );
-    SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
-}
-
 pub(super) fn unique_session_uuid(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -390,6 +365,32 @@ pub(super) fn settle_worker_subscription() {
     shared_test_runtime().block_on(async {
         tokio::time::sleep(Duration::from_millis(50)).await;
     });
+}
+
+pub(super) fn recv_session_io_request_matching<F>(
+    rx: &mut tokio::sync::mpsc::Receiver<crate::worker::session_io::SessionIoRequest>,
+    mut matches_request: F,
+) -> crate::worker::session_io::SessionIoRequest
+where
+    F: FnMut(&crate::worker::session_io::SessionIoRequest) -> bool,
+{
+    shared_test_runtime().block_on(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for matching SessionIoRequest"
+            );
+            if let Ok(Some(request)) =
+                tokio::time::timeout(remaining.min(Duration::from_millis(50)), rx.recv()).await
+            {
+                if matches_request(&request) {
+                    return request;
+                }
+            }
+        }
+    })
 }
 
 pub(super) fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
@@ -2014,8 +2015,13 @@ pub(super) fn test_tui_input_routes_through_client_worker_to_session_io_mailbox(
     let mut routed = None;
     for _ in 0..20 {
         if let Ok(request) = session_io_rx.try_recv() {
-            routed = Some(request);
-            break;
+            if matches!(
+                request,
+                crate::worker::session_io::SessionIoRequest::PtyInput { .. }
+            ) {
+                routed = Some(request);
+                break;
+            }
         }
         hub.tokio_runtime.block_on(async {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -2027,6 +2033,128 @@ pub(super) fn test_tui_input_routes_through_client_worker_to_session_io_mailbox(
         Some(crate::worker::session_io::SessionIoRequest::PtyInput { data })
             if data == b"mailbox\n"
     ));
+}
+
+#[test]
+pub(super) fn test_tui_initial_scrollback_routes_snapshot_through_session_io_mailbox() {
+    let (mut hub, _request_tx, mut output_rx) = e2e_hub();
+    let session_uuid = "sess-tui-snapshot-mailbox";
+    let snapshot = b"tui mailbox snapshot".to_vec();
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
+
+    hub.create_lua_tui_pty_forwarder(crate::lua::primitives::CreateTuiForwarderRequest {
+        session_uuid: session_uuid.to_string(),
+        subscription_id: format!("tui:{session_uuid}"),
+        active_flag: Arc::new(Mutex::new(true)),
+        rows: 30,
+        cols: 100,
+    });
+
+    assert!(matches!(
+        recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize {
+                rows: 30,
+                cols: 100
+            }
+        )),
+        crate::worker::session_io::SessionIoRequest::Resize { .. }
+    ));
+    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )
+    }) {
+        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
+        other => panic!("expected GetSnapshot request, got {other:?}"),
+    };
+
+    settle_worker_subscription();
+    hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
+        request_id,
+        session_uuid: session_uuid.to_string(),
+        payload: snapshot.clone(),
+    });
+
+    let scrollback = shared_test_runtime()
+        .block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                if let Ok(Some(TuiOutput::Scrollback {
+                    session_uuid: frame_session,
+                    rows,
+                    cols,
+                    data,
+                    ..
+                })) = tokio::time::timeout(Duration::from_millis(50), output_rx.recv()).await
+                {
+                    if frame_session == session_uuid {
+                        return Some((rows, cols, data));
+                    }
+                }
+            }
+            None
+        })
+        .expect("TUI scrollback from SessionIo snapshot");
+
+    assert_eq!(scrollback, (30, 100, snapshot));
+}
+
+#[test]
+pub(super) fn test_tui_snapshot_mailbox_failure_emits_not_ready() {
+    let (mut hub, _request_tx, mut output_rx) = e2e_hub();
+    let session_uuid = "sess-tui-snapshot-mailbox-missing";
+    hub.handle_cache
+        .add_session(test_session_backed_handle(session_uuid, 24, 80));
+
+    hub.create_lua_tui_pty_forwarder(crate::lua::primitives::CreateTuiForwarderRequest {
+        session_uuid: session_uuid.to_string(),
+        subscription_id: format!("tui:{session_uuid}"),
+        active_flag: Arc::new(Mutex::new(true)),
+        rows: 24,
+        cols: 80,
+    });
+
+    let outputs = shared_test_runtime().block_on(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut outputs = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Some(output)) =
+                tokio::time::timeout(Duration::from_millis(50), output_rx.recv()).await
+            {
+                outputs.push(output);
+                if outputs.iter().any(|output| {
+                    matches!(
+                        output,
+                        TuiOutput::Message(json)
+                            if json.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
+                                && json.get("state").and_then(|v| v.as_str()) == Some("not_ready")
+                                && json.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid)
+                    )
+                }) {
+                    break;
+                }
+            }
+        }
+        outputs
+    });
+
+    assert!(
+        outputs.iter().any(|output| matches!(
+            output,
+            TuiOutput::Message(json)
+                if json.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
+                    && json.get("state").and_then(|v| v.as_str()) == Some("not_ready")
+                    && json.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid)
+        )),
+        "mailbox failure should emit a deterministic not_ready attach state"
+    );
 }
 
 #[test]
@@ -2152,6 +2280,75 @@ pub(super) fn test_socket_attach_intent_resolves_when_session_and_client_appear(
 }
 
 #[test]
+pub(super) fn test_socket_initial_scrollback_routes_snapshot_through_session_io_mailbox() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let session_uuid = "sess-socket-snapshot-mailbox";
+    let client_id = "socket:snapshot-mailbox";
+    let snapshot = b"socket mailbox snapshot".to_vec();
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
+    let mut client_stream = register_test_socket_client(&mut hub, client_id);
+
+    hub.create_lua_socket_pty_forwarder(crate::lua::primitives::CreateSocketForwarderRequest {
+        client_id: client_id.to_string(),
+        session_uuid: session_uuid.to_string(),
+        subscription_id: format!("socket:{session_uuid}"),
+        active_flag: Arc::new(Mutex::new(true)),
+        rows: 31,
+        cols: 101,
+    });
+
+    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize {
+                rows: 31,
+                cols: 101
+            }
+        )
+    });
+    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )
+    }) {
+        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
+        other => panic!("expected GetSnapshot request, got {other:?}"),
+    };
+
+    settle_worker_subscription();
+    hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
+        request_id,
+        session_uuid: session_uuid.to_string(),
+        payload: snapshot.clone(),
+    });
+
+    let socket_scrollback =
+        read_test_socket_frame_matching(&mut client_stream, Duration::from_secs(2), |frame| {
+            matches!(
+                frame,
+                Frame::Scrollback {
+                    session_uuid: frame_session,
+                    rows: 31,
+                    cols: 101,
+                    data,
+                    ..
+                } if frame_session == session_uuid && data == &snapshot
+            )
+        });
+
+    assert!(
+        socket_scrollback.is_some(),
+        "socket initial scrollback should be delivered from SessionIo snapshot response"
+    );
+}
+
+#[test]
 pub(super) fn test_tui_worker_handle_registered_and_removed_with_forwarder() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let session_uuid = "sess-tui-worker-lifecycle";
@@ -2251,6 +2448,22 @@ pub(super) fn test_tui_and_socket_attach_handlers_delegate_to_shared_terminal_ru
         assert!(
             !body.contains("PtyEvent"),
             "{function} must not own a transport-specific PTY event loop"
+        );
+    }
+}
+
+#[test]
+pub(super) fn test_shared_terminal_runtime_session_snapshots_use_session_io_mailbox() {
+    let source = include_str!("terminal_runtime.rs");
+    let body = function_body(source, "spawn_terminal_client_forwarder_runtime");
+    assert!(
+        body.contains("SessionIoRequest::GetSnapshot"),
+        "session-backed TUI/socket snapshots must be requested through SessionIoWorker"
+    );
+    for forbidden in ["resize_direct", ".get_snapshot()"] {
+        assert!(
+            !body.contains(forbidden),
+            "shared TUI/socket runtime must not use direct session snapshot calls: {forbidden}"
         );
     }
 }
@@ -2515,10 +2728,11 @@ pub(super) fn test_tui_first_scrollback_latency_budget_session_backed() {
         let session_uuid = unique_session_uuid(&format!("sess-tui-latency-{idx}"));
         register_live_session_identity(&session_uuid);
 
+        let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
         hub.handle_cache
-            .add_session(test_session_backed_handle_with_snapshot_override(
+            .add_session(test_session_backed_handle_with_mailbox(
                 &session_uuid,
-                snapshot.clone(),
+                session_io_tx,
             ));
 
         let started = Instant::now();
@@ -2528,6 +2742,27 @@ pub(super) fn test_tui_first_scrollback_latency_budget_session_backed() {
             active_flag: Arc::new(Mutex::new(true)),
             rows: 24,
             cols: 80,
+        });
+        let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+            matches!(
+                request,
+                crate::worker::session_io::SessionIoRequest::Resize { .. }
+            )
+        });
+        let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
+            matches!(
+                request,
+                crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+            )
+        }) {
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
+            other => panic!("expected GetSnapshot request, got {other:?}"),
+        };
+        settle_worker_subscription();
+        hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
+            request_id,
+            session_uuid: session_uuid.clone(),
+            payload: snapshot.clone(),
         });
 
         let received = shared_test_runtime().block_on(async {
@@ -2847,8 +3082,12 @@ pub(super) fn test_tui_attach_reconnecting_emits_explicit_attach_state() {
     register_live_session_identity(&session_uuid);
 
     let (mut hub, _request_tx, mut output_rx) = e2e_hub();
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
     hub.handle_cache
-        .add_session(test_session_backed_handle(&session_uuid, 24, 80));
+        .add_session(test_session_backed_handle_with_mailbox(
+            &session_uuid,
+            session_io_tx,
+        ));
 
     let req = crate::lua::primitives::CreateTuiForwarderRequest {
         session_uuid: session_uuid.clone(),
@@ -2858,6 +3097,27 @@ pub(super) fn test_tui_attach_reconnecting_emits_explicit_attach_state() {
         cols: 80,
     };
     hub.create_lua_tui_pty_forwarder(req);
+    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize { .. }
+        )
+    });
+    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )
+    }) {
+        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
+        other => panic!("expected GetSnapshot request, got {other:?}"),
+    };
+    settle_worker_subscription();
+    hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
+        request_id,
+        session_uuid: session_uuid.clone(),
+        payload: Vec::new(),
+    });
 
     let rt = shared_test_runtime();
     let outputs = rt.block_on(async {
@@ -2910,8 +3170,12 @@ pub(super) fn test_socket_attach_reconnecting_emits_explicit_attach_state() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let client_id = "socket:reconnecting";
     let mut client_stream = register_test_socket_client(&mut hub, client_id);
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
     hub.handle_cache
-        .add_session(test_session_backed_handle(&session_uuid, 24, 80));
+        .add_session(test_session_backed_handle_with_mailbox(
+            &session_uuid,
+            session_io_tx,
+        ));
 
     let req = crate::lua::primitives::CreateSocketForwarderRequest {
         client_id: client_id.to_string(),
@@ -2922,6 +3186,27 @@ pub(super) fn test_socket_attach_reconnecting_emits_explicit_attach_state() {
         cols: 80,
     };
     hub.create_lua_socket_pty_forwarder(req);
+    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize { .. }
+        )
+    });
+    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )
+    }) {
+        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
+        other => panic!("expected GetSnapshot request, got {other:?}"),
+    };
+    settle_worker_subscription();
+    hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
+        request_id,
+        session_uuid: session_uuid.clone(),
+        payload: Vec::new(),
+    });
 
     let frames = read_test_socket_frames(&mut client_stream, 4, Duration::from_secs(5));
 

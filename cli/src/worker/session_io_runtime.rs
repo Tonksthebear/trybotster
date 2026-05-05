@@ -4,10 +4,11 @@
 //! It preserves the session-process wire protocol while coalescing hot-path
 //! output before crossing back into the hub event loop.
 
+use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -21,7 +22,7 @@ use crate::session::protocol::{
     PromptMarkPayload, FRAME_BELL, FRAME_CWD_CHANGED, FRAME_GET_MODE_FLAGS, FRAME_GET_SCREEN,
     FRAME_GET_SNAPSHOT, FRAME_MODE_CHANGED, FRAME_NOTIFICATION, FRAME_PROCESS_EXITED,
     FRAME_PROMPT_MARK, FRAME_PTY_INPUT, FRAME_PTY_OUTPUT, FRAME_RESIZE, FRAME_SET_COLOR_PROFILE,
-    FRAME_SHUTDOWN, FRAME_TITLE_CHANGED,
+    FRAME_SHUTDOWN, FRAME_SNAPSHOT, FRAME_TITLE_CHANGED,
 };
 
 use super::session_io::{
@@ -46,6 +47,7 @@ pub(crate) struct SessionIoWorkerConfig {
     pub response_tx: std::sync::mpsc::Sender<Frame>,
     pub hub_event_tx: HubEventTx,
     pub reader_alive: Arc<AtomicBool>,
+    pub pending_snapshot_requests: Arc<Mutex<VecDeque<String>>>,
 }
 
 pub(crate) struct SessionIoWorkerHandle {
@@ -74,6 +76,7 @@ impl SessionIoWorker {
             hub_event_tx: config.hub_event_tx.clone(),
             reader_alive: Arc::clone(&config.reader_alive),
             last_human_input_ms: Arc::clone(&config.last_human_input_ms),
+            pending_snapshot_requests: Arc::clone(&config.pending_snapshot_requests),
         };
         let request_thread_name = format!(
             "session-io-requests-{}",
@@ -108,6 +111,7 @@ struct SessionIoRequestProcessorConfig {
     hub_event_tx: HubEventTx,
     reader_alive: Arc<AtomicBool>,
     last_human_input_ms: Arc<AtomicI64>,
+    pending_snapshot_requests: Arc<Mutex<VecDeque<String>>>,
 }
 
 fn run_request_processor(config: SessionIoRequestProcessorConfig) {
@@ -118,6 +122,7 @@ fn run_request_processor(config: SessionIoRequestProcessorConfig) {
         hub_event_tx: config.hub_event_tx,
         reader_alive: config.reader_alive,
         last_human_input_ms: config.last_human_input_ms,
+        pending_snapshot_requests: config.pending_snapshot_requests,
     };
     processor.run();
 }
@@ -129,6 +134,7 @@ struct SessionIoRequestProcessor {
     hub_event_tx: HubEventTx,
     reader_alive: Arc<AtomicBool>,
     last_human_input_ms: Arc<AtomicI64>,
+    pending_snapshot_requests: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl SessionIoRequestProcessor {
@@ -160,9 +166,22 @@ impl SessionIoRequestProcessor {
                     Err(e) => log::warn!("[session-io] resize request failed: {e}"),
                 }
             }
-            SessionIoRequest::GetSnapshot { .. } => {
+            SessionIoRequest::GetSnapshot { request_id } => {
+                if let Ok(mut pending) = self.pending_snapshot_requests.lock() {
+                    pending.push_back(request_id.clone());
+                }
                 if let Err(e) = self.write_frame(encode_empty(FRAME_GET_SNAPSHOT)) {
+                    if let Ok(mut pending) = self.pending_snapshot_requests.lock() {
+                        pending.retain(|pending_id| pending_id != &request_id);
+                    }
                     log::warn!("[session-io] snapshot RPC request failed: {e}");
+                    let _ = self
+                        .hub_event_tx
+                        .send(HubEvent::SessionIo(SessionIoEvent::Snapshot {
+                            request_id,
+                            session_uuid: self.session_uuid.clone(),
+                            payload: Vec::new(),
+                        }));
                 }
             }
             SessionIoRequest::PasteFile {
@@ -277,6 +296,7 @@ struct SessionIoRuntime {
     response_tx: std::sync::mpsc::Sender<Frame>,
     hub_event_tx: HubEventTx,
     reader_alive: Arc<AtomicBool>,
+    pending_snapshot_requests: Arc<Mutex<VecDeque<String>>>,
     coalescer: SessionIoCoalescer,
     saw_process_exit: bool,
 }
@@ -295,6 +315,7 @@ impl SessionIoRuntime {
             response_tx: config.response_tx,
             hub_event_tx: config.hub_event_tx,
             reader_alive: config.reader_alive,
+            pending_snapshot_requests: config.pending_snapshot_requests,
             coalescer: SessionIoCoalescer::default(),
             saw_process_exit: false,
         }
@@ -427,6 +448,26 @@ impl SessionIoRuntime {
                     exit_code,
                 });
                 log::info!("[session-io] process exited (code={exit_code:?})");
+            }
+            FRAME_SNAPSHOT => {
+                self.flush_pending();
+                let request_id = self
+                    .pending_snapshot_requests
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.pop_front());
+                if let Some(request_id) = request_id {
+                    let _ = self
+                        .hub_event_tx
+                        .send(HubEvent::SessionIo(SessionIoEvent::Snapshot {
+                            request_id,
+                            session_uuid: self.session_uuid.clone(),
+                            payload: frame.payload,
+                        }));
+                } else if self.response_tx.send(frame).is_err() {
+                    log::debug!("[session-io] response channel closed");
+                    return false;
+                }
             }
             _ => {
                 self.flush_pending();
@@ -699,6 +740,7 @@ mod tests {
             response_tx,
             hub_event_tx: HubEventTx::from(hub_tx),
             reader_alive: Arc::clone(&alive),
+            pending_snapshot_requests: Arc::new(Mutex::new(VecDeque::new())),
         })
         .expect("spawn worker");
 
@@ -833,6 +875,42 @@ mod tests {
                 assert!(recovery);
             }
             other => panic!("expected prepared snapshot event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_snapshot_request_emits_correlated_snapshot_event() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, mut hub_rx, _alive) =
+            spawn_test_worker_with_requests(reader);
+
+        request_tx
+            .blocking_send(SessionIoRequest::GetSnapshot {
+                request_id: "snapshot-rpc".to_string(),
+            })
+            .expect("send get snapshot");
+
+        let mut request = [0u8; 5];
+        writer
+            .read_exact(&mut request)
+            .expect("read get snapshot frame");
+        assert_eq!(request[4], FRAME_GET_SNAPSHOT);
+
+        writer
+            .write_all(&encode_frame(FRAME_SNAPSHOT, b"snapshot-bytes"))
+            .expect("write snapshot response");
+
+        match hub_rx.blocking_recv().expect("snapshot event") {
+            HubEvent::SessionIo(SessionIoEvent::Snapshot {
+                request_id,
+                session_uuid,
+                payload,
+            }) => {
+                assert_eq!(request_id, "snapshot-rpc");
+                assert_eq!(session_uuid, "sess-test-io");
+                assert_eq!(payload, b"snapshot-bytes");
+            }
+            other => panic!("expected snapshot event, got {other:?}"),
         }
     }
 
