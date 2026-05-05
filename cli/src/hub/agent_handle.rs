@@ -574,6 +574,36 @@ impl PtyHandle {
         session.enqueue_session_io_request(request)
     }
 
+    /// Clone the real SessionIoWorker mailbox for workerized terminal input.
+    pub fn session_io_sender(
+        &self,
+    ) -> Result<
+        tokio::sync::mpsc::Sender<crate::worker::session_io::SessionIoRequest>,
+        crate::session::connection::SessionIoRequestEnqueueError,
+    > {
+        let Some(ref conn) = self.session_connection else {
+            return Err(
+                crate::session::connection::SessionIoRequestEnqueueError::ConnectionMissing,
+            );
+        };
+
+        let guard = conn.lock().map_err(|_| {
+            crate::session::connection::SessionIoRequestEnqueueError::ConnectionLockPoisoned
+        })?;
+        let session = guard
+            .as_ref()
+            .ok_or(crate::session::connection::SessionIoRequestEnqueueError::ConnectionMissing)?;
+        if !session.has_reader() {
+            return Err(crate::session::connection::SessionIoRequestEnqueueError::ReaderMissing);
+        }
+        if !session.is_reader_alive() {
+            return Err(crate::session::connection::SessionIoRequestEnqueueError::ReaderClosed);
+        }
+        session
+            .session_io_sender()
+            .ok_or(crate::session::connection::SessionIoRequestEnqueueError::MailboxMissing)
+    }
+
     // =========================================================================
     // Direct Sync Methods - Immediate I/O without async channel
     // =========================================================================
@@ -650,6 +680,15 @@ impl PtyHandle {
         state
             .last_human_input_ms
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Clone the last-human-input timestamp shared with the session I/O worker.
+    pub(crate) fn last_human_input_atomic(&self) -> Arc<std::sync::atomic::AtomicI64> {
+        let state = self
+            .shared_state
+            .lock()
+            .expect("shared_state lock poisoned");
+        Arc::clone(&state.last_human_input_ms)
     }
 
     /// Current PTY dimensions `(rows, cols)`.

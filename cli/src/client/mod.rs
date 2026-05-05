@@ -12,7 +12,7 @@
 //! TuiRunner (rendering, keyboard)
 //!   │
 //!   ├── TuiRequest::LuaMessage ──► Hub ──► lua.call_tui_message() ──► client.lua
-//!   ├── TuiRequest::PtyInput   ──► Hub ──► pty.write_input_direct() (raw bytes)
+//!   ├── TuiRequest::PtyInput   ──► Hub ──► ClientWorker ──► SessionIoWorker
 //!   ◄── TuiOutput::Message     ◄── Lua tui.send() (events, subscriptions)
 //!   ◄── TuiOutput::Output      ◄── Lua PTY forwarder tasks
 //! ```

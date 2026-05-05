@@ -10,7 +10,7 @@
 //! the Lua `client.lua` protocol, shared with browser clients.
 //!
 //! PTY keyboard input bypasses Lua entirely — raw bytes go directly from
-//! TuiRunner to the PTY writer via [`TuiRequest::PtyInput`].
+//! TuiRunner to the workerized session I/O path via [`TuiRequest::PtyInput`].
 //!
 //! JSON message types:
 //! - Resize: `{subscriptionId: "tui:{session_uuid}", data: {type: "resize", rows, cols}}`
@@ -34,10 +34,9 @@ pub enum TuiRequest {
     /// control operations that need Lua processing.
     LuaMessage(serde_json::Value),
 
-    /// Raw PTY input bytes — bypasses Lua entirely.
+    /// Raw PTY input bytes — bypasses Lua and routes through ClientWorker.
     ///
-    /// Keyboard input goes directly to the PTY writer. No JSON
-    /// serialization, no `from_utf8_lossy`, no Lua round-trip.
+    /// No JSON serialization, no `from_utf8_lossy`, no Lua round-trip.
     PtyInput {
         /// Session UUID identifying the target PTY.
         session_uuid: String,

@@ -285,7 +285,10 @@ mod tests {
     #[test]
     fn static_webrtc_receiver_access_stays_test_only_and_registry_owned() {
         let webrtc = include_str!("webrtc.rs");
-        let server_comms = include_str!("../hub/server_comms.rs");
+        let server_comms = concat!(
+            include_str!("../hub/server_comms.rs"),
+            include_str!("../hub/server_comms/webrtc_transport.rs")
+        );
 
         assert!(webrtc.contains("fn start_queue_forwarders"));
         for event in [
@@ -331,7 +334,10 @@ mod tests {
     #[test]
     fn static_browser_webrtc_ingress_crosses_client_worker_boundary() {
         let webrtc = include_str!("webrtc.rs");
-        let server_comms = include_str!("../hub/server_comms.rs");
+        let server_comms = concat!(
+            include_str!("../hub/server_comms.rs"),
+            include_str!("../hub/server_comms/webrtc_transport.rs")
+        );
 
         for typed_mapping in [
             "Some(\"subscribe\")",
@@ -419,7 +425,11 @@ mod tests {
         let docs = include_str!("../../../docs/worker-actor-contracts.md");
         let transport = include_str!("transport.rs");
         let webrtc = include_str!("webrtc.rs");
-        let server_comms = include_str!("../hub/server_comms.rs");
+        let server_comms = concat!(
+            include_str!("../hub/server_comms.rs"),
+            include_str!("../hub/server_comms/webrtc_transport.rs"),
+            include_str!("../hub/server_comms/terminal_runtime.rs")
+        );
 
         assert!(docs.contains("JSON remains limited to Lua/plugin/relay boundaries"));
         assert!(transport.contains("TransportIngress::BoundaryJson"));
@@ -493,9 +503,10 @@ mod tests {
 
     fn inside_preceding_cfg_test_function(source: &str, idx: usize) -> bool {
         let prefix = &source[..idx];
-        let Some(fn_idx) = prefix.rfind("\n    fn ") else {
-            return false;
-        };
+        let fn_idx = prefix
+            .rfind("\n    pub(super) fn ")
+            .or_else(|| prefix.rfind("\n    fn "));
+        let Some(fn_idx) = fn_idx else { return false };
         prefix[fn_idx..]
             .lines()
             .take(4)

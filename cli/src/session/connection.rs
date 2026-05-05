@@ -156,6 +156,7 @@ impl SessionConnection {
         cursor_visible: Arc<AtomicBool>,
         resize_pending: Arc<AtomicBool>,
         last_output_at: Arc<AtomicU64>,
+        last_human_input_ms: Arc<std::sync::atomic::AtomicI64>,
         hub_event_tx: crate::hub::events::HubEventTx,
     ) -> Result<()> {
         let reader_stream = self
@@ -182,6 +183,7 @@ impl SessionConnection {
             cursor_visible,
             resize_pending,
             last_output_at,
+            last_human_input_ms,
             response_tx,
             hub_event_tx,
             reader_alive: Arc::clone(&self.reader_alive),
@@ -214,6 +216,11 @@ impl SessionConnection {
                 Err(SessionIoRequestEnqueueError::MailboxClosed)
             }
         }
+    }
+
+    /// Clone the session I/O worker mailbox for client workers.
+    pub fn session_io_sender(&self) -> Option<tokio::sync::mpsc::Sender<SessionIoRequest>> {
+        self.session_io_tx.clone()
     }
 
     /// Whether the session I/O worker has been installed.

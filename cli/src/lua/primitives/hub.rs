@@ -319,6 +319,7 @@ pub(crate) fn register(
                                             pty.cursor_visible_arc(),
                                             pty.resize_pending_arc(),
                                             pty.last_output_at_atomic().clone(),
+                                            pty.last_human_input_atomic(),
                                             {
                                                 let g = register_event_tx
                                                     .lock()
