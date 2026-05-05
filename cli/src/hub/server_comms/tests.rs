@@ -417,6 +417,37 @@ pub(super) fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
     panic!("unterminated function {name}");
 }
 
+pub(super) fn production_source(source: &str) -> String {
+    let mut remaining = source;
+    let mut output = String::with_capacity(source.len());
+    while let Some(attr_offset) = remaining.find("#[cfg(test)]") {
+        output.push_str(&remaining[..attr_offset]);
+        let cfg_start = attr_offset;
+        let body_start = remaining[cfg_start..]
+            .find('{')
+            .map(|offset| cfg_start + offset)
+            .expect("cfg(test) item body start");
+        let mut depth = 0usize;
+        let mut end = remaining.len();
+        for (idx, ch) in remaining[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_start + idx + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        remaining = &remaining[end..];
+    }
+    output.push_str(remaining);
+    output
+}
+
 /// Create a test session handle. No local shadow screen — all PTYs are
 /// session-backed. Seed output is broadcast but not parsed locally.
 pub(super) fn test_local_session_handle_with_seed(
@@ -729,7 +760,7 @@ pub(super) fn test_queue_webrtc_terminal_snapshot_returns_false_when_mailbox_ful
 pub(super) fn test_empty_initial_snapshot_cleans_pending_session_io_request() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let session_uuid = "sess-empty-initial-snapshot";
-    let (session_io_tx, _session_io_rx) = tokio::sync::mpsc::channel(4);
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(4);
     hub.handle_cache
         .add_session(test_session_backed_handle_with_mailbox_and_snapshot(
             session_uuid,
@@ -751,6 +782,27 @@ pub(super) fn test_empty_initial_snapshot_cleans_pending_session_io_request() {
 
     assert!(hub.try_attach_terminal_forwarder(&req));
     assert_eq!(hub.pending_session_io_snapshots.len(), 1);
+    assert!(matches!(
+        recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize { rows: 23, cols: 80 }
+        )),
+        crate::worker::session_io::SessionIoRequest::Resize { .. }
+    ));
+    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+        )
+    }) {
+        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
+        other => panic!("expected GetSnapshot request, got {other:?}"),
+    };
+    hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
+        request_id,
+        session_uuid: session_uuid.to_string(),
+        payload: Vec::new(),
+    });
 
     for _ in 0..20 {
         hub.tokio_runtime.block_on(async {
@@ -2432,8 +2484,8 @@ pub(super) fn test_socket_worker_handle_registered_and_removed_with_forwarder() 
 }
 
 #[test]
-pub(super) fn test_tui_and_socket_attach_handlers_delegate_to_shared_terminal_runtime() {
-    let source = include_str!("terminal_runtime.rs");
+pub(super) fn test_tui_and_socket_attach_handlers_delegate_to_terminal_stream_runtime() {
+    let source = include_str!("terminal_clients.rs");
     for function in [
         "create_lua_tui_pty_forwarder",
         "try_attach_tui_terminal_forwarder",
@@ -2453,8 +2505,8 @@ pub(super) fn test_tui_and_socket_attach_handlers_delegate_to_shared_terminal_ru
 }
 
 #[test]
-pub(super) fn test_shared_terminal_runtime_session_snapshots_use_session_io_mailbox() {
-    let source = include_str!("terminal_runtime.rs");
+pub(super) fn test_terminal_stream_session_snapshots_use_session_io_mailbox() {
+    let source = include_str!("terminal_stream.rs");
     let body = function_body(source, "spawn_terminal_client_forwarder_runtime");
     assert!(
         body.contains("SessionIoRequest::GetSnapshot"),
@@ -2471,8 +2523,9 @@ pub(super) fn test_shared_terminal_runtime_session_snapshots_use_session_io_mail
 #[test]
 pub(super) fn test_terminal_attach_snapshot_paths_have_no_fixed_sleep_settle_windows() {
     let source = concat!(
-        include_str!("terminal_runtime.rs"),
-        include_str!("session_io_bridge.rs")
+        include_str!("terminal_attach.rs"),
+        include_str!("terminal_snapshot.rs"),
+        include_str!("terminal_stream.rs")
     );
     for function in [
         "create_lua_pty_forwarder",
@@ -2487,6 +2540,53 @@ pub(super) fn test_terminal_attach_snapshot_paths_have_no_fixed_sleep_settle_win
         assert!(
             !body.contains("from_millis(125)"),
             "{function} must not reintroduce the former 125ms attach delay"
+        );
+    }
+}
+
+#[test]
+pub(super) fn test_extracted_terminal_runtime_modules_fence_direct_hot_paths() {
+    let modules = [
+        ("terminal_attach.rs", include_str!("terminal_attach.rs")),
+        ("terminal_snapshot.rs", include_str!("terminal_snapshot.rs")),
+        ("terminal_stream.rs", include_str!("terminal_stream.rs")),
+        ("terminal_clients.rs", include_str!("terminal_clients.rs")),
+        (
+            "terminal_client_adapters.rs",
+            include_str!("terminal_client_adapters.rs"),
+        ),
+        ("terminal_cleanup.rs", include_str!("terminal_cleanup.rs")),
+    ];
+
+    for (module, source) in modules {
+        let source = production_source(source);
+        for forbidden in ["write_input_direct", "WebRtcAdapterCommand::Pty"] {
+            assert!(
+                !source.contains(forbidden),
+                "{module} must not reintroduce direct terminal hot path: {forbidden}"
+            );
+        }
+        for forbidden in ["thread::sleep", "from_millis(125)"] {
+            assert!(
+                !source.contains(forbidden),
+                "{module} must not reintroduce fixed attach/snapshot settle windows: {forbidden}"
+            );
+        }
+    }
+
+    for (module, source) in [
+        ("terminal_attach.rs", include_str!("terminal_attach.rs")),
+        ("terminal_stream.rs", include_str!("terminal_stream.rs")),
+        ("terminal_clients.rs", include_str!("terminal_clients.rs")),
+    ] {
+        let source = production_source(source);
+        assert!(
+            !source.contains(".get_snapshot()"),
+            "{module} must not bypass SessionIoWorker snapshots on attach/stream paths"
+        );
+        assert!(
+            !source.contains("resize_direct"),
+            "{module} must not bypass SessionIoWorker resize on attach/stream paths"
         );
     }
 }
@@ -2546,7 +2646,7 @@ pub(super) fn test_server_comms_dispatcher_does_not_own_terminal_hot_paths() {
 
 #[test]
 pub(super) fn test_worker_session_io_registration_uses_real_session_io_mailbox() {
-    let source = include_str!("client_worker_adapters.rs");
+    let source = include_str!("terminal_client_adapters.rs");
     let body = function_body(source, "register_worker_session_io_sender");
     assert!(
         body.contains("pty_handle.session_io_sender()"),
