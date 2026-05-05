@@ -2299,6 +2299,7 @@ pub(super) fn test_missing_session_io_sender_control_records_observable_metric()
 #[test]
 pub(super) fn test_server_comms_dispatcher_does_not_own_terminal_hot_paths() {
     let source = include_str!("../server_comms.rs");
+    let body = function_body(source, "handle_hub_event");
     for forbidden in [
         "write_input_direct",
         "snapshot_and_subscribe",
@@ -2309,6 +2310,25 @@ pub(super) fn test_server_comms_dispatcher_does_not_own_terminal_hot_paths() {
             "server_comms.rs dispatcher must not contain hot-path terminal code: {forbidden}"
         );
     }
+    for forbidden in [
+        "spawn_blocking",
+        "std::process::Command",
+        "serde_json::json!",
+        "enqueue_session_io_request",
+        "pending_reconnects",
+        "terminal_client_workers",
+        "WorktreeManager::new",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "handle_hub_event must stay thin and delegate domain logic; found {forbidden}"
+        );
+    }
+    let body_lines = body.lines().count();
+    assert!(
+        body_lines <= 310,
+        "handle_hub_event should stay visibly thin; saw {body_lines} lines"
+    );
 }
 
 #[test]
@@ -2331,12 +2351,13 @@ pub(super) fn test_worker_session_io_registration_uses_real_session_io_mailbox()
 
 #[test]
 pub(super) fn test_lua_write_and_resize_pty_are_session_io_data_plane() {
-    let source = include_str!("../server_comms.rs");
+    let source = include_str!("event_socket_terminal.rs");
+    let body = function_body(source, "handle_lua_pty_request_event");
     for request in ["WritePty", "ResizePty"] {
-        let start = source
+        let start = body
             .find(request)
             .unwrap_or_else(|| panic!("missing {request} arm"));
-        let excerpt = &source[start..source.len().min(start + 500)];
+        let excerpt = &body[start..body.len().min(start + 500)];
         assert!(
             excerpt.contains("enqueue_session_io_request"),
             "{request} must route through SessionIoRequest"
