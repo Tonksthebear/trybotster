@@ -475,6 +475,32 @@ impl Hub {
 }
 
 #[cfg(test)]
+mod architecture_guardrail_tests;
+#[cfg(test)]
+mod async_runtime_tests;
+#[cfg(test)]
 mod cargo_profile_tests;
 #[cfg(test)]
-mod tests;
+mod client_worker_adapters_tests;
+#[cfg(test)]
+mod event_session_tests;
+#[cfg(test)]
+mod event_socket_terminal_tests;
+#[cfg(test)]
+mod lua_bridge_tests;
+#[cfg(test)]
+mod metrics_guardrails_tests;
+#[cfg(test)]
+mod push_notifications_tests;
+#[cfg(test)]
+mod session_io_bridge_tests;
+#[cfg(test)]
+mod session_reconnect_tests;
+#[cfg(test)]
+mod terminal_profile_tests;
+#[cfg(test)]
+mod terminal_runtime_tests;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod webrtc_transport_tests;
